@@ -301,6 +301,9 @@ class BagelModel(Model):
 
         # Set by get_worker_graphs() when config has LLM_cfg_text/LLM_cfg_img
         self._has_cfg_parallel = False
+        # Set when graph-walk-specific node groups place LLM cache consumers
+        # in separate worker instances.
+        self._has_llm_disaggregation = False
 
     @property
     def _image_gen_walk(self) -> str:
@@ -790,6 +793,26 @@ class BagelModel(Model):
         model_kwargs = model_kwargs or {}
         cfg = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs["requires_cfg"]
         sampling = self.get_sampling_config("LLM", model_kwargs)
+        publish_labels: dict[tuple[str, str], list[str]] = {}
+        final_publish_labels: dict[tuple[str, str], list[str]] = {}
+        if cfg:
+            publish_labels.update({
+                ("LLM", "prefill_text"): ["cfg_text", "cfg_img"],
+                ("LLM", "prefill_vit"): ["cfg_text"],
+                ("LLM", "prefill_vae"): ["cfg_text"],
+            })
+            final_publish_labels[("LLM", "decode")] = ["cfg_img"]
+
+        if self._has_llm_disaggregation:
+            # Any prefill walk can be the last one before a remote decode or
+            # image-generation worker. Decode itself may hand off to a remote
+            # image-generation worker, but only its final state is needed.
+            for walk in ("prefill_text", "prefill_vit", "prefill_vae"):
+                publish_labels.setdefault(("LLM", walk), []).insert(0, "main")
+            final_publish_labels.setdefault(
+                ("LLM", "decode"), []
+            ).insert(0, "main")
+
         return {
             # The KV resource reads this in admit_retrieve, to know which of a
             # published request's streams to pull in. Guidance-off requests
@@ -805,15 +828,11 @@ class BagelModel(Model):
                 # by the remote CFG replicas. Text-only requests export
                 # nothing. Think-then-image exports cfg_img once after decode
                 # stops, so image_gen_cfg sees the final KV without rewriting
-                # the SHM payload on every token.
-                publish_labels_per_node_walk={
-                    ("LLM", "prefill_text"): ["cfg_text", "cfg_img"],
-                    ("LLM", "prefill_vit"): ["cfg_text"],
-                    ("LLM", "prefill_vae"): ["cfg_text"],
-                } if cfg else {},
-                final_publish_labels_per_node_walk={
-                    ("LLM", "decode"): ["cfg_img"],
-                } if cfg else {},
+                # the SHM payload on every token. Disaggregated LLM placements
+                # additionally export main at prefill boundaries and once when
+                # decode stops.
+                publish_labels_per_node_walk=publish_labels,
+                final_publish_labels_per_node_walk=final_publish_labels,
             ),
             "sampler": SamplingReqConfig(
                 temperature=sampling.temperature,
@@ -855,6 +874,9 @@ class BagelModel(Model):
             name for g in node_groups for name in g["node_names"]
         }
         self._has_cfg_parallel = "LLM_cfg_text" in all_node_names
+        self._has_llm_disaggregation = sum(
+            "LLM" in group["node_names"] for group in node_groups
+        ) > 1
         return super().get_worker_graphs(config_path)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

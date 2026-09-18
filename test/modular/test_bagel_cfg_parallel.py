@@ -29,8 +29,17 @@ from mstar.model.bagel.submodules import CombineCFGSubmodule
 
 def _bare_model() -> BagelModel:
     model = BagelModel.__new__(BagelModel)
-    model.config = SimpleNamespace(num_timesteps=50)
+    model.config = SimpleNamespace(
+        num_timesteps=50,
+        temperature=1.0,
+        top_k=0,
+        top_p=1.0,
+        repetition_penalty=1.0,
+        ignore_eos=False,
+        vocab_size=32,
+    )
     model._has_cfg_parallel = True
+    model._has_llm_disaggregation = False
     return model
 
 
@@ -64,6 +73,49 @@ def test_xpu_cfg_replicas_match_main_tp_and_walk():
     assert len(cfg_groups) == 2
     assert all(group["tp_size"] == main["tp_size"] for group in cfg_groups)
     assert all(group.get("graph_walks") == ["image_gen_cfg"] for group in cfg_groups)
+
+
+def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
+    model = _bare_model()
+    model._has_llm_disaggregation = True
+    args = {
+        "default": SimpleNamespace(
+            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True})
+        )
+    }
+
+    config = model.get_request_resource_configs(args)["kv"]
+
+    assert config.publish_labels_per_node_walk == {
+        ("LLM", "prefill_text"): ["main", "cfg_text", "cfg_img"],
+        ("LLM", "prefill_vit"): ["main", "cfg_text"],
+        ("LLM", "prefill_vae"): ["main", "cfg_text"],
+    }
+    assert config.final_publish_labels_per_node_walk == {
+        ("LLM", "decode"): ["main", "cfg_img"],
+    }
+    assert config.get_publish_labels("LLM", "decode", ["main", "cfg_img"]) == []
+
+    args["default"].full_metadata.kwargs["requires_cfg"] = False
+    config = model.get_request_resource_configs(args)["kv"]
+    assert {
+        tuple(labels)
+        for labels in config.publish_labels_per_node_walk.values()
+    } == {("main",)}
+    assert config.final_publish_labels_per_node_walk == {
+        ("LLM", "decode"): ["main"],
+    }
+
+
+def test_bagel_configs_detect_only_graph_walk_split_llm_as_disaggregated():
+    root = Path(__file__).parents[2]
+    model = _bare_model()
+
+    model.get_worker_graphs(str(root / "configs/bagel_cfg_parallel.yaml"))
+    assert not model._has_llm_disaggregation
+
+    model.get_worker_graphs(str(root / "configs/bagel_pd_disaggregated.yaml"))
+    assert model._has_llm_disaggregation
 
 
 def test_combine_cfg_is_parameterless():
