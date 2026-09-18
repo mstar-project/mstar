@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
-import torch.nn.functional as F
 
 from mstar.engine.resources.linear_attn.conv_update import conv_update_slots, conv_update_slots_supported
 
@@ -148,72 +147,31 @@ class FLAKDAKernels:
 
     def run_verify(self, qkv, g_raw, beta_raw, plan, conv_state, rec_state, spec: SpecBlocks, p: KDAParams):
         """The checkpoint recurrence of a verify step (plan section 8.3 item 6), static shapes and
-        device tensors only (capturable). Rows gather their checkpoint window and pending prefix by
-        slot; the prefix's conv (from that window) and the block's conv (from the window after the
-        prefix, gathered at the prefix length) run as fp32 sequential taps like the reference;
-        prefix positions past the accepted length become no-op tokens for the recurrence (k = v =
-        0, raw gate and beta at -1e4: decay 1, beta 0, verified bit-identical); one launch of
-        ``kda_recurrent_checkpoint`` runs prefix + block from the slot's state and writes the slot
-        after the prefix; the block's outputs are returned, its raw inputs saved as the next prefix
-        and the window after the prefix written to the pool. Same semantics as
+        device tensors only (capturable), two launches. ``kda_verify_prep`` gathers each row's
+        checkpoint window and pending prefix by slot, runs the prefix's conv (from that window) and
+        the block's (from the window after the prefix, at the prefix length) as fp32 taps like the
+        reference, turns prefix positions past the accepted length into no-op tokens for the
+        recurrence (k = v = 0, raw gate and beta at -1e4: decay 1, beta 0, verified bit-identical),
+        writes the window after the prefix to the pool and saves the block's raw inputs as the next
+        prefix; ``kda_recurrent_checkpoint`` runs prefix + block from the slot's state and writes
+        the slot after the prefix. The block's outputs are returned. Same semantics as
         ``TorchKDAKernels.run_verify``."""
+        from mstar.engine.resources.linear_attn.kda_spec_prep import kda_verify_prep
         from mstar.engine.resources.linear_attn.kda_spec_recurrent import kda_recurrent_checkpoint
 
         h, d = p.num_heads, p.head_dim
         rows = plan.num_rows
         k1 = plan.cu_seqlens_cpu[1] - plan.cu_seqlens_cpu[0]
         assert rows * k1 == qkv.shape[0], (rows, k1, qkv.shape)
-        conv_w = p.conv_weight.float()  # [3P, W]
-        w = conv_w.shape[1]
-        slots = plan.slot_ids[:rows].to(torch.long)
-        win = conv_state.index_select(0, slots).transpose(1, 2).float()  # [rows, W-1, 3P]: the checkpoint window
-        pre = spec.prefix.index_select(0, slots).float()  # [rows, k1, 3P]
-        # padding rows address the sink, whose length is garbage: clamp before it indexes anything
-        plen = spec.length.index_select(0, slots)[:, 0].clamp_(0, k1)  # [rows] int32
-        blk = qkv.view(rows, k1, -1).float()
-
-        def conv(x):  # x [rows, W-1+T, 3P] -> silu(depthwise causal conv) [rows, T, 3P], fp32 taps in tap order
-            t = x.shape[1] - (w - 1)
-            y = x[:, 0:t] * conv_w[:, 0]
-            for j in range(1, w):
-                y = y + x[:, j:j + t] * conv_w[:, j]
-            return F.silu(y)
-
-        combined = torch.cat([win, pre], dim=1)  # [rows, W-1+k1, 3P]
-        idx = plen.to(torch.long)[:, None] + torch.arange(w - 1, device=qkv.device)[None, :]  # last W-1 real inputs
-        win_after = torch.gather(combined, 1, idx[:, :, None].expand(-1, -1, combined.shape[-1]))  # [rows, W-1, 3P]
-        y_pre = conv(combined).to(qkv.dtype)  # positions >= plen are garbage, masked below
-        y_blk = conv(torch.cat([win_after, blk], dim=1)).to(qkv.dtype)  # [rows, k1, 3P]
-        conv_state.index_copy_(0, slots, win_after.transpose(1, 2).to(conv_state.dtype))
-
-        def heads(y):  # [rows, T, 3P] -> q, k, v each [rows, T, H, D]
-            q, k, v = y.split([h * d, h * d, h * d], dim=-1)
-            return q.reshape(rows, -1, h, d), k.reshape(rows, -1, h, d), v.reshape(rows, -1, h, d)
-
-        qP, kP, vP = heads(y_pre)
-        qB, kB, vB = heads(y_blk)
-        pad = (torch.arange(k1, device=qkv.device)[None, :] >= plen[:, None])  # [rows, k1]
-        kP = torch.where(pad[:, :, None, None], torch.zeros_like(kP), kP)
-        vP = torch.where(pad[:, :, None, None], torch.zeros_like(vP), vP)
-        gP = torch.where(pad[:, :, None, None], torch.full_like(spec.g[:1, :1], -1e4).expand(rows, k1, h, d),
-                         spec.g.index_select(0, slots))
-        bP = torch.where(pad[:, :, None], torch.full_like(spec.beta[:1, :1], -1e4).expand(rows, k1, h),
-                         spec.beta.index_select(0, slots))
-        gB = g_raw.view(rows, k1, h, d)
-        bB = beta_raw.view(rows, k1, h)
-        cat = lambda a, b: torch.cat([a, b], dim=1).reshape(rows * 2 * k1, *a.shape[2:]).contiguous()
-        cu = torch.arange(rows + 1, device=qkv.device, dtype=torch.int32) * (2 * k1)
-        o = kda_recurrent_checkpoint(
-            cat(qP, qB), cat(kP, kB), cat(vP, vB), cat(gP.to(qkv.dtype), gB.to(qkv.dtype)),
-            cat(bP.to(qkv.dtype), bB.to(qkv.dtype)), p.A_log, p.dt_bias, rec_state, plan.slot_ids[:rows],
-            (plen - 1).to(torch.int32), cu, p.scale, p.lower_bound,
+        slots = plan.slot_ids[:rows]
+        q, k, v, g, beta, ckpt = kda_verify_prep(
+            qkv, g_raw, beta_raw, conv_state, spec, slots, p.conv_weight, rows, k1, h, d,
         )
-        o = o.view(rows, 2 * k1, h, d)[:, k1:].reshape(rows * k1, h, d)
-        # this block is the next step's pending prefix (its length follows the verification)
-        spec.prefix.index_copy_(0, slots, blk.to(spec.prefix.dtype))
-        spec.g.index_copy_(0, slots, gB.to(spec.g.dtype))
-        spec.beta.index_copy_(0, slots, bB.to(spec.beta.dtype))
-        return o
+        o = kda_recurrent_checkpoint(
+            q.view(-1, h, d), k.view(-1, h, d), v.view(-1, h, d), g.view(-1, h, d), beta, p.A_log, p.dt_bias,
+            rec_state, slots, ckpt, plan.verify_cu_seqlens(), p.scale, p.lower_bound,
+        )
+        return o.view(rows, 2 * k1, h, d)[:, k1:].reshape(rows * k1, h, d)
 
 
 class FlashKDAKernels(FLAKDAKernels):
