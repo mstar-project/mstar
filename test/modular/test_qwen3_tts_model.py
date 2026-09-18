@@ -1639,3 +1639,13 @@ def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
     assert encoder.calls == 3 and len(submodule._conditioning) == 2
     encode("a4", clip_a, 7)   # evicted, so encoded again
     assert encoder.calls == 4
+
+
+def test_qwen3_tts_codec_dtype_option():
+    from mstar.model.qwen3_tts.qwen3_tts_model import codec_dtype
+
+    assert codec_dtype("float32") is torch.float32
+    assert codec_dtype("bfloat16") is torch.bfloat16
+    assert codec_dtype(torch.float16) is torch.float16
+    with pytest.raises(ValueError, match="codec_dtype"):
+        codec_dtype("int8")
