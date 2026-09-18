@@ -273,3 +273,15 @@ def test_audio_voices_404_for_non_speech_model(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
     assert client.get("/v1/audio/voices").status_code == 404
+
+
+def test_speech_stream_pcm_has_no_wav_header(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2, 3]))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True, "response_format": "pcm"})
+    assert r.status_code == 200 and r.headers["content-type"].startswith("audio/pcm")
+    assert r.content == _pcm([1, 2, 3])
+    r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True})
+    assert r.headers["content-type"].startswith("audio/wav") and r.content[:4] == b"RIFF"
+    assert r.content[44:] == _pcm([1, 2, 3])
