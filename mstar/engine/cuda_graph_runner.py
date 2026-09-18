@@ -994,6 +994,7 @@ class PiecewiseCudaGraphRunner:
         num_slots: int,
         joint_comm_group: JointGroups | None = None,
         node_name: str | None = None,
+        memory_pool=None,
     ):
         self._label = label
         self._config = config
@@ -1011,7 +1012,13 @@ class PiecewiseCudaGraphRunner:
         )
 
         self._graphs: dict[PiecewiseGraphKey, PiecewiseGraphData] = {}
-        self._memory_pool = None
+        # The graph memory pool every bucket of this region captures into. A
+        # node's regions never replay concurrently and their outputs are
+        # cloned before the next replay, so the engine hands all of them one
+        # pool: a region's intermediates then reuse another's instead of each
+        # region keeping its own peak resident (nineteen regions of a 82M TTS
+        # model filled an 80 GB card). None: allocate a private pool at capture.
+        self._memory_pool = memory_pool
         # (bs, total_tokens) shapes that failed to capture and run eagerly
         self.dropped_shapes: list[tuple[int, int]] = []
         self._dummy_rows = DummyRowPool(
@@ -1096,7 +1103,8 @@ class PiecewiseCudaGraphRunner:
             return
 
         torch.cuda.set_device(self._device)
-        self._memory_pool = torch.cuda.graphs.graph_pool_handle()
+        if self._memory_pool is None:
+            self._memory_pool = torch.cuda.graphs.graph_pool_handle()
 
         shapes = self.prepare_for_capture()
         if not shapes:
