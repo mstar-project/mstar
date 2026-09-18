@@ -182,3 +182,33 @@ def test_batched_streams_match_their_single_runs(setup):
             # float32 reassociation in the padded batch, amplified by the vocoder;
             # measured 1-6 LSB on CPU
             assert diff <= 16.0, (rid, step, diff)
+
+
+def test_context_window_keeps_streaming_close_to_offline(setup):
+    """A bounded left-context window (``stream_context_tokens``) makes each
+    chunk's flow solve cost constant; the streamed mel must stay close to the
+    whole-utterance decode, and the chunks must still join without clicks."""
+    sub, ref, tokens = setup
+    saved = sub.context_tokens
+    sub.context_tokens = 20
+    try:
+        streamed, boundaries, state = _stream(sub, ref, tokens, [15, 15, 15, 15], seed=13)
+    finally:
+        sub.context_tokens = saved
+    assert streamed.numel() == tokens.numel() * 960 and state.done
+
+    lens = torch.tensor([tokens.numel()])
+    with torch.no_grad():
+        mel = sub.s3gen.tokens_to_mel(tokens[None], lens, ref, n_timesteps=6, noise=state.noise)
+        offline = sub.s3gen.mel_to_wav(mel, generator=torch.Generator().manual_seed(13))[0]
+        mel_stream = sub.s3gen.mel_extractor(streamed[None])[0]
+        mel_offline = sub.s3gen.mel_extractor(offline[None])[0]
+    mel_err = (mel_stream - mel_offline).abs()
+    mel_corr = torch.corrcoef(torch.stack([mel_stream.flatten(), mel_offline.flatten()]))[0, 1]
+    print(f"[s3gen streaming, context 20] log-mel mean|d|={mel_err.mean():.3f} corr={mel_corr:.4f}")
+    assert torch.isfinite(streamed).all()
+    assert mel_corr > 0.95 and mel_err.mean() < 0.6
+    jumps = (streamed[1:] - streamed[:-1]).abs()
+    typical = jumps.quantile(0.999)
+    for b in boundaries:
+        assert jumps[b - 3:b + 3].max() <= max(2 * typical, 0.05), (b, jumps[b - 3:b + 3].max(), typical)
