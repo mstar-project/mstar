@@ -338,7 +338,7 @@ class Qwen3TTSAdapter(OpenAIAdapter):
 
     supports_speech = True
 
-    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
         if getattr(req, "voice", None):
             mk["voice"] = req.voice
@@ -347,6 +347,24 @@ class Qwen3TTSAdapter(OpenAIAdapter):
         if instructions:
             mk.setdefault("instruct", instructions)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL, a
+        # local path or bare base64 (vLLM-Omni's field). It becomes the
+        # request's audio input for one request; ``ref_text`` and
+        # ``x_vector_only_mode`` ride along as model kwargs. Named, persisted
+        # voices come with the shared voice registry (engine/voice-registry).
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            if ref_audio.startswith(("data:", "http://", "https://")) or Path(ref_audio).suffix:
+                _, path = media_io.resolve_media_ref(ref_audio, upload_dir)
+            else:
+                _, path = media_io.save_base64(ref_audio, "wav", "audio", upload_dir)
+            return SubmitArgs(
+                text=req.input,
+                file_paths={"audio": [path]},
+                input_modalities=["audio", "text"],
+                output_modalities=["audio"],
+                model_kwargs=mk,
+            )
         return SubmitArgs(
             text=req.input,
             input_modalities=["text"],
