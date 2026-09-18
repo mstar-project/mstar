@@ -90,7 +90,8 @@ def test_prefill_layout_matches_variant(loaded):
     variant, model, talker, _ = loaded
     kwargs = {"input_modalities": ["text"], "output_modalities": ["audio"]}
     if variant == "base":
-        with pytest.raises(ValueError, match="reference audio"):
+        # Base clones a voice: a text-only request has no reference clip.
+        with pytest.raises(ValueError, match="reference clip"):
             model.process_prompt("Testing the base model.", **kwargs)
         return
     if variant == "custom_voice":
@@ -104,8 +105,9 @@ def test_prefill_layout_matches_variant(loaded):
             "Testing Qwen three TTS.", instruct="A calm male voice.", **kwargs,
         )
         assert tensors["speaker_id"][0].item() == -1
-    instruct_len, text_len, stream_text = tensors["prompt_layout"][0].tolist()
+    instruct_len, text_len, stream_text, ref_text_len, ref_frames = tensors["prompt_layout"][0].tolist()
     assert instruct_len > 0 and text_len > 0 and stream_text == 0
+    assert ref_text_len == 0 and ref_frames == 0
 
     prepared = talker.prepare_inputs(
         "talker_prefill", SimpleNamespace(request_id=f"prefill-{variant}"), tensors,
@@ -132,3 +134,60 @@ def test_depth_loop_runs_through_projection(loaded):
     assert (codes[:, 0] == layer0).all()
     assert (codes[:, 1:] < model.config.code_predictor.vocab_size).all()
     assert embed_sum.shape == (batch, model.config.talker.hidden_size)
+
+
+def test_base_reference_clip_becomes_xvector_frames_and_clone_prefill(loaded):
+    """Base only: the shared reference clip runs through load_audio -> RefEncoder -> clone prefill.
+
+    ``QWEN3_TTS_REF_AUDIO`` names a 24 kHz mono clip (the benchmark's
+    ``clone_2.wav``); its transcript is fixed here.
+    """
+    variant, model, talker, _ = loaded
+    if variant != "base":
+        pytest.skip("voice cloning is a Base feature")
+    clip_path = os.environ.get("QWEN3_TTS_REF_AUDIO")
+    if not clip_path or not Path(clip_path).is_file():
+        pytest.skip("set QWEN3_TTS_REF_AUDIO to a reference clip")
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    clip = model.load_audio(clip_path, "cuda:0")
+    assert clip.metadata["sample_rate"] == 24000 and clip.data.ndim == 1
+    frames = model.config.codec.frames_for_samples(clip.data.shape[0])
+    tensors = model.process_prompt(
+        "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye.",
+        input_modalities=["audio", "text"], output_modalities=["audio"],
+        tensors={"audio_inputs": [clip.data]},
+        ref_text="Okay. Yeah. I resent you. I love you. I respect you. "
+                 "But you know what? You blew it! And thanks to you.",
+    )
+    assert tensors["prompt_layout"][0].tolist()[4] == frames and tensors["ref_frames"][0].item() == frames
+
+    ref_encoder = model.get_submodule("RefEncoder", device="cuda:0", autocast_dtype=torch.bfloat16)
+    prepared = ref_encoder.prepare_inputs(
+        "talker_prefill_clone", SimpleNamespace(request_id="clone"),
+        {"audio_inputs": [clip.data], "prompt_layout": tensors["prompt_layout"]},
+    )
+    engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
+    with torch.no_grad():
+        encoded = ref_encoder.forward(
+            "talker_prefill_clone", engine_inputs,
+            **ref_encoder.preprocess("talker_prefill_clone", engine_inputs, [prepared]),
+        )
+    torch.cuda.synchronize()
+    xvec, codes = encoded["speaker_embed"][0], encoded["ref_codes"][0]
+    assert xvec.shape == (model.config.talker.hidden_size,) and torch.isfinite(xvec.float()).all()
+    assert codes.shape == (frames, model.config.num_code_groups)
+    assert (codes >= 0).all() and (codes < model.config.codec.codebook_size).all()
+
+    prefill = talker.prepare_inputs(
+        "talker_prefill_clone", SimpleNamespace(request_id="clone-prefill"),
+        {**tensors, "speaker_embed": [xvec], "ref_codes": [codes]},
+    )
+    # role(3) + [think, think_bos, lang?, think_eos, x-vector, pad] + in-context span (streaming text default)
+    assert prefill.input_embeds.shape[1] == model.config.talker.hidden_size
+    assert prefill.input_seq_len > 3 + 5 + frames
+    state = talker.request_state("clone-prefill")
+    assert torch.equal(state["reference_frames"], codes)
+    model._submodule_cache.pop("RefEncoder", None)
+    del ref_encoder
+    torch.cuda.empty_cache()
