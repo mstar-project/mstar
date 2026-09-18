@@ -109,7 +109,10 @@ class ZImageModel(Model):
                 resource_key=DIT_ATTN, nodes={"dit"},
                 config=RaggedAttentionConfig(
                     num_qo_heads=tcfg.n_heads, num_kv_heads=tcfg.n_heads, head_dim=tcfg.head_dim,
+                    # per label (image / caption / main span) one segment per request
                     max_segments_per_request=1,
+                    # the DiT's activation dtype: there is no KV cache to inherit one from
+                    dtype=torch.bfloat16,
                 ),
             )
         ]
