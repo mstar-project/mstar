@@ -318,3 +318,69 @@ def test_tokenize_matches_the_pipeline_recipe_with_the_real_tokenizer():
     ref = tok(text, return_tensors="pt", padding="max_length", truncation=True, max_length=512)
     assert torch.equal(ids, ref["input_ids"][0]) and torch.equal(mask, ref["attention_mask"][0])
     assert int(mask.sum()) == 21 and ids[int(mask.sum()):].unique().tolist() == [151643]
+
+
+def test_load_image_resamples_before_rgb_conversion(tmp_path):
+    """The reference image processor resizes and crops the file as-is and converts to RGB last."""
+    import numpy as np
+    from PIL import Image
+
+    model = _make_model()
+    rng = np.random.default_rng(0)
+    rgba = Image.fromarray(rng.integers(0, 256, (1000, 1100, 4), dtype=np.uint8), "RGBA")  # > 1 MP: gets shrunk
+    path = tmp_path / "ref.png"
+    rgba.save(path)
+    scale = (1024 * 1024 / (1100 * 1000)) ** 0.5
+    w, h = int(1100 * scale), int(1000 * scale)
+    cw, ch = (w // 16) * 16, (h // 16) * 16
+    box = ((w - cw) // 2, (h - ch) // 2, (w - cw) // 2 + cw, (h - ch) // 2 + ch)
+    expected = rgba.resize((w, h), Image.Resampling.LANCZOS).crop(box).convert("RGB")
+    got = model.load_image(str(path), "cpu").data
+    assert got.shape == (3, ch, cw) and got.dtype == torch.float32
+    assert torch.equal(got, torch.from_numpy(np.array(expected)).permute(2, 0, 1).float() / 255)
+    # converting first would resample without the alpha weighting Pillow applies to RGBA
+    other = rgba.convert("RGB").resize((w, h), Image.Resampling.LANCZOS).crop(box)
+    assert not np.array_equal(np.array(other), np.array(expected))
+
+
+def test_qwen3_encoder_config_rejects_taps_at_or_past_the_final_norm():
+    from mstar.model.flux2_klein.config import Qwen3EncoderConfig
+
+    with pytest.raises(ValueError, match="below layer"):
+        Qwen3EncoderConfig(num_hidden_layers=36, hidden_state_layers=(9, 36))
+    with pytest.raises(ValueError, match="1-indexed"):
+        Qwen3EncoderConfig(num_hidden_layers=36, hidden_state_layers=(0,))
+    assert Qwen3EncoderConfig(num_hidden_layers=36, hidden_state_layers=(35,)).num_layers_needed == 35
+
+
+def test_component_iterator_filters_skipped_keys_before_reading(tmp_path):
+    import json
+
+    from safetensors.torch import save_file
+
+    from mstar.model.flux2_klein.weight_loader import iter_transformers_component
+
+    tensors = {
+        "model.layers.0.w": torch.ones(2), "model.layers.5.w": torch.ones(3),
+        "model.norm.weight": torch.ones(4), "lm_head.weight": torch.ones(5),
+    }
+
+    def skip(name: str) -> bool:
+        return name.startswith(("lm_head.", "model.layers.5.")) or name == "model.norm.weight"
+
+    single = tmp_path / "single"
+    single.mkdir()
+    save_file(tensors, single / "model.safetensors")
+    assert [k for k, _ in iter_transformers_component(single, "cpu", skip=skip)] == ["model.layers.0.w"]
+    assert sorted(k for k, _ in iter_transformers_component(single, "cpu")) == sorted(tensors)
+
+    sharded = tmp_path / "sharded"
+    sharded.mkdir()
+    shards = {"model.layers.0.w": 1, "model.norm.weight": 1, "model.layers.5.w": 2, "lm_head.weight": 2}
+    for n in (1, 2):
+        save_file({k: tensors[k] for k, s in shards.items() if s == n}, sharded / f"model-0000{n}-of-00002.safetensors")
+    weight_map = {k: f"model-0000{s}-of-00002.safetensors" for k, s in shards.items()}
+    (sharded / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    # the second shard is empty after the filter and is never opened
+    assert [k for k, _ in iter_transformers_component(sharded, "cpu", skip=skip)] == ["model.layers.0.w"]
+    assert sorted(k for k, _ in iter_transformers_component(sharded, "cpu")) == sorted(tensors)
