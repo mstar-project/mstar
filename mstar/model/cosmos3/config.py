@@ -428,6 +428,12 @@ class Cosmos3Config:
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.
     compile_denoise: bool = True
+    # torch.compile the reasoner's captured decode step before the CUDA-graph
+    # capture: at bs=1 the eager step is ~1240 kernels, ~1000 of them the
+    # norms', rotary's and residuals' pointwise pieces; fused, the step runs
+    # at the weight-streaming floor (H100: 4.2 -> 2.05 ms/token). Env override
+    # COSMOS3_REASONER_COMPILE=0/1 for A/B.
+    compile_reasoner_decode: bool = True
     # Which attention backends the DiT node declares (see
     # Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the
     # paged FlashInfer backend the understanding prefill and the captured
