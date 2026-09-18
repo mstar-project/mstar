@@ -95,7 +95,8 @@ case ${1:-} in
     { cat "$MSTAR/$cfg"; printf 'model_kwargs:\n  voices_dir: %s\n%s' "$VOICES_DIR" "${EXTRA_MODEL_KWARGS:-}"; } > "$out/config.yaml"
     cd "$MSTAR"
     start_group "$out/server.log" mstar-serve --config "$out/config.yaml" --port "$PORT" \
-        --tensor-comm-protocol SHM --socket-path-prefix "/tmp/mstar_${USER}_bench_$$/"
+        --tensor-comm-protocol SHM --socket-path-prefix "/tmp/mstar_${USER}_bench_$$/" \
+        --log-stats --log-stats-file "$out/stats.log"
     trap 'stop_group' EXIT
     wait_http "http://127.0.0.1:$PORT/health" 900
     runner "http://127.0.0.1:$PORT" "$c" "$out"
