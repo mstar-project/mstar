@@ -425,6 +425,12 @@ class OrpheusModel(Model):
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
 
+    def get_voices(self) -> list[str]:
+        return list(self.config.available_voices)
+
+    def get_default_voice(self) -> str:
+        return self.config.available_voices[0]
+
     # -------------------------------------------------------------------
     # Model ABC: postprocess
     # -------------------------------------------------------------------
