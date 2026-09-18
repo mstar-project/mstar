@@ -165,6 +165,38 @@ class MarkovHead(nn.Module):
         return self.markov_w2(self.markov_w1(prev))
 
 
+class ContextAccumulator:
+    """The context projection summed one aux layer at a time. ``sink(j, state)`` adds the ``j``-th
+    aux layer's share of ``context_proj`` (its slice of the input columns) in fp32, ``finish()``
+    casts, all-gathers the output slices and applies ``context_norm``: the same as
+    ``combine(torch.cat(aux, -1))`` up to the fp32 summation order, without the prefill ever
+    holding the five aux states (5 x [T, 7168] bf16 is 587 MB at 8k tokens) or their concatenation.
+    """
+
+    def __init__(self, draft: "DSparkDraft"):
+        self._draft = draft
+        self._acc: torch.Tensor | None = None
+
+    def __call__(self, j: int, state: torch.Tensor) -> None:
+        weight = self._draft.context_proj.weight
+        h = state.shape[-1]
+        w_j = weight[:, j * h:(j + 1) * h]
+        if state.is_cuda:
+            part = torch.mm(state, w_j.t(), out_dtype=torch.float32)
+        else:
+            part = torch.mm(state.float(), w_j.float().t())
+        self._acc = part if self._acc is None else self._acc.add_(part)
+
+    def finish(self) -> torch.Tensor:
+        assert self._acc is not None, "no aux state was added"
+        proj = self._draft.context_proj
+        out = self._acc.to(proj.weight.dtype)
+        self._acc = None
+        if proj.gather_output and proj.tp_size > 1:
+            out = proj.comm_group.all_gather(out, dim=-1)
+        return self._draft.context_norm(out)
+
+
 class DSparkDraft(nn.Module):
     def __init__(self, cfg: DSparkConfig, embed_tokens: nn.Module, lm_head: nn.Module,
                  comm_group: CommGroup | None = None, max_positions: int = 65536,
@@ -202,6 +234,10 @@ class DSparkDraft(nn.Module):
     def combine(self, aux: torch.Tensor) -> torch.Tensor:
         """``aux [T, 5 * target_hidden]`` (the target's aux states, layer order) -> context states ``[T, hidden]``."""
         return self.context_norm(self.context_proj(aux))
+
+    def context_accumulator(self) -> "ContextAccumulator":
+        """``combine`` spread over the target's forward: an ``aux_sink`` for the language model."""
+        return ContextAccumulator(self)
 
     def context_latents(self, states: torch.Tensor, positions: torch.Tensor) -> list[torch.Tensor]:
         """Per layer, the cache entries of context states at ``positions``: ``[T, latent + rope]`` each."""
