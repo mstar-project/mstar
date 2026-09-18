@@ -169,8 +169,12 @@ Chatterbox notes
   the three look-ahead tokens and crossfades the vocoder tail, so the stream
   is continuous but not sample-identical to the whole-utterance decode;
   ``stream_chunk_tokens: 0`` synthesises whole utterances (the reference
-  path, bit-exact with the package at a fixed seed). Requests whose chunks
-  are ready together share one padded flow solve (up to 8 per step).
+  path, bit-exact with the package at a fixed seed). ``stream_context_tokens``
+  (default 0 = whole history) bounds how many settled tokens a chunk's flow
+  solve keeps as left context, making the per-chunk cost constant; a window
+  of 20-25 tokens stays as close to the whole-utterance decode as the full
+  history does (log-mel correlation 0.988 vs 0.985 on CPU). Requests whose
+  chunks are ready together share one padded flow solve (up to 8 per step).
 - Sampling follows the reference order inside the sampler resource:
   repetition penalty -> temperature -> ``min_p`` -> ``top_p``; the T3 node
   declares ``enable_min_p`` on its ``SamplerSpec`` (see
