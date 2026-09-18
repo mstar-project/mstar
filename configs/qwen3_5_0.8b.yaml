@@ -1,0 +1,11 @@
+model: "qwen3_5_0.8b"
+max_seq_len: 32768
+node_groups:
+  # Text and images. Video is refused — see `process_prompt`; it needs the
+  # per-frame timestamp spans, not a new encoder. Colocated because the
+  # encoder runs once per request and then idles.
+  - node_names: [LLM, vision_encoder]
+    ranks: [0]
+resources:
+  gdn_state:
+    max_slots: 129

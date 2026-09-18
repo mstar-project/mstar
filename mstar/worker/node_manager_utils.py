@@ -404,14 +404,19 @@ class WorkerGraphsManager:
         streaming_edges = [edge for edge in outputs if edge.is_streaming]
         non_streaming_outputs = [edge for edge in outputs if not edge.is_streaming]
 
-        # (1) find persist (to-conductor) and new-token-output edges
-        to_conductor = [edge for edge in non_streaming_outputs if edge.persist]
-        new_token_outputs = [edge for edge in non_streaming_outputs if edge.conductor_new_token]
-
         sharding_config = self.per_request_info[request_id].sharding_config
         group = sharding_config.get_sharding_group(node_name, graph_walk)
         # No group → singleton/non-TP; treat as rank 0.
         is_first_tp_rank = group is None or group._tp_rank == 0
+
+        # (1) find persist (to-conductor) and new-token-output edges
+        to_conductor = [edge for edge in non_streaming_outputs if edge.persist]
+        # Leader only: the conductor discards a follower's counts anyway, and
+        # `_send_outputs` sizes each one from a store `_register_outputs` never
+        # filled on a follower.
+        new_token_outputs = [
+            edge for edge in non_streaming_outputs if edge.conductor_new_token
+        ] if is_first_tp_rank else []
 
         # (2) route each output edge to its destination worker graph via the
         # inverted index. Compute the per-rank fanout first; ingest *this

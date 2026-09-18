@@ -182,6 +182,224 @@ def _fused_sampling_prep_kernel(
         )
 
 
+# ---------------------------------------------------------------------------
+# Split-V variant of the above.
+#
+# The single-kernel form runs one threadblock per row, so a decode batch of 16
+# occupies 16 SMs of 132 and the vocab is walked serially three times. Splitting
+# the vocab across blocks fixes both: occupancy scales with B x NSPLIT, and pass
+# one keeps a running max/sum (online softmax) so the logits are read twice
+# rather than three times.
+#
+# Three kernels instead of one, but each saturates; measured well under the
+# single-kernel version for Qwen3.5's 248k vocab.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _penalize(vals, seen, penalty):
+    """Repetition penalty: divide positive logits, multiply negative ones."""
+    return tl.where(seen, tl.where(vals > 0, vals / penalty, vals * penalty), vals)
+
+
+@triton.jit
+def _split_partials_kernel(
+    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr,
+    chunk_max_ptr, chunk_sum_ptr, chunk_arg_ptr,
+    V, CHUNK,
+    stride_b, stride_v, mask_stride_b, mask_stride_v, part_stride_b,
+    BLOCK_SIZE: tl.constexpr,
+    APPLY_PENALTY: tl.constexpr,
+    INCLUDE_GREEDY: tl.constexpr,
+):
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    temp = tl.load(temperature_ptr + row)
+    if INCLUDE_GREEDY:
+        inv_temp = tl.where(temp == 0, 1.0, 1.0 / tl.maximum(temp, 1e-30))
+    else:
+        inv_temp = 1.0 / temp
+    if APPLY_PENALTY:
+        penalty = tl.load(penalty_ptr + row)
+
+    lo = split * CHUNK
+    hi = tl.minimum(lo + CHUNK, V)
+
+    # Online softmax over this chunk: one read, running max and sum.
+    run_max = -float("inf")
+    run_sum = tl.zeros([], dtype=tl.float32)
+    arg = tl.zeros([], dtype=tl.int32)
+    for v_start in range(lo, hi, BLOCK_SIZE):
+        offs = v_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < hi
+        vals = tl.load(
+            logits_ptr + row * stride_b + offs * stride_v,
+            mask=mask, other=-float("inf"),
+        ).to(tl.float32)
+        if APPLY_PENALTY:
+            seen = tl.load(
+                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                mask=mask, other=0,
+            ).to(tl.int1)
+            vals = _penalize(vals, seen, penalty)
+        scaled = tl.where(mask, vals * inv_temp, -float("inf"))
+        block_max = tl.max(scaled)
+        if INCLUDE_GREEDY:
+            is_new = block_max > run_max
+            arg = tl.where(
+                is_new, v_start + tl.argmax(scaled, axis=0).to(tl.int32), arg,
+            )
+        new_max = tl.maximum(run_max, block_max)
+        # rescale what we had, then fold this block in
+        run_sum = run_sum * tl.exp(run_max - new_max) + tl.sum(
+            tl.where(mask, tl.exp(scaled - new_max), 0.0)
+        )
+        run_max = new_max
+
+    base = row * part_stride_b + split
+    tl.store(chunk_max_ptr + base, run_max)
+    tl.store(chunk_sum_ptr + base, run_sum)
+    if INCLUDE_GREEDY:
+        tl.store(chunk_arg_ptr + base, arg)
+
+
+@triton.jit
+def _split_combine_kernel(
+    chunk_max_ptr, chunk_sum_ptr, chunk_arg_ptr,
+    row_max_ptr, row_inv_sum_ptr, row_arg_ptr,
+    NSPLIT, part_stride_b,
+    BLOCK_N: tl.constexpr,
+    INCLUDE_GREEDY: tl.constexpr,
+):
+    """Fold the per-chunk partials into one max/sum/argmax per row."""
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    mask = offs < NSPLIT
+    base = row * part_stride_b + offs
+    cmax = tl.load(chunk_max_ptr + base, mask=mask, other=-float("inf"))
+    csum = tl.load(chunk_sum_ptr + base, mask=mask, other=0.0)
+    gmax = tl.max(cmax)
+    # each chunk's sum is relative to its own max, so rescale before adding
+    gsum = tl.sum(tl.where(mask, csum * tl.exp(cmax - gmax), 0.0))
+    tl.store(row_max_ptr + row, gmax)
+    tl.store(row_inv_sum_ptr + row, 1.0 / tl.maximum(gsum, 1e-30))
+    if INCLUDE_GREEDY:
+        carg = tl.load(chunk_arg_ptr + base, mask=mask, other=0)
+        winner = tl.argmax(tl.where(mask, cmax, -float("inf")), axis=0)
+        tl.store(row_arg_ptr + row, tl.sum(tl.where(offs == winner, carg, 0)))
+
+
+@triton.jit
+def _split_write_kernel(
+    logits_ptr, temperature_ptr, penalty_ptr, seen_mask_ptr,
+    row_max_ptr, row_inv_sum_ptr, row_arg_ptr, probs_ptr,
+    V, CHUNK,
+    stride_b, stride_v, out_stride_b, out_stride_v,
+    mask_stride_b, mask_stride_v,
+    BLOCK_SIZE: tl.constexpr,
+    APPLY_PENALTY: tl.constexpr,
+    INCLUDE_GREEDY: tl.constexpr,
+):
+    row = tl.program_id(0)
+    split = tl.program_id(1)
+    temp = tl.load(temperature_ptr + row)
+    if INCLUDE_GREEDY:
+        is_greedy = temp == 0
+        inv_temp = tl.where(is_greedy, 1.0, 1.0 / tl.maximum(temp, 1e-30))
+        arg = tl.load(row_arg_ptr + row)
+    else:
+        inv_temp = 1.0 / temp
+    if APPLY_PENALTY:
+        penalty = tl.load(penalty_ptr + row)
+    gmax = tl.load(row_max_ptr + row)
+    inv_sum = tl.load(row_inv_sum_ptr + row)
+
+    lo = split * CHUNK
+    hi = tl.minimum(lo + CHUNK, V)
+    for v_start in range(lo, hi, BLOCK_SIZE):
+        offs = v_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < hi
+        vals = tl.load(
+            logits_ptr + row * stride_b + offs * stride_v,
+            mask=mask, other=0.0,
+        ).to(tl.float32)
+        if APPLY_PENALTY:
+            seen = tl.load(
+                seen_mask_ptr + row * mask_stride_b + offs * mask_stride_v,
+                mask=mask, other=0,
+            ).to(tl.int1)
+            vals = _penalize(vals, seen, penalty)
+        out = tl.exp(vals * inv_temp - gmax) * inv_sum
+        if INCLUDE_GREEDY:
+            out = tl.where(is_greedy, tl.where(offs == arg, 1.0, 0.0), out)
+        tl.store(
+            probs_ptr + row * out_stride_b + offs * out_stride_v,
+            out, mask=mask,
+        )
+
+
+# A fixed chunk, rather than one derived from the batch: the block count then
+# scales with B on its own, and every launch has the same iteration count, so
+# there is no batch size at which the split quietly turns into a long serial
+# walk. 16k over a 248k vocab is 16 chunks, i.e. 256 blocks at a decode batch
+# of 16 — enough to fill an H100 twice over.
+_SPLIT_CHUNK = 16384
+_SPLIT_MAX_BLOCK = 8192
+
+
+def _split_count(batch: int, vocab: int, device: torch.device) -> int:
+    """How many chunks to cut the vocab into, or 1 to keep the fused kernel."""
+    del batch, device
+    return max(1, -(-vocab // _SPLIT_CHUNK))
+
+
+def _split_v_softmax(
+    logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
+    apply_penalty, include_greedy, mask_stride_b, mask_stride_v,
+):
+    """The three-kernel path; see the kernels above for why."""
+    B, V = logits.shape
+    chunk = -(-V // nsplit)
+    # Sized to the chunk: a fixed small block turns a long chunk into many
+    # serial iterations, which cost more than the occupancy the split bought.
+    block = min(_SPLIT_MAX_BLOCK, triton.next_power_of_2(chunk))
+    opts = dict(
+        BLOCK_SIZE=block,
+        APPLY_PENALTY=apply_penalty,
+        INCLUDE_GREEDY=include_greedy,
+        num_warps=8,
+        num_stages=2,
+    )
+    f32 = dict(device=logits.device, dtype=torch.float32)
+    cmax = torch.empty((B, nsplit), **f32)
+    csum = torch.empty((B, nsplit), **f32)
+    carg = torch.empty((B, nsplit), device=logits.device, dtype=torch.int32)
+    rmax = torch.empty(B, **f32)
+    rinv = torch.empty(B, **f32)
+    rarg = torch.empty(B, device=logits.device, dtype=torch.int32)
+    with torch.cuda.device(logits.device):
+        _split_partials_kernel[(B, nsplit)](
+            logits, temperature, pen_ptr, mask_ptr, cmax, csum, carg,
+            V, chunk,
+            logits.stride(0), logits.stride(1), mask_stride_b, mask_stride_v,
+            cmax.stride(0), **opts,
+        )
+        _split_combine_kernel[(B,)](
+            cmax, csum, carg, rmax, rinv, rarg,
+            nsplit, cmax.stride(0),
+            BLOCK_N=triton.next_power_of_2(nsplit),
+            INCLUDE_GREEDY=include_greedy,
+            num_warps=4,
+        )
+        _split_write_kernel[(B, nsplit)](
+            logits, temperature, pen_ptr, mask_ptr, rmax, rinv, rarg, probs,
+            V, chunk,
+            logits.stride(0), logits.stride(1),
+            probs.stride(0), probs.stride(1),
+            mask_stride_b, mask_stride_v, **opts,
+        )
+
+
 def fused_temperature_softmax(
     logits: torch.Tensor,       # [B, V]
     temperature: torch.Tensor,  # [B]
@@ -201,6 +419,15 @@ def fused_temperature_softmax(
     mask_ptr = seen_mask if apply_penalty else logits
     mask_stride_b = seen_mask.stride(0) if apply_penalty else 0
     mask_stride_v = seen_mask.stride(1) if apply_penalty else 0
+
+    nsplit = _split_count(B, V, logits.device)
+    if nsplit > 1:
+        _split_v_softmax(
+            logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
+            apply_penalty, include_greedy, mask_stride_b, mask_stride_v,
+        )
+        return probs
+
     grid = (B,)
     with torch.cuda.device(logits.device):
         # BLOCK_SIZE is picked by @triton.autotune (not passed here). The first

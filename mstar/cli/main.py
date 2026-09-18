@@ -40,6 +40,15 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "wan22": "wan22.yaml",
 }
 
+# qwen 3.5 series (dense)
+qwen_3_5_dense_sizes = ("0.8", "2", "4", "9", "27")
+DEFAULT_CONFIGS.update({
+    f"qwen3_5_{size}b": f"qwen3_5_{size}b.yaml" \
+        for size in qwen_3_5_dense_sizes
+})
+# 27B has no single-GPU form
+DEFAULT_CONFIGS["qwen3_5_27b"] = "qwen3_5_27b_tp4.yaml"
+
 
 def _repo_root() -> Path:
     # mstar package lives at <repo>/mstar/ ; configs/ sits at <repo>/configs/.

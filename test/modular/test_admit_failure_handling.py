@@ -255,7 +255,7 @@ def test_per_request_admits_every_rid_before_running_any():
     assert [e for e in engine.events if e[0] != "declare"] == [
         ("admit", "a"), ("admit", "b"), ("run", "a"), ("run", "b"),
     ]
-    assert set(out) == {"a", "b"}
+    assert set(out.per_rid_outputs) == {"a", "b"}
 
 
 def test_per_request_runs_nothing_when_a_later_rid_fails_admit():
@@ -269,7 +269,7 @@ def test_per_request_runs_nothing_when_a_later_rid_fails_admit():
 
     assert ("run", "a") not in engine.events, "a ran despite the batch failing"
     assert not any(kind == "run" for kind, _ in engine.events)
-    assert out == {"a": {}, "b": {}}
+    assert out.per_rid_outputs == {"a": {}, "b": {}}
     assert isinstance(batch.admit_error, AllocationFailed)
 
 
