@@ -140,6 +140,13 @@ class KokoroModelConfig:
     )
     capture_batch_sizes: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16, 32])
     max_batch_frames: int = 16384
+    # How a step's rows are split before the decoder: "bucket" runs one replay
+    # per frame bucket (least padding, more launches), "single" pads every row
+    # to the step's largest bucket (one replay).
+    frame_grouping: str = "bucket"
+    # Precision of the decoder's convolutional trunk and generator. The
+    # harmonic source and the STFT head always run in fp32 (phase-sensitive).
+    decoder_dtype: str = "float32"
 
     # ---------------------------------------------------------------------
     @property
