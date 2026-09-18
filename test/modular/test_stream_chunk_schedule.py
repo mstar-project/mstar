@@ -49,8 +49,10 @@ def _geometry(chunks):
     for chunk in chunks:
         data = chunk.data["data"]
         if data is None:
+            assert chunk.num_items == 0
             continue
         items = data.reshape(-1).tolist()
+        assert chunk.num_items == len(items)
         out.append((len(items), chunk.context_items, chunk.start_offset, items))
     return out
 
@@ -120,7 +122,9 @@ def test_existing_policies_report_context_items(policy, expected):
 
 def test_graph_edge_clone_keeps_stream_chunk_geometry():
     edge = GraphEdge(next_node="Codec", name="codec_tokens", _final_stream_chunk=True,
-                     _stream_chunk_offset=7, _stream_chunk_context=3)
+                     _stream_chunk_offset=7, _stream_chunk_context=3, _stream_chunk_items=12)
     clone = edge.clone()
-    assert (clone._stream_chunk_offset, clone._stream_chunk_context, clone._final_stream_chunk) == (7, 3, True)
-    assert GraphEdge(next_node="x", name="y")._stream_chunk_context is None
+    assert (clone._stream_chunk_offset, clone._stream_chunk_context, clone._stream_chunk_items,
+            clone._final_stream_chunk) == (7, 3, 12, True)
+    plain = GraphEdge(next_node="x", name="y")
+    assert plain._stream_chunk_context is None and plain._stream_chunk_items is None
