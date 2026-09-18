@@ -286,7 +286,10 @@ ragged FlashInfer resource and is CUDA-graph replayable; ``sdpa``: the reference
 kernel, used by the parity suite), ``compile`` (``torch.compile`` of the transformer,
 one trace per shape), ``cuda_graph`` with ``capture_sizes`` / ``capture_batch_sizes``
 (the denoise step, Euler update included, is captured per listed ``[height, width]``
-and batch size; other shapes run the eager batched path), ``max_batch_size``.
+and batch size; other shapes run the eager batched path), ``max_batch_size``, and
+``vae_compile`` (``torch.compile`` of the VAE decode with inductor autotuning: 89 to 29 ms
+at 1024² on an H100; its fused bf16 reductions move the image by about 56 dB PSNR from the
+eager decode, so the parity suite runs with it off).
 Requests at the same output size batch across users in every node, including the
 text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the
 transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or
