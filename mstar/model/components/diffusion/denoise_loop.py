@@ -151,13 +151,26 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         """The bound resource's ``run`` for the ``"main"`` span, or None (SDPA)."""
         return self.ragged_for(MAIN_SPAN)
 
+    def bind_node_resources(self, resources) -> None:
+        super().bind_node_resources(resources)
+        self._ragged_fns: dict[str, Any] = {}
+
     def ragged_for(self, label: str):
         """``(q, k, v) -> out`` over the segments declared under ``label``, or None
-        when no ragged resource is bound (layers then fall back to SDPA)."""
+        when no ragged resource is bound (layers then fall back to SDPA).
+
+        One callable per label for the life of the binding: the compiled transformer
+        region guards on the identity of the callables it is handed, and a fresh
+        partial per step would recompile it every step until dynamo gave up."""
         if self.attn_resource_key is None:
             return None
-        resource = self.node_resources.get(self.attn_resource_key)
-        return None if resource is None else functools.partial(resource.run, label=label)
+        fns = self.__dict__.setdefault("_ragged_fns", {})
+        if label not in fns:
+            resource = self.node_resources.get(self.attn_resource_key)
+            if resource is None:
+                return None
+            fns[label] = functools.partial(resource.run, label=label)
+        return fns[label]
 
     # --------------------------------------------------------- engine contract
     def prepare_inputs(
