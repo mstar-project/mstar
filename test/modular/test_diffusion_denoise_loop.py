@@ -210,4 +210,10 @@ def test_ragged_for_binds_the_label():
     sub.bind_node_resources({"dit_attn": Resource()})
     assert sub.ragged_for("image")(None, None, None) == "image"
     assert sub._ragged()(None, None, None) == "main"
+    # one callable object per label, so a compiled region's identity guards hold across steps
+    assert sub.ragged_for("image") is sub.ragged_for("image") and sub._ragged() is sub._ragged()
+    sub.bind_node_resources({"dit_attn": Resource()})  # a rebinding starts over
+    assert sub.ragged_for("main")(None, None, None) == "main"
     assert ToyDenoise().ragged_for("image") is None  # no resource declared -> SDPA
+    unbound = TwoSpanDenoise(attn_resource_key="dit_attn")
+    assert unbound.ragged_for("image") is None  # declared but not bound yet -> SDPA
