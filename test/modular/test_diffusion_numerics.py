@@ -15,7 +15,7 @@ sys.path.insert(0, ".")
 
 from mstar.model.components.diffusion.flow_match import FlowMatchConfig, FlowMatchSchedule  # noqa: E402
 from mstar.model.components.diffusion.image_io import pixels_to_uint8  # noqa: E402
-from mstar.model.components.diffusion.text_encoder import Qwen3RMSNorm  # noqa: E402
+from mstar.model.components.diffusion.text_encoder import Qwen3RMSNorm, qwen3_rotary_tables  # noqa: E402
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -58,3 +58,19 @@ def test_base_grid_follows_the_pipeline(num_steps):
     torch.testing.assert_close(torch_grid, torch.linspace(1.0, 1 / num_steps, num_steps), rtol=0, atol=0)
     if num_steps in (3, 10, 50):
         assert not torch.equal(numpy_grid, torch_grid), "these step counts are where the two grids differ"
+
+
+@pytest.mark.parametrize("seq,head_dim,theta", [(512, 128, 1_000_000.0), (37, 64, 10_000.0)])
+def test_qwen3_rotary_tables_match_hf(seq, head_dim, theta):
+    hf = pytest.importorskip("transformers.models.qwen3.modeling_qwen3")
+    config = hf.Qwen3Config(
+        hidden_size=head_dim * 2, num_attention_heads=2, num_key_value_heads=2, head_dim=head_dim, rope_theta=theta,
+        max_position_embeddings=max(seq, 4096),
+    )
+    rotary = hf.Qwen3RotaryEmbedding(config)
+    positions = torch.arange(seq)
+    cos_ref, sin_ref = rotary(torch.zeros(1, seq, head_dim), positions[None])
+    cos, sin = qwen3_rotary_tables(positions, head_dim, theta)
+    assert cos.dtype == sin.dtype == torch.float32 and cos.shape == (seq, head_dim)
+    torch.testing.assert_close(cos, cos_ref[0], rtol=0, atol=0)
+    torch.testing.assert_close(sin, sin_ref[0], rtol=0, atol=0)
