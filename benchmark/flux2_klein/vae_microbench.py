@@ -56,6 +56,11 @@ def main() -> None:
     h, w = (s // config.vae.spatial_compression for s in args.size)
     print(f"{args.repo}: decode of [B, {config.vae.latent_channels}, {h}, {w}] latents "
           f"-> {args.size[0]}x{args.size[1]}")
+    # the serving path: one compiled callable, warmed at batch 1 and 2 so the batch dim goes symbolic
+    dynamic = torch.compile(vae.decode, fullgraph=False, dynamic=None, mode="max-autotune-no-cudagraphs")
+    with torch.no_grad():
+        for bs in (1, 2):
+            dynamic(torch.zeros(bs, config.vae.latent_channels, h, w, device=device, dtype=vae.dtype))
     for batch in args.batch:
         latents = torch.randn(batch, config.vae.latent_channels, h, w, device=device, dtype=vae.dtype)
         with torch.no_grad():
@@ -70,6 +75,7 @@ def main() -> None:
             for mode in ("reduce-overhead", "max-autotune-no-cudagraphs"):
                 fn = torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=mode)
                 variants[f"compiled {mode}"] = functools.partial(fn, latents)
+            variants["serving: dynamic batch, warmed at 1 & 2"] = functools.partial(dynamic, latents)
             print(f"== batch {batch}")
             ref_u8 = pixels_to_uint8(reference)
             for name, fn in variants.items():
@@ -79,7 +85,6 @@ def main() -> None:
                 psnr = _psnr(pixels_to_uint8(out), ref_u8)
                 print(f"  {name:36s} {ms:8.2f} ms   max_abs vs eager {diff:.3e}   uint8 PSNR {psnr:6.2f} dB")
             torch.backends.cudnn.benchmark = False
-            torch._dynamo.reset()
         print(f"  peak alloc {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
 
