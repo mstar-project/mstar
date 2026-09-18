@@ -6,8 +6,10 @@ landed on the critical path between the GPU thread taking a batch and reaching
 the forward launch.
 
 What has to hold for staging to be safe: a promoted plan must be the plan the
-step would have made, and an *abandoned* one must leave no trace. The second is
-the sharp edge, because ``plan`` applies pre-forks, which mutate live state.
+step would have made, and an *abandoned* one must leave no trace. Pre-forks are
+the sharp edge on both counts. Their copy writes the state blocks, which the
+in-flight step's kernels are still writing, so staging must not do it on the
+plan stream — but the addressing it stages has to come out as though it had.
 
 CPU-only: nothing calls a kernel, so no device is needed.
 """
@@ -130,48 +132,96 @@ def test_staging_matches_planning_inline():
     )
 
 
-def test_abandoned_stage_rewinds_the_fork():
-    """The sharp edge: pre-forks mutate live state during plan.
+def forking_step(rids: list[str], *, address_target: bool = False) -> RecurrentStep:
+    """A pre-fork of ``main`` onto ``draft``.
 
-    The copy itself is idempotent — it reads a source the staged step never
-    wrote — but ``generation`` is not, and a slot left marked ``has_state``
-    would make the next step resume from a fork that never ran.
+    With ``address_target``, the step also runs on ``draft`` — Bagel's shape
+    for ``cfg_text``, and the case where the fork changes what the step's own
+    addressing says.
     """
+    labels = ("main", "draft") if address_target else ("main",)
+    return RecurrentStep(
+        segments=tuple(
+            Segment(rid, label, 1) for rid in rids for label in labels
+        ),
+        pre_forks=(("main", "draft"),),
+    )
+
+
+def test_staging_leaves_the_fork_alone():
+    """The copy writes blocks the in-flight step is still writing, so staging
+    must not issue it on the plan stream — nor flip the flags that say it
+    happened. An abandoned stage then has nothing to rewind."""
     pool = build_pool()
     rids = ["a"]
-    step = decode_step(rids, pre_forks=(("main", "draft"),))
+    step = forking_step(rids)
     pool.admit(step, ctx(rids))
 
-    # give "main" state to fork from, so the fork actually changes the target
-    main = pool._slots["a"]["main"]
-    main.has_state = True
+    # give "main" state to fork from, so the fork would change the target
+    pool._slots["a"]["main"].has_state = True
+    pool._blocks["state"][:, pool._slots["a"]["main"].index].fill_(1.0)
     before = pool._slots["a"]["draft"]
     was = (before.has_state, before.generation)
 
     pool.plan(step, ctx(rids, is_preplan=True))
-    assert pool._slots["a"]["draft"].has_state is True, "fork should have applied"
+    after = pool._slots["a"]["draft"]
+    assert (after.has_state, after.generation) == was, "staging applied the fork"
+    assert not pool._blocks["state"][:, after.index].any(), "staging copied state"
 
     pool.clear_preplan()
-    after = pool._slots["a"]["draft"]
     assert (after.has_state, after.generation) == was
     assert not pool._preplanned
 
 
-def test_promoted_fork_is_not_rewound():
-    """Promotion keeps the staged fork — only abandonment undoes it."""
+def test_promotion_applies_the_fork_once():
+    """Deferred, not dropped: the copy lands when the real step plans."""
     pool = build_pool()
     rids = ["a"]
-    step = decode_step(rids, pre_forks=(("main", "draft"),))
+    step = forking_step(rids)
     pool.admit(step, ctx(rids))
     pool._slots["a"]["main"].has_state = True
+    pool._blocks["state"][:, pool._slots["a"]["main"].index].fill_(1.0)
+    generation = pool._slots["a"]["draft"].generation
 
     pool.plan(step, ctx(rids, is_preplan=True))
-    generation = pool._slots["a"]["draft"].generation
     pool.plan(step, ctx(rids))
 
     draft = pool._slots["a"]["draft"]
     assert draft.has_state is True
-    assert draft.generation == generation, "promotion must not rewind"
+    assert draft.generation == generation + 1, "the fork should apply exactly once"
+    assert (pool._blocks["state"][:, draft.index] == 1.0).all()
+
+
+def test_staged_addressing_accounts_for_the_pending_fork():
+    """A fork target inherits its source's ``has_state``, and the step may run
+    on that target in the same step. Staging defers the copy but must still
+    address the row the way the inline plan does, or the backend zeroes a state
+    the fork is about to fill."""
+    rids = ["a"]
+    inline, staged = build_pool(), build_pool()
+    for pool in (inline, staged):
+        step = forking_step(rids, address_target=True)
+        pool.admit(step, ctx(rids))
+        pool._slots["a"]["main"].has_state = True
+
+    got_inline = inline.plan(forking_step(rids, address_target=True), ctx(rids))
+    step = forking_step(rids, address_target=True)
+    got_staged = staged.plan(step, ctx(rids, is_preplan=True))
+
+    assert bool(got_inline["draft"].has_state[0]), (
+        "the inline plan must see the fork it just applied"
+    )
+    torch.testing.assert_close(
+        got_staged["draft"].has_state, got_inline["draft"].has_state,
+    )
+    torch.testing.assert_close(
+        got_staged["draft"].slot_indices, got_inline["draft"].slot_indices,
+    )
+    # and promotion keeps it that way
+    promoted = staged.plan(step, ctx(rids))
+    torch.testing.assert_close(
+        promoted["draft"].has_state, got_inline["draft"].has_state,
+    )
 
 
 def test_staging_twice_is_refused():

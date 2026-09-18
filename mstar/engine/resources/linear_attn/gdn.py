@@ -61,6 +61,7 @@ class GDNManager(LinearAttnManager):
         self.state_dtype = state_dtype
         self._device = device
         self._pool_key = config.recurrent_state
+        self._has_sink = has_sink
 
         major = (
             torch.cuda.get_device_capability(device)[0]
@@ -213,6 +214,7 @@ class GDNManager(LinearAttnManager):
                     bs=bs,
                     num_tokens=tok,
                     cuda_graph=lease is not None,
+                    has_sink_state=self._has_sink
                 )
         return store[key]
 

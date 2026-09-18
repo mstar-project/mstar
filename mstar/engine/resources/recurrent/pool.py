@@ -111,10 +111,9 @@ class RecurrentStatePool(Resource):
 
         # Pre-planning. The addressing is host bookkeeping plus two H2D copies,
         # so staging it off the critical path is most of what this resource
-        # costs a step. `(rid, label, has_state, generation)` per staged fork.
+        # costs a step. Forks are not staged; see `_pending_fork_state`.
         self._preplanned = False
         self._cached_plan_output: dict[str, RecurrentAddressing] | None = None
-        self._preplan_fork_undo: list[tuple[str, str, bool, int]] = []
 
         logger.info(
             "recurrent state pool: %d usable slots (+%d sink) x %d layers, "
@@ -240,48 +239,67 @@ class RecurrentStatePool(Resource):
     def supports_preplan(self):
         return True
 
+    def _maybe_apply_forks(self, step: RecurrentStep):
+        for rid in self._fork_rids(step):
+            for from_label, to_label in step.pre_forks:
+                self._apply_fork(rid, from_label, to_label)
+
+    def _pending_fork_state(self, step: RecurrentStep) -> dict[tuple[str, str], bool]:
+        """``has_state`` each pre-fork will hand its target, without applying it.
+
+        Staging cannot apply the fork — the copy would race the default stream
+        — but the addressing it stages has to be the one the step will run
+        with, and a fork target inherits its source's ``has_state``. So the
+        flag is read ahead and the copy still happens at promotion.
+        """
+        pending: dict[tuple[str, str], bool] = {}
+        for rid in self._fork_rids(step):
+            for from_label, to_label in step.pre_forks:
+                src = self._slots.get(rid, {}).get(from_label)
+                if src is not None:
+                    pending[(rid, to_label)] = src.has_state
+        return pending
+
     def plan(self, step: RecurrentStep, ctx: StepContext):
         assert not (self._preplanned and ctx.is_preplan), (
             "recurrent preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
         if self._preplanned:
-            # Promotion: the staged fork stands, so drop its undo record
-            # before clear_preplan would replay it.
+            # Promotion. The staged addressing already reads as though the
+            # fork had happened; this is the copy itself, which staging left
+            # undone. `_pending_fork_state` says why.
             self._current = self._cached_plan_output
-            self._preplan_fork_undo = []
+            self._maybe_apply_forks(step)
             self.clear_preplan()
             return self._current
 
-        undo = self._preplan_fork_undo if ctx.is_preplan else None
-        for rid in self._fork_rids(step):
-            for from_label, to_label in step.pre_forks:
-                self._apply_fork(rid, from_label, to_label, undo=undo)
+        # Both run ahead of the addressing, which records each slot's
+        # `has_state`. Staging only reads the flag the fork will land; running
+        # for real applies it.
+        if ctx.is_preplan:
+            pending = self._pending_fork_state(step)
+        else:
+            pending = {}
+            self._maybe_apply_forks(step)
 
         self._current = {}
         for label, segments in self._group_by_label(step.segments or ()).items():
-            self._current[label] = self._build_addressing(label, segments, ctx)
+            self._current[label] = self._build_addressing(
+                label, segments, ctx, pending,
+            )
         if ctx.is_preplan:
             self._preplanned = True
             self._cached_plan_output = self._current
         return self._current
 
     def clear_preplan(self):
-        """Drop the staged plan, rewinding what it did to live state.
+        """Drop the staged plan.
 
-        Only the flags rewind: ``_apply_fork``'s copy is idempotent — it reads
-        a source the staged step never wrote — so a re-plan redoing it lands
-        the same bytes. ``generation`` is not, hence the undo record.
+        Nothing to rewind: staging builds addressing and touches no live state
+        — forks apply at promotion, not here — so an abandoned stage leaves the
+        pool as it found it.
         """
-        with self._lock:
-            for rid, label, has_state, generation in reversed(
-                self._preplan_fork_undo
-            ):
-                slot = self._slots.get(rid, {}).get(label)
-                if slot is not None:
-                    slot.has_state = has_state
-                    slot.generation = generation
-            self._preplan_fork_undo = []
         self._preplanned = False
         self._cached_plan_output = None
 
@@ -303,16 +321,12 @@ class RecurrentStatePool(Resource):
 
     def _apply_fork(
         self, rid: str, from_label: str, to_label: str,
-        undo: list[tuple[str, str, bool, int]] | None = None,
     ) -> None:
         """Copy one slot onto its fork target.
 
         A real copy, not the KV cache's page aliasing: the state is mutated in
         place, so two labels cannot share it. Fixed-size, which is why this
         needs none of ``KVManager._apply_fork``'s length arithmetic.
-
-        ``undo`` records the target's flags when staging this ahead of the
-        step, so ``clear_preplan`` can rewind an abandoned one.
         """
         with self._lock:
             labels = self._slots.get(rid)
@@ -320,8 +334,6 @@ class RecurrentStatePool(Resource):
                 return
             src = labels[from_label]
             dst = labels.get(to_label)
-            if undo is not None and dst is not None:
-                undo.append((rid, to_label, dst.has_state, dst.generation))
             assert dst is not None, (
                 f"fork target {rid}/{to_label} was never reserved; admit "
                 "should have allocated it"
@@ -342,8 +354,10 @@ class RecurrentStatePool(Resource):
 
     def _build_addressing(
         self, label: str, segments: list[Segment], ctx: StepContext,
+        pending_forks: dict[tuple[str, str], bool] | None = None,
     ) -> RecurrentAddressing:
         pad = self.pad_index
+        pending_forks = pending_forks or {}
         indices = []
         has_state = []
         for seg in segments:
@@ -353,7 +367,9 @@ class RecurrentStatePool(Resource):
                 has_state.append(False)
             else:
                 indices.append(slot.index)
-                has_state.append(slot.has_state)
+                has_state.append(
+                    pending_forks.get((seg.request_id, label), slot.has_state)
+                )
 
         num_rows = len(indices)
         target = self._addressing_buffers(label, ctx, num_rows)

@@ -110,6 +110,7 @@ class GDNPrefillWrapper(GDNWrapper):
         prefill_dtype: torch.dtype = torch.float32,
         num_tokens: int | None=None,
         bs: int | None=None,
+        has_sink_state: bool = True,
         cuda_graph: bool=False
     ):
         super().__init__(
@@ -121,6 +122,7 @@ class GDNPrefillWrapper(GDNWrapper):
             bs=bs,
             cuda_graph=cuda_graph
         )
+        self._has_sink_state = has_sink_state
         # What this arch's chunked kernel reads as its packed state; the
         # manager picks it off the device capability.
         self._prefill_dtype = prefill_dtype
@@ -304,14 +306,35 @@ class GDNPrefillWrapper(GDNWrapper):
         beta = torch.sigmoid(b.float())
 
         slots = self._plan_state.slots.to(torch.int64)
+
+        # _has_sink_state is a static property of the corresponding recurrent
+        # state resource, making this if statement cuda graph-compatible
+        if not self._has_sink_state:
+            # With the pool's sink slot off, a padding row carries -1, which
+            # index_select and index_copy_ cannot take. Point those rows at a live
+            # row's slot instead; the gather is masked off below.
+            live = slots >= 0
+            any_live = live.any()
+            ref = torch.argmax(live.to(torch.uint8)).view(1)
+            ref_slot = torch.index_select(slots, 0, ref).clamp_min(0)
+            addr = torch.where(live, slots, ref_slot)
+            carried = self._plan_state.has_state & live
+        else:
+            addr = slots
+            carried = self._plan_state.has_state
+
         # SM90 takes packed, sequence-ordered state — `state_indices` is
         # SM100/SM103 only — so gather here and scatter back. Once per prefill
         # step rather than per token, and prefill stays eager-cheap.
-        initial = torch.index_select(state, 0, slots).to(self._prefill_dtype)
+        initial = torch.index_select(state, 0, addr).to(self._prefill_dtype)
 
-        # zero the rows that start fresh, by multiply rather than boolean mask:
+        # zero the rows that start fresh, by select rather than boolean mask:
         # `initial[~mask] = 0` is a data-dependent shape and cannot be captured
-        initial.mul_(self._plan_state.has_state.to(initial.dtype).view(-1, 1, 1, 1))
+        initial = torch.where(
+            carried.view(-1, 1, 1, 1),
+            initial,
+            torch.zeros((), dtype=initial.dtype, device=initial.device),
+        )
 
         # Neutralise the bucket's padded tail before it reaches the kernel,
         # so inf values in the tail can't poison the result
@@ -338,7 +361,18 @@ class GDNPrefillWrapper(GDNWrapper):
             # has already normalised q and k
             use_qk_l2norm_in_kernel=False,
         )
-        state.index_copy_(0, slots, final.to(state.dtype))
+
+        if not self._has_sink_state:
+            # What the padding rows write to `ref_slot`: the live row's own result,
+            # or — with no live row in the batch — whatever is already there, so
+            # the write cannot disturb slot 0.
+            padded = torch.where(
+                any_live,
+                torch.index_select(final, 0, ref),
+                torch.index_select(state, 0, ref_slot).to(final.dtype),
+            )
+            final = torch.where(live.view(-1, 1, 1, 1), final, padded)
+        state.index_copy_(0, addr, final.to(state.dtype))
         return out
 
 

@@ -109,8 +109,9 @@ class RopeManager(PositionManager):
         self._preplan_pos_ids: dict[str, torch.Tensor] = {}
         self._preplanned = False
         # (rid, to_label, counter) for each pre-fork applied, so
-        # `clear_preplan` can put the targets back. Mirror to
-        # `KVManager._preplan_fork_undo`
+        # `clear_preplan` can put the targets back. These forks *are* staged,
+        # unlike KV's and the state pool's: a counter is host bookkeeping, so
+        # copying it early races nothing on the default stream.
         self._preplan_fork_undo: list[tuple[str, str, int | None]] = []
 
     def depends_on(self):

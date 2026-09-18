@@ -191,11 +191,12 @@ class RecurrentStateConfig:
     # Not the model author's call: it turns on what the backend's kernels do
     # with an unaddressed row, and they disagree. FlashInfer's fp32 GDN decode
     # skips a -1 row entirely; its bf16 fast path redirects -1 onto slot 0 and
-    # writes there anyway. A sink is correct under both, so it is the default
-    # and the sentinel is opt-in.
+    # writes there anyway; SM90 prefill has no say at all, since it gathers the
+    # state in torch rather than addressing the pool, and masks the sentinel
+    # itself (`GDNPrefillWrapper.run`). A sink is correct under all three, so
+    # it is the default.
     #
-    # TODO: derive this from (backend, dtype, ...) once there is more than one
-    # backend to ask, and drop the knob.
+    # TODO: derive this from (backend, dtype, ...) automatically.
     disable_sink_slot: bool = False
 
     def __post_init__(self):
