@@ -72,12 +72,23 @@ def load_reference(snapshot: str, device: str):
     )
 
 
-def reference_generate(ref, args) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """Greedy reference codes ``[frames, groups]`` and the embeds the Talker saw.
+def reference_clone_prompt(ref, args):
+    """The reference's voice-clone prompt (x-vector + codes) for ``--ref-audio``, or None."""
+    if not args.ref_audio:
+        return None
+    items = ref.create_voice_clone_prompt(
+        ref_audio=args.ref_audio, ref_text=args.ref_text, x_vector_only_mode=args.x_vector_only,
+    )
+    return ref._prompt_items_to_voice_clone_prompt(items), items[0]
+
+
+def reference_generate(ref, args, clone=None) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Greedy reference codes ``[frames, groups]`` and the hidden states behind them.
 
     Uses the low-level ``generate`` of the reference so the prompt layout
-    (speaker, language, instruct, streaming vs non-streaming text) is exactly
-    the reference's own, independent of M*'s ``process_prompt``.
+    (speaker, language, instruct, reference clip, streaming vs non-streaming
+    text) is exactly the reference's own, independent of M*'s
+    ``process_prompt``.
     """
     model = ref.model
     device = model.device
@@ -89,6 +100,13 @@ def reference_generate(ref, args) -> tuple[torch.Tensor, list[torch.Tensor]]:
     non_streaming = model.tts_model_type in ("custom_voice", "voice_design")
     if args.non_streaming_mode is not None:
         non_streaming = args.non_streaming_mode
+    extra = {}
+    if clone is not None:
+        prompt_dict, item = clone
+        extra = {
+            "voice_clone_prompt": prompt_dict,
+            "ref_ids": [ref._tokenize_texts([ref._build_ref_text(item.ref_text)])[0]] if item.ref_text else None,
+        }
     codes_list, hidden_list = model.generate(
         input_ids=input_ids,
         instruct_ids=instruct_ids,
@@ -99,6 +117,7 @@ def reference_generate(ref, args) -> tuple[torch.Tensor, list[torch.Tensor]]:
         do_sample=False,
         subtalker_dosample=False,
         repetition_penalty=args.repetition_penalty,
+        **extra,
     )
     codes = codes_list[0].to(device)
     if codes.shape[0] < args.frames:
@@ -201,6 +220,8 @@ class MStarTalkerDriver:
     def step(self, walk: str, fwd: CurrentForwardPassInfo, inputs: dict, forward):
         """One step; ``forward(engine_inputs, **preprocessed)`` runs the compute."""
         rid = fwd.request_id
+        if walk == "talker_prefill" and ("speaker_embed" in inputs or "ref_codes" in inputs):
+            walk = "talker_prefill_clone"
         fwd.graph_walk = walk
         prepared = self.talker.prepare_inputs(walk, fwd, inputs)
         step = self.talker.declare_step(walk, [rid], [prepared])
@@ -355,6 +376,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--language", default="English")
     parser.add_argument("--instruct", default=None)
     parser.add_argument("--non-streaming-mode", type=lambda s: s.lower() == "true", default=None)
+    parser.add_argument("--ref-audio", default=None, help="Base: reference clip (voice clone)")
+    parser.add_argument("--ref-text", default=None, help="Base: transcript of the reference clip")
+    parser.add_argument("--x-vector-only", action="store_true", help="Base: skip in-context frames")
     parser.add_argument("--frames", type=int, default=64)
     parser.add_argument("--repetition-penalty", type=float, default=1.05)
     parser.add_argument("--device", default="cuda:0")
@@ -383,11 +407,54 @@ def main(argv: list[str] | None = None) -> None:
         request_kwargs["instruct"] = args.instruct
     if args.non_streaming_mode is not None:
         request_kwargs["non_streaming_mode"] = args.non_streaming_mode
-    tensors = model.process_prompt(args.text, ["text"], ["audio"], **request_kwargs)
+    clone = reference_clone_prompt(ref, args)
+    clone_report = None
+    if clone is None:
+        tensors = model.process_prompt(args.text, ["text"], ["audio"], **request_kwargs)
+    else:
+        # Voice clone: M*'s load_audio -> process_prompt -> RefEncoder, compared
+        # with the reference's own x-vector and codec frames for the same clip.
+        clip = model.load_audio(args.ref_audio, args.device)
+        request_kwargs.update({"ref_text": args.ref_text, "x_vector_only_mode": args.x_vector_only})
+        tensors = model.process_prompt(
+            args.text, ["audio", "text"], ["audio"], tensors={"audio_inputs": [clip.data]}, **request_kwargs,
+        )
+        ref_encoder = model.get_submodule("RefEncoder", device=args.device, autocast_dtype=torch.bfloat16)
+        prepared = ref_encoder.prepare_inputs(
+            "talker_prefill_clone", CurrentForwardPassInfo(
+                request_id="clone", graph_walk="talker_prefill_clone", fwd_index=0, random_seed=0, max_tokens=0,
+            ), {"audio_inputs": [clip.data], "prompt_layout": tensors["prompt_layout"]},
+        )
+        with torch.no_grad():
+            encoded = ref_encoder.forward(
+                "talker_prefill_clone", ModelInputsFromEngine(request_ids=["clone"], per_request_info={}),
+                **ref_encoder.preprocess("talker_prefill_clone", None, [prepared]),
+            )
+        tensors["speaker_embed"] = encoded["speaker_embed"]
+        tensors["ref_codes"] = encoded["ref_codes"]
+        _, item = clone
+        their_xvec = item.ref_spk_embedding.to(args.device).float()
+        our_xvec = encoded["speaker_embed"][0].float()
+        clone_report = {
+            "xvector_cosine": float(torch.nn.functional.cosine_similarity(our_xvec, their_xvec, dim=0)),
+            "xvector_max_abs_diff": float((our_xvec - their_xvec).abs().max()),
+            "xvector_scale": float(their_xvec.abs().mean()),
+        }
+        if item.ref_code is not None:
+            their_codes = item.ref_code.to(args.device)
+            our_codes = encoded["ref_codes"][0]
+            n = min(their_codes.shape[0], our_codes.shape[0])
+            clone_report.update({
+                "ref_frames_mstar": int(our_codes.shape[0]),
+                "ref_frames_reference": int(their_codes.shape[0]),
+                "ref_code_agreement": float((our_codes[:n] == their_codes[:n]).float().mean()),
+            })
+        del ref_encoder
+        torch.cuda.empty_cache()
 
     # 1 + 2: teacher forced against the reference's greedy frames. ``ref_hidden``
     # is the hidden state the reference's own generation used for each frame.
-    ref_codes, ref_hidden = reference_generate(ref, args)
+    ref_codes, ref_hidden = reference_generate(ref, args, clone)
     ref_hidden = ref_hidden.to(torch.bfloat16)
     frames = ref_codes.shape[0]
     theirs_logits = ref.model.talker.codec_head(ref_hidden)
@@ -403,6 +470,8 @@ def main(argv: list[str] | None = None) -> None:
     prefill = talker._build_prefill(
         "layout-probe", tensors["text_inputs"][0], tensors["prompt_layout"][0],
         int(tensors["speaker_id"][0]), int(tensors["language_id"][0]),
+        speaker_embed=tensors.get("speaker_embed", [None])[0],
+        ref_codes=tensors.get("ref_codes", [None])[0],
     )
     probe_state = talker.request_state("layout-probe")
     backbone_logits, _ = reference_teacher_forced(
@@ -441,6 +510,7 @@ def main(argv: list[str] | None = None) -> None:
     report = {
         "repo": args.repo, "snapshot": snapshot, "text": args.text, "voice": args.voice,
         "language": args.language, "instruct": args.instruct, "frames": int(ref_codes.shape[0]),
+        "clone": clone_report,
         "talker": talker_report, "talker_hidden": hidden_report, "backbone_only": backbone_report,
         "code_predictor": cp_report,
         "greedy_codes": codes_report, "codec": codec_report, "audio": e2e_audio,
