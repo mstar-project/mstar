@@ -45,7 +45,7 @@ def _fmt_vram(*entries: dict | None) -> str:
 
 def render_table(rows: dict[tuple[str, str], dict], concurrencies: tuple[int, ...] = (4, 8, 16)) -> str:
     """The protocol's markdown table for the image row set."""
-    head = ["System", "model", "size / steps", "B=1 latency median", "p95"]
+    head = ["System", "model", "size / steps", "output", "B=1 latency median", "p95"]
     head += [f"images/s @{c}" for c in concurrencies] + ["peak VRAM", "notes"]
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for (tag, model), parts in sorted(rows.items()):
@@ -59,7 +59,8 @@ def render_table(rows: dict[tuple[str, str], dict], concurrencies: tuple[int, ..
         if thr and by_c:
             first = next(iter(by_c.values()))
             notes.append(f"{first.get('images', '?')} images x {first.get('repeats', 1)} repeats per level")
-        cells = [tag, model, size, _fmt_s(lat and lat["median_s"]), _fmt_s(lat and lat["p95_s"])]
+        output = any_part.get("output_format") or "server default"
+        cells = [tag, model, size, output, _fmt_s(lat and lat["median_s"]), _fmt_s(lat and lat["p95_s"])]
         cells += [_fmt_rate(by_c.get(str(c))) for c in concurrencies]
         cells += [_fmt_vram(lat, *by_c.values()), "; ".join(notes)]
         lines.append("| " + " | ".join(cells) + " |")

@@ -33,9 +33,9 @@ def test_table_groups_latency_and_throughput_by_system(tmp_path):
         files.append(path)
     table = render_table(load_results(files))
     lines = table.splitlines()
-    assert lines[0].startswith("| System | model | size / steps | B=1 latency median | p95 | images/s @4")
+    assert lines[0].startswith("| System | model | size / steps | output | B=1 latency median | p95 | images/s @4")
     mstar_row = next(line for line in lines if line.startswith("| mstar |"))
-    assert "0.400 s | 0.450 s | 5.00 (4.90-5.10) | 6.00 (5.90-6.10) | 6.50 (6.40-6.60) | 29.3 GiB" in mstar_row
+    assert "server default | 0.400 s | 0.450 s | 5.00 (4.90-5.10) | 6.00 (5.90-6.10) | 6.50 (6.40-6.60) | 29.3 GiB" in mstar_row
     assert "n=20; 32 images x 3 repeats per level" in mstar_row
     sglang_row = next(line for line in lines if line.startswith("| sglang |"))
     assert "| n/a | n/a | n/a | 24.4 GiB |" in sglang_row  # no throughput file: nothing invented
