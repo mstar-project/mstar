@@ -1165,12 +1165,14 @@ class RefEncoderSubmodule(NodeSubmodule):
     Runs once per request, before the clone prefill, and owns no resources.
     The x-vector comes from the ECAPA-TDNN encoder over a log-mel spectrogram
     of the 24 kHz clip; for in-context cloning the codec encoder also turns
-    the clip into ``ref_frames`` 16-group frames. The mel front end and the
-    codec encoder run in float32 regardless of the engine's autocast dtype;
-    the x-vector is produced in the encoder's own (Talker) dtype.
+    the clip into ``ref_frames`` 16-group frames. The node keeps the dtypes it
+    was built with (``disable_autocast``): the mel front end and the codec
+    encoder stay in float32, the speaker encoder runs in the Talker's dtype
+    as the reference does.
     """
 
     disable_torch_compile = True
+    disable_autocast = True
 
     def __init__(
         self,
