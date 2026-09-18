@@ -14,7 +14,8 @@
 # file name resolved by every system, default Abigail.wav), VOICES_DIR (the
 # preset directory, default the TTS server's), WS (workspace with the baseline
 # venvs), NUM (requests, default 200). For M* variants: EXTRA_MODEL_KWARGS
-# (extra indented "  key: value" model_kwargs lines) and RUN_TAG (run name suffix).
+# (extra indented "  key: value" model_kwargs lines) and RUN_TAG (run name suffix, also
+# used by the vllm case); VLLM_EXTRA_ARGS adds flags to bench_chatterbox_vllm.py.
 set -euo pipefail
 
 WS=${WS:-$(cd "$(dirname "$0")/../../.." && pwd)}
@@ -121,7 +122,7 @@ case ${1:-} in
     runner "http://127.0.0.1:$port" "$c" "$out"
     ;;
   vllm)
-    b=$2 out=$RESULTS/chatterbox_vllm_c$b
+    b=$2 out=$RESULTS/chatterbox_vllm${RUN_TAG:+_$RUN_TAG}_c$b
     mkdir -p "$out/t3-model"
     # run from the results dir: the port symlinks its T3 weights into ./t3-model, next to
     # the vLLM model config files it ships in its repo
@@ -130,7 +131,8 @@ case ${1:-} in
     # spawned engine-core process never sees: run the engine core in-process
     ( cd "$out" && HF_HUB_OFFLINE=1 VLLM_ENABLE_V1_MULTIPROCESSING=0 "$WS/baselines/chatterbox-vllm/.venv/bin/python" \
         "$MSTAR/benchmark/chatterbox/bench_chatterbox_vllm.py" --sentences "$SENTENCES" --num "$NUM" \
-        --warmup "$WARMUP" --batch "$b" --out "$out" --audio-prompt "$VOICES_DIR/$VOICE" ) 2>&1 | tee "$out.log"
+        --warmup "$WARMUP" --batch "$b" --out "$out" --audio-prompt "$VOICES_DIR/$VOICE" \
+        ${VLLM_EXTRA_ARGS:-} ) 2>&1 | tee "$out.log"
     wer "$out" "$out/wer.json"
     ;;
   wer) wer "$2" ;;
