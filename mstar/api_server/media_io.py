@@ -173,6 +173,48 @@ def resolve_media_ref(ref: str, upload_dir: Path, *, allow_remote: bool = False)
 # Outbound: wrap raw model output for client surfaces
 # ---------------------------------------------------------------------------
 
+def decode_audio(path: str, sample_rate: int = 16000):
+    """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``.
+
+    libsndfile (``soundfile``) first — no FFmpeg needed for wav/flac/ogg/mp3 —
+    then torchcodec for the rest (m4a, webm, ...).
+    """
+    try:
+        import soundfile as sf
+
+        audio, sr = sf.read(path, dtype="float32", always_2d=True)
+        audio = audio.mean(axis=1)
+    except Exception:  # noqa: BLE001 — not a libsndfile container
+        from torchcodec.decoders import AudioDecoder
+
+        frames = AudioDecoder(path, sample_rate=sample_rate, num_channels=1).get_all_samples()
+        return frames.data[0].numpy().astype(np.float32)
+    if sr != sample_rate:
+        try:
+            import torch
+            import torchaudio
+
+            audio = torchaudio.functional.resample(torch.from_numpy(audio), sr, sample_rate).numpy()
+        except ImportError:
+            idx = np.linspace(0, len(audio) - 1, int(round(len(audio) * sample_rate / sr)))
+            audio = np.interp(idx, np.arange(len(audio)), audio).astype(np.float32)
+    return audio
+
+
+def split_windows(audio, window_seconds: float, sample_rate: int = 16000) -> list:
+    """Cut a waveform into consecutive windows of ``window_seconds`` (the last
+    one shorter); concatenating them gives the input back sample for sample."""
+    step = int(round(window_seconds * sample_rate))
+    return [audio[i:i + step] for i in range(0, len(audio), step)]
+
+
+def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
+    """Float waveform -> 16-bit PCM WAV file at ``path``."""
+    pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0) * 32767).astype("<i2").tobytes()
+    Path(path).write_bytes(pcm16_to_wav_bytes(pcm, sample_rate))
+    return path
+
+
 def pcm16_to_wav_bytes(pcm: bytes, sample_rate: int, num_channels: int = 1) -> bytes:
     """Wrap raw little-endian 16-bit PCM (the model's audio output) into a WAV blob."""
     buf = io.BytesIO()
