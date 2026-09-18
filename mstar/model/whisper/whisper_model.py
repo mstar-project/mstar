@@ -280,7 +280,7 @@ class WhisperModel(Model):
             return Sequential([
                 GraphNode(
                     name=ENCODER_NODE,
-                    input_names=["audio_features"],
+                    input_names=["audio"],
                     outputs=[GraphEdge(next_node=DECODER_NODE, name="encoder_states")],
                 ),
                 GraphNode(
@@ -359,7 +359,7 @@ class WhisperModel(Model):
             kwargs={"prompt_tail": prompt_tail},
         )
         inputs = [
-            self._edge(ENCODER_NODE, "audio_features", input_signals.get("audio_features", [])),
+            self._edge(ENCODER_NODE, "audio", input_signals.get("audio", [])),
             self._edge(DECODER_NODE, "text_inputs", input_signals.get("text_inputs", [])),
         ]
         return ForwardPassArgs(
@@ -466,9 +466,11 @@ class WhisperModel(Model):
             raise ValueError("Whisper received an empty audio input.")
 
         # One fixed 30 s window: audio beyond it is dropped (long-form
-        # chunking is the transcription route's job).
-        window = self.log_mel.pad_or_trim(waveform)
-        audio_features = self.log_mel(window)  # (num_mel_bins, 3000)
+        # chunking is the transcription route's job). The samples go to the
+        # encoder as they are; the log-mel is its first step on the GPU. (On
+        # the data worker's CPU threads the spectrogram was the serving
+        # bottleneck: torch's intra-op pool spun a whole core per thread.)
+        window = waveform[: self.config.n_samples].contiguous()
 
         language = kwargs.get("language")
         task = kwargs.get("task", "transcribe")
@@ -479,7 +481,7 @@ class WhisperModel(Model):
         )
 
         out: NameToTensorList = {
-            "audio_features": [audio_features],
+            "audio": [window],
             "text_inputs": [torch.tensor(prompt_ids, dtype=torch.long)],
         }
         if language is None:
