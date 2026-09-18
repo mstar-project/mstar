@@ -140,3 +140,24 @@ def test_ramp_policy_chunk_sizes():
     assert sizes == [2, 3, 3, 1]
     with pytest.raises(ValueError):
         RampChunkPolicy(first_chunk=0, chunk_size=3)
+
+
+def test_ramp_policy_geometric_growth_is_capped():
+    """first 2, then 3, 6, 12 (growth 2) capped at 10 -> 2, 3, 6, 10, 10 ..."""
+    policy = RampChunkPolicy(first_chunk=2, chunk_size=3, growth=2.0, max_chunk=10)
+    sizes = []
+    for buffered in (2, 3, 6, 10, 10, 10):
+        assert not policy.is_ready(buffered - 1)
+        assert policy.is_ready(buffered)
+        sizes.append(policy.next_chunk_size(buffered))
+        policy.register_chunk(buffered)
+    assert sizes == [2, 3, 6, 10, 10, 10]
+    # growth 1 (the default) keeps the fixed chunk of the original policy
+    fixed = RampChunkPolicy(first_chunk=2, chunk_size=3)
+    fixed.register_chunk(2)
+    fixed.register_chunk(3)
+    assert fixed.next_chunk_size(3) == 3
+    with pytest.raises(ValueError):
+        RampChunkPolicy(first_chunk=2, chunk_size=3, growth=0.5)
+    with pytest.raises(ValueError):
+        RampChunkPolicy(first_chunk=2, chunk_size=3, max_chunk=2)
