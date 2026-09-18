@@ -174,8 +174,10 @@ Chatterbox notes
 - Sampling follows the reference order inside the sampler resource:
   repetition penalty -> temperature -> ``min_p`` -> ``top_p``; the T3 node
   declares ``enable_min_p`` on its ``SamplerSpec`` (see
-  :doc:`adding_models`). ``model_kwargs: t3_dtype: float32`` runs the
-  transformer in float32 for token-level parity checks (bf16 by default).
+  :doc:`adding_models`). T3 runs in bf16 (``model_kwargs: t3_dtype:
+  float16`` is the alternative; float32 is refused because the paged
+  attention has no float32 kernels, and fp32 token parity is checked by the
+  CPU tests in ``test/chatterbox``).
 - Reference clips are decoded with ``soundfile`` (WAV/FLAC/OGG/MP3 through
   the bundled libsndfile); other codecs fall back to ``torchcodec``, which
   needs FFmpeg's shared libraries on the node.
