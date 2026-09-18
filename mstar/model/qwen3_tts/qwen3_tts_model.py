@@ -770,11 +770,22 @@ class Qwen3TTSModel(Model):
             )
             return ForwardPassArgs(
                 full_metadata=metadata,
-                inputs=[],
+                # The clone walk needs the reference frame count next to the
+                # stream from its very first chunk; the API tensor stays
+                # persisted so every later re-arm can read it again.
+                inputs=self._codec_ref_frames_edges(input_signals) if clone else [],
                 unpersist_tensors=[],
                 request_done="audio" not in output_modalities,
             )
         raise ValueError(f"Unknown Qwen3-TTS partition: {partition_name!r}")
+
+    @staticmethod
+    def _codec_ref_frames_edges(
+        signals: dict[str, list[TensorPointerInfo]],
+    ) -> list[GraphEdge]:
+        edge = GraphEdge(next_node="Codec", name="ref_frames")
+        edge.tensor_info = signals.get("ref_frames", [])
+        return [edge]
 
     def get_partition_forward_pass_args(
         self,
@@ -820,9 +831,7 @@ class Qwen3TTSModel(Model):
             if partition_metadata.graph_walk == "codec_chunk_clone":
                 # The reference frame count is an API tensor; every codec
                 # invocation of a clone request re-reads it (cheap, one int).
-                edge = GraphEdge(next_node="Codec", name="ref_frames")
-                edge.tensor_info = persist_signals.get("ref_frames", [])
-                inputs.append(edge)
+                inputs = self._codec_ref_frames_edges(persist_signals)
             else:
                 partition_metadata.graph_walk = "codec_chunk"
             return ForwardPassArgs(
