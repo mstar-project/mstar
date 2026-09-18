@@ -187,6 +187,8 @@ async def run(args) -> dict:
                 "wall_s": wall,
                 "audio_s": sum(u.duration for u in items),
             }
+            # the transcripts of the last session count, for a diff against the references
+            record["hypotheses"] = {res["uid"]: res["text"] for res in results}
             r = record["sessions"][str(n_sessions)]
             wer_pct = 100 * wer if wer is not None else float("nan")
             print(f"[sessions={n_sessions:>3}] partial p50 {r['partial_p50_ms']:7.0f} ms  "
