@@ -374,6 +374,25 @@ def make_model(voices_dir, chunks=None) -> KokoroModel:
     return model
 
 
+def test_deployment_overrides_reach_the_config(voices_dir, tmp_path, monkeypatch):
+    import json
+
+    from mstar.model.kokoro import kokoro_model as km
+
+    (tmp_path / "config.json").write_text(json.dumps({"vocab": VOCAB, "n_token": len(VOCAB) + 1}))
+    (tmp_path / "voices").mkdir()
+    for name in ("af_heart", "bf_alice"):
+        torch.save(torch.randn(510, 1, 256), tmp_path / "voices" / f"{name}.pt")
+    monkeypatch.setattr(km, "_resolve_snapshot", lambda repo, cache, patterns: str(tmp_path))
+    model = KokoroModel(
+        str(tmp_path), lang_code="b", frame_buckets=[64, 128], max_batch_frames=512, default_voice="bf_alice"
+    )
+    assert model.config.frame_buckets == [64, 128] and model.config.max_batch_frames == 512
+    assert model.get_default_voice() == "bf_alice" and model.default_lang == "b"
+    with pytest.raises(ValueError, match="Unknown Kokoro option"):
+        KokoroModel(str(tmp_path), hidden_dim=3)
+
+
 def test_registry_and_config(voices_dir):
     assert get_model_class("kokoro") is KokoroModel
     assert HF_MODELS["kokoro"]["model_path_hf"] == "hexgrad/Kokoro-82M"
