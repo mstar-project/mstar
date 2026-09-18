@@ -47,6 +47,9 @@ def main() -> None:
     ap.add_argument("--batch", type=int, nargs="+", default=[1, 4])
     ap.add_argument("--size", type=int, nargs=2, default=[1024, 1024], metavar=("H", "W"))
     ap.add_argument("--repeats", type=int, default=10)
+    ap.add_argument("--warm", type=int, nargs="+", default=[1, 2],
+                    help="batch sizes (in order) the serving-path callable is warmed with before timing")
+    ap.add_argument("--serving-only", action="store_true", help="time only the serving-path callable")
     args = ap.parse_args()
 
     device = torch.device("cuda")
@@ -59,23 +62,24 @@ def main() -> None:
     # the serving path: one compiled callable, warmed at batch 1 and 2 so the batch dim goes symbolic
     dynamic = torch.compile(vae.decode, fullgraph=False, dynamic=None, mode="max-autotune-no-cudagraphs")
     with torch.no_grad():
-        for bs in (1, 2):
+        for bs in args.warm:
             dynamic(torch.zeros(bs, config.vae.latent_channels, h, w, device=device, dtype=vae.dtype))
     for batch in args.batch:
         latents = torch.randn(batch, config.vae.latent_channels, h, w, device=device, dtype=vae.dtype)
         with torch.no_grad():
             reference = vae.decode(latents)
-            variants = {"eager": functools.partial(vae.decode, latents)}
-            cl_latents = latents.to(memory_format=torch.channels_last)
-            variants["channels_last input"] = functools.partial(vae.decode, cl_latents)
-            torch.backends.cudnn.benchmark = True
-            variants["eager + cudnn.benchmark"] = functools.partial(vae.decode, latents)
-            compiled = torch.compile(vae.decode, fullgraph=False, dynamic=False)
-            variants["compiled + cudnn.benchmark"] = functools.partial(compiled, latents)
-            for mode in ("reduce-overhead", "max-autotune-no-cudagraphs"):
-                fn = torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=mode)
-                variants[f"compiled {mode}"] = functools.partial(fn, latents)
-            variants["serving: dynamic batch, warmed at 1 & 2"] = functools.partial(dynamic, latents)
+            variants = {} if args.serving_only else {"eager": functools.partial(vae.decode, latents)}
+            if not args.serving_only:
+                cl_latents = latents.to(memory_format=torch.channels_last)
+                variants["channels_last input"] = functools.partial(vae.decode, cl_latents)
+                torch.backends.cudnn.benchmark = True
+                variants["eager + cudnn.benchmark"] = functools.partial(vae.decode, latents)
+                compiled = torch.compile(vae.decode, fullgraph=False, dynamic=False)
+                variants["compiled + cudnn.benchmark"] = functools.partial(compiled, latents)
+                for mode in ("reduce-overhead", "max-autotune-no-cudagraphs"):
+                    fn = torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=mode)
+                    variants[f"compiled {mode}"] = functools.partial(fn, latents)
+            variants[f"serving: dynamic batch, warmed at {args.warm}"] = functools.partial(dynamic, latents)
             print(f"== batch {batch}")
             ref_u8 = pixels_to_uint8(reference)
             for name, fn in variants.items():
