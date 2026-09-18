@@ -115,6 +115,7 @@ class ChatterboxModel(Model):
         watermark: bool | None = None,
         stream_chunk_tokens: int | None = None,
         stream_first_chunk_tokens: int | None = None,
+        stream_context_tokens: int | None = None,
         t3_dtype: str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -143,6 +144,8 @@ class ChatterboxModel(Model):
             self.config.stream_chunk_tokens = int(stream_chunk_tokens)
         if stream_first_chunk_tokens is not None:
             self.config.stream_first_chunk_tokens = int(stream_first_chunk_tokens)
+        if stream_context_tokens is not None:
+            self.config.stream_context_tokens = int(stream_context_tokens)
         self.voices_dir = Path(voices_dir) if voices_dir else None
         self.local_dir = resolve_snapshot(model_path_hf, cache_dir)
         self.tokenizer = self._build_text_tokenizer()
