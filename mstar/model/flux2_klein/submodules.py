@@ -272,6 +272,15 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
 # vae_decoder
 # ---------------------------------------------------------------------------
 
+VAE_COMPILE_MODE = "max-autotune-no-cudagraphs"
+
+
+def compile_vae_decode(vae: nn.Module):
+    """``vae.decode`` compiled per shape with inductor autotuning (no cudagraphs: the engine's
+    runner owns capture). Compilation happens on the first decode of each (batch, grid)."""
+    return torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=VAE_COMPILE_MODE)
+
+
 class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
     """Final packed tokens ``[L, 128]`` per request -> uint8 images ``[B, 3, H, W]``.
 
@@ -284,11 +293,17 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
     disable_torch_compile = True
     output_key = IMAGE_OUTPUT
 
-    def __init__(self, vae: nn.Module, config: Flux2KleinConfig, max_batch_size: int = 8):
+    def __init__(
+        self, vae: nn.Module, config: Flux2KleinConfig, max_batch_size: int = 8, compile_decode: bool = False,
+    ):
         super().__init__()
         self.vae = vae
         self.config = config
         self._max_batch_size = max_batch_size
+        # torch.compile (max-autotune, no cudagraphs) takes the 1024^2 decode from 89 to 29 ms on an
+        # H100; its fused bf16 reductions move the image by <= 5.6e-2 in [-1, 1] (~56 dB), so it is a
+        # deployment knob and stays off for the bit-exact parity path.
+        self._decode = compile_vae_decode(vae) if compile_decode else vae.decode
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         grid = self.config.latent_grid(int(fwd_info.step_metadata["height"]), int(fwd_info.step_metadata["width"]))
@@ -309,5 +324,5 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
     def forward(self, graph_walk, engine_inputs, latents: torch.Tensor, grid: tuple[int, int], **kwargs):
         latents = latents.to(device=self.get_device(), dtype=self.vae.dtype)
         patched = self.vae.denormalize_latents(unpack_latents(latents, *grid))
-        image = self.vae.decode(unpatchify_latents(patched))
+        image = self._decode(unpatchify_latents(patched))
         return {IMAGE_OUTPUT: [pixels_to_uint8(image)]}
