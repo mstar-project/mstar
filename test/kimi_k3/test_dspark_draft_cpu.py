@@ -118,3 +118,19 @@ def test_block_ids_and_markov_sampling():
     bias_of = lambda prev: torch.zeros(50).index_fill_(0, torch.tensor([(prev + 1) % 50]), 10.0)  # noqa: E731
     draft.markov_head.bias = lambda prev: torch.stack([bias_of(int(p)) for p in prev])  # type: ignore[method-assign]
     assert draft.markov_sample(torch.zeros(1, K, 50), torch.tensor([3])).tolist() == [[4, 5, 6]]
+
+
+def test_context_accumulator_matches_combine():
+    """The prefill's one-layer-at-a-time context projection equals ``combine`` of the concatenated aux states."""
+    torch.manual_seed(2)
+    draft = DSparkDraft(CFG, nn.Embedding(50, 32), nn.Linear(32, 50, bias=False), max_positions=16)
+    for name, p in draft.named_parameters():
+        p.data = torch.ones_like(p) if name.endswith("norm.weight") else torch.randn_like(p) * 0.2
+    aux = [torch.randn(6, CFG.target_hidden_size) for _ in CFG.target_layer_ids]
+    context = draft.context_accumulator()
+    for j, state in enumerate(aux):
+        context(j, state)
+    got = context.finish()
+    want = draft.combine(torch.cat(aux, dim=-1))
+    assert got.shape == want.shape == (6, CFG.hidden_size)
+    assert torch.allclose(got, want, atol=1e-5, rtol=1e-5), (got - want).abs().max()
