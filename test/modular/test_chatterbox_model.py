@@ -396,6 +396,13 @@ def test_t3_dtype_switch():
     assert _parse_dtype("float32") == torch.float32 and _parse_dtype("bf16") == torch.bfloat16
     with pytest.raises(ValueError, match="t3_dtype"):
         _parse_dtype("int8")
+    # float32 would size the KV cache and plan the paged attention in fp32,
+    # which FlashInfer cannot run: refused up front with a clear message
+    with pytest.raises(ValueError, match="cannot be served"):
+        ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", t3_dtype="float32")
+    assert ChatterboxModel(
+        model_path_hf="ResembleAI/chatterbox", variant="chatterbox", t3_dtype="float16",
+    ).get_autocast_dtype() == torch.float16
 
 
 def test_postprocess_encodes_pcm16():
