@@ -163,21 +163,21 @@ Chatterbox notes
   is installed; ``watermark: false`` per request or in ``model_kwargs`` turns it
   off, and a deployment without the package logs that outputs are unmarked.
 - Streaming (``stream: true``) emits WAV chunks as the speech tokens arrive:
-  the first after 15 tokens, then every 25 (``model_kwargs:
-  stream_first_chunk_tokens`` / ``stream_chunk_tokens``); ``stream_chunk_growth``
-  (default 1.0) lets later chunks grow geometrically up to
-  ``stream_max_chunk_tokens``, so a stream costs fewer, larger flow solves
-  while playback stays ahead. Each chunk re-runs
+  the first after 15 tokens (about 0.23 s on an H100), then 50, 100 and 200
+  tokens (``model_kwargs: stream_first_chunk_tokens`` / ``stream_chunk_tokens``
+  / ``stream_chunk_growth`` / ``stream_max_chunk_tokens``): each chunk buys
+  the playback time to produce a bigger one, so a stream costs three or four
+  flow solves instead of one per 25 tokens. Each chunk re-runs
   the flow decoder over all tokens so far with a fixed noise field, holds back
   the three look-ahead tokens and crossfades the vocoder tail, so the stream
   is continuous but not sample-identical to the whole-utterance decode;
   ``stream_chunk_tokens: 0`` synthesises whole utterances (the reference
   path, bit-exact with the package at a fixed seed). ``stream_context_tokens``
-  (default 0 = whole history) bounds how many settled tokens a chunk's flow
-  solve keeps as left context, making the per-chunk cost constant; a window
-  of 20-25 tokens stays as close to the whole-utterance decode as the full
-  history does (log-mel correlation 0.988 vs 0.985 on CPU). Requests whose
-  chunks are ready together share one padded flow solve (up to 8 per step).
+  (default 25; 0 = whole history) bounds how many settled tokens a chunk's
+  flow solve keeps as left context, making the per-chunk cost constant; the
+  window stays as close to the whole-utterance decode as the full history
+  does (log-mel correlation 0.988 vs 0.985 on CPU). Requests whose chunks
+  are ready together share one padded flow solve (up to 8 per step).
 - Sampling follows the reference order inside the sampler resource:
   repetition penalty -> temperature -> ``min_p`` -> ``top_p``; the T3 node
   declares ``enable_min_p`` on its ``SamplerSpec`` (see
