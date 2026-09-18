@@ -118,6 +118,12 @@ Qwen3-TTS notes
   ``code_predictor`` aux sampler, so custom values neither block batching nor
   fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
   Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
+- ``configs/qwen3tts_1p7b_split.yaml`` runs the Codec on a second worker that
+  shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.
+  On its own it lowers first-audio latency at high concurrency; with a
+  user-level CUDA MPS daemon (``nvidia-cuda-mps-control -d`` before
+  ``mstar serve``) the two workers' kernels also overlap, which raised c=32
+  throughput by about a fifth on an H100.
 - The codec decoder runs in float32 by default, reproducing the reference
   decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
   deployment YAML halves its GPU time when throughput matters more than
