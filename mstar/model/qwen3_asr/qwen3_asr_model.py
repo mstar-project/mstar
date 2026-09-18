@@ -194,7 +194,7 @@ class Qwen3ASRModel(Model):
         prefill = Sequential([
             GraphNode(
                 name=ENCODER_NODE,
-                input_names=["audio_features"],
+                input_names=["audio"],
                 outputs=[GraphEdge(next_node=LLM_NODE, name="audio_embeds")],
             ),
             GraphNode(
@@ -244,7 +244,7 @@ class Qwen3ASRModel(Model):
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
         inputs = [
-            self._edge(ENCODER_NODE, "audio_features", input_signals.get("audio_features", [])),
+            self._edge(ENCODER_NODE, "audio", input_signals.get("audio", [])),
             self._edge(LLM_NODE, "text_inputs", input_signals.get("text_inputs", [])),
         ]
         return ForwardPassArgs(
@@ -359,8 +359,11 @@ class Qwen3ASRModel(Model):
         if waveform.numel() < min_samples:
             waveform = torch.nn.functional.pad(waveform, (0, min_samples - waveform.numel()))
 
-        audio_features = self.log_mel(waveform)  # (num_mel_bins, T)
-        num_audio_tokens = self.config.audio.tokens_for_frames(audio_features.shape[-1])
+        # The samples go to the encoder as they are; the log-mel is its first
+        # step on the GPU (spectrograms on the data worker's CPU threads were
+        # the serving bottleneck). The prompt only needs the frame count.
+        num_frames = self.log_mel.num_frames(waveform.numel())
+        num_audio_tokens = self.config.audio.tokens_for_frames(num_frames)
         context = kwargs.get("initial_prompt") or prompt or ""
         language = self.config.language_name(kwargs.get("language"))
         ids = self.prompt_ids(
@@ -368,7 +371,7 @@ class Qwen3ASRModel(Model):
             assistant_prefix=kwargs.get("assistant_prefix") or "",
         )
         return {
-            "audio_features": [audio_features],
+            "audio": [waveform.contiguous()],
             "text_inputs": [torch.tensor(ids, dtype=torch.long)],
         }
 
