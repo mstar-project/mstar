@@ -885,3 +885,22 @@ def test_s3gen_node_advertises_its_batch_size_to_the_scheduler():
     sub, _ = _s3_submodule()
     assert sub.max_batch_size("s3gen_chunk") == sub.MAX_BATCH_SIZE == 8
     assert sub.max_batch_size("s3gen_chunk_voice") == 8
+
+
+def test_chunk_policy_growth_knobs_reach_the_ramp():
+    model = ChatterboxModel(
+        model_path_hf="ResembleAI/chatterbox", variant="chatterbox",
+        stream_chunk_growth=2.0, stream_max_chunk_tokens=100,
+    )
+    policy = model._chunk_policy()
+    sizes = []
+    for buffered in (15, 25, 50, 100, 100):
+        assert policy.is_ready(buffered)
+        sizes.append(policy.next_chunk_size(buffered))
+        policy.register_chunk(buffered)
+    assert sizes == [15, 25, 50, 100, 100]
+    # the default keeps fixed 25-token chunks after the first
+    fixed = _make_model()._chunk_policy()
+    fixed.register_chunk(15)
+    fixed.register_chunk(25)
+    assert fixed.next_chunk_size(25) == 25
