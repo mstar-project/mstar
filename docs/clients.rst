@@ -164,10 +164,10 @@ Endpoints and model coverage:
      - ``bagel``, ``qwen3_omni``
      - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.
    * - ``POST /v1/audio/speech``
-     - ``orpheus``, ``qwen3_omni``
-     - Text-to-speech.
+     - ``kokoro``, ``orpheus``, ``qwen3_omni``
+     - Text-to-speech (``kokoro`` streams sentence by sentence with ``stream=True``).
    * - ``GET /v1/audio/voices``
-     - speech models with a fixed voice list (``orpheus``, ``qwen3_tts``)
+     - speech models with a fixed voice list (``kokoro``, ``orpheus``, ``qwen3_tts``)
      - The ``voice`` ids the served model accepts, plus its default.
    * - ``POST /v1/images/generations``
      - ``bagel``
@@ -201,6 +201,10 @@ Per-model notes:
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
   Non-OpenAI knobs (e.g. ``talker_top_k``, ``code_predictor_top_p``) go through
   ``extra_body``.
+- **Kokoro** — ``voice`` is one of the 54 bundled voices (default ``af_heart``) or a
+  blend such as ``af_bella+af_sky`` or ``af_bella(2)+af_sky(1)``; ``speed`` scales the
+  speaking rate (0.25-4.0). ``lang_code`` and ``phonemes`` go through ``extra_body``.
+  ``temperature`` / ``top_p`` are ignored: Kokoro does not sample.
 - **Orpheus** — set the speaker with ``voice`` — one of ``tara`` (default), ``zoe``,
   ``zac``, ``jess``, ``leo``, ``mia``, ``julia``, ``leah`` (the ``available_voices`` list
   in the Orpheus config).
