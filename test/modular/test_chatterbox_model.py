@@ -841,3 +841,28 @@ def test_materialize_refuses_modules_with_computed_buffers():
     with pytest.raises(ValueError, match="window"):
         materialize(bad, "cpu", torch.float32)
     assert materialize(good, "cpu", torch.float32).weight.device.type == "cpu"
+
+
+def test_s3gen_context_window_bounds_the_solve_and_keeps_the_frame_bookkeeping():
+    """With ``stream_context_tokens`` the flow sees only the prompt plus the
+    last settled tokens, but the emitted audio must be the same as the full
+    history run (the fake decoder's mel depends on nothing but the token ids,
+    so any bookkeeping slip shows up as different or missing frames)."""
+    full, fake_full = _s3_submodule()
+    windowed, fake_win = _s3_submodule()
+    windowed.context_tokens = 10
+    chunks = [torch.arange(1, 21), torch.arange(21, 41), torch.arange(41, 61), torch.tensor([61, 62])]
+    finals = [False, False, False, True]
+
+    out_full = [_run(full, c, is_final=f)[1] for c, f in zip(chunks, finals, strict=True)]
+    out_win = [_run(windowed, c, is_final=f)[1] for c, f in zip(chunks, finals, strict=True)]
+
+    for a, b in zip(out_full, out_win, strict=True):
+        assert torch.equal(a, b)
+    full_lens = [c[1][1] for c in fake_full.calls if c[0] == "mel"]
+    win_lens = [c[1][1] for c in fake_win.calls if c[0] == "mel"]
+    # chunk 1 settles 17 tokens (20 - 3 look-ahead); chunk 2's solve keeps the
+    # last 10 of them (tokens 7..39 = 33), chunk 3 likewise (27..59 = 33) and
+    # the final one starts at 57 - 10 = 47 of 62 tokens
+    assert full_lens == [20, 40, 60, 62]
+    assert win_lens == [20, 33, 33, 15]
