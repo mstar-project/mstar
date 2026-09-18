@@ -34,13 +34,15 @@ sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.model.flux2_klein.config import DENOISE_LOOP, Flux2KleinConfig, resolve_snapshot_dir  # noqa: E402
-from mstar.model.flux2_klein.flux2_klein_model import IMAGE_GEN_WALK, Flux2KleinModel  # noqa: E402
+from mstar.model.flux2_klein.flux2_klein_model import IMAGE_EDIT_WALK, IMAGE_GEN_WALK, Flux2KleinModel  # noqa: E402
 from mstar.model.flux2_klein.submodules import (  # noqa: E402
     LATENTS,
+    REF_LATENTS,
     TEXT_EMBEDS,
     KleinDenoiseSubmodule,
     KleinTextEncoderSubmodule,
     KleinVaeDecoderSubmodule,
+    KleinVaeEncoderSubmodule,
 )
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
 
@@ -90,11 +92,11 @@ def model() -> Flux2KleinModel:
     return m
 
 
-def _fwd_info(meta: dict, k: int, seed: int) -> CurrentForwardPassInfo:
+def _fwd_info(meta: dict, k: int, seed: int, ref_grids=(), walk: str = IMAGE_GEN_WALK) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
-        request_id="oracle", graph_walk=IMAGE_GEN_WALK, fwd_index=k, random_seed=seed, max_tokens=0,
+        request_id="oracle", graph_walk=walk, fwd_index=k, random_seed=seed, max_tokens=0,
         step_metadata={"height": meta["height"], "width": meta["width"], "num_inference_steps": meta["steps"],
-                       "ref_grids": []},
+                       "ref_grids": [list(g) for g in ref_grids]},
         dynamic_loop_iter_counts={DENOISE_LOOP: k},
     )
 
@@ -169,3 +171,48 @@ def test_denoise_trajectory_and_image_match_oracle(model, meta):
     print(f"final image PSNR={psnr:.2f} dB")
     assert psnr >= MIN_PSNR_DB
     dit.cleanup_request("oracle")
+
+
+def test_edit_trajectory_and_image_match_oracle(model, meta):
+    """Single-reference edit: the t2i image is the reference, the edit prompt and seed come from the
+    oracle; reference latents, text embeddings, every Euler step and the final image must match."""
+    if "edit_prompt" not in meta:
+        pytest.skip("oracle recorded with --skip-edit")
+    text: KleinTextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
+    encoder: KleinVaeEncoderSubmodule = model.get_submodule("vae_encoder", device=DEVICE)
+    dit: KleinDenoiseSubmodule = model.get_submodule("dit", device=DEVICE)
+    decoder: KleinVaeDecoderSubmodule = model.get_submodule("vae_decoder", device=DEVICE)
+    reference = model.load_image(str(ORACLE_DIR / meta["edit_reference"]), "cpu").data  # [3, H, W] in [0, 1]
+    ref_grids = [model.config.latent_grid(reference.shape[1], reference.shape[2])]
+    ids, mask = model.tokenize(meta["edit_prompt"])
+    with torch.no_grad():
+        embeds = text.forward(
+            IMAGE_EDIT_WALK, _engine_inputs(), text_inputs=ids[None], text_mask=mask[None],
+        )[TEXT_EMBEDS][0]
+        expected_embeds = torch.load(ORACLE_DIR / "edit" / "prompt_embeds.pt")
+        diff = (embeds.cpu().float() - expected_embeds.float()).abs().max().item()
+        print(f"edit text embeds max_abs={diff:.3e}")
+        assert diff <= TEXT_MAX_ABS
+        ref_latents = encoder.forward(IMAGE_EDIT_WALK, _engine_inputs(), image_0=reference)[REF_LATENTS][0]
+        assert ref_latents.shape == (1, ref_grids[0][0] * ref_grids[0][1], model.config.transformer.in_channels)
+        inputs = {TEXT_EMBEDS: [embeds], REF_LATENTS: [ref_latents]}
+        latents, worst = None, 0.0
+        for k in range(meta["steps"]):
+            info = _fwd_info(meta, k, meta["edit_seed"], ref_grids=ref_grids, walk=IMAGE_EDIT_WALK)
+            node_inputs = dit.prepare_inputs(IMAGE_EDIT_WALK, info,
+                                             {**inputs, **({LATENTS: [latents]} if latents is not None else {})})
+            kwargs = dit.preprocess(IMAGE_EDIT_WALK, _engine_inputs(), [node_inputs])
+            latents = dit.forward(IMAGE_EDIT_WALK, _engine_inputs(), **kwargs)[LATENTS][0]
+            expected = torch.load(ORACLE_DIR / "edit" / f"latents_step_{k:03d}.pt")[0]
+            diff = (latents.cpu().float() - expected.float()).abs().max().item()
+            worst = max(worst, diff)
+            print(f"edit step {k}: latents max_abs={diff:.3e}")
+        assert worst <= STEP_MAX_ABS, f"edit per-step latents diverge from the oracle (max {worst:.3e})"
+        image = decoder.forward(
+            IMAGE_EDIT_WALK, _engine_inputs(), latents=latents[None],
+            grid=model.config.latent_grid(meta["height"], meta["width"]),
+        )["image_output"][0][0].cpu()
+    dit.cleanup_request("oracle")
+    psnr = _psnr(image, _load_png(ORACLE_DIR / "edit" / "image.png"))
+    print(f"edit image PSNR={psnr:.2f} dB")
+    assert psnr >= MIN_PSNR_DB
