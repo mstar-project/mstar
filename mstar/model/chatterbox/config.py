@@ -410,6 +410,11 @@ class ChatterboxConfig:
     # (CosyVoice 2's token2wav scheme).
     stream_first_chunk_tokens: int = 15
     stream_chunk_tokens: int = 25
+    # Later chunks grow by this factor (1.0 = fixed ``stream_chunk_tokens``)
+    # up to ``stream_max_chunk_tokens``: each chunk buys the playback time to
+    # produce a bigger one, so a stream costs fewer, larger flow solves.
+    stream_chunk_growth: float = 1.0
+    stream_max_chunk_tokens: int = 200
     stream_mel_cache_frames: int = 8
     # How many already-decoded tokens a chunk's flow solve keeps as left
     # context (plus the reference prompt). 0 = the whole history, as CosyVoice
