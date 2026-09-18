@@ -147,6 +147,17 @@ qwen3_tts = [
     "transformers>=4.57.3",
 ]
 
+kokoro = [
+    # misaki is the G2P (lexicon + spaCy tagger); `misaki[en]` additionally
+    # bundles espeak-ng (GPL) for out-of-dictionary words and is optional.
+    # The spaCy model is fetched on first use: `python -m spacy download en_core_web_sm`.
+    "misaki>=0.9.4",
+    "spacy>=3.8",
+    "num2words",
+    "huggingface-hub",
+    "transformers",
+]
+
 orpheus = [
     "einops",
     "flashinfer-python>=0.6.4",
