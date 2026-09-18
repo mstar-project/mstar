@@ -95,9 +95,10 @@ case ${1:-} in
     # EXTRA_MODEL_KWARGS (indented "  key: value" lines) adds deployment knobs, RUN_TAG names the run
     { cat "$MSTAR/$cfg"; printf 'model_kwargs:\n  voices_dir: %s\n%s' "$VOICES_DIR" "${EXTRA_MODEL_KWARGS:-}"; } > "$out/config.yaml"
     cd "$MSTAR"
+    # shellcheck disable=SC2086  # SERVE_EXTRA_ARGS is a list of extra mstar-serve flags (e.g. --log-level DEBUG)
     start_group "$out/server.log" mstar-serve --config "$out/config.yaml" --port "$PORT" \
         --tensor-comm-protocol SHM --socket-path-prefix "/tmp/mstar_${USER}_bench_$$/" \
-        --log-stats --log-stats-file "$out/stats.log"
+        --log-stats --log-stats-file "$out/stats.log" ${SERVE_EXTRA_ARGS:-}
     trap 'stop_group' EXIT
     wait_http "http://127.0.0.1:$PORT/health" 900
     # one long-timeout request first: JIT kernels, CUDA-graph and torch.compile
