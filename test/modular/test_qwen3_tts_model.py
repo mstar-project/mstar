@@ -1445,7 +1445,7 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
         assert graph_config.capture_graph_walk == "codec_chunk"
         # CustomVoice has no clone walk; a Base config would add codec_chunk_clone.
         assert set(graph_config.replay_graph_walks) == {"codec_chunk"}
-        assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16]
+        assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
         assert graph_config.single_request_inputs.tensor_inputs["codec_tokens"].shape == (
             4, graph_config.additional_key_info,
         )
@@ -1455,7 +1455,7 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
     assert set(base_codec.get_cuda_graph_configs(torch.device("cpu"))[0].replay_graph_walks) == {
         "codec_chunk", "codec_chunk_clone",
     }
-    assert submodule.max_batch_size("codec_chunk") == 16
+    assert submodule.max_batch_size("codec_chunk") == 32
     # The batch's capture key is the bucket its requests pad to: read off the
     # stream metadata when present (before prepare_inputs), else off the state.
     def meta(num_items):
@@ -1481,8 +1481,8 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
     )
     assert packed["codec_tokens"].shape == (3, 4, 4)
     assert packed["codec_tokens"][2].tolist() == [[1, 0, 0, 0]] * 4   # 1-frame window padded on the right
-    oversized = model_inputs * 9
-    assert len(oversized) == 18
+    oversized = model_inputs * 17
+    assert len(oversized) == 34
     assert not submodule.can_batch(batch, oversized)
 
 
