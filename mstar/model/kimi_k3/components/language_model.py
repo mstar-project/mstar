@@ -15,6 +15,8 @@ import logging
 import re
 from collections.abc import Iterable
 
+from typing import Callable
+
 import torch
 from torch import nn
 
@@ -129,25 +131,35 @@ class KimiK3LanguageModel(nn.Module):
             return self.output_attn_res.read(prefix, blocks, out_norm=self.norm, add=pending)[0]
         return self.norm(prefix if pending is None else prefix + pending)
 
-    def forward(self, hidden: torch.Tensor, *, label: str = "main", aux_layers: tuple[int, ...] | None = None):
+    def forward(self, hidden: torch.Tensor, *, label: str = "main", aux_layers: tuple[int, ...] | None = None,
+                aux_sink: Callable[[int, torch.Tensor], None] | None = None):
         """Paged path over packed tokens ``hidden [T, H]``; returns the final-normed
         hidden states ``[T, H]``. With ``aux_layers`` also the residual stream entering each of
         those layers (the stream after layer ``L - 1``: the running prefix plus the pending MLP
         output, vLLM's default aux capture for Kimi K3), as a list in the given order, for a
-        speculative draft."""
+        speculative draft. With ``aux_sink`` each state goes to ``aux_sink(j, state)`` (``j`` its
+        index in ``aux_layers``) as it appears and is not kept, so the list comes back empty: the
+        draft's context projection sums over the states one at a time and a long prefill never
+        holds all of them."""
         self.bind_label(label)
         prefix, pending = hidden, None
         blocks = hidden.new_zeros(hidden.shape[0], 0, hidden.shape[1])
         aux: list[torch.Tensor] = []
+        seen = 0
         for i, layer in enumerate(self.layers):
             self._set_cursors(layer)
             prefix, blocks, pending = layer(prefix, blocks, pending)
             if aux_layers is not None and i + 1 in aux_layers:
-                aux.append(prefix if pending is None else prefix + pending)
+                state = prefix if pending is None else prefix + pending
+                if aux_sink is None:
+                    aux.append(state)
+                else:
+                    aux_sink(seen, state)
+                seen += 1
         final = self._finish(prefix, blocks, pending)
         if aux_layers is None:
             return final
-        assert list(aux_layers) == sorted(aux_layers) and len(aux) == len(aux_layers), (aux_layers, len(self.layers))
+        assert list(aux_layers) == sorted(aux_layers) and seen == len(aux_layers), (aux_layers, len(self.layers))
         return final, aux
 
     def forward_dense(
