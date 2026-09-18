@@ -47,6 +47,19 @@ def _percentile(values: list[float], q: float) -> float | None:
 DIALECTS = ("openai", "vllm")
 
 
+def _vllm_transcript(raw: str) -> str:
+    """The spoken words in vLLM's realtime output: one ``language X<asr_text>text``
+    line per internal chunk, a chunk repeated when it is re-decoded with more
+    audio. Keeps each distinct line's text, in order."""
+    lines: list[str] = []
+    for line in raw.split("\n"):
+        text = line.split("<asr_text>", 1)[1] if "<asr_text>" in line else line
+        text = text.strip()
+        if text and (not lines or lines[-1] != text):
+            lines.append(text)
+    return " ".join(lines)
+
+
 async def run_session(
     session: aiohttp.ClientSession, base_url: str, utt: Utterance, speed: float,
     language: str | None, chunk_seconds: float | None, dialect: str = "openai", model: str = "",
@@ -124,8 +137,9 @@ async def run_session(
                 completed_time = now
                 break
             elif kind == "transcription.done":
-                # vLLM's ``text`` is the last utterance's; the deltas cover the session
-                final_text = "".join(deltas) or event.get("text") or ""
+                # vLLM streams the model's raw lines (``language X<asr_text>...`` per
+                # internal chunk, re-emitted as chunks grow): keep the transcript text
+                final_text = _vllm_transcript("".join(deltas) or event.get("text") or "")
                 completed_time = now
                 break
             elif kind == "error":
