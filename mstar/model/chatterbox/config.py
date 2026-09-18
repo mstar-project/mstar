@@ -411,6 +411,11 @@ class ChatterboxConfig:
     stream_first_chunk_tokens: int = 15
     stream_chunk_tokens: int = 25
     stream_mel_cache_frames: int = 8
+    # How many already-decoded tokens a chunk's flow solve keeps as left
+    # context (plus the reference prompt). 0 = the whole history, as CosyVoice
+    # 2 streams (cost grows with every chunk); a window bounds the work per
+    # chunk at the price of re-estimating the new frames with less context.
+    stream_context_tokens: int = 0
 
     @property
     def sample_rate(self) -> int:
