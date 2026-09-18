@@ -11,15 +11,16 @@ derived from ``config.json`` (``Qwen3TTSModelConfig``), never from the
 registry key.
 
 Architecture (two asynchronous partitions):
-    Talker - text/voice prefill, then autoregressive 16-group codec frames
-    Codec  - stateless speech-tokenizer decoder producing PCM chunks
+    Talker     - text/voice prefill, then autoregressive 16-group codec frames
+    RefEncoder - (Base) reference clip -> x-vector + codec frames, feeds the prefill
+    Codec      - stateless speech-tokenizer decoder producing PCM chunks
 
 Streaming topology:
     Talker --[codec_tokens, LeftContextChunkPolicy(300, 25)]--> Codec
 
 Request state machine:
-    Talker: talker_prefill -> talker_decode loop -> done on EOS/token limit
-    Codec:  waits for streamed frames -> codec_chunk -> emits audio -> waits
+    Talker: talker_prefill | talker_prefill_clone -> talker_decode loop -> done on EOS/token limit
+    Codec:  waits for streamed frames -> codec_chunk | codec_chunk_clone -> emits audio -> waits
 
 This class runs in the API/conductor side. It owns request validation, graph
 and partition declarations, state-machine transitions, sampling defaults, and
@@ -59,10 +60,11 @@ from mstar.graph.base import (
     GraphNode,
     GraphSection,
     Loop,
+    Sequential,
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
@@ -112,8 +114,11 @@ def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
 
 
 @lru_cache(maxsize=1)
-def _load_qwen3_tts_decoder_classes() -> tuple[type, type]:
-    """Load only qwen-tts' 12 Hz decoder modules.
+def _load_qwen3_tts_codec_classes() -> tuple[type, type, type]:
+    """Load only qwen-tts' 12 Hz speech-tokenizer modules.
+
+    Returns the decoder config class, the decoder (codes -> waveform) and the
+    encoder (waveform -> codes, used for voice-clone reference audio).
 
     ``qwen_tts.__init__`` eagerly imports its high-level inference package,
     which in turn imports the unrelated 25 Hz tokenizer and pysox.  Pysox
@@ -176,6 +181,7 @@ def _load_qwen3_tts_decoder_classes() -> tuple[type, type]:
     return (
         config_module.Qwen3TTSTokenizerV2DecoderConfig,
         model_module.Qwen3TTSTokenizerV2Decoder,
+        model_module.Qwen3TTSTokenizerV2Encoder,
     )
 
 
@@ -356,27 +362,45 @@ class Qwen3TTSModel(Model):
 
         ``talker_input_embeds`` is the recurrent Talker edge. ``codec_tokens``
         crosses the asynchronous partition boundary and is buffered according
-        to ``get_partition_topology`` before Codec is scheduled.
+        to ``get_partition_topology`` before Codec is scheduled. Base
+        checkpoints add a clone prefill (RefEncoder -> Talker) and a codec walk
+        that also receives the reference frame count to trim.
         """
-        # Prefill seeds both recurrent paths: the embedding for the next
-        # Talker step is persisted, while the first codec frame starts the
-        # Talker-to-Codec stream.
-        talker_prefill = GraphNode(
-            name="Talker",
-            input_names=list(self.PREFILL_INPUTS),
-            outputs=[
-                GraphEdge(
-                    next_node=EMPTY_DESTINATION,
-                    name="talker_input_embeds",
-                    persist=True,
-                ),
-                StreamingGraphEdge(
-                    next_node="Codec",
-                    name="codec_tokens",
-                    target_partition="Codec",
-                ),
-            ],
-        )
+        def talker_prefill_node(input_names: list[str]) -> GraphNode:
+            # Prefill seeds both recurrent paths: the embedding for the next
+            # Talker step is persisted, while the first codec frame(s) start
+            # the Talker-to-Codec stream.
+            return GraphNode(
+                name="Talker",
+                input_names=input_names,
+                outputs=[
+                    GraphEdge(
+                        next_node=EMPTY_DESTINATION,
+                        name="talker_input_embeds",
+                        persist=True,
+                    ),
+                    StreamingGraphEdge(
+                        next_node="Codec",
+                        name="codec_tokens",
+                        target_partition="Codec",
+                    ),
+                ],
+            )
+
+        def codec_node(input_names: list[str]) -> GraphNode:
+            # Codec is deliberately a separate walk/engine so waveform decoding
+            # can overlap with subsequent Talker steps.
+            return GraphNode(
+                name="Codec",
+                input_names=input_names,
+                outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="audio_chunk",
+                        output_modality="audio",
+                    ),
+                ],
+            )
 
         # Each loop iteration predicts one complete 16-group codec frame and
         # feeds the summed codec embedding back into the next Talker step.
@@ -400,25 +424,26 @@ class Qwen3TTSModel(Model):
             max_iters=self.get_max_output_tokens(),
             outputs=[],
         )
-
-        # Codec is deliberately a separate walk/engine so waveform decoding
-        # can overlap with subsequent Talker steps.
-        codec_chunk = GraphNode(
-            name="Codec",
-            input_names=["codec_tokens"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="audio_chunk",
-                    output_modality="audio",
-                ),
-            ],
-        )
-        return {
-            "talker_prefill": talker_prefill,
+        walks = {
+            "talker_prefill": talker_prefill_node(list(self.PREFILL_INPUTS)),
             "talker_decode": talker_decode,
-            "codec_chunk": codec_chunk,
+            "codec_chunk": codec_node(["codec_tokens"]),
         }
+        if self.config.supports_reference_audio:
+            ref_encoder = GraphNode(
+                name="RefEncoder",
+                input_names=list(self.REF_ENCODER_INPUTS),
+                outputs=[
+                    GraphEdge(next_node="Talker", name="speaker_embed"),
+                    GraphEdge(next_node="Talker", name="ref_codes"),
+                ],
+            )
+            walks["talker_prefill_clone"] = Sequential([
+                ref_encoder,
+                talker_prefill_node([*self.PREFILL_INPUTS, "speaker_embed", "ref_codes"]),
+            ])
+            walks["codec_chunk_clone"] = codec_node(["codec_tokens", "ref_frames"])
+        return walks
 
     # -----------------------------------------------------------------------
     # Asynchronous partitions and stream buffering
@@ -426,16 +451,21 @@ class Qwen3TTSModel(Model):
 
     def get_partitions(self) -> list[PartitionDefinition]:
         """Split autoregressive generation from independently scheduled audio."""
+        talker_walks = {"talker_prefill", "talker_decode"}
+        codec_walks = {"codec_chunk"}
+        if self.config.supports_reference_audio:
+            talker_walks.add("talker_prefill_clone")
+            codec_walks.add("codec_chunk_clone")
         return [
             PartitionDefinition(
                 name="Talker",
-                graph_walks={"talker_prefill", "talker_decode"},
+                graph_walks=talker_walks,
                 initial_walk="talker_prefill",
                 producer_partitions=[],
             ),
             PartitionDefinition(
                 name="Codec",
-                graph_walks={"codec_chunk"},
+                graph_walks=codec_walks,
                 initial_walk=None,
                 producer_partitions=["Talker"],
             ),
@@ -474,8 +504,26 @@ class Qwen3TTSModel(Model):
     # which is how the text span is located inside the tokenized turn.
     ASSISTANT_TEMPLATE = "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
     INSTRUCT_TEMPLATE = "<|im_start|>user\n{instruct}<|im_end|>\n"
-    # Tensors ``process_prompt`` produces and the Talker prefill consumes.
+    REFERENCE_TEMPLATE = "<|im_start|>assistant\n{text}<|im_end|>\n"
+    # API tensors the Talker prefill consumes; the clone prefill adds the
+    # RefEncoder's ``speaker_embed`` and ``ref_codes`` to them.
     PREFILL_INPUTS = ("text_inputs", "prompt_layout", "speaker_id", "language_id")
+    # API tensors the RefEncoder consumes (reference clip + layout).
+    REF_ENCODER_INPUTS = ("audio_inputs", "prompt_layout")
+
+    def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
+        """Decode a reference clip to 24 kHz mono float32 (speaker encoder + codec rate)."""
+        import soundfile
+        import torchaudio.functional as audio_functional
+
+        waveform, sample_rate = soundfile.read(filepath, dtype="float32", always_2d=True)
+        audio = torch.from_numpy(waveform).mean(dim=1)
+        target_rate = self.config.codec.input_sample_rate
+        if sample_rate != target_rate:
+            audio = audio_functional.resample(audio, sample_rate, target_rate)
+        return TensorAndMetadata(
+            data=audio.to(device), metadata={"sample_rate": target_rate, "num_channels": 1}
+        )
 
     def _tokenize(self, text: str) -> torch.Tensor:
         encoded = self.tokenizer(text, return_tensors="pt", padding=True)
@@ -549,6 +597,43 @@ class Qwen3TTSModel(Model):
             )
         return instruct
 
+    def _resolve_reference(
+        self, kwargs: dict[str, Any], tensors: NameToTensorList | None, input_modalities: list[str],
+    ) -> tuple[str, int]:
+        """Voice-clone reference: (transcript, frames). ``frames == 0`` means x-vector only.
+
+        Base needs exactly one reference clip. In-context cloning (the
+        default) also needs the clip's transcript; ``x_vector_only_mode``
+        drops both the transcript and the frames and conditions on the
+        x-vector alone.
+        """
+        clips = (tensors or {}).get("audio_inputs", [])
+        if not self.config.supports_reference_audio:
+            if clips or "audio" in input_modalities:
+                raise ValueError(
+                    f"Qwen3-TTS {self.config.tts_model_type} does not take reference "
+                    "audio; voice cloning needs a Base checkpoint"
+                )
+            return "", 0
+        if len(clips) != 1:
+            raise ValueError(
+                "Qwen3-TTS Base clones a voice from exactly one reference clip "
+                f"(got {len(clips)}); pass it as the request's audio input"
+            )
+        ref_text = str(kwargs.get("ref_text") or "").strip()
+        if kwargs.get("x_vector_only_mode", False):
+            return "", 0
+        if not ref_text:
+            raise ValueError(
+                "Qwen3-TTS Base needs 'ref_text' (the reference clip's transcript) "
+                "unless 'x_vector_only_mode' is set"
+            )
+        num_samples = int(clips[0].reshape(-1).shape[0])
+        frames = self.config.codec.frames_for_samples(num_samples)
+        if frames < 1:
+            raise ValueError("Qwen3-TTS reference clip is empty")
+        return ref_text, frames
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -559,31 +644,36 @@ class Qwen3TTSModel(Model):
     ) -> NameToTensorList:
         """Validate a request against the checkpoint variant and tokenize it.
 
-        Produces the four ``PREFILL_INPUTS`` tensors. ``text_inputs`` is the
-        optional instruction turn followed by the assistant turn (both in the
-        reference ChatML templates); ``prompt_layout`` is
-        ``[instruct_len, text_len, stream_text]``. ``stream_text`` follows the
-        reference default per variant (whole text in the prefill for
-        CustomVoice/VoiceDesign, one token per frame for Base) unless the
-        request sets ``non_streaming_mode``.
+        Produces the ``PREFILL_INPUTS`` tensors. ``text_inputs`` is the
+        optional instruction turn, the assistant turn and (in-context clone)
+        the reference transcript turn, all in the reference ChatML templates;
+        ``prompt_layout`` is ``[instruct_len, text_len, stream_text,
+        ref_text_len, ref_frames]``. ``stream_text`` follows the reference
+        default per variant (whole text in the prefill for CustomVoice and
+        VoiceDesign, one token per frame for Base) unless the request sets
+        ``non_streaming_mode``. Base requests also get ``ref_frames`` as its
+        own tensor for the codec's trimming.
         """
-        del tensors
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
-        if set(input_modalities) != {"text"}:
-            raise ValueError("Qwen3-TTS currently supports text input only")
+        if "audio" in input_modalities and not self.config.supports_reference_audio:
+            raise ValueError(
+                f"Qwen3-TTS {self.config.tts_model_type} does not take reference "
+                "audio; voice cloning needs a Base checkpoint"
+            )
+        allowed = {"text", "audio"} if self.config.supports_reference_audio else {"text"}
+        if "text" not in input_modalities or not set(input_modalities) <= allowed:
+            raise ValueError(
+                "Qwen3-TTS currently supports text input only"
+                + (" (plus one reference clip for Base)" if self.config.supports_reference_audio else "")
+            )
         if set(output_modalities) != {"audio"}:
             raise ValueError("Qwen3-TTS supports audio output only")
-        if self.config.is_base:
-            raise ValueError(
-                "Qwen3-TTS Base clones a voice from reference audio, which "
-                "this build does not accept yet; use a CustomVoice or "
-                "VoiceDesign checkpoint for text-only requests"
-            )
 
         speaker, speaker_id = self._resolve_speaker(kwargs)
         language_id = self._resolve_language(kwargs, speaker)
         instruct = self._resolve_instruct(kwargs)
+        ref_text, ref_frames = self._resolve_reference(kwargs, tensors, input_modalities)
         stream_text = not bool(
             kwargs.get("non_streaming_mode", self.config.default_non_streaming_mode)
         )
@@ -600,14 +690,23 @@ class Qwen3TTSModel(Model):
             if instruct
             else assistant_ids.new_empty(0)
         )
-        return {
-            "text_inputs": [torch.cat([instruct_ids, assistant_ids])],
+        ref_ids = (
+            self._tokenize(self.REFERENCE_TEMPLATE.format(text=ref_text))
+            if ref_frames
+            else assistant_ids.new_empty(0)
+        )
+        outputs = {
+            "text_inputs": [torch.cat([instruct_ids, assistant_ids, ref_ids])],
             "prompt_layout": [torch.tensor(
-                [instruct_ids.numel(), text_len, int(stream_text)], dtype=torch.long
+                [instruct_ids.numel(), text_len, int(stream_text), ref_ids.numel(), ref_frames],
+                dtype=torch.long,
             )],
             "speaker_id": [torch.tensor([speaker_id], dtype=torch.long)],
             "language_id": [torch.tensor([language_id], dtype=torch.long)],
         }
+        if self.config.supports_reference_audio:
+            outputs["ref_frames"] = [torch.tensor([ref_frames], dtype=torch.long)]
+        return outputs
 
     # -----------------------------------------------------------------------
     # Conductor partition state machine
@@ -623,24 +722,30 @@ class Qwen3TTSModel(Model):
     ) -> ForwardPassArgs:
         """Create each partition's initial state.
 
-        Talker starts immediately from API tensors. Codec has no direct API
-        inputs and remains dormant until its incoming streaming connection has
-        enough frames to schedule ``codec_chunk``.
+        Talker starts immediately from API tensors; a request that carries a
+        reference clip takes the clone prefill, whose RefEncoder runs first.
+        Codec has no direct API inputs and remains dormant until its incoming
+        streaming connection has enough frames to schedule its chunk walk.
         """
         model_kwargs = model_kwargs or {}
+        clone = "audio" in input_modalities
         if partition_name == "Talker":
+            walk = "talker_prefill_clone" if clone else "talker_prefill"
             metadata = CurrentForwardConductorMetadata(
                 input_modalities=input_modalities,
                 output_modalities=output_modalities,
-                graph_walk="talker_prefill",
+                graph_walk=walk,
                 is_prefill=True,
                 kwargs={
                     "talker_max_tokens": self.get_max_output_tokens(**model_kwargs),
                 },
             )
+            routes = [(name, "Talker") for name in self.PREFILL_INPUTS]
+            if clone:
+                routes += [(name, "RefEncoder") for name in self.REF_ENCODER_INPUTS]
             inputs = []
-            for name in self.PREFILL_INPUTS:
-                edge = GraphEdge(next_node="Talker", name=name)
+            for name, node in routes:
+                edge = GraphEdge(next_node=node, name=name)
                 edge.tensor_info = input_signals.get(name, [])
                 inputs.append(edge)
             return ForwardPassArgs(
@@ -657,7 +762,7 @@ class Qwen3TTSModel(Model):
             metadata = CurrentForwardConductorMetadata(
                 input_modalities=input_modalities,
                 output_modalities=output_modalities,
-                graph_walk="codec_chunk",
+                graph_walk="codec_chunk_clone" if clone else "codec_chunk",
                 is_prefill=False,
             )
             return ForwardPassArgs(
@@ -684,7 +789,7 @@ class Qwen3TTSModel(Model):
         """
         del incoming_connections
         if partition_name == "Talker":
-            if partition_metadata.graph_walk == "talker_prefill":
+            if partition_metadata.graph_walk in ("talker_prefill", "talker_prefill_clone"):
                 partition_metadata.graph_walk = "talker_decode"
                 partition_metadata.is_prefill = False
                 edge = GraphEdge(next_node="Talker", name="talker_input_embeds")
@@ -708,10 +813,18 @@ class Qwen3TTSModel(Model):
             )
 
         if partition_name == "Codec":
-            partition_metadata.graph_walk = "codec_chunk"
+            inputs = []
+            if partition_metadata.graph_walk == "codec_chunk_clone":
+                # The reference frame count is an API tensor; every codec
+                # invocation of a clone request re-reads it (cheap, one int).
+                edge = GraphEdge(next_node="Codec", name="ref_frames")
+                edge.tensor_info = persist_signals.get("ref_frames", [])
+                inputs.append(edge)
+            else:
+                partition_metadata.graph_walk = "codec_chunk"
             return ForwardPassArgs(
                 full_metadata=partition_metadata,
-                inputs=[],
+                inputs=inputs,
                 unpersist_tensors=[],
                 step_metadata={
                     "codec_chunk_frames": self.config.codec.chunk_frames,
@@ -816,7 +929,7 @@ class Qwen3TTSModel(Model):
     ) -> NodeSubmodule | None:
         """Build only the node assigned to this worker and cache the wrapper."""
         del sp_group
-        if node_name not in ("Talker", "Codec"):
+        if node_name not in ("Talker", "Codec", "RefEncoder"):
             raise ValueError(f"Unknown Qwen3-TTS node: {node_name!r}")
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
@@ -827,6 +940,10 @@ class Qwen3TTSModel(Model):
                 device=device,
                 tp_group=tp_group,
                 autocast_dtype=autocast_dtype,
+            )
+        elif node_name == "RefEncoder":
+            submodule = self._create_ref_encoder_submodule(
+                device=device, autocast_dtype=autocast_dtype
             )
         else:
             submodule = self._create_codec_submodule(device=device)
@@ -910,10 +1027,7 @@ class Qwen3TTSModel(Model):
     def _create_codec_submodule(self, device: str) -> NodeSubmodule:
         """Build the official speech-tokenizer decoder from its sub-checkpoint."""
         try:
-            (
-                Qwen3TTSTokenizerV2DecoderConfig,
-                Qwen3TTSTokenizerV2Decoder,
-            ) = _load_qwen3_tts_decoder_classes()
+            decoder_config_cls, decoder_cls, _ = _load_qwen3_tts_codec_classes()
         except ImportError as exc:
             raise ImportError(
                 "Qwen3-TTS Codec requires the 'qwen-tts' package; install "
@@ -925,13 +1039,12 @@ class Qwen3TTSModel(Model):
         from mstar.model.qwen3_tts.submodules import CodecSubmodule
 
         # Reuse the official decoder implementation, but keep graph scheduling,
-        # chunk padding, overlap trimming, and output transport in M*.
-        decoder_config = Qwen3TTSTokenizerV2DecoderConfig(
-            **self.config.codec.decoder_kwargs()
-        )
-        with torch.device("meta"):
-            decoder = Qwen3TTSTokenizerV2Decoder(decoder_config)
-        decoder.to_empty(device=device)
+        # chunk padding, overlap trimming, and output transport in M*. The
+        # 114M-parameter module is built on the CPU rather than on ``meta``:
+        # its rotary tables are non-persistent buffers that ``to_empty`` would
+        # leave uninitialized (no checkpoint tensor refills them).
+        decoder_config = decoder_config_cls(**self.config.codec.decoder_kwargs())
+        decoder = decoder_cls(decoder_config).to(device=device)
 
         codec_dir = Path(self.local_dir) / "speech_tokenizer"
         prefix = "decoder."
@@ -947,6 +1060,67 @@ class Qwen3TTSModel(Model):
         )
         decoder.eval()
         return CodecSubmodule(decoder, self.config)
+
+    def _create_ref_encoder_submodule(
+        self, device: str, autocast_dtype: torch.dtype | None = None,
+    ) -> NodeSubmodule:
+        """Speaker encoder (main checkpoint) + codec encoder (speech tokenizer) for Base."""
+        if not self.config.supports_reference_audio or self.config.speaker_encoder is None:
+            raise ValueError(
+                f"Qwen3-TTS {self.config.tts_model_type} has no reference-audio encoder"
+            )
+        from transformers import MimiConfig
+
+        from mstar.model.loader import load_hf_weights
+        from mstar.model.loader.iterators import iter_safetensors_shards
+        from mstar.model.qwen3_tts.components.speaker_encoder import (
+            Qwen3TTSMelFrontEnd,
+            Qwen3TTSSpeakerEncoder,
+        )
+        from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
+
+        # The x-vector is computed in the Talker's dtype, as the reference does.
+        speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder)
+        if autocast_dtype is not None:
+            speaker_encoder = speaker_encoder.to(autocast_dtype)
+        speaker_encoder = speaker_encoder.to(device=device)
+        prefix = "speaker_encoder."
+        loaded = load_hf_weights(
+            speaker_encoder,
+            (
+                (name.removeprefix(prefix), tensor)
+                for name, tensor in iter_safetensors_shards(self.local_dir, device=device, prefix=prefix)
+            ),
+        )
+        _verify_checkpoint_coverage(
+            speaker_encoder, loaded, _checkpoint_keys(self.local_dir, prefix), "Qwen3-TTS speaker encoder"
+        )
+        speaker_encoder.eval()
+
+        # Mimi encoder of the speech tokenizer: reference clip -> codec frames.
+        # Float32 like the decoder; built on the CPU for its non-persistent
+        # buffers (rotary tables, convolution geometry).
+        _, _, encoder_cls = _load_qwen3_tts_codec_classes()
+        codec_encoder = encoder_cls(MimiConfig(**self.config.codec.encoder_config)).to(device=device)
+        codec_dir = Path(self.local_dir) / "speech_tokenizer"
+        prefix = "encoder."
+        loaded = load_hf_weights(
+            codec_encoder,
+            (
+                (name.removeprefix(prefix), tensor)
+                for name, tensor in iter_safetensors_shards(codec_dir, device=device, prefix=prefix)
+            ),
+        )
+        _verify_checkpoint_coverage(
+            codec_encoder, loaded, _checkpoint_keys(codec_dir, prefix), "Qwen3-TTS codec encoder"
+        )
+        codec_encoder.eval()
+        return RefEncoderSubmodule(
+            speaker_encoder,
+            Qwen3TTSMelFrontEnd(self.config.speaker_encoder).to(device=device),
+            codec_encoder,
+            self.config,
+        )
 
     @staticmethod
     def _talker_step_metadata(
