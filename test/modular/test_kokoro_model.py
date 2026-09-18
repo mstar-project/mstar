@@ -351,6 +351,10 @@ class _StubG2P:
     def __init__(self, chunks):
         self.chunks = chunks
         self.calls = []
+        self.backends = []
+
+    def backend(self, lang):
+        self.backends.append(lang)
 
     def chunk(self, text, lang):
         self.calls.append((text, lang))
@@ -424,6 +428,15 @@ def test_process_prompt_validation(voices_dir):
     model.g2p = _StubG2P([Chunk("", "a")] * 9)
     with pytest.raises(ValueError, match="chunks"):
         model.process_prompt("many", ["text"], ["audio"])
+
+
+def test_warmup_builds_the_default_language_backend(voices_dir):
+    model = make_model(voices_dir)
+    model.warmup_preprocess()
+    assert model.g2p.backends == ["a"]  # af_heart -> American English
+    model.default_lang = "b"
+    model.warmup_preprocess()
+    assert model.g2p.backends[-1] == "b"
 
 
 def test_process_prompt_language_and_phonemes(voices_dir):
