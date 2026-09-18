@@ -112,3 +112,42 @@ def test_greedy_tokens_match_hf_generate(models):
     # The reference transcripts exist for every file; a run that produced
     # nothing means the pipeline is broken, not just imprecise.
     assert all(t.strip() for _, t in mismatches), mismatches
+
+
+def test_word_timestamps_match_hf_token_timestamps(models):
+    """Word starts against HF's DTW token timestamps (same alignment heads,
+    same median filter), on real utterances: most words within 0.1 s."""
+    model, hf = models
+    from transformers import WhisperProcessor
+
+    from mstar.model.whisper.components import alignment
+
+    processor = WhisperProcessor.from_pretrained(_snapshot())
+    dec_sub = model.get_submodule("decoder", device="cuda", autocast_dtype=torch.bfloat16)
+    enc_sub = model.get_submodule("audio_encoder", device="cuda", autocast_dtype=torch.bfloat16)
+    generation_config = hf.generation_config
+    within, total = 0, 0
+    for path in _audio_paths(4):
+        wave = model.load_audio(str(path), "cpu").data
+        feats = processor(wave.numpy(), sampling_rate=16000, return_tensors="pt")["input_features"]
+        with torch.no_grad():
+            out = hf.generate(
+                feats.cuda().to(torch.bfloat16), language="en", task="transcribe",
+                return_token_timestamps=True, return_timestamps=False, num_frames=wave.numel() // 160,
+            )
+        tokens = out.sequences[0].tolist()
+        text = [t for t in tokens[4:] if t < model.config.eos_token_id]  # after <|sot|><|en|><|transcribe|><|nots|>
+        hf_times = out.token_timestamps[0].tolist()  # one per output position, first text token at index 4
+        # ours: the same teacher-forced sequence through the served decoder weights
+        encoder_states = enc_sub.encoder(
+            enc_sub.log_mel(enc_sub.log_mel.pad_or_trim(wave.cuda())).to(torch.bfloat16).unsqueeze(0)
+        )[0]
+        seq = torch.tensor(tokens[:4] + text + [model.config.eos_token_id], device="cuda")
+        heads = [(int(layer), int(head)) for layer, head in model.config.alignment_heads]
+        weights = dec_sub.decoder.cross_attention_weights(seq, encoder_states, heads)
+        matrix = alignment.alignment_matrix(weights[:, 3:-1], wave.numel() // 160)
+        starts = alignment.token_start_frames(matrix) / alignment.FRAMES_PER_SECOND
+        for i in range(len(text)):
+            total += 1
+            within += abs(starts[i] - hf_times[4 + i]) <= 0.1
+    assert within / total > 0.9, (within, total)
