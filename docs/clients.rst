@@ -164,6 +164,16 @@ Endpoints and model coverage:
    * - ``POST /v1/audio/speech``
      - ``orpheus``, ``qwen3_omni``
      - Text-to-speech.
+   * - ``POST /v1/audio/transcriptions``
+     - ``whisper_large``, ``higgs_audio``
+     - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
+       ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
+   * - ``WS /v1/realtime?intent=transcription``
+     - models whose adapter can continue a hypothesis
+     - Streaming speech-to-text: ``input_audio_buffer.append`` PCM16 chunks in,
+       ``conversation.item.input_audio_transcription.delta`` (append-only) and
+       ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
+       finishes the utterance.
    * - ``POST /v1/images/generations``
      - ``bagel``
      - Text-to-image.
@@ -182,6 +192,10 @@ Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``) return ``
    # text-to-speech
    client.audio.speech.create(model="orpheus", input="hello there", voice="tara")
 
+   # speech-to-text
+   client.audio.transcriptions.create(model="whisper_large", file=open("speech.wav", "rb"),
+                                      language="en")
+
    # image generation
    client.images.generate(model="bagel", prompt="a cat in a hat")
 
@@ -194,6 +208,24 @@ Per-model notes:
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
   Non-OpenAI knobs (e.g. ``talker_top_k``, ``code_predictor_top_p``) go through
   ``extra_body``.
+- **Whisper / Higgs-Audio** — ``language`` (ISO-639-1) skips language detection,
+  ``prompt`` conditions the decoder on prior text (it reaches the model as
+  ``initial_prompt``), and ``response_format``
+  ``verbose_json`` / ``srt`` / ``vtt`` (or ``timestamp_granularities[]``) asks the
+  model for timestamps. Whisper's language and timestamp tokens travel in the
+  text stream and are lifted into ``language`` / ``segments`` by the server; a
+  streaming client receives only the spoken words. Uploads longer than the
+  model's clip (30 s for Whisper) are cut into consecutive windows; by default
+  they run in order with the transcript so far as each window's
+  ``initial_prompt`` and the first window's detected language (openai-whisper's
+  long-form algorithm), ``long_form="parallel"`` in ``extra_body`` submits them
+  all at once. Segment timestamps are offset to the whole file.
+- **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
+  session re-transcribes everything heard so far as one engine request whose assistant
+  turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``
+  tokens (the Qwen3-ASR SDK's streaming algorithm), so only the tail is ever revised.
+  Tune ``chunk_seconds`` / ``unfixed_chunks`` / ``unfixed_tokens`` under ``session.mstar``
+  in ``transcription_session.update``.
 - **Orpheus** — set the speaker with ``voice`` — one of ``tara`` (default), ``zoe``,
   ``zac``, ``jess``, ``leo``, ``mia``, ``julia``, ``leah`` (the ``available_voices`` list
   in the Orpheus config).
