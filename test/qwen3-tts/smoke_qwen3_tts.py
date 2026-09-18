@@ -139,13 +139,18 @@ def main(argv: list[str] | None = None) -> None:
     run("stream", {**base, "input": TEXT}, stream=True, min_seconds=3.0, max_seconds=12.0)
     # 2. non-streaming container response.
     run("blob", {**base, "input": TEXT}, stream=False, min_seconds=3.0, max_seconds=12.0)
-    # 3. greedy is repeatable byte for byte (same seed).
-    greedy = {**base, "input": TEXT, "do_sample": False, "subtalker_dosample": False, "seed": 7}
-    first = run("greedy_a", greedy, stream=True, min_seconds=3.0, max_seconds=12.0)
-    second = run("greedy_b", greedy, stream=True, min_seconds=3.0, max_seconds=12.0)
-    report["greedy_repeatable"] = first == second
+    # 3. the same seed is repeatable byte for byte. CustomVoice/VoiceDesign run
+    # greedy; Base clone prompts degenerate under greedy decoding in the
+    # reference implementation too (repeated near-silent frames, no EOS), so
+    # there the seeded default sampling is what must repeat.
+    repeat = {**base, "input": TEXT, "seed": 7}
+    if args.variant != "base":
+        repeat.update(do_sample=False, subtalker_dosample=False)
+    first = run("repeat_a", repeat, stream=True, min_seconds=3.0, max_seconds=12.0)
+    second = run("repeat_b", repeat, stream=True, min_seconds=3.0, max_seconds=12.0)
+    report["seed_repeatable"] = first == second
     if first != second:
-        failures.append("greedy runs with the same seed differ")
+        failures.append("runs with the same seed differ")
     # 4. long input goes through sentence chunking (server side) and stays continuous.
     run("long_chunked", {**base, "input": LONG_TEXT}, stream=True, min_seconds=25.0, max_seconds=90.0)
     # 5. instruction control (1.7B CustomVoice style, VoiceDesign voice description).
