@@ -38,10 +38,11 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 
 from mstar.model.components.diffusion.lora import LoraSpec, apply_loras
 from mstar.model.components.diffusion.text_encoder import Qwen3HiddenStateEncoder
@@ -125,19 +126,30 @@ _IGNORED_KEYS = {"bn.num_batches_tracked"}
 
 
 def _iter_component(
-    component_dir: Path, device, index_name: str, single_name: str,
+    component_dir: Path, device, index_name: str, single_name: str, skip: Callable[[str], bool] | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Stream the safetensors of one pipeline component (sharded or single file)."""
+    """Stream the safetensors of one pipeline component (sharded or single file).
+
+    ``skip`` names the checkpoint keys the caller will not load (the encoder's unused LM
+    layers, say); they are filtered before the read, so they never touch the device.
+    """
+    def wanted(names) -> set[str]:
+        return {name for name in names if skip is None or not skip(name)}
+
     index_path = component_dir / index_name
     if index_path.exists():
         with open(index_path) as f:
-            index = json.load(f)
-        for shard in sorted(set(index["weight_map"].values())):
-            yield from iter_safetensors_file(component_dir / shard, device=device)
+            weight_map: dict[str, str] = json.load(f)["weight_map"]
+        for shard in sorted(set(weight_map.values())):
+            keys = wanted(name for name, in_shard in weight_map.items() if in_shard == shard)
+            if keys:
+                yield from iter_safetensors_file(component_dir / shard, device=device, keys=keys)
         return
     single = component_dir / single_name
     if single.exists():
-        yield from iter_safetensors_file(single, device=device)
+        with safe_open(str(single), framework="pt", device="cpu") as f:
+            keys = wanted(f.keys())
+        yield from iter_safetensors_file(single, device=device, keys=keys)
         return
     raise FileNotFoundError(f"no safetensors checkpoint in {component_dir}")
 
@@ -148,8 +160,10 @@ def iter_diffusers_component(component_dir: Path, device) -> Iterator[tuple[str,
     )
 
 
-def iter_transformers_component(component_dir: Path, device) -> Iterator[tuple[str, torch.Tensor]]:
-    return _iter_component(component_dir, device, "model.safetensors.index.json", "model.safetensors")
+def iter_transformers_component(
+    component_dir: Path, device, skip: Callable[[str], bool] | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    return _iter_component(component_dir, device, "model.safetensors.index.json", "model.safetensors", skip=skip)
 
 
 def load_native(
@@ -225,9 +239,10 @@ def build_text_encoder(
     with torch.device("meta"):
         encoder = make_text_encoder(text_config)
     _materialize(encoder, dtype, device)
+    skip = text_encoder_skip(text_config)  # filtered before the read: unused LM layers never reach the device
     return load_native(
-        encoder, iter_transformers_component(snapshot / "text_encoder", device), remap_text_encoder_key,
-        "Qwen3 text encoder", stacked_params=_QKV_RULES_LM, skip=text_encoder_skip(text_config),
+        encoder, iter_transformers_component(snapshot / "text_encoder", device, skip=skip), remap_text_encoder_key,
+        "Qwen3 text encoder", stacked_params=_QKV_RULES_LM, skip=skip,
     )
 
 
