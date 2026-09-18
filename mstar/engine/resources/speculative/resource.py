@@ -42,9 +42,11 @@ WAIT_TIMEOUT_S = 120.0
 
 class Verdict(NamedTuple):
     """One request's settled verdict: how many drafts the target accepted, and the ``k + 1``
-    tokens it verified (the ones at ``[:accepted + 1]`` are the emitted ones)."""
+    tokens it verified (the ones at ``[:accepted + 1]`` are the emitted ones). ``drafts`` (the
+    ``k`` drafted ids) are carried only when the submodule stages them for a debug trace."""
     accepted: int
     tokens: list[int]
+    drafts: list[int] | None = None
 
 
 class SpecAcceptance(Resource):
@@ -62,6 +64,8 @@ class SpecAcceptance(Resource):
         self._acc_host: dict[int | None, torch.Tensor] = {}
         self._tok_dev: dict[int | None, torch.Tensor] = {}
         self._tok_host: dict[int | None, torch.Tensor] = {}
+        self._drf_dev: dict[int | None, torch.Tensor] = {}
+        self._drf_host: dict[int | None, torch.Tensor] = {}
         self._cg_max_bs = 0
         self._current_slot: int | None = None
         self._seq_enqueued = 0  # verify steps committed so far, host view (= the device counter's target)
@@ -176,13 +180,16 @@ class SpecAcceptance(Resource):
             self._acc_host[slot] = torch.zeros(size, dtype=torch.int32, **self._pin)
             self._tok_dev[slot] = torch.zeros(size, self.k + 1, dtype=torch.int32, device=self.device)
             self._tok_host[slot] = torch.zeros(size, self.k + 1, dtype=torch.int32, **self._pin)
+            self._drf_dev[slot] = torch.zeros(size, max(self.k, 1), dtype=torch.int32, device=self.device)
+            self._drf_host[slot] = torch.zeros(size, max(self.k, 1), dtype=torch.int32, **self._pin)
         return self._acc_dev[slot], self._acc_host[slot]
 
-    def stage(self, accepted: torch.Tensor, tokens: torch.Tensor | None = None) -> None:
+    def stage(self, accepted: torch.Tensor, tokens: torch.Tensor | None = None,
+              drafts: torch.Tensor | None = None) -> None:
         """Inside the forward, after the verification: publish ``accepted [rows]`` (int32, real rows
-        first) and, when given, the verified ``tokens [rows, k + 1]`` to the host mirrors of the
-        current slot, then bump the step counter. Capturable: device copies and device-to-host
-        copies into pinned memory, in stream order."""
+        first) and, when given, the verified ``tokens [rows, k + 1]`` (and the ``drafts [rows, k]``,
+        for a debug trace) to the host mirrors of the current slot, then bump the step counter.
+        Capturable: device copies and device-to-host copies into pinned memory, in stream order."""
         rows = int(accepted.shape[0])
         dev, host = self._buffers(self._current_slot, rows)  # made in plan; a no-op here
         dev[:rows].copy_(accepted.to(torch.int32))
@@ -191,6 +198,11 @@ class SpecAcceptance(Resource):
             tdev, thost = self._tok_dev[self._current_slot], self._tok_host[self._current_slot]
             tdev[:rows].copy_(tokens.to(torch.int32))
             thost[:rows].copy_(tdev[:rows], non_blocking=True)
+        self._staged_drafts = drafts is not None
+        if drafts is not None:
+            ddev, dhost = self._drf_dev[self._current_slot], self._drf_host[self._current_slot]
+            ddev[:rows].copy_(drafts.to(torch.int32))
+            dhost[:rows].copy_(ddev[:rows], non_blocking=True)
         self._counter_dev.add_(1)
         self._counter_host.copy_(self._counter_dev, non_blocking=True)
 
@@ -226,7 +238,8 @@ class SpecAcceptance(Resource):
                 if seq > latest:
                     continue
                 accepted = int(self._acc_host[slot][row])
-                self._settled[rid] = (seq, Verdict(accepted, self._tok_host[slot][row].tolist()))
+                drafts = self._drf_host[slot][row].tolist() if getattr(self, "_staged_drafts", False) else None
+                self._settled[rid] = (seq, Verdict(accepted, self._tok_host[slot][row].tolist(), drafts))
                 del self._pending[rid]
                 self.rows_settled += 1
                 self.accepted_total += accepted
