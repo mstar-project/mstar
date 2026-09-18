@@ -176,3 +176,38 @@ def test_cuda_graph_configs_one_bucket_per_shape():
     assert cfg.get_total_tokens(4) == [44]
     assert cfg.caps_eager_batch_size is False and cfg.compile is False
     assert ToyDenoise().get_cuda_graph_configs(torch.device("cpu")) == []
+
+
+class TwoSpanDenoise(ToyDenoise):
+    """A model whose refiner layers attend over the image tokens alone."""
+
+    def attention_segments(self, shape_key):
+        return (("image", shape_key[0]), ("main", self.num_tokens(shape_key)))
+
+
+def test_declare_step_lists_every_attention_span_per_row():
+    sub = TwoSpanDenoise(attn_resource_key="dit_attn")
+    a = sub.prepare_inputs(WALK, _info("a", 0), _inputs())
+    b = sub.prepare_inputs(WALK, _info("b", 1), _inputs())
+    step = sub.declare_step(WALK, ["a", "b"], [a, b])
+    assert [(s.request_id, s.label, s.span) for s in step.segments] == [
+        ("a", "image", 8), ("a", "main", 11), ("b", "image", 8), ("b", "main", 11),
+    ]
+    # a capture bucket's rows carry the shape key, so their spans match the real rows'
+    cfg = TwoSpanDenoise(attn_resource_key="dit_attn", capture_shapes=[(WALK, (8, 3))]).get_cuda_graph_configs(
+        torch.device("cpu"),
+    )[0]
+    pad = cfg.single_request_inputs
+    assert [(s.label, s.span) for s in sub.declare_step(WALK, ["pad"], [pad]).segments] == [("image", 8), ("main", 11)]
+
+
+def test_ragged_for_binds_the_label():
+    class Resource:
+        def run(self, q, k, v, label=None):
+            return label
+
+    sub = TwoSpanDenoise(attn_resource_key="dit_attn")
+    sub.bind_node_resources({"dit_attn": Resource()})
+    assert sub.ragged_for("image")(None, None, None) == "image"
+    assert sub._ragged()(None, None, None) == "main"
+    assert ToyDenoise().ragged_for("image") is None  # no resource declared -> SDPA
