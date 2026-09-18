@@ -82,8 +82,10 @@ class ZImageTextEncoderSubmodule(NodeSubmodule):
     """Caption features ``[1, cap_len, 2560]`` for one request: Qwen3 hidden states after
     layer 35 at the real token positions, zero elsewhere (the DiT swaps those rows for its
     learned pad token). ``text_inputs`` arrives unpadded; rows are right-padded to the
-    batch's longest padded length, so requests of any length batch together — the hidden
-    states of real tokens do not depend on how much padding follows them."""
+    encoder's ``max_sequence_length`` (512), as the reference pipeline pads them: the real
+    tokens' values do not depend on the padding mathematically, but the attention kernel's
+    accumulation order does, so the padded length is part of bit-exactness. Requests of any
+    length batch together."""
 
     disable_torch_compile = True
 
@@ -105,7 +107,7 @@ class ZImageTextEncoderSubmodule(NodeSubmodule):
 
     def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
         lengths = [int(inp.tensor_inputs[TEXT_INPUTS].shape[0]) for inp in inputs]
-        width = padded_length(max(lengths))
+        width = self.config.text_encoder.max_sequence_length
         pad_id = self.config.text_encoder.pad_token_id
         ids = torch.full((len(inputs), width), pad_id, dtype=torch.long)
         mask = torch.zeros((len(inputs), width), dtype=torch.long)
