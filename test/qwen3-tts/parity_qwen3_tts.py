@@ -394,6 +394,22 @@ def compare_codes(ours: torch.Tensor, theirs: torch.Tensor) -> dict[str, Any]:
     }
 
 
+def describe_codes(codes: torch.Tensor, audio: torch.Tensor, eos: int) -> dict[str, Any]:
+    """What one greedy run produced: token diversity and the loudness of its
+    audio. Greedy decoding of a codec LM can lock onto a repeated (silent)
+    frame; this tells silence apart from speech on each side independently."""
+    group0 = codes[:, 0]
+    counts = torch.bincount(group0, minlength=1)
+    return {
+        "frames": int(codes.shape[0]),
+        "reached_eos": bool((group0 == eos).any()),
+        "unique_group0": int((counts > 0).sum()),
+        "top_group0_share": float(counts.max() / max(1, group0.numel())),
+        "audio_peak": float(audio.abs().max()) if audio.numel() else 0.0,
+        "audio_rms": float(audio.pow(2).mean().sqrt()) if audio.numel() else 0.0,
+    }
+
+
 @torch.no_grad()
 def decode_audio(codec, codes: torch.Tensor) -> torch.Tensor:
     """M* codec: ``[frames, groups]`` -> float waveform in [-1, 1]."""
@@ -585,6 +601,9 @@ def main(argv: list[str] | None = None) -> None:
         "length_mismatch": int(audio_ref_codes_mstar.numel() - audio_ref_codes_ref.numel()),
     }
     audio_ours = decode_audio(codec, ours_codes[:n])
+    eos = talker.talker_config.codec_eos_token_id
+    codes_report["mstar"] = describe_codes(ours_codes[:n], audio_ours, eos)
+    codes_report["reference"] = describe_codes(ref_codes[:n], audio_ref_codes_ref, eos)
     k = min(audio_ours.numel(), audio_ref_codes_ref.numel())
     e2e_audio = {
         "name": "audio_greedy_e2e",
