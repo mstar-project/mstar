@@ -1495,8 +1495,8 @@ class Engine:
             cg_runner = self._submodules[batch.node_name].cuda_graph_runner
             if lease is not None and cg_runner is not None:
                 cg_runner.release(lease, len(batch.request_ids))
-        for resource in self._resources.values():
-            resource.clear_preplan()
+        # through the runner, so its record of the staged step goes too
+        self._runner.clear_preplan()
 
     # ── Eviction ────────────────────────────────────────────────────────
     #
