@@ -401,26 +401,29 @@ class ChatterboxConfig:
     voice_cache_size: int = 64
 
     # S3Gen streaming: the first waveform chunk is synthesised once
-    # ``stream_first_chunk_tokens`` speech tokens exist, later chunks every
-    # ``stream_chunk_tokens`` tokens (0 = one chunk per utterance, the
-    # reference's offline behaviour). Each chunk re-runs the flow decoder over
-    # every token so far with a fixed per-request noise field and withholds the
-    # encoder's look-ahead tokens; the vocoder keeps ``stream_mel_cache_frames``
-    # mel frames of context and crossfades the re-synthesised tail
-    # (CosyVoice 2's token2wav scheme).
+    # ``stream_first_chunk_tokens`` speech tokens exist (about 0.23 s on an
+    # H100); later chunks start at ``stream_chunk_tokens`` and grow by
+    # ``stream_chunk_growth`` up to ``stream_max_chunk_tokens`` (15, 50, 100,
+    # 200, 200 ...): each chunk buys the playback time to produce a bigger one,
+    # so an utterance costs three or four flow solves instead of one per 25
+    # tokens (+40 % throughput at concurrency 8-32, playback still continuous
+    # at concurrency 1). ``stream_chunk_tokens = 0`` = one chunk per utterance,
+    # the reference's offline behaviour. Each chunk re-runs the flow decoder
+    # over the prompt and the recent tokens with a fixed per-request noise
+    # field and withholds the encoder's look-ahead tokens; the vocoder keeps
+    # ``stream_mel_cache_frames`` mel frames of context and crossfades the
+    # re-synthesised tail (CosyVoice 2's token2wav scheme).
     stream_first_chunk_tokens: int = 15
-    stream_chunk_tokens: int = 25
-    # Later chunks grow by this factor (1.0 = fixed ``stream_chunk_tokens``)
-    # up to ``stream_max_chunk_tokens``: each chunk buys the playback time to
-    # produce a bigger one, so a stream costs fewer, larger flow solves.
-    stream_chunk_growth: float = 1.0
+    stream_chunk_tokens: int = 50
+    stream_chunk_growth: float = 2.0
     stream_max_chunk_tokens: int = 200
     stream_mel_cache_frames: int = 8
     # How many already-decoded tokens a chunk's flow solve keeps as left
     # context (plus the reference prompt). 0 = the whole history, as CosyVoice
-    # 2 streams (cost grows with every chunk); a window bounds the work per
-    # chunk at the price of re-estimating the new frames with less context.
-    stream_context_tokens: int = 0
+    # 2 streams (cost grows with every chunk); the window bounds the work per
+    # chunk and stays as close to the whole-utterance decode as the full
+    # history does (log-mel correlation 0.988 vs 0.985 on CPU).
+    stream_context_tokens: int = 25
     # torch.compile the flow-matching estimator (the UNet the Euler solve
     # calls 10 x 2 times per chunk): fuses its many small kernels, which is
     # what a chunk's latency is made of. Dynamic shapes, so one compile covers
