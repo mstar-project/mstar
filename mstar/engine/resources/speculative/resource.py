@@ -5,10 +5,11 @@ resources that grew by ``k + 1`` at commit (host bookkeeping, done as the step i
 to take the rejected tail back before the next step is planned. The counts are known on the
 device only, mid-step, so this resource carries them across:
 
-* ``stage(accepted)`` runs inside the forward, right after the verification (captured into the
-  step's CUDA graph): the counts go to a static per-slot device buffer and from there to a pinned
-  host mirror, and a step counter is bumped and mirrored the same way, in that order, so a host
-  that sees the counter at ``seq`` also sees the counts of step ``seq``.
+* ``stage(accepted, tokens)`` runs inside the forward, right after the verification (captured into
+  the step's CUDA graph): the counts and the verified tokens go to static per-slot device buffers
+  and from there to pinned host mirrors, and a step counter is bumped and mirrored the same way, in
+  that order, so a host that sees the counter at ``seq`` also sees the counts and tokens of step
+  ``seq``. The tokens let the post-replay cut of a row's output stop at a stop token without a sync.
 * ``note_step(request_ids)`` runs on the host once the step is enqueued (replayed or eager) and
   remembers, per real request, which step and row hold its verdict.
 * ``plan`` (first in the runner's order: it depends on nothing) settles every pending verdict
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import NamedTuple
 
 import torch
 
@@ -37,6 +39,13 @@ logger = logging.getLogger(__name__)
 WAIT_TIMEOUT_S = 120.0
 
 
+class Verdict(NamedTuple):
+    """One request's settled verdict: how many drafts the target accepted, and the ``k + 1``
+    tokens it verified (the ones at ``[:accepted + 1]`` are the emitted ones)."""
+    accepted: int
+    tokens: list[int]
+
+
 class SpecAcceptance(Resource):
     def __init__(self, device: torch.device, num_speculative: int):
         self.device = device
@@ -46,14 +55,17 @@ class SpecAcceptance(Resource):
         self._pin = pin
         self._counter_dev = torch.zeros(1, dtype=torch.int32, device=device)
         self._counter_host = torch.zeros(1, dtype=torch.int32, **pin)
-        # per CUDA-graph slot (None: eager, sized per step): device buffer and pinned mirror
+        # per CUDA-graph slot (None: eager, sized per step): device buffers and pinned mirrors of the
+        # accepted counts [rows] and the verified tokens [rows, k + 1]
         self._acc_dev: dict[int | None, torch.Tensor] = {}
         self._acc_host: dict[int | None, torch.Tensor] = {}
+        self._tok_dev: dict[int | None, torch.Tensor] = {}
+        self._tok_host: dict[int | None, torch.Tensor] = {}
         self._cg_max_bs = 0
         self._current_slot: int | None = None
         self._seq_enqueued = 0  # verify steps staged so far, host view
-        # rid -> (seq, slot, row) until its counts are read, then -> int accepted
-        self._pending: dict[str, tuple[int, int | None, int] | int] = {}
+        # rid -> (seq, slot, row) until its step's mirrors are read, then -> Verdict
+        self._pending: dict[str, tuple[int, int | None, int] | Verdict] = {}
         self._max_rows_seen = 0
 
     @classmethod
@@ -77,8 +89,8 @@ class SpecAcceptance(Resource):
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
 
     def cleanup(self):
-        self._acc_dev.clear()
-        self._acc_host.clear()
+        for d in (self._acc_dev, self._acc_host, self._tok_dev, self._tok_host):
+            d.clear()
         self._pending.clear()
 
     # ---------------------------------------------------------------------- step
@@ -103,8 +115,8 @@ class SpecAcceptance(Resource):
             if ctx.is_padding_row(rid):
                 continue
             verdict = self._pending.get(rid)
-            if isinstance(verdict, int):
-                out[rid] = SpecAccepted(accepted=verdict, rejected=self.k - verdict, label=segment.label)
+            if isinstance(verdict, Verdict):
+                out[rid] = SpecAccepted(accepted=verdict.accepted, rejected=self.k - verdict.accepted, label=segment.label)
                 del self._pending[rid]
         return out
 
@@ -119,19 +131,25 @@ class SpecAcceptance(Resource):
         size = max(self._cg_max_bs, rows) if slot is not None else rows
         dev = self._acc_dev.get(slot)
         if dev is None or dev.shape[0] < size:
-            dev = torch.zeros(size, dtype=torch.int32, device=self.device)
-            host = torch.zeros(size, dtype=torch.int32, **self._pin)
-            self._acc_dev[slot], self._acc_host[slot] = dev, host
+            self._acc_dev[slot] = torch.zeros(size, dtype=torch.int32, device=self.device)
+            self._acc_host[slot] = torch.zeros(size, dtype=torch.int32, **self._pin)
+            self._tok_dev[slot] = torch.zeros(size, self.k + 1, dtype=torch.int32, device=self.device)
+            self._tok_host[slot] = torch.zeros(size, self.k + 1, dtype=torch.int32, **self._pin)
         return self._acc_dev[slot], self._acc_host[slot]
 
-    def stage(self, accepted: torch.Tensor) -> None:
+    def stage(self, accepted: torch.Tensor, tokens: torch.Tensor | None = None) -> None:
         """Inside the forward, after the verification: publish ``accepted [rows]`` (int32, real rows
-        first) to the host mirror of the current slot and bump the step counter after it. Capturable:
-        two device copies, two device-to-host copies into pinned memory."""
+        first) and, when given, the verified ``tokens [rows, k + 1]`` to the host mirrors of the
+        current slot, then bump the step counter. Capturable: device copies and device-to-host
+        copies into pinned memory, in stream order."""
         rows = int(accepted.shape[0])
         dev, host = self._buffers(self._current_slot, rows)  # made in plan; a no-op here
         dev[:rows].copy_(accepted.to(torch.int32))
         host[:rows].copy_(dev[:rows], non_blocking=True)
+        if tokens is not None:
+            tdev, thost = self._tok_dev[self._current_slot], self._tok_host[self._current_slot]
+            tdev[:rows].copy_(tokens.to(torch.int32))
+            thost[:rows].copy_(tdev[:rows], non_blocking=True)
         self._counter_dev.add_(1)
         self._counter_host.copy_(self._counter_dev, non_blocking=True)
 
@@ -143,33 +161,37 @@ class SpecAcceptance(Resource):
             self._pending[rid] = (self._seq_enqueued, self._current_slot, row)
         return self._seq_enqueued
 
-    def accepted_for(self, request_ids: list[str]) -> list[int]:
-        """The verdicts of these requests' last verify step (waits for it). For slicing the
-        emitted tokens post-replay; the pending entries stay for the next plan to publish."""
+    def verdicts_for(self, request_ids: list[str]) -> list["Verdict"]:
+        """The verdicts (accepted count and verified tokens) of these requests' last verify step,
+        waiting for it. For the post-replay cut of the emitted tokens; the pending entries stay for
+        the next plan to publish."""
         self._settle()
         out = []
         for rid in request_ids:
             verdict = self._pending.get(rid)
-            if not isinstance(verdict, int):
-                raise RuntimeError(f"no settled verdict for {rid}: note_step before accepted_for")
+            if not isinstance(verdict, Verdict):
+                raise RuntimeError(f"no settled verdict for {rid}: note_step before verdicts_for")
             out.append(verdict)
         return out
+
+    def accepted_for(self, request_ids: list[str]) -> list[int]:
+        return [v.accepted for v in self.verdicts_for(request_ids)]
 
     def _settle(self) -> None:
         """Read every pending verdict whose step has been staged, after waiting for its counter.
         Values are copied out here, before a later step reuses the slot's buffers."""
         latest = 0
         for verdict in self._pending.values():
-            if not isinstance(verdict, int):
+            if not isinstance(verdict, Verdict):
                 latest = max(latest, verdict[0])
         if latest == 0:
             return
         self._wait(latest)
         for rid, verdict in list(self._pending.items()):
-            if isinstance(verdict, int):
+            if isinstance(verdict, Verdict):
                 continue
             seq, slot, row = verdict
-            self._pending[rid] = int(self._acc_host[slot][row])
+            self._pending[rid] = Verdict(int(self._acc_host[slot][row]), self._tok_host[slot][row].tolist())
 
     def _wait(self, seq: int) -> None:
         if self.device.type != "cuda":
