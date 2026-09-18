@@ -193,9 +193,13 @@ chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
        {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
      "enable_thinking": false}'
 
-Concurrent chat requests share decode steps (continuous batching over the
-captured decode graphs, padded to the next batch bucket); a request's tokens
-are the same whether it runs alone or in a batch. Generation requests batch
+The decode step is captured into CUDA graphs per batch bucket and, by default,
+compiled first (``compile_reasoner_decode: true``; ``COSMOS3_REASONER_COMPILE=0``
+turns it off): the eager step is over a thousand tiny kernels, and the fused
+step runs at the weight-streaming floor (about twice the uncompiled rate at
+batch size 1 on an H100). Concurrent chat requests share decode steps
+(continuous batching over the captured decode graphs, padded to the next batch
+bucket); a request's tokens are the same whether it runs alone or in a batch. Generation requests batch
 into one denoise pass too, which is the same maths but not the same bf16
 arithmetic — under classifier-free guidance the branch rounding is amplified,
 so an image or clip produced alongside other requests differs from its solo
