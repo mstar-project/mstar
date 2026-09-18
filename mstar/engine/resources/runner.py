@@ -102,6 +102,9 @@ class StepRunner:
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
+        # the step whose pre-plan is staged across the pre-planning resources,
+        # as `_step_key` describes it; None when nothing is staged
+        self._staged: tuple | None = None
 
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
@@ -223,8 +226,54 @@ class StepRunner:
 
 
 
+    # ── Pre-plan bookkeeping ─────────────────────────────────────────────
+    #
+    # A pre-plan is staged across every pre-planning resource for one step,
+    # and each resource promotes its share when that step's full `plan`
+    # arrives. Only the runner sees the whole step, so it is the one that
+    # decides whether the step reaching `admit`/`plan` is the staged one. Any
+    # other step — a new request's prefill dispatched while a decode step sits
+    # pre-planned, or the same rows re-declared without their lease — drops
+    # the stage on every resource first. Otherwise a resource that promotes
+    # blindly (the attention wrappers, positions) would run against the KV
+    # layout its dependency just discarded and planned afresh.
+
+    def _step_key(self, step: SubmoduleStep):
+        """What identifies the step a pre-plan was staged for: its walk, the
+        rows it runs (padding included), the replay slot it was leased on,
+        its capture key, and every resource's segments."""
+        ctx = step.ctx
+        lease = ctx.slot_lease
+        return (
+            ctx.graph_walk,
+            tuple(ctx.padded_request_ids),
+            None if lease is None else lease.slot,
+            step.cg_key_info,
+            tuple(
+                (key, tuple(step.get(key).segments or ()))
+                for key in self._keys_for(step)
+            ),
+        )
+
+    def _drop_stale_preplan(self, step: SubmoduleStep) -> None:
+        if self._staged is None or step.ctx.is_preplan:
+            return
+        if self._staged != self._step_key(step):
+            logger.debug(
+                "dropping the staged pre-plan: a different step reached the "
+                "GPU thread first"
+            )
+            self.clear_preplan()
+
+    def clear_preplan(self) -> None:
+        """Drop the staged pre-plan on every resource, and the record of it."""
+        self._staged = None
+        for key in self._order:
+            self._resources[key].clear_preplan()
+
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """reserve capacity for step"""
+        self._drop_stale_preplan(step)
         ready = True
         for key in self._keys_for(step):
             if self._nvtx:
@@ -248,6 +297,11 @@ class StepRunner:
 
         place plan in `step.ctx.plan_results` before next plan runs
         again could possibly move that into `plan` itself"""
+        self._drop_stale_preplan(step)
+        if not step.ctx.is_preplan:
+            # the resources promote their staged share below (or plan afresh
+            # if nothing was staged): either way nothing stays staged
+            self._staged = None
         results = step.ctx.plan_results
         results.clear()
         for key in self._keys_for(step):
@@ -298,6 +352,7 @@ class StepRunner:
             finally:
                 if self._nvtx:
                     range_pop()
+        self._staged = self._step_key(step)
         return results
 
     def commit(self, step: SubmoduleStep) -> None:
