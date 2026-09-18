@@ -102,7 +102,7 @@ def test_prefill_layout_matches_variant(loaded):
         assert tensors["speaker_id"][0].item() == model.config.talker.spk_id["vivian"]
     else:
         tensors = model.process_prompt(
-            "Testing Qwen three TTS.", instruct="A calm male voice.", **kwargs,
+            "Testing Qwen three TTS.", language="English", instruct="A calm male voice.", **kwargs,
         )
         assert tensors["speaker_id"][0].item() == -1
     instruct_len, text_len, stream_text, ref_text_len, ref_frames = tensors["prompt_layout"][0].tolist()
@@ -113,8 +113,10 @@ def test_prefill_layout_matches_variant(loaded):
         "talker_prefill", SimpleNamespace(request_id=f"prefill-{variant}"), tensors,
     )
     assert prepared.input_embeds.shape[1] == model.config.talker.hidden_size
-    # instruct + role(3) + codec tags + (text + eos) + closing pad/bos
-    tags = 3 + 1 + (1 if variant == "custom_voice" else 0) + 1  # think..., [speaker], pad
+    # instruct + role(3) + codec tags + (text + eos) + closing pad/bos; with an
+    # explicit language the tags are think, think_bos, language, think_eos,
+    # [speaker], pad.
+    tags = 3 + 1 + (1 if variant == "custom_voice" else 0) + 1
     assert prepared.input_seq_len == instruct_len + 3 + tags + (text_len + 1) + 1
     state = talker.request_state(f"prefill-{variant}")
     assert state["trailing_text_hidden"].shape == (0, model.config.talker.hidden_size)
