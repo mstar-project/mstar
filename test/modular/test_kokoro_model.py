@@ -440,6 +440,7 @@ def test_state_machine_and_postprocess(voices_dir):
     assert model.postprocess(torch.tensor([0.5, -1.0]), "audio") == expected
     assert model.postprocess(torch.zeros(0), "audio") == b""
     assert model.get_output_sample_rate() == model.config.sample_rate == 24000
+    assert model.get_voices() == ["af_heart", "af_sky", "am_adam"] and model.get_default_voice() == "af_heart"
     with pytest.raises(ValueError):
         model.postprocess(pcm, "text")
 
