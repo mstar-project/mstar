@@ -416,6 +416,11 @@ class ChatterboxConfig:
     # 2 streams (cost grows with every chunk); a window bounds the work per
     # chunk at the price of re-estimating the new frames with less context.
     stream_context_tokens: int = 0
+    # torch.compile the flow-matching estimator (the UNet the Euler solve
+    # calls 10 x 2 times per chunk): fuses its many small kernels, which is
+    # what a chunk's latency is made of. Dynamic shapes, so one compile covers
+    # every chunk length; costs a few minutes at startup.
+    s3gen_compile: bool = False
 
     @property
     def sample_rate(self) -> int:
