@@ -421,6 +421,14 @@ class ChatterboxConfig:
     # what a chunk's latency is made of. Dynamic shapes, so one compile covers
     # every chunk length; costs a few minutes at startup.
     s3gen_compile: bool = False
+    # ``torch.compile`` mode for the estimator: "default" fuses kernels;
+    # "reduce-overhead" also replays it as CUDA graphs (one recording per
+    # distinct shape, so pair it with ``s3gen_frame_bucket``).
+    s3gen_compile_mode: str = "default"
+    # Pad every flow solve to a multiple of this many mel frames (0 = exact
+    # length). Padding is masked, so outputs stay the same up to float noise;
+    # it bounds the number of distinct shapes the compiled estimator sees.
+    s3gen_frame_bucket: int = 0
 
     @property
     def sample_rate(self) -> int:
