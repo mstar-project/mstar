@@ -144,6 +144,7 @@ qwen3_tts = [
     "mooncake-transfer-engine",
     "qwen-tts==0.1.1",
     "safetensors",
+    "soundfile",  # reference-audio decoding for Base voice cloning
     "transformers>=4.57.3",
 ]
 
