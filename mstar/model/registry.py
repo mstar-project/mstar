@@ -17,6 +17,8 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
+    "qwen3_asr": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
+    "qwen3_asr_realtime": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
     "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "qwen3_tts_1p7b": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "qwen3_tts_voicedesign": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
@@ -26,6 +28,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
     "waypoint": ("mstar.model.waypoint.waypoint_model", "WaypointModel"),
     "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
+    "whisper_large_v3_turbo": ("mstar.model.whisper.whisper_model", "WhisperModel"),
 }
 
 HF_MODELS: dict[str, dict] = {
@@ -69,10 +72,11 @@ HF_MODELS: dict[str, dict] = {
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
-    # Qwen3-TTS 12 Hz family: one class, the variant is read from config.json.
-    # CustomVoice = built-in speakers (1.7B also takes style instructions),
-    # VoiceDesign = voice described by an instruction, Base = voice cloned
-    # from reference audio.
+    # Qwen3-ASR: AuT audio encoder + dense Qwen3 decoder. ``qwen3_asr`` is
+    # the 1.7B transcription model; ``qwen3_asr_realtime`` the 0.6B variant
+    # trained for chunked streaming, served by the same class.
+    "qwen3_asr": {"model_path_hf": "Qwen/Qwen3-ASR-1.7B"},
+    "qwen3_asr_realtime": {"model_path_hf": "Qwen/Qwen3-ASR-0.6B"},
     "qwen3_tts": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"},
     "qwen3_tts_1p7b": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"},
     "qwen3_tts_voicedesign": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"},
@@ -90,14 +94,12 @@ HF_MODELS: dict[str, dict] = {
     # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
     # only; the A14B MoE variants are a separate follow-up.
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
-    # Waypoint owns a variant -> Hub repository mapping. None is intentional:
-    # it lets WaypointModel distinguish the registry default from an explicit
-    # local path or Hub ID, then select the 720P or 360P repository named by the
-    # YAML `variant`. TAEHV is resolved independently from config.ae_uri.
-    "waypoint": {"model_path_hf": None},
-    # Whisper works for any size; the registry key pins large-v3, the
-    # standard ASR-benchmark checkpoint.
+    # Whisper works for any size (dims and token ids come from the
+    # checkpoint's configs). ``whisper_large`` pins large-v3, the standard
+    # ASR-benchmark checkpoint; ``whisper_large_v3_turbo`` is the 4-decoder-
+    # layer distillation that serves the same encoder several times faster.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
+    "whisper_large_v3_turbo": {"model_path_hf": "openai/whisper-large-v3-turbo"},
 }
 
 
