@@ -179,3 +179,69 @@ def test_euler_step_with_negated_fp32_velocity_matches_reference_scheduler():
         # the reference conditions the transformer on (1000 - t) / 1000 in fp32
         assert torch.equal((1000.0 - ours.timesteps[k]) / 1000.0, (1000 - t) / 1000)
         x = expected
+
+
+def test_refiners_and_main_layers_use_their_own_attention_span(pair):
+    """Each span's kernel sees exactly its own packed rows, and the result equals the SDPA path."""
+    from mstar.model.components.diffusion.attention import sdpa_attention
+    from mstar.model.z_image.components.transformer import ATTENTION_SPANS, CAPTION_SPAN, IMAGE_SPAN, MAIN_SPAN
+
+    _, native = pair
+    gen = torch.Generator().manual_seed(4)
+    h, w, cap_lens = 3, 5, [7, 11]
+    latents, caps, tokens, img_pad, cap_tokens, cap_pad, img_freqs, cap_freqs = _layout(
+        2, h, w, cap_lens, torch.float32, gen,
+    )
+    t = torch.tensor([0.9, 0.3])
+    n_img, n_cap = padded_length(h * w), padded_length(max(cap_lens))
+    spans = {IMAGE_SPAN: n_img, CAPTION_SPAN: n_cap, MAIN_SPAN: n_img + n_cap}
+    seen: dict[str, set[int]] = {}
+
+    def kernel(label):
+        def run(q, k, v):
+            seen.setdefault(label, set()).add(q.shape[0])
+            span = spans[label]
+            out = sdpa_attention(*(x.view(-1, span, *x.shape[1:]) for x in (q, k, v)))
+            return out.reshape(q.shape)
+
+        return run
+
+    ragged = {label: kernel(label) for label in ATTENTION_SPANS}
+    with torch.no_grad():
+        expected = native(tokens, cap_tokens, cap_pad, img_pad, t, img_freqs, cap_freqs)
+        got = native(tokens, cap_tokens, cap_pad, img_pad, t, img_freqs, cap_freqs, ragged=ragged)
+    assert seen == {IMAGE_SPAN: {2 * n_img}, CAPTION_SPAN: {2 * n_cap}, MAIN_SPAN: {2 * (n_img + n_cap)}}
+    assert torch.equal(got, expected)
+    with pytest.raises(KeyError, match="one kernel per span"):
+        native(tokens, cap_tokens, cap_pad, img_pad, t, img_freqs, cap_freqs, ragged={MAIN_SPAN: ragged[MAIN_SPAN]})
+
+
+def test_denoise_node_declares_the_three_spans():
+    from mstar.model.z_image.components.transformer import CAPTION_SPAN, IMAGE_SPAN, MAIN_SPAN
+    from mstar.model.z_image.config import ZImageConfig
+    from mstar.model.z_image.submodules import ZImageDenoiseSubmodule, ZShape
+
+    config = ZImageConfig(transformer=ZImageTransformerConfig.from_dict(TINY))
+    node = ZImageDenoiseSubmodule(
+        None, config, loop_name="denoise_loop", attn_resource_key="dit_attn", compile_transformer=False,
+    )
+    key = ZShape(grid=(3, 5), cap_len=padded_length(11))
+    assert node.attention_segments(key) == (
+        (IMAGE_SPAN, padded_length(15)), (CAPTION_SPAN, padded_length(11)), (MAIN_SPAN, key.total_tokens),
+    )
+    assert node._ragged_spans() is None  # no resource bound -> SDPA everywhere
+
+
+@pytest.mark.parametrize("steps", [8, 10, 50])
+def test_schedule_matches_the_pipeline_grid(steps):
+    """The pipeline's fp32 ``torch.linspace`` base grid (an ulp off numpy's for 10 and 50 steps)."""
+    from diffusers import FlowMatchEulerDiscreteScheduler
+    from diffusers.pipelines.z_image.pipeline_z_image import get_default_z_image_sigmas
+
+    from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
+    from mstar.model.z_image.config import ZImageConfig
+
+    ref = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=3.0, use_dynamic_shifting=False)
+    ref.set_timesteps(sigmas=get_default_z_image_sigmas(steps), mu=1.15)  # the pipeline passes an ignored mu
+    ours = FlowMatchSchedule.build(ZImageConfig().scheduler, steps, 4096)
+    assert torch.equal(ref.sigmas, ours.sigmas) and torch.equal(ref.timesteps, ours.timesteps)
