@@ -85,7 +85,13 @@ def collect(results: Path) -> list[dict]:
         else:
             continue
         wer_path = run / "wer.json"
-        row["wer"] = json.loads(wer_path.read_text())["wer"] if wer_path.exists() else None
+        if wer_path.exists():
+            wer = json.loads(wer_path.read_text())
+            row["wer"] = wer["wer"]
+            row["mean_audio_s"] = wer.get("mean_audio_s")
+        else:
+            row["wer"] = None
+            row["mean_audio_s"] = None
         sha_path = run / "sha.txt"
         row["sha"] = sha_path.read_text().split()[0][:8] if sha_path.exists() and sha_path.read_text().strip() else None
         rows.append({"system": system, "variant": variant, "options": options, "concurrency": conc,
@@ -114,8 +120,10 @@ def table(rows: list[dict], variant: str, env: dict) -> str:
         notes = []
         if r.get("succeeded") is not None and r.get("requested") and r["succeeded"] != r["requested"]:
             notes.append(f"{r['succeeded']}/{r['requested']} ok")
+        if r.get("mean_audio_s"):
+            notes.append(f"{r['mean_audio_s']:.1f} s audio/utt")
         if r["system"] == "chatterbox-vllm":
-            notes.append("offline batch API, TTFA = batch wall time")
+            notes.append("offline batch API, TTFA = batch wall time, RTF = batch compute/audio")
             if r.get("t3_tokens_per_s"):
                 notes.append(f"T3 {r['t3_tokens_per_s']:.0f} tok/s")
         lines.append(
@@ -154,12 +162,27 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results", required=True)
     parser.add_argument("--out", default=None, help="markdown file (default: <results>/TABLE.md)")
+    parser.add_argument(
+        "--curated", action="store_true",
+        help="only the rows the PR table needs: baselines, the shipped defaults ('final') and the "
+             "offline decoder ('fix_chunk0' / 'chunk0' without lost requests)",
+    )
     args = parser.parse_args()
     results = Path(args.results)
     rows = collect(results)
     env = read_env(results)
+    if args.curated:
+        keep = {"": True, "final": True, "fix_chunk0": True, "refsampling": True}
+        rows = [r for r in rows if r["system"] != "M*" or r["options"] in keep]
+        for r in rows:
+            if r["options"] == "final":
+                r["options"] = "default: stream 15/50/100/200, ctx 25"
+            elif r["options"] == "fix_chunk0":
+                r["options"] = "offline decoder (stream_chunk_tokens 0)"
+            elif r["options"] == "" and r["system"] == "M*":
+                r["options"] = "earlier default: fixed 25-token chunks"
     md = "\n\n".join(table(rows, v, env) for v in ("chatterbox", "turbo") if any(r["variant"] == v for r in rows))
-    out = Path(args.out) if args.out else results / "TABLE.md"
+    out = Path(args.out) if args.out else results / ("TABLE_curated.md" if args.curated else "TABLE.md")
     out.write_text(md + "\n")
     (results / "TABLE.json").write_text(json.dumps({"env": env, "rows": rows}, indent=2))
     print(md)
