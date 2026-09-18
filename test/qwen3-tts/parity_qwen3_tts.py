@@ -41,7 +41,7 @@ import torch
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine.resources import StepContext, StepRunner, resolve_spec_dependencies
+from mstar.engine.resources import StepContext, StepRunner, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
@@ -53,6 +53,19 @@ GREEDY_KWARGS = {"do_sample": False, "subtalker_dosample": False}
 # ---------------------------------------------------------------------------
 # Checkpoint + reference
 # ---------------------------------------------------------------------------
+
+
+def default_deployment(config) -> str | None:
+    """The deployment YAML ``mstar serve`` would use for this checkpoint variant."""
+    root = Path(__file__).resolve().parents[2] / "configs"
+    if config.is_base:
+        name = "qwen3tts_base.yaml"
+    elif config.is_voice_design:
+        name = "qwen3tts_voicedesign.yaml"
+    else:
+        name = "qwen3tts.yaml" if config.tts_model_size == "0b6" else "qwen3tts_1p7b.yaml"
+    path = root / name
+    return str(path) if path.is_file() else None
 
 
 def resolve_snapshot(repo: str) -> str:
@@ -174,12 +187,19 @@ class MStarTalkerDriver:
     from the model's own ``get_node_resources`` declaration.
     """
 
-    def __init__(self, model: Qwen3TTSModel, talker, device: str, max_num_pages: int = 64):
+    def __init__(self, model: Qwen3TTSModel, talker, device: str, deployment: str | None = None,
+                 max_num_pages: int = 64):
         self.model = model
         self.talker = talker
         self.device = torch.device(device)
         specs = model.get_node_resources()
         by_key = resolve_spec_dependencies(specs)
+        if deployment is not None:
+            # The served deployment's resource overrides (e.g. the FA2 pin), so
+            # the harness runs the same kernels as ``mstar serve``.
+            import yaml
+
+            apply_yaml_overrides(specs, yaml.safe_load(Path(deployment).read_text(encoding="utf-8")))
         for spec in specs:
             if hasattr(spec, "apply_yaml_overrides") and hasattr(spec.config, "max_num_pages"):
                 spec.apply_yaml_overrides(max_num_pages=max_num_pages)
@@ -382,6 +402,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--frames", type=int, default=64)
     parser.add_argument("--repetition-penalty", type=float, default=1.05)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--config", default=None,
+                        help="deployment YAML for resource overrides (default: the variant's)")
     parser.add_argument("--json", default=None)
     args = parser.parse_args(argv)
     if args.voice == "":
@@ -396,7 +418,9 @@ def main(argv: list[str] | None = None) -> None:
     model = Qwen3TTSModel(model_path_hf=snapshot)
     talker = model.get_submodule("Talker", device=args.device, autocast_dtype=torch.bfloat16)
     codec = model.get_submodule("Codec", device=args.device)
-    driver = MStarTalkerDriver(model, talker, args.device)
+    deployment = args.config or default_deployment(model.config)
+    print(f"resource overrides from {deployment}", file=sys.stderr)
+    driver = MStarTalkerDriver(model, talker, args.device, deployment=deployment)
     print(f"M* loaded in {time.perf_counter() - t0:.1f}s", file=sys.stderr)
 
     request_kwargs = {"language": args.language, **GREEDY_KWARGS,
