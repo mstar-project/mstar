@@ -2851,10 +2851,13 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
             token = inputs["text_inputs"][0].reshape(-1)[-1:]
             pos = st["next_pos"]
             st.add("next_pos", pos + 1)
+            # On the token's device: a captured decode pads the batch with the
+            # capture config's device-resident rows, and `preprocess` concatenates
+            # every row's position ids into one tensor.
             return ARNodeInputs(
                 input_ids=token,
                 input_seq_len=1,
-                tensor_inputs={"position_ids": torch.full((3, 1), pos, dtype=torch.long)},
+                tensor_inputs={"position_ids": torch.full((3, 1), pos, dtype=torch.long, device=token.device)},
             )
         raise ValueError(f"Unknown Cosmos3 reasoner graph walk: {graph_walk!r}")
 
@@ -2900,9 +2903,14 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
     # ------------------------------------------------------------------
 
     def preprocess(self, graph_walk, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]) -> dict:
+        # One device for the whole batch: prompt rows arrive on the model's
+        # device, decode rows follow their token, and a captured step's padding
+        # rows are the capture config's. Sequential requests never mix them;
+        # a padded batch does.
+        device = inputs[0].input_ids.device
         out = {
-            "input_ids": torch.cat([inp.input_ids for inp in inputs]),
-            "position_ids": torch.cat([inp.tensor_inputs["position_ids"] for inp in inputs], dim=1),
+            "input_ids": torch.cat([inp.input_ids.to(device) for inp in inputs]),
+            "position_ids": torch.cat([inp.tensor_inputs["position_ids"].to(device) for inp in inputs], dim=1),
             "seq_lens": [int(inp.input_seq_len) for inp in inputs],
         }
         vision = [inp.tensor_inputs["vision_embeds"] for inp in inputs if "vision_embeds" in inp.tensor_inputs]
