@@ -138,6 +138,10 @@ Qwen3-TTS notes
   ``code_predictor`` aux sampler, so custom values neither block batching nor
   fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
   Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
+- The codec decoder runs in float32 by default, reproducing the reference
+  decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
+  deployment YAML halves its GPU time when throughput matters more than
+  bit-exactness (the Talker is bf16 either way).
 - Weight loading checks coverage in both directions: a parameter the checkpoint
   does not fill, or a checkpoint tensor the port does not load, fails startup.
 - The 12 Hz codec does not require the system SoX executable. M* imports only
