@@ -86,6 +86,8 @@ def collect(results: Path) -> list[dict]:
             continue
         wer_path = run / "wer.json"
         row["wer"] = json.loads(wer_path.read_text())["wer"] if wer_path.exists() else None
+        sha_path = run / "sha.txt"
+        row["sha"] = sha_path.read_text().split()[0][:8] if sha_path.exists() and sha_path.read_text().strip() else None
         rows.append({"system": system, "variant": variant, "options": options, "concurrency": conc,
                      "run": run.name, **row})
     return rows
@@ -106,6 +108,8 @@ def table(rows: list[dict], variant: str, env: dict) -> str:
     for r in sorted((r for r in rows if r["variant"] == variant),
                     key=lambda r: (r["system"] != "M*", r["system"], r["options"], r["concurrency"])):
         version = env.get(r["system"], "")
+        if r["system"] == "M*" and r.get("sha"):
+            version = f"(`{r['sha']}`)" + version.split(")", 1)[1] if ")" in version else f"(`{r['sha']}`)"
         label = r["system"] + (f" [{r['options']}]" if r["options"] else "")
         notes = []
         if r.get("succeeded") is not None and r.get("requested") and r["succeeded"] != r["requested"]:
