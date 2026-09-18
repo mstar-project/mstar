@@ -63,14 +63,35 @@ class PackageSynth:
         return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
 
+ASR_SAMPLE_RATE = 16000
+WHISPER_WINDOW_SECONDS = 30
+
+
 def transcribe(wavs: list[Path], asr_model: str, device: str, batch_size: int) -> list[str]:
+    """Whisper transcripts of the files (each at most one 30 s window)."""
+    import soundfile as sf
     import torch
-    from transformers import pipeline
+    from scipy.signal import resample_poly
+    from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
     dtype = torch.float16 if device.startswith("cuda") else torch.float32
-    asr = pipeline("automatic-speech-recognition", model=asr_model, device=device, dtype=dtype)
-    out = asr([str(p) for p in wavs], batch_size=batch_size, generate_kwargs={"language": "en", "task": "transcribe"})
-    return [o["text"] for o in out]
+    processor = WhisperProcessor.from_pretrained(asr_model)
+    model = WhisperForConditionalGeneration.from_pretrained(asr_model, dtype=dtype).to(device).eval()
+    clips = []
+    for path in wavs:
+        audio, rate = sf.read(path, dtype="float32")
+        audio = audio if audio.ndim == 1 else audio.mean(axis=1)
+        g = np.gcd(rate, ASR_SAMPLE_RATE)
+        clip = resample_poly(audio, ASR_SAMPLE_RATE // g, rate // g).astype(np.float32)
+        clips.append(clip[: WHISPER_WINDOW_SECONDS * ASR_SAMPLE_RATE])
+    texts: list[str] = []
+    with torch.no_grad():
+        for start in range(0, len(clips), batch_size):
+            batch = clips[start : start + batch_size]
+            features = processor(batch, sampling_rate=ASR_SAMPLE_RATE, return_tensors="pt").input_features
+            ids = model.generate(features.to(device=device, dtype=dtype), language="en", task="transcribe")
+            texts.extend(processor.batch_decode(ids, skip_special_tokens=True))
+    return texts
 
 
 def main() -> None:
