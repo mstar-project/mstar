@@ -172,15 +172,21 @@ def main() -> None:
     rows = collect(results)
     env = read_env(results)
     if args.curated:
-        keep = {"": True, "final": True, "fix_chunk0": True, "refsampling": True}
-        rows = [r for r in rows if r["system"] != "M*" or r["options"] in keep]
+        # the PR rows: shipped defaults and the offline decoder per node, the earlier default,
+        # and every baseline run (n04 = first allocation, n08 = second; the nodes differ)
+        labels = {
+            "final": "default (n04)", "final_n08": "default (n08)",
+            "fix_chunk0": "offline decoder, stream_chunk_tokens 0 (n08)",
+            "": "earlier default: fixed 25-token chunks (n04)",
+        }
+        rows = [r for r in rows if r["system"] != "M*" or r["options"] in labels]
         for r in rows:
-            if r["options"] == "final":
-                r["options"] = "default: stream 15/50/100/200, ctx 25"
-            elif r["options"] == "fix_chunk0":
-                r["options"] = "offline decoder (stream_chunk_tokens 0)"
-            elif r["options"] == "" and r["system"] == "M*":
-                r["options"] = "earlier default: fixed 25-token chunks"
+            if r["system"] == "M*":
+                r["options"] = labels[r["options"]]
+            elif r["system"] == "Chatterbox-TTS-Server":
+                r["options"] = "n08" if r["options"] == "n08" else "n04"
+            elif r["system"] == "chatterbox-vllm":
+                r["options"] = ("reference sampling, " if r["options"] == "refsampling" else "its defaults, ") + "n04"
     md = "\n\n".join(table(rows, v, env) for v in ("chatterbox", "turbo") if any(r["variant"] == v for r in rows))
     out = Path(args.out) if args.out else results / ("TABLE_curated.md" if args.curated else "TABLE.md")
     out.write_text(md + "\n")
