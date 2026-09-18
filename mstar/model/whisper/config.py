@@ -43,6 +43,10 @@ DETECT_LANGUAGE_WALK = "detect_language"
 PREFILL_PROMPT_WALK = "prefill_prompt"
 DECODE_WALK = "decode"
 DECODE_LOOP = "decode_loop"
+# ``align`` runs after the decode loop when word timestamps were asked for:
+# one teacher-forced pass over the transcript whose cross-attention gives
+# every word its start and end (see ``components/alignment.py``).
+ALIGN_WALK = "align"
 
 
 @dataclass
