@@ -281,10 +281,13 @@ The OpenAI routes are ``POST /v1/images/generations`` (``size`` as ``WxH``, ``se
 conditioning tokens, in order).
 
 Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
-``attention_backend`` (``flashinfer``: the DiT's joint attention runs on the engine's
-ragged FlashInfer resource and is CUDA-graph replayable; ``sdpa``: the reference
-kernel, used by the parity suite), ``compile`` (``torch.compile`` of the transformer,
-one trace per shape), ``cuda_graph`` with ``capture_sizes`` / ``capture_batch_sizes``
+``attention_backend`` (``sdpa``, the default: the reference kernel, cuDNN on an H100,
+measured as fast as FlashInfer in the served path; ``flashinfer``: the DiT's joint
+attention runs on the engine's ragged FlashInfer resource, also CUDA-graph replayable),
+``compile`` (``torch.compile`` of the transformer, one trace per shape) with
+``compile_eager_rounding`` (inductor rounds intermediates where eager PyTorch does, which
+keeps the compiled transformer within about 41 dB PSNR of the eager path on a 4-step
+sampler instead of 35 to 39 dB), ``cuda_graph`` with ``capture_sizes`` / ``capture_batch_sizes``
 (the denoise step, Euler update included, is captured per listed ``[height, width]``
 and batch size; other shapes run the eager batched path), ``max_batch_size``, and
 ``vae_compile`` (``torch.compile`` of the VAE decode with inductor autotuning: 89 to 29 ms
