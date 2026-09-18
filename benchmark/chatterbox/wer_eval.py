@@ -31,19 +31,31 @@ ASR_MODEL = "openai/whisper-large-v3-turbo"
 
 
 def transcribe(wavs: list[Path], model_id: str, device: str, batch_size: int) -> list[str]:
-    from transformers import pipeline
+    """Whisper via the model classes directly: the ASR pipeline's preprocess
+    imports torchcodec (FFmpeg libraries the nodes lack) even for in-memory
+    arrays, and soundfile already gives us the samples."""
+    from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
     dtype = torch.float16 if device.startswith("cuda") else torch.float32
-    asr = pipeline("automatic-speech-recognition", model=model_id, torch_dtype=dtype, device=device)
+    processor = WhisperProcessor.from_pretrained(model_id)
+    model = WhisperForConditionalGeneration.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
     samples = []
     for path in wavs:
         data, sr = sf.read(str(path), dtype="float32", always_2d=True)
         wav = torch.from_numpy(data).mean(dim=1)
         if sr != 16000:
             wav = resample(wav, sr, 16000)
-        samples.append({"raw": wav.numpy(), "sampling_rate": 16000})
-    outputs = asr(samples, batch_size=batch_size, generate_kwargs={"language": "en", "task": "transcribe"})
-    return [o["text"].strip() for o in outputs]
+        samples.append(wav.numpy())
+    texts: list[str] = []
+    for start in range(0, len(samples), batch_size):
+        batch = samples[start:start + batch_size]
+        feats = processor.feature_extractor(batch, sampling_rate=16000, return_tensors="pt").input_features
+        with torch.inference_mode():
+            ids = model.generate(
+                feats.to(device, dtype), language="en", task="transcribe", max_new_tokens=220,
+            )
+        texts.extend(t.strip() for t in processor.batch_decode(ids, skip_special_tokens=True))
+    return texts
 
 
 def main() -> None:
@@ -53,6 +65,7 @@ def main() -> None:
     parser.add_argument("--asr-model", default=ASR_MODEL)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--limit", type=int, default=0, help="only the first N files (smoke tests)")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
@@ -61,6 +74,8 @@ def main() -> None:
     indexed = {p: int(p.stem.removeprefix("req_")) for p in Path(args.wavs).glob("*.wav")
                if p.stem.removeprefix("req_").isdigit()}
     wavs = sorted(indexed, key=indexed.get)
+    if args.limit:
+        wavs = wavs[: args.limit]
     if not wavs:
         raise SystemExit(f"no <index>.wav / req_<index>.wav files under {args.wavs}")
     references = [sentences[indexed[p] % len(sentences)] for p in wavs]
