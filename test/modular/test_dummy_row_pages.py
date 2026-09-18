@@ -32,14 +32,21 @@ from mstar.model.submodule_base import ARNodeInputs
 class _StubTransferManager:
     """No engine, no bytes moved."""
 
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
-    def get_kv_transfer_info(self):
-        return None
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del transfer_info, kwargs
+        return False
 
     def cleanup(self):
         pass
+
+    def remove_request(self, request_id):
+        del request_id
 
 
 @pytest.fixture(autouse=True)
