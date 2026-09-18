@@ -109,6 +109,11 @@ class KokoroModel(Model):
 
     # -- request preprocessing (API data worker) -----------------------------
 
+    def warmup_preprocess(self) -> None:
+        """Build the default language's G2P (spaCy tagger, lexicon) before the
+        first request; it takes several seconds."""
+        self.g2p.backend(self.default_lang or self.voices.language_of(self.config.default_voice))
+
     def tokenize(self, phonemes: str) -> list[int]:
         """Phoneme string -> ``[<bos>, ids..., <eos>]``; characters outside the
         vocabulary are dropped, as in the reference."""
