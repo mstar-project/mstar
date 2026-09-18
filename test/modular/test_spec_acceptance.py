@@ -175,3 +175,22 @@ def test_kv_plan_takes_the_rejected_tail_back(monkeypatch):
     before = kv._streams["a"]["main"].stored_len
     kv.plan(s3.get("kv"), ctx3)
     assert kv._streams["a"]["main"].stored_len == before
+
+
+def test_staged_drafts_ride_along_for_a_trace():
+    """When the forward stages the drafts too, the verdict carries them (the debug trace of drafts against the
+    verified tokens); without them the verdict's drafts are None."""
+    res = spec_resource()
+    res.ingest_request("a")
+    s, ctx = step(["a"])
+    res.plan(s.get("spec_acceptance"), ctx)
+    res.stage(torch.tensor([2], dtype=torch.int32), torch.tensor([[5, 6, 7, 8, 9]], dtype=torch.int32),
+              torch.tensor([[5, 6, 1, 2]], dtype=torch.int32))
+    res.commit(s.get("spec_acceptance"), ctx)
+    v = res.verdicts_for(["a"])[0]
+    assert v.accepted == 2 and v.tokens == [5, 6, 7, 8, 9] and v.drafts == [5, 6, 1, 2]
+    s2, ctx2 = step(["a"])
+    res.plan(s2.get("spec_acceptance"), ctx2)
+    res.stage(torch.tensor([0], dtype=torch.int32), torch.tensor([[3, 0, 0, 0, 0]], dtype=torch.int32))
+    res.commit(s2.get("spec_acceptance"), ctx2)
+    assert res.verdicts_for(["a"])[0].drafts is None
