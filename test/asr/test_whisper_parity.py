@@ -135,9 +135,10 @@ def test_word_timestamps_match_hf_token_timestamps(models):
                 feats.cuda().to(torch.bfloat16), language="en", task="transcribe",
                 return_token_timestamps=True, return_timestamps=False, num_frames=wave.numel() // 160,
             )
-        tokens = out.sequences[0].tolist()
+        out = dict(out) if not isinstance(out, dict) else out  # a ModelOutput or a plain dict, by transformers version
+        tokens = out["sequences"][0].tolist()
         text = [t for t in tokens[4:] if t < model.config.eos_token_id]  # after <|sot|><|en|><|transcribe|><|nots|>
-        hf_times = out.token_timestamps[0].tolist()  # one per output position, first text token at index 4
+        hf_times = out["token_timestamps"][0].tolist()  # one per output position, first text token at index 4
         # ours: the same teacher-forced sequence through the served decoder weights
         encoder_states = enc_sub.encoder(
             enc_sub.log_mel(enc_sub.log_mel.pad_or_trim(wave.cuda())).to(torch.bfloat16).unsqueeze(0)
