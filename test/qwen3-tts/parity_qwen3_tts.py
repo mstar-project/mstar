@@ -401,17 +401,43 @@ def decode_audio(codec, codes: torch.Tensor) -> torch.Tensor:
     return wav.squeeze().float()
 
 
+_FP32_TOKENIZER = {}
+
+
+def reference_fp32_tokenizer(snapshot: str, device: str):
+    """The reference speech tokenizer in float32 (M* runs its codec in float32;
+    the reference wrapper would otherwise inherit the Talker's bf16)."""
+    key = (snapshot, device)
+    if key not in _FP32_TOKENIZER:
+        from qwen_tts import Qwen3TTSTokenizer
+
+        _FP32_TOKENIZER[key] = Qwen3TTSTokenizer.from_pretrained(
+            str(Path(snapshot) / "speech_tokenizer"), device_map=device, dtype=torch.float32,
+        )
+    return _FP32_TOKENIZER[key]
+
+
 @torch.no_grad()
 def reference_decode_audio(snapshot: str, device: str, codes: torch.Tensor) -> torch.Tensor:
-    """Reference codec in float32 (M* runs its codec in float32; the reference
-    wrapper would otherwise inherit the Talker's bf16)."""
-    from qwen_tts import Qwen3TTSTokenizer
-
-    tokenizer = Qwen3TTSTokenizer.from_pretrained(
-        str(Path(snapshot) / "speech_tokenizer"), device_map=device, dtype=torch.float32,
-    )
-    wavs, _ = tokenizer.decode([{"audio_codes": codes}])
+    wavs, _ = reference_fp32_tokenizer(snapshot, device).decode([{"audio_codes": codes}])
     return torch.as_tensor(wavs[0]).float()
+
+
+@torch.no_grad()
+def reference_encode_fp32(snapshot: str, device: str, clip_path: str) -> torch.Tensor:
+    """Reference encoder (float32) codes ``[frames, groups]`` for the clip."""
+    tokenizer = reference_fp32_tokenizer(snapshot, device)
+    return tokenizer.encode(clip_path).audio_codes[0].to(device)
+
+
+def code_agreement(ours: torch.Tensor, theirs: torch.Tensor) -> dict[str, Any]:
+    n = min(ours.shape[0], theirs.shape[0])
+    same = (ours[:n] == theirs[:n])
+    return {
+        "frames": n,
+        "all_groups": float(same.float().mean()),
+        "per_group": [round(float(v), 3) for v in same.float().mean(dim=0)],
+    }
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -484,8 +510,6 @@ def main(argv: list[str] | None = None) -> None:
                 "talker_prefill_clone", ModelInputsFromEngine(request_ids=["clone"], per_request_info={}),
                 **ref_encoder.preprocess("talker_prefill_clone", None, [prepared]),
             )
-        tensors["speaker_embed"] = encoded["speaker_embed"]
-        tensors["ref_codes"] = encoded["ref_codes"]
         _, item = clone
         their_xvec = item.ref_spk_embedding.to(args.device).float()
         our_xvec = encoded["speaker_embed"][0].float()
@@ -494,15 +518,25 @@ def main(argv: list[str] | None = None) -> None:
             "xvector_max_abs_diff": float((our_xvec - their_xvec).abs().max()),
             "xvector_scale": float(their_xvec.abs().mean()),
         }
+        tensors["speaker_embed"] = encoded["speaker_embed"]
+        tensors["ref_codes"] = encoded["ref_codes"]
         if item.ref_code is not None:
-            their_codes = item.ref_code.to(args.device)
+            # M*'s float32 Mimi encoder vs the reference's own codes (bf16, the
+            # default dtype it inherits) and vs the reference encoder in float32.
             our_codes = encoded["ref_codes"][0]
-            n = min(their_codes.shape[0], our_codes.shape[0])
+            their_codes = item.ref_code.to(args.device)
+            fp32_codes = reference_encode_fp32(snapshot, args.device, args.ref_audio)
             clone_report.update({
                 "ref_frames_mstar": int(our_codes.shape[0]),
                 "ref_frames_reference": int(their_codes.shape[0]),
-                "ref_code_agreement": float((our_codes[:n] == their_codes[:n]).float().mean()),
+                "ref_code_agreement": code_agreement(our_codes, their_codes)["all_groups"],
+                "ref_codes_vs_reference_bf16": code_agreement(our_codes, their_codes),
+                "ref_codes_vs_reference_fp32": code_agreement(our_codes, fp32_codes),
+                "reference_fp32_vs_bf16": code_agreement(fp32_codes, their_codes),
             })
+            # The Talker comparison must see the same in-context frames on both
+            # sides, so M* is fed the reference's own codes from here on.
+            tensors["ref_codes"] = [their_codes]
         del ref_encoder
         torch.cuda.empty_cache()
 
