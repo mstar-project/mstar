@@ -27,6 +27,7 @@ from mstar.model.cosmos3.cosmos3_model import (
     Cosmos3Model,
 )
 from mstar.model.cosmos3.submodules import ATTN, KV_CACHE, REASONER_DECODE_LOOP, SAMPLER
+from mstar.model.submodule_base import ARNodeInputs
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 
@@ -273,6 +274,35 @@ def test_reasoner_submodule_step_and_stop(tmp_path) -> None:
     out = {"new_token": [torch.tensor([12])]}
     sub.postprocess("r", info, out)
     assert out["text_inputs"] is out["new_token"]
+
+
+def test_reasoner_padded_decode_batch_shares_one_device(tmp_path) -> None:
+    """A captured decode pads the batch with the capture config's rows, which
+    live on the model's device; the real rows' position ids must land there
+    too, or the batch concatenation fails (seen on H100 with three concurrent
+    requests filling a bucket of four)."""
+    import types
+
+    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+
+    model = _model(tmp_path)
+    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config)
+    fwd = types.SimpleNamespace(request_id="r", step_metadata={})
+    sub.request_state("r").add_all(next_pos=6)
+
+    token = torch.tensor([42])
+    dec = sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [token]})
+    assert dec.tensor_inputs["position_ids"].device == token.device
+
+    # Padding rows shaped like the capture config's single-request inputs.
+    pad = ARNodeInputs(
+        input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=1,
+        tensor_inputs={"position_ids": torch.zeros((3, 1), dtype=torch.long)},
+    )
+    out = sub.preprocess(Cosmos3Model.REASONER_DECODE_WALK, None, [dec, pad, pad, pad])
+    assert out["input_ids"].tolist() == [42, 0, 0, 0]
+    assert out["position_ids"].tolist() == [[6, 0, 0, 0]] * 3 and out["seq_lens"] == [1, 1, 1, 1]
+    assert out["input_ids"].device == out["position_ids"].device == token.device
 
 
 def test_edge_chat_adapter(tmp_path) -> None:
