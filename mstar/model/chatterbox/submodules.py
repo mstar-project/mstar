@@ -462,6 +462,7 @@ class _ChunkPlan:
     generator: torch.Generator
     is_final: bool
     usable: int = 0
+    window_start: int = 0  # first token of the flow solve (0 = whole history)
     row: FlowRow | None = None
     ready: torch.Tensor | None = None
 
@@ -524,6 +525,7 @@ class S3GenSubmodule(NodeSubmodule):
         self.frames_per_token = s3.token_mel_ratio
         self.samples_per_frame = s3.hift.upsample_factor
         self.lookahead_tokens = s3.encoder.pre_lookahead_len
+        self.context_tokens = config.stream_context_tokens
         self.cache_frames = config.stream_mel_cache_frames
         self.cache_samples = self.cache_frames * self.samples_per_frame
         # crossfade of the re-synthesised tail: the second half of a Hamming
@@ -651,10 +653,23 @@ class S3GenSubmodule(NodeSubmodule):
         # noise drawn on the spot from the request's generator (bit-exact with
         # the package). A stream instead denoises one fixed field every chunk.
         whole = is_final and state.token_offset == 0 and state.noise is None
+        if whole:
+            plan.row = FlowRow(tokens=state.tokens, ref=ref, finalize=True, generator=generator)
+            return plan
+        # A bounded window keeps only the last ``context_tokens`` settled
+        # tokens (plus the prompt) in the solve; the noise field is sliced by
+        # absolute frame so every frame keeps the draw it was started with.
+        start = 0
+        if self.context_tokens > 0:
+            start = max(state.token_offset - self.context_tokens, 0)
+        plan.window_start = start
+        noise = self._noise_field(state, ref, generator)
+        if start > 0:
+            prompt_frames = ref.num_prompt_tokens * self.frames_per_token
+            gen = noise[:, :, prompt_frames + start * self.frames_per_token : prompt_frames + n * self.frames_per_token]
+            noise = torch.cat([noise[:, :, :prompt_frames], gen], dim=2)
         plan.row = FlowRow(
-            tokens=state.tokens, ref=ref, finalize=is_final,
-            noise=None if whole else self._noise_field(state, ref, generator),
-            generator=generator,
+            tokens=state.tokens[start:], ref=ref, finalize=is_final, noise=noise, generator=generator,
         )
         return plan
 
@@ -662,7 +677,7 @@ class S3GenSubmodule(NodeSubmodule):
         """Vocode the frames the flow solve added, continuing the vocoder's
         held-back tail, and return the waveform to emit now."""
         state = plan.state
-        new_mel = mel[:, :, state.token_offset * self.frames_per_token:]
+        new_mel = mel[:, :, (state.token_offset - plan.window_start) * self.frames_per_token:]
         state.token_offset = plan.usable
 
         first = state.hift_mel is None
