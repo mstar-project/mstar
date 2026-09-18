@@ -8,8 +8,10 @@ against the reference scheduler once.
 
 Numerics follow diffusers ``FlowMatchEulerDiscreteScheduler`` to the bit:
 
-* the base grid is ``np.linspace(1.0, 1 / N, N)`` (float64) cast to float32,
-  which is what the FLUX.2 / Z-Image pipelines hand to ``set_timesteps``;
+* the base grid is ``np.linspace(1.0, 1 / N, N)`` (float64) cast to float32, as
+  the FLUX.2 pipelines hand it to ``set_timesteps``, or float32 ``torch.linspace``
+  (``torch_linspace=True``) as the Z-Image pipeline does; the two differ by one
+  ulp for most ``N`` (they agree at 1, 2, 4, 8, 16);
 * the shift is applied in float32 numpy arithmetic with a Python-float ``mu``
   (NumPy's NEP-50 promotion keeps float32), so the sigmas equal the reference's
   ``self.sigmas`` exactly;
@@ -50,6 +52,9 @@ class FlowMatchConfig:
     max_shift: float = 1.15
     base_image_seq_len: int = 256
     max_image_seq_len: int = 4096
+    # The pipeline's base grid: float64 numpy linspace cast to float32 (FLUX.2) or
+    # float32 torch.linspace (Z-Image). Not in the scheduler config; the pipeline picks.
+    torch_linspace: bool = False
 
     @classmethod
     def from_scheduler_config(cls, cfg: dict, empirical_mu: bool = False) -> "FlowMatchConfig":
@@ -130,8 +135,11 @@ class FlowMatchSchedule:
     def build(cls, config: FlowMatchConfig, num_steps: int, image_seq_len: int) -> "FlowMatchSchedule":
         if num_steps < 1:
             raise ValueError(f"num_steps must be >= 1, got {num_steps}")
-        # The pipelines' explicit grid: float64 linspace, then the scheduler's float32 cast.
-        sigmas = np.linspace(1.0, 1 / num_steps, num_steps).astype(np.float32)
+        # The pipelines' explicit grid, then the scheduler's float32 numpy arithmetic.
+        if config.torch_linspace:
+            sigmas = torch.linspace(1.0, 1 / num_steps, num_steps, dtype=torch.float32).numpy()
+        else:
+            sigmas = np.linspace(1.0, 1 / num_steps, num_steps).astype(np.float32)
         mu: float | None = None
         if config.shift_mode is ShiftMode.EMPIRICAL_MU:
             mu = compute_empirical_mu(image_seq_len, num_steps)
