@@ -324,8 +324,11 @@ def _forward_step(
             # ids — those were the batch at capture time — so entry i belongs
             # to real request i.
             out_ids = cg_runner.slot_for(lease).dummy_rids
+            # A copy per request, as the engine's collect step makes: the
+            # runner keeps ``raw`` as its static output mapping, and the
+            # submodule's postprocess rewrites the dict it is handed.
             out = {
-                rid: raw[out_id]
+                rid: dict(raw[out_id])
                 for rid, out_id in zip(real_ids, out_ids, strict=False)
             }
         else:
@@ -780,7 +783,10 @@ def test_cross_request_batch_matches_individual() -> None:
     rids = [f"r{i}" for i in range(len(prompts))]
     conds, unconds = [], []
     for p in prompts:
-        c, u = tokenize_prompt(model.tokenizer, p, "", num_frames=1, height=H, width=W)
+        c, u = tokenize_prompt(
+            model.tokenizer, p, "", num_frames=1, height=H, width=W,
+            use_system_prompt=False, add_resolution_template=False, add_duration_template=False,
+        )
         conds.append(c)
         unconds.append(u)
     gen = torch.Generator(device=device).manual_seed(SEED)
@@ -1069,9 +1075,12 @@ def _run_cuda_graph_denoise(ctx):
     groups = JointGroups(
         tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(),
     )
+    # The runner's autocast scope is the engine's: none for a node that pins
+    # its own precision (the DiT forwards run native bf16), else the model's.
     cg_runner = CudaGraphRunner(
         submodule_name="dit", submodule=dit, resources=resources,
-        step_runner=StepRunner(resources), device=dev, autocast_dtype=dtype,
+        step_runner=StepRunner(resources), device=dev,
+        autocast_dtype=None if dit.disable_autocast else model.get_autocast_dtype(),
         joint_comm_group=groups, num_slots=1,
     )
     cg_runner.warmup_and_capture()
