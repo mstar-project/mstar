@@ -541,7 +541,8 @@ def test_qwen3_tts_validates_speaker_dialect_after_language_override():
     ("prompt", "inputs", "outputs", "kwargs", "message"),
     [
         ("", ["text"], ["audio"], {}, "non-empty"),
-        ("hello", ["audio"], ["audio"], {}, "text input only"),
+        ("hello", ["audio"], ["audio"], {}, "does not take reference audio"),
+        ("hello", ["video", "text"], ["audio"], {}, "text input only"),
         ("hello", ["text"], ["text"], {}, "audio output only"),
         ("hello", ["text"], ["audio", "text"], {}, "audio output only"),
         ("hello", ["text"], ["audio"], {"voice": "unknown"}, "speaker"),
