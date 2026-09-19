@@ -15,11 +15,15 @@ from typing import Any, Callable
 
 import torch
 
-_enabled = os.environ.get("MSTAR_AUX_STREAM", "0") == "1"  # off until the served windows say it pays
+# On by default: on the pruned75 checkpoint at TP8 (8 x H100) the captured step's span fell from 23.8 to
+# 22.5 ms at 8 rows, 32.5 to 30.3 at 32 and 41.6 to 39.8 at 64 (client ITL 1 to 2 ms lower at every
+# concurrency), while the kernels' summed time rose 3 to 4 ms from sharing the GPU. MSTAR_AUX_STREAM=0
+# keeps every captured step on one stream.
+_enabled = os.environ.get("MSTAR_AUX_STREAM", "1") == "1"
 
 
 def aux_stream_enabled() -> bool:
-    """``MSTAR_AUX_STREAM=1`` turns the two-stream captures on (off by default until measured)."""
+    """``MSTAR_AUX_STREAM=0`` turns the two-stream captures off (on by default)."""
     return _enabled
 
 
