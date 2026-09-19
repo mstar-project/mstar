@@ -33,6 +33,7 @@ def _kda_recurrent_checkpoint_kernel(
     N: tl.int64,
     H: tl.constexpr, K: tl.constexpr, V: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
     stride_state_slot: tl.constexpr,
+    OUT_SKIP: tl.constexpr, OUT_T: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
 ):
     pid = tl.program_id(0).to(tl.int64)
@@ -59,7 +60,11 @@ def _kda_recurrent_checkpoint_kernel(
     p_v = v + (bos * H + i_h) * V + o_v
     p_g = g + (bos * H + i_h) * K + o_k
     p_beta = beta + bos * H + i_h
-    p_o = o + (bos * H + i_h) * V + o_v
+    if OUT_T > 0:
+        # block-only outputs: rows of OUT_SKIP + OUT_T tokens, the first OUT_SKIP (the prefix) not stored
+        p_o = o + ((i_n * OUT_T - OUT_SKIP) * H + i_h) * V + o_v
+    else:
+        p_o = o + (bos * H + i_h) * V + o_v
     p_h = states + slot * stride_state_slot + i_h * K * V + o_v[:, None] * K + o_k[None, :]
 
     b_h = tl.load(p_h, mask=mask_h, other=0).to(tl.float32)
@@ -84,7 +89,10 @@ def _kda_recurrent_checkpoint_kernel(
         b_v *= b_beta
         b_h += b_v[:, None] * b_k[None, :]
         b_o = tl.sum(b_h * b_q[None, :], 1)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+        if OUT_T > 0:
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v & (i_t >= OUT_SKIP))
+        else:
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
         if i_t == ckpt:
             tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
         p_q += H * K
@@ -99,11 +107,15 @@ def kda_recurrent_checkpoint(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor,
     A_log: torch.Tensor, dt_bias: torch.Tensor, states: torch.Tensor, slot_ids: torch.Tensor,
     checkpoint_pos: torch.Tensor, cu_seqlens: torch.Tensor, scale: float, lower_bound: float | None,
+    out_skip: int = 0,
 ) -> torch.Tensor:
     """``q, k, v, g [T, H, D]`` (raw g), ``beta [T, H]`` (raw), packed rows per ``cu_seqlens [N+1]``
     int32; ``states [slots, H, D, D]`` fp32 V-first, read at ``slot_ids [N]`` and written there
     after token ``checkpoint_pos [N]`` of the row (negative: never). Returns ``o [T, H, D]`` in
-    ``v``'s dtype. Every argument is a device tensor of static shape: capturable."""
+    ``v``'s dtype; with ``out_skip`` the rows must all be ``T // N`` tokens long and only their tokens
+    from position ``out_skip`` on are returned, ``[N * (T // N - out_skip), H, D]`` (a verify step's
+    block outputs without the prefix part and the copy that sliced it out). Every argument is a
+    device tensor of static shape: capturable."""
     t, h, d = k.shape
     n = cu_seqlens.numel() - 1
     assert q.shape == k.shape == g.shape and v.shape == (t, h, d) and beta.shape == (t, h)
@@ -111,13 +123,19 @@ def kda_recurrent_checkpoint(
     assert slot_ids.numel() == n and checkpoint_pos.numel() == n
     for x in (q, k, v, g, beta, states):
         assert x.is_contiguous(), "contiguous inputs"
-    o = torch.empty_like(v)
+    out_t = 0
+    if out_skip:
+        assert t % n == 0 and 0 < out_skip < t // n, (t, n, out_skip)
+        out_t = t // n - out_skip
+        o = torch.empty(n * out_t, h, d, dtype=v.dtype, device=v.device)
+    else:
+        o = torch.empty_like(v)
     bk = triton.next_power_of_2(d)
     bv = 32
     grid = (triton.cdiv(d, bv) * n * h,)
     _kda_recurrent_checkpoint_kernel[grid](
         q, k, v, g, beta, A_log, dt_bias, o, states, slot_ids, checkpoint_pos, cu_seqlens, lower_bound,
         scale=float(scale), N=n, H=h, K=d, V=d, BK=bk, BV=bv, stride_state_slot=states.stride(0),
-        num_warps=4, num_stages=2,
+        OUT_SKIP=out_skip, OUT_T=out_t, num_warps=4, num_stages=2,
     )
     return o
