@@ -15,11 +15,11 @@ from typing import Any, Callable
 
 import torch
 
-_enabled = os.environ.get("MSTAR_AUX_STREAM", "1") != "0"
+_enabled = os.environ.get("MSTAR_AUX_STREAM", "0") == "1"  # off until the served windows say it pays
 
 
 def aux_stream_enabled() -> bool:
-    """``MSTAR_AUX_STREAM=0`` keeps every captured step on one stream (an A/B switch)."""
+    """``MSTAR_AUX_STREAM=1`` turns the two-stream captures on (off by default until measured)."""
     return _enabled
 
 
