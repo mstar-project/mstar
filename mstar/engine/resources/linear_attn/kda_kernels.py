@@ -183,7 +183,8 @@ class FLAKDAKernels:
             q.view(-1, h, d), k.view(-1, h, d), v.view(-1, h, d), g.view(-1, h, d), beta, p.A_log, p.dt_bias,
             rec_state, slots, ckpt, plan.verify_cu_seqlens(), p.scale, p.lower_bound,
         )
-        return o.view(rows, 2 * k1, h, d)[:, k1:].reshape(rows * k1, h, d)
+        kp = spec.prefix.shape[1]  # the prefix part is padded to the pool's slots
+        return o.view(rows, kp + k1, h, d)[:, kp:].reshape(rows * k1, h, d)
 
 
 class FlashKDAKernels(FLAKDAKernels):
