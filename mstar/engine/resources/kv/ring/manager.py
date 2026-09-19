@@ -28,11 +28,12 @@ __all__ = ["RingKVManager", "RingPlan"]
 
 
 class RingPlan(NamedTuple):
-    """Host facts downstream resources need to stage this fixed ring view."""
+    """Host facts downstream resources need to stage this fixed ring view, one
+    entry per row of the step batch, in ``ctx.request_ids`` order."""
 
-    request_id: str
-    world_idx: int
-    frame_pos: int
+    request_ids: tuple[str, ...]
+    world_idx: tuple[int, ...]
+    frame_pos: tuple[int, ...]
 
 
 class RingKVManager(AttentionResource):
@@ -50,9 +51,12 @@ class RingKVManager(AttentionResource):
         self.device = torch.device(device)
         self.dtype = dtype
 
+        # ``total_worlds`` == ``num_worlds`` + 1: the extra world is the shared
+        # scratch that ``plan`` parks a replay's padding tail on. It is never in
+        # ``_free_worlds``, so no request is admitted to it.
         self.layers = [
             LayerRingCache(
-                num_worlds=config.num_worlds,
+                num_worlds=config.total_worlds,
                 n_kv_heads=config.num_kv_heads,
                 ring_frames=layer.ring_frames,
                 ring_buckets=layer.ring_buckets,
@@ -67,9 +71,16 @@ class RingKVManager(AttentionResource):
 
         self._worlds: dict[str, int] = {}
         self._free_worlds: set[int] = set(range(config.num_worlds))
+        # The one world past the resident pool; padding rows write here and it is
+        # never claimed, so a padding write never reaches a real world's history.
+        self._padding_world: int = config.num_worlds
         self._known_rids: set[str] = set()
         self._last_frames: dict[str, int] = {}
-        self._static_world_idx = torch.zeros(1, dtype=torch.int64, device=self.device)
+        # Sized to num_worlds, the largest B any step can carry (B_max <=
+        # num_worlds is enforced at config load).
+        self._static_world_idx = torch.zeros(
+            config.num_worlds, dtype=torch.int64, device=self.device
+        )
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo) -> "RingKVManager":
@@ -125,26 +136,31 @@ class RingKVManager(AttentionResource):
         commit: bool,
         build_visibility: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Write one frame's K/V for ``layer_idx`` and return what to attend to.
+        """Write one step's K/V for ``layer_idx`` and return what to attend to.
 
-        ``k``/``v`` are ``[1, H_kv, tokens_per_frame, D]``. ``k`` is already
-        RoPE'd and RMS-normed and ``v`` is post value-residual lerp: the cache
-        stores post-RoPE keys, so replayed history is never re-rotated.
+        ``k``/``v`` are ``[B, H_kv, tokens_per_frame, D]``, one frame per
+        resident world in the step batch. ``k`` is already RoPE'd and
+        RMS-normed and ``v`` is post value-residual lerp: the cache stores
+        post-RoPE keys, so replayed history is never re-rotated.
         Returns ``(k_all, v_all, visible)``, the first two spanning
         the whole buffer, every resident world and the third a
         ``[total_slots]`` bool row that is False everywhere outside the calling
         request's own world.
 
         ``frame_pos`` and ``commit`` are both arguments rather than resource
-        state, for the same reason. ``frame_pos`` is the ``[]`` int64 ring clock
-        -- not a slot id -- and alone determines the slot written and the
+        state, for the same reason. ``frame_pos`` is the ``[B]`` int64 ring
+        clock -- not a slot id -- and alone determines the slot written and the
         visibility row;
         """
         # `layer_idx` is Python-level (it indexes a list of differently-shaped
         # rings), so indexing on it is graph-safe.
-        kv = torch.stack([k, v], dim=0)
+        B = k.size(0)
+        # [2, H_kv, B, T, D] contiguous, then folded into the ring's [2, 1,
+        # H_kv, B*T, D] layout -- the one copy this already needed.
+        kv = torch.stack([k.transpose(0, 1), v.transpose(0, 1)], dim=0)
+        kv = kv.view(2, 1, k.size(1), B * k.size(2), k.size(3))
         return self.layers[layer_idx].upsert(
-            kv, frame_pos, commit, self._static_world_idx,
+            kv, frame_pos, commit, self._static_world_idx[:B],
             build_visibility=build_visibility,
         )
 
@@ -245,15 +261,13 @@ class RingKVManager(AttentionResource):
         # not be able to take a world from the real request in the same batch.
         rids = list(ctx.request_ids)
 
-        if len({*rids}) > 1:
+        if len(set(rids)) != len(rids):
             return AdmitOutcome(
                 ok=False, ready=False,
                 reason=AdmitRuntimeError(
-                    f"ring KV {self.name!r} was handed a batch of {len(set(rids))} "
-                    f"requests ({sorted(set(rids))}); one step advances one world, "
-                    "so max_batch_size must be 1. This is a step-batch limit, not "
-                    "a ring limit -- the ring holds "
-                    f"{self.num_worlds} worlds and they take turns across steps."
+                    f"ring KV {self.name!r} was handed a batch naming "
+                    f"{sorted({rid for rid in rids if rids.count(rid) > 1})} more "
+                    "than once; a step batches distinct worlds, one row per request."
                 ),
             )
 
@@ -324,23 +338,37 @@ class RingKVManager(AttentionResource):
         return ADMIT_OK
 
     def plan(self, step: ResourceStep, ctx: StepContext) -> RingPlan:
-        """Stage this step's world index. Its ring addresses stay in the graph."""
+        """Stage the padded batch's world indices, one per row. Ring addresses
+        stay in the graph.
 
-        rids = {*ctx.request_ids}
-        if len(rids) != 1:
-            raise ValueError(
-                f"ring KV {self.name!r} can stage one world index per step and "
-                f"this step names {sorted(rids)}. `admit` refuses a mixed batch "
-                "for the same reason; reaching here means it was bypassed."
-            )
-        rid = rids.pop()
-        world_idx = self._require_world(rid, "plan")
-        # `fill_`, not a `copy_` from a fresh host tensor: same in-place write
-        # through the address the graph baked, without allocating a staging
-        # tensor 24 times a second.
-        self._static_world_idx.fill_(world_idx)
+        A replay pads the batch to its capture bucket with dummy rids that hold
+        no world. Those rows still write and attend (their output is dropped
+        downstream), so every one is parked on ``_padding_world`` -- the shared
+        scratch world outside the resident pool. The flex mask scopes each row to
+        its own world, so a padding row's read and its commit both stay on that
+        world and never reach a real request's history; no request is ever
+        admitted to it, so the tail it leaves behind is never read.
+        """
         frames = self._step_frames(step)
-        return RingPlan(rid, world_idx, frames[rid])
+        real_rids = tuple(ctx.request_ids)
+        padded_rids = tuple(ctx.padded_request_ids)
+        world_idx = []
+        frame_pos = []
+        for b, rid in enumerate(real_rids):
+            world = self._require_world(rid, "plan")
+            # `fill_`, not a `copy_` from a fresh host tensor: same in-place
+            # write through the address the graph baked, without allocating a
+            # staging tensor 24 times a second.
+            self._static_world_idx[b].fill_(world)
+            world_idx.append(world)
+            frame_pos.append(frames[rid])
+        for b in range(len(real_rids), len(padded_rids)):
+            self._static_world_idx[b].fill_(self._padding_world)
+            world_idx.append(self._padding_world)
+            # Frame 0's visibility is scratch-only, so the padding row attends
+            # exactly one (garbage, dropped) block and never an unwritten slot.
+            frame_pos.append(0)
+        return RingPlan(padded_rids, tuple(world_idx), tuple(frame_pos))
 
     def commit(self, step: ResourceStep, ctx: StepContext) -> None:
         """Record the frame each request just committed. Metadata only."""

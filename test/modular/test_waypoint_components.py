@@ -321,7 +321,7 @@ def test_ring_slot_rotation(kind, dilation, frames, expected_slots):
     last wrote it, so the expected list is the whole history at once."""
     cache = make_cache(ring_frames=16, ring_buckets=16, dilation=dilation)
     for f in frames:
-        upsert(cache, frame_kv(f), torch.tensor(f, dtype=torch.int64), commit=True)
+        upsert(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), commit=True)
     assert ring_slot_values(cache) == [float(v) for v in expected_slots], kind
     assert bool(cache.written[: cache.ring_len].all())
 
@@ -331,14 +331,14 @@ def test_frozen_passes_leave_the_ring_byte_identical():
     would corrupt the world state permanently, and nothing would raise."""
     cache = make_cache(ring_frames=4, ring_buckets=4, dilation=1)
     for f in range(4):
-        upsert(cache, frame_kv(f), torch.tensor(f, dtype=torch.int64), commit=True)
+        upsert(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), commit=True)
 
     ring_before = cache.kv[:, :, :, : cache.ring_len].clone()
     written_before = cache.written.clone()
     scratch_before = cache.kv[:, :, :, cache.ring_len :].clone()
 
     for pass_idx in range(4):  # the four Euler steps, each a different noisy x
-        upsert(cache, frame_kv(100 + pass_idx), torch.tensor(4, dtype=torch.int64), commit=False)
+        upsert(cache, frame_kv(100 + pass_idx), torch.tensor([4], dtype=torch.int64), commit=False)
 
     assert torch.equal(cache.kv[:, :, :, : cache.ring_len], ring_before), (
         "a frozen pass wrote the ring; that is amnesia, not a cache miss"
@@ -360,12 +360,12 @@ def test_mask_hides_the_slot_this_frame_is_about_to_overwrite():
     checked to agree over a whole 4+1 frame."""
     cache = make_cache(ring_frames=4, ring_buckets=4, dilation=1)
     for f in range(4):
-        upsert(cache, frame_kv(f), torch.tensor(f, dtype=torch.int64), commit=True)
+        upsert(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), commit=True)
     assert set(range(5)) == visible_blocks(
         make_block_mask(TPF, cache.capacity, cache.written)
     ), "precondition: the whole ring plus scratch is written"
 
-    fp = torch.tensor(4, dtype=torch.int64)  # slot 0 is about to be reused
+    fp = torch.tensor([4], dtype=torch.int64)  # slot 0 is about to be reused
     for commit in (False, False, False, False, True):
         _, _, visible = upsert(cache, frame_kv(4), fp, commit=commit)
         assert visible_blocks(make_block_mask(TPF, cache.capacity, visible)) == {1, 2, 3, 4}, (
@@ -373,22 +373,52 @@ def test_mask_hides_the_slot_this_frame_is_about_to_overwrite():
         )
 
 
+def test_upsert_batches_two_worlds_like_two_sequential_calls():
+    """``upsert`` at B=2 (one row each for worlds 0 and 1) is bit-exact to
+    running the same two frames one world at a time: the row dimension is
+    folded into the token dim by ``world_base``, so a batched call must not
+    touch a row that is not its own."""
+    def new_cache() -> LayerRingCache:
+        return LayerRingCache(
+            num_worlds=2, n_kv_heads=1, ring_frames=4, ring_buckets=4,
+            d_head=8, tokens_per_frame=TPF, pinned_dilation=1,
+            dtype=torch.float32, device="cpu",
+        )
+
+    solo = new_cache()
+    upsert(solo, frame_kv(10.0), torch.tensor([2], dtype=torch.int64), commit=True, world=0)
+    upsert(solo, frame_kv(20.0), torch.tensor([3], dtype=torch.int64), commit=True, world=1)
+
+    batched = new_cache()
+    kv = torch.cat([frame_kv(10.0), frame_kv(20.0)], dim=3)
+    batched.upsert(
+        kv,
+        torch.tensor([2, 3], dtype=torch.int64),
+        True,
+        torch.tensor([0, 1], dtype=torch.int64),
+        build_visibility=False,
+    )
+
+    assert torch.equal(batched.kv, solo.kv)
+    assert torch.equal(batched.written, solo.written)
+
+
 def test_global_layer_commits_nothing_on_non_dilation_frames():
     """``torch.where(write_step, ring_idx, current_idx)``
     redirects the commit onto the scratch slot it just wrote."""
     cache = make_cache(ring_frames=4, ring_buckets=4, dilation=8)
-    upsert(cache, frame_kv(0), torch.tensor(0, dtype=torch.int64), commit=True)
+    upsert(cache, frame_kv(0), torch.tensor([0], dtype=torch.int64), commit=True)
     ring_before = cache.kv[:, :, :, : cache.ring_len].clone()
     written_before = cache.written.clone()
 
     for f in range(1, 8):  # the 7 non-committing frames of every 8
-        upsert(cache, frame_kv(f), torch.tensor(f, dtype=torch.int64), commit=True)
+        upsert(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), commit=True)
 
     assert torch.equal(cache.kv[:, :, :, : cache.ring_len], ring_before)
     assert torch.equal(cache.written, written_before)
     assert cache.kv[0, 0, 0, cache.ring_len, 0].item() == 7.0  # scratch has the latest
 
-    upsert(cache, frame_kv(8), torch.tensor(8, dtype=torch.int64), commit=True)
+    upsert(cache, frame_kv(8), torch.tensor([8], dtype=torch.int64), commit=True)
     assert ring_slot_values(cache)[:2] == [0.0, 8.0]
 
 
@@ -437,7 +467,7 @@ def test_bucket_round_up_is_faithful_but_currently_unobservable(dilation):
     floor_cache = make_cache(ring_frames=4, ring_buckets=4, dilation=dilation)
 
     for f in range(24):
-        fp = torch.tensor(f, dtype=torch.int64)
+        fp = torch.tensor([f], dtype=torch.int64)
         for pass_idx in range(5):
             commit = pass_idx == 4
             kv = frame_kv(f * 10 + pass_idx)
@@ -453,19 +483,19 @@ def test_bucket_round_up_is_faithful_but_currently_unobservable(dilation):
 
 def test_upsert_rejects_a_wrong_shaped_frame_or_clock():
     cache = make_cache(ring_frames=4, ring_buckets=4, dilation=1)
-    fp = torch.tensor(0, dtype=torch.int64)
-    with pytest.raises(RuntimeError, match="exactly one frame per upsert"):
+    fp = torch.tensor([0], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="exactly one frame per world"):
         upsert(cache, frame_kv(0, tokens=TPF // 2), fp, commit=True)
-    with pytest.raises(RuntimeError, match=r"frame_pos must be a \[\] int64 tensor"):
-        upsert(cache, frame_kv(0), torch.tensor([0], dtype=torch.int64), commit=True)
-    with pytest.raises(RuntimeError, match=r"frame_pos must be a \[\] int64 tensor"):
-        upsert(cache, frame_kv(0), torch.tensor(0, dtype=torch.int32), commit=True)
+    with pytest.raises(RuntimeError, match=r"frame_pos must be a \[B\] int64 tensor"):
+        upsert(cache, frame_kv(0), torch.tensor(0, dtype=torch.int64), commit=True)
+    with pytest.raises(RuntimeError, match=r"frame_pos must be a \[B\] int64 tensor"):
+        upsert(cache, frame_kv(0), torch.tensor([0], dtype=torch.int32), commit=True)
 
 
 def test_reset_restores_a_fresh_ring():
     cache = make_cache(ring_frames=4, ring_buckets=4, dilation=1)
     for f in range(4):
-        upsert(cache, frame_kv(f + 1), torch.tensor(f, dtype=torch.int64), commit=True)
+        upsert(cache, frame_kv(f + 1), torch.tensor([f], dtype=torch.int64), commit=True)
     cache.reset(0)
     assert not bool(cache.kv.any())
     # The scratch tail stays permanently visible -- masking it removes
@@ -493,7 +523,7 @@ def test_ring_state_is_a_deep_copy_and_is_specific_to_the_compaction_setting():
     gen = torch.Generator().manual_seed(3)
     for layer in range(config.n_layers):
         frame = torch.randn(1, 1, TPF, config.d_head, generator=gen)
-        kv.upsert(frame, frame, layer, torch.tensor(0, dtype=torch.int64), commit=True)
+        kv.upsert(frame, frame, layer, torch.tensor([0], dtype=torch.int64), commit=True)
 
     state = kv.get_state("a")
     snapshot = [t.clone() for t, _ in state["layers"]]
@@ -504,7 +534,13 @@ def test_ring_state_is_a_deep_copy_and_is_specific_to_the_compaction_setting():
     assert all(torch.equal(a, b) for a, b in zip((t for t, _ in state["layers"]), snapshot, strict=True))
 
     kv.load_state("a", state)
-    assert all(torch.equal(layer.kv, t) for layer, (t, _) in zip(kv.layers, state["layers"], strict=True))
+    # Compare the request's world span, not the whole buffer: the ring now holds
+    # a padding world past the resident pool that get_state never captured.
+    world = kv.world_of("a")
+    assert all(
+        torch.equal(layer.kv[:, :, :, slice(*layer.world_span(world))], t)
+        for layer, (t, _) in zip(kv.layers, state["layers"], strict=True)
+    )
 
     other = ring_manager(dataclasses.replace(config, full_global_ring=True))
     other.ingest_request("a")
@@ -571,7 +607,7 @@ def test_compacted_global_ring_addresses_all_sixteen_slots():
 
     for j in range(16):
         f = 8 * j
-        upsert(cache, frame_kv(f), torch.tensor(f, dtype=torch.int64), commit=True)
+        upsert(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), commit=True)
 
     assert ring_slot_values(cache) == [float(8 * j) for j in range(16)]
     assert bool(cache.written[: cache.ring_len].all()), "a 2-bucket ring would leave 14 slots unwritten"
@@ -588,7 +624,7 @@ def drive_ring(config: WaypointConfig, n_frames: int, seed: int = 7) -> list[tor
     gen = torch.Generator().manual_seed(seed)
     outputs = []
     for f in range(n_frames):
-        fp = torch.tensor(f, dtype=torch.int64)
+        fp = torch.tensor([f], dtype=torch.int64)
         for pass_idx in range(5):
             for layer in range(config.n_layers):
                 k = torch.randn(1, 1, TPF, config.d_head, generator=gen)

@@ -123,6 +123,18 @@ class RingKVConfig(KVConfig):
     # How many worlds are resident at once. NOT a batch.
     num_worlds: int = 1
 
+    @property
+    def total_worlds(self) -> int:
+        """Resident worlds plus one shared scratch world for padding rows.
+
+        A replay padded to its capture bucket parks the dummy tail on this world
+        (see ``RingKVManager.plan``); it is never handed to a request, so
+        resident capacity stays ``num_worlds`` and the deployment knob keeps its
+        meaning. The ring buffer and the flex mask both size on this count so the
+        padding world is a real, addressable span.
+        """
+        return self.num_worlds + 1
+
     def __post_init__(self):
         super().__post_init__()
         if len(self.layers) != self.num_layers:

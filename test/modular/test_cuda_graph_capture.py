@@ -220,3 +220,73 @@ def test_single_slot_runners_still_register():
     (bucket,) = runner._buckets.values()
     assert bucket.slots == ["decode:slot0"]
     assert runner.declared == [], "nothing to pre-plan with a single slot"
+
+
+class _InternRunner:
+    """`_intern_static_buffer` bound onto the three fields it touches."""
+
+    _seq_dim = staticmethod(CudaGraphRunner._seq_dim)
+    _intern_static_buffer = CudaGraphRunner._intern_static_buffer
+
+    def __init__(self):
+        self._shared_static_buffers = {}
+        self._static_buffer_seq_dims = {}
+        self._capture_clone_bytes_naive = 0
+
+
+def test_button_shares_its_buffer_once_batch_size_disambiguates_the_axis():
+    """Waypoint 360p at bs=2: the bucket's token count is 2*128 = 256, which
+    is also ``n_buttons``. Passing the real call site's ``batch_size`` lets
+    ``_seq_dim`` settle on dim 0 (bs=2 there) before it ever scans for a
+    ``seq_len`` match, so button reslices the shared buffer like every other
+    per-row tensor instead of falling back to a private allocation."""
+    runner = _InternRunner()
+    big = torch.arange(2 * 256, dtype=torch.float32).reshape(2, 1, 256)
+    small = -torch.arange(256, dtype=torch.float32).reshape(1, 1, 256)
+
+    shared_view = runner._intern_static_buffer(0, "button", big, seq_len=256, batch_size=2)
+    assert shared_view.shape == (2, 1, 256)
+    assert torch.equal(shared_view, big)
+
+    resliced = runner._intern_static_buffer(0, "button", small, seq_len=128, batch_size=1)
+
+    assert runner._static_buffer_seq_dims[(0, "button")] == 0
+    assert resliced.shape == (1, 1, 256)
+    assert resliced.data_ptr() == shared_view.data_ptr()
+    assert torch.equal(resliced, small)
+    # the reslice writes through the shared buffer — row 0 now reads back
+    # as `small`, which is the whole point of sharing rather than cloning
+    assert torch.equal(shared_view[:1], small)
+
+
+def test_a_smaller_bucket_that_shrinks_off_the_hoisted_axis_raises():
+    """Without a batch size to disambiguate — a caller that only knows the
+    flattened token count — a fixed-width tensor can still coincidentally
+    match ``seq_len`` on a non-batch dim (here: button's n_buttons=256 lines
+    up with the bs=2 bucket's token count), hoisting the wrong axis. The bs=1
+    bucket then shrinks along dim 0, not the hoisted one, and can't reslice
+    the shared buffer. This stays a hard failure rather than a silent private
+    allocation; the real fix is giving `_seq_dim` enough information (the
+    batch size) to never hoist the wrong axis in the first place — see
+    `test_button_shares_its_buffer_once_batch_size_disambiguates_the_axis`."""
+    runner = _InternRunner()
+    big = torch.arange(2 * 256, dtype=torch.float32).reshape(2, 1, 256)
+    small = -torch.arange(256, dtype=torch.float32).reshape(1, 1, 256)
+
+    runner._intern_static_buffer(0, "button", big, seq_len=256)
+    with pytest.raises(RuntimeError, match="captures must be largest-first"):
+        runner._intern_static_buffer(0, "button", small, seq_len=128)
+
+
+def test_a_smaller_bucket_along_the_hoisted_axis_still_reslices_the_shared_buffer():
+    runner = _InternRunner()
+    big = torch.arange(3 * 8, dtype=torch.float32).reshape(3, 8)
+    small = torch.zeros(3, 4)
+
+    shared_view = runner._intern_static_buffer(0, "mrope", big, seq_len=8)
+    resliced = runner._intern_static_buffer(0, "mrope", small, seq_len=4)
+
+    assert runner._static_buffer_seq_dims[(0, "mrope")] == 1
+    assert resliced.shape == (3, 4)
+    assert resliced.data_ptr() == shared_view.data_ptr()
+    assert torch.equal(shared_view[:, :4], small)

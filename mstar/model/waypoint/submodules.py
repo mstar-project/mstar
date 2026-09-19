@@ -61,6 +61,26 @@ def _frame_seed(request_seed: int, frame_pos: int) -> int:
     return z & (_U64 >> 1)
 
 
+def _rollout_capture_batch_sizes(step_batch_size: int) -> list[int]:
+    """Powers of two up to ``step_batch_size``, with ``step_batch_size`` itself.
+
+    Capturing every size ``1..B`` makes startup linear in B: each bucket is a new
+    static shape, so the DiT re-traces both fullgraph regions and the decode
+    re-tunes its convs for it. A geometric set makes startup grow with ``log B``
+    instead; a step of ``n`` rows replays the smallest bucket ``>= n`` and pads
+    the tail with dummy rows the ring parks on spare worlds (see
+    ``RingKVManager.plan``). This is what every other batched model already does
+    -- the engine default ``CAPTURE_BATCH_SIZES`` is the same geometric set.
+    """
+    sizes = []
+    bs = 1
+    while bs < step_batch_size:
+        sizes.append(bs)
+        bs *= 2
+    sizes.append(step_batch_size)
+    return sizes
+
+
 class _SingleRequestMixin:
     """Serve one request per step, through the engine's batched entry point.
 
@@ -72,18 +92,10 @@ class _SingleRequestMixin:
     every batch with ``running_batched=True`` — so a submodule that only defines
     ``forward`` never runs.
 
-    **The cap is on the step, not on the node.** It used to be both: the ring
-    held one live world, so a second request in the batch had nowhere to put its
-    history and neither did a second request anywhere on the node. The ring now
-    holds ``num_worlds`` of them and they interleave freely across steps; what
-    is left here is the honest wan22 statement — the *step* is not batched yet.
-    The DiT's driver still asserts ``B == 1``, ``_pos_ids`` still hardcodes the
-    leading 1, and ``capture_batch_sizes`` is still ``[1]``, so a batched step
-    has nowhere to go until those lift together.
-
-    ``max_batch_size`` is what the micro scheduler reads and chunks on; the
-    assert is the backstop, and ``RingKVManager.admit`` refusing a mixed batch
-    is the one below that.
+    Only ``WaypointVaeEncoderSubmodule`` uses this now: prime's encode is once
+    per request, off the steady-state path, so it stays capped at 1. The dit
+    node's step is batched (see ``WaypointDitSubmodule.max_batch_size`` and
+    ``forward_batched``); this mixin no longer describes it.
     """
 
     def max_batch_size(self, graph_walk: str):
@@ -130,7 +142,7 @@ class _FunctionalAeMixin:
         )
 
 
-class WaypointDitSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodule):
+class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     """The world DiT: one latent frame per engine step, TAEHV-decoded in the
     same forward.
 
@@ -185,6 +197,25 @@ class WaypointDitSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodul
                 "and all 24 attention layers call them."
             )
         super().bind_node_resources(resources)
+
+    def max_batch_size(self, graph_walk: str) -> int:
+        """Both walks carry up to ``step_batch_size`` rows: one per resident
+        world sharing the forward. Prime rows batch too, when several
+        requests are admitted in the same step.
+        """
+        return self.config.step_batch_size
+
+    def can_batch(self, batch, model_inputs) -> bool:
+        """Batch concurrent rows into one forward, matching every other batched
+        model. A captured lease replays batched regardless of this flag; it is
+        the eager fallback (graphs off, or a shape with no captured bucket) that
+        would otherwise run one forward per request. Rows are independent --
+        ``preprocess`` concatenates on the batch dim and every resource is
+        scoped per row -- so any admitted set (capped by ``max_batch_size``) is
+        batchable.
+        """
+        del batch, model_inputs
+        return True
 
     # ------------------------------------------------------------------
     # prepare_inputs / preprocess
@@ -280,11 +311,22 @@ class WaypointDitSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodul
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict:
-        assert len(inputs) == 1, (
-            f"WaypointDitSubmodule does not batch a step; preprocess got "
-            f"{len(inputs)} rows (max_batch_size should have capped it at 1)"
-        )
-        return super().preprocess(graph_walk, engine_inputs, inputs)
+        """Concatenate every row's tensors along the batch dim.
+
+        Each row already carries a leading 1 (``frame_pos [1]``,
+        ``noise``/``latent`` ``[1, 1, C, H, W]``, ``mouse``/``button``/``scroll``
+        ``[1, 1, *]``, the nine histories ``[1, C, h, w]``), in
+        ``engine_inputs.request_ids`` order (``inputs[i]`` pairs positionally
+        with row ``i`` — the row-order invariant every batched resource below
+        this node relies on). ``len(inputs) == 1`` returns the row unchanged,
+        no copy, which is what B=1 ran before this method concatenated anything.
+        """
+        if len(inputs) == 1:
+            return inputs[0].tensor_inputs
+        return {
+            key: torch.cat([row.tensor_inputs[key] for row in inputs], dim=0)
+            for key in inputs[0].tensor_inputs
+        }
 
     def _frame_noise(
         self,
@@ -487,9 +529,7 @@ class WaypointDitSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodul
         histories = tuple(kwargs.pop(f"{DECODER_HISTORY_PREFIX}{idx}") for idx in range(9))
         if kwargs:
             raise TypeError(f"unexpected dit inputs: {sorted(kwargs)}")
-        # The graph boundary owns [1]; the model owns [] — ``_pos_ids``
-        # asserts rank 0 and int64. This reshape is the entire seam.
-        pos = frame_pos.reshape(())
+        pos = frame_pos
 
         if graph_walk == ROLLOUT_WALK:
             out = self.dit.generate_frame(
@@ -511,7 +551,7 @@ class WaypointDitSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodul
         )
         result: NameToTensorList = {
             "video_output": [frames],
-            # [1], not []: the loop-back edge to next iteration's "clock"
+            # [B], not []: the loop-back edge to next iteration's "clock"
             # input, whose only job is to be a name in ready_signals (see
             # prepare_inputs). Harmless on prime too, whose node declares no
             # outputs at all.
@@ -522,6 +562,32 @@ class WaypointDitSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodul
             for idx, value in enumerate(updated)
         })
         return result
+
+    def forward_batched(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        **kwargs,
+    ) -> dict[str, NameToTensorList]:
+        """Run the batched ``forward`` once, then split its rows back out.
+
+        Row ``i`` of every output tensor belongs to
+        ``engine_inputs.request_ids[i]`` — the same row-order invariant
+        ``preprocess`` concatenated on the way in. ``video_output[i]`` is
+        ``[F, H, W, 3]``, exactly what ``postprocess`` consumes today;
+        ``clock[i:i+1]`` and each history row stay ``[1, ...]``, matching what
+        ``prepare_inputs`` builds for the next step.
+        """
+        out = self.forward(graph_walk, engine_inputs=engine_inputs, **kwargs)
+        # Each value is a one-element list holding the batched tensor; index
+        # the tensor's rows, not the list.
+        return {
+            rid: {
+                key: [value[0][i]] if key == "video_output" else [value[0][i : i + 1]]
+                for key, value in out.items()
+            }
+            for i, rid in enumerate(engine_inputs.request_ids)
+        }
 
     # ------------------------------------------------------------------
     # capture
@@ -569,19 +635,32 @@ class WaypointDitSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeSubmodul
                 input_seq_len=self.config.tokens_per_frame,
             )
 
-        # Rollout first, and the order is load-bearing: both captures share one
-        # graph pool and rollout's five forwards are a superset of prime's one,
-        # so the pool is sized once and prime reuses its freed blocks.
-        # ``prepare_for_capture``'s sort is stable and both specs are
-        # (bs=1, tokens_per_frame), so declaration order is capture order.
+        # Rollout listed first, but what actually orders capture is
+        # ``prepare_for_capture``'s ``(bs, num_tokens)`` sort, descending: the
+        # largest bucket (bs=step_batch_size) captures before every smaller one,
+        # sizing the shared graph pool once at its biggest allocation. Prime and
+        # rollout share the bucket set and, per bs, the same num_tokens, so each
+        # prime bucket ties the same-size rollout bucket on that key; the sort is
+        # stable, so rollout's earlier position here keeps it captured first at
+        # every tie, and prime reuses freed blocks all the way down.
+        batch_sizes = _rollout_capture_batch_sizes(self.config.step_batch_size)
         walks = [(ROLLOUT_WALK, "noise")]
         if self.config.capture_dit_prime:
+            # Prime captures the same geometric buckets as rollout. A prime batch
+            # of several requests admitted in one step replays the smallest
+            # bucket >= its size and pads the tail on the ring's scratch world
+            # (see ``RingKVManager.plan``), the same idiom rollout uses -- so the
+            # first multi-request prime replays a captured graph instead of
+            # falling to a runtime eager re-trace. ``caps_eager_batch_size`` stays
+            # the default True: a prime batch is capped at the largest captured
+            # bucket, which is ``step_batch_size``, exactly where admission caps
+            # it anyway.
             walks.append((PRIME_WALK, "latent"))
         return [
             BatchedCudaGraphConfig(
                 capture_graph_walk=walk,
                 single_request_inputs=template(latent_key),
-                capture_batch_sizes=[1],
+                capture_batch_sizes=batch_sizes,
                 capture_forward_method="forward_batched",
                 # The DiT compiles its two reference-shaped fullgraph regions
                 # itself. Compiling this wrapper would fuse across their boundary.

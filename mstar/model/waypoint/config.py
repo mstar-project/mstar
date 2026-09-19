@@ -149,6 +149,11 @@ class WaypointConfig:
     # that A/B's control arm and stays reachable.
     capture_dit_prime: bool = True
 
+    # Rows carried per rollout step; one per resident world sharing the DiT
+    # forward. Must be <= `resources.kv.num_worlds` (checked at YAML-load time
+    # in waypoint_model.py, where num_worlds is known).
+    step_batch_size: int = 1
+
     # Guard rails the ported modules assert against, kept here so a drifting
     # checkpoint fails loudly at construction rather than silently mis-serving.
     _supported_rope_impls: tuple[str, ...] = field(
@@ -196,6 +201,7 @@ class WaypointConfig:
             "inference_fps": self.inference_fps,
             "temporal_compression": self.temporal_compression,
             "max_frames": self.max_frames,
+            "step_batch_size": self.step_batch_size,
         }
         invalid = [name for name, value in positive_ints.items() if type(value) is not int or value <= 0]
         if invalid:
