@@ -14,6 +14,7 @@ import triton.language as tl
 @triton.jit
 def _dspark_block_attn_kernel(
     q_lat, q_pe, lat, o_ctx, lse_ctx, out, scale,
+    stride_ql_tok, stride_ql_head, stride_qp_tok, stride_qp_head,
     K: tl.constexpr, BK: tl.constexpr, H: tl.constexpr, L: tl.constexpr, BL: tl.constexpr, BLC: tl.constexpr,
     R: tl.constexpr, BR: tl.constexpr,
 ):
@@ -31,12 +32,12 @@ def _dspark_block_attn_kernel(
     for l0 in tl.static_range(0, BL, BLC):
         l = l0 + tl.arange(0, BLC)
         lm = l < L
-        qc = tl.load(q_lat + (tok_i * H + h)[:, None] * L + l[None, :], mask=im[:, None] & lm[None, :], other=0.0)
+        qc = tl.load(q_lat + (tok_i * stride_ql_tok + h * stride_ql_head)[:, None] + l[None, :], mask=im[:, None] & lm[None, :], other=0.0)
         cc = tl.load(lat + tok_j[:, None] * (L + R) + l[None, :], mask=jm[:, None] & lm[None, :], other=0.0)
         s += tl.sum(qc.to(tl.float32)[:, None, :] * cc.to(tl.float32)[None, :, :], axis=2)
     e = tl.arange(0, BR)
     em = e < R
-    qp = tl.load(q_pe + (tok_i * H + h)[:, None] * R + e[None, :], mask=im[:, None] & em[None, :], other=0.0)
+    qp = tl.load(q_pe + (tok_i * stride_qp_tok + h * stride_qp_head)[:, None] + e[None, :], mask=im[:, None] & em[None, :], other=0.0)
     kp = tl.load(lat + tok_j[:, None] * (L + R) + L + e[None, :], mask=jm[:, None] & em[None, :], other=0.0)
     s += tl.sum(qp.to(tl.float32)[:, None, :] * kp.to(tl.float32)[None, :, :], axis=2)
     s = s * scale
@@ -75,11 +76,14 @@ def dspark_block_attention(
     k = t // rows
     r = q_pe.shape[-1]
     assert q_pe.shape == (t, h, r) and lat.shape == (t, l + r) and o_ctx.shape == (t, h, l) and lse_ctx.shape == (t, h)
-    q_lat, q_pe, lat, o_ctx, lse_ctx = (x.contiguous() for x in (q_lat, q_pe, lat, o_ctx, lse_ctx))
-    out = torch.empty_like(q_lat)
+    # the queries are read with their strides (they are slices of the draft's q projection); the rest is dense
+    assert q_lat.stride(2) == 1 and q_pe.stride(2) == 1
+    lat, o_ctx, lse_ctx = (x.contiguous() for x in (lat, o_ctx, lse_ctx))
+    out = torch.empty(t, h, l, dtype=q_lat.dtype, device=q_lat.device)
     bl = triton.next_power_of_2(l)
     _dspark_block_attn_kernel[(rows * h,)](
         q_lat, q_pe, lat, o_ctx, lse_ctx, out, float(scale),
+        q_lat.stride(0), q_lat.stride(1), q_pe.stride(0), q_pe.stride(1),
         K=k, BK=triton.next_power_of_2(k), H=h, L=l, BL=bl, BLC=min(bl, 64), R=r, BR=triton.next_power_of_2(r),
         num_warps=4,
     )
