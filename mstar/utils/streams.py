@@ -26,7 +26,9 @@ def aux_stream_enabled() -> bool:
 class Fork:
     """One auxiliary stream and the two events that fork from and join the current stream."""
 
-    def __init__(self) -> None:
+    def __init__(self, enabled: bool | None = None) -> None:
+        # None follows MSTAR_AUX_STREAM; a bool pins it (tests)
+        self._enabled = _enabled if enabled is None else enabled
         self._stream: torch.cuda.Stream | None = None
         self._fork: torch.cuda.Event | None = None
         self._join: torch.cuda.Event | None = None
@@ -40,7 +42,7 @@ class Fork:
     def run(self, fn0: Callable[[], Any], fn1: Callable[[], Any]) -> tuple[Any, Any]:
         """``fn0`` on the current stream, ``fn1`` on the auxiliary one, joined before returning,
         while a capture is in progress; otherwise both in order on the current stream."""
-        if not (_enabled and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+        if not (self._enabled and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
             return fn0(), fn1()
         self._lazy()
         self._fork.record()
