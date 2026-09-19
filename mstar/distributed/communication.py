@@ -80,6 +80,7 @@ class CommGroup:
             channel = self._lamport_channel(input_, gather=True)
             if channel is not None:
                 return channel.all_gather(input_)
+        input_ = input_.contiguous()  # the Lamport path above reads a strided view; NCCL needs a dense one
         input_size = input_.size()
         output_size = (input_size[0] * self.world_size,) + input_size[1:]
         # Allocate output tensor
