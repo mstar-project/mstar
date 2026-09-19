@@ -20,7 +20,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
-from mstar.engine.cache_manager import BatchedCacheManager
+from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components import RMSNorm, SparseMoeBlock
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
@@ -29,7 +29,7 @@ from mstar.model.components.distributed import (
     RowParallelLinear,
     VocabParallelEmbedding,
 )
-from mstar.model.zonos2.config import Zonos2Config
+from mstar.model.zonos2.config import ATTN, KV_CACHE, ROPE, Zonos2Config
 
 # The attention of the reference hardcodes the QK-norm epsilon. See
 # ``F.rms_norm(..., eps=1e-6)``.
@@ -106,6 +106,14 @@ class Zonos2Attention(nn.Module):
         self.comm_group = comm_group
         tp_size = comm_group.world_size
 
+        # Resource labels this layer calls, as ``Zonos2Model.get_node_resources``
+        # declares them. ``bind_resources`` resolves them to objects once at
+        # load; see ``NodeSubmodule.bind_node_resources``.
+        self.attn = None
+        self.kv = None
+        self.pos = None
+        self.attend: AttentionCallable | None = None
+
         self.head_dim = config.head_dim
         self.num_heads = config.num_qo_heads
         self.num_kv_heads = config.num_kv_heads
@@ -170,11 +178,21 @@ class Zonos2Attention(nn.Module):
         )
         param.data.copy_(shard)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        cache_handle: BatchedCacheManager,
-    ) -> torch.Tensor:
+    def bind_resources(self, resources: dict) -> None:
+        """Resolve the resources this layer calls. See
+        ``NodeSubmodule.bind_node_resources``.
+
+        ``.get``: a layer may be bound on a node that owns only some of them.
+        """
+        self.attn = resources.get(ATTN)
+        self.kv = resources.get(KV_CACHE)
+        self.pos = resources.get(ROPE)
+        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """The label and layer index are cursors on the resources, set by
+        ``Zonos2ForCausalLM.forward`` (``attend.bind_step`` once, then
+        ``attend.set_layer_idx`` per layer) rather than passed in per call."""
         num_tokens = x.shape[0]
 
         # The headwise gate comes from the normed input. The code applies it
@@ -194,15 +212,18 @@ class Zonos2Attention(nn.Module):
         k = F.rms_norm(k, (self.head_dim,), eps=_QK_NORM_EPS)
 
         # Interleaved RoPE (is_neox=False). Pass no llama3 scaling kwargs, so
-        # that the cache handle keeps the plain rope path.
-        q, k = cache_handle.apply_rope(
-            q, k, rope_theta=self.rope_theta, interleave=True,
+        # that the position resource keeps the plain rope path — the spec
+        # leaves ``low_freq_factor`` and friends unset, so ``llama31_params``
+        # is empty and the llama31 kernel is never selected.
+        q, k = self.pos.apply_qk(
+            q, k, label=self.attend.label,
+            rope_theta=self.rope_theta, interleave=True,
         )
 
         # Standard scaled-dot-product attention, with a softmax scale of
         # 1/sqrt(dim). The temperature above is an extra learned multiplier on
-        # the query.
-        o = cache_handle.run_attention(q=q, k=k, v=v)  # (tokens, heads, dim)
+        # the query. ``attend`` writes K/V into the cache and runs the kernel.
+        o = self.attend(q, k, v)  # (tokens, heads, dim)
         o = o * gate.unsqueeze(-1)
         o = o.reshape(num_tokens, self.local_num_heads * self.head_dim)
         return self.wo(o)
@@ -340,12 +361,11 @@ class Zonos2DecoderLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         router_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         residual = x
         x = self.attention_norm(x)
-        x = self.attention(x, cache_handle)
+        x = self.attention(x)
         x = residual + x
 
         residual = x
@@ -421,9 +441,10 @@ class Zonos2ForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         speaker_emb_values: torch.Tensor | None = None,
         speaker_token_positions: torch.Tensor | None = None,
+        *,
+        label: str = "main",
     ) -> torch.Tensor:
         # Multi-codebook embedding: the sum of the tables of each column.
         x = self.multi_embedder(input_ids)
@@ -456,11 +477,17 @@ class Zonos2ForCausalLM(nn.Module):
         # emb_norm is an RMSNorm with no parameters.
         x = F.rms_norm(x, (x.shape[-1],), eps=self._emb_norm_eps)
 
+        # The label and layer index are cursors on the shared resources: bind
+        # the label once, advance the index per layer. Passing them as
+        # arguments instead would make inductor specialize on the int. The
+        # sequence-length advance is the runner's now, off the step
+        # declaration, so there is no ``advance_seq_lens`` call here.
         router_states: torch.Tensor | None = None
         for layer_idx, layer in enumerate(self.layers):
-            cache_handle.set_layer_idx(layer_idx)
-            x, router_states = layer(x, cache_handle, router_states)
-        cache_handle.advance_seq_lens()
+            if layer_idx == 0:
+                layer.attention.attend.bind_step(label)
+            layer.attention.attend.set_layer_idx(layer_idx)
+            x, router_states = layer(x, router_states)
 
         return self.out_norm(x)
 

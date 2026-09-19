@@ -33,8 +33,15 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mstar.engine.base import EngineType
-from mstar.engine.kv_cache_engine import KVCacheConfig
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVSpec,
+    NodeResourceSpec,
+    PositionConfig,
+    PositionSpec,
+)
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -45,7 +52,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.zonos2.config import Zonos2Config
+from mstar.model.zonos2.config import ATTN, KV_CACHE, ROPE, Zonos2Config
 from mstar.model.zonos2.prompt import BYTE_TEXT_VOCAB_SIZE, TTSPromptBuilder
 from mstar.model.zonos2.tts_sampling import TTSSamplingParams
 from mstar.streaming.chunk_policy import FixedChunkPolicy
@@ -127,29 +134,45 @@ class Zonos2Model(Model):
         return cfg
 
     # ------------------------------------------------------------------
-    # Model ABC: engines + KV cache
+    # Model ABC: node resources
     # ------------------------------------------------------------------
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
-        return [
-            KVCacheConfig(
-                num_layers=self.config.num_layers,
-                num_kv_heads=self.config.num_kv_heads,
-                head_dim=self.config.head_dim,
-                max_seq_len=self.config.max_position_embeddings,
-                num_qo_heads=self.config.num_qo_heads,
-            )
-        ]
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """The LLM node's cache, attention and positions.
 
-    def get_node_engine_types(self) -> dict[str, EngineType]:
-        # The code declares speaker_encoder always. The serving YAML lists the
-        # node without knowledge of the checkpoint, and EngineManager looks up
-        # every configured node here. On a checkpoint with no speaker, the
-        # submodule factory returns None and no walk reaches the node.
-        return {
-            _LLM: EngineType.KV_CACHE,
-            _DAC_NODE: EngineType.STATELESS,
-            _SPK_NODE: EngineType.STATELESS,
-        }
+        ``dac_decoder`` and ``speaker_encoder`` declare nothing: both are
+        stateless codec nodes with no cache and no positions, and neither
+        samples. The LLM declares no sampler either — the multi-codebook
+        sampler is the submodule's own, and it runs inside the captured
+        decode forward (``Zonos2LLMSubmodule._sample_in_graph``).
+        """
+        kv_config = KVConfig(
+            num_layers=self.config.num_layers,
+            num_kv_heads=self.config.num_kv_heads,
+            head_dim=self.config.head_dim,
+            max_seq_len=self.config.max_position_embeddings,
+            num_qo_heads=self.config.num_qo_heads,
+        )
+        return [
+            KVSpec(resource_key=KV_CACHE, nodes={_LLM}, config=kv_config),
+            AttentionSpec(
+                resource_key=ATTN,
+                nodes={_LLM},
+                config=AttentionConfig(kv_cache=KV_CACHE),
+            ),
+            PositionSpec(
+                resource_key=ROPE,
+                nodes={_LLM},
+                # Plain interleaved RoPE: no llama3 scaling, so the llama31
+                # factors stay unset and ``llama31_params`` is empty. The
+                # attention layer passes ``interleave=True`` and its own theta
+                # per call, matching the reference (is_neox=False).
+                config=PositionConfig(
+                    kv_cache=KV_CACHE,
+                    rope_theta=self.config.rope_theta,
+                    interleave=True,
+                ),
+            ),
+        ]
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
         return model_kwargs.get("max_output_tokens", self.sampling_params.max_tokens)

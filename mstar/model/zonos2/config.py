@@ -7,6 +7,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Resource keys for the LLM node, as ``Zonos2Model.get_node_resources``
+# declares them and the layers resolve them in ``bind_resources``. Zonos2
+# declares no sampler resource: the multi-codebook sampler runs inside the
+# submodule's own captured forward (see ``Zonos2LLMSubmodule._sample_in_graph``).
+KV_CACHE = "kv_cache"
+ATTN = "attn"
+ROPE = "rope"
+
 
 @dataclass
 class Zonos2Config:

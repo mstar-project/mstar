@@ -254,6 +254,13 @@ class ModelInputsFromEngine:
     # ``capture_forward_method``, so most submodules never need this.
     captured: bool = False
 
+    # Request ids whose consumed streaming input was the final chunk: the
+    # producing partition is done and its buffer is drained. Lets a
+    # streaming-codec node flush its per-request tail on the last call (the
+    # Zonos2 DAC vocoder's withheld crossfade tail). Mirrors
+    # ``ExecutingBatch.final_stream_rids``; empty on every non-streaming path.
+    final_stream_rids: set[str] = field(default_factory=set)
+
     @property
     @torch.compiler.disable
     def single_request_info(self):

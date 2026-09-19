@@ -53,7 +53,13 @@ BATCH_SIZES = [1, 4, 16, 32]
 
 
 class _DecodeStubCache:
-    """Minimal cache_handle: interleaved RoPE + SDPA over a fixed static KV.
+    """Stand-in for the LLM node's position + attention resources.
+
+    It plays both roles the ported layers call: ``pos.apply_qk`` and the
+    ``AttentionCallable`` bound as ``attention.attend``. ``_bind`` installs one
+    instance on every layer, which matches the real thing — the resources are
+    per-node objects shared by the whole stack, and the label/layer cursors
+    live on them.
 
     Not the real FlashInfer path, but issues one attention kernel per layer
     against a fixed [B, kv_heads, CTX_LEN, head_dim] context, so the per-step
@@ -83,10 +89,23 @@ class _DecodeStubCache:
         self.cos = freqs.cos().to(DTYPE)
         self.sin = freqs.sin().to(DTYPE)
 
+    def bind(self, model) -> None:
+        """Install this stub as every layer's position + attention resource."""
+        for layer in model.layers:
+            layer.attention.pos = self
+            layer.attention.attend = self
+
+    # -- AttentionCallable surface the layers drive --------------------
+    label = "main"
+
+    def bind_step(self, label, attn=None):
+        del attn
+        self.label = label
+
     def set_layer_idx(self, i):
         self.layer_idx = i
 
-    def apply_rope(self, q, k, rope_theta, interleave=True):
+    def apply_qk(self, q, k, label=None, rope_theta=None, interleave=True, **kwargs):
         # q: (B, n_q, head_dim), k: (B, n_kv, head_dim) at the current position.
         pos = CTX_LEN
         cos = self.cos[pos].view(1, 1, -1)
@@ -99,7 +118,7 @@ class _DecodeStubCache:
             return out
         return rot(q), rot(k)
 
-    def run_attention(self, q, k, v):
+    def __call__(self, q, k, v):
         # q,k,v: (B, heads, head_dim) for the single decode token.
         B = q.shape[0]
         i = self.layer_idx
@@ -113,9 +132,6 @@ class _DecodeStubCache:
         qh = q.unsqueeze(2)  # (B, n_q, 1, dim)
         o = torch.nn.functional.scaled_dot_product_attention(qh, k_all, v_all)  # (B, n_q, 1, dim)
         return o.squeeze(2)  # (B, n_q, dim)
-
-    def advance_seq_lens(self):
-        pass
 
 
 def _build_model(cfg):
@@ -156,9 +172,9 @@ def _make_sub(model, cfg):
 
 
 def _engine_like(rids):
-    # Stand-in for ModelInputsFromEngine: eager path (real_request_ids=None),
-    # so _prepare_sampler_step recovers rids straight from request_ids.
-    return SimpleNamespace(request_ids=rids, real_request_ids=None, cache_manager=None)
+    # Stand-in for ModelInputsFromEngine on the eager path, where
+    # ``request_ids`` is already the real, unpadded list.
+    return SimpleNamespace(request_ids=rids)
 
 
 @torch.no_grad()
@@ -180,7 +196,7 @@ def profile_forward(model, cfg, batch):
     graphs over compile — but compile does not remove kernel-launch overhead the
     way graphs do (the codebase runs both together for captured models).
     """
-    cache = _DecodeStubCache(cfg, batch)
+    _DecodeStubCache(cfg, batch).bind(model)
     ids = _decode_inputs(cfg, batch).clone()  # static input buffer for capture
 
     sub = _make_sub(model, cfg)
@@ -192,7 +208,7 @@ def profile_forward(model, cfg, batch):
         sub._prepare_sampler_step(ei, padded_bs=batch)
 
     def step():
-        h = model(ids, cache)
+        h = model(ids)
         logits = model.compute_logits(h[-batch:])   # (B, C, V)
         return sub._sample_in_graph(logits)          # (B, C + 1)
 

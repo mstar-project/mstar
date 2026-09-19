@@ -12,9 +12,10 @@ against the frozen dict oracle. These tests pin the *split itself*:
 
 * the deferred-sync order reproduces the pre-Phase-3 **inline** draws exactly,
   across join / evict / slot-reuse and capture-style padding;
-* the real request ids are recovered under CUDA-graph replay (where
-  ``request_ids`` is the dummy capture slots) via ``real_request_ids``, and the
-  ``__cg_`` capture placeholders are filtered out;
+* the real request ids are recovered under CUDA-graph replay, where
+  ``request_ids`` is the padded list the runner hands the step — the reals
+  first, then ``__cg_`` placeholder rows out to the bucket's batch size —
+  and those placeholders are filtered out;
 * **sync-before-register** holds: a new request reusing a just-freed slot is not
   clobbered by the departing request's deferred write-back.
 
@@ -62,12 +63,15 @@ def _sub(params: TTSSamplingParams) -> Zonos2LLMSubmodule:
     )
 
 
-def _engine_inputs(request_ids, real_request_ids=None):
-    return SimpleNamespace(
-        request_ids=request_ids,
-        real_request_ids=real_request_ids,
-        cache_manager=None,
-    )
+def _engine_inputs(request_ids):
+    return SimpleNamespace(request_ids=request_ids)
+
+
+def _padded_rids(rids, padded_bs):
+    """What the runner puts on ``ctx.padded_request_ids`` for a leased step:
+    the real rids, then its own dummy rows out to the bucket's batch size."""
+    pad = [f"__cg_decode_False_slot0_{i}__" for i in range(len(rids), padded_bs)]
+    return [*rids, *pad]
 
 
 def _inline_step(buf, rids, logits, params):
@@ -90,13 +94,11 @@ def _inline_step(buf, rids, logits, params):
     return frames
 
 
-def _split_step(sub, rids, logits, *, padded_bs=None, real_request_ids=None,
-                request_ids=None):
+def _split_step(sub, rids, logits, *, padded_bs=None, request_ids=None):
     """Phase-3 order: host-side preprocess (deferred sync) then in-graph sample."""
     pb = padded_bs if padded_bs is not None else len(rids)
     ei = _engine_inputs(
-        request_ids=request_ids if request_ids is not None else list(rids),
-        real_request_ids=real_request_ids,
+        request_ids if request_ids is not None else _padded_rids(rids, pb)
     )
     sub._prepare_sampler_step(ei, padded_bs=pb)
     return sub._sample_in_graph(logits)  # (pb, C + 1)
@@ -121,7 +123,7 @@ def test_deferred_split_matches_inline_single_request():
     for _ in range(params.repetition_window * 4 + 2):
         logits = torch.randn(1, C, V, generator=gen, device=DEVICE)
         inline = _inline_step(ref, ["r0"], logits.clone(), params)
-        split = _split_step(sub, ["r0"], logits.clone(), real_request_ids=["r0"])
+        split = _split_step(sub, ["r0"], logits.clone())
         assert torch.equal(inline, split)
 
 
@@ -135,7 +137,7 @@ def test_deferred_split_matches_inline_multibatch_join_evict_reuse():
     def both(rids):
         logits = torch.randn(len(rids), C, V, generator=gen, device=DEVICE)
         inline = _inline_step(ref, rids, logits.clone(), params)
-        split = _split_step(sub, rids, logits.clone(), real_request_ids=list(rids))
+        split = _split_step(sub, rids, logits.clone())
         assert torch.equal(inline, split), f"mismatch on {rids}"
 
     for _ in range(6):
@@ -150,8 +152,8 @@ def test_deferred_split_matches_inline_multibatch_join_evict_reuse():
 
 
 def test_capture_style_padding_matches_unpadded_reals():
-    """Padded batch (real_request_ids shorter than padded_bs): the real rows'
-    frames match the unpadded inline run, and padding rows never corrupt master.
+    """Padded batch (fewer reals than padded_bs): the real rows' frames match
+    the unpadded inline run, and padding rows never corrupt master.
     """
     params = _params(window=4)
     sub = _sub(params)
@@ -165,16 +167,12 @@ def test_capture_style_padding_matches_unpadded_reals():
         logits_real = torch.randn(len(reals), C, V, generator=gen, device=DEVICE)
         inline = _inline_step(ref, reals, logits_real.clone(), params)
 
-        # Split runs capture-style: request_ids is padded_bs dummy slots,
-        # real_request_ids carries the two reals; logits are padded_bs wide with
-        # the real rows first (padding rows get arbitrary logits).
+        # Split runs capture-style: request_ids is the two reals followed by
+        # padding rows out to padded_bs; logits are padded_bs wide with the real
+        # rows first (padding rows get arbitrary logits).
         pad_logits = torch.randn(padded_bs, C, V, generator=gen, device=DEVICE)
         pad_logits[:len(reals)] = logits_real
-        dummy_rids = [f"__cg_decode_False_slot0_{i}__" for i in range(padded_bs)]
-        split = _split_step(
-            sub, reals, pad_logits, padded_bs=padded_bs,
-            real_request_ids=reals, request_ids=dummy_rids,
-        )
+        split = _split_step(sub, reals, pad_logits, padded_bs=padded_bs)
         assert torch.equal(inline, split[:len(reals)])
 
     # Master offset for the two reals must equal the step count (10), proving
@@ -204,21 +202,20 @@ def test_sync_before_register_no_clobber_on_slot_reuse():
     sub = _sub(params)
     warm = torch.Generator(device=DEVICE).manual_seed(99)
     for _ in range(7):  # A accumulates a long history / large offset
-        _split_step(sub, ["A"], torch.randn(1, C, V, generator=warm, device=DEVICE),
-                    real_request_ids=["A"])
+        _split_step(sub, ["A"], torch.randn(1, C, V, generator=warm, device=DEVICE))
     a_slot = sub._sampler_buffers._rid_to_slot["A"]
     sub.cleanup_request("A")  # frees A's slot (LIFO -> D will reuse it)
 
     d_frames_reuse = []
     for lg in d_logits:
-        d_frames_reuse.append(_split_step(sub, ["D"], lg.clone(), real_request_ids=["D"]))
+        d_frames_reuse.append(_split_step(sub, ["D"], lg.clone()))
     assert sub._sampler_buffers._rid_to_slot["D"] == a_slot, "test needs slot reuse"
 
     # --- Scenario B: D alone on a pristine submodule. ---
     sub_fresh = _sub(params)
     d_frames_fresh = []
     for lg in d_logits:
-        d_frames_fresh.append(_split_step(sub_fresh, ["D"], lg.clone(), real_request_ids=["D"]))
+        d_frames_fresh.append(_split_step(sub_fresh, ["D"], lg.clone()))
 
     for a, b in zip(d_frames_reuse, d_frames_fresh, strict=True):
         assert torch.equal(a, b), "reused slot bled prior request's state into D"
@@ -228,28 +225,24 @@ def test_sync_before_register_no_clobber_on_slot_reuse():
 
 
 def test_real_rid_recovery_and_cg_filter():
-    """Under replay, real ids come from ``real_request_ids``; ``__cg_`` dummies
-    (capture-time placeholders) register nothing and gather to slot 0.
+    """The reals are recovered off the padded ``request_ids``; ``__cg_`` rows
+    (capture placeholders and replay padding) register nothing and gather to
+    slot 0.
     """
     params = _params()
     sub = _sub(params)
 
-    # Capture-time call: request_ids are dummy slots, real_request_ids is None.
-    # Nothing should register; gather must not raise.
-    dummy = [f"__cg_decode_False_slot0_{i}__" for i in range(3)]
+    # Capture-time call: every row is a placeholder, so nothing should
+    # register; gather must not raise.
     logits = torch.randn(3, C, V, device=DEVICE)
-    _split_step(sub, [], logits, padded_bs=3, real_request_ids=None, request_ids=dummy)
+    _split_step(sub, [], logits, padded_bs=3)
     assert sub._sampler_buffers._rid_to_slot == {}, "dummy rids must not register"
     assert sub._pending_sync_rids == [], "no reals retained for deferred sync"
 
-    # Replay-time call: real_request_ids carries the live ids (request_ids stays
-    # dummy). Exactly those register.
+    # Replay-time call: two live ids at the head, padding out to the bucket.
+    # Exactly the reals register.
     logits2 = torch.randn(4, C, V, device=DEVICE)
-    _split_step(
-        sub, ["ra", "rb"], logits2, padded_bs=4,
-        real_request_ids=["ra", "rb"],
-        request_ids=[f"__cg_decode_False_slot0_{i}__" for i in range(4)],
-    )
+    _split_step(sub, ["ra", "rb"], logits2, padded_bs=4)
     assert set(sub._sampler_buffers._rid_to_slot) == {"ra", "rb"}
     assert sub._pending_sync_rids == ["ra", "rb"]
 
@@ -272,7 +265,7 @@ def test_captured_sampler_matches_eager_token_for_token(reals, padded_bs):
     params = _params(window=4, penalty=1.3, seed=0)
     params.temperature, params.topk, params.min_p = 1.0, 8, 0.1  # exercise filters
     rids = [f"r{i}" for i in range(reals)]
-    dummy = [f"__cg_decode_False_slot0_{i}__" for i in range(padded_bs)]
+    padded = _padded_rids(rids, padded_bs)
     n_steps = 12
 
     gen = torch.Generator(device=dev).manual_seed(5)
@@ -293,7 +286,7 @@ def test_captured_sampler_matches_eager_token_for_token(reals, padded_bs):
     for lg in logit_stream:
         f = _split_step(
             eager, rids, lg[:reals].clone() if reals == padded_bs else lg.clone(),
-            padded_bs=padded_bs, real_request_ids=rids, request_ids=dummy,
+            padded_bs=padded_bs,
         )
         eager_frames.append(f[:reals].clone())
 
@@ -303,7 +296,7 @@ def test_captured_sampler_matches_eager_token_for_token(reals, padded_bs):
     static_logits = torch.empty(padded_bs, C, V, device=dev)
 
     # Prime buf with a valid gather, then warm up on a side stream before capture.
-    ei0 = _engine_inputs(request_ids=dummy, real_request_ids=rids)
+    ei0 = _engine_inputs(padded)
     cap._prepare_sampler_step(ei0, padded_bs=padded_bs)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
@@ -324,7 +317,7 @@ def test_captured_sampler_matches_eager_token_for_token(reals, padded_bs):
 
     cap_frames = []
     for lg in logit_stream:
-        ei = _engine_inputs(request_ids=dummy, real_request_ids=rids)
+        ei = _engine_inputs(padded)
         cap._prepare_sampler_step(ei, padded_bs=padded_bs)  # gather outside graph
         static_logits.copy_(lg)
         g.replay()

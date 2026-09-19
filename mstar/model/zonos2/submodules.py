@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -23,8 +24,15 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_runner import BasicBatchedCudaGraphConfig
-from mstar.engine.kv_cache_engine import BatchedCacheManager
+from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+)
 from mstar.model.components.moe import _HAS_FUSED
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -33,6 +41,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.model.zonos2.config import ATTN, KV_CACHE, ROPE
 from mstar.model.zonos2.sampler_buffers import Zonos2SamplerBuffers
 from mstar.model.zonos2.tts_sampling import TTSSamplingParams, sample_frame
 from mstar.model.zonos2.vocoder import StreamingDacDecoder
@@ -83,7 +92,7 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
     # -- CUDA-graph capture --------------------------------------------
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[BasicBatchedCudaGraphConfig]:
+    ) -> list[CudaGraphConfig]:
         """Declare the decode capture, which includes the multi-codebook sampler.
 
         The capture applies only to the fused-MoE path, because only that
@@ -103,10 +112,8 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
             return []
         frame_w = self.n_codebooks + 1
         return [
-            BasicBatchedCudaGraphConfig(
+            BatchedCudaGraphConfig(
                 capture_graph_walk="decode",
-                requires_cfg=False,
-                labels=["main"],
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(
                         1, frame_w, dtype=torch.long, device=device,
@@ -122,8 +129,6 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        seen_token_mask=None,
-        pos_info: dict = {},
         **kwargs,
     ) -> ARNodeInputs:
         ids = inputs["text_inputs"][0]  # (num_frames, n_codebooks + 1)
@@ -136,17 +141,43 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
             node_inputs.tensor_inputs["speaker_embedding"] = speaker[0].reshape(1, -1)
         return node_inputs
 
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
+    ) -> SubmoduleStep:
+        """One causal span per row on the single ``main`` stream.
+
+        No ``SamplerStep``: the multi-codebook sampler is the submodule's own
+        (``_sample_in_graph``), so the node declares no sampler resource. The
+        runner plans attention and RoPE off this declaration and advances the
+        sequence lengths on commit, which is what the old ``plan_attention`` /
+        ``plan_rope`` / ``advance_seq_lens`` calls in ``preprocess`` and the
+        model forward used to do by hand.
+        """
+        return SubmoduleStep(
+            segments=[
+                Segment(request_id=rid, label="main", span=inp.input_seq_len)
+                for rid, inp in zip(request_ids, inputs, strict=True)
+            ],
+            steps={
+                KV_CACHE: KVStep(),
+                ATTN: AttentionStep(causal=True),
+                ROPE: PositionStep(),
+            },
+        )
+
     def preprocess(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        cache_manager = engine_inputs.cache_manager
         seq_lens = [inp.input_seq_len for inp in inputs]
-        cache_manager.set_active_label("main")
-        cache_manager.plan_attention(seq_lens=seq_lens, is_causal=True, label="main")
-        cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
         input_ids = torch.cat([inp.input_ids for inp in inputs], dim=0).to(
             device=self.get_device(), dtype=torch.long
         )
@@ -229,15 +260,15 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         if self._pending_sync_rids:
             bufs.sync_after_step(self._pending_sync_rids)
             self._pending_sync_rids = None
-        # (2) Recover the real request ids. Under CUDA-graph replay,
-        # ``request_ids`` holds dummy capture slots, so prefer
-        # ``real_request_ids``. The ``__cg_`` filter also drops the placeholder
-        # ids of the capture itself. No real request exists there, so the
-        # register and the gather become no-ops onto slot 0.
-        rids = engine_inputs.real_request_ids
-        if rids is None:
-            rids = engine_inputs.request_ids
-        real_rids = [r for r in rids if not r.startswith("__cg_")]
+        # (2) Recover the real request ids. ``request_ids`` is the padded list
+        # under a captured replay: the real rids first, then the runner's
+        # ``__cg_`` padding rows to the bucket's batch size. Dropping those
+        # leaves the real head. During the capture itself every row is a
+        # placeholder, so this is empty and the register and the gather become
+        # no-ops onto slot 0.
+        real_rids = [
+            r for r in engine_inputs.request_ids if not r.startswith("__cg_")
+        ]
         for rid in real_rids:
             bufs.register_request(rid)                        # idempotent
         # (3) Gather the real slots into buf[:len(real_rids)]. Padding rows use
@@ -261,9 +292,8 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         speaker_token_positions: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        cache_handle: BatchedCacheManager = engine_inputs.cache_manager
         hidden = self.model(
-            input_ids, cache_handle, speaker_emb_values, speaker_token_positions,
+            input_ids, speaker_emb_values, speaker_token_positions, label="main",
         )                                                     # (num_frames, hidden)
         logits = self.model.compute_logits(hidden[-1:])       # (1, C, V)
         frame = self._sample_in_graph(logits)                 # (1, C + 1)
@@ -279,9 +309,8 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         speaker_token_positions: torch.Tensor | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        cache_handle: BatchedCacheManager = engine_inputs.cache_manager
         hidden = self.model(
-            input_ids, cache_handle, speaker_emb_values, speaker_token_positions,
+            input_ids, speaker_emb_values, speaker_token_positions, label="main",
         )                                                     # (total_frames, hidden)
         last_hidden = hidden.index_select(0, last_indices.to(hidden.device))
         logits = self.model.compute_logits(last_hidden)       # (B, C, V)
@@ -408,6 +437,12 @@ class Zonos2DACSubmodule(NodeSubmodule):
     shear-alignment frames, because they hold no audio of their own.
     """
 
+    # fp32, uncompiled: what ``get_stateless_flavor`` returning "audio_codec"
+    # used to buy on the old stateless engine, stated directly now that the
+    # engine reads these off the submodule.
+    disable_torch_compile = True
+    disable_autocast = True
+
     def __init__(self, decoder: StreamingDacDecoder, n_codebooks: int):
         super().__init__()
         self.decoder = decoder
@@ -416,9 +451,6 @@ class Zonos2DACSubmodule(NodeSubmodule):
         # A marker parameter, so that ``get_device`` and ``.to(device)`` work.
         # The decoder loads the DAC model itself, and it does so lazily.
         self._device_param = nn.Parameter(torch.zeros(1), requires_grad=False)
-
-    def get_stateless_flavor(self) -> str:
-        return "audio_codec"  # fp32, no autocast, no torch.compile
 
     def prepare_inputs(
         self,
@@ -490,15 +522,16 @@ class Zonos2SpeakerEncoderSubmodule(NodeSubmodule):
     one-time cost for each request, not a cost for each token.
     """
 
+    # fp32, no autocast, no torch.compile. The reference runs this encoder in
+    # fp32, and the downstream projection was fit against those values. These
+    # replace the old ``get_stateless_flavor() -> "audio_codec"``.
+    disable_torch_compile = True
+    disable_autocast = True
+
     def __init__(self, encoder: nn.Module, sample_rate: int):
         super().__init__()
         self.encoder = encoder
         self.sample_rate = sample_rate
-
-    def get_stateless_flavor(self) -> str:
-        # fp32, no autocast, no torch.compile. The reference runs this encoder
-        # in fp32, and the downstream projection was fit against those values.
-        return "audio_codec"
 
     def prepare_inputs(
         self,

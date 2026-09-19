@@ -204,10 +204,6 @@ def _speaker_model(**kw) -> Zonos2ForCausalLM:
     return model
 
 
-def _stub_cache() -> SimpleNamespace:
-    return SimpleNamespace(advance_seq_lens=lambda: None, set_layer_idx=lambda i: None)
-
-
 def _ids(model: Zonos2ForCausalLM, T: int = 4) -> torch.Tensor:
     return torch.zeros(T, model.n_codebooks + 1, dtype=torch.long)
 
@@ -226,12 +222,12 @@ def test_speaker_projection_shapes():
 
 def test_speaker_injection_only_at_positions():
     model = _speaker_model(speaker_enabled=True, speaker_embedding_dim=5, speaker_lda_dim=4)
-    ids, cache = _ids(model, T=4), _stub_cache()
+    ids = _ids(model, T=4)
     pos = 1
     with torch.no_grad():
-        base = model(ids, _stub_cache())
+        base = model(ids)
         spk = model(
-            ids, cache,
+            ids,
             speaker_emb_values=torch.randn(1, 5),
             speaker_token_positions=torch.tensor([pos]),
         )
@@ -246,10 +242,10 @@ def test_speaker_disabled_ignores_values():
     assert model.speaker_projection is None
     ids = _ids(model)
     with torch.no_grad():
-        base = model(ids, _stub_cache())
+        base = model(ids)
         # Supplying values is a harmless no-op when the model is speaker-disabled.
         out = model(
-            ids, _stub_cache(),
+            ids,
             speaker_emb_values=torch.randn(1, 5),
             speaker_token_positions=torch.tensor([0]),
         )
