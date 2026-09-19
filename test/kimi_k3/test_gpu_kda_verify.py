@@ -145,3 +145,27 @@ def test_checkpoint_kernel_matches_fla_on_plain_rows():
         output_final_state=True, state_v_first=True, cu_seqlens=cu5, use_qk_l2norm_in_kernel=True,
         use_gate_in_kernel=True, use_beta_sigmoid_in_kernel=True, lower_bound=-5.0)
     assert torch.allclose(pool[slots.long()], S5, atol=1e-4, rtol=1e-4)
+
+
+def test_checkpoint_kernel_block_only_output_matches_the_full_one():
+    """``out_skip``: the same recurrence stores only each row's tokens past the prefix part, into
+    ``[N * k1, H, D]``, equal to slicing the full output."""
+    from mstar.engine.resources.linear_attn.kda_spec_recurrent import kda_recurrent_checkpoint
+
+    torch.manual_seed(3)
+    n, kp, k1 = 3, K1, 5
+    t = n * (kp + k1)
+    q, k, v, g = (torch.randn(t, H, D, device=DEV).to(torch.bfloat16) for _ in range(4))
+    beta = torch.randn(t, H, device=DEV).to(torch.bfloat16)
+    A_log = torch.randn(H, device=DEV)
+    dt_bias = torch.randn(H * D, device=DEV) * 0.1
+    S0 = torch.randn(n + 2, H, D, D, device=DEV)
+    slots = torch.tensor([3, 0, 4], device=DEV, dtype=torch.int32)
+    ckpt = torch.tensor([2, -1, kp - 1], device=DEV, dtype=torch.int32)
+    cu = torch.arange(n + 1, device=DEV, dtype=torch.int32) * (kp + k1)
+    pool_a, pool_b = S0.clone(), S0.clone()
+    full = kda_recurrent_checkpoint(q, k, v, g, beta, A_log, dt_bias, pool_a, slots, ckpt, cu, D ** -0.5, -5.0)
+    block = kda_recurrent_checkpoint(q, k, v, g, beta, A_log, dt_bias, pool_b, slots, ckpt, cu, D ** -0.5, -5.0, out_skip=kp)
+    assert block.shape == (n * k1, H, D)
+    assert torch.equal(block, full.view(n, kp + k1, H, D)[:, kp:].reshape(n * k1, H, D))
+    assert torch.equal(pool_a, pool_b)
