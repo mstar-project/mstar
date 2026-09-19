@@ -21,6 +21,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.distributed.merged_linear import COLUMN, REPLICATED, MergedParallelLinear
 from mstar.model.kimi_k3.components.common import KimiRMSNorm, fused_decode_kernels
+from mstar.utils.streams import Fork
 from mstar.model.kimi_k3.components.mla_out_kernel import mla_out
 
 # the checkpoint's q_a_proj / kv_a_proj_with_mqa land in the merged in_proj by segment name; its
@@ -65,6 +66,7 @@ class ParallelMLAAttention(nn.Module):
         self._attn_key, self._kv_key = attn_key, kv_key
         self.attn = None
         self.kv = None
+        self._fork = Fork()
 
         # the three projections of the layer input (the replicated LoRA-A factors of q and kv,
         # the column-parallel output gate) run as one GEMM; see MergedParallelLinear
@@ -142,8 +144,9 @@ class ParallelMLAAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert self.attn is not None and self.kv is not None, "bind_resources first, or use forward_dense"
         mixed = self._project(x)
-        q_lat, q_pe = self._query(mixed["q_a"])
-        self.kv.write_kv(self._latent(mixed["kv_a"]))
+        # the query path and the latent write only share the projection: two streams under a capture
+        (q_lat, q_pe), _ = self._fork.run(
+            lambda: self._query(mixed["q_a"]), lambda: self.kv.write_kv(self._latent(mixed["kv_a"])))
         o_lat = self.attn.run(q_lat, kv_cache_layer=self.kv.layer_view(), q_pe=q_pe)
         return self._finish(mixed.get("g"), o_lat)
 
