@@ -19,7 +19,7 @@ def test_fork_under_capture_matches_the_sequential_result():
     w0 = torch.randn(256, 128, device="cuda")
     w1 = torch.randn(256, 96, device="cuda")
     want = (x @ w0).sum(1) + (x @ w1).sum(1)
-    f = Fork()
+    f = Fork(enabled=True)  # the module default may be off; this test is about the two-stream path
     out = torch.empty(64, device="cuda")
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
