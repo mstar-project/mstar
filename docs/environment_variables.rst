@@ -38,11 +38,13 @@ Communication
        ``MSTAR_TORCH_PROFILE_STACK=1`` records Python stacks and shapes, which attributes an
        eager step's kernels to their ops. Unset, the hook is a counter increment per step.
    * - ``MSTAR_MLA_DECODE_BACKEND``
-     - ``flashmla``
+     - ``flashinfer``
      - Which kernel the MLA attention resource runs for plain decode plans (one causal query per
-       row) when DeepSeek's FlashMLA is built for the GPU (sm90, latent 512 + rope 64): ``flashmla``
-       (a few us a layer) or ``flashinfer`` (FlashInfer's Hopper MLA kernel, ~15 us a call at any
-       batch). Prefill, verify blocks and context-only reads stay on FlashInfer.
+       row): ``flashinfer`` (FlashInfer's Hopper MLA kernel) or ``flashmla`` (DeepSeek's FlashMLA,
+       where it is built for the GPU: sm90, latent 512 + rope 64). On an H100 the two cost about the
+       same per call (15 us at one row, 26 against 31 us at 32 rows, 48 against 50 at 64), so
+       FlashMLA is an option, not the default. Prefill, verify blocks and context-only reads stay on
+       FlashInfer either way.
    * - ``MSTAR_AUX_STREAM``
      - ``1``
      - ``0`` keeps every captured step on one stream. By default a layer's independent branches
