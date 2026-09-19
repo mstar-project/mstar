@@ -174,10 +174,10 @@ class FLAKDAKernels:
         k1 = plan.cu_seqlens_cpu[1] - plan.cu_seqlens_cpu[0]
         assert rows * k1 == qkv.shape[0], (rows, k1, qkv.shape)
         slots = plan.slot_ids[:rows]
-        # the prep kernel reads the gates and betas flat: the layer hands over views into its
-        # merged projection, so a verify step pays these two small copies
+        # the prep kernel reads the gates and betas with their row strides: the layer's views into
+        # its merged projection go in as they are
         q, k, v, g, beta, ckpt = kda_verify_prep(
-            qkv, g_raw.contiguous(), beta_raw.contiguous(), conv_state, spec, slots, p.conv_weight, rows, k1, h, d,
+            qkv, g_raw, beta_raw, conv_state, spec, slots, p.conv_weight, rows, k1, h, d,
         )
         o = kda_recurrent_checkpoint(
             q.view(-1, h, d), k.view(-1, h, d), v.view(-1, h, d), g.view(-1, h, d), beta, p.A_log, p.dt_bias,
