@@ -41,7 +41,8 @@ Communication
      - ``1``
      - ``0`` makes the Kimi K3 decode step fall back to the torch/fla paths its fused Triton
        kernels replaced (the KDA recurrence and gated norm reading the merged projection's
-       slices in place, MLA's per-head output product with its gate), for a served A/B.
+       slices in place, MLA's per-head output product with its gate, the MoE up-projection's
+       latent slice taken as a view), for a served A/B.
    * - ``MSTAR_SYMM_MEM_ALLREDUCE``
      - ``auto``
      - How small tensor-parallel all-reduces (``CommGroup.all_reduce``) run. ``auto`` runs 2-D
