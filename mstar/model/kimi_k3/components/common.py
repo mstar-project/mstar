@@ -3,6 +3,7 @@ with a plain copy loader, and dim-0 sharding loaders for per-head parameters."""
 from __future__ import annotations
 
 import logging
+import os
 from functools import partial
 
 import torch
@@ -115,3 +116,10 @@ def replicated_loader(param: nn.Parameter, loaded: torch.Tensor, loaded_shard_id
     assert loaded_shard_id is None
     assert param.data.shape == loaded.shape, (tuple(param.data.shape), tuple(loaded.shape))
     param.data.copy_(loaded)
+
+
+def fused_decode_kernels() -> bool:
+    """``MSTAR_K3_FUSED_DECODE=0`` falls back to the torch/fla decode paths the fused kernels replaced
+    (the KDA recurrence and gated norm reading the projection slices in place, the MLA output),
+    for a served A/B on one tree."""
+    return os.environ.get("MSTAR_K3_FUSED_DECODE", "1") != "0"
