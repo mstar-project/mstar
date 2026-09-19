@@ -24,6 +24,83 @@ Communication
        ``0``: always pyzmq. The two transports are wire-compatible, so
        this can be set per-process while the rest of the mesh stays on
        pyzmq.
+   * - ``MSTAR_TORCH_PROFILE``
+     - unset
+     - ``<start>:<count>[@<bs>][,...]`` makes a worker profile ``count`` engine
+       steps of ``MSTAR_TORCH_PROFILE_WALK`` (default ``decode``) from the ``start``-th such
+       step of each window with ``torch.profiler``, then log one per-kernel table per window
+       (CUDA time and launches per step, the batch sizes seen; the kernels of CUDA-graph
+       replays are listed individually) and write a Chrome trace to
+       ``MSTAR_TORCH_PROFILE_DIR`` (default ``/tmp``). With ``@<bs>`` a window counts and
+       covers only the steps of that batch size (one served run through several concurrency
+       levels gives one table per bucket). ``MSTAR_TORCH_PROFILE_RANKS`` (default
+       ``0``; comma-separated worker indices or ``all``) selects the workers;
+       ``MSTAR_TORCH_PROFILE_STACK=1`` records Python stacks and shapes, which attributes an
+       eager step's kernels to their ops. Unset, the hook is a counter increment per step.
+   * - ``MSTAR_MLA_DECODE_BACKEND``
+     - ``flashinfer``
+     - Which kernel the MLA attention resource runs for plain decode plans (one causal query per
+       row): ``flashinfer`` (FlashInfer's Hopper MLA kernel) or ``flashmla`` (DeepSeek's FlashMLA,
+       where it is built for the GPU: sm90, latent 512 + rope 64). On an H100 the two cost about the
+       same per call (15 us at one row, 26 against 31 us at 32 rows, 48 against 50 at 64), so
+       FlashMLA is an option, not the default. Prefill, verify blocks and context-only reads stay on
+       FlashInfer either way.
+   * - ``MSTAR_AUX_STREAM``
+     - ``1``
+     - ``0`` keeps every captured step on one stream. By default a layer's independent branches
+       (``mstar.utils.streams.Fork``: Kimi K3's router beside its merged projection, the shared
+       experts beside the routed ones, MLA's query path beside its latent write, KDA's two input
+       projections) run on an auxiliary stream while a CUDA graph is being captured, so their
+       kernels overlap in the replay; eager steps are unchanged.
+   * - ``MSTAR_K3_FUSED_DECODE``
+     - ``1``
+     - ``0`` makes the Kimi K3 decode step fall back to the torch/fla paths its fused Triton
+       kernels replaced (the KDA recurrence and gated norm reading the merged projection's
+       slices in place, MLA's per-head output product with its gate, the MoE up-projection's
+       latent slice taken as a view), for a served A/B.
+   * - ``MSTAR_SYMM_MEM_ALLREDUCE``
+     - ``auto``
+     - How small tensor-parallel all-reduces (``CommGroup.all_reduce``) run. ``auto`` runs 2-D
+       bf16/fp16 messages of up to ``MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS`` rows (decode batches)
+       through a Lamport one-shot kernel: flashinfer's TensorRT-LLM kernel when its comm module
+       imports (``flashinfer`` pins it; 2.5 us for a decode-sized message at TP2), else M*'s own
+       Triton kernel (``lamport`` pins it; ``mstar/distributed/lamport_allreduce.py``: every rank
+       pushes its partial into its peers' symmetric buffers and sums what arrives, no barrier, one
+       launch; it also serves ``CommGroup.all_gather`` along the last dim), and everything else, like
+       ``multimem``, through torch's symmetric-memory NVLink-multicast ``multimem_all_reduce_``
+       kernel, in place on a ring of four symmetric buffers per shape (a result stays valid
+       until three more all-reduces of that shape); it falls back to the one-shot/two-shot
+       kernels where the node lacks NVLS and to NCCL where the group spans nodes. ``1`` uses
+       the one-shot kernel (every rank reads its peers' buffers over NVLink and reduces
+       locally) up to ``MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES`` and the two-shot kernel
+       (reduce-scatter + all-gather) above it; ``0`` keeps NCCL. On an 8xH100 node a
+       decode-sized all-reduce costs ~24 µs on NCCL, ~13 µs one-shot and less with multicast;
+       a Kimi K3 decode step pays three per MoE layer, and the multicast default took it from
+       28 to 23 ms at one request (together with the other 2026-09-15 changes). Producers can
+       write straight into the buffer (``CommGroup.symm_buffer`` / ``all_reduce_symm_buffer``).
+   * - ``MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS``
+     - ``128 // world``
+     - Largest row count (tokens) an all-reduce takes through the Lamport kernel; bigger
+       messages go to the multicast ring. The one-shot's cost grows with rows times ranks, so
+       the default is 128 divided by the group size (16 at TP8, 64 at TP2, never below 8).
+       Measured on 8xH100 at width 7168 in a CUDA graph (2026-09-17): flashinfer's one-shot
+       4.0 / 5.9 / 28 / 62 us at 1 / 8 / 64 / 128 rows against the multicast ring's 7.9 / 8.6 /
+       12.6 / 15.8, so the tiers cross near 16 rows; a Kimi K3 decode step at 64 requests pays
+       about 190 of these all-reduces.
+   * - ``MSTAR_LAMPORT_ALLGATHER_MAX_ROWS``
+     - ``128``
+     - Largest row count ``CommGroup.all_gather`` takes through M*'s Lamport kernel, and the
+       row capacity of every Lamport workspace (``2 x world x rows x width`` elements per
+       (dtype, width) channel: 29 MB per rank at width 7168 on 8 ranks). The all-gather stays
+       far ahead of NCCL at every measured size (6.4 to 9.2 us against 65 us up to 64 rows at TP8).
+   * - ``MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES``
+     - ``262144``
+     - Largest message (bytes) the one-shot kernel takes; up to
+       ``MSTAR_SYMM_MEM_ALLREDUCE_MAX_BYTES`` the two-shot kernel is used.
+   * - ``MSTAR_SYMM_MEM_ALLREDUCE_MAX_BYTES``
+     - ``4194304``
+     - Largest message (bytes) the symmetric-memory path takes; bigger
+       all-reduces stay on NCCL, whose ring wins at size.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a
@@ -209,8 +286,11 @@ Worker scheduling
      - Default
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
-     - ``0``
-     - Async scheduling for lockstep-parallel (TP / SP) nodes. ``1``: the
+     - unset
+     - Async scheduling for lockstep-parallel (TP / SP) nodes. Unset: a
+       parallel node runs it when its submodule sets
+       ``NodeSubmodule.prefers_tp_async_scheduling`` (Kimi K3 does), else the
+       serial protocol. ``1``: the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
        opened) and broadcasts it at once as a speculative
@@ -222,7 +302,8 @@ Worker scheduling
        rank from replicated state, never signalled. A comma-separated
        list of node names (``thinker,talker``) enables it for those
        parallel nodes only. ``0``: the serial path — leader schedules
-       after N, followers rebuild after the broadcast. Set it identically
+       after N, followers rebuild after the broadcast — whatever the
+       submodule prefers. Set it identically
        on every rank of an instance: the workers compare it at startup and
        refuse to start on a mismatch. Leave ``MSTAR_ENGINE_STEP_SYNC`` at
        ``0`` with it: that throttle holds the GPU thread until step N drains,

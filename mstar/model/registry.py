@@ -8,6 +8,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
+    "kimi_k3": ("mstar.model.kimi_k3.kimi_k3_model", "KimiK3Model"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
@@ -34,6 +35,10 @@ HF_MODELS: dict[str, dict] = {
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
+    # Kimi K3 (2.8T hybrid KDA + MLA MoE, MXFP4 experts). The expert-pruned
+    # ``mgoin/Kimi-K3-pruned75`` (224 experts) shares the architecture and is the
+    # single-node dev checkpoint; override ``model_path_hf`` under ``model_kwargs``.
+    "kimi_k3": {"model_path_hf": "moonshotai/Kimi-K3"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar

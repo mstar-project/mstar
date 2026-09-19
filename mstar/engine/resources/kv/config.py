@@ -17,7 +17,10 @@ if TYPE_CHECKING:
 
 class KVLayout(Enum):
     NHD = "NHD"
-    # TODO: can add more, like HND, MLA
+    # Multi-head Latent Attention: one compressed latent per token per layer,
+    # ``[num_layers, max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim]``.
+    # No K/V axis and a single (replicated) KV head; only query heads shard.
+    MLA = "MLA"
 
 
 @dataclass
@@ -32,12 +35,28 @@ class KVConfig:
     layout: KVLayout = KVLayout.NHD
     # pages of pinned host memory to keep for offloading; 0 disables it
     cpu_offload_pages: int = 0
+    # MLA only: the latent is ``[ckv (kv_lora_rank) | kpe (qk_rope_head_dim)]``
+    kv_lora_rank: int | None = None
+    qk_rope_head_dim: int | None = None
 
     def __post_init__(self):
+        if self.layout == KVLayout.MLA:
+            if self.kv_lora_rank is None or self.qk_rope_head_dim is None:
+                raise ValueError("KVLayout.MLA needs kv_lora_rank and qk_rope_head_dim")
+            # the cache stores one latent per token: a single KV "head" of the
+            # latent width, whatever the model's head counts are
+            self.num_kv_heads = 1
+            self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         if self.num_qo_heads is None:
             self.num_qo_heads = self.num_kv_heads
         self._unsharded_kv_heads = self.num_kv_heads
         self._unsharded_qo_heads = self.num_qo_heads
+
+    @property
+    def latent_dim(self) -> int:
+        """Per-token cache width under MLA."""
+        assert self.layout == KVLayout.MLA
+        return self.kv_lora_rank + self.qk_rope_head_dim
 
     def shard(self, num_shards: int) -> None:
         """Narrow the head counts to one rank's slice.
@@ -77,6 +96,12 @@ class KVReqConfig(ResourceReqConfig):
 @dataclass
 class KVSpec(NodeResourceSpec):
     config: KVConfig
+    # resources whose plan must run before this cache's (their plan results are read in
+    # `KVManager.plan`): the speculative acceptance verdicts that trim a verify step's tail
+    plan_after: tuple[str, ...] = ()
+
+    def depends_on(self) -> set[str]:
+        return set(self.plan_after)
 
     @property
     def resource_class(self) -> "type[Resource]":

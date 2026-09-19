@@ -1,0 +1,24 @@
+# DSpark-draft variant (3 drafts per step, random tiny draft) of kimi_k3_tiny.yaml: served greedy texts must equal the plain ones.
+# Kimi K3 architecture smoke deployment: the random-weight 0.4B test checkpoint
+# (inference-optimization/Kimi-K3-0.40B) on one GPU. Same code path as the real
+# model; only the checkpoint directory differs.
+model: "kimi_k3"
+max_seq_len: 4096
+model_kwargs:
+  speculative_tokens: 3   # speculative decoding with the DSpark draft below (random weights: a path test, near-zero acceptance)
+  speculative_draft: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ref/tiny_kimi_k3_dspark
+  checkpoint_dir: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ref/tiny_kimi_k3
+  max_output_tokens: 256
+node_groups:
+  - node_names: [LLM]
+    ranks: [0]
+    graph_walks: [prefill, decode]
+resources:
+  mla_kv:
+    max_num_pages: 512
+    page_size: 64
+  kda_state:
+    max_slots: 129
+  dspark_kv:
+    max_num_pages: 512
+    page_size: 64

@@ -248,6 +248,77 @@ class SamplingConfig:
         return self._seed
 
 
+
+
+def verify_greedy(logits: torch.Tensor, drafts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Greedy verification of a speculative block.
+
+    ``logits [N * (k + 1), V]`` are the target's logits at a request's ``k + 1``
+    input positions (the bonus token it was given, then its ``k`` drafted
+    tokens), rows grouped by request; ``drafts [N, k]`` are those drafted
+    tokens. Position ``j``'s argmax is the target's choice of the token after
+    input ``j``, so draft ``j`` is accepted while every earlier draft was and
+    it equals that argmax. Returns ``tokens [N, k + 1]`` (the argmaxes: the
+    ones at ``[:accepted + 1]`` are the tokens the request emits, the last of
+    them the new bonus) and ``accepted [N]`` (int32, 0..k). Tensor ops only,
+    so it captures into a CUDA graph.
+    """
+    n, k = drafts.shape
+    tokens = logits.view(n, k + 1, -1).argmax(dim=-1)
+    match = tokens[:, :k] == drafts.to(tokens.dtype)
+    accepted = torch.cumprod(match.to(torch.int32), dim=1).sum(dim=1).to(torch.int32)
+    return tokens, accepted
+
+
+def verify_speculative_gpu(
+    logits: torch.Tensor, drafts: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor,
+    top_p: torch.Tensor, seed: torch.Tensor, offset: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Speculative sampling of a verify block on the GPU, per row of ``drafts [N, k]``:
+    ``logits [N * (k + 1), V]`` at the row's bonus-plus-drafts positions become the target
+    distributions (temperature, top-k, top-p of the row, repeated over its positions; the
+    greedy encoding temp 1 / top-k 1 gives a one-hot at the argmax), the drafts are a greedy
+    draft's one-hot distributions, and FlashInfer's ``chain_speculative_sampling`` accepts each
+    draft with probability ``p(d) / q(d)`` (so exactly when it is the argmax for a greedy row),
+    resamples from the residual on the first rejection, or draws the bonus token when every
+    draft passed; deterministic philox on the row's ``seed`` / ``offset``. Returns the same
+    ``(tokens [N, k + 1], accepted [N] int32)`` as ``verify_greedy``: the emitted tokens are
+    ``tokens[i, :accepted[i] + 1]``. Tensor ops only, capturable."""
+    import flashinfer
+
+    n, k = drafts.shape
+    k1 = k + 1
+    vocab = logits.shape[1]
+    with torch.cuda.device(logits.device):
+        rep = lambda t: t.repeat_interleave(k1)  # noqa: E731
+        probs = fused_temperature_softmax(logits, rep(temperature), include_greedy=False)
+        top_k_rep = rep(torch.where(top_k > 0, top_k, vocab))
+        probs = flashinfer.sampling.top_k_renorm_probs(probs, top_k_rep)
+        probs = flashinfer.sampling.top_p_renorm_probs(probs, rep(top_p))
+        # greedy rows (the sampler's top-k 1 encoding): an exact one-hot at the argmax, the same op
+        # as `verify_greedy`, so a draft equal to the argmax is accepted with probability exactly 1
+        # (the renormalised top-1 comes out a few ulps under 1, which would reject it once in ~1e7
+        # tokens and resample from an empty residual) and the bonus is the argmax itself
+        greedy = top_k_rep == 1
+        argmax = logits.argmax(dim=-1, keepdim=True)
+        probs.mul_((~greedy).to(probs.dtype)[:, None])
+        kept = probs.gather(1, argmax)
+        probs.scatter_(1, argmax, torch.where(greedy[:, None], torch.ones_like(kept), kept))
+        target = probs.view(n, k1, vocab)
+        draft_probs = torch.zeros(n, k, vocab, dtype=torch.float32, device=logits.device)
+        draft_probs.scatter_(2, drafts.to(torch.long).unsqueeze(-1), 1.0)
+        res = flashinfer.sampling.chain_speculative_sampling(
+            draft_probs, drafts.to(torch.int32), target, deterministic=True, seed=seed, offset=offset,
+        )
+    # flashinfer 0.6 returns (output_token_ids, position-wise agreements, chain-accepted count); the
+    # tokens are padded with -1 after the emitted ones, so the count read off the padding is the
+    # chain's on every version
+    out = res[0] if isinstance(res, (tuple, list)) else res
+    accepted = ((out >= 0).to(torch.int32).sum(dim=1) - 1).clamp_min(0)
+    tokens = torch.where(out >= 0, out, torch.zeros_like(out)).to(torch.int64)
+    return tokens, accepted
+
+
 @dataclass
 class BaseSampler(ABC):
     def _broadcast_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -799,6 +870,20 @@ class CudaGraphableSampler(BaseSampler):
             # permitted when stream is capturing".
             self.seen_tokens_buf.scatter_(1, codes.unsqueeze(1), True)
         return codes
+
+    @torch.compiler.disable
+    def sample_verify(self, logits: torch.Tensor, drafts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Verify a speculative block with each row's sampling parameters (``verify_speculative_gpu``),
+        the verdict agreed across TP ranks like ``sample``; the per-step RNG offset advances in-graph."""
+        n = drafts.shape[0]
+        tokens, accepted = verify_speculative_gpu(
+            logits, drafts, self.temperature_buf[:n], self.top_k_buf[:n], self.top_p_buf[:n],
+            self.seed_buf[:n], self.offset_buf[:n],
+        )
+        self.offset_buf += 1
+        packed = torch.cat([tokens, accepted.to(tokens.dtype).unsqueeze(1)], dim=1)
+        packed = self._broadcast_tokens(packed)
+        return packed[:, :-1], packed[:, -1].to(torch.int32)
 
     @torch.compiler.disable
     def sync_seen_token_masks(

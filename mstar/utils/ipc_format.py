@@ -106,6 +106,9 @@ class ScheduleTPNode(MessageBody):
     speculative: bool = False
     spec_seq: int = -1
     spec_from_seq: int = -1
+    # rid -> walk for rows riding along in a step of another walk (see
+    # ``NodeSubmodule.mixed_step_walks``); absent rids run ``graph_walk``
+    request_walks: dict[str, str] | None = None
 
 
 @dataclass

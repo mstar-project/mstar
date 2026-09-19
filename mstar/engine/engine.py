@@ -9,6 +9,8 @@ from typing import Any, Callable, Mapping
 
 import torch
 
+from mstar.utils.coalesce import clone_coalesced
+
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
@@ -177,6 +179,9 @@ class ExecutingBatch:
     # rids whose consumed streaming input was the final chunk — this step
     # reports the partition done
     final_stream_rids: set[str] = field(default_factory=set)
+    # rid -> walk for rows riding along in this step from another walk (see
+    # ``NodeSubmodule.mixed_step_walks``); every other rid runs the step's walk
+    request_walks: Mapping[str, str] = field(default_factory=dict)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -230,6 +235,10 @@ class ExecutingBatch:
     @property
     def graph_walk(self) -> str:
         return self.step_context.graph_walk
+
+    def walk_of(self, rid: str) -> str:
+        """The walk this request is on: the step's, unless it rides along from another."""
+        return self.request_walks.get(rid, self.step_context.graph_walk)
 
     def register_prepare_batch(self, inputs: list[NodeInputs]):
         self.inputs = inputs
@@ -333,6 +342,12 @@ class Engine:
 
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
+            if device.type == "cuda":
+                logger.info(
+                    "resource %s built: %.2f GiB allocated, %.2f GiB reserved on %s (current device %d)",
+                    spec.resource_key, torch.cuda.memory_allocated(device) / 2**30,
+                    torch.cuda.memory_reserved(device) / 2**30, device, torch.cuda.current_device(),
+                )
 
         self._runner = StepRunner(
             self._resources,
@@ -359,6 +374,10 @@ class Engine:
                 resources=resources
             )
             submodule.bind_node_resources(resources)
+
+    def submodule(self, node_name: str) -> NodeSubmodule:
+        """The loaded submodule of ``node_name`` (``KeyError`` before it is loaded)."""
+        return self._submodules[node_name].submodule
 
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.
@@ -499,7 +518,7 @@ class Engine:
         for rid in batch.request_ids:
             try:
                 req_inputs = submodule.prepare_inputs(
-                    graph_walk=batch.step_context.graph_walk,
+                    graph_walk=batch.walk_of(rid),
                     fwd_info=batch.per_request_info[rid],
                     inputs=batch.per_request_input_tensors.get(rid, {}),
                     resources=self._submodules[batch.node_name].resources,
@@ -674,7 +693,7 @@ class Engine:
         ):
             ctxs[rid] = StepContext(
                 request_ids=(rid,),
-                graph_walk=batch.step_context.graph_walk,
+                graph_walk=batch.walk_of(rid),
                 slot=slot, capture=False,
             )
             if i != len(batch.request_ids) - 1:
@@ -1106,7 +1125,13 @@ class Engine:
         submodule: NodeSubmodule,
         req_info: Mapping[str, CurrentForwardPassInfo],
     ) -> None:
-        """Fold the forward's per-rid entries into ``outputs``."""
+        """Fold the forward's per-rid entries into ``outputs``.
+
+        The per-rid tensors are cloned off the forward's (static, graph-owned) buffers. They are
+        typically slices of one batch-wide result, so the clones are coalesced: one kernel per
+        shared storage instead of one per request (``mstar.utils.coalesce``).
+        """
+        pending: list[tuple[dict, str, int, torch.Tensor]] = []  # (merged dict, key, position, tensor)
         for rid, out_id in zip(request_ids, out_ids, strict=False):
             rid_out = raw_outputs.get(out_id)
             if not isinstance(rid_out, dict):
@@ -1117,11 +1142,19 @@ class Engine:
             merged = outputs.setdefault(rid, {})
             for key, value in rid_out.items():
                 if isinstance(value, list):
-                    merged[key] = [t.clone() for t in value]
+                    merged[key] = list(value)
+                    for i, t in enumerate(value):
+                        if isinstance(t, torch.Tensor):
+                            pending.append((merged, key, i, t))
                 elif isinstance(value, torch.Tensor):
-                    merged[key] = [value.clone()]
+                    merged[key] = [value]
+                    pending.append((merged, key, 0, value))
                 else:
                     merged[key] = value
+        if pending:
+            clones = clone_coalesced([t for _, _, _, t in pending])
+            for (merged, key, i, _), c in zip(pending, clones, strict=True):
+                merged[key][i] = c
 
     def _merge_unpacked(
         self,
@@ -1147,6 +1180,11 @@ class Engine:
         for rid, rid_out in unpacked.items():
             outputs.setdefault(rid, {}).update(rid_out)
 
+
+    def mixed_step_walks(self, node_name: str, graph_walk: str) -> set[str]:
+        """Walks whose ready requests the node lets ride along in a step of ``graph_walk``
+        (``NodeSubmodule.mixed_step_walks``)."""
+        return set(self._submodules[node_name].submodule.mixed_step_walks(graph_walk))
 
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """Most requests this node will take in one step, or None for no cap.

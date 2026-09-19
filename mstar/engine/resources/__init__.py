@@ -31,6 +31,13 @@ from mstar.engine.resources.kv.config import (
     KVSpec,
     KVStep,
 )
+from mstar.engine.resources.linear_attn.config import (
+    LinearAttnBackend,
+    LinearAttnConfig,
+    LinearAttnSpec,
+    LinearAttnStep,
+    LinearAttnVariant,
+)
 from mstar.engine.resources.position.config import (
     PosBackend,
     PositionConfig,
@@ -38,12 +45,21 @@ from mstar.engine.resources.position.config import (
     PositionStep,
     PosScheme,
 )
+from mstar.engine.resources.recurrent.config import (
+    DeltaNetGeometry,
+    RecurrentBlockConfig,
+    RecurrentGeometry,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+    RecurrentStep,
+)
 from mstar.engine.resources.runner import StepRunner, topo_sort
 from mstar.engine.resources.sampler.config import (
     SamplerSpec,
     SamplerStep,
     SamplingReqConfig,
 )
+from mstar.engine.resources.speculative import SPEC_ACCEPTANCE, SpecAccepted, SpecAcceptanceSpec, SpecStep
 from mstar.engine.resources.spec import (
     NodeResourceSpec,
     ResourceReqConfig,
@@ -94,6 +110,17 @@ __all__ = [
     "PublishedInfo",
     "RaggedAttentionConfig",
     "RaggedAttentionSpec",
+    "DeltaNetGeometry",
+    "LinearAttnBackend",
+    "LinearAttnConfig",
+    "LinearAttnSpec",
+    "LinearAttnStep",
+    "LinearAttnVariant",
+    "RecurrentBlockConfig",
+    "RecurrentGeometry",
+    "RecurrentStateConfig",
+    "RecurrentStateSpec",
+    "RecurrentStep",
     "Resource",
     "ResourceReqConfig",
     "ResourceStep",
@@ -108,4 +135,8 @@ __all__ = [
     "apply_yaml_overrides",
     "resolve_spec_dependencies",
     "topo_sort",
+    "SPEC_ACCEPTANCE",
+    "SpecAccepted",
+    "SpecAcceptanceSpec",
+    "SpecStep",
 ]

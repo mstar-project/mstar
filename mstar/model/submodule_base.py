@@ -288,6 +288,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
 
+    # Set True on a submodule whose lockstep-parallel (TP / SP) instance should run the async
+    # scheduling protocol -- the leader speculates step N+1 during forward N and broadcasts it,
+    # see ``MSTAR_TP_ASYNC_SCHED`` -- when that variable is not set. A set variable wins.
+    prefers_tp_async_scheduling: bool = False
+
     def __init__(self):
         super().__init__()
         # Per-request state store. prepare_inputs-time code (no engine inputs
@@ -470,6 +475,20 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
     def max_batch_size(self, graph_walk: str):
         return None
+
+    def mixed_step_walks(self, graph_walk: str) -> set[str]:
+        """Walks whose ready requests may ride along in a step of ``graph_walk`` as extra rows.
+
+        An autoregressive node that runs its prefill and its decode as separate steps stalls every
+        decoding request for the length of each prefill. Returning ``{"decode"}`` for ``"prefill"``
+        lets the scheduler append the node's ready decode requests (up to the decode walk's own cap)
+        to a prefill step: the step keeps ``graph_walk`` (so it dispatches, leases and preprocesses as
+        that walk) while each request keeps its own walk for input preparation, output routing and
+        loop bookkeeping. The submodule's forward must accept a batch of mixed spans (a packed prefill
+        plus one-token rows); the resources already do. Default: nothing rides along.
+        """
+        del graph_walk
+        return set()
 
     def get_autocast_dtype(self) -> torch.dtype | None:
         """Per-submodule autocast dtype override for the engine's forward

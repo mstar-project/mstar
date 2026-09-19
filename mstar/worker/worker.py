@@ -1,5 +1,6 @@
 import gc
 import logging
+import math
 import os
 import sys
 import threading
@@ -8,7 +9,7 @@ import time as _time
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from time import sleep
@@ -31,6 +32,9 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.api_server.request_types import INLINE_MAX_BYTES, InlineResults
+from mstar.communication.tensors import _serialize_tensor
+from mstar.utils.coalesce import apply_coalesced
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessage,
@@ -53,6 +57,7 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
+from mstar.utils.step_profiler import StepProfiler
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import (
@@ -73,6 +78,41 @@ def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
     if raw == "1":
         return True, None
     return True, frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+
+def inline_output_bytes(
+    host_outputs: dict | None, graph_node_info: dict, max_bytes: int = INLINE_MAX_BYTES,
+    blobs: dict[int, bytes] | None = None,
+) -> dict[str, bytes]:
+    """The step's small outputs of one request as ``{uuid: bytes}``, taken from the host copies
+    the stop check already made (``host_outputs[name][i]`` mirrors the stored tensor
+    ``graph_node_info[name][i]``). Tensors without a host copy or above ``max_bytes`` are left to
+    the transport path. ``blobs`` is a per-step cache keyed by storage: the host copies of a
+    step's requests share one buffer, which is then converted to bytes once and sliced."""
+    out: dict[str, bytes] = {}
+    if not isinstance(host_outputs, dict):
+        return out
+    for name, infos in graph_node_info.items():
+        tensors = host_outputs.get(name)
+        if not isinstance(tensors, list) or len(tensors) != len(infos):
+            continue
+        for t, info in zip(tensors, infos, strict=True):
+            if torch.is_tensor(t) and not t.is_cuda and info.nbytes <= max_bytes:
+                out[info.uuid] = host_tensor_bytes(t, blobs)
+    return out
+
+
+def host_tensor_bytes(t: torch.Tensor, blobs: dict[int, bytes] | None = None) -> bytes:
+    """The bytes ``_serialize_tensor`` would produce for a host tensor."""
+    if blobs is None or not t.is_contiguous():
+        return t.contiguous().view(-1).view(torch.uint8).numpy().tobytes()
+    storage = t.untyped_storage()
+    blob = blobs.get(storage.data_ptr())
+    if blob is None:
+        whole = torch.empty(0, dtype=torch.uint8, device=t.device).set_(storage)
+        blob = blobs[storage.data_ptr()] = whole.numpy().tobytes()
+    start = t.storage_offset() * t.element_size()
+    return blob[start:start + t.numel() * t.element_size()]
 
 
 @dataclass
@@ -175,6 +215,8 @@ class Worker:
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
+        # Optional torch.profiler window over engine steps (MSTAR_TORCH_PROFILE); None when unset.
+        self._step_profiler = StepProfiler.from_env(self.worker_id)
 
         if self.device.type != "cpu" and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
@@ -298,6 +340,8 @@ class Worker:
         self.tp_async_sched, self.tp_async_nodes = _parse_tp_async_sched(
             os.environ.get("MSTAR_TP_ASYNC_SCHED", "0")
         )
+        # unset: a parallel node's submodule may ask for it (resolved once the models are loaded)
+        self._tp_async_from_model = "MSTAR_TP_ASYNC_SCHED" not in os.environ
         # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
         self._tp_broadcast_seq = 0
         # Follower: leader steps that will NOT be followed by a head; the
@@ -977,6 +1021,7 @@ class Worker:
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
             final_stream_rids=final_stream_rids,
+            request_walks=batch.request_walks,
         )
 
     def _make_executing_batch(
@@ -987,17 +1032,20 @@ class Worker:
         per_request_input_tensors: dict[str, NameToTensorList],
         per_request_info: dict[str, CurrentForwardPassInfo],
         final_stream_rids: set[str] | None = None,
+        request_walks: dict[str, str] | None = None,
     ) -> ExecutingBatch:
         """One step's batch, with the step context the engine drives it through.
 
         The context starts unleased and eager; a slot is reserved later, once
-        the real token count is known.
+        the real token count is known. ``request_walks`` names the rows riding
+        along from another walk (``NodeSubmodule.mixed_step_walks``).
         """
         return ExecutingBatch(
             node_name=node_name,
             per_request_info=per_request_info,
             per_request_input_tensors=per_request_input_tensors,
             final_stream_rids=final_stream_rids or set(),
+            request_walks=dict(request_walks or {}),
             step_context=StepContext(
                 request_ids=tuple(request_ids),
                 graph_walk=graph_walk,
@@ -1036,6 +1084,7 @@ class Worker:
                         speculative=speculative,
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
+                        request_walks=dict(node_batch.request_walks) or None,
                     )
                 )
             )
@@ -1070,6 +1119,7 @@ class Worker:
         self,
         batch: ScheduledBatch,
         routing_per_request: dict[str, NodeOutputRouting],
+        inline_edges: dict[str, list[GraphEdge]] | None = None,
     ):
         """
         For outputs going to other workers: register tensors for RDMA send
@@ -1080,10 +1130,12 @@ class Worker:
         for request_id, _node in batch.node_objects.items():
             routing = routing_per_request[request_id]
             infos_by_uuid = {}
+            # client-emit edges whose bytes ride in the result message are read by nobody
+            skip = {id(e) for e in (inline_edges or {}).get(request_id, [])}
             for edge in (
                 routing.persist +
                 sum(routing.to_workers.values(), start=[]) +
-                routing.emit_to_client +
+                [e for e in routing.emit_to_client if id(e) not in skip] +
                 sum(routing.streaming_to_workers.values(), start=[])
             ):
                 for info in edge.tensor_info:
@@ -1099,15 +1151,21 @@ class Worker:
         nested_loop_indices: NestedLoopIndices,
         graph_walk: str | None = None,
         partition_name: str | None = None,
-        node_speculatively_scheduled: bool=False
+        node_speculatively_scheduled: bool=False,
+        inline_edges: list[GraphEdge] | None = None,
+        inline_batch: list[ResultTensors] | None = None,
     ) -> None:
         """
-        Send outputs to other workers and to the conductor.
+        Send outputs to other workers and to the conductor. ``inline_edges`` are
+        client-emit edges whose bytes travel in the step's ``InlineResults``
+        message: their ``ResultTensors`` go to ``inline_batch`` instead of one
+        message each.
         Persist signals and new-token counts are buffered and sent together
         with the WORKER_GRAPHS_DONE message to avoid race conditions.
         """
         if graph_walk is None:
             graph_walk = self.worker_graphs_manager.get_graph_walk(request_id, partition_name)
+        inline_ids = {id(e) for e in (inline_edges or [])}
         for worker_id, edges in outputs.to_workers.items():
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
@@ -1126,18 +1184,26 @@ class Worker:
                 request_id, outputs.persist
             )
 
-        if outputs.new_token_outputs:
+        # Only the first TP rank counts new tokens: the conductor reads the counts
+        # from the rank-0 WORKER_GRAPHS_DONE alone, and followers never register the
+        # emit-to-client tensors these edges point at (the leader emits them), so
+        # looking them up on a follower raises KeyError.
+        if outputs.new_token_outputs and outputs.is_first_tp_rank:
             name_to_count: dict[str, int] = {}
             for signal in outputs.new_token_outputs:
                 if signal.name in name_to_count:
                     continue  # don't double-count new tokens
+                # the element count is in the tensor info (no store lookup per request);
+                # infos without dims fall back to the stored tensor
                 count = 0
                 for tensor_info in signal.tensor_info:
-                    tensor = self.tensor_manager.get_tensor(
-                        request_id=request_id,
-                        uuid=tensor_info.uuid,
-                    )
-                    count += tensor.numel()
+                    dims = getattr(tensor_info, "dims", None)
+                    if dims is None:
+                        count += self.tensor_manager.get_tensor(
+                            request_id=request_id, uuid=tensor_info.uuid,
+                        ).numel()
+                    else:
+                        count += math.prod(dims)
                 name_to_count[signal.name] = count
             self.worker_graphs_manager.buffer_new_token_counts(
                 request_id, name_to_count
@@ -1152,17 +1218,19 @@ class Worker:
                     request_id=request_id, loop_indices=nested_loop_indices,
                     output_name=graph_edge.name
                 )
-                message = APIServerMessage(
-                    message_type="result_tensors",
-                    body=ResultTensors(
-                        request_id=request_id,
-                        modality=graph_edge.output_modality,
-                        graph_edge=graph_edge,
-                        loop_indices=nested_loop_indices,
-                        metadata={}
-                    )
+                result = ResultTensors(
+                    request_id=request_id,
+                    modality=graph_edge.output_modality,
+                    graph_edge=graph_edge,
+                    loop_indices=nested_loop_indices,
+                    metadata={}
                 )
-                self.communicator.send("api_server", message)
+                if id(graph_edge) in inline_ids and inline_batch is not None:
+                    inline_batch.append(result)
+                    continue
+                self.communicator.send("api_server", APIServerMessage(
+                    message_type="result_tensors", body=result,
+                ))
 
         # Handle streaming edges
         # Local streaming: route to StreamBuffer
@@ -1331,6 +1399,11 @@ class Worker:
         if self._phase_period > 0:
             self._phase_buf[name].append(dt)
 
+    def _profile_step(self, graph_walk: str, batch_size: int):
+        """The MSTAR_TORCH_PROFILE window around one engine step, or a no-op."""
+        prof = self._step_profiler
+        return prof.step(graph_walk, batch_size) if prof is not None else nullcontext()
+
     def _execute_on_gpu_thread(
         self,
         batch: ScheduledBatch,
@@ -1372,7 +1445,7 @@ class Worker:
             # call is_stale after prepare_inputs because prepare_inputs may drop rids
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
-            with self._span("worker.gpu_thread.exec"):
+            with self._span("worker.gpu_thread.exec"), self._profile_step(batch.graph_walk, len(batch.node_objects)):
                 outputs = engine.exec_and_postprocess(node_batch)
             execution_stream = (
                 torch.accelerator.current_stream(self.device)
@@ -1507,6 +1580,28 @@ class Worker:
         return self.tp_async_sched and (
             self.tp_async_nodes is None or node_name in self.tp_async_nodes
         )
+
+    def _resolve_tp_async_default(self) -> None:
+        """``MSTAR_TP_ASYNC_SCHED`` unset: a parallel node runs the async protocol when its loaded
+        submodule sets ``prefers_tp_async_scheduling`` (the same class on every rank, so the
+        ranks agree). A set variable, ``0`` included, is left alone."""
+        if not self._tp_async_from_model or self.tp_async_sched:
+            return
+        preferring = []
+        for node in sorted(self.parallel_nodes):
+            try:
+                submodule = self.engine_manager.get_engine(node).submodule(node)
+            except (KeyError, AttributeError):
+                continue
+            if getattr(submodule, "prefers_tp_async_scheduling", False):
+                preferring.append(node)
+        if preferring:
+            self.tp_async_sched, self.tp_async_nodes = True, frozenset(preferring)
+            logger.info(
+                "Worker %s: TP async scheduling ON for %s (%s; the submodule's default, "
+                "MSTAR_TP_ASYNC_SCHED unset)",
+                self.worker_id, preferring, "follower" if self.is_tp_follower else "leader",
+            )
 
     def _verify_tp_async_sched_agrees(self) -> None:
         """Refuse a per-rank flag mismatch at startup: a follower would wait for
@@ -1744,6 +1839,11 @@ class Worker:
         """
         batch_N = pending.batch
         graph_walk = pending.graph_walk
+        if batch_N.request_walks:
+            # a step with rows riding along from another walk speculates nothing: its rows
+            # do not share one walk, and it is a prefill-sized step whose successor gains
+            # little from being prepared early
+            return None
 
         # sample node and RID to see which node we will be speculating
         # (TODO: refine this to be, e.g., a majority vote)
@@ -1880,7 +1980,7 @@ class Worker:
                     fresh_batch.request_to_worker_graph[rid]
                 )
 
-        logger.debug(f"Speculating: {spec_node_info.node_name} {list(new_node_objects)}")
+        logger.debug("Speculating: %s %s", spec_node_info.node_name, list(new_node_objects))
         return self._assemble_speculation(
             pending, sample_node, spec_node_info,
             new_node_objects, new_request_to_worker_graph, per_request_inputs,
@@ -2278,7 +2378,7 @@ class Worker:
             self._pending_loop_stops.update([
                 PendingLoopStop(
                     rid=rid,
-                    graph_walk=batch_N.graph_walk,
+                    graph_walk=batch_N.batch.walk_of(rid),
                     loop_name=name
                 ) for name in loop_names
             ])
@@ -2312,6 +2412,11 @@ class Worker:
         # Mark nodes complete and route
         routing_per_request: dict[str, NodeOutputRouting] = {}
         per_request_uuids: dict[str, set[str]] = {}
+        # small client outputs travel inline in one message for the whole step (their bytes
+        # are the host copies the stop check made): rid -> {uuid: bytes}, rid -> the edges
+        inline_bytes: dict[str, dict[str, bytes]] = {}
+        inline_edges: dict[str, list[GraphEdge]] = {}
+        host_blobs: dict[int, bytes] = {}  # this step's host buffers as bytes, converted once each
         for rid, wg_id in batch_N.batch.request_to_worker_graph.items():
             # Store output tensors before marking the node as complete so that
             # loop outputs can be buffered properly.
@@ -2324,13 +2429,14 @@ class Worker:
                     tensors=req_output_tensors,
                     graph_edges=node.outputs,
                     node_name=node.name,
-                    graph_walk=batch_N.graph_walk,
+                    graph_walk=batch_N.batch.walk_of(rid),
                     skip_cuda_sync=True,
                     skip_ref_count=True,
                 )
                 per_request_uuids[rid] = {
                     info.uuid for infos in graph_node_info.values() for info in infos
                 }
+                inline_bytes[rid] = inline_output_bytes(cpu_outputs.get(rid), graph_node_info, blobs=host_blobs)
 
             completion_output = self.worker_graphs_manager.mark_node_complete(
                 rid, wg_id, batch_N.node_name
@@ -2339,7 +2445,7 @@ class Worker:
 
             routing_per_request[rid] = self.worker_graphs_manager.process_node_outputs(
                 rid, node_name=batch_N.node_name,
-                outputs=real_outputs, graph_walk=batch_N.graph_walk
+                outputs=real_outputs, graph_walk=batch_N.batch.walk_of(rid),
             )
 
             if rid in per_request_uuids:
@@ -2356,9 +2462,17 @@ class Worker:
                 #  double-counted (e.g., we should not be incrementing the refcount of
                 # a persist signal that has EMPTY_DESTINATION; that's the conductor's
                 # job to properly compute the reference when unpersisting the signal)
+                # a client-emit edge goes inline when every one of its tensors has small host
+                # bytes; such an edge holds no transport reference (nothing reads it remotely)
+                have = inline_bytes.get(rid, {})
+                inline_edges[rid] = [
+                    e for e in routing.emit_to_client
+                    if e.tensor_info and all(info.uuid in have for info in e.tensor_info)
+                ]
+                inline_ids = {id(e) for e in inline_edges[rid]}
                 routed_edges = (
                     routing.routed_to_this_worker_graph
-                    + routing.emit_to_client
+                    + [e for e in routing.emit_to_client if id(e) not in inline_ids]
                     + routing.streaming_local
                     + sum(routing.to_workers.values(), start=[])
                     + sum(routing.streaming_to_workers.values(), start=[])
@@ -2370,7 +2484,7 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
-        self._register_outputs(batch_N.batch, routing_per_request)
+        self._register_outputs(batch_N.batch, routing_per_request, inline_edges)
 
         # send outputs
         if self.enable_nvtx:
@@ -2392,14 +2506,25 @@ class Worker:
                 batch_N.node_batch.request_ids,
                 batch_N.node_batch.exec_timings,
             )
+        inline_batch: list[ResultTensors] = []
         for rid, routing in routing_per_request.items():
             self._send_outputs(
                 rid, routing,
                 nested_loop_indices=per_req_nested_idxs[rid],
-                graph_walk=batch_N.graph_walk,
+                graph_walk=batch_N.batch.walk_of(rid),
                 partition_name=batch_N.partition,
-                node_speculatively_scheduled=batch_N.batch.node_objects[rid]._speculatively_scheduled
+                node_speculatively_scheduled=batch_N.batch.node_objects[rid]._speculatively_scheduled,
+                inline_edges=inline_edges.get(rid),
+                inline_batch=inline_batch,
             )
+        if inline_batch:
+            data: dict[str, bytes] = {}
+            for res in inline_batch:
+                for info in res.graph_edge.tensor_info:
+                    data[info.uuid] = inline_bytes[res.request_id][info.uuid]
+            self.communicator.send("api_server", APIServerMessage(
+                message_type="inline_results", body=InlineResults(results=inline_batch, data=data),
+            ))
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -2451,32 +2576,39 @@ class Worker:
         side = self._d2h_stream
         side.wait_event(completion_event)
 
+        # collect the CUDA tensors, copy them once per shared storage (the per-request
+        # tokens are slices of one sampler result), then rebuild the per-request structure
         cpu_per_rid: dict = {}
-        buffer_indices: dict[tuple[str, torch.dtype, tuple[int, ...]], int] = defaultdict(int)
-        with torch.cuda.stream(side):
-            for rid, name_to_list in outputs.items():
-                if not isinstance(name_to_list, dict):
-                    cpu_per_rid[rid] = name_to_list
+        pending: list[tuple[list, int, torch.Tensor]] = []
+        for rid, name_to_list in outputs.items():
+            if not isinstance(name_to_list, dict):
+                cpu_per_rid[rid] = name_to_list
+                continue
+            cpu_per_rid[rid] = {}
+            for name, tensors in name_to_list.items():
+                if not isinstance(tensors, list):
+                    cpu_per_rid[rid][name] = tensors
                     continue
-                cpu_per_rid[rid] = {}
-                for name, tensors in name_to_list.items():
-                    if not isinstance(tensors, list):
-                        cpu_per_rid[rid][name] = tensors
-                        continue
-                    new_list = []
-                    for t in tensors:
-                        if torch.is_tensor(t) and t.is_cuda:
-                            key = ("check_stop", t.dtype, tuple(t.shape))
-                            idx = buffer_indices[key]
-                            buffer_indices[key] += 1
-                            cpu_t = self._get_pinned_d2h_buffer(
-                                "check_stop", t.shape, t.dtype, idx,
-                            )
-                            cpu_t.copy_(t, non_blocking=True)
-                            new_list.append(cpu_t)
-                        else:
-                            new_list.append(t)
-                    cpu_per_rid[rid][name] = new_list
+                new_list = list(tensors)
+                for i, t in enumerate(tensors):
+                    if torch.is_tensor(t) and t.is_cuda:
+                        pending.append((new_list, i, t))
+                cpu_per_rid[rid][name] = new_list
+        if pending:
+            buffer_indices: dict[tuple[str, torch.dtype, tuple[int, ...]], int] = defaultdict(int)
+
+            def to_host(span: torch.Tensor) -> torch.Tensor:
+                key = ("check_stop", span.dtype, (span.numel(),))
+                idx = buffer_indices[key]
+                buffer_indices[key] += 1
+                cpu_t = self._get_pinned_d2h_buffer("check_stop", (span.numel(),), span.dtype, idx)
+                cpu_t.copy_(span, non_blocking=True)
+                return cpu_t
+
+            with torch.cuda.stream(side):
+                host = apply_coalesced([t for _, _, t in pending], to_host)
+            for (lst, i, _), h in zip(pending, host, strict=True):
+                lst[i] = h
         side.synchronize()
 
         return cpu_per_rid
@@ -2634,6 +2766,7 @@ class Worker:
         # reaches warmup at the same wall-clock instant, so subgroup
         # bootstrap completes within the retry budget.
         self.parallel_groups.barrier_all()
+        self._resolve_tp_async_default()
         self._verify_tp_async_sched_agrees()
 
         # CUDA graph capture before entering the main loop
@@ -2759,6 +2892,10 @@ class Worker:
                 p95 = vs[min(n - 1, int(n * 0.95))] * 1000
                 mean = (sum(vs) / n) * 1000
                 parts.append(f"{name}: p50={p50:.2f}ms p95={p95:.2f}ms mean={mean:.2f}ms n={n}")
+            if self.scheduler.mixed_steps:
+                parts.append(
+                    f"mixed steps: {self.scheduler.mixed_steps} carrying {self.scheduler.mixed_rows} rows of another walk"
+                )
             logger.info(
                 "Worker %s phase-timing iter=%d: %s",
                 self.worker_id, phase_iter[0], " | ".join(parts),
@@ -2865,7 +3002,7 @@ class Worker:
                         if batch is not None:
                             node_batch = self._build_executing_batch(batch)
                             batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
-                            logger.debug(f"Yield away: {batch.node_name} {node_batch.request_ids}")
+                            logger.debug("Yield away: %s %s", batch.node_name, node_batch.request_ids)
                             speculation = Speculation(
                                 scheduled_batch=batch,
                                 node_batch=node_batch,
@@ -3115,7 +3252,7 @@ class Worker:
                     self._execute_on_gpu_thread, batch, node_batch, None,
                 )
                 self.wakeup_event.register_future(future)
-                logger.debug(f"Scheduling: {batch.node_name} {node_batch.request_ids}")
+                logger.debug("Scheduling: %s %s", batch.node_name, node_batch.request_ids)
                 _set_pending(PendingBatch(
                     batch=batch,
                     node_batch=node_batch,
@@ -3125,6 +3262,12 @@ class Worker:
                     future=future,
                     tp_seq=fallthrough_tp_seq,
                 ))
+                if phase_period:
+                    # the serial protocol's iterations flush too, so MSTAR_PHASE_TIMING shows its
+                    # phases (and the mixed-step counter) rather than only the speculative path's
+                    _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                    phase_iter[0] += 1
+                    _phase_flush()
             except Exception as e:
                 self._handle_main_loop_error(e, (pending, spec_pending), batch)
                 # Follower: a head from a step that raised must not sit at the

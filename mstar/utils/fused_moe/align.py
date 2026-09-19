@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import time
 
 import torch
 import triton
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 _CSRC = os.path.join(os.path.dirname(__file__), "csrc", "moe_align_block_size.cu")
 
 
-def _clear_stale_build_lock(name: str) -> None:
+def _clear_stale_build_lock(name: str, min_age_s: float = 20 * 60) -> None:
     """Remove a ``FileBaton`` lock left behind by a killed build process.
 
     ``torch.utils.cpp_extension.load`` serialises concurrent builds with a lock
@@ -37,7 +38,13 @@ def _clear_stale_build_lock(name: str) -> None:
 
     The baton holds the fd open for the build's duration, so a lock nobody has
     open is by definition abandoned. Scanning /proc for holders distinguishes
-    that from a genuine build in progress, which mtime alone cannot.
+    that from a genuine build in progress, which mtime alone cannot -- on this
+    machine. The extension cache usually lives in the home directory, which is
+    shared across nodes, and /proc only shows local processes: a lock held by a
+    rank on another node looks abandoned from here. Removing it made the holder's
+    release fail (``FileNotFoundError``) and that rank fell back to a slower kernel
+    (2026-09-15). So a lock is only removed when it is also older than
+    ``min_age_s`` (default 20 minutes) -- longer than any load or build takes.
     """
     from torch.utils.cpp_extension import _get_build_directory
 
@@ -47,6 +54,11 @@ def _clear_stale_build_lock(name: str) -> None:
         return
     lock_path = os.path.join(build_dir, "lock")
     if not os.path.exists(lock_path):
+        return
+    try:
+        if time.time() - os.path.getmtime(lock_path) < min_age_s:
+            return  # young: a live build or load, possibly on another node
+    except OSError:
         return
     try:
         target = os.path.realpath(lock_path)
@@ -109,7 +121,10 @@ def moe_align_block_size(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sort ``topk_ids`` into expert-aligned blocks.
 
-    ``topk_ids`` must be int32 and contiguous (the CUDA op reads it directly).
+    ``topk_ids`` must be int32 and contiguous (the CUDA op reads it directly). Entries outside
+    ``[0, num_experts)`` are ignored: they get no slot and no block, so an expert-parallel rank
+    passes the assignments of experts it does not hold under such an id
+    (``ExpertSharding.invalid_id``) and the GEMMs never touch them.
 
     Returns
     -------
@@ -162,10 +177,8 @@ def _moe_align_block_size_torch(
     num_tokens_post_pad: torch.Tensor,
 ) -> None:
     """Vectorized PyTorch equivalent of the CUDA op, filling the buffers
-    in place with the same semantics.
-
-    Assumes every entry of ``topk_ids`` is a valid expert in
-    ``[0, num_experts)`` (always true for mstar's routed dispatch).
+    in place with the same semantics (entries outside ``[0, num_experts)``
+    are ignored, like the CUDA kernels do).
     """
     device = topk_ids.device
     flat = topk_ids.reshape(-1)
@@ -174,6 +187,14 @@ def _moe_align_block_size_torch(
     # Padding slots hold ``numel``; unused expert-id blocks hold 0.
     sorted_ids.fill_(numel)
     expert_ids.zero_()
+
+    # assignments of experts this rank does not hold get no slot at all
+    valid = (flat >= 0) & (flat < num_experts)
+    if not bool(valid.all()):
+        keep = valid.nonzero().reshape(-1)
+        flat = flat[keep]
+    else:
+        keep = None
 
     # Per-expert token counts, each rounded up to a multiple of block_size.
     counts = torch.bincount(flat, minlength=num_experts)[:num_experts]
@@ -197,6 +218,8 @@ def _moe_align_block_size_torch(
     sorted_experts = flat[order].to(torch.int64)
     ucounts = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     ucounts[1:] = torch.cumsum(counts, dim=0)  # unpadded prefix over sorted tokens
-    local_rank = torch.arange(numel, device=device, dtype=torch.int64) - ucounts[sorted_experts]
+    local_rank = torch.arange(flat.numel(), device=device, dtype=torch.int64) - ucounts[sorted_experts]
     dest = cumsum[sorted_experts] + local_rank
+    if keep is not None:
+        order = keep[order]  # back to positions in the original topk_ids
     sorted_ids[dest] = order.to(torch.int32)

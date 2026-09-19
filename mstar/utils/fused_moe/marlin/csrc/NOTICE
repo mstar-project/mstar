@@ -1,0 +1,12 @@
+The CUDA sources in this directory are vendored from vLLM (https://github.com/vllm-project/vllm,
+Apache License 2.0), commit ed29dfae6e (2026-09-07):
+  marlin_moe_wna16/{ops.cu, kernel.h, marlin_template.h, generate_kernels.py}
+      <- csrc/libtorch_stable/moe/marlin_moe_wna16/
+  marlin/{marlin.cuh, marlin_dtypes.cuh, dequant.h, marlin_mma.h, gptq_marlin_repack.cu}
+      <- csrc/libtorch_stable/quantization/marlin/
+  scalar_type.hpp <- csrc/core/scalar_type.hpp; torch_utils.h <- csrc/libtorch_stable/torch_utils.h
+Local changes: include paths flattened; op registration moved to the `_mstar_marlin_C` namespace
+(bindings.cpp holds the schemas); the cuBLAS helper dropped from torch_utils.h (torch 2.11 has no
+stable-ABI handle accessor); generate_kernels.py gained MARLIN_MOE_MXFP4_BF16_ONLY, with which
+sm80_kernel_bfloat16_fe2m1f_bfloat16.cu and kernel_selector.h were generated (`python
+generate_kernels.py 9.0`) - the only instantiations Kimi K3's MXFP4 experts need.
