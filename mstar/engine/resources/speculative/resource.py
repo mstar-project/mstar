@@ -47,6 +47,7 @@ class Verdict(NamedTuple):
     accepted: int
     tokens: list[int]
     drafts: list[int] | None = None
+    k: int = 0  # the block's drafts per row (rejected = k - accepted)
 
 
 class SpecAcceptance(Resource):
@@ -75,7 +76,7 @@ class SpecAcceptance(Resource):
         # its removal; rid -> the seq whose verdict a plan already published (the KV manager applies
         # a published trim once and does not undo it when a pre-plan is discarded).
         self._lock = threading.Lock()
-        self._pending: dict[str, tuple[int, int | None, int]] = {}
+        self._pending: dict[str, tuple[int, int | None, int, int]] = {}  # (step seq, slot, row, drafts)
         self._settled: dict[str, tuple[int, Verdict]] = {}
         self._published: dict[str, int] = {}
         self._max_rows_seen = 0
@@ -149,7 +150,7 @@ class SpecAcceptance(Resource):
                 if entry is None or self._published.get(rid) == entry[0]:
                     continue
                 seq, verdict = entry
-                out[rid] = SpecAccepted(accepted=verdict.accepted, rejected=self.k - verdict.accepted, label=segment.label)
+                out[rid] = SpecAccepted(accepted=verdict.accepted, rejected=verdict.k - verdict.accepted, label=segment.label)
                 self._published[rid] = seq
         return out
 
@@ -162,11 +163,13 @@ class SpecAcceptance(Resource):
             return
         rows = ctx.padded_request_ids if ctx.padded_request_ids is not None else ctx.request_ids
         slot = ctx.slot_lease.slot if ctx.slot_lease is not None else None
+        k = self.k if step.num_drafts is None else int(step.num_drafts)
+        assert 0 <= k <= self.k, (k, self.k)
         with self._lock:
             self._seq_enqueued += 1
             for row, rid in enumerate(rows):
                 if not ctx.is_padding_row(rid):
-                    self._pending[rid] = (self._seq_enqueued, slot, row)
+                    self._pending[rid] = (self._seq_enqueued, slot, row, k)
 
     # ------------------------------------------------------------ submodule side
     def _buffers(self, slot: int | None, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -195,14 +198,17 @@ class SpecAcceptance(Resource):
         dev[:rows].copy_(accepted.to(torch.int32))
         host[:rows].copy_(dev[:rows], non_blocking=True)
         if tokens is not None:
+            # a shorter block than the resource's k fills the leading columns
             tdev, thost = self._tok_dev[self._current_slot], self._tok_host[self._current_slot]
-            tdev[:rows].copy_(tokens.to(torch.int32))
-            thost[:rows].copy_(tdev[:rows], non_blocking=True)
-        self._staged_drafts = drafts is not None
-        if drafts is not None:
+            width = tokens.shape[1]
+            tdev[:rows, :width].copy_(tokens.to(torch.int32))
+            thost[:rows, :width].copy_(tdev[:rows, :width], non_blocking=True)
+        self._staged_drafts = drafts is not None and drafts.shape[1] > 0
+        if self._staged_drafts:
             ddev, dhost = self._drf_dev[self._current_slot], self._drf_host[self._current_slot]
-            ddev[:rows].copy_(drafts.to(torch.int32))
-            dhost[:rows].copy_(ddev[:rows], non_blocking=True)
+            width = drafts.shape[1]
+            ddev[:rows, :width].copy_(drafts.to(torch.int32))
+            dhost[:rows, :width].copy_(ddev[:rows, :width], non_blocking=True)
         self._counter_dev.add_(1)
         self._counter_host.copy_(self._counter_dev, non_blocking=True)
 
@@ -234,12 +240,12 @@ class SpecAcceptance(Resource):
             return
         self._wait(latest)
         with self._lock:
-            for rid, (seq, slot, row) in list(self._pending.items()):
+            for rid, (seq, slot, row, k) in list(self._pending.items()):
                 if seq > latest:
                     continue
                 accepted = int(self._acc_host[slot][row])
-                drafts = self._drf_host[slot][row].tolist() if getattr(self, "_staged_drafts", False) else None
-                self._settled[rid] = (seq, Verdict(accepted, self._tok_host[slot][row].tolist(), drafts))
+                drafts = self._drf_host[slot][row, :k].tolist() if getattr(self, "_staged_drafts", False) else None
+                self._settled[rid] = (seq, Verdict(accepted, self._tok_host[slot][row, : k + 1].tolist(), drafts, k))
                 del self._pending[rid]
                 self.rows_settled += 1
                 self.accepted_total += accepted
