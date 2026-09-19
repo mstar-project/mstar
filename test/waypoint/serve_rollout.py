@@ -9,7 +9,7 @@ objects from the stream.
 By default the request is sent twice, under *different* ids and one explicit
 ``model_kwargs.seed``, so the two rollouts draw the same noise. Identical bytes
 the second time are what shows the first request left nothing behind: with
-``num_worlds: 1`` a leaked world fails the second admission outright, and a
+``num_sessions: 1`` a leaked world fails the second admission outright, and a
 leaked ``ChunkedStreamingTAEHV`` in ``PerRequestState.kwargs`` would resume the
 first rollout's stream and change the pixels.
 
@@ -160,7 +160,7 @@ def _run_config(
     config["max_concurrent_requests"] = worlds
     resources = config["resources"] = config.get("resources") or {}
     kv = resources["kv"] = resources.get("kv") or {}
-    kv["num_worlds"] = worlds
+    kv["num_sessions"] = worlds
     out.write_text(yaml.safe_dump(config, sort_keys=False))
     return out
 

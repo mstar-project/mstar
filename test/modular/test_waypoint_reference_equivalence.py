@@ -185,7 +185,7 @@ def _build_port(config, checkpoint: Path = CHECKPOINT):
             head_dim=config.d_head,
             num_qo_heads=config.n_heads,
             tokens_per_frame=config.tokens_per_frame,
-            num_worlds=1,
+            num_sessions=1,
             layers=tuple(
                 RingKVLayerConfig(
                     ring_frames=config.ring_frames(i),

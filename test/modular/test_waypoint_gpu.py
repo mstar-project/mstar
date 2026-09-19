@@ -99,7 +99,7 @@ def gpu_config(**overrides) -> WaypointConfig:
     return WaypointConfig(**{**base, **overrides})
 
 
-def _kv_spec(config: WaypointConfig, num_worlds: int) -> KVSpec:
+def _kv_spec(config: WaypointConfig, num_sessions: int) -> KVSpec:
     return KVSpec(
         resource_key="kv",
         nodes={"dit"},
@@ -109,7 +109,7 @@ def _kv_spec(config: WaypointConfig, num_worlds: int) -> KVSpec:
             head_dim=config.d_head,
             num_qo_heads=config.n_heads,
             tokens_per_frame=config.tokens_per_frame,
-            num_worlds=num_worlds,
+            num_sessions=num_sessions,
             layers=tuple(
                 RingKVLayerConfig(
                     ring_frames=config.ring_frames(i),
@@ -137,7 +137,7 @@ class _DitNode(NodeSubmodule):
         raise NotImplementedError("binding stand-in; nothing here runs a step")
 
 
-def build(config: WaypointConfig, *, seed: int = 0, num_worlds: int = 1):
+def build(config: WaypointConfig, *, seed: int = 0, num_sessions: int = 1):
     """The serving build order -- meta, cast, ``to_empty``, retie -- with random
     weights, wired to a real ring and a real flex backend on the GPU.
 
@@ -159,7 +159,7 @@ def build(config: WaypointConfig, *, seed: int = 0, num_worlds: int = 1):
             block.attn.v_lamb.fill_(0.25)
     dit.eval()
 
-    spec = _kv_spec(config, num_worlds)
+    spec = _kv_spec(config, num_sessions)
     info = EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE)
     kv = RingKVManager.build(spec, info)
     attn = AttentionManager.build(
@@ -259,15 +259,15 @@ def scrub(kv: RingKVManager, *rids: str) -> None:
         kv.reset_request(rid, free=True)
         kv.remove_request(rid)
     for layer in kv.layers:
-        for world in range(layer.num_worlds):
+        for world in range(layer.num_sessions):
             layer.reset(world)
 
 
-def world_snapshot(kv: RingKVManager, world_idx: int):
+def world_snapshot(kv: RingKVManager, session_idx: int):
     return [
         (
-            layer.kv[:, :, :, slice(*layer.world_span(world_idx))].clone(),
-            layer.written[slice(*layer.world_span(world_idx))].clone(),
+            layer.kv[:, :, :, slice(*layer.session_span(session_idx))].clone(),
+            layer.written[slice(*layer.session_span(session_idx))].clone(),
         )
         for layer in kv.layers
     ]
@@ -424,7 +424,7 @@ def test_compiled_matches_eager_to_four_bf16_ulp_of_peak():
                 )
                 kv.commit(_step("r", frame), _ctx("r"))
         torch.cuda.synchronize()
-        return latents, world_snapshot(kv, kv.world_of("r"))
+        return latents, world_snapshot(kv, kv.session_of("r"))
 
     eager_latents, eager_ring = rollout(False)
     compiled_latents, compiled_ring = rollout(True)
@@ -457,12 +457,12 @@ def captured():
     static buffers a replay reads.
 
     Two worlds, so the interleave gate can use the same graph the single-world
-    gates do -- ``world_idx`` is staged by ``plan`` and read at replay, never
+    gates do -- ``session_idx`` is staged by ``plan`` and read at replay, never
     baked. Capture holds a dummy rid and its warmup frames land in the ring;
     every test scrubs on entry.
     """
     config = gpu_config()
-    dit, kv, attn = build(config, seed=0, num_worlds=2)
+    dit, kv, attn = build(config, seed=0, num_sessions=2)
     dit.materialize_runtime_tables(DEVICE)
     dit.compile_regions()
     mouse, button, scroll = controls(config)
@@ -633,14 +633,14 @@ def test_replay_matches_the_uncaptured_regions_over_two_ring_wraps(captured):
     uncaptured = [
         eager_frame(captured, "uncaptured", f, "a3") for f in range(ROLLOUT_FRAMES)
     ]
-    uncaptured_ring = world_snapshot(kv, kv.world_of("uncaptured"))
+    uncaptured_ring = world_snapshot(kv, kv.session_of("uncaptured"))
     scrub(kv, "uncaptured")
 
     kv.ingest_request("replayed")
     replayed = [
         replay_frame(captured, "replayed", f, "a3") for f in range(ROLLOUT_FRAMES)
     ]
-    replayed_ring = world_snapshot(kv, kv.world_of("replayed"))
+    replayed_ring = world_snapshot(kv, kv.session_of("replayed"))
     scrub(kv, "replayed")
 
     for frame, (want, got) in enumerate(zip(uncaptured, replayed, strict=True)):
@@ -672,7 +672,7 @@ def test_a_second_rollout_starts_from_nothing(captured):
 
     kv.ingest_request("first")
     first = [replay_frame(captured, "first", f, "a4") for f in range(frames)]
-    first_ring = world_snapshot(kv, kv.world_of("first"))
+    first_ring = world_snapshot(kv, kv.session_of("first"))
     with pytest.raises(RuntimeError):
         kv.post_warmup_validate()
     scrub(kv, "first")
@@ -680,7 +680,7 @@ def test_a_second_rollout_starts_from_nothing(captured):
 
     kv.ingest_request("second")
     second = [replay_frame(captured, "second", f, "a4") for f in range(frames)]
-    second_ring = world_snapshot(kv, kv.world_of("second"))
+    second_ring = world_snapshot(kv, kv.session_of("second"))
 
     for frame, (want, got) in enumerate(zip(first, second, strict=True)):
         assert torch.equal(want, got), (
@@ -699,12 +699,12 @@ def test_two_worlds_interleaved_match_the_same_rollouts_run_alone(captured):
     Nothing physical separates the worlds -- they share one buffer per layer,
     folded into the token dimension -- so the whole isolation mechanism is the
     visibility row, and a leak is silent. Both rollouts go through the *same*
-    captured graph, which is also the claim that ``world_idx`` is read at replay
+    captured graph, which is also the claim that ``session_idx`` is read at replay
     rather than baked at capture.
     """
     kv = captured["kv"]
     frames = 10
-    assert kv.num_worlds == 2
+    assert kv.num_sessions == 2
 
     scrub(kv, "capture")
     alone = {}
@@ -712,14 +712,14 @@ def test_two_worlds_interleaved_match_the_same_rollouts_run_alone(captured):
         rid = f"alone{stream}"
         kv.ingest_request(rid)
         latents = [replay_frame(captured, rid, f, stream) for f in range(frames)]
-        alone[stream] = (latents, world_snapshot(kv, kv.world_of(rid)))
+        alone[stream] = (latents, world_snapshot(kv, kv.session_of(rid)))
         scrub(kv, rid)
 
     kv.ingest_request("both_a")
     kv.ingest_request("both_b")
     admit_frame(kv, "both_a", 0, captured["attn"])
     admit_frame(kv, "both_b", 0, captured["attn"])
-    assert {kv.world_of("both_a"), kv.world_of("both_b")} == {0, 1}
+    assert {kv.session_of("both_a"), kv.session_of("both_b")} == {0, 1}
 
     interleaved = {"A": [], "B": []}
     for frame in range(frames):
@@ -735,7 +735,7 @@ def test_two_worlds_interleaved_match_the_same_rollouts_run_alone(captured):
                 f"world {stream} frame {frame}: sharing the node changed the rollout by "
                 f"{(want.float() - got.float()).abs().max().item():.3e}"
             )
-        assert_worlds_equal(want_ring, world_snapshot(kv, kv.world_of(rid)), f"world {stream}")
+        assert_worlds_equal(want_ring, world_snapshot(kv, kv.session_of(rid)), f"world {stream}")
 
     assert not torch.equal(interleaved["A"][0], interleaved["B"][0]), (
         "the two rollouts are identical; an isolation leak would be invisible"
@@ -758,7 +758,7 @@ def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
     config = gpu_config()
     frames = 8
     mouse, button, scroll = controls(config)
-    dit, kv, attn = build(config, seed=0, num_worlds=2)
+    dit, kv, attn = build(config, seed=0, num_sessions=2)
     dit.materialize_runtime_tables(DEVICE)
 
     # ---- B=1, alternating: each world through its own single-row forward.
@@ -777,7 +777,7 @@ def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
                 solo_latents[rid].append(out)
                 kv.commit(_step(rid, frame), _ctx(rid))
     torch.cuda.synchronize()
-    solo_ring = {rid: world_snapshot(kv, kv.world_of(rid)) for rid in ("w0", "w1")}
+    solo_ring = {rid: world_snapshot(kv, kv.session_of(rid)) for rid in ("w0", "w1")}
     scrub(kv, "w0", "w1")
 
     # ---- B=2, batched: both worlds' row for frame f in one forward.
@@ -802,7 +802,7 @@ def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
             batched_latents["w1"].append(out[1:2])
             kv.commit(_batch_step(batch_frames), _batch_ctx("w0", "w1"))
     torch.cuda.synchronize()
-    batch_ring = {rid: world_snapshot(kv, kv.world_of(rid)) for rid in ("w0", "w1")}
+    batch_ring = {rid: world_snapshot(kv, kv.session_of(rid)) for rid in ("w0", "w1")}
     scrub(kv, "w0", "w1")
 
     for rid in ("w0", "w1"):
@@ -856,12 +856,12 @@ def test_prime_replay_matches_the_uncaptured_prime(captured):
 
     kv.ingest_request("eager_p")
     eager_prime(captured, "eager_p", "P")
-    eager_ring = world_snapshot(kv, kv.world_of("eager_p"))
+    eager_ring = world_snapshot(kv, kv.session_of("eager_p"))
     scrub(kv, "eager_p")
 
     kv.ingest_request("graph_p")
     replay_prime(captured, "graph_p", "P")
-    graph_ring = world_snapshot(kv, kv.world_of("graph_p"))
+    graph_ring = world_snapshot(kv, kv.session_of("graph_p"))
 
     assert_worlds_equal(eager_ring, graph_ring, "primed by replay vs uncaptured")
     assert any(written.any() for _, written in graph_ring), (
@@ -874,7 +874,7 @@ def test_prime_replay_matches_the_uncaptured_prime(captured):
     # reproducing capture-time state rather than reading its input buffer.
     kv.ingest_request("other_p")
     replay_prime(captured, "other_p", "Q")
-    other_ring = world_snapshot(kv, kv.world_of("other_p"))
+    other_ring = world_snapshot(kv, kv.session_of("other_p"))
     assert not torch.equal(graph_ring[0][0], other_ring[0][0]), (
         "two different seed latents primed the same ring bytes"
     )
@@ -916,13 +916,13 @@ def test_prime_then_rollout_through_both_graphs_matches_eager(captured):
     kv.ingest_request("eager_pr")
     eager_prime(captured, "eager_pr", "S")
     want = [eager_frame(captured, "eager_pr", f, "S") for f in range(1, frames + 1)]
-    want_ring = world_snapshot(kv, kv.world_of("eager_pr"))
+    want_ring = world_snapshot(kv, kv.session_of("eager_pr"))
     scrub(kv, "eager_pr")
 
     kv.ingest_request("graph_pr")
     replay_prime(captured, "graph_pr", "S")
     got = [replay_frame(captured, "graph_pr", f, "S") for f in range(1, frames + 1)]
-    got_ring = world_snapshot(kv, kv.world_of("graph_pr"))
+    got_ring = world_snapshot(kv, kv.session_of("graph_pr"))
 
     for frame, (a, b) in enumerate(zip(want, got, strict=True), start=1):
         assert torch.equal(a, b), (

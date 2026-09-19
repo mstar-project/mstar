@@ -50,7 +50,7 @@ class KVConfig(ABC):
 
         Idempotent because one KVConfig is shared by the KV resource and the
         attention resources planned against it, and each shards on construction.
-        ``num_shards`` is the instance world size (tp * sp): Ulysses SP
+        ``num_shards`` is the instance session size (tp * sp): Ulysses SP
         all-to-alls heads, so attention runs at head-degree tp*sp.
         """
         from mstar.distributed.utils import divide
@@ -120,20 +120,20 @@ class RingKVConfig(KVConfig):
 
     tokens_per_frame: int
     layers: tuple[RingKVLayerConfig, ...]
-    # How many worlds are resident at once. NOT a batch.
-    num_worlds: int = 1
+    # How many sessions are resident at once. NOT a batch.
+    num_sessions: int = 1
 
     @property
-    def total_worlds(self) -> int:
-        """Resident worlds plus one shared scratch world for padding rows.
+    def total_sessions(self) -> int:
+        """Resident sessions plus one shared scratch session for padding rows.
 
-        A replay padded to its capture bucket parks the dummy tail on this world
+        A replay padded to its capture bucket parks the dummy tail on this session
         (see ``RingKVManager.plan``); it is never handed to a request, so
-        resident capacity stays ``num_worlds`` and the deployment knob keeps its
+        resident capacity stays ``num_sessions`` and the deployment knob keeps its
         meaning. The ring buffer and the flex mask both size on this count so the
-        padding world is a real, addressable span.
+        padding session is a real, addressable span.
         """
-        return self.num_worlds + 1
+        return self.num_sessions + 1
 
     def __post_init__(self):
         super().__post_init__()
@@ -143,33 +143,33 @@ class RingKVConfig(KVConfig):
                 f"{self.num_layers}; each layer's ring is declared separately."
             )
         if (
-            not isinstance(self.num_worlds, int)
-            or isinstance(self.num_worlds, bool)
-            or self.num_worlds < 1
+            not isinstance(self.num_sessions, int)
+            or isinstance(self.num_sessions, bool)
+            or self.num_sessions < 1
         ):
             raise ValueError(
-                f"num_worlds must be a positive int; got {self.num_worlds!r}. A node serving "
-                "zero worlds refuses every request at admit."
+                f"num_sessions must be a positive int; got {self.num_sessions!r}. A node serving "
+                "zero sessions refuses every request at admit."
             )
 
-    def apply_yaml_overrides(self, num_worlds: int | None = None, **kwargs) -> None:
-        """``num_worlds`` only. Nothing else here is a deployment knob."""
+    def apply_yaml_overrides(self, num_sessions: int | None = None, **kwargs) -> None:
+        """``num_sessions`` only. Nothing else here is a deployment knob."""
         if kwargs:
             raise TypeError(
                 "ring KV geometry is a checkpoint fact, not a deployment tunable; "
                 f"got {sorted(kwargs)}"
             )
-        if num_worlds is not None:
+        if num_sessions is not None:
             if (
-                not isinstance(num_worlds, int)
-                or isinstance(num_worlds, bool)
-                or num_worlds < 1
+                not isinstance(num_sessions, int)
+                or isinstance(num_sessions, bool)
+                or num_sessions < 1
             ):
                 raise ValueError(
-                    f"num_worlds must be a positive int; got {num_worlds!r}. A node serving "
-                    "zero worlds refuses every request at admit."
+                    f"num_sessions must be a positive int; got {num_sessions!r}. A node serving "
+                    "zero sessions refuses every request at admit."
                 )
-            self.num_worlds = num_worlds
+            self.num_sessions = num_sessions
 
 
 @dataclass

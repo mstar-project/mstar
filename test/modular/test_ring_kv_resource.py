@@ -7,7 +7,7 @@ a world reading its neighbour's history does not raise — it produces plausible
 smoothly drifting video, or a request that hangs forever waiting on an evictor
 with nothing to evict.
 
-``num_worlds`` worlds share one buffer per layer, folded into its token
+``num_sessions`` worlds share one buffer per layer, folded into its token
 dimension (``kv/ring/cache.py``). Nothing physical separates them: ``upsert``
 hands back K and V spanning every resident world and one bool row that is False
 outside the caller's own span. That row is the whole isolation mechanism, so the
@@ -18,7 +18,7 @@ failures corrupt video.
 
 CPU-only and allocation-free at test scale: the geometry is 3 layers of 4 frames
 at 128 tokens, not 24 x 17 x 512. The one GPU test is the capture test, which
-cannot be anything else — the property it pins (``world_idx`` is *read* at
+cannot be anything else — the property it pins (``session_idx`` is *read* at
 replay, not baked at capture) only exists inside a CUDA graph.
 """
 
@@ -64,7 +64,7 @@ D_HEAD = 8
 
 def _ring_config(
     *,
-    num_worlds: int = 1,
+    num_sessions: int = 1,
     ring_frames: int = RING_FRAMES,
     num_kv_heads: int = N_KV_HEADS,
 ) -> RingKVConfig:
@@ -75,7 +75,7 @@ def _ring_config(
         num_kv_heads=num_kv_heads,
         head_dim=D_HEAD,
         tokens_per_frame=TPF,
-        num_worlds=num_worlds,
+        num_sessions=num_sessions,
         layers=tuple(
             RingKVLayerConfig(
                 ring_frames=ring_frames,
@@ -160,9 +160,9 @@ def _ptrs(kv: RingKVManager) -> list[tuple[int, int, int, int]]:
 
 
 def _world_view(layer: LayerRingCache) -> torch.Tensor:
-    """``written`` cut back into ``[num_worlds, capacity]``. A view, so it reads
+    """``written`` cut back into ``[num_sessions, capacity]``. A view, so it reads
     the live row rather than a snapshot of it."""
-    return layer.written.view(layer.num_worlds, layer.capacity)
+    return layer.written.view(layer.num_sessions, layer.capacity)
 
 
 # ── spec dispatch ───────────────────────────────────────────────────────
@@ -212,7 +212,7 @@ def test_num_worlds_is_the_one_yaml_tunable():
     """The counterweight to the test above, and the reason it is a whitelist
     rather than a blanket refusal.
 
-    `num_worlds` is a different kind of number from the geometry: how many
+    `num_sessions` is a different kind of number from the geometry: how many
     concurrent sessions this box holds resident (~816 MiB of ring each at 720P)
     is a sizing decision about the box, exactly like `max_num_pages` on the
     paged config. It changes what the node can *serve* and never what it
@@ -222,11 +222,11 @@ def test_num_worlds_is_the_one_yaml_tunable():
     config = _ring_config()
     spec = KVSpec(resource_key="kv", nodes={"dit"}, config=config)
 
-    apply_yaml_overrides([spec], {"resources": {"kv": {"num_worlds": 4}}})
+    apply_yaml_overrides([spec], {"resources": {"kv": {"num_sessions": 4}}})
 
-    assert config.num_worlds == 4
+    assert config.num_sessions == 4
     kv = _manager(config)
-    assert kv.num_worlds == 4
+    assert kv.num_sessions == 4
     # 4 resident worlds plus the one shared padding world the ring parks a
     # replay's dummy tail on.
     assert kv.total_slots(0) == (4 + 1) * kv.capacity(0)
@@ -236,14 +236,14 @@ def test_num_worlds_is_the_one_yaml_tunable():
 def test_invalid_num_worlds_is_refused_at_both_entry_points(bad):
     """A node sized for zero worlds refuses every request at admit — a
     deployment that boots, reports healthy, and serves nothing."""
-    with pytest.raises(ValueError, match="num_worlds"):
-        _ring_config(num_worlds=bad)
-    with pytest.raises(ValueError, match="num_worlds"):
-        _ring_config().apply_yaml_overrides(num_worlds=bad)
+    with pytest.raises(ValueError, match="num_sessions"):
+        _ring_config(num_sessions=bad)
+    with pytest.raises(ValueError, match="num_sessions"):
+        _ring_config().apply_yaml_overrides(num_sessions=bad)
 
 
 def test_applying_num_worlds_does_not_rebaseline_the_head_counts():
-    """`apply_yaml_overrides` validates `num_worlds` inline rather than
+    """`apply_yaml_overrides` validates `num_sessions` inline rather than
     re-running `__post_init__`, and that is load-bearing rather than tidiness.
 
     `KVConfig.__post_init__` snapshots `_unsharded_kv_heads` from the CURRENT
@@ -258,7 +258,7 @@ def test_applying_num_worlds_does_not_rebaseline_the_head_counts():
     sharded = config.num_kv_heads
     assert sharded == 4
 
-    config.apply_yaml_overrides(num_worlds=4)
+    config.apply_yaml_overrides(num_sessions=4)
     config.shard(2)
 
     assert config.num_kv_heads == sharded, "shard() stopped being idempotent"
@@ -322,7 +322,7 @@ def test_two_capture_configs_can_each_open_and_claim():
     anything the manager could learn without a commit, the second warmup admit
     would refuse and capture would die here rather than in production.
     """
-    kv = _manager(_ring_config(num_worlds=1))
+    kv = _manager(_ring_config(num_sessions=1))
     pool = DummyRowPool(
         prefix="dit",
         step_runner=SimpleNamespace(ingest_request=kv.ingest_request),
@@ -362,7 +362,7 @@ def test_ingest_request_registers_without_claiming():
     kv.ingest_request("b")
     kv.ingest_request("a")  # idempotent: one NewRequest per partition
 
-    assert kv.world_of("a") is None and kv.world_of("b") is None
+    assert kv.session_of("a") is None and kv.session_of("b") is None
     # neither registration took a world, so either may still be admitted
     assert kv.admit(_step("b"), _ctx("b")).ok
 
@@ -379,19 +379,19 @@ def test_admit_refuses_a_request_that_was_never_ingested():
     With one world the distinction was invisible, because the single claim was
     always overwritten by whoever asked next. It is not invisible with a pool.
     """
-    kv = _manager(_ring_config(num_worlds=4))
+    kv = _manager(_ring_config(num_sessions=4))
 
     outcome = kv.admit(_step("stranger"), _ctx("stranger"))
 
     assert not outcome.ok
     assert type(outcome.reason) is AdmitRuntimeError
     assert "never ingested" in outcome.reason.message
-    assert kv.world_of("stranger") is None
-    assert len(kv._free_worlds) == 4, "a refused admit still took a world"
+    assert kv.session_of("stranger") is None
+    assert len(kv._free_sessions) == 4, "a refused admit still took a world"
 
 
-@pytest.mark.parametrize("num_worlds", [1, 2, 4])
-def test_the_n_plus_first_request_is_refused_with_a_terminal_reason(num_worlds):
+@pytest.mark.parametrize("num_sessions", [1, 2, 4])
+def test_the_n_plus_first_request_is_refused_with_a_terminal_reason(num_sessions):
     """The pool is finite and exhaustion is terminal. The reason class is the
     whole point: `AllocationFailed` sends the scheduler to evict, but
     `supports_eviction` is False so nothing is evictable and the request spins;
@@ -399,8 +399,8 @@ def test_the_n_plus_first_request_is_refused_with_a_terminal_reason(num_worlds):
     of failing. That reasoning does not change with the pool size — an exhausted
     ring is exhausted for the same reason at N=4 as at N=1.
     """
-    kv = _manager(_ring_config(num_worlds=num_worlds))
-    _open(kv, *[f"r{i}" for i in range(num_worlds)])
+    kv = _manager(_ring_config(num_sessions=num_sessions))
+    _open(kv, *[f"r{i}" for i in range(num_sessions)])
     kv.ingest_request("extra")
 
     outcome = kv.admit(_step("extra"), _ctx("extra"))
@@ -409,11 +409,11 @@ def test_the_n_plus_first_request_is_refused_with_a_terminal_reason(num_worlds):
     assert not outcome.ready
     assert type(outcome.reason) is AdmitRuntimeError
     assert not isinstance(outcome.reason, (AllocationFailed, RequestOffloading))
-    assert f"all {num_worlds}" in outcome.reason.message
+    assert f"all {num_sessions}" in outcome.reason.message
 
 
-@pytest.mark.parametrize("num_worlds", [2, 4])
-def test_concurrent_requests_get_distinct_worlds(num_worlds):
+@pytest.mark.parametrize("num_sessions", [2, 4])
+def test_concurrent_requests_get_distinct_worlds(num_sessions):
     """The point of the whole change, and the thing that has no meaning at N=1.
 
     Two requests handed the same world index would share one span: each would
@@ -422,18 +422,18 @@ def test_concurrent_requests_get_distinct_worlds(num_worlds):
     set, not against an expected assignment, because which index a request gets
     is allocator business; that it gets its own is not.
     """
-    kv = _manager(_ring_config(num_worlds=num_worlds))
-    rids = [f"r{i}" for i in range(num_worlds)]
+    kv = _manager(_ring_config(num_sessions=num_sessions))
+    rids = [f"r{i}" for i in range(num_sessions)]
 
     _open(kv, *rids)
 
-    worlds = [kv.world_of(rid) for rid in rids]
+    worlds = [kv.session_of(rid) for rid in rids]
     assert None not in worlds
-    assert len(set(worlds)) == num_worlds, (
+    assert len(set(worlds)) == num_sessions, (
         f"worlds collided: {dict(zip(rids, worlds, strict=True))}"
     )
-    assert set(worlds) == set(range(num_worlds)), "a world was skipped"
-    assert not kv._free_worlds
+    assert set(worlds) == set(range(num_sessions)), "a world was skipped"
+    assert not kv._free_sessions
 
 
 def test_admit_is_idempotent_for_the_holder():
@@ -442,7 +442,7 @@ def test_admit_is_idempotent_for_the_holder():
     kv.ingest_request("a")
 
     assert all(kv.admit(_step("a"), _ctx("a")).ok for _ in range(4))
-    assert kv.world_of("a") == 0
+    assert kv.session_of("a") == 0
 
 
 def test_a_refused_admit_leaves_every_previous_holder_in_place():
@@ -452,17 +452,17 @@ def test_a_refused_admit_leaves_every_previous_holder_in_place():
     refusal that half-claimed would now do it to whichever holder happened to
     own the index it grabbed.
     """
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "a", "b")
-    before = {rid: kv.world_of(rid) for rid in ("a", "b")}
+    before = {rid: kv.session_of(rid) for rid in ("a", "b")}
     kv.ingest_request("c")
 
     assert not kv.admit(_step("c"), _ctx("c")).ok
 
-    assert {rid: kv.world_of(rid) for rid in ("a", "b")} == before
+    assert {rid: kv.session_of(rid) for rid in ("a", "b")} == before
     assert kv.admit(_step("a"), _ctx("a")).ok
     assert kv.admit(_step("b"), _ctx("b")).ok
-    assert kv.world_of("c") is None
+    assert kv.session_of("c") is None
 
 
 @pytest.mark.parametrize("free", [False, True])
@@ -476,31 +476,31 @@ def test_reset_request_releases_one_world_and_only_one(free):
     dropped *the* claim, which was the same statement then and would now end
     every other rollout on the node every time any request was reset.
     """
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "a", "b")
-    b_world = kv.world_of("b")
+    b_world = kv.session_of("b")
 
     kv.reset_request("a", free=free)
 
-    assert kv.world_of("a") is None
-    assert kv.world_of("b") == b_world, "resetting `a` released `b`'s world"
+    assert kv.session_of("a") is None
+    assert kv.session_of("b") == b_world, "resetting `a` released `b`'s world"
     kv.ingest_request("c")
     assert kv.admit(_step("c"), _ctx("c")).ok
-    assert kv.world_of("c") == 0, "the freed world was not the one handed on"
+    assert kv.session_of("c") == 0, "the freed world was not the one handed on"
 
 
 def test_remove_request_releases_the_world_and_the_registration():
     """Both, and neither anyone else's. Dropping the registration is what makes
     the world genuinely returned rather than reserved for a rid the engine has
     already forgotten."""
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "a", "b")
-    b_world = kv.world_of("b")
+    b_world = kv.session_of("b")
 
     kv.remove_request("a")
 
-    assert kv.world_of("a") is None
-    assert kv.world_of("b") == b_world, "removing `a` released `b`'s world"
+    assert kv.session_of("a") is None
+    assert kv.session_of("b") == b_world, "removing `a` released `b`'s world"
     # the registration went with it: `a` is a stranger again
     assert not kv.admit(_step("a"), _ctx("a")).ok
     kv.ingest_request("a")
@@ -511,7 +511,7 @@ def test_supports_preplan_stays_false():
     """It keeps `CudaGraphRunner._num_slots` at 1. Two slots exist so a plan for
     step N+1 can write buffers replay N is not reading; the only thing planned
     here is one `[B]` world index, so the second slot would be an identical
-    graph at double the capture cost — and the only reason `_static_world_idx`
+    graph at double the capture cost — and the only reason `_static_session_idx`
     would have to become one buffer per slot."""
     assert _manager().supports_preplan is False
 
@@ -527,75 +527,75 @@ def test_plan_stages_the_world_index_in_place_as_a_device_tensor():
     buffer that existed at capture, so a rebind leaves every replay reading the
     orphaned original.
 
-    Hence both halves below: the staged value is a ``[num_worlds]`` int64
+    Hence both halves below: the staged value is a ``[num_sessions]`` int64
     device tensor (row ``b`` holds row ``b``'s world once staged), and `plan`
     writes *through* it rather than replacing it.
     """
-    kv = _manager(_ring_config(num_worlds=4))
+    kv = _manager(_ring_config(num_sessions=4))
     _open(kv, "a", "b")
-    staged = kv._static_world_idx
+    staged = kv._static_session_idx
     assert staged.shape == (4,) and staged.dtype == torch.int64
 
     kv.plan(_step("b"), _ctx("b"))
 
-    assert kv._static_world_idx is staged, "plan rebound the buffer capture baked"
-    assert staged.data_ptr() == kv._static_world_idx.data_ptr()
-    assert int(staged[0]) == kv.world_of("b")
+    assert kv._static_session_idx is staged, "plan rebound the buffer capture baked"
+    assert staged.data_ptr() == kv._static_session_idx.data_ptr()
+    assert int(staged[0]) == kv.session_of("b")
 
     kv.plan(_step("a"), _ctx("a"))
-    assert int(staged[0]) == kv.world_of("a")
+    assert int(staged[0]) == kv.session_of("a")
 
 
 def test_plan_stages_a_batch_of_distinct_rids():
     """A step can batch worlds each claimed on its own admit -- `admit` no
     longer refuses a same-step batch of distinct rids, and `plan` stages every
     row, in `ctx.request_ids` order, rather than just the first."""
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "a", "b")
 
     result = kv.plan(_step("a", "b"), _ctx("a", "b"))
 
     assert result.request_ids == ("a", "b")
-    assert result.world_idx == (kv.world_of("a"), kv.world_of("b"))
+    assert result.session_idx == (kv.session_of("a"), kv.session_of("b"))
     assert result.frame_pos == (0, 0)
-    assert kv._static_world_idx[:2].tolist() == list(result.world_idx)
+    assert kv._static_session_idx[:2].tolist() == list(result.session_idx)
 
 
 def test_plan_parks_padding_rows_on_the_shared_padding_world():
     """A replay padded past its real rows stages the dummy tail on the padding
     world -- the one world past the resident pool -- so a padding write never
     lands in a resident request's history. Real rows keep their own world; the
-    padding rows all share ``_padding_world``, and no admit ever hands it out."""
-    kv = _manager(_ring_config(num_worlds=4))
+    padding rows all share ``_padding_session``, and no admit ever hands it out."""
+    kv = _manager(_ring_config(num_sessions=4))
     _open(kv, "a", "b")
-    free_before = set(kv._free_worlds)
+    free_before = set(kv._free_sessions)
 
     ctx = _ctx("a", "b")
     ctx.set_padded_rids(("a", "b", "__pad0__", "__pad1__"))
     result = kv.plan(_step("a", "b"), ctx)
 
-    pad = kv._padding_world
+    pad = kv._padding_session
     assert pad == 4, "the padding world is the one index past the resident pool"
-    assert pad not in kv._free_worlds and kv.layers[0].num_worlds == 5
+    assert pad not in kv._free_sessions and kv.layers[0].num_sessions == 5
     assert result.request_ids == ("a", "b", "__pad0__", "__pad1__")
-    assert result.world_idx == (kv.world_of("a"), kv.world_of("b"), pad, pad)
+    assert result.session_idx == (kv.session_of("a"), kv.session_of("b"), pad, pad)
     assert result.frame_pos == (0, 0, 0, 0)
-    assert kv._static_world_idx[:4].tolist() == list(result.world_idx)
+    assert kv._static_session_idx[:4].tolist() == list(result.session_idx)
     # Padding never touched the pool: no free world was consumed for the tail.
-    assert set(kv._free_worlds) == free_before
+    assert set(kv._free_sessions) == free_before
 
 
 def test_plan_refuses_a_request_holding_no_world():
     kv = _manager()
 
-    with pytest.raises(KeyError, match="no world for request"):
+    with pytest.raises(KeyError, match="no session for request"):
         kv.plan(_step("a"), _ctx("a"))
 
 
 def test_admit_refuses_a_batch_naming_the_same_request_twice():
     """A step batches distinct worlds, one row per request; naming the same
     rid twice would try to stage two rows into the same world."""
-    kv = _manager(_ring_config(num_worlds=4))
+    kv = _manager(_ring_config(num_sessions=4))
     kv.ingest_request("a")
 
     outcome = kv.admit(_step("a", "a"), _ctx("a", "a"))
@@ -679,7 +679,7 @@ def test_each_world_runs_its_own_clock():
     and, worse under a hypothetical "just take the max", would let a lagging
     world skip forward into a slot it never wrote.
     """
-    kv = _manager(_ring_config(num_worlds=3))
+    kv = _manager(_ring_config(num_sessions=3))
     _open(kv, "a", "b", "c")
 
     _drive(kv, "a", 0)
@@ -703,7 +703,7 @@ def test_the_clock_check_fires_per_rid_inside_a_batched_admit():
     """Two rids in one `admit` call, not two: the continuity check must still
     catch a bad clock on either row of a batch, and a good row ahead of it in
     `ctx.request_ids` order must not paper over it."""
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "a", "b")
     _drive(kv, "a", 0)
     _drive(kv, "b", 0)
@@ -858,10 +858,10 @@ def test_reset_request_zeroes_one_span_without_reallocating():
     A reset that zeroed the whole buffer (which is what the single-world version
     did, indistinguishably) fails on `b`.
     """
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     before = _ptrs(kv)
     _open(kv, "a", "b")
-    assert (kv.world_of("a"), kv.world_of("b")) == (0, 1)
+    assert (kv.session_of("a"), kv.session_of("b")) == (0, 1)
 
     kv.plan(_step("b"), _ctx("b"))
     _rollout(kv, frames=6, seed=2)
@@ -893,7 +893,7 @@ def test_remove_request_zeroes_one_span_without_reallocating():
     rollout ending takes. The single-world version zeroed the whole buffer
     here: with one world that was the same statement, with N it ends every
     concurrent rollout on the node every time any one of them finishes."""
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     before = _ptrs(kv)
     _open(kv, "a", "b")
 
@@ -913,11 +913,11 @@ def test_remove_request_zeroes_one_span_without_reallocating():
 
 
 def test_a_reused_world_starts_empty():
-    """The pairing `_release_world` exists to enforce: a world handed back to
+    """The pairing `_release_session` exists to enforce: a world handed back to
     the pool still holding a dead request's frames is handed to the next request
     as its history — neither empty nor its own, and attended to as real. There
     is no release path that does not zero first."""
-    kv = _manager(_ring_config(num_worlds=1))
+    kv = _manager(_ring_config(num_sessions=1))
     _open(kv, "a")
     kv.plan(_step("a"), _ctx("a"))
     _rollout(kv, frames=5, seed=6)
@@ -926,7 +926,7 @@ def test_a_reused_world_starts_empty():
     kv.remove_request("a")
     _open(kv, "b")
 
-    assert kv.world_of("b") == 0, "this test needs the same index handed on"
+    assert kv.session_of("b") == 0, "this test needs the same index handed on"
     assert all(not bool(layer.kv.any()) for layer in kv.layers)
     for layer in kv.layers:
         assert not bool(layer.written[: layer.ring_len].any())
@@ -945,7 +945,7 @@ def test_post_warmup_validate_catches_capture_residue():
     """NUM_WARMUP=2 plus the capture forward is three committing passes
     into whatever world the dummy held. Left there, the first real rollout
     handed that world attends to them as history."""
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     kv.post_warmup_validate()
 
     _rollout(kv, frames=1)
@@ -957,7 +957,7 @@ def test_post_warmup_validate_catches_a_lingering_claim():
     """A dummy rid still holding a world after capture is a world no request
     will ever get back: the node boots reporting healthy and serves one fewer
     session than it was sized for, forever."""
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "dummy")
 
     with pytest.raises(RuntimeError, match="still claimed"):
@@ -994,10 +994,10 @@ def test_state_is_refused_for_a_request_holding_no_world(call):
     it back would overwrite worlds the caller never asked about — so there is no
     unscoped spelling to fall back to, and a rid that owns nothing has to say
     so."""
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "a")
 
-    with pytest.raises(KeyError, match="no world for request"):
+    with pytest.raises(KeyError, match="no session for request"):
         if call == "get_state":
             kv.get_state("ghost")
         else:
@@ -1010,7 +1010,7 @@ def test_get_state_covers_one_world_and_is_cloned_not_aliased():
     place, and an aliased snapshot silently tracks the live world instead. The
     span check is the multi-world half — a snapshot the size of the whole buffer
     would carry `b`'s history into `a`'s save file."""
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "a", "b")
     kv.plan(_step("a"), _ctx("a"))
     _rollout(kv, frames=2)
@@ -1037,7 +1037,7 @@ def test_load_state_copies_into_one_span_of_the_fixed_allocation():
     a *span* rather than the whole buffer is the second half of that: every
     other resident world has to come through untouched, or restoring one
     session resets its neighbours."""
-    kv = _manager(_ring_config(num_worlds=2))
+    kv = _manager(_ring_config(num_sessions=2))
     _open(kv, "a", "b")
     kv.plan(_step("a"), _ctx("a"))
     _rollout(kv, frames=5)
@@ -1060,10 +1060,10 @@ def test_load_state_copies_into_one_span_of_the_fixed_allocation():
 
     assert _ptrs(kv) == before
     for i, layer in enumerate(kv.layers):
-        lo, hi = layer.world_span(kv.world_of("a"))
+        lo, hi = layer.session_span(kv.session_of("a"))
         assert torch.equal(layer.kv[:, :, :, lo:hi], state["layers"][i][0])
         assert torch.equal(layer.written[lo:hi], state["layers"][i][1])
-        b_lo, b_hi = layer.world_span(kv.world_of("b"))
+        b_lo, b_hi = layer.session_span(kv.session_of("b"))
         assert torch.equal(layer.kv[:, :, :, b_lo:b_hi], b_kv[i][:, :, :, b_lo:b_hi]), (
             "load_state reached another world's span"
         )
@@ -1075,8 +1075,8 @@ def test_a_state_is_portable_between_rings_of_different_widths():
     part of it. This is not incidental: a node resized from 2 worlds to 4
     between restarts must still be able to load the sessions it wrote, and a
     guard that compared against the whole buffer would refuse them all."""
-    small = _manager(_ring_config(num_worlds=2))
-    big = _manager(_ring_config(num_worlds=4))
+    small = _manager(_ring_config(num_sessions=2))
+    big = _manager(_ring_config(num_sessions=4))
     _open(small, "a")
     small.plan(_step("a"), _ctx("a"))
     _rollout(small, frames=3, seed=13)
@@ -1085,12 +1085,12 @@ def test_a_state_is_portable_between_rings_of_different_widths():
     big.load_state("y", small.get_state("a"))
 
     for layer, (kv_t, w_t) in zip(big.layers, small.get_state("a")["layers"], strict=True):
-        lo, hi = layer.world_span(big.world_of("y"))
+        lo, hi = layer.session_span(big.session_of("y"))
         assert torch.equal(layer.kv[:, :, :, lo:hi], kv_t)
         assert torch.equal(layer.written[lo:hi], w_t)
     # and `x`'s world is still empty
     for layer in big.layers:
-        lo, hi = layer.world_span(big.world_of("x"))
+        lo, hi = layer.session_span(big.session_of("x"))
         assert not bool(layer.kv[:, :, :, lo:hi].any())
 
 
@@ -1178,7 +1178,7 @@ def test_upsert_returns_the_whole_buffer_and_delegates_by_layer():
     the caller's world back out of it. `capacity` and `total_slots` are both
     named for this reason: using either where the other belongs is an off-by-N
     that produces a valid shape."""
-    kv = _manager(_ring_config(num_worlds=3))
+    kv = _manager(_ring_config(num_sessions=3))
     gen = torch.Generator().manual_seed(5)
     k, v = _frame(kv, gen)
 
@@ -1255,14 +1255,14 @@ def _w(idx: int) -> torch.Tensor:
     return torch.tensor([idx], dtype=torch.int64)
 
 
-@pytest.mark.parametrize("num_worlds", [2, 4])
+@pytest.mark.parametrize("num_sessions", [2, 4])
 @pytest.mark.parametrize("pinned_dilation", [1, 8])
-def test_the_flat_ring_matches_one_ring_per_world(num_worlds, pinned_dilation):
+def test_the_flat_ring_matches_one_ring_per_world(num_sessions, pinned_dilation):
     """N worlds folded into one token axis are bit-identical to N separate
     single-world rings, span for span.
 
     This is the equivalence the whole layout rests on and the reason
-    `num_worlds` can be a deployment knob at all: a world's arithmetic must not
+    `num_sessions` can be a deployment knob at all: a world's arithmetic must not
     depend on how many neighbours it has. Three things are compared and all
     three are necessary — the K/V bytes (the write landed in the right slots),
     `written` (the bookkeeping did too), and the visibility row restricted to
@@ -1270,7 +1270,7 @@ def test_the_flat_ring_matches_one_ring_per_world(num_worlds, pinned_dilation):
     single-world counterpart: everything OUTSIDE the span is False, which is
     isolation itself.
 
-    The own-world term is checked as `_world_of_slot == world_idx` computed from
+    The own-world term is checked as `_session_of_slot == session_idx` computed from
     the span arithmetic, not read back off the implementation, so a mask built
     from the wrong comparison cannot agree with it by construction.
     """
@@ -1279,27 +1279,27 @@ def test_the_flat_ring_matches_one_ring_per_world(num_worlds, pinned_dilation):
         d_head=D_HEAD, tokens_per_frame=TPF, pinned_dilation=pinned_dilation,
         dtype=torch.float32, device="cpu",
     )
-    flat = LayerRingCache(num_worlds=num_worlds, **kwargs)
-    solo = [LayerRingCache(num_worlds=1, **kwargs) for _ in range(num_worlds)]
-    assert flat.total_slots == num_worlds * flat.capacity
+    flat = LayerRingCache(num_sessions=num_sessions, **kwargs)
+    solo = [LayerRingCache(num_sessions=1, **kwargs) for _ in range(num_sessions)]
+    assert flat.total_slots == num_sessions * flat.capacity
     assert all(s.capacity == flat.capacity for s in solo)
 
     # Independent clocks and a deliberately uneven interleave: with every world
-    # on the same frame, a mask that ignored `world_idx` entirely would still
+    # on the same frame, a mask that ignored `session_idx` entirely would still
     # hide the same slots and this test would pass against it.
-    gens = [torch.Generator().manual_seed(100 + w) for w in range(num_worlds)]
-    clocks = [3 * w for w in range(num_worlds)]
+    gens = [torch.Generator().manual_seed(100 + w) for w in range(num_sessions)]
+    clocks = [3 * w for w in range(num_sessions)]
     order = torch.Generator().manual_seed(41)
 
-    for _ in range(20 * num_worlds):
-        w = int(torch.randint(0, num_worlds, (1,), generator=order).item())
+    for _ in range(20 * num_sessions):
+        w = int(torch.randint(0, num_sessions, (1,), generator=order).item())
         frame_pos = torch.tensor([clocks[w]], dtype=torch.int64)
         for commit in (False, False, False, False, True):
             kv = torch.randn(2, 1, N_KV_HEADS, TPF, D_HEAD, generator=gens[w])
             _, _, flat_vis = flat.upsert(kv, frame_pos, commit, _w(w))
             _, _, solo_vis = solo[w].upsert(kv, frame_pos, commit, _w(0))
 
-            lo, hi = flat.world_span(w)
+            lo, hi = flat.session_span(w)
             assert torch.equal(flat_vis[lo:hi], solo_vis), (
                 f"world {w} frame {clocks[w]}: visibility diverged from a solo ring"
             )
@@ -1316,8 +1316,8 @@ def test_the_flat_ring_matches_one_ring_per_world(num_worlds, pinned_dilation):
             assert torch.equal(flat_vis, flat_vis & own)
         clocks[w] += 1
 
-    for w in range(num_worlds):
-        lo, hi = flat.world_span(w)
+    for w in range(num_sessions):
+        lo, hi = flat.session_span(w)
         assert torch.equal(flat.kv[:, :, :, lo:hi], solo[w].kv), f"world {w} ring bytes"
         assert torch.equal(flat.written[lo:hi], solo[w].written), f"world {w} written"
 
@@ -1341,9 +1341,9 @@ def test_worlds_interleave_without_reaching_each_other():
     starts = {"a": 0, "b": 5, "c": 11}
     frames = 40
 
-    flat = _manager(_ring_config(num_worlds=3))
+    flat = _manager(_ring_config(num_sessions=3))
     _open(flat, *rids)
-    solo = {rid: _manager(_ring_config(num_worlds=1)) for rid in rids}
+    solo = {rid: _manager(_ring_config(num_sessions=1)) for rid in rids}
     for rid, mgr in solo.items():
         _open(mgr, rid)
 
@@ -1363,12 +1363,12 @@ def test_worlds_interleave_without_reaching_each_other():
         clocks[rid] += 1
 
     for rid in rids:
-        world = flat.world_of(rid)
+        world = flat.session_of(rid)
         for i, (layer, ref) in enumerate(zip(flat.layers, solo[rid].layers, strict=True)):
-            lo, hi = layer.world_span(world)
+            lo, hi = layer.session_span(world)
             # The solo manager holds a padding world too, so compare against its
             # world span, not its whole buffer.
-            ref_lo, ref_hi = ref.world_span(solo[rid].world_of(rid))
+            ref_lo, ref_hi = ref.session_span(solo[rid].session_of(rid))
             assert torch.equal(layer.kv[:, :, :, lo:hi], ref.kv[:, :, :, ref_lo:ref_hi]), (
                 f"{rid} layer {i}: interleaving changed what the world holds"
             )
@@ -1379,14 +1379,14 @@ def test_worlds_interleave_without_reaching_each_other():
     # and the mask hid every other world completely, on the last step of each
     gen = torch.Generator().manual_seed(59)
     for rid in rids:
-        world = flat.world_of(rid)
+        world = flat.session_of(rid)
         flat.plan(_step(rid), _ctx(rid))
         for layer_idx in range(N_LAYERS):
             k, v = _frame(flat, gen)
             _, _, visible = flat.upsert(
                 k, v, layer_idx, torch.tensor([clocks[rid]], dtype=torch.int64), commit=False
             )
-            lo, hi = flat.layers[layer_idx].world_span(world)
+            lo, hi = flat.layers[layer_idx].session_span(world)
             seen = visible.clone()
             seen[lo:hi] = False
             assert not bool(seen.any()), (
@@ -1404,7 +1404,7 @@ def test_the_captured_world_index_is_read_at_replay_not_baked_at_capture():
     """The property the entire layout exists for, and the only test that can
     see it.
 
-    `world_idx` is a `[1]` int64 device tensor rather than a Python int for one
+    `session_idx` is a `[1]` int64 device tensor rather than a Python int for one
     reason: a host int — or a `kv[:, w]` view taken with one — has its value (or
     its `storage_offset`) folded into the graph at capture time, and every
     subsequent replay then serves whichever world capture happened to hold.
@@ -1416,12 +1416,12 @@ def test_the_captured_world_index_is_read_at_replay_not_baked_at_capture():
     tensor. Every other world, including the one capture used, has to be
     untouched.
     """
-    kv = _manager(_ring_config(num_worlds=4), device="cuda")
+    kv = _manager(_ring_config(num_sessions=4), device="cuda")
     layer = kv.layers[0]
 
     _open(kv, "cap")
     kv.plan(_step("cap"), _ctx("cap"))
-    assert kv.world_of("cap") == 0, "this test needs capture to hold world 0"
+    assert kv.session_of("cap") == 0, "this test needs capture to hold world 0"
 
     static_k = torch.zeros(1, N_KV_HEADS, TPF, D_HEAD, dtype=torch.float32, device="cuda")
     static_v = torch.zeros_like(static_k)
@@ -1442,12 +1442,12 @@ def test_the_captured_world_index_is_read_at_replay_not_baked_at_capture():
     torch.cuda.synchronize()
 
     kv.reset_request("cap", free=True)
-    for world in range(layer.num_worlds):
+    for world in range(layer.num_sessions):
         layer.reset(world)
 
     # push the real request off world 0: three placeholders take 0, 1, 2
     _open(kv, "pad0", "pad1", "pad2", "real")
-    world = kv.world_of("real")
+    world = kv.session_of("real")
     assert world == 3
     kv.plan(_step("real"), _ctx("real"))
 
@@ -1456,17 +1456,17 @@ def test_the_captured_world_index_is_read_at_replay_not_baked_at_capture():
     graph.replay()
     torch.cuda.synchronize()
 
-    lo, hi = layer.world_span(world)
+    lo, hi = layer.session_span(world)
     span = layer.kv[:, :, :, lo:hi]
     assert bool((span == 1.5).any()), (
-        "the replay wrote nothing into the world `plan` staged; `world_idx` was "
+        "the replay wrote nothing into the world `plan` staged; `session_idx` was "
         "baked at capture"
     )
     assert bool(layer.written[lo : lo + TPF].all()), "the frame's ring slot went unmarked"
-    for other in range(kv.num_worlds):
+    for other in range(kv.num_sessions):
         if other == world:
             continue
-        o_lo, o_hi = layer.world_span(other)
+        o_lo, o_hi = layer.session_span(other)
         assert not bool(layer.kv[:, :, :, o_lo:o_hi].any()), (
             f"the replay wrote into world {other}; it was staged to write world "
             f"{world}"
@@ -1474,7 +1474,7 @@ def test_the_captured_world_index_is_read_at_replay_not_baked_at_capture():
         assert not bool(layer.written[o_lo : o_lo + layer.ring_len].any())
     # the visibility row the graph returns is the layer's scratch, restaged too
     assert bool(captured_visible[lo:hi].any())
-    other_lo, other_hi = layer.world_span(0)
+    other_lo, other_hi = layer.session_span(0)
     assert not bool(captured_visible[other_lo:other_hi].any()), (
         "the captured mask still shows the capture-time world"
     )
@@ -1497,7 +1497,7 @@ def test_the_bucket_rounding_is_unobservable_off_write_steps():
     step, the off-write-step case is empty, and a version of this test that ran
     layer 0 would assert nothing at all; hence the counter at the end.
     """
-    layer = _manager(_ring_config(num_worlds=2)).layers[N_LAYERS - 1]
+    layer = _manager(_ring_config(num_sessions=2)).layers[N_LAYERS - 1]
     d = layer.pinned_dilation
     assert d > 1, "this test needs a layer that has off-write-step frames"
 
@@ -1514,7 +1514,7 @@ def test_the_bucket_rounding_is_unobservable_off_write_steps():
         # this test can see.
         _, _, visible = layer.upsert(kv, torch.tensor([f], dtype=torch.int64), True, _w(1))
 
-        lo, hi = layer.world_span(1)
+        lo, hi = layer.session_span(1)
         if f % d:
             off_steps += 1
             expected = before_written.clone()
@@ -1614,23 +1614,23 @@ def test_upsert_refuses_a_world_index_that_is_not_the_staged_shape(bad):
     layer = _manager().layers[0]
     kv = torch.zeros(2, 1, N_KV_HEADS, TPF, D_HEAD)
 
-    with pytest.raises(RuntimeError, match="world_idx must be a"):
+    with pytest.raises(RuntimeError, match="session_idx must be a"):
         layer.upsert(kv, torch.tensor([0], dtype=torch.int64), True, bad)
 
 
 def test_a_world_index_out_of_range_is_caught_on_the_host_paths():
-    """Only on the host paths. The forward cannot check it — `world_idx` is a
+    """Only on the host paths. The forward cannot check it — `session_idx` is a
     device tensor there and comparing it would cost a sync per upsert — so an
     out-of-range index in the graph silently writes past the buffer's last
     world or wraps into another's. What keeps it in range is that `admit` is the
     only thing that ever produces one."""
-    layer = _manager(_ring_config(num_worlds=2)).layers[0]
+    layer = _manager(_ring_config(num_sessions=2)).layers[0]
 
-    assert layer.world_span(1) == (layer.capacity, 2 * layer.capacity)
+    assert layer.session_span(1) == (layer.capacity, 2 * layer.capacity)
     # The layer allocates one world past the pool (the shared padding scratch),
     # so index 2 is that valid world and 3 is the first out-of-range one.
     for bad in (-1, 3):
         with pytest.raises(IndexError, match="out of range"):
-            layer.world_span(bad)
+            layer.session_span(bad)
         with pytest.raises(IndexError, match="out of range"):
             layer.reset(bad)

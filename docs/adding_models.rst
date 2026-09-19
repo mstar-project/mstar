@@ -271,7 +271,7 @@ The spec types are:
        ``max_num_pages``, ``page_size`` and ``cpu_offload_pages`` fields.
    * - ``KVSpec(config=RingKVConfig(...))``
      - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
-       ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_worlds``.
+       ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
        Ring storage is currently paired with FlexAttention.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
@@ -1224,7 +1224,7 @@ that a misspelled setting is never silently ignored:
    * - ``KVSpec`` with ``PagedKVConfig``
      - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``
    * - ``KVSpec`` with ``RingKVConfig``
-     - ``num_worlds``
+     - ``num_sessions``
    * - ``AttentionSpec``
      - ``backend`` (``flashinfer`` / ``dense`` / ``flex``),
        ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
