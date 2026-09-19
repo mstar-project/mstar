@@ -216,7 +216,7 @@ class FlashInferMLAManager(AttentionManager):
         # MSTAR_MLA_DECODE_BACKEND=flashmla asks for it; measured no faster than FlashInfer's Hopper kernel
         # on an H100 at 1 to 64 rows, so FlashInfer stays the default
         self._flashmla = (flashmla_wanted() and flashmla_available()
-                          and flashmla_supports(kv_config.kv_lora_rank, kv_config.qk_rope_head_dim))
+                          and flashmla_supports(kv_config.kv_lora_rank, kv_config.qk_rope_head_dim, kv_config.page_size))
         if self._flashmla:
             logger.info("MLA attention: FlashMLA serves the decode plans of %r", kv_cache)
         if sm_scale is None:
