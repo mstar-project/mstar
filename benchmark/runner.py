@@ -634,8 +634,11 @@ def parse_args() -> BenchmarkConfig:
             txtfile = "benchmark/assets/simple_text_queries.txt"
         elif request_type == RequestType.T2S:
             dataset = DatasetType.TEXT
-            if args.model == ModelType.ORPHEUS:
-                # T2S model, will just transcribe
+            if args.model in {
+                ModelType.ORPHEUS.value,
+                ModelType.QWEN3TTS.value,
+            }:
+                # Direct TTS models synthesize the prompt verbatim.
                 txtfile = "benchmark/assets/t2s.txt"
             else:
                 # thinker-talker type model that speaks its answer

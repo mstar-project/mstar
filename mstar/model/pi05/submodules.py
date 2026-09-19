@@ -11,6 +11,7 @@ Two submodules:
 
 import logging
 import math
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -18,14 +19,18 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.base import NodeBatch
-from mstar.engine.cache_manager import BatchedCacheManager
-from mstar.engine.cuda_graph_config import BasicBatchedCudaGraphConfig, FlashInferPackedCudaGraphConfig
+from mstar.engine.cuda_graph_config import (
+    BatchedCudaGraphConfig,
+    CudaGraphConfig,
+    PackedCudaGraphConfig,
+)
+from mstar.engine.engine import ExecutingBatch
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.flow_matching import sincos_timestep_embedding
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
-from mstar.model.pi05.config import Pi05Config
+from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
 from mstar.model.pi05.kernels.image_normalize import normalize_float_images
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
@@ -129,7 +134,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
 
     def can_batch(
         self,
-        batch: NodeBatch,
+        batch: ExecutingBatch,
         model_inputs: list[NodeInputs],
     ) -> bool:
         """Batch when all requests share the same number of cameras.
@@ -156,11 +161,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         compile=False because warmup() already applies torch.compile to
         forward_batched; _capture_one captures the compiled callable directly.
         """
-        from mstar.engine.cuda_graph_config import BasicBatchedCudaGraphConfig
         H = W = self.config.vit_image_size
         num_cameras = self.config.num_cameras
         return [
-            BasicBatchedCudaGraphConfig(
+            BatchedCudaGraphConfig(
                 capture_graph_walk="prefill",
                 single_request_inputs=ARNodeInputs(
                     input_seq_len=0,  # not used by StatelessCudaGraphRunner
@@ -346,7 +350,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
 
     def can_batch(
         self,
-        batch: NodeBatch,
+        batch: ExecutingBatch,
         model_inputs: list[NodeInputs],
     ) -> bool:
         """Pi0.5 supports batched execution for both graph walks.
@@ -360,13 +364,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
           can be concatenated and processed in a single action expert forward.
         """
         return True
-
-    def get_needed_cache_labels(
-        self,
-        graph_walk: str,
-        per_request_info: dict[str, CurrentForwardPassInfo],
-    ) -> list[str] | None:
-        return ["main"]
 
     def _get_timestep_emb_fraction(self) -> torch.Tensor:
         if self._fraction is not None:
@@ -406,32 +403,13 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[BasicBatchedCudaGraphConfig | FlashInferPackedCudaGraphConfig]:
-        # Visibility check: log the shape that's about to be captured so it's
-        # easy to confirm yaml-level Pi05Config overrides (e.g. action_horizon
-        # for the DROID variant) flowed all the way through. The values here
-        # are read directly from self.config — same source as the nn.Linear
-        # weight shapes — so they're guaranteed consistent.
-        logger.info(
-            "Pi05LLMSubmodule.get_cuda_graph_configs: capturing 'action_gen' "
-            "graph with input_seq_len=%d, noisy_actions=(%d, %d), batch_sizes=[1,2,4] "
-            "(num_flow_steps=%d denoising iters runs INSIDE this captured graph; "
-            "denoising count is independent of horizon)",
-            self.config.action_horizon,
-            self.config.action_horizon, self.config.action_dim,
-            self.config.num_flow_steps,
-        )
-        prefill_packed = {
-            num_tokens: {
-                "prefix_embs": torch.zeros(num_tokens, self.config.hidden_size, device=device)
-            }
-            for num_tokens in self.PREFILL_TOKEN_BUCKETS
-        }
+    ) -> list[CudaGraphConfig]:
+        del tp_world_size
         return [
-            # Action generation always has latents of the same size, so it is a similar
-            # paradigm to AR decode and can use the batched cuda graphs
-            BasicBatchedCudaGraphConfig(
-                capture_graph_walk="action_gen", requires_cfg=False, labels=["main"],
+            # Action generation always has latents of the same size, so it is a
+            # similar paradigm to AR decode and can use the batched cuda graphs.
+            BatchedCudaGraphConfig(
+                capture_graph_walk="action_gen",
                 single_request_inputs=ARNodeInputs(
                     input_seq_len=self.config.action_horizon,
                     tensor_inputs={
@@ -443,14 +421,17 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                 ),
                 capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
             ),
-            FlashInferPackedCudaGraphConfig(
+            PackedCudaGraphConfig(
                 capture_graph_walk="prefill",
-                packed_seq_len_to_inputs=prefill_packed,
-                requires_cfg=False,
-                labels=["main"],
-                compile=True,
-                causal_attention=False,
+                make_node_input=lambda n: ARNodeInputs(
+                    input_seq_len=n,
+                    input_embeds=torch.zeros(
+                        n, self.config.hidden_size, device=device
+                    ),
+                ),
+                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                compile=True,
             ),
         ]
 
@@ -530,61 +511,65 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                             })
 
 
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
+    ) -> SubmoduleStep:
+        """Bidirectional (prefix-LM) attention over the packed batch.
+
+        ``prefill`` commits the prefix KV and advances positions. ``action_gen``
+        reads the frozen prefix read-only: the action tokens are written to
+        scratch pages and attended (``KVStep(commit=False)``) but neither the
+        stored length nor the position counter advances, so all denoise
+        iterations reuse the same prefix and the same action positions.
+        """
+        is_prefill = graph_walk == "prefill"
+        segments = [
+            Segment(request_id=rid, label="main", span=inp.input_seq_len)
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        ]
+        pos_step = (
+            PositionStep() if is_prefill
+            else PositionStep(advance=tuple(0 for _ in request_ids))
+        )
+        return SubmoduleStep(
+            segments=segments,
+            steps={
+                LLM_KV: KVStep(commit=is_prefill),
+                LLM_ATTN: AttentionStep(causal=False),
+                LLM_POS: pos_step,
+            },
+        )
+
     def preprocess(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-
+        del engine_inputs
         if graph_walk == "prefill":
-            return self._preprocess_prefill(
-                inputs=inputs,
-                cache_manager=engine_inputs.cache_manager,
-            )
+            return self._preprocess_prefill(inputs=inputs)
         if graph_walk == "action_gen":
-            return self._preprocess_action_gen(
-                inputs=inputs,
-                cache_manager=engine_inputs.cache_manager,
-            )
+            return self._preprocess_action_gen(inputs=inputs)
+        raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
 
     def _preprocess_prefill(
         self,
         inputs: list[ARNodeInputs],
-        cache_manager: BatchedCacheManager,
     ) -> dict[str, torch.Tensor | Any]:
-        per_request_seqs = [inp.input_embeds for inp in inputs]
-        prefix_embs = torch.cat(per_request_seqs, dim=0)
-        seq_lens = [inp.input_seq_len for inp in inputs]
-
-        # Bidirectional attention over the prefix; PaliGemma is a prefix-LM.
-        cache_manager.plan_attention(
-            seq_lens=seq_lens, is_causal=False, label="main", dtype=torch.bfloat16
-        )
-        cache_manager.plan_rope(seq_lens=seq_lens, pos_ids=None, label="main")
-
+        prefix_embs = torch.cat([inp.input_embeds for inp in inputs], dim=0)
         return {"prefix_embs": prefix_embs}
 
     def _preprocess_action_gen(
         self,
         inputs: list[ARNodeInputs],
-        cache_manager: BatchedCacheManager,
     ) -> dict[str, torch.Tensor | Any]:
-        seq_lens = [inp.input_seq_len for inp in inputs]
-
-        # The action suffix attends to the frozen prefix KV cache. We pass
-        # write_store=False so the cache is read-only during all 10 iterations.
-        cache_manager.plan_attention(
-            seq_lens=seq_lens,
-            is_causal=False,
-            label="main",
-            write_store=False,
-            dtype=torch.bfloat16
-        )
-        cache_manager.plan_rope(
-            seq_lens=seq_lens, pos_ids=None, label="main"
-        )
-
         # Concatenate noisy_actions across requests for a single forward.
         cat_noisy = torch.cat(
             [inp.tensor_inputs["noisy_actions"] for inp in inputs],
@@ -599,7 +584,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         return {
             "noisy_actions": cat_noisy,
             "timestep_index": all_ts,
-            "seq_lens": seq_lens,
+            "seq_lens": [inp.input_seq_len for inp in inputs],
             "fraction": self._get_timestep_emb_fraction(),
             "time_emb_buffer": self._get_time_emb_buffer(len(inputs))
         }
@@ -613,12 +598,11 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         **kwargs # coming from preprocess output
     ) -> NameToTensorList:
-        cache_handle=engine_inputs.cache_manager
-
+        del engine_inputs
         if graph_walk == "prefill":
-            return self._forward_prefill(cache_handle=cache_handle, **kwargs)
+            return self._forward_prefill(**kwargs)
         if graph_walk == "action_gen":
-            return self._forward_action_gen(cache_handle=cache_handle, **kwargs)
+            return self._forward_action_gen(**kwargs)
         raise ValueError(f"Unknown Pi0.5 LLM graph walk: {graph_walk!r}")
 
     def forward_batched(
@@ -629,21 +613,16 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
     )  -> dict[str, NameToTensorList]:
         """Batched forward: process all requests in a single transformer pass.
 
-        Called by ``KVCacheEngine._execute_batched`` when ``can_batch()`` returns
-        True. ``packed_inputs`` comes from ``preprocess()`` which already
-        concatenated per-request tensors and planned attention/RoPE for the
-        full batch.
+        ``preprocess`` already concatenated the per-request tensors; the runner
+        planned attention/RoPE from this walk's ``declare_step``.
         """
-
         if graph_walk == "prefill":
             return self._forward_prefill_batched(
-                cache_manager=engine_inputs.cache_manager,
                 request_ids=engine_inputs.request_ids,
                 **kwargs,
             )
         if graph_walk == "action_gen":
             return self._forward_action_gen_batched(
-                cache_manager=engine_inputs.cache_manager,
                 request_ids=engine_inputs.request_ids,
                 **kwargs,
             )
@@ -652,24 +631,17 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
 
     def _forward_prefill_batched(
         self,
-        cache_manager: BatchedCacheManager,
         request_ids: list[str],
         prefix_embs: torch.Tensor,
         **kwargs,
     ) -> dict[str, NameToTensorList]:
         """Batched prefill: single PaliGemma forward over concatenated prefixes."""
-        cache_manager.set_active_label("main")
-        self.paligemma(
-            query_sequence=prefix_embs,
-            cache_handle=cache_manager,
-            write_cache=True,
-        )
+        self.paligemma(query_sequence=prefix_embs, label="main")
         # Prefill produces no graph-edge outputs.
         return {rid: {} for rid in request_ids}
 
     def _forward_action_gen_batched(
         self,
-        cache_manager: BatchedCacheManager,
         request_ids: list[str],
         noisy_actions: torch.Tensor,
         timestep_index: torch.Tensor,
@@ -685,7 +657,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             noisy_actions, timestep_index,
             fraction=fraction,
             time_emb_buffer=time_emb_buffer,
-            cache_handle=cache_manager
         )
 
         # Split back per-request by horizon.
@@ -702,16 +673,9 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
     def _forward_prefill(
         self,
         prefix_embs: torch.Tensor,
-        cache_handle: BatchedCacheManager,
         **kwargs,
     ) -> NameToTensorList:
-        if cache_handle is not None:
-            cache_handle.set_active_label("main")
-        self.paligemma(
-            query_sequence=prefix_embs,
-            cache_handle=cache_handle,
-            write_cache=True,
-        )
+        self.paligemma(query_sequence=prefix_embs, label="main")
         return {}
 
     def _forward_action_gen(
@@ -720,7 +684,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         timestep_index,
         fraction,
         time_emb_buffer,
-        cache_handle: BatchedCacheManager,
         **kwargs,
     ) -> NameToTensorList:
         """Single-request action_gen forward (called from _execute_sequential).
@@ -740,7 +703,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             noisy_actions, timestep_index,
             fraction=fraction,
             time_emb_buffer=time_emb_buffer,
-            cache_handle=cache_handle
         )
         # We ALWAYS return both loop-back edges, even on the final iteration.
         # The Loop primitive (mstar/graph/base.py:Loop) handles the final-iter
@@ -760,7 +722,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         timestep_index: torch.Tensor,
         fraction: torch.Tensor,
         time_emb_buffer: torch.Tensor,
-        cache_handle: BatchedCacheManager,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One Euler flow-matching step. Shared by sequential and batched paths.
 
@@ -768,7 +729,6 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
             noisy_actions: [horizon, action_dim] (or [total_horizon, action_dim]
                 when batched across multiple requests).
             timestep_index: scalar long.
-            cache_handle: BatchedCacheManager with attention already planned.
 
         Returns:
             (next_actions, next_timestep_index) with same shapes as inputs.
@@ -794,12 +754,10 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
 
         suffix = self.action_in_proj(noisy_actions)
 
-        if cache_handle is not None:
-            cache_handle.set_active_label("main")
         suffix_out = self.action_expert(
             query_sequence=suffix,
-            cache_handle=cache_handle,
             adarms_cond=adarms_cond,
+            label="main",
         )
 
         velocity = self.action_out_proj(suffix_out)

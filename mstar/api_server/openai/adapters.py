@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
+from mstar.model.multimodal import PromptPart
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
     from mstar.api_server.openai.protocol import (
@@ -46,23 +47,41 @@ class SubmitArgs:
     input_modalities: list[str] = field(default_factory=list)
     output_modalities: list[str] = field(default_factory=lambda: ["text"])
     model_kwargs: dict = field(default_factory=dict)
+    # Ordered text/attachment sequence. None from entrypoints with no ordering
+    # to preserve, which keep the legacy attachments-then-text layout.
+    prompt_parts: list[PromptPart] | None = None
 
 
 def flatten_messages(
     messages: list, upload_dir: Path, allow_remote: bool = True
-) -> tuple[str | None, dict[str, list[str]], list[str]]:
-    """Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities).
+) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
+    """Flatten OpenAI chat ``messages`` into (text, file_paths, input_modalities, parts).
 
-    Text parts across all messages are concatenated (newline-joined). Image /
-    audio / video content parts are persisted under ``upload_dir`` and grouped
-    by modality. (Multi-turn role structure is flattened — a v1 simplification;
-    the models here apply their own prompt formatting in ``process_prompt``.)
+    ``parts`` is the ordered sequence as written; the other three derive from
+    it — text newline-joined, attachments persisted under ``upload_dir`` and
+    grouped by modality, ``input_modalities`` the per-part modality sequence.
+    So an attachment's position and a repeated modality both survive.
+    (Multi-turn role structure is flattened — a v1 simplification; the models
+    apply their own prompt formatting in ``process_prompt``.)
     """
-    text_parts: list[str] = []
+    parts: list[PromptPart] = []
     file_paths: dict[str, list[str]] = {}
 
     def add_file(modality: str, path: str) -> None:
-        file_paths.setdefault(modality, []).append(path)
+        paths = file_paths.setdefault(modality, [])
+        parts.append(PromptPart(modality=modality, index=len(paths)))
+        paths.append(path)
+
+    def add_text(text: str) -> None:
+        # Adjacent text parts were newline-joined before ordering was kept;
+        # merge them here so only text an attachment separates gets its own
+        # part, and the rendered prompt keeps the separator it used to have.
+        if parts and parts[-1].modality == "text":
+            parts[-1] = PromptPart(
+                modality="text", text=f"{parts[-1].text}\n{text}"
+            )
+            return
+        parts.append(PromptPart(modality="text", text=text))
 
     for msg in messages or []:
         # Messages may be pydantic ChatMessage objects or plain dicts.
@@ -71,7 +90,7 @@ def flatten_messages(
             continue
         if isinstance(content, str):
             if content:
-                text_parts.append(content)
+                add_text(content)
             continue
         for part in content:
             if not isinstance(part, dict):
@@ -79,7 +98,7 @@ def flatten_messages(
             ptype = part.get("type")
             if ptype == "text":
                 if part.get("text"):
-                    text_parts.append(part["text"])
+                    add_text(part["text"])
             elif ptype == "image_url":
                 url = (part.get("image_url") or {}).get("url", "")
                 if url:
@@ -102,11 +121,9 @@ def flatten_messages(
                     mod, path = media_io.save_base64(data, fmt, "audio", upload_dir)
                     add_file(mod, path)
 
-    input_modalities = list(file_paths.keys())
+    text_parts = [p.text for p in parts if p.modality == "text"]
     text = "\n".join(text_parts) if text_parts else None
-    if text is not None:
-        input_modalities.append("text")
-    return text, file_paths, input_modalities
+    return text, file_paths, [p.modality for p in parts], parts
 
 
 def _passthrough(req) -> dict:
@@ -166,6 +183,7 @@ class OpenAIAdapter:
     supports_speech: bool = False   # POST /v1/audio/speech
     supports_images: bool = False   # POST /v1/images/generations and /v1/images/edits
     supports_videos: bool = False   # POST /v1/videos/generations
+    supports_realtime: bool = False  # /v1/realtime (bidirectional speech WebSocket)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
@@ -197,7 +215,7 @@ class BagelAdapter(OpenAIAdapter):
     supports_images = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        text, file_paths, in_mods = flatten_messages(req.messages, upload_dir)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
         return SubmitArgs(
@@ -206,6 +224,7 @@ class BagelAdapter(OpenAIAdapter):
             input_modalities=in_mods,
             output_modalities=["text"],
             model_kwargs=mk,
+            prompt_parts=parts,
         )
 
     def image_to_request(self, req: ImageGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
@@ -234,14 +253,17 @@ class BagelAdapter(OpenAIAdapter):
 class Qwen3OmniAdapter(OpenAIAdapter):
     """Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.
 
-    Sampling is split across two stages: the Thinker (text) takes
-    ``thinker_*`` keys, the Talker (speech) ``talker_*``. The other Talker knobs
-    (``talker_top_k``, ``talker_repetition_penalty``) aren't OpenAI fields — pass
-    them via ``extra_body``.
+    Sampling is split across three stages: the Thinker (text) takes
+    ``thinker_*`` keys, the Talker (speech) ``talker_*``, and the Talker's
+    CodePredictor (residual codec groups) ``code_predictor_*``. Everything
+    except temperature/top_p is not an OpenAI field (``talker_top_k``,
+    ``talker_repetition_penalty``, ``code_predictor_top_k``, …) — pass those
+    via ``extra_body``.
     """
 
     supports_chat = True
     supports_speech = True
+    supports_realtime = True
 
     def _voice(self, req) -> str | None:
         audio_cfg = getattr(req, "audio", None) or {}
@@ -250,7 +272,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         return getattr(req, "voice", None)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        text, file_paths, in_mods = flatten_messages(req.messages, upload_dir)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         # Speech output also emits text, so request both modalities when audio is asked for.
         want_audio = bool(req.modalities and "audio" in req.modalities)
@@ -265,6 +287,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
             input_modalities=in_mods,
             output_modalities=out_mods,
             model_kwargs=mk,
+            prompt_parts=parts,
         )
 
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
@@ -373,6 +396,59 @@ class Cosmos3Adapter(OpenAIAdapter):
         )
 
 
+class Wan22Adapter(OpenAIAdapter):
+    """Wan2.2-TI2V-5B: text/image-to-video generation (video only).
+
+    ``size`` ("WxH") maps to the model's ``width`` / ``height`` kwargs; ``seed``
+    and any extra knobs (``guidance_scale``, ``num_inference_steps``,
+    ``negative_prompt``) pass through via ``extra_body``. ``fps`` is a playback
+    rate (the mp4 container rate), not a generation knob — see
+    ``Wan22Model.postprocess``.
+    """
+
+    supports_videos = True
+
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        if getattr(req, "size", None):
+            # Unlike cosmos3, the model has no "size" kwarg — its generation
+            # knobs are width/height, so the adapter does the split here.
+            try:
+                width, height = (int(v) for v in req.size.lower().split("x"))
+            except ValueError:
+                raise ValueError(f"size must be 'WxH' (e.g. '832x480'); got {req.size!r}") from None
+            mk.setdefault("width", width)
+            mk.setdefault("height", height)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+        # num_frames / fps are first-class video fields (not in extra_body).
+        if getattr(req, "num_frames", None) is not None:
+            mk.setdefault("num_frames", req.num_frames)
+        if getattr(req, "fps", None) is not None:
+            mk.setdefault("fps", req.fps)
+        # Image-to-video: the conditioning frame (URL / data URI) is persisted
+        # and loaded by the worker, which VAE-encodes it into the frame-0
+        # anchor. Wan2.2 has no video-conditioned mode.
+        if getattr(req, "video", None):
+            raise ValueError("Wan2.2 does not support 'video' conditioning; provide 'image' or neither.")
+        image = getattr(req, "image", None)
+        if image:
+            _, path = media_io.resolve_media_ref(image, upload_dir)
+            return SubmitArgs(
+                text=req.prompt,
+                file_paths={"image": [path]},
+                input_modalities=["image", "text"],
+                output_modalities=["video"],
+                model_kwargs=mk,
+            )
+        return SubmitArgs(
+            text=req.prompt,
+            input_modalities=["text"],
+            output_modalities=["video"],
+            model_kwargs=mk,
+        )
+
+
 # Only models with an OpenAI-standard surface are registered. Action/world-model
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
@@ -382,6 +458,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),
     "cosmos3_super": Cosmos3Adapter(),
+    "wan22": Wan22Adapter(),
 }
 
 

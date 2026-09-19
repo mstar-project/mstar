@@ -27,7 +27,10 @@ NDJSON stream.
      - One or more media uploads; each file's modality is inferred from its extension.
    * - ``input_modalities``
      - auto
-     - Comma-separated input modalities; auto-detected from the data when omitted.
+     - Comma-separated input modalities, one entry per prompt element in order.
+       Auto-detected from the uploads and text when omitted, which is what keeps
+       the ordering and the count of same-modality attachments; an explicit list
+       replaces it.
    * - ``output_modalities``
      - ``text``
      - Comma-separated desired outputs (e.g. ``text``, ``image``, ``audio``, ``video``,
@@ -186,9 +189,10 @@ Per-model notes:
 
 - **BAGEL** — chat returns text only; use ``/v1/images/generations`` and
   ``/v1/images/edits`` for image output.
-- **Qwen3-Omni** — text sampling uses ``thinker_*`` keys and speech uses ``talker_*``; set
-  the speaker with ``voice`` (default ``Ethan``) and request audio output by including
-  ``"audio"`` in ``modalities``. Non-OpenAI knobs (e.g. ``talker_top_k``) go through
+- **Qwen3-Omni** — text sampling uses ``thinker_*`` keys, speech uses ``talker_*``, and the
+  residual codec groups use ``code_predictor_*``; set the speaker with ``voice`` (default
+  ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
+  Non-OpenAI knobs (e.g. ``talker_top_k``, ``code_predictor_top_p``) go through
   ``extra_body``.
 - **Orpheus** — set the speaker with ``voice`` — one of ``tara`` (default), ``zoe``,
   ``zac``, ``jess``, ``leo``, ``mia``, ``julia``, ``leah`` (the ``available_voices`` list

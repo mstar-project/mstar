@@ -25,9 +25,10 @@ from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.constants import VIDEO_SOUND_GEN_WALK
 from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
 from mstar.model.cosmos3.tests.test_engine_cache import (
-    _flashinfer_cache,
+    _engine_resources,
+    _forward_step,
     _load,
-    _SdpaCacheHandle,
+    _SdpaResources,
 )
 
 # ---------------------------------------------------------------------------
@@ -101,12 +102,17 @@ def test_sound_request_validation() -> None:
         except ValueError:
             pass
     # The sound walk + audio decoder node are registered when sound is enabled...
+    # Under the v1 engine the graph walks are what declare a node as served, so
+    # the node set is read off them rather than off an engine-type mapping.
+    def served_nodes(m) -> set[str]:
+        return {n for g in m.get_graph_walk_graphs().values() for n in g.get_nodes()}
+
     assert VIDEO_SOUND_GEN_WALK in model.get_graph_walk_graphs()
-    assert model.get_node_engine_types()[AUDIO_DECODER_NODE] is not None
+    assert AUDIO_DECODER_NODE in served_nodes(model)
     # ...and disappear when the serving knob is off.
     model.config.enable_sound = False
     assert VIDEO_SOUND_GEN_WALK not in model.get_graph_walk_graphs()
-    assert AUDIO_DECODER_NODE not in model.get_node_engine_types()
+    assert AUDIO_DECODER_NODE not in served_nodes(model)
     try:
         model._resolve_gen_params({"generate_sound": True, "num_frames": 17}, [], ["video"])
         raise AssertionError("expected ValueError with sound serving disabled")
@@ -235,24 +241,22 @@ _SOUND_CACHE: dict = {}
 
 
 @torch.no_grad()
-def _run_cache_once_sound(model, dit, cm, init, sound_init, cond_ids, uncond_ids, device):
+def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, uncond_ids, device):
     from mstar.conductor.request_info import CurrentForwardPassInfo
-    from mstar.model.submodule_base import ModelInputsFromEngine
 
     rid = "rs0"
     md = {"height": H, "width": W, "num_frames": FRAMES, "fps": 24.0,
           "guidance_scale": GS, "num_inference_steps": STEPS, "generate_sound": True}
     fwd = CurrentForwardPassInfo(
-        request_id=rid, graph_walk="prefill", requires_cfg=True,
+        request_id=rid, graph_walk="prefill",
         fwd_index=0, random_seed=SEED, max_tokens=0, sampling_config={}, step_metadata=md,
     )
-    ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd}, cache_manager=cm)
     text_inputs = [
         torch.tensor(cond_ids, dtype=torch.long, device=device),
         torch.tensor(uncond_ids, dtype=torch.long, device=device),
     ]
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": text_inputs})
-    dit.forward("prefill", ei, **dit.preprocess("prefill", ei, [ni]))
+    _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
 
     latents, sound_latents = init.clone(), sound_init.clone()
     time_index = torch.zeros(1, dtype=torch.long, device=device)
@@ -261,7 +265,9 @@ def _run_cache_once_sound(model, dit, cm, init, sound_init, cond_ids, uncond_ids
         ni = dit.prepare_inputs(VIDEO_SOUND_GEN_WALK, fwd, {
             "latents": [latents], "sound_latents": [sound_latents], "time_index": [time_index],
         })
-        out = dit.forward(VIDEO_SOUND_GEN_WALK, ei, **dit.preprocess(VIDEO_SOUND_GEN_WALK, ei, [ni]))
+        out = _forward_step(
+            dit, VIDEO_SOUND_GEN_WALK, resources, [rid], {rid: fwd}, [ni],
+        )
         latents = out["latents"][0]
         sound_latents = out["sound_latents"][0]
         time_index = out["time_index"][0]
@@ -315,7 +321,7 @@ def test_sound_cache_once_matches_fused_exact() -> None:
     dit.batched_cfg = False
     try:
         lat, snd = _run_cache_once_sound(
-            ctx["model"], dit, _SdpaCacheHandle(), ctx["init"], ctx["sound_init"],
+            ctx["model"], dit, _SdpaResources().as_dict(), ctx["init"], ctx["sound_init"],
             ctx["cond"], ctx["uncond"], ctx["device"],
         )
     finally:
@@ -333,7 +339,7 @@ def test_sound_engine_path_flashinfer() -> None:
         print("  (skipped sound engine parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
     try:
-        cm = _flashinfer_cache(ctx["model"], "rs0", ctx["device"], ctx["dtype"])
+        cm = _engine_resources(ctx["model"], ["rs0"], ctx["device"], ctx["dtype"])
     except Exception as exc:  # noqa: BLE001
         print(f"  (skipped sound engine parity: FlashInfer unavailable: {exc})")
         return

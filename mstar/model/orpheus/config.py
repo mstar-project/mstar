@@ -1,5 +1,10 @@
 from dataclasses import dataclass, field
 
+# Constants
+KV_CACHE = "kv_cache"
+ATTN = "attn"
+SAMPLER = "sampler"
+ROPE = "rope"
 
 @dataclass
 class OrpheusModelConfig:

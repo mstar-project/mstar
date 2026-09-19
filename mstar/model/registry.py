@@ -1,27 +1,22 @@
-from mstar.model.bagel.bagel_model import BagelModel
-from mstar.model.base import Model
-from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
-from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
-from mstar.model.orpheus.orpheus_model import OrpheusModel
-from mstar.model.pi05.pi05_model import Pi05Model
-from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
-from mstar.model.vjepa2.vjepa2_model import VJepa2ACModel, VJepa2Model
-from mstar.model.whisper.whisper_model import WhisperModel
-from mstar.model.zonos2.zonos2_model import Zonos2Model
+from importlib import import_module
 
-MODEL_REGISTRY: dict[str, type[Model]] = {
-    "bagel": BagelModel,
-    "cosmos3": Cosmos3Model,
-    "cosmos3_droid": Cosmos3Model,
-    "cosmos3_super": Cosmos3Model,
-    "higgs_audio": HiggsAudioModel,
-    "orpheus": OrpheusModel,
-    "pi05": Pi05Model,
-    "qwen3_omni": Qwen3OmniModel,
-    "vjepa2": VJepa2Model,
-    "vjepa2_ac": VJepa2ACModel,
-    "whisper_large": WhisperModel,
-    "zonos2": Zonos2Model,
+from mstar.model.base import Model
+
+MODEL_REGISTRY: dict[str, tuple[str, str]] = {
+    "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
+    "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
+    "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
+    "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
+    "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
+    "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
+    "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
+    "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
+    "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
+    "zonos2": ("mstar.model.zonos2.zonos2_model", "Zonos2Model"),
 }
 
 HF_MODELS: dict[str, dict] = {
@@ -46,6 +41,7 @@ HF_MODELS: dict[str, dict] = {
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
+    "qwen3_tts": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"},
     # V-JEPA 2 standard (encoder + masked predictor).  Default is ViT-L @ 256
     # (~300M); the same class loads vitl/h/g at 256 or 384 by reading
     # config.json.
@@ -56,6 +52,9 @@ HF_MODELS: dict[str, dict] = {
     # ``download_vjepa2_ac_upstream_pt`` — the ``model_path_hf`` string is
     # kept as a logical identifier but isn't resolved against HuggingFace.
     "vjepa2_ac": {"model_path_hf": "vjepa2-ac-vitg"},
+    # Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).  TI2V-5B
+    # only; the A14B MoE variants are a separate follow-up.
+    "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
@@ -70,4 +69,5 @@ HF_MODELS: dict[str, dict] = {
 def get_model_class(name: str) -> type[Model]:
     if name not in MODEL_REGISTRY:
         raise KeyError(f"Unknown model name: {name!r}. Available: {list(MODEL_REGISTRY.keys())}")
-    return MODEL_REGISTRY[name]
+    module_name, class_name = MODEL_REGISTRY[name]
+    return getattr(import_module(module_name), class_name)

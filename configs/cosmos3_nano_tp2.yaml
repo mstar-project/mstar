@@ -3,8 +3,9 @@ model: "cosmos3"
 max_seq_len: 8192
 # Per-rank KV pool. Under tensor parallelism the KV heads shard across ranks, so
 # each rank's pages hold half the heads — 1024 pages leave ample headroom.
-kv_cache:
-  max_num_pages: 1024
+resources:
+  kv:
+    max_num_pages: 1024
 # The DiT runs tensor-parallel across two ranks (attention heads + MLP
 # intermediate shard; the residual stream stays full and the out/down
 # projections all-reduce). The VAE decoder is small and runs un-sharded on

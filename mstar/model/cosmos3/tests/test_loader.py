@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
 import torch
 
 from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
@@ -25,14 +26,14 @@ from mstar.model.cosmos3.loader import (
     read_transformer_weight_shapes,
 )
 
-NANO_DIR = Path(
-    os.environ.get(
-        "COSMOS3_NANO_DIR",
-        "/Users/atindrajha/Downloads/disaggregation_research/Cosmos3-Nano-hf",
-    )
+NANO_DIR = Path(os.environ.get("COSMOS3_NANO_DIR", "/nonexistent-cosmos3-nano"))
+
+needs_nano = pytest.mark.skipif(
+    not NANO_DIR.exists(), reason="set COSMOS3_NANO_DIR to a Cosmos3-Nano dir"
 )
 
 
+@needs_nano
 def test_config_roundtrip() -> None:
     cfg = Cosmos3Config.from_pretrained(NANO_DIR)
 
@@ -85,6 +86,7 @@ def test_config_roundtrip() -> None:
     assert cfg.scheduler.use_karras_sigmas is True
 
 
+@needs_nano
 def test_loader_key_coverage() -> None:
     cfg = Cosmos3Config.from_pretrained(NANO_DIR)
     with torch.device("meta"):
@@ -110,6 +112,7 @@ def test_loader_key_coverage() -> None:
     assert len(model_keys) == 813, len(model_keys)
 
 
+@needs_nano
 def test_loader_shape_coverage() -> None:
     """Every backbone param's *shape* matches the checkpoint tensor it loads
     from. Reads only safetensors headers (no tensor data, CPU-safe). Returns
@@ -137,6 +140,7 @@ def test_loader_shape_coverage() -> None:
     assert not mismatched, mismatched
 
 
+@needs_nano
 def test_tokenizer_roundtrip() -> None:
     from transformers import AutoTokenizer
 

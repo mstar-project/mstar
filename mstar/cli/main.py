@@ -30,6 +30,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "cosmos3_super": "cosmos3_super_tp2.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
+    "qwen3_tts": "qwen3tts.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
@@ -37,6 +38,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     # ASR (Beta, un-optimized) — audio in, transcript out.
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
+    "wan22": "wan22.yaml",
 }
 
 
@@ -55,11 +57,24 @@ def _resolve_config(model: str, override: str | None) -> str:
         avail = ", ".join(sorted(DEFAULT_CONFIGS))
         sys.exit(f"error: unknown model {model!r}. Known models: {avail}\n"
                  f"       (or pass --config <path.yaml> for a custom deployment)")
-    candidate = _repo_root() / "configs" / DEFAULT_CONFIGS[model]
+    name = DEFAULT_CONFIGS[model]
+    # A pip install ships the default configs as package data under
+    # mstar/default_configs/; find them there first so `mstar serve <model>`
+    # works without a checkout. (A source checkout has only the marker there
+    # and falls through to the repo configs/ below.)
+    try:
+        from importlib.resources import files
+        packaged = files("mstar.default_configs") / name
+        if packaged.is_file():
+            return str(packaged)
+    except (ModuleNotFoundError, FileNotFoundError, TypeError):
+        pass
+    # Repo checkout: <repo>/configs/.
+    candidate = _repo_root() / "configs" / name
     if candidate.exists():
         return str(candidate)
     # Fall back to a CWD-relative configs/ (e.g. running from a checkout).
-    cwd_candidate = Path("configs") / DEFAULT_CONFIGS[model]
+    cwd_candidate = Path("configs") / name
     if cwd_candidate.exists():
         return str(cwd_candidate)
     sys.exit(f"error: default config for {model!r} not found at {candidate}")
@@ -94,8 +109,12 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("                           raw_action_dim=10, action_chunk_size=16)")
     if model == "qwen3_omni":
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
-    if model in ("orpheus", "qwen3_omni"):
-        voice = "tara" if model == "orpheus" else "Ethan"
+    if model in ("orpheus", "qwen3_omni", "qwen3_tts"):
+        voice = {
+            "orpheus": "tara",
+            "qwen3_omni": "Ethan",
+            "qwen3_tts": "Vivian",
+        }[model]
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
     if model == "zonos2":
         # Zonos2 has no named voices: it clones from a reference clip instead,
@@ -155,6 +174,12 @@ def _serve(args: argparse.Namespace) -> None:
         argv += ["--log-stats"]
     if args.log_stats_file:
         argv += ["--log-stats-file", args.log_stats_file]
+    # Passing --rust-frontend-bin implies --rust-frontend: naming a binary but
+    # silently staying on uvicorn would be a footgun.
+    if args.rust_frontend or args.rust_frontend_bin:
+        argv += ["--rust-frontend"]
+    if args.rust_frontend_bin:
+        argv += ["--rust-frontend-bin", args.rust_frontend_bin]
 
     print(_next_steps(args.model, args.host, args.port), file=sys.stderr)
 
@@ -190,6 +215,16 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--log-stats-file", default=None,
         help="append per-request profiling stats to this file (implies --log-stats)",
+    )
+    serve.add_argument(
+        "--rust-frontend", action="store_true",
+        help="serve HTTP from the Rust mstar-server binary instead of "
+             "uvicorn/FastAPI (see docs: environment variables / installation)",
+    )
+    serve.add_argument(
+        "--rust-frontend-bin", default=None,
+        help="path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
+             "$PATH, then rust/server/target/release)",
     )
     serve.set_defaults(func=_serve)
     return parser

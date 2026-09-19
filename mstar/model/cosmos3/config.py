@@ -174,11 +174,13 @@ class Cosmos3Config:
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.
     compile_denoise: bool = True
-    # KV-cache attention backend (a cache_manager.ATTENTION_BACKENDS key).
-    # "dense_gen" (default) runs eager single-request generation attention as
-    # one dense FA3 varlen pass over [frozen text prefix | fresh gen tokens];
-    # captured graphs and multi-request batches fall back to the paged
-    # FlashInfer path. "flashinfer" forces paged everywhere.
+    # Which attention backends the DiT node declares (see
+    # Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the
+    # paged FlashInfer backend the understanding prefill and the captured
+    # denoise graphs run on, plus a dense FA3 one an eager denoise step runs
+    # instead: one varlen pass over [frozen text prefix | fresh gen tokens],
+    # skipping the paged path's per-step K/V write and wrapper plan.
+    # "flashinfer" declares only the paged backend, so every step uses it.
     attention_backend: str = "dense_gen"
 
     # ----- sub-configs -----
