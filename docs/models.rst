@@ -74,7 +74,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        and the layers run through the ``LinearAttnManager`` planned against it (variant
        ``KDA``, fla / FlashKDA kernels; ``model_kwargs.kda_backend``).
        ``model_kwargs.mixed_prefill_decode: true`` lets decoding requests
-       ride along in prefill steps instead of pausing for them. Tensor-parallel
+       ride along in prefill steps instead of pausing for them;
+       ``model_kwargs.cuda_graphs: false`` serves every step eagerly (op-level
+       profiling). The decode step's fused Triton kernels (the KDA recurrence and
+       gated norm reading the projection slices in place, MLA's per-head output
+       with its gate) can be switched off with ``MSTAR_K3_FUSED_DECODE=0``. Tensor-parallel
        deployments run the async scheduling protocol by default (the submodule sets
        ``prefers_tp_async_scheduling``; ``MSTAR_TP_ASYNC_SCHED=0`` restores the serial
        one): on pruned75 at TP8 it adds 10-14% decode throughput at every concurrency
