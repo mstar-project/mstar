@@ -16,7 +16,7 @@ def ring_scatter(
     ``mstar::kv_scatter_nhd`` (``kv/cache.py``) is one: the forward reaches
     ``cache`` through an attribute chain, so dynamo lifts it as a graph
     attribute and AOTAutograd functionalizes the mutation into a copy of the
-    WHOLE ring. At 720P that is 816 MiB per world copied 120 times per frame
+    WHOLE ring. At 720P that is 816 MiB per session copied 120 times per frame
     (24 layers x 5 passes) -- a throughput collapse, not an error, so nothing
     tells you.
     Declaring the mutation keeps the write in place and in-graph, with no break
@@ -42,19 +42,19 @@ def _ring_scatter_fake(
 
 class LayerRingCache:
     """One attention layer's ring: ``ring_frames`` frame slots of history plus
-    one scratch frame at the tail, times ``num_worlds`` resident worlds.
+    one scratch frame at the tail, times ``num_sessions`` resident sessions.
 
-    Storage is a single ``[2, 1, H_kv, num_worlds * capacity, D]`` tensor so
+    Storage is a single ``[2, 1, H_kv, num_sessions * capacity, D]`` tensor so
     that a commit is one ``index_copy_`` for K and V together and the read is
     one ``unbind(0)`` into two views -- no copy on the read path.
 
-    ``capacity`` is ONE world's token slots; ``total_slots`` is the token-dim
+    ``capacity`` is ONE session's token slots; ``total_slots`` is the token-dim
     length of the buffer.
     """
 
     def __init__(
         self,
-        num_worlds: int,
+        num_sessions: int,
         n_kv_heads: int,
         ring_frames: int,
         ring_buckets: int,
@@ -64,8 +64,8 @@ class LayerRingCache:
         dtype: torch.dtype,
         device: torch.device | str,
     ):
-        if num_worlds < 1:
-            raise ValueError(f"num_worlds must be >= 1; got {num_worlds}.")
+        if num_sessions < 1:
+            raise ValueError(f"num_sessions must be >= 1; got {num_sessions}.")
         if pinned_dilation < 1:
             raise ValueError(f"pinned_dilation must be >= 1; got {pinned_dilation}.")
         if not 1 <= ring_buckets <= ring_frames:
@@ -79,29 +79,29 @@ class LayerRingCache:
                 f"block size ({_DEFAULT_SPARSE_BLOCK_SIZE}); the BlockMask has no partial blocks."
             )
 
-        self.num_worlds = num_worlds
+        self.num_sessions = num_sessions
         self.tokens_per_frame = tokens_per_frame
         self.ring_frames = ring_frames
         self.ring_buckets = ring_buckets
         self.pinned_dilation = pinned_dilation
-        # ring_len is the reference's `L`: one world's history region, scratch
+        # ring_len is the reference's `L`: one session's history region, scratch
         # excluded.
         self.ring_len = ring_frames * tokens_per_frame
         self.capacity = self.ring_len + tokens_per_frame
-        self.total_slots = num_worlds * self.capacity
+        self.total_slots = num_sessions * self.capacity
 
         self.kv = torch.zeros(
             2, 1, n_kv_heads, self.total_slots, d_head, dtype=dtype, device=device
         )
 
         written = torch.zeros(self.total_slots, dtype=torch.bool, device=device)
-        written.view(num_worlds, self.capacity)[:, self.ring_len :] = True
+        written.view(num_sessions, self.capacity)[:, self.ring_len :] = True
         self.written = written
         # Preallocated scratch for the per-call visibility mask. Allocating it
         # inside upsert would put a fresh buffer in the compiled region on every
         # one of the 120 upserts per frame.
         self._mask_written = torch.empty_like(written)
-        self._world_of_slot = (
+        self._session_of_slot = (
             torch.arange(self.total_slots, dtype=torch.long, device=device)
             // self.capacity
         )
@@ -110,27 +110,27 @@ class LayerRingCache:
 
     @property
     def memory_bytes(self) -> int:
-        """Resident bytes of KV storage, all worlds (the bool/index buffers are
+        """Resident bytes of KV storage, all sessions (the bool/index buffers are
         noise)."""
         return self.kv.numel() * self.kv.element_size()
 
-    def world_span(self, world_idx: int) -> tuple[int, int]:
-        """``[lo, hi)`` token slots owned by ``world_idx``.
+    def session_span(self, session_idx: int) -> tuple[int, int]:
+        """``[lo, hi)`` token slots owned by ``session_idx``.
 
         A host ``int`` here, unlike everywhere on the forward path: the two
         callers below are host-side lifecycle (a rollout ending, capture
         tearing down), never inside a captured region.
         """
-        if not 0 <= world_idx < self.num_worlds:
+        if not 0 <= session_idx < self.num_sessions:
             raise IndexError(
-                f"world_idx {world_idx} out of range for {self.num_worlds} worlds."
+                f"session_idx {session_idx} out of range for {self.num_sessions} sessions."
             )
-        lo = world_idx * self.capacity
+        lo = session_idx * self.capacity
         return lo, lo + self.capacity
 
-    def reset(self, world_idx: int) -> None:
-        """Drop ONE world's state and re-arm its scratch tail."""
-        lo, hi = self.world_span(world_idx)
+    def reset(self, session_idx: int) -> None:
+        """Drop ONE session's state and re-arm its scratch tail."""
+        lo, hi = self.session_span(session_idx)
         self.kv[:, :, :, lo:hi].zero_()
         self.written[lo:hi].zero_()
         self.written[lo + self.ring_len : hi].fill_(True)
@@ -140,14 +140,14 @@ class LayerRingCache:
         kv: Tensor,
         frame_pos: Tensor,
         commit: bool,
-        world_idx: Tensor,
+        session_idx: Tensor,
         *,
         build_visibility: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """``kv`` is ``[2, 1, H_kv, B*tokens_per_frame, D]``, one frame for
-        each of ``B`` worlds;
+        each of ``B`` sessions;
         ``commit`` writes the frame into its ring slot; without it the frame
-        lands in that world's scratch tail only, visible to itself and to
+        lands in that session's scratch tail only, visible to itself and to
         nothing later.
 
         Returns ``(k, v, visible)``
@@ -168,19 +168,19 @@ class LayerRingCache:
         if not torch.compiler.is_compiling():
             torch._check(
                 kv.size(3) == B * tokens,
-                lambda: f"ring cache expects exactly one frame per world; got "
+                lambda: f"ring cache expects exactly one frame per session; got "
                 f"{kv.size(3)} tokens for B={B}",
             )
             torch._check(
-                world_idx.shape == frame_pos.shape and world_idx.dtype == torch.int64,
-                lambda: f"world_idx must be a {list(frame_pos.shape)} int64 tensor matching "
-                f"frame_pos; got {tuple(world_idx.shape)} {world_idx.dtype}",
+                session_idx.shape == frame_pos.shape and session_idx.dtype == torch.int64,
+                lambda: f"session_idx must be a {list(frame_pos.shape)} int64 tensor matching "
+                f"frame_pos; got {tuple(session_idx.shape)} {session_idx.dtype}",
             )
-        world_base = world_idx * self.capacity  # [B]
+        session_base = session_idx * self.capacity  # [B]
         bucket = (frame_pos + (self.pinned_dilation - 1)) // self.pinned_dilation
         slot = bucket % self.ring_buckets  # [B]
-        ring_idx = self.frame_offsets[None] + (slot * tokens + world_base)[:, None]  # [B, T]
-        current_idx = self._current_base[None] + world_base[:, None]  # [B, T]
+        ring_idx = self.frame_offsets[None] + (slot * tokens + session_base)[:, None]  # [B, T]
+        current_idx = self._current_base[None] + session_base[:, None]  # [B, T]
         ring_scatter(self.kv, self.written, current_idx.flatten(), kv, False)
 
         write_step = frame_pos.remainder(self.pinned_dilation) == 0  # [B]
@@ -192,7 +192,7 @@ class LayerRingCache:
                 "the engine path passes build_visibility=False.",
             )
             mask_written.copy_(self.written)
-            mask_written &= self._world_of_slot == world_idx
+            mask_written &= self._session_of_slot == session_idx
             mask_written[ring_idx[0]] = mask_written[ring_idx[0]] & ~write_step
 
         if commit:
@@ -205,8 +205,8 @@ class LayerRingCache:
         # layer's preallocated scratch, handed out by reference and overwritten
         # in place by the next `upsert` on this layer. A consumer that stashes
         # it and reads it later reads some *later* frame's visibility -- which
-        # is a mask off by one or more frames, and with worlds resident it can
-        # now also be another world's mask entirely.
+        # is a mask off by one or more frames, and with sessions resident it can
+        # now also be another session's mask entirely.
         #
         # When false, the value is intentionally stale and must be ignored by
         # the planned attention backend. The obligation on a fallback consumer:

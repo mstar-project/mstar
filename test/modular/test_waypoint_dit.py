@@ -71,7 +71,7 @@ def reduced_config(**overrides) -> WaypointConfig:
     return WaypointConfig(**{**base, **overrides})
 
 
-def ring_kv_spec(config: WaypointConfig, *, num_worlds: int = 1) -> KVSpec:
+def ring_kv_spec(config: WaypointConfig, *, num_sessions: int = 1) -> KVSpec:
     """The ``RingKVConfig`` a ``WaypointConfig``'s geometry implies.
 
     Hand-rolled here because the model does not declare its specs yet; when
@@ -89,7 +89,7 @@ def ring_kv_spec(config: WaypointConfig, *, num_worlds: int = 1) -> KVSpec:
             head_dim=config.d_head,
             num_qo_heads=config.n_heads,
             tokens_per_frame=config.tokens_per_frame,
-            num_worlds=num_worlds,
+            num_sessions=num_sessions,
             layers=tuple(
                 RingKVLayerConfig(
                     ring_frames=config.ring_frames(i),

@@ -726,7 +726,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="concurrent streams; >1 runs the concurrent batching phase",
     )
     parser.add_argument(
-        "--worlds", type=int, help="server world slots (kv.num_worlds); defaults to --streams"
+        "--worlds", type=int, help="server world slots (kv.num_sessions); defaults to --streams"
     )
     parser.add_argument(
         "--batch",

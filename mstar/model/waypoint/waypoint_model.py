@@ -36,10 +36,10 @@ lifecycle is the only place that can hand a request one of the node's worlds —
 or refuse it when they are all taken. That refusal is a backstop, though — see
 ``get_worker_graphs``.
 
-``num_worlds`` and ``max_batch_size`` are separate numbers and stay separate.
-``num_worlds`` is how many sessions are *resident* (one ring span each, folded
+``num_sessions`` and ``max_batch_size`` are separate numbers and stay separate.
+``num_sessions`` is how many sessions are *resident* (one ring span each, folded
 into the token dimension by ``LayerRingCache``); ``max_batch_size`` is how many
-share one *forward step*, set by ``step_batch_size`` (<= ``num_worlds``), so up
+share one *forward step*, set by ``step_batch_size`` (<= ``num_sessions``), so up
 to that many resident worlds batch into one step instead of each taking a
 separate turn.
 """
@@ -226,25 +226,25 @@ class WaypointModel(Model):
             # How many sessions this node holds resident. One by default
             # because a world is ~816 MiB of ring at 720P and a model has no
             # business assuming the box; a deployment raises it under
-            # ``resources: {kv: {num_worlds: N}}`` and raises
+            # ``resources: {kv: {num_sessions: N}}`` and raises
             # ``max_concurrent_requests`` with it (see ``get_worker_graphs``).
             # Not the step batch — that is ``max_batch_size``, set by
-            # ``step_batch_size`` (<= num_worlds).
-            num_worlds=1,
+            # ``step_batch_size`` (<= num_sessions).
+            num_sessions=1,
         )
         # Logged, not merely allocated: this declaration is worth ~816 MiB per
         # world and nothing downstream prints it. The report carries the
         # counterfactual under the other ``full_global_ring`` setting, which is
         # the number you want *before* the engine commits to one of them.
         #
-        # `ring_config.num_worlds` is the DECLARED count, which is what this
+        # `ring_config.num_sessions` is the DECLARED count, which is what this
         # line can honestly report: `EngineManager.build` calls
         # `apply_yaml_overrides` on the specs after this hook returns, so a
-        # deployment's `num_worlds` has not landed yet. The reported total
+        # deployment's `num_sessions` has not landed yet. The reported total
         # scales linearly with it -- the world dim is folded into the token
         # axis -- so N worlds is N times the number below.
         logger.info(
-            "%s", describe_ring_memory(self.config, num_worlds=ring_config.num_worlds)
+            "%s", describe_ring_memory(self.config, num_sessions=ring_config.num_sessions)
         )
         return [
             KVSpec(
@@ -341,11 +341,11 @@ class WaypointModel(Model):
 
         ``max_batch_size`` does NOT cover this, independent of its value. It
         caps how many requests share one *step* (``step_batch_size``, <=
-        ``num_worlds``); worlds beyond that batch still alternate steps — each
+        ``num_sessions``); worlds beyond that batch still alternate steps — each
         holds its own world and the BlockMask keeps them apart — but it says
         nothing about how many may exist, which is the thing the pool bounds.
 
-        A limit *below* ``num_worlds`` is legal and only wasteful: it allocates
+        A limit *below* ``num_sessions`` is legal and only wasteful: it allocates
         rings (~816 MiB each at 720P) for worlds no request can ever reach, so
         it is warned about rather than refused.
 
@@ -360,46 +360,46 @@ class WaypointModel(Model):
         # ``apply_yaml_overrides``, read here for the same key, so the gate and
         # the allocation cannot disagree about how many worlds exist.
         overrides = (config.get("resources") or {}).get(KV_RESOURCE) or {}
-        num_worlds = overrides.get("num_worlds", 1)
+        num_sessions = overrides.get("num_sessions", 1)
         if (
-            not isinstance(num_worlds, int)
-            or isinstance(num_worlds, bool)
-            or num_worlds < 1
+            not isinstance(num_sessions, int)
+            or isinstance(num_sessions, bool)
+            or num_sessions < 1
         ):
             raise ValueError(
-                f"Waypoint requires `resources.{KV_RESOURCE}.num_worlds` in "
-                f"{config_path} to be a positive int; got {num_worlds!r}."
+                f"Waypoint requires `resources.{KV_RESOURCE}.num_sessions` in "
+                f"{config_path} to be a positive int; got {num_sessions!r}."
             )
         limit = config.get("max_concurrent_requests")
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ValueError(
                 f"Waypoint requires `max_concurrent_requests` in {config_path} to be "
                 f"a positive int; got {limit!r}. The DiT node holds "
-                f"{num_worlds} live world(s) in a fixed ring buffer, and the "
+                f"{num_sessions} live world(s) in a fixed ring buffer, and the "
                 "conductor's FIFO admit queue — which exists only when this key "
                 "is set — is what keeps arrivals inside that pool. max_batch_size "
                 "alone does not: it caps a step, not the number of requests on "
                 "the node."
             )
-        if limit > num_worlds:
+        if limit > num_sessions:
             raise ValueError(
                 f"`max_concurrent_requests: {limit}` in {config_path} exceeds the "
-                f"{num_worlds} world(s) the ring is sized for. Every request past "
+                f"{num_sessions} world(s) the ring is sized for. Every request past "
                 "the pool fails terminally at admit — there is nothing to evict. "
-                f"Set `resources.{KV_RESOURCE}.num_worlds` to {limit} to match, at "
+                f"Set `resources.{KV_RESOURCE}.num_sessions` to {limit} to match, at "
                 "the cost of ~816 MiB of ring per world at 720P."
             )
-        if limit < num_worlds:
+        if limit < num_sessions:
             logger.warning(
                 "Waypoint ring is sized for %d worlds but max_concurrent_requests "
                 "is %d: %d world(s) of ring (~816 MiB each at 720P) are allocated "
                 "and can never be filled.",
-                num_worlds, limit, num_worlds - limit,
+                num_sessions, limit, num_sessions - limit,
             )
-        if self.config.step_batch_size > num_worlds:
+        if self.config.step_batch_size > num_sessions:
             raise ValueError(
                 f"`step_batch_size: {self.config.step_batch_size}` exceeds "
-                f"`resources.{KV_RESOURCE}.num_worlds: {num_worlds}` in "
+                f"`resources.{KV_RESOURCE}.num_sessions: {num_sessions}` in "
                 f"{config_path}. A step cannot batch more rows than there are "
                 "resident worlds to supply them."
             )
