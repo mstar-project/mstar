@@ -133,8 +133,12 @@ class MarlinMXFP4Experts:
         return 64
 
     # longest prefill slice per kernel call: bounds the transient ``[m * top_k, latent]`` buffers
-    # (2048 tokens x 16 experts x 3584 x bf16 = 235 MB) instead of a whole 16k-token prefill
-    max_chunk_tokens = 2048
+    # (2048 tokens x 16 experts x 3584 x bf16 = 235 MB) instead of a whole 16k-token prefill. Every
+    # slice reads the expert weights again, and at these per-expert row counts Marlin is bound by
+    # them: a 7168-token prefill step in four slices spent 5.5 ms a layer on the two Marlin calls
+    # against vLLM's 3.4 in one (plan section 11, 2026-09-19). MSTAR_MOE_CHUNK_TOKENS raises the bound
+    # where the memory is there (8192 tokens: some 940 MB transient).
+    max_chunk_tokens = int(os.environ.get("MSTAR_MOE_CHUNK_TOKENS", "2048"))
 
     @torch.compiler.disable
     def __call__(
