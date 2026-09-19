@@ -42,7 +42,7 @@ def _load_combined(conv_state, prefix, slot, c, cm, idx, P: tl.constexpr, KP: tl
 @triton.jit
 def _kda_verify_prep_kernel(
     qkv, g_raw, beta_raw, conv_state, prefix, spec_g, spec_beta, spec_len, conv_w,
-    out_qkv, out_g, out_beta, out_ckpt, slot_ids, rows,
+    out_qkv, out_g, out_beta, out_ckpt, slot_ids, rows, stride_g_row, stride_b_row,
     P: tl.constexpr, H: tl.constexpr, K1: tl.constexpr, KP: tl.constexpr, TK: tl.constexpr, W: tl.constexpr,
     NW: tl.constexpr, BP: tl.constexpr, BH: tl.constexpr,
 ):
@@ -76,7 +76,7 @@ def _kda_verify_prep_kernel(
     blk = tl.load(qkv + (r * K1 + t) * (3 * P) + c[None, :], mask=tm & cm[None, :], other=0.0)
     gm = c < P
     g_pre = tl.load(spec_g + (slot * KP + t) * P + c[None, :], mask=tp & gm[None, :], other=0.0).to(tl.float32)
-    g_blk = tl.load(g_raw + (r * K1 + t) * P + c[None, :], mask=tm & gm[None, :], other=0.0)
+    g_blk = tl.load(g_raw + (r * K1 + t) * stride_g_row + c[None, :], mask=tm & gm[None, :], other=0.0)
     # every read of the pool is done: the writes (the prefix part fills KP slots, the block K1)
     which = c // P
     o_base = which[None, :] * (rows * T2 * P) + (c - which * P)[None, :]
@@ -94,7 +94,7 @@ def _kda_verify_prep_kernel(
         hh = tl.arange(0, BH)[None, :]
         hm = hh < H
         b_pre = tl.load(spec_beta + (slot * KP + t) * H + hh, mask=tp & hm, other=0.0).to(tl.float32)
-        b_blk = tl.load(beta_raw + (r * K1 + t) * H + hh, mask=tm & hm, other=0.0)
+        b_blk = tl.load(beta_raw + (r * K1 + t) * stride_b_row + hh, mask=tm & hm, other=0.0)
         b_dt = out_beta.dtype.element_ty
         tl.store(out_beta + (r * T2 + t) * H + hh, tl.where(t < plen, b_pre, -1e4).to(b_dt), mask=tp & hm)
         tl.store(out_beta + (r * T2 + KP + t) * H + hh, b_blk.to(b_dt), mask=tm & hm)
@@ -106,8 +106,9 @@ def kda_verify_prep(
     qkv: torch.Tensor, g_raw: torch.Tensor, beta_raw: torch.Tensor, conv_state: torch.Tensor, spec,
     slot_ids: torch.Tensor, conv_w: torch.Tensor, rows: int, k1: int, h: int, d: int,
 ) -> tuple[torch.Tensor, ...]:
-    """``qkv [rows * k1, 3P]`` (pre-conv), ``g_raw [rows * k1, P]``, ``beta_raw [rows * k1, H]`` of the
-    rows' blocks; ``conv_state [slots, 3P, W - 1]`` and ``spec`` (``SpecBlocks``) are the pool's blocks,
+    """``qkv [rows * k1, 3P]`` (pre-conv), ``g_raw [rows * k1, P]`` and ``beta_raw [rows * k1, H]`` (both
+    read with their row stride, so the layer's projection slices need no copy) of the rows' blocks;
+    ``conv_state [slots, 3P, W - 1]`` and ``spec`` (``SpecBlocks``) are the pool's blocks,
     rewritten in place; ``slot_ids [rows]`` int32; ``conv_w [3P, W]``. Returns ``(q, k, v, g, beta,
     checkpoint_pos)``: ``[rows * (kp + k1), P]`` each (``beta [rows * (kp + k1), H]``) in ``qkv``'s dtype,
     each row's prefix padded to the pool's ``kp`` slots then its ``k1`` block tokens, and
@@ -117,11 +118,15 @@ def kda_verify_prep(
     kp = spec.prefix.shape[1]
     assert 1 <= k1 <= kp, (k1, kp)
     t2 = kp + k1
-    # the raw gates arrive as [T, H, D] and the betas as [T, H]: the kernel reads them flat
-    qkv, g_raw, beta_raw = qkv.reshape(rows * k1, 3 * p), g_raw.reshape(rows * k1, p), beta_raw.reshape(rows * k1, h)
+    # the raw gates arrive as [T, H, D] (heads and dims dense) and the betas as [T, H]: the kernel reads
+    # them as rows of P and H with the row strides they have
+    qkv = qkv.reshape(rows * k1, 3 * p)
+    g_raw = g_raw.view(rows * k1, p) if g_raw.dim() == 3 else g_raw
+    beta_raw = beta_raw.view(rows * k1, h)
+    assert g_raw.shape == (rows * k1, p) and g_raw.stride(1) == 1 and beta_raw.stride(1) == 1
     assert conv_state.shape[1:] == (3 * p, w - 1) and spec.prefix.shape[1:] == (kp, 3 * p)
     assert spec.g.shape[1:] == (kp, h, d) and spec.beta.shape[1:] == (kp, h) and spec.length.shape[1:] == (1,)
-    for x in (qkv, g_raw, beta_raw, conv_state, spec.prefix, spec.g, spec.beta, spec.length, slot_ids, conv_w):
+    for x in (qkv, conv_state, spec.prefix, spec.g, spec.beta, spec.length, slot_ids, conv_w):
         assert x.is_contiguous(), "contiguous inputs"
     assert slot_ids.numel() == rows and slot_ids.dtype == torch.int32
     out_qkv = torch.empty(3, rows * t2, p, dtype=qkv.dtype, device=qkv.device)
@@ -132,7 +137,7 @@ def kda_verify_prep(
     grid = (rows, triton.cdiv(3 * p, bp))
     _kda_verify_prep_kernel[grid](
         qkv, g_raw, beta_raw, conv_state, spec.prefix, spec.g, spec.beta, spec.length, conv_w,
-        out_qkv, out_g, out_beta, ckpt, slot_ids, rows,
+        out_qkv, out_g, out_beta, ckpt, slot_ids, rows, g_raw.stride(0), beta_raw.stride(0),
         P=p, H=h, K1=k1, KP=kp, TK=triton.next_power_of_2(kp), W=w, NW=triton.next_power_of_2(w - 1),
         BP=bp, BH=triton.next_power_of_2(h), num_warps=4, enable_fp_fusion=False,
     )
