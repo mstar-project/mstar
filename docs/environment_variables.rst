@@ -37,6 +37,13 @@ Communication
        ``0``; comma-separated worker indices or ``all``) selects the workers;
        ``MSTAR_TORCH_PROFILE_STACK=1`` records Python stacks and shapes, which attributes an
        eager step's kernels to their ops. Unset, the hook is a counter increment per step.
+   * - ``MSTAR_AUX_STREAM``
+     - ``1``
+     - ``0`` keeps every captured step on one stream. By default a layer's independent branches
+       (``mstar.utils.streams.Fork``: Kimi K3's router beside its merged projection, the shared
+       experts beside the routed ones, MLA's query path beside its latent write, KDA's two input
+       projections) run on an auxiliary stream while a CUDA graph is being captured, so their
+       kernels overlap in the replay; eager steps are unchanged.
    * - ``MSTAR_K3_FUSED_DECODE``
      - ``1``
      - ``0`` makes the Kimi K3 decode step fall back to the torch/fla paths its fused Triton
