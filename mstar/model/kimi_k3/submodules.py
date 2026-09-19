@@ -53,7 +53,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
 
     def __init__(self, language_model: nn.Module, config: KimiK3Config, cuda_graphs: bool = True,
                  max_capture_batch_size: int | None = None, max_prefill_batch_size: int | None = 8,
-                 mixed_prefill_decode: bool = False, speculative_tokens: int = 0, draft: DSparkDraft | None = None):
+                 mixed_prefill_decode: bool = False, speculative_tokens: int = 0, draft: DSparkDraft | None = None,
+                 speculative_schedule=None):
         super().__init__()
         # speculative decoding (plan sections 8.5, 8.6): a decode row arrives with its bonus token
         # (one id, as the conductor hands the prefill's token to the decode loop), the step drafts
@@ -91,6 +92,31 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         # number of resident requests can only ever replay with padding rows
         self.capture_batch_sizes = [b for b in self.DECODE_CAPTURE_BATCH_SIZES
                                     if max_capture_batch_size is None or b <= max_capture_batch_size]
+        # drafts per row by step size ((rows, k) pairs, rows ascending): the block shrinks as the batch
+        # grows, since a verify step's cost is fixed by its block; None keeps speculative_tokens everywhere
+        self.speculative_schedule = self._parse_schedule(speculative_schedule)
+
+    def _parse_schedule(self, schedule) -> tuple[tuple[int, int], ...] | None:
+        if not schedule:
+            return None
+        pairs = sorted((int(b), int(k)) for b, k in (schedule.items() if isinstance(schedule, dict) else schedule))
+        if any(not 0 <= k <= self.speculative_tokens for _, k in pairs):
+            raise ValueError(f"speculative_schedule drafts must lie in 0..{self.speculative_tokens}: {pairs}")
+        if self.cuda_graphs and any(b not in self.capture_batch_sizes for b, _ in pairs):
+            # a step's block is decided per capture bucket, so the bounds must be bucket sizes for a
+            # batch and the bucket it replays in to agree
+            raise ValueError(f"speculative_schedule bounds must be capture batch sizes {self.capture_batch_sizes}: {pairs}")
+        return tuple(pairs)
+
+    def block_length(self, rows: int) -> int:
+        """Drafts per row for a step of ``rows`` rows (the capture bucket's count, or the real one
+        for an eager step): the schedule's first bound at or above ``rows``, its last beyond them."""
+        if not self.speculative_schedule:
+            return self.speculative_tokens
+        for bound, k in self.speculative_schedule:
+            if rows <= bound:
+                return k
+        return self.speculative_schedule[-1][1]
 
     def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
         if not self.cuda_graphs:
@@ -112,7 +138,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         ids = inputs["text_inputs"][0].reshape(-1)
         # a speculating decode row carries its bonus token and spans k + 1 tokens (it and the
-        # drafts the step verifies)
+        # drafts the step verifies); with a schedule this is the budget of the largest block and
+        # declare_step sets the step's real spans, which need the batch size
         span = self.k1 if self.speculative_tokens > 0 and graph_walk == "decode" else ids.shape[0]
         return ARNodeInputs(input_ids=ids, input_seq_len=span)
 
@@ -120,28 +147,39 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         self, graph_walk: str, request_ids: list[str], inputs: list[ARNodeInputs],
         slot_lease: SlotLease | None = None, piecewise_leases: Mapping[str, SlotLease] | None = None, **kwargs,
     ):
-        segments = [
-            Segment(request_id=rid, label="main", span=inp.input_seq_len)
-            for rid, inp in zip(request_ids, inputs, strict=True)
-        ]
+        speculating = self.speculative_tokens > 0 and graph_walk == "decode"
+        k = None
+        if speculating:
+            # the block is a property of the step: the capture bucket's row count decides it (every
+            # row of a bucket shares the block), the real count for an eager step
+            rows = slot_lease.bucket.bs if slot_lease is not None and slot_lease.bucket is not None else len(request_ids)
+            k = self.block_length(rows)
+            segments = [Segment(request_id=rid, label="main", span=k + 1) for rid in request_ids]
+        else:
+            segments = [
+                Segment(request_id=rid, label="main", span=inp.input_seq_len)
+                for rid, inp in zip(request_ids, inputs, strict=True)
+            ]
         steps = {
             MLA_KV: KVStep(),
             MLA_ATTN: AttentionStep(causal=True),
             KDA_STATE: RecurrentStep(),
-            KDA_ATTN: LinearAttnStep(),
+            KDA_ATTN: LinearAttnStep(speculative=speculating),
             SAMPLER: SamplerStep(apply_penalty=False),
         }
         if self.speculative_tokens > 0:
-            # every decode step of a speculating node verifies a block (its rows carry the bonus id)
-            steps[SPEC] = SpecStep(verify=graph_walk == "decode")
+            # every decode step of a speculating node verifies a block (its rows carry the bonus id),
+            # of k drafts, which may be none: the pending prefix is consumed either way
+            steps[SPEC] = SpecStep(verify=speculating, num_drafts=k)
         if self.draft is not None:
             # the draft cache appends the rows' spans (the prompt, then k + 1 context entries per
             # step); in a decode step the draft's k queries per row attend to the stored context alone
+            # (a step without drafts still plans the attention for the rows' context lengths)
             steps[DSPARK_KV] = KVStep()
             if graph_walk == "decode":
                 steps[DSPARK_ATTN] = AttentionStep(
                     causal=False, context_only=True,
-                    segments=tuple(Segment(request_id=rid, label="main", span=self.speculative_tokens) for rid in request_ids),
+                    segments=tuple(Segment(request_id=rid, label="main", span=max(k, 1)) for rid in request_ids),
                 )
         return SubmoduleStep(segments=segments, steps=steps)
 
@@ -174,10 +212,10 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         return sampler.sample(engine_inputs.request_ids, logits=logits)
 
     # ------------------------------------------------------------ speculation
-    def _draft(self, bonus: torch.Tensor) -> torch.Tensor:
+    def _draft(self, bonus: torch.Tensor, k: int | None = None) -> torch.Tensor:
         """``bonus [bs, 1]`` -> ``drafts [bs, k]``. The stand-in until the DSpark draft: the bonus
         token repeated, accepted only where the target repeats itself."""
-        return bonus.expand(-1, self.speculative_tokens)
+        return bonus.expand(-1, self.speculative_tokens if k is None else k)
 
     def _forward_verify(self, engine_inputs: ModelInputsFromEngine, text_inputs: torch.Tensor) -> dict[str, torch.Tensor]:
         """One speculative decode step (plan section 8.6). The rows carry their bonus tokens (one
@@ -191,14 +229,18 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         acceptance: SpecAcceptance = engine_inputs.resources[SPEC]
         kda = engine_inputs.resources[KDA_ATTN]
         pool = engine_inputs.resources[KDA_STATE]
-        k = self.speculative_tokens
         bonus = text_inputs.view(-1)
+        rows = bonus.shape[0]  # the bucket's rows under a capture, the real ones eagerly: what declare_step saw
+        k = self.block_length(rows)
         if self.draft is not None:
-            ctx_len = engine_inputs.resources[DSPARK_ATTN].kv_len_buf()[: bonus.shape[0]]
-            offsets = torch.arange(self.k1, device=bonus.device)
-            drafts = self.draft.draft(bonus, (ctx_len[:, None] + offsets[None, :k]).reshape(-1), k)
+            ctx_len = engine_inputs.resources[DSPARK_ATTN].kv_len_buf()[:rows]
+            offsets = torch.arange(k + 1, device=bonus.device)
+            if k > 0:
+                drafts = self.draft.draft(bonus, (ctx_len[:, None] + offsets[None, :k]).reshape(-1), k)
+            else:
+                drafts = bonus.new_empty(rows, 0)
         else:
-            drafts = self._draft(bonus[:, None])
+            drafts = self._draft(bonus[:, None], k)
         ids = torch.cat([bonus[:, None], drafts], dim=1)
         if self.draft is not None:
             context = self.draft.context_accumulator()
@@ -208,7 +250,12 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         else:
             hidden = self.language_model.model(self.embed_tokens(ids.reshape(-1)), label="main")
         logits = self.lm_head(hidden)
-        tokens, accepted = sampler.sample_verify(engine_inputs.request_ids, logits, ids[:, 1:])
+        if k > 0:
+            tokens, accepted = sampler.sample_verify(engine_inputs.request_ids, logits, ids[:, 1:])
+        else:
+            # no drafts: the one token after the bonus is sampled as a plain step samples it
+            tokens = sampler.sample(engine_inputs.request_ids, logits=logits).reshape(rows, 1).to(torch.long)
+            accepted = torch.zeros(rows, dtype=torch.int32, device=bonus.device)
         acceptance.stage(accepted, tokens, ids[:, 1:] if self._spec_debug_rows else None)
         kda.set_prefix_len(pool.block("spec_len", 0), accepted)
         new_bonus = tokens.gather(1, accepted.to(torch.long).unsqueeze(1))
