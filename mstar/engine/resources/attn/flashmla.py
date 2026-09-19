@@ -16,6 +16,7 @@ import torch
 
 FLASHMLA_HEAD_DIM = 576  # latent + rope
 FLASHMLA_HEAD_DIM_V = 512
+FLASHMLA_PAGE = 64
 
 
 @lru_cache(maxsize=1)
@@ -37,8 +38,10 @@ def flashmla_wanted() -> bool:
     return os.environ.get("MSTAR_MLA_DECODE_BACKEND", "flashinfer") == "flashmla"
 
 
-def flashmla_supports(kv_lora_rank: int, qk_rope_head_dim: int) -> bool:
-    return kv_lora_rank == FLASHMLA_HEAD_DIM_V and kv_lora_rank + qk_rope_head_dim == FLASHMLA_HEAD_DIM
+def flashmla_supports(kv_lora_rank: int, qk_rope_head_dim: int, page_size: int = FLASHMLA_PAGE) -> bool:
+    """The kernel's fixed shape: latent 512 + rope 64 in pages of 64 tokens."""
+    return (kv_lora_rank == FLASHMLA_HEAD_DIM_V and kv_lora_rank + qk_rope_head_dim == FLASHMLA_HEAD_DIM
+            and page_size == FLASHMLA_PAGE)
 
 
 class FlashMLAWrapper:
@@ -60,7 +63,7 @@ class FlashMLAWrapper:
     ):
         from flash_mla import get_mla_metadata
 
-        assert flashmla_supports(kv_lora_rank, qk_rope_head_dim), (kv_lora_rank, qk_rope_head_dim)
+        assert flashmla_supports(kv_lora_rank, qk_rope_head_dim, page_size), (kv_lora_rank, qk_rope_head_dim, page_size)
         self.num_qo_heads, self.kv_lora_rank, self.qk_rope_head_dim = num_qo_heads, kv_lora_rank, qk_rope_head_dim
         self.page_size, self.sm_scale, self.device = page_size, float(sm_scale), torch.device(device)
         self.use_cuda_graph, self.batch_size, self.max_pages = use_cuda_graph, batch_size, int(max_pages_per_row)
@@ -123,14 +126,17 @@ class FlashMLAWrapper:
             self._block_table.copy_(self._block_table_host, non_blocking=True)
             self._kv_len_buf.copy_(self._kv_len_host, non_blocking=True)
             self._qo_indptr_buf.copy_(qo_indptr.to(torch.int32), non_blocking=True)
-            if self._sched is None or self.s_q != s_q:
-                self._sched, _ = self._get_meta()
         else:
             self._block_table = table.to(self.device, non_blocking=True)
             self._kv_len_buf = kv_len.to(self.device, dtype=torch.int32, non_blocking=True)
             self._qo_indptr_buf = qo_indptr.to(self.device, dtype=torch.int32, non_blocking=True)
-            self._sched, _ = self._get_meta()  # the eager rows and queries change from step to step
             self.batch_size = rows
+        # FlashMLA works its tile schedule out on the device at the first call made with a
+        # FlashMLASchedMeta and keeps it for the calls after, so a plan with other lengths needs a
+        # new one (the old schedule gave wrong rows after a replan). The captured path gets its new
+        # one inside the capture (see run), so a replay recomputes the schedule from the lengths buffer.
+        if not self.use_cuda_graph:
+            self._sched, _ = self._get_meta()
         self.s_q = s_q
         self.dtype = dtype
 
@@ -141,6 +147,8 @@ class FlashMLAWrapper:
         from flash_mla import flash_mla_with_kvcache
 
         rows = self.batch_size
+        if self._sched is None or torch.cuda.is_current_stream_capturing():
+            self._sched, _ = self._get_meta()  # a fresh schedule, computed by the captured kernels on every replay
         q = torch.cat([q_nope, q_pe], dim=-1).view(rows, self.s_q, self.num_qo_heads, FLASHMLA_HEAD_DIM)
         k = kv_cache_layer.view(kv_cache_layer.shape[0], self.page_size, 1, FLASHMLA_HEAD_DIM)
         out, lse = flash_mla_with_kvcache(
