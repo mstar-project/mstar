@@ -300,12 +300,23 @@ class ParallelKDAAttention(nn.Module):
         """``RMSNorm_headdim(o) * weight * sigmoid(g)``: one Triton launch on CUDA that reads the
         gate slice in place (fp32 math, the reference's operation order), the torch reference
         elsewhere."""
-        if fused_decode_kernels() and o.is_cuda and o.dtype in (torch.bfloat16, torch.float16) and o.stride(-1) == 1 \
-                and g_out.stride(-1) == 1:
+        if o.is_cuda and o.dtype in (torch.bfloat16, torch.float16) and o.stride(-1) == 1 and g_out.stride(-1) == 1:
             t = o.shape[0]
             o3 = o.view(t, self.num_heads, self.head_dim)
-            if o3.stride(1) == self.head_dim:
+            if fused_decode_kernels() and o3.stride(1) == self.head_dim:
                 return gated_rmsnorm(o3, g_out, self.o_norm.weight, self.norm_eps).view_as(o)
+            # the switch off: fla's kernel as before, on contiguous copies (what the served path did)
+            try:
+                from fla.modules.fused_norm_gate import rms_norm_gated
+            except ImportError:
+                rms_norm_gated = None
+            if rms_norm_gated is not None:
+                d = self.head_dim
+                y = rms_norm_gated(
+                    o.reshape(-1, d).contiguous(), g_out.reshape(-1, d).to(o.dtype).contiguous(),
+                    self.o_norm.weight, None, activation="sigmoid", eps=self.norm_eps,
+                )
+                return y.view_as(o)
         return gated_rms_norm(o, g_out, self.o_norm.weight, self.norm_eps)
 
     # ------------------------------------------------------------------ paths
