@@ -91,4 +91,9 @@ class LinearAttnStep(ResourceStep):
     each is, and the pool's own step says what becomes of the slots. Which rows
     take the recurrent path and which the chunked one is derived from the
     spans, not declared.
+
+    ``speculative``: every row is a verify block of a speculating node (its pending prefix and
+    its tokens run through the checkpoint recurrence); the row's span is the block length,
+    which may be shorter than the pool's speculative blocks, down to one token (no drafts).
     """
+    speculative: bool = False
