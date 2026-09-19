@@ -120,6 +120,6 @@ def replicated_loader(param: nn.Parameter, loaded: torch.Tensor, loaded_shard_id
 
 def fused_decode_kernels() -> bool:
     """``MSTAR_K3_FUSED_DECODE=0`` falls back to the torch/fla decode paths the fused kernels replaced
-    (the KDA recurrence and gated norm reading the projection slices in place, the MLA output),
-    for a served A/B on one tree."""
+    (the KDA recurrence and gated norm reading the projection slices in place, the MLA output, the
+    routed up-projection's latent slice read as a view), for a served A/B on one tree."""
     return os.environ.get("MSTAR_K3_FUSED_DECODE", "1") != "0"
