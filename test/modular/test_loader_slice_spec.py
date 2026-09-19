@@ -2,17 +2,17 @@
 
 The generic loader has every rank read the full checkpoint and keep its
 slice (8x the bytes at TP8). ``slice_spec`` lets a TP-aware caller ask the
-iterator for ``get_slice(key)[start:stop]`` / ``[:, start:stop]`` instead of
-the full tensor. These tests pin the iterator half of the fast read path
+iterator for ``get_slice(key)[..., start:stop]`` on one dim instead of the
+full tensor. These tests pin the iterator half of the fast read path
 (the model-side read plan lives with the model that builds it).
 """
 import json
 
-import pytest
 import torch
 from safetensors.torch import save_file
 
 from mstar.model.loader.iterators import (
+    TensorSlice,
     iter_safetensors_file,
     iter_safetensors_shards,
 )
@@ -31,7 +31,7 @@ def test_iterator_slice_spec_reads_exact_shards(tmp_path):
     c = torch.randn(4)
     _write_sharded(tmp_path, {"a": a, "b": b, "c": c})
 
-    specs = {"a": (0, 2, 5), "b": (1, 4, 8)}
+    specs = {"a": TensorSlice(0, 2, 5), "b": TensorSlice(1, 4, 8)}
     out = dict(iter_safetensors_shards(tmp_path, keys={"a", "b", "c"},
                                        slice_spec=specs.get))
     assert torch.equal(out["a"], a[2:5])
@@ -45,14 +45,20 @@ def test_single_file_slice_spec_and_default_full_read(tmp_path):
     path = tmp_path / "model.safetensors"
     save_file({"w": w}, str(path))
 
-    sliced = dict(iter_safetensors_file(path, slice_spec={"w": (1, 3, 7)}.get))
+    sliced = dict(iter_safetensors_file(path, slice_spec={"w": TensorSlice(1, 3, 7)}.get))
     assert torch.equal(sliced["w"], w[:, 3:7])
     # slice_spec omitted -> the pre-existing full-tensor path, unchanged.
     full = dict(iter_safetensors_file(path))
     assert torch.equal(full["w"], w)
 
 
-def test_slice_spec_rejects_unsupported_dim(tmp_path):
-    save_file({"w": torch.zeros(2, 3, 4)}, str(tmp_path / "model.safetensors"))
-    with pytest.raises(ValueError, match="dim=2"):
-        list(iter_safetensors_shards(tmp_path, slice_spec=lambda _k: (2, 0, 1)))
+def test_slice_spec_slices_any_dim(tmp_path):
+    torch.manual_seed(2)
+    v = torch.randn(6)
+    t = torch.randn(2, 3, 4)
+    _write_sharded(tmp_path, {"v": v, "t": t})
+
+    specs = {"v": TensorSlice(0, 1, 4), "t": TensorSlice(2, 1, 3)}
+    out = dict(iter_safetensors_shards(tmp_path, slice_spec=specs.get))
+    assert torch.equal(out["v"], v[1:4])
+    assert torch.equal(out["t"], t[:, :, 1:3])

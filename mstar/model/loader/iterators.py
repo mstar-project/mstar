@@ -4,21 +4,31 @@ Yields ``(key, tensor)`` one at a time so the full state_dict never has
 to fit in memory.
 
 ``slice_spec`` lets TP-aware callers read only their shard of a tensor:
-``slice_spec(key)`` returns ``(dim, start, stop)`` (dim 0 or 1) or ``None``
-for a full read. safetensors' ``get_slice`` then reads just those bytes —
-for checkpoints dominated by expert tensors this cuts per-rank IO by the
-TP factor (GLM-5.2 at TP8: ~704 GB -> ~120 GB per rank).
+``slice_spec(key)`` returns a ``TensorSlice`` or ``None`` for a full read.
+safetensors' ``get_slice`` then reads just those bytes — for checkpoints
+dominated by expert tensors this cuts per-rank IO by the TP factor
+(GLM-5.2 at TP8: ~704 GB -> ~120 GB per rank).
 """
 from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from safetensors import safe_open
 
-SliceSpec = Callable[[str], tuple[int, int, int] | None]
+
+class TensorSlice(NamedTuple):
+    """The half-open range of ``dim`` a caller wants: ``[start, stop)``."""
+
+    dim: int
+    start: int
+    stop: int
+
+
+SliceSpec = Callable[[str], TensorSlice | None]
 
 
 def _resolve_safetensors_device(device: torch.device | str) -> str:
@@ -51,14 +61,9 @@ def iter_safetensors_file(
             else:
                 dim, start, stop = spec
                 sl = f.get_slice(key)
-                if dim == 0:
-                    tensor = sl[start:stop]
-                elif dim == 1:
-                    tensor = sl[:, start:stop]
-                else:
-                    raise ValueError(
-                        f"slice_spec for {key!r} has dim={dim}; only 0/1 supported"
-                    )
+                index = [slice(None)] * len(sl.get_shape())
+                index[dim] = slice(start, stop)
+                tensor = sl[tuple(index)]
             if str(device) != st_device:
                 tensor = tensor.to(device, non_blocking=True)
             yield key, tensor
