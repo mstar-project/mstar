@@ -63,14 +63,22 @@ def reference(qkv, g_raw, beta_raw, conv_state, spec, slots, conv_w, rows, k1, h
     return (y[:, 0], y[:, 1], y[:, 2], g, beta, (plen - 1).to(torch.int32)), (conv_state, prefix, g_blk, b_blk), pad
 
 
-@pytest.mark.parametrize("h,d,k1,kp,rows", [(4, 32, 8, 8, 5), (2, 48, 6, 6, 3), (4, 64, 4, 4, 1), (2, 32, 2, 8, 3), (2, 32, 1, 8, 2)])
-def test_prep_matches_the_torch_glue(h, d, k1, kp, rows):
+@pytest.mark.parametrize("h,d,k1,kp,rows,strided", [(4, 32, 8, 8, 5, False), (2, 48, 6, 6, 3, True), (4, 64, 4, 4, 1, False),
+                                                    (2, 32, 2, 8, 3, True), (2, 32, 1, 8, 2, False)])
+def test_prep_matches_the_torch_glue(h, d, k1, kp, rows, strided):
     """``kp`` prefix slots (the pool's largest block + 1) and a block of ``k1`` tokens, shorter when the
-    block length follows the batch size, down to a single token."""
+    block length follows the batch size, down to a single token; ``strided`` hands the gates and betas
+    over as column slices of a wider matrix, as the layer's merged projection does."""
     gen = torch.Generator(device=DEV).manual_seed(0)
     p = h * d
     rnd = lambda *shape, s=1.0: (torch.randn(*shape, device=DEV, generator=gen) * s).to(torch.bfloat16)  # noqa: E731
     qkv, g_raw, beta_raw = rnd(rows * k1, 3 * p), rnd(rows * k1, h, d, s=2.0), rnd(rows * k1, h, s=2.0)
+    if strided:
+        wide = rnd(rows * k1, 5 + p + 3 + h + 2, s=2.0)
+        wide[:, 5:5 + p] = g_raw.reshape(rows * k1, p)
+        wide[:, 5 + p + 3:5 + p + 3 + h] = beta_raw
+        g_raw, beta_raw = wide[:, 5:5 + p].view(rows * k1, h, d), wide[:, 5 + p + 3:5 + p + 3 + h]
+        assert not g_raw.is_contiguous() and not beta_raw.is_contiguous()
     conv_state, prefix = rnd(SLOTS, 3 * p, W - 1), rnd(SLOTS, kp, 3 * p)
     spec_g, spec_beta = rnd(SLOTS, kp, h, d, s=2.0), rnd(SLOTS, kp, h, s=2.0)
     # accepted lengths: none, some, all, and the sink's garbage above and below the range
