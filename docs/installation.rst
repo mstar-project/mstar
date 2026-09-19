@@ -262,7 +262,7 @@ Install the DAC packages without their dependency closure, then add back the dep
    pip install --no-deps descript-audio-codec descript-audiotools argbind
    pip install "protobuf>=4" \
        flatten-dict julius docstring-parser ffmpy importlib-resources \
-       randomname tensorboard soundfile absl-py dill pynvml markdown-it-py
+       randomname tensorboard soundfile absl-py dill markdown-it-py
 
 Verify:
 
