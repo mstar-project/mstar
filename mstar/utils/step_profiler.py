@@ -1,11 +1,15 @@
 """Env-gated ``torch.profiler`` windows over engine steps (``MSTAR_TORCH_PROFILE``).
 
-``MSTAR_TORCH_PROFILE=<start>:<count>[,<start>:<count>...]`` makes the worker profile
-``count`` consecutive steps of ``MSTAR_TORCH_PROFILE_WALK`` (default ``decode``) from the
-``start``-th such step (absolute, 0-based) for each window, then log one per-kernel table per
-window (CUDA time and launches per step, the batch sizes seen) and write a Chrome trace to
-``MSTAR_TORCH_PROFILE_DIR`` (default ``/tmp``). ``MSTAR_TORCH_PROFILE_RANKS`` (default ``0``,
-comma-separated worker indices, ``all``) selects the workers that profile. Kernels launched by
+``MSTAR_TORCH_PROFILE=<start>:<count>[@<bs>][,...]`` makes the worker profile ``count``
+consecutive steps of ``MSTAR_TORCH_PROFILE_WALK`` (default ``decode``) from the ``start``-th such
+step (absolute, 0-based) for each window, then log one per-kernel table per window (CUDA time and
+launches per step, the batch sizes seen) and write a Chrome trace to ``MSTAR_TORCH_PROFILE_DIR``
+(default ``/tmp``). With ``@<bs>`` a window counts and covers only the steps of that batch size, so
+one served run through several concurrency levels yields one table per bucket whatever the step
+count of each level. Windows open in the order given, one at a time. ``MSTAR_TORCH_PROFILE_RANKS`` (default ``0``,
+comma-separated worker indices, ``all``) selects the workers that profile; ``MSTAR_TORCH_PROFILE_STACK=1``
+records Python stacks and input shapes, which attributes an eager step's kernels to their ops (a
+CUDA-graph replay's kernels carry no CPU side). Kernels launched by
 CUDA-graph replays are recorded individually, so the tables show the real served step. A window
 costs one device synchronize when it closes; unset, the hook is a counter increment per step.
 """
@@ -21,14 +25,20 @@ logger = logging.getLogger(__name__)
 
 
 class StepProfiler:
-    def __init__(self, windows: list[tuple[int, int]], graph_walk: str, tag: str, out_dir: str):
-        self.windows = sorted(windows)  # (start step, count), absolute step indices of ``graph_walk``
+    def __init__(self, windows: list[tuple], graph_walk: str, tag: str, out_dir: str):
+        # (start step, count[, batch size]); the start counts steps of ``graph_walk``, of that batch size when given
+        self.windows = [tuple(w) if len(w) == 3 else (w[0], w[1], None) for w in windows]
+        if all(w[2] is None for w in self.windows):
+            self.windows.sort()
         self.graph_walk, self.tag, self.out_dir = graph_walk, tag, out_dir
         self._seen = 0
+        self._seen_by_bs: dict[int, int] = {}
         self._prof: torch.profiler.profile | None = None
         self._profiled = 0
         self._batch_sizes: list[int] = []
         self._window = 0
+        self._bs: int | None = None
+        self.with_stack = False
 
     @property
     def done(self) -> bool:
@@ -46,10 +56,13 @@ class StepProfiler:
             return None
         windows = []
         for w in spec.split(","):
+            w, _, bs = w.partition("@")
             start, count = w.split(":")[:2]
-            windows.append((int(start), int(count)))
+            windows.append((int(start), int(count), int(bs)) if bs else (int(start), int(count), None))
         walk = env.get("MSTAR_TORCH_PROFILE_WALK", "decode")
-        return cls(windows, walk, worker_id, env.get("MSTAR_TORCH_PROFILE_DIR", "/tmp"))
+        prof = cls(windows, walk, worker_id, env.get("MSTAR_TORCH_PROFILE_DIR", "/tmp"))
+        prof.with_stack = env.get("MSTAR_TORCH_PROFILE_STACK", "0") == "1"
+        return prof
 
     @contextmanager
     def step(self, graph_walk: str | None, batch_size: int | None = None):
@@ -58,20 +71,25 @@ class StepProfiler:
         if self.done or graph_walk != self.graph_walk:
             yield
             return
-        start, count = self.windows[self._window]
-        if self._prof is None and self._seen >= start:
+        start, count, bs = self.windows[self._window]
+        seen = self._seen if bs is None else self._seen_by_bs.get(bs, 0)
+        matches = bs is None or batch_size == bs
+        if self._prof is None and matches and seen >= start:
             acts = [torch.profiler.ProfilerActivity.CPU]
             if torch.cuda.is_available():
                 acts.append(torch.profiler.ProfilerActivity.CUDA)
-            self._prof = torch.profiler.profile(activities=acts)
+            self._prof = torch.profiler.profile(activities=acts, with_stack=self.with_stack, record_shapes=self.with_stack)
             self._prof.__enter__()
-            self._profiled, self._batch_sizes = 0, []
-            logger.info("%s: profiling %d %s steps from step %d", self.tag, count, self.graph_walk, self._seen)
+            self._profiled, self._batch_sizes, self._bs = 0, [], bs
+            logger.info("%s: profiling %d %s steps from step %d%s", self.tag, count, self.graph_walk, seen,
+                        "" if bs is None else f" of batch size {bs}")
         self._seen += 1
+        if batch_size is not None:
+            self._seen_by_bs[batch_size] = self._seen_by_bs.get(batch_size, 0) + 1
         try:
             yield
         finally:
-            if self._prof is not None:
+            if self._prof is not None and (self._bs is None or batch_size == self._bs):
                 self._profiled += 1
                 if batch_size is not None:
                     self._batch_sizes.append(batch_size)
