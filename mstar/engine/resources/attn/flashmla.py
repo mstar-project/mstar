@@ -31,8 +31,10 @@ def flashmla_available() -> bool:
 
 
 def flashmla_wanted() -> bool:
-    """``MSTAR_MLA_DECODE_BACKEND`` = ``flashmla`` (the default where it is built) or ``flashinfer``."""
-    return os.environ.get("MSTAR_MLA_DECODE_BACKEND", "flashmla") == "flashmla"
+    """``MSTAR_MLA_DECODE_BACKEND`` = ``flashmla`` or ``flashinfer`` (the default). On an H100 the two
+    kernels cost about the same per call (15 us at one row, 26 against 31 us at 32 rows, 48 against
+    50 at 64: bench/kernels/mla_decode_backends.py), so FlashMLA stays an option until it wins somewhere."""
+    return os.environ.get("MSTAR_MLA_DECODE_BACKEND", "flashinfer") == "flashmla"
 
 
 def flashmla_supports(kv_lora_rank: int, qk_rope_head_dim: int) -> bool:
