@@ -15,6 +15,7 @@ import torch
 
 from mstar.engine.resources.attn.base import AttentionManager, WorkspacePool
 from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.flashmla import FlashMLAWrapper, flashmla_available, flashmla_supports, flashmla_wanted
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
 from mstar.engine.resources.kv.plan import KVPlanOutputs, build_paged_indptrs, context_only_views
@@ -206,11 +207,17 @@ class FlashInferMLAManager(AttentionManager):
         self._device = device
         self._dtype = dtype
         self._kv_config = kv_config
-        self._current_plan_states: dict[str, FlashInferMLAWrapper] = {}
-        self._eager_plan_states: dict[str, FlashInferMLAWrapper] = {}
-        self._cg_plan_states: dict[CGSlotKey, FlashInferMLAWrapper] = {}
-        self._preplan_states: dict[str, FlashInferMLAWrapper] = {}
+        self._current_plan_states: dict[str, FlashInferMLAWrapper | FlashMLAWrapper] = {}
+        self._eager_plan_states: dict[tuple[str, bool], FlashInferMLAWrapper | FlashMLAWrapper] = {}
+        self._cg_plan_states: dict[tuple[CGSlotKey, bool], FlashInferMLAWrapper | FlashMLAWrapper] = {}
+        self._preplan_states: dict[str, FlashInferMLAWrapper | FlashMLAWrapper] = {}
         self._preplanned = False
+        # DeepSeek's FlashMLA for the plans it takes (causal, one query per row): a few us a layer
+        # against FlashInfer's Hopper kernel's ~15 us floor; MSTAR_MLA_DECODE_BACKEND=flashinfer keeps the latter
+        self._flashmla = (flashmla_wanted() and flashmla_available()
+                          and flashmla_supports(kv_config.kv_lora_rank, kv_config.qk_rope_head_dim))
+        if self._flashmla:
+            logger.info("MLA attention: FlashMLA serves the decode plans of %r", kv_cache)
         if sm_scale is None:
             raise ValueError(
                 "AttentionConfig.sm_scale must be set for MLA: the kernel scores the absorbed "
@@ -231,22 +238,35 @@ class FlashInferMLAManager(AttentionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
-    def _cg_wrapper(self, lease: SlotLease, label: str, num_rows: int) -> FlashInferMLAWrapper:
-        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+    def _flashmla_kwargs(self) -> dict:
+        k = self._wrapper_kwargs
+        return dict(num_qo_heads=k["num_qo_heads"], kv_lora_rank=k["kv_lora_rank"], qk_rope_head_dim=k["qk_rope_head_dim"],
+                    page_size=k["page_size"], sm_scale=k["sm_scale"], device=k["device"],
+                    max_pages_per_row=-(-int(self._kv_config.max_seq_len) // int(k["page_size"])))
+
+    def _cg_wrapper(self, lease: SlotLease, label: str, num_rows: int, flashmla: bool = False):
+        key = (CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label), flashmla)
         wrapper = self._cg_plan_states.get(key)
         if wrapper is None:
-            wrapper = self._cg_plan_states[key] = FlashInferMLAWrapper(
-                workspace_buffer=self._workspaces.get(label, lease.slot),
-                batch_size=num_rows, use_cuda_graph=True, **self._wrapper_kwargs,
-            )
+            if flashmla:
+                wrapper = FlashMLAWrapper(batch_size=num_rows, use_cuda_graph=True, **self._flashmla_kwargs())
+            else:
+                wrapper = FlashInferMLAWrapper(
+                    workspace_buffer=self._workspaces.get(label, lease.slot),
+                    batch_size=num_rows, use_cuda_graph=True, **self._wrapper_kwargs,
+                )
+            self._cg_plan_states[key] = wrapper
         return wrapper
 
-    def _eager_wrapper(self, label: str) -> FlashInferMLAWrapper:
-        wrapper = self._eager_plan_states.get(label)
+    def _eager_wrapper(self, label: str, flashmla: bool = False):
+        key = (label, flashmla)
+        wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            wrapper = self._eager_plan_states[label] = FlashInferMLAWrapper(
-                workspace_buffer=self._workspaces.get(label), **self._wrapper_kwargs,
-            )
+            if flashmla:
+                wrapper = FlashMLAWrapper(**self._flashmla_kwargs())
+            else:
+                wrapper = FlashInferMLAWrapper(workspace_buffer=self._workspaces.get(label), **self._wrapper_kwargs)
+            self._eager_plan_states[key] = wrapper
         return wrapper
 
     @property
@@ -275,10 +295,12 @@ class FlashInferMLAManager(AttentionManager):
                 spans = [int(seg.span) for seg in (step.segments or ()) if seg.label == label]
                 views = context_only_views(kv_out.views, spans, self._kv_config.page_size)
                 indptrs = build_paged_indptrs(views, self._kv_config.page_size)
+            # FlashMLA for a plain decode plan (one causal query per row, no context-only read)
+            fmla = self._flashmla and FlashMLAWrapper.plan_fits(indptrs.qo_indptr, step.causal, step.context_only) == 1
             if lease is not None:
-                wrapper = self._cg_wrapper(lease, label, indptrs.qo_indptr.shape[0] - 1)
+                wrapper = self._cg_wrapper(lease, label, indptrs.qo_indptr.shape[0] - 1, fmla)
             else:
-                wrapper = self._eager_wrapper(label)
+                wrapper = self._eager_wrapper(label, fmla)
             wrapper.plan(causal=step.causal, dtype=self._dtype, **indptrs.to_kwargs_dict())
             plan_states[label] = wrapper
         self._preplanned = ctx.is_preplan
