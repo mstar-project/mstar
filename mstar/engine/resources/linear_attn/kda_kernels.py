@@ -179,12 +179,12 @@ class FLAKDAKernels:
         q, k, v, g, beta, ckpt = kda_verify_prep(
             qkv, g_raw, beta_raw, conv_state, spec, slots, p.conv_weight, rows, k1, h, d,
         )
-        o = kda_recurrent_checkpoint(
-            q.view(-1, h, d), k.view(-1, h, d), v.view(-1, h, d), g.view(-1, h, d), beta, p.A_log, p.dt_bias,
-            rec_state, slots, ckpt, plan.verify_cu_seqlens(), p.scale, p.lower_bound,
-        )
+        # the kernel stores the block positions only, straight into [rows * k1, H, D]
         kp = spec.prefix.shape[1]  # the prefix part is padded to the pool's slots
-        return o.view(rows, kp + k1, h, d)[:, kp:].reshape(rows * k1, h, d)
+        return kda_recurrent_checkpoint(
+            q.view(-1, h, d), k.view(-1, h, d), v.view(-1, h, d), g.view(-1, h, d), beta, p.A_log, p.dt_bias,
+            rec_state, slots, ckpt, plan.verify_cu_seqlens(), p.scale, p.lower_bound, out_skip=kp,
+        )
 
 
 class FlashKDAKernels(FLAKDAKernels):
