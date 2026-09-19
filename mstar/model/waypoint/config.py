@@ -150,8 +150,8 @@ class WaypointConfig:
     capture_dit_prime: bool = True
 
     # Rows carried per rollout step; one per resident world sharing the DiT
-    # forward. Must be <= `resources.kv.num_worlds` (checked at YAML-load time
-    # in waypoint_model.py, where num_worlds is known).
+    # forward. Must be <= `resources.kv.num_sessions` (checked at YAML-load time
+    # in waypoint_model.py, where num_sessions is known).
     step_batch_size: int = 1
 
     # Guard rails the ported modules assert against, kept here so a drifting

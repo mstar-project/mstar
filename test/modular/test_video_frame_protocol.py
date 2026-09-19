@@ -493,7 +493,7 @@ def test_rollout_harness_variant_controls_config_and_checkpoint_default(
     }
     assert generated["max_seq_len"] == tokens
     assert generated["max_concurrent_requests"] == 2
-    assert generated["resources"]["kv"]["num_worlds"] == 2
+    assert generated["resources"]["kv"]["num_sessions"] == 2
 
 
 def test_rollout_harness_hub_config_omits_local_overrides_and_forwards_cache(tmp_path):
@@ -532,7 +532,7 @@ def test_rollout_harness_hub_config_omits_local_overrides_and_forwards_cache(tmp
         "step_batch_size": 1,
     }
     assert generated["max_concurrent_requests"] == 2
-    assert generated["resources"]["kv"]["num_worlds"] == 2
+    assert generated["resources"]["kv"]["num_sessions"] == 2
     assert command[command.index("--cache-dir") + 1] == str(tmp_path / "hub-cache")
     assert "--enable-nvtx" in command
 

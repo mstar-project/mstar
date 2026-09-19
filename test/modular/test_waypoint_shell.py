@@ -218,7 +218,7 @@ def test_ring_geometry_is_copied_from_the_config_layer_for_layer(model, config):
     # One world declared here, because sizing is a deployment question and
     # `apply_yaml_overrides` runs after this hook. What is pinned is the
     # *default*: a node that never says otherwise serves one session.
-    assert ring.num_worlds == 1
+    assert ring.num_sessions == 1
 
     assert len(ring.layers) == config.n_layers
     for i, layer in enumerate(ring.layers):
@@ -731,11 +731,11 @@ def _write_config(tmp_path, name: str, **extra) -> str:
     return str(path)
 
 
-def _worlds(n: int) -> dict:
+def _sessions(n: int) -> dict:
     """The ``resources:`` block a deployment writes to size the ring — the same
     one ``EngineManager.build`` feeds to ``apply_yaml_overrides``, which is why
     the gate reads it here rather than inventing its own key."""
-    return {"resources": {KV_RESOURCE: {"num_worlds": n}}}
+    return {"resources": {KV_RESOURCE: {"num_sessions": n}}}
 
 
 @pytest.mark.parametrize("limit", [None, 0, -1, True, 1.0, "2"])
@@ -773,9 +773,9 @@ def test_get_worker_graphs_refuses_invalid_world_pool_size(
         tmp_path,
         f"invalid_worlds_{worlds}.yaml",
         max_concurrent_requests=1,
-        **_worlds(worlds),
+        **_sessions(worlds),
     )
-    with pytest.raises(ValueError, match=r"resources\.kv\.num_worlds"):
+    with pytest.raises(ValueError, match=r"resources\.kv\.num_sessions"):
         model.get_worker_graphs(path)
 
 
@@ -784,7 +784,7 @@ def test_get_worker_graphs_refuses_more_arrivals_than_worlds(
     model, tmp_path, limit, worlds
 ):
     """A queue longer than the pool is not a queue, it is a delayed failure: the
-    conductor admits ``limit`` requests, the ring hands out ``num_worlds``, and
+    conductor admits ``limit`` requests, the ring hands out ``num_sessions``, and
     the difference is a set of requests that reach ``admit`` and die there with
     an ``AdmitRuntimeError`` that no retry, eviction or reload can clear.
 
@@ -794,7 +794,7 @@ def test_get_worker_graphs_refuses_more_arrivals_than_worlds(
     """
     extra = {"max_concurrent_requests": limit}
     if worlds is not None:
-        extra |= _worlds(worlds)
+        extra |= _sessions(worlds)
     path = _write_config(tmp_path, f"over_{limit}_{worlds}.yaml", **extra)
 
     with pytest.raises(ValueError, match="exceeds the"):
@@ -805,12 +805,12 @@ def test_get_worker_graphs_refuses_more_arrivals_than_worlds(
 def test_get_worker_graphs_accepts_a_deployment_inside_its_pool(
     model, tmp_path, limit, worlds
 ):
-    """``limit == num_worlds`` is the shape that should be written, at any size.
+    """``limit == num_sessions`` is the shape that should be written, at any size.
     The ``(1, None)`` case is the default deployment, which must keep working
     unchanged — the pool is a widening, not a migration."""
     extra = {"max_concurrent_requests": limit}
     if worlds is not None:
-        extra |= _worlds(worlds)
+        extra |= _sessions(worlds)
     path = _write_config(tmp_path, f"ok_{limit}_{worlds}.yaml", **extra)
 
     graphs = model.get_worker_graphs(path)
@@ -850,7 +850,7 @@ def test_get_worker_graphs_warns_about_worlds_no_request_can_reach(
     and never written, which is worth a line in the log rather than a failed
     boot: the deployment still serves correctly."""
     path = _write_config(
-        tmp_path, "underused.yaml", max_concurrent_requests=2, **_worlds(8)
+        tmp_path, "underused.yaml", max_concurrent_requests=2, **_sessions(8)
     )
 
     with caplog.at_level(logging.WARNING):

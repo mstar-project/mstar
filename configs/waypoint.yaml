@@ -11,7 +11,7 @@ model_kwargs:
   compile_dit: true
   cuda_graph: true
   full_global_ring: false
-  # Rows per rollout step; must be <= resources.kv.num_worlds below.
+  # Rows per rollout step; must be <= resources.kv.num_sessions below.
   step_batch_size: 1
 
 # The world state is a ring, not a paged KV cache, so nothing here is sized in
@@ -21,7 +21,7 @@ max_seq_len: 512
 
 # The primary bound on the world pool. `WaypointModel.get_worker_graphs`
 # refuses to build unless this is a positive int no larger than
-# `resources.kv.num_worlds`: a world is claimed at admit, by which point a
+# `resources.kv.num_sessions`: a world is claimed at admit, by which point a
 # request the pool cannot hold can only be failed terminally, and the
 # conductor's FIFO admit queue that prevents that exists only when this is set.
 max_concurrent_requests: 1
@@ -30,7 +30,7 @@ resources:
   kv:
     # ~816 MiB of ring per world at 720P. Raise together with
     # max_concurrent_requests; the two are checked against each other.
-    num_worlds: 1
+    num_sessions: 1
 
 # 1.28B DiT plus a ~7M-parameter TAEHV, all on rank 0. One group: the rollout
 # Loop body is a single dit node (the TAEHV decode is fused into its forward),

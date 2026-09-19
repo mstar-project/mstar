@@ -121,7 +121,7 @@ def visible_blocks(block_mask) -> set[int]:
     return set(block_mask.full_kv_indices[0, 0, 0, :n].tolist())
 
 
-def ring_kv_spec(config: WaypointConfig, *, num_worlds: int = 1) -> KVSpec:
+def ring_kv_spec(config: WaypointConfig, *, num_sessions: int = 1) -> KVSpec:
     """The ``RingKVConfig`` a ``WaypointConfig``'s geometry implies -- which is
     the bridge under test in most of section 3.
 
@@ -140,7 +140,7 @@ def ring_kv_spec(config: WaypointConfig, *, num_worlds: int = 1) -> KVSpec:
             head_dim=config.d_head,
             num_qo_heads=config.n_heads,
             tokens_per_frame=config.tokens_per_frame,
-            num_worlds=num_worlds,
+            num_sessions=num_sessions,
             layers=tuple(
                 RingKVLayerConfig(
                     ring_frames=config.ring_frames(i),
@@ -153,11 +153,11 @@ def ring_kv_spec(config: WaypointConfig, *, num_worlds: int = 1) -> KVSpec:
     )
 
 
-def ring_manager(config: WaypointConfig, *, num_worlds: int = 1) -> RingKVManager:
+def ring_manager(config: WaypointConfig, *, num_sessions: int = 1) -> RingKVManager:
     """``config``'s rings, allocated. Through ``build(spec, info)`` and not the
     constructor: the spec is what picks ``RingKVManager`` over the paged one."""
     return RingKVManager.build(
-        ring_kv_spec(config, num_worlds=num_worlds),
+        ring_kv_spec(config, num_sessions=num_sessions),
         EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float32),
     )
 
@@ -277,11 +277,11 @@ def test_a_fully_visible_ring_makes_eager_and_compiled_agree():
 def make_cache(*, ring_frames: int, ring_buckets: int, dilation: int) -> LayerRingCache:
     """One world, because this section is about the ring *algorithm* — which
     slot a frame lands in, which slot it hides — and that is per world and
-    identical at any ``num_worlds``. The folded layout and its isolation are
+    identical at any ``num_sessions``. The folded layout and its isolation are
     pinned where they belong, in ``test_ring_kv_resource.py``; driving them
     again here would only make these tests slower to read."""
     return LayerRingCache(
-        num_worlds=1,
+        num_sessions=1,
         n_kv_heads=1,
         ring_frames=ring_frames,
         ring_buckets=ring_buckets,
@@ -296,7 +296,7 @@ def make_cache(*, ring_frames: int, ring_buckets: int, dilation: int) -> LayerRi
 def upsert(cache: LayerRingCache, kv, frame_pos, *, commit: bool, world: int = 0):
     """``LayerRingCache.upsert`` with the world index spelled out.
 
-    Not a default on ``upsert`` itself, deliberately. ``world_idx`` is a ``[1]``
+    Not a default on ``upsert`` itself, deliberately. ``session_idx`` is a ``[1]``
     int64 *device* tensor on the forward path and never a Python int — a host
     int is folded into the graph at capture and every replay then serves the
     capture-time world, silently. A default argument is exactly how a caller
@@ -376,11 +376,11 @@ def test_mask_hides_the_slot_this_frame_is_about_to_overwrite():
 def test_upsert_batches_two_worlds_like_two_sequential_calls():
     """``upsert`` at B=2 (one row each for worlds 0 and 1) is bit-exact to
     running the same two frames one world at a time: the row dimension is
-    folded into the token dim by ``world_base``, so a batched call must not
+    folded into the token dim by ``session_base``, so a batched call must not
     touch a row that is not its own."""
     def new_cache() -> LayerRingCache:
         return LayerRingCache(
-            num_worlds=2, n_kv_heads=1, ring_frames=4, ring_buckets=4,
+            num_sessions=2, n_kv_heads=1, ring_frames=4, ring_buckets=4,
             d_head=8, tokens_per_frame=TPF, pinned_dilation=1,
             dtype=torch.float32, device="cpu",
         )
@@ -427,18 +427,18 @@ def floor_bucket_upsert(cache: LayerRingCache, kv, frame_pos, commit: bool):
     instead of ``(f + d - 1) // d``. Everything else is statement-for-statement
     the same. Used only to A/B the round-up."""
     tokens = cache.tokens_per_frame
-    world_idx = torch.tensor([0], dtype=torch.int64)
-    world_base = world_idx * cache.capacity
+    session_idx = torch.tensor([0], dtype=torch.int64)
+    session_base = session_idx * cache.capacity
     slot = (frame_pos // cache.pinned_dilation) % cache.ring_buckets
-    ring_idx = cache.frame_offsets + slot * tokens + world_base
-    current_idx = cache._current_base + world_base
+    ring_idx = cache.frame_offsets + slot * tokens + session_base
+    current_idx = cache._current_base + session_base
 
     cache.kv.index_copy_(3, current_idx, kv)
 
     write_step = frame_pos.remainder(cache.pinned_dilation) == 0
     mask_written = torch.empty_like(cache.written)
     mask_written.copy_(cache.written)
-    mask_written &= cache._world_of_slot == world_idx
+    mask_written &= cache._session_of_slot == session_idx
     mask_written[ring_idx] = mask_written[ring_idx] & ~write_step
 
     if commit:
@@ -484,7 +484,7 @@ def test_bucket_round_up_is_faithful_but_currently_unobservable(dilation):
 def test_upsert_rejects_a_wrong_shaped_frame_or_clock():
     cache = make_cache(ring_frames=4, ring_buckets=4, dilation=1)
     fp = torch.tensor([0], dtype=torch.int64)
-    with pytest.raises(RuntimeError, match="exactly one frame per world"):
+    with pytest.raises(RuntimeError, match="exactly one frame per session"):
         upsert(cache, frame_kv(0, tokens=TPF // 2), fp, commit=True)
     with pytest.raises(RuntimeError, match=r"frame_pos must be a \[B\] int64 tensor"):
         upsert(cache, frame_kv(0), torch.tensor(0, dtype=torch.int64), commit=True)
@@ -528,7 +528,7 @@ def test_ring_state_is_a_deep_copy_and_is_specific_to_the_compaction_setting():
     state = kv.get_state("a")
     snapshot = [t.clone() for t, _ in state["layers"]]
     for layer in kv.layers:
-        layer.reset(kv.world_of("a"))
+        layer.reset(kv.session_of("a"))
     assert not any(layer.kv.any() for layer in kv.layers)
     # get_state must clone: the reset above must not have reached the snapshot.
     assert all(torch.equal(a, b) for a, b in zip((t for t, _ in state["layers"]), snapshot, strict=True))
@@ -536,9 +536,9 @@ def test_ring_state_is_a_deep_copy_and_is_specific_to_the_compaction_setting():
     kv.load_state("a", state)
     # Compare the request's world span, not the whole buffer: the ring now holds
     # a padding world past the resident pool that get_state never captured.
-    world = kv.world_of("a")
+    world = kv.session_of("a")
     assert all(
-        torch.equal(layer.kv[:, :, :, slice(*layer.world_span(world))], t)
+        torch.equal(layer.kv[:, :, :, slice(*layer.session_span(world))], t)
         for layer, (t, _) in zip(kv.layers, state["layers"], strict=True)
     )
 

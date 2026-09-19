@@ -201,7 +201,7 @@ class FlexAttentionManager(AttentionManager):
     drifting video. The FlashInfer alternative was measured at ~9% on the
     attention kernel, against the 2x that had motivated trying it.
 
-    Stateless across steps. The world state is the ring, and the ring belongs
+    Stateless across steps. The session state is the ring, and the ring belongs
     to the KV resource this one names in ``depends_on``; nothing here survives
     a call except the label/layer cursors the base class defines.
     """
@@ -271,7 +271,7 @@ class FlexAttentionManager(AttentionManager):
         if mask is None and create:
             ring_frames, _, _ = geometry
             capacity = (ring_frames + 1) * self._kv_config.tokens_per_frame
-            capacity *= self._kv_config.total_worlds
+            capacity *= self._kv_config.total_sessions
             mask = _empty_block_mask(
                 self._kv_config.tokens_per_frame, capacity, self._device, batch
             )
@@ -305,21 +305,21 @@ class FlexAttentionManager(AttentionManager):
             self._kv_config.tokens_per_frame // _DEFAULT_SPARSE_BLOCK_SIZE
         )
         total_blocks = (
-            (ring_frames + 1) * blocks_per_frame * self._kv_config.total_worlds
+            (ring_frames + 1) * blocks_per_frame * self._kv_config.total_sessions
         )
         counts: list[list[int]] = []
         rows: list[list[list[int]]] = []
-        for world_idx in range(self._kv_config.total_worlds):
-            world_counts = []
-            world_rows = []
+        for session_idx in range(self._kv_config.total_sessions):
+            session_counts = []
+            session_rows = []
             for frame_pos in range(2 * period):
                 visible = self._visible_blocks_for(
-                    geometry, world_idx=world_idx, frame_pos=frame_pos
+                    geometry, session_idx=session_idx, frame_pos=frame_pos
                 )
-                world_counts.append(len(visible))
-                world_rows.append(visible + [0] * (total_blocks - len(visible)))
-            counts.append(world_counts)
-            rows.append(world_rows)
+                session_counts.append(len(visible))
+                session_rows.append(visible + [0] * (total_blocks - len(visible)))
+            counts.append(session_counts)
+            rows.append(session_rows)
 
         table = (
             torch.tensor(counts, dtype=torch.int32, device=self._device),
@@ -342,14 +342,14 @@ class FlexAttentionManager(AttentionManager):
         self,
         geometry: tuple[int, int, int],
         *,
-        world_idx: int,
+        session_idx: int,
         frame_pos: int,
     ) -> list[int]:
         tokens = self._kv_config.tokens_per_frame
         blocks_per_frame = tokens // _DEFAULT_SPARSE_BLOCK_SIZE
         ring_frames, ring_buckets, dilation = geometry
         capacity_blocks = (ring_frames + 1) * blocks_per_frame
-        world_base = world_idx * capacity_blocks
+        session_base = session_idx * capacity_blocks
 
         committed = range(0, frame_pos, dilation)
         slots = {
@@ -360,9 +360,9 @@ class FlexAttentionManager(AttentionManager):
 
         visible: list[int] = []
         for ring_slot in sorted(slots):
-            start = world_base + ring_slot * blocks_per_frame
+            start = session_base + ring_slot * blocks_per_frame
             visible.extend(range(start, start + blocks_per_frame))
-        scratch = world_base + ring_frames * blocks_per_frame
+        scratch = session_base + ring_frames * blocks_per_frame
         visible.extend(range(scratch, scratch + blocks_per_frame))
         return visible
 
@@ -373,7 +373,7 @@ class FlexAttentionManager(AttentionManager):
         plan: RingPlan,
     ) -> None:
         counts, indices, period = self._visibility_table_for(geometry)
-        for b, (w, f) in enumerate(zip(plan.world_idx, plan.frame_pos)):
+        for b, (w, f) in enumerate(zip(plan.session_idx, plan.frame_pos)):
             phase = f if f < period else period + f % period
             mask.full_kv_num_blocks[b].copy_(counts[w, phase])
             mask.full_kv_indices[b].copy_(indices[w, phase])
@@ -397,7 +397,7 @@ class FlexAttentionManager(AttentionManager):
         # The padded width, not the real row count: the graph baked the address
         # of the mask captured at the bucket size, and a replay padded below that
         # bucket must stage into that same buffer. `ring_plan` already carries one
-        # (world, frame) per padded row, padding rows included.
+        # (session, frame) per padded row, padding rows included.
         B = len(ctx.padded_request_ids)
         geometries = {self._geometry(layer) for layer in self._kv_config.layers}
         for geometry in geometries:

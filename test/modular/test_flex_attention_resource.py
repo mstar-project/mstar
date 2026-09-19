@@ -225,7 +225,7 @@ def test_plan_stages_one_reused_mask_per_geometry_and_slot(monkeypatch):
         head_dim=D_HEAD,
         num_qo_heads=N_QO_HEADS,
         tokens_per_frame=TPF,
-        num_worlds=2,
+        num_sessions=2,
         layers=(
             RingKVLayerConfig(4, 4, 1),
             RingKVLayerConfig(4, 4, 1),
@@ -300,13 +300,13 @@ def test_planned_masks_match_ring_visibility_across_wraps_and_worlds():
         head_dim=D_HEAD,
         num_qo_heads=N_QO_HEADS,
         tokens_per_frame=TPF,
-        num_worlds=2,
+        num_sessions=2,
         layers=layers,
     )
     manager = build_attention(AttnBackend.FLEX, config)
     caches = [
         LayerRingCache(
-            num_worlds=config.num_worlds,
+            num_sessions=config.num_sessions,
             n_kv_heads=config.num_kv_heads,
             ring_frames=layer.ring_frames,
             ring_buckets=layer.ring_buckets,
@@ -359,7 +359,7 @@ def test_stage_writes_each_rows_own_visibility_at_its_own_world_and_frame():
         head_dim=D_HEAD,
         num_qo_heads=N_QO_HEADS,
         tokens_per_frame=TPF,
-        num_worlds=2,
+        num_sessions=2,
         layers=(
             RingKVLayerConfig(4, 4, 1),
             RingKVLayerConfig(4, 4, 1),
@@ -556,7 +556,7 @@ CAPACITY = 2 * BLOCK  # one history frame + the scratch frame, per world
 FOLDED_KV = WORLDS * CAPACITY
 
 
-def world_span(w: int) -> tuple[int, int]:
+def session_span(w: int) -> tuple[int, int]:
     return w * CAPACITY, (w + 1) * CAPACITY
 
 
@@ -565,7 +565,7 @@ def folded_visible_row(w: int, *, history: bool, device) -> torch.Tensor:
     always, its own history block if it has committed one, and nothing outside
     its span ever."""
     row = torch.zeros(FOLDED_KV, dtype=torch.bool, device=device)
-    lo, hi = world_span(w)
+    lo, hi = session_span(w)
     row[hi - BLOCK : hi] = True  # scratch: the frame being denoised
     if history:
         row[lo : lo + BLOCK] = True
@@ -723,7 +723,7 @@ def test_a_batched_step_does_not_reach_across_world_spans(device):
         for w in range(WORLDS):
             if w == kept:
                 continue
-            lo, hi = world_span(w)
+            lo, hi = session_span(w)
             shape = (1, N_KV_HEADS, hi - lo, D_HEAD)
             k2[:, :, lo:hi] = torch.randn(shape, generator=gen).to(device)
             v2[:, :, lo:hi] = torch.randn(shape, generator=gen).to(device)
