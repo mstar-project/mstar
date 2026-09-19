@@ -22,7 +22,7 @@ _BIG = 2**31 - 1
 @triton.jit
 def _markov_partial_kernel(
     logits, w1, w2, prev, out_val, out_idx,
-    V, stride_l_row, stride_w1, stride_w2, n_chunks,
+    V, stride_l_row, stride_w1, stride_w2, stride_prev, n_chunks,
     ROWS: tl.constexpr, RP: tl.constexpr, R: tl.constexpr, BV: tl.constexpr,
     ROUND_BF16: tl.constexpr, IEEE: tl.constexpr,
 ):
@@ -33,7 +33,7 @@ def _markov_partial_kernel(
     o_r = tl.arange(0, R)
     o_rows = tl.arange(0, RP)
     m_rows = o_rows < ROWS
-    prev_ids = tl.load(prev + o_rows, mask=m_rows, other=0).to(tl.int64)
+    prev_ids = tl.load(prev + o_rows * stride_prev, mask=m_rows, other=0).to(tl.int64)
     e = tl.load(w1 + prev_ids[:, None] * stride_w1 + o_r[None, :], mask=m_rows[:, None], other=0.0)  # [RP, R]
     w = tl.load(w2 + o_v[:, None] * stride_w2 + o_r[None, :], mask=m_v[:, None], other=0.0)  # [BV, R]
     if IEEE:
@@ -66,9 +66,9 @@ def _markov_final_kernel(out_val, out_idx, drafts, n_chunks, stride_d_row, NC: t
 def markov_argmax(logits: torch.Tensor, prev: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor,
                   out: torch.Tensor, workspace: tuple[torch.Tensor, torch.Tensor] | None = None) -> None:
     """``out[r] = argmax_v(logits[r, v] + w2[v] . w1[prev[r]])`` for ``logits [rows, V]`` (any row
-    stride), ``prev [rows]`` ids, ``w1 [V, R]`` and ``w2 [V, R]``; ``out`` a ``[rows]`` integer view
-    (a column of the drafts) written in place. ``workspace``: the ``[rows, n_chunks]`` fp32 and int32
-    partials, reused across the draft's steps."""
+    stride), ``prev [rows]`` ids (any stride: the previous column of the drafts), ``w1 [V, R]`` and
+    ``w2 [V, R]``; ``out`` a ``[rows]`` integer view (a column of the drafts) written in place.
+    ``workspace``: the ``[rows, n_chunks]`` fp32 and int32 partials, reused across the draft's steps."""
     rows, v = logits.shape
     r = w1.shape[1]
     assert w2.shape == (v, r) and w1.shape[0] == v and logits.stride(1) == 1 and prev.numel() == rows
@@ -81,7 +81,7 @@ def markov_argmax(logits: torch.Tensor, prev: torch.Tensor, w1: torch.Tensor, w2
     vals, idxs = workspace
     rp = max(16, triton.next_power_of_2(rows))
     _markov_partial_kernel[(n_chunks,)](
-        logits, w1, w2, prev, vals, idxs, v, logits.stride(0), w1.stride(0), w2.stride(0), n_chunks,
+        logits, w1, w2, prev, vals, idxs, v, logits.stride(0), w1.stride(0), w2.stride(0), prev.stride(0), n_chunks,
         ROWS=rows, RP=rp, R=r, BV=bv, ROUND_BF16=w2.dtype == torch.bfloat16, IEEE=w2.dtype == torch.float32,
         num_warps=4,
     )
