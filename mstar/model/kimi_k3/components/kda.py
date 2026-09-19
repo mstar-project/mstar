@@ -158,9 +158,10 @@ class TorchKDAKernels:
                 g_log, torch.sigmoid(beta_raw[rows_i].float()), state, p.scale,
             )
             out[rows_i] = o.to(out.dtype)
-            spec.prefix[slot].copy_(x.to(spec.prefix.dtype))
-            spec.g[slot].copy_(g_raw[rows_i].to(spec.g.dtype))
-            spec.beta[slot].copy_(beta_raw[rows_i].to(spec.beta.dtype))
+            # the block becomes the pending prefix (a shorter block fills the leading slots)
+            spec.prefix[slot, :k1].copy_(x.to(spec.prefix.dtype))
+            spec.g[slot, :k1].copy_(g_raw[rows_i].to(spec.g.dtype))
+            spec.beta[slot, :k1].copy_(beta_raw[rows_i].to(spec.beta.dtype))
         return out
 
 
