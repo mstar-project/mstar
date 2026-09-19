@@ -326,8 +326,6 @@ class APIServer:
         since the conductor's per-request seed is derived from
         ``hash(request_id)``); otherwise a fresh uuid4 is generated.
         """
-        if self.fatal_error is not None:
-            raise HTTPException(status_code=503, detail=self.fatal_error)
         if request_id is None:
             request_id = str(uuid.uuid4())
 
@@ -337,6 +335,8 @@ class APIServer:
 
         # Register pending request
         with self.request_lock:
+            if self.fatal_error is not None:
+                raise HTTPException(status_code=503, detail=self.fatal_error)
             self.pending_requests[request_id] = PendingRequest(
                 streaming=streaming,
                 input_modalities=input_modalities,
