@@ -27,7 +27,9 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from mstar.model.kimi_k3.components.common import KimiRMSNorm, ReplicatedLinear
+from mstar.model.kimi_k3.components.common import fused_decode_kernels
 from mstar.model.kimi_k3.dspark.config import DSparkConfig
+from mstar.model.kimi_k3.dspark.markov_kernel import markov_argmax, markov_argmax_workspace
 from mstar.model.kimi_k3.dspark.rope import YarnRotary
 
 DSPARK_KV = "dspark_kv"
@@ -270,8 +272,18 @@ class DSparkDraft(nn.Module):
     def markov_sample(self, logits: torch.Tensor, bonus: torch.Tensor) -> torch.Tensor:
         """Greedy left-to-right drafting: ``logits [rows, k, V]`` (position ``i`` predicts the token
         after query ``i``), each corrected by the Markov bias of the previously drafted token
-        (the bonus first). Returns ``drafts [rows, k]``."""
-        rows, k, _ = logits.shape
+        (the bonus first). Returns ``drafts [rows, k]``. On CUDA each step is two launches
+        (``markov_kernel``); the torch spelling below is the reference."""
+        rows, k, v = logits.shape
+        w1, w2 = self.markov_head.markov_w1.weight, self.markov_head.markov_w2.weight
+        if logits.is_cuda and fused_decode_kernels() and w1.shape[1] % 16 == 0:
+            drafts = torch.empty(rows, k, dtype=torch.long, device=logits.device)
+            workspace = markov_argmax_workspace(rows, v, logits.device)
+            prev = bonus.view(rows)
+            for i in range(k):
+                markov_argmax(logits[:, i], prev, w1, w2, drafts[:, i], workspace)
+                prev = drafts[:, i]
+            return drafts
         drafts = []
         prev = bonus.view(rows)
         for i in range(k):
