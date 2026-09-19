@@ -88,6 +88,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[orpheus]``
      - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+   * - ``.[omnivoice]``
+     - OmniVoice TTS. The extra is empty on purpose: the runtime is the
+       ``omnivoice`` package, installed separately from git —
+       see `omnivoice (OmniVoice)`_.
    * - ``.[pi05]``
      - Pi0.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``.
@@ -144,6 +148,28 @@ The GPU model families depend on:
 Apart from ``flash-attn``, these are installed by the extras above. Your installed ``torch``
 must match your system CUDA toolkit — ``--torch-backend=auto`` handles that for you (next
 section).
+
+omnivoice (OmniVoice)
+---------------------
+
+``omnivoice`` is only needed for **OmniVoice**, and it is **not** pulled in by
+``.[omnivoice]`` or ``.[all]`` — you install it as a separate step:
+
+.. code-block:: bash
+
+   uv pip install "git+https://github.com/k2-fsa/OmniVoice.git"
+
+It has to come from git rather than PyPI: the released package has no
+``omnivoice.models.omnivoice_flashinfer``, and that is the packed-attention
+forward mstar's graph calls, so a PyPI install fails at model load with
+``ImportError: cannot import name 'omnivoice_flashinfer'``. A direct git URL
+cannot live in ``pyproject.toml`` either, because PyPI rejects any
+``requires_dist`` entry carrying one, which is why this is an install step
+and not a dependency. Verify with:
+
+.. code-block:: bash
+
+   python -c "from omnivoice.models import omnivoice_flashinfer; print('ok')"
 
 flash-attn (Qwen3-Omni)
 -----------------------
