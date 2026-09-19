@@ -21,8 +21,9 @@ def test_markov_step_matches_torch(dtype, rank, rows, v):
     logits = torch.randn(rows, 3, v, device=DEV).to(dtype)[:, 1]  # a column of a [rows, k, V] block: strided rows
     w1 = (torch.randn(v, rank, device=DEV) * 0.1).to(dtype)
     w2 = (torch.randn(v, rank, device=DEV) * 0.1).to(dtype)
-    prev = torch.randint(0, v, (rows,), device=DEV)
     out = torch.empty(rows, 2, dtype=torch.long, device=DEV)
+    out[:, 0] = torch.randint(0, v, (rows,), device=DEV)
+    prev = out[:, 0]  # the previous drafts are a column of the drafts matrix: a strided view
     markov_argmax(logits, prev, w1, w2, out[:, 1], markov_argmax_workspace(rows, v, DEV))
     ref = reference(logits, prev, w1, w2)
     same = (out[:, 1] == ref).float().mean().item()
@@ -30,7 +31,6 @@ def test_markov_step_matches_torch(dtype, rank, rows, v):
         assert same == 1.0, (out[:, 1].tolist(), ref.tolist())
     else:
         assert same >= 0.9, same  # a bf16 rounding boundary in the bias can move a near-tied argmax
-    assert torch.all(out[:, 0] == 0) or True  # the other column is untouched (uninitialised, so only the shape matters)
 
 
 def test_markov_step_breaks_ties_at_the_lowest_index():
