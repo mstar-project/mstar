@@ -45,6 +45,7 @@ from mstar.model.kimi_k3.components.common import (
 from mstar.model.kimi_k3.reference.moe import routed_experts_loop
 from mstar.model.kimi_k3.reference.mxfp4 import MXFP4_GROUP, dequant_mxfp4
 from mstar.model.kimi_k3.components.common import fused_decode_kernels
+from mstar.utils.streams import Fork
 from mstar.model.kimi_k3.components.router_kernel import fused_route, fused_route_supported, gate_logits
 from mstar.model.kimi_k3.reference.router import noaux_tc_route
 
@@ -238,6 +239,7 @@ class KimiLatentMoE(nn.Module):
         # a converted-weight expert backend (FlashInfer CUTLASS or Marlin) once
         # prepare_experts_backend() ran; it owns the routed forward from then on
         self._backend = None
+        self._fork_in, self._fork_experts = Fork(), Fork()
         self._attach_loaders()
 
     def _attach_loaders(self) -> None:
@@ -368,6 +370,20 @@ class KimiLatentMoE(nn.Module):
         same view out of the merged projection)."""
         return self._latent(self.in_proj(x.reshape(-1, self.hidden_size)))
 
+    def _routed_reduced(self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+        """The routed experts' output summed over the ranks: this rank's partial (over its
+        intermediate shard and/or its experts) written straight into the symmetric all-reduce
+        buffer when that path applies (no copy launch), then reduced."""
+        buf = self.comm_group.symm_buffer(z.shape, z.dtype, z.device)
+        y = self._routed(z, topk_idx, topk_weight, out=buf)
+        if buf is not None:
+            if y is not buf:
+                buf.copy_(y)
+            return self.comm_group.all_reduce_symm_buffer(buf)
+        if self.comm_group.world_size > 1:
+            y = self.comm_group.all_reduce(y)
+        return y
+
     def _shared(self, mixed: torch.Tensor) -> torch.Tensor:
         """Shared experts' partial ``[T, hidden]`` from the merged projection's gate | up block (a
         strided view: the SiTU kernel takes the row stride)."""
@@ -377,19 +393,14 @@ class KimiLatentMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.hidden_size)
-        topk_idx, topk_weight = self.gate(x)
-        mixed = self.in_proj(x)
+        # the router and the merged projection read the same input: two streams under a capture
+        (topk_idx, topk_weight), mixed = self._fork_in.run(lambda: self.gate(x), lambda: self.in_proj(x))
         z = self._latent(mixed)
-        # this rank's partial sum (over its intermediate shard and/or its experts); the fused backends
-        # write it straight into the symmetric all-reduce buffer when that path applies (no copy launch)
-        buf = self.comm_group.symm_buffer(z.shape, z.dtype, z.device)
-        y = self._routed(z, topk_idx, topk_weight, out=buf)
-        if buf is not None:
-            if y is not buf:
-                buf.copy_(y)
-            y = self.comm_group.all_reduce_symm_buffer(buf)
-        elif self.comm_group.world_size > 1:
-            y = self.comm_group.all_reduce(y)
+        # the shared experts only need the projection: they run beside the routed path
+        y, s_out = self._fork_experts.run(
+            lambda: self._routed_reduced(z, topk_idx, topk_weight),
+            lambda: self._shared(mixed) if self.shared_experts is not None else None,  # partial over the intermediate shards
+        )
         if self.routed_expert_norm is not None:
             y = self.routed_expert_norm(y)
         # partial over the latent shards: this rank's columns of the latent, a view the GEMM reads with
@@ -399,7 +410,6 @@ class KimiLatentMoE(nn.Module):
         if not fused_decode_kernels():
             y = y.contiguous()
         if self.shared_experts is not None:
-            s_out = self._shared(mixed)  # partial over the intermediate shards
             buf = self.comm_group.symm_buffer((y.shape[0], self.hidden_size), y.dtype, y.device)
             if buf is not None and fused_decode_kernels():
                 # the up-projection accumulates onto the shared partial, straight into the all-reduce
