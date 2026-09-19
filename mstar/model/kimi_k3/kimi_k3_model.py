@@ -102,6 +102,8 @@ class KimiK3Model(Model):
                 raise ValueError("the draft shares the target's embedding and head: hidden sizes must match")
         cap = kwargs.get("max_capture_batch_size")
         self.max_capture_batch_size = int(cap) if cap is not None else None
+        # cuda_graphs: false serves every step eagerly (profiling with op attribution, kernel debugging)
+        self.cuda_graphs = bool(kwargs.get("cuda_graphs", True))
         # requests per prefill step (the scheduler splits larger groups); None lifts the cap
         pre = kwargs.get("max_prefill_batch_size", 8)
         self.max_prefill_batch_size = int(pre) if pre is not None else None
@@ -361,7 +363,10 @@ class KimiK3Model(Model):
             graph_safe = graph_safe and flashinfer_mla_supports(d.kv_lora_rank, d.qk_rope_head_dim)
             logger.info("Loaded the DSpark draft (%d layers, %d drafts per step) on %s", d.num_hidden_layers,
                         self.speculative_tokens, device)
-        submodule = KimiK3LLMSubmodule(language_model=language_model, config=self.config, cuda_graphs=graph_safe,
+        if not self.cuda_graphs:
+            logger.info("Kimi K3: CUDA graphs off by configuration, decode runs eagerly")
+        submodule = KimiK3LLMSubmodule(language_model=language_model, config=self.config,
+                                       cuda_graphs=graph_safe and self.cuda_graphs,
                                        max_capture_batch_size=self.max_capture_batch_size,
                                        max_prefill_batch_size=self.max_prefill_batch_size,
                                        mixed_prefill_decode=self.mixed_prefill_decode,
