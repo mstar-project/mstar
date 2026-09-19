@@ -397,14 +397,21 @@ class KimiLatentMoE(nn.Module):
         y = y.narrow(-1, up.tp_rank * up.input_size_per_partition, up.input_size_per_partition)
         if not fused_decode_kernels():
             y = y.contiguous()
-        y = up(y)
         if self.shared_experts is not None:
             s_out = self._shared(mixed)  # partial over the intermediate shards
-            buf = self.comm_group.symm_buffer(y.shape, y.dtype, y.device)
+            buf = self.comm_group.symm_buffer((y.shape[0], self.hidden_size), y.dtype, y.device)
+            if buf is not None and fused_decode_kernels():
+                # the up-projection accumulates onto the shared partial, straight into the all-reduce
+                # buffer: the GEMM and the add in one launch, one rounding
+                torch.addmm(s_out, y, up.weight.t(), out=buf)
+                return self.comm_group.all_reduce_symm_buffer(buf).view(shape)
+            y = up(y)
             if buf is not None:  # the add lands in the all-reduce buffer: no copy launch
                 torch.add(y, s_out, out=buf)
                 return self.comm_group.all_reduce_symm_buffer(buf).view(shape)
             y = y + s_out
+        else:
+            y = up(y)
         if self.comm_group.world_size > 1:
             y = self.comm_group.all_reduce(y)
         return y.view(shape)
