@@ -17,11 +17,11 @@ The ids have to differ. A worker defers ``REMOVE_REQUEST`` while a step is in
 flight and keys the deferral on the rid alone, so reusing an id lets the first
 request's teardown land on the second and drop its in-flight reads.
 
-``--concurrent-waves`` switches to the two-world isolation gate: two distinct
-solo baselines are replayed concurrently through separate SDK clients, then
-checked byte-for-byte across repeated world reuse. Optional memory sampling
-tracks only the server process group and excludes the first concurrent wave as
-allocator warmup.
+``--concurrent-waves`` switches to the N-stream isolation gate, N = ``--worlds``:
+N distinct solo baselines are replayed concurrently through separate SDK
+clients, then checked byte-for-byte across repeated world reuse. Optional
+memory sampling tracks only the server process group and excludes the first
+concurrent wave as allocator warmup.
 
 Deployment details that the checked-in config cannot carry are supplied here
 rather than edited into it:
@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import yaml
 
 REPO = Path(__file__).resolve().parents[2]
@@ -130,14 +131,20 @@ def _run_config(
     ae_path: Path | None,
     out: Path,
     worlds: int = 1,
+    batch: int = 1,
 ) -> Path:
     """Build one deployment config without modifying the checked-in YAML."""
     if worlds < 1:
         raise ValueError(f"worlds must be positive; got {worlds}")
+    if batch < 1:
+        raise ValueError(f"batch must be positive; got {batch}")
+    if batch > worlds:
+        raise ValueError(f"batch ({batch}) must be <= worlds ({worlds})")
     config = yaml.safe_load(base.read_text())
     model_kwargs = {
         **(config.get("model_kwargs") or {}),
         "variant": variant.model_variant,
+        "step_batch_size": batch,
     }
     # Hub mode passes None for these and must not inherit a local override from
     # the base config: omitting checkpoint_dir is what exercises the registry's
@@ -226,15 +233,24 @@ def _rollout(
     return chunks
 
 
+def _wave_labels(n: int) -> tuple[str, ...]:
+    """Stream labels "A", "B", "C", ... for a wave of ``n`` concurrent streams."""
+    if n < 1:
+        raise ValueError(f"n must be positive; got {n}")
+    if n > 26:
+        raise ValueError(f"concurrent isolation gate supports at most 26 streams; got {n}")
+    return tuple(chr(ord("A") + i) for i in range(n))
+
+
 def _concurrent_rollouts(
     client_factory: Callable[[], MStarClient],
     seed: Path,
     num_steps: int,
-    specs: tuple[RolloutSpec, RolloutSpec],
+    specs: tuple[RolloutSpec, ...],
 ) -> dict[str, list[VideoFrameChunk]]:
-    """Start exactly two lazy SDK streams together, each on its own Session."""
-    barrier = threading.Barrier(3)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+    """Start ``len(specs)`` lazy SDK streams together, each on its own Session."""
+    barrier = threading.Barrier(len(specs) + 1)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(specs)) as executor:
         futures = {
             spec.label: executor.submit(
                 _rollout,
@@ -255,10 +271,79 @@ def _video_bytes(chunks: list[VideoFrameChunk]) -> bytes:
     return b"".join(chunk.data for chunk in chunks)
 
 
-def _dit_schedule(log_text: str, request_ids: set[str]) -> list[str]:
-    """Extract single-request DiT rollout executions from worker DEBUG logs."""
+def _pixel_diff_summary(actual: bytes, expected: bytes, chunk_size: int) -> str:
+    """Summarize a byte-for-byte mismatch between two uint8 RGB24 video streams."""
+    if len(actual) != len(expected):
+        return f"length mismatch: actual={len(actual)} bytes, expected={len(expected)} bytes"
+    max_abs_diff = 0
+    num_differing = 0
+    for a, b in zip(actual, expected):
+        diff = a - b if a > b else b - a
+        if diff:
+            num_differing += 1
+            if diff > max_abs_diff:
+                max_abs_diff = diff
+    num_chunks = len(actual) // chunk_size
+    chunks_differing = sum(
+        1
+        for i in range(num_chunks)
+        if actual[i * chunk_size : (i + 1) * chunk_size] != expected[i * chunk_size : (i + 1) * chunk_size]
+    )
+    fraction = num_differing / len(actual) if actual else 0.0
+    return (
+        f"max abs diff={max_abs_diff}, fraction of bytes differing={fraction:.6f}, "
+        f"chunks differing={chunks_differing}/{num_chunks}"
+    )
+
+
+# measured 2026-09-17, 360p, 16 steps: a 1-bf16-ulp noise perturbation of a
+# solo run gives PSNR 45.6->43.4 dB over the first 4 frames and 29 dB by frame
+# 15; floors sit ~5 dB and ~4 dB under that envelope. Provisional: one
+# calibration, one variant.
+EARLY_PSNR_FLOOR_DB = 38.0
+LATE_PSNR_FLOOR_DB = 25.0
+
+
+def _chunk_psnr_db(actual: bytes, expected: bytes, chunk_size: int) -> list[float]:
+    """Per-chunk PSNR (dB) between two same-length uint8 RGB24 video streams; inf where identical."""
+    num_chunks = len(actual) // chunk_size
+    psnr = []
+    for i in range(num_chunks):
+        a = np.frombuffer(actual[i * chunk_size : (i + 1) * chunk_size], dtype=np.uint8).astype(np.float64)
+        b = np.frombuffer(expected[i * chunk_size : (i + 1) * chunk_size], dtype=np.uint8).astype(np.float64)
+        mse = np.mean((a - b) ** 2)
+        psnr.append(float("inf") if mse == 0 else float(10 * np.log10(255.0**2 / mse)))
+    return psnr
+
+
+def _batched_tolerance_failure(actual: bytes, expected: bytes, chunk_size: int) -> str | None:
+    """Tolerance gate for --batch > 1: chunks are allowed to differ, but must stay within the
+    PSNR envelope of a 1-bf16-ulp noise perturbation (see EARLY_PSNR_FLOOR_DB/LATE_PSNR_FLOOR_DB)."""
+    if len(actual) != len(expected):
+        return f"length mismatch: actual={len(actual)} bytes, expected={len(expected)} bytes"
+    psnr = _chunk_psnr_db(actual, expected, chunk_size)
+    first = next((i for i, p in enumerate(psnr) if p != float("inf")), None)
+    if first is None:
+        return None
+    for i in range(first, min(first + 4, len(psnr))):
+        if psnr[i] < EARLY_PSNR_FLOOR_DB:
+            return (
+                f"chunk {i} psnr={psnr[i]:.1f}dB below early floor {EARLY_PSNR_FLOOR_DB}dB "
+                f"(first differing chunk={first})"
+            )
+    for i in range(first, len(psnr)):
+        if psnr[i] < LATE_PSNR_FLOOR_DB:
+            return (
+                f"chunk {i} psnr={psnr[i]:.1f}dB below late floor {LATE_PSNR_FLOOR_DB}dB "
+                f"(first differing chunk={first})"
+            )
+    return None
+
+
+def _dit_schedule(log_text: str, request_ids: set[str]) -> list[tuple[str, ...]]:
+    """Extract DiT rollout executions (any batch size) from worker DEBUG logs."""
     marker = "Executing: dit graph_walk=rollout "
-    scheduled: list[str] = []
+    scheduled: list[tuple[str, ...]] = []
     for line in log_text.splitlines():
         if marker not in line:
             continue
@@ -266,41 +351,70 @@ def _dit_schedule(log_text: str, request_ids: set[str]) -> list[str]:
             batch = ast.literal_eval(line.split(marker, 1)[1].strip())
         except (SyntaxError, ValueError):
             continue
-        if (
-            isinstance(batch, (list, tuple))
-            and len(batch) == 1
-            and batch[0] in request_ids
-        ):
-            scheduled.append(batch[0])
+        if not isinstance(batch, (list, tuple)):
+            continue
+        filtered = tuple(rid for rid in batch if rid in request_ids)
+        if filtered:
+            scheduled.append(filtered)
     return scheduled
 
 
-def _interleaving_failure(log_text: str, request_ids: tuple[str, str]) -> str | None:
-    """Require an A/B/A or B/A/B DiT schedule, not just overlapping clients."""
+def _interleaving_failure(log_text: str, request_ids: tuple[str, ...]) -> str | None:
+    """Require a batched step, or some rid reappearing after a different rid in
+    the single-request DiT schedule, not just overlapping clients."""
     scheduled = _dit_schedule(log_text, set(request_ids))
-    compressed = [rid for i, rid in enumerate(scheduled) if i == 0 or rid != scheduled[i - 1]]
-    interleaved = any(
-        first == third and first != second
-        for first, second, third in zip(compressed, compressed[1:], compressed[2:], strict=False)
-    )
+    if any(len(batch) > 1 for batch in scheduled):
+        return None
+    singles = [batch[0] for batch in scheduled if len(batch) == 1]
+    compressed = [rid for i, rid in enumerate(singles) if i == 0 or rid != singles[i - 1]]
+    interleaved = len(set(compressed)) != len(compressed)
     if interleaved:
         return None
-    counts = {rid: scheduled.count(rid) for rid in request_ids}
+    counts = {rid: sum(1 for batch in scheduled if rid in batch) for rid in request_ids}
     return (
-        f"worker DEBUG schedule did not contain A/B/A interleaving for {request_ids}; DiT schedule counts were {counts}"
+        f"worker DEBUG schedule did not contain A/B/A-style interleaving for {request_ids}; "
+        f"DiT schedule counts were {counts}"
     )
+
+
+_OVERSHOOT_MARKER = "skipping async-overshoot rollout step"
+
+
+def _vetoed_overshoots(log_text: str, request_ids: set[str]) -> dict[str, int]:
+    """Per rid, the async-overshoot iterations ``prepare_inputs`` vetoed.
+
+    The worker logs ``Executing:`` before ``prepare_inputs`` runs, so the
+    schedule counts one iteration per request that never reached the GPU.
+    """
+    counts = {rid: 0 for rid in request_ids}
+    for line in log_text.splitlines():
+        if _OVERSHOOT_MARKER not in line:
+            continue
+        for rid in request_ids:
+            if f"(request {rid} runs" in line:
+                counts[rid] += 1
+    return counts
 
 
 def _execution_count_failure(
     log_text: str,
-    request_ids: tuple[str, str],
+    request_ids: tuple[str, ...],
     num_steps: int,
 ) -> str | None:
+    """Every request ran its DiT step exactly ``num_steps`` times: scheduled
+    executions minus the vetoed overshoot iterations."""
     scheduled = _dit_schedule(log_text, set(request_ids))
-    counts = {rid: scheduled.count(rid) for rid in request_ids}
+    vetoed = _vetoed_overshoots(log_text, set(request_ids))
+    counts = {
+        rid: sum(1 for batch in scheduled if rid in batch) - vetoed[rid]
+        for rid in request_ids
+    }
     if all(count == num_steps for count in counts.values()):
         return None
-    return f"expected {num_steps} DiT rollout executions per request; got {counts}"
+    return (
+        f"expected {num_steps} DiT rollout forwards per request; got {counts} "
+        f"(vetoed overshoots {vetoed})"
+    )
 
 
 _CLEANUP_MARKER = "Request cleanup complete:"
@@ -711,10 +825,16 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=112464007)
     parser.add_argument("--worlds", type=int, default=1)
     parser.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help="rows per rollout step (model_kwargs.step_batch_size); must be <= --worlds",
+    )
+    parser.add_argument(
         "--concurrent-waves",
         type=int,
         default=0,
-        help="run the two-world isolation gate for this many waves (minimum 2)",
+        help="run the N-stream isolation gate (N = --worlds) for this many waves (minimum 2)",
     )
     parser.add_argument("--measure-memory", action="store_true")
     parser.add_argument(
@@ -737,12 +857,16 @@ def main() -> int:
 
     if args.worlds < 1:
         parser.error("--worlds must be positive")
+    if args.batch < 1:
+        parser.error("--batch must be positive")
+    if args.batch > args.worlds:
+        parser.error("--batch must be <= --worlds")
     if args.concurrent_waves < 0:
         parser.error("--concurrent-waves cannot be negative")
     if args.concurrent_waves == 1:
         parser.error("--concurrent-waves must be 0 or at least 2")
-    if args.concurrent_waves and args.worlds != 2:
-        parser.error("the concurrent isolation gate requires exactly --worlds 2")
+    if args.concurrent_waves and args.worlds < 2:
+        parser.error("the concurrent isolation gate needs at least --worlds 2")
     if args.measure_memory and args.concurrent_waves < 3:
         parser.error("--measure-memory needs at least 3 concurrent waves (one warm, two measured)")
     if args.measure_memory and args.physical_gpu is None:
@@ -773,6 +897,7 @@ def main() -> int:
         ae_path,
         workdir / "run.yaml",
         worlds=args.worlds,
+        batch=args.batch,
     )
     seed = _seed_png(args.seed_image, variant, workdir / "seed.png")
     path = str(REPO)
@@ -845,9 +970,10 @@ def main() -> int:
             else:
                 print(f"repeat is byte-identical over {len(first)} bytes of video")
         else:
-            baseline_specs = (
-                RolloutSpec("A", f"{args.request_id}-solo-a", args.seed),
-                RolloutSpec("B", f"{args.request_id}-solo-b", args.seed + 1),
+            labels = _wave_labels(args.worlds)
+            baseline_specs = tuple(
+                RolloutSpec(label, f"{args.request_id}-solo-{label.lower()}", args.seed + i)
+                for i, label in enumerate(labels)
             )
             baselines: dict[str, bytes] = {}
             for spec in baseline_specs:
@@ -869,20 +995,26 @@ def main() -> int:
 
             if not all(baselines.values()):
                 failures.append("a solo baseline returned no video")
-            elif baselines["A"] == baselines["B"]:
-                failures.append("distinct solo seeds produced identical baselines, so world swaps are invisible")
+            else:
+                for i, label_i in enumerate(labels):
+                    for label_j in labels[i + 1 :]:
+                        if baselines[label_i] == baselines[label_j]:
+                            failures.append(
+                                f"distinct solo seeds produced identical baselines for {label_i} and "
+                                f"{label_j}, so world swaps are invisible"
+                            )
 
             wave_memory: list[WaveMemory] = []
             interleaved_waves = 0
             for wave in range(1, args.concurrent_waves + 1):
                 phase = f"concurrent-wave-{wave}"
-                specs = (
-                    RolloutSpec("A", f"{args.request_id}-wave-{wave}-a", args.seed),
-                    RolloutSpec("B", f"{args.request_id}-wave-{wave}-b", args.seed + 1),
+                specs = tuple(
+                    RolloutSpec(label, f"{args.request_id}-wave-{wave}-{label.lower()}", args.seed + i)
+                    for i, label in enumerate(labels)
                 )
                 if sampler is not None:
                     sampler.set_phase(phase)
-                print(f"--- {phase}: {specs[0].request_id} + {specs[1].request_id} ---")
+                print(f"--- {phase}: {' + '.join(spec.request_id for spec in specs)} ---")
                 log_offset = args.log.stat().st_size
                 chunks_by_label = _concurrent_rollouts(
                     lambda: MStarClient(url, timeout=args.request_timeout),
@@ -897,8 +1029,34 @@ def main() -> int:
                         for failure in _check(chunks, args.steps, variant.height, variant.width)
                     ]
                     actual = _video_bytes(chunks)
-                    if actual != baselines[spec.label]:
-                        failures.append(f"{phase} {spec.label} differs byte-for-byte from its solo baseline")
+                    baseline = baselines[spec.label]
+                    chunk_size = 4 * variant.height * variant.width * 3
+                    if args.batch == 1:
+                        if actual != baseline:
+                            failures.append(f"{phase} {spec.label} differs byte-for-byte from its solo baseline")
+                            print(
+                                f"  {phase} {spec.label} pixel diff: "
+                                f"{_pixel_diff_summary(actual, baseline, chunk_size)}"
+                            )
+                    else:
+                        tolerance_failure = _batched_tolerance_failure(actual, baseline, chunk_size)
+                        if tolerance_failure is not None:
+                            failures.append(f"{phase} {spec.label} {tolerance_failure}")
+                            print(
+                                f"  {phase} {spec.label} pixel diff: "
+                                f"{_pixel_diff_summary(actual, baseline, chunk_size)}"
+                            )
+
+                    if len(actual) == len(baseline):
+                        psnr = _chunk_psnr_db(actual, baseline, chunk_size)
+                        first = next((i for i, p in enumerate(psnr) if p != float("inf")), None)
+                    else:
+                        psnr, first = [], None
+                    psnr_str = "[" + ", ".join("inf" if p == float("inf") else f"{p:.1f}" for p in psnr) + "]"
+                    print(
+                        f"  {phase} {spec.label} first differing chunk={first if first is not None else 'none'} "
+                        f"psnr/chunk={psnr_str}"
+                    )
 
                 rids = tuple(spec.request_id for spec in specs)
                 _wait_for_cleanup(

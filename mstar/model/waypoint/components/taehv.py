@@ -306,11 +306,12 @@ def decode_latent(
             "TAEHV decoder returned "
             f"{decoded.shape[1]} frames for one latent; expected {expected_frames}."
         )
+    B, num_frames = decoded.shape[:2]
     decoded = F.interpolate(
-        decoded[0], size=output_size, mode="bilinear", align_corners=False
-    )[None]
+        decoded.flatten(0, 1), size=output_size, mode="bilinear", align_corners=False
+    ).unflatten(0, (B, num_frames))
     frames = (decoded.clamp(0, 1) * 255).round().to(torch.uint8)
-    frames = frames.squeeze(0).permute(0, 2, 3, 1)[..., :3].contiguous()
+    frames = frames.permute(0, 1, 3, 4, 2)[..., :3].contiguous()
     return frames, state
 
 

@@ -487,6 +487,7 @@ def test_rollout_harness_variant_controls_config_and_checkpoint_default(
     assert generated["model_kwargs"] == {
         "variant": model_variant,
         "compile_dit": True,
+        "step_batch_size": 1,
         "checkpoint_dir": "custom/checkpoint",
         "ae_path": "custom/ae",
     }
@@ -528,6 +529,7 @@ def test_rollout_harness_hub_config_omits_local_overrides_and_forwards_cache(tmp
     assert generated["model_kwargs"] == {
         "compile_dit": True,
         "variant": "waypoint-1.5-1b-360p",
+        "step_batch_size": 1,
     }
     assert generated["max_concurrent_requests"] == 2
     assert generated["resources"]["kv"]["num_worlds"] == 2
@@ -650,6 +652,19 @@ def test_rollout_harness_requires_worker_schedule_interleaving_and_cleanup_marke
         serial, ("rid-a", "rid-b"), 3
     )
 
+    three_way = "\n".join(
+        [
+            "DEBUG Executing: dit graph_walk=rollout ('rid-a', 'rid-b', 'rid-c')",
+            "DEBUG Executing: dit graph_walk=rollout ('rid-a', 'rid-b', 'rid-c')",
+            "DEBUG Executing: dit graph_walk=rollout ('rid-a', 'rid-b', 'rid-c')",
+            "INFO Waypoint dit: skipping async-overshoot rollout step 2 (request rid-a runs 2 steps)",
+            "INFO Waypoint dit: skipping async-overshoot rollout step 2 (request rid-b runs 2 steps)",
+            "INFO Waypoint dit: skipping async-overshoot rollout step 2 (request rid-c runs 2 steps)",
+        ]
+    )
+    assert interleaving_failure(three_way, ("rid-a", "rid-b", "rid-c")) is None
+    assert harness["_execution_count_failure"](three_way, ("rid-a", "rid-b", "rid-c"), 2) is None
+
 
 def test_rollout_harness_parses_and_filters_memory_telemetry(monkeypatch):
     harness = runpy.run_path(str(Path(__file__).parents[1] / "waypoint" / "serve_rollout.py"))
@@ -750,3 +765,43 @@ def test_waypoint_emits_only_generated_raw_frame_chunks():
             num_steps=1,
             actions=[{}],
         )
+
+
+def test_rollout_harness_batched_tolerance_gate_allows_bounded_psnr_drift():
+    harness = runpy.run_path(str(Path(__file__).parents[1] / "waypoint" / "serve_rollout.py"))
+    batched_tolerance_failure = harness["_batched_tolerance_failure"]
+    chunk_size = 12
+    base = bytes([100] * chunk_size)
+
+    def shifted(delta):
+        return bytes((b + delta) & 0xFF for b in base)
+
+    # (a) identical bytes -> pass
+    identical = base * 2
+    assert batched_tolerance_failure(identical, identical, chunk_size) is None
+
+    # (b) chunk 0 identical, chunk 1 off by +1 everywhere (PSNR 48.1) -> within both floors
+    expected_b = base * 2
+    actual_b = base + shifted(1)
+    assert batched_tolerance_failure(actual_b, expected_b, chunk_size) is None
+
+    # (c) chunk 1 off by +10 everywhere (PSNR 28.1) -> below the 38 dB early floor
+    actual_c = base + shifted(10)
+    failure_c = batched_tolerance_failure(actual_c, expected_b, chunk_size)
+    assert failure_c is not None
+    assert "chunk 1" in failure_c
+    assert "38.0" in failure_c
+
+    # (d) chunk 0 identical, chunks 1-4 off by +1, chunk 5 off by +20 (PSNR 22.1)
+    expected_d = base * 6
+    actual_d = base + shifted(1) * 4 + shifted(20)
+    failure_d = batched_tolerance_failure(actual_d, expected_d, chunk_size)
+    assert failure_d is not None
+    assert "chunk 5" in failure_d
+    assert "25.0" in failure_d
+
+    # (e) length mismatch
+    failure_e = batched_tolerance_failure(base, base * 2, chunk_size)
+    assert failure_e is not None
+    assert str(len(base)) in failure_e
+    assert str(len(base) * 2) in failure_e

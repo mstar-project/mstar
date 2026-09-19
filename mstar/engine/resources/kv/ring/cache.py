@@ -144,8 +144,8 @@ class LayerRingCache:
         *,
         build_visibility: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """``kv`` is ``[2, 1, H_kv, tokens_per_frame, D]`` for exactly one frame
-        of one world;
+        """``kv`` is ``[2, 1, H_kv, B*tokens_per_frame, D]``, one frame for
+        each of ``B`` worlds;
         ``commit`` writes the frame into its ring slot; without it the frame
         lands in that world's scratch tail only, visible to itself and to
         nothing later.
@@ -155,36 +155,48 @@ class LayerRingCache:
         tokens = self.tokens_per_frame
 
         if not torch.compiler.is_compiling():
+            # Shape-checked before indexing into it: a malformed frame_pos
+            # (e.g. the old [] scalar) must raise this message, not an
+            # IndexError out of `frame_pos.shape[0]` below.
             torch._check(
-                kv.size(3) == tokens,
-                lambda: f"ring cache expects exactly one frame per upsert; got {kv.size(3)} tokens",
-            )
-            torch._check(
-                frame_pos.ndim == 0 and frame_pos.dtype == torch.int64,
-                lambda: f"frame_pos must be a [] int64 tensor; got {tuple(frame_pos.shape)} "
+                frame_pos.ndim == 1 and frame_pos.dtype == torch.int64,
+                lambda: f"frame_pos must be a [B] int64 tensor; got {tuple(frame_pos.shape)} "
                 f"{frame_pos.dtype}",
             )
-            torch._check(
-                tuple(world_idx.shape) == (1,) and world_idx.dtype == torch.int64,
-                lambda: f"world_idx must be a [1] int64 tensor; got "
-                f"{tuple(world_idx.shape)} {world_idx.dtype}",
-            )
-        world_base = world_idx * self.capacity
-        bucket = (frame_pos + (self.pinned_dilation - 1)) // self.pinned_dilation
-        slot = bucket % self.ring_buckets
-        ring_idx = self.frame_offsets + slot * tokens + world_base
-        current_idx = self._current_base + world_base
-        ring_scatter(self.kv, self.written, current_idx, kv, False)
+        B = frame_pos.shape[0]
 
-        write_step = frame_pos.remainder(self.pinned_dilation) == 0
+        if not torch.compiler.is_compiling():
+            torch._check(
+                kv.size(3) == B * tokens,
+                lambda: f"ring cache expects exactly one frame per world; got "
+                f"{kv.size(3)} tokens for B={B}",
+            )
+            torch._check(
+                world_idx.shape == frame_pos.shape and world_idx.dtype == torch.int64,
+                lambda: f"world_idx must be a {list(frame_pos.shape)} int64 tensor matching "
+                f"frame_pos; got {tuple(world_idx.shape)} {world_idx.dtype}",
+            )
+        world_base = world_idx * self.capacity  # [B]
+        bucket = (frame_pos + (self.pinned_dilation - 1)) // self.pinned_dilation
+        slot = bucket % self.ring_buckets  # [B]
+        ring_idx = self.frame_offsets[None] + (slot * tokens + world_base)[:, None]  # [B, T]
+        current_idx = self._current_base[None] + world_base[:, None]  # [B, T]
+        ring_scatter(self.kv, self.written, current_idx.flatten(), kv, False)
+
+        write_step = frame_pos.remainder(self.pinned_dilation) == 0  # [B]
         mask_written = self._mask_written
         if build_visibility:
+            torch._check(
+                B == 1,
+                lambda: "ring cache's fallback visibility row only supports B == 1; "
+                "the engine path passes build_visibility=False.",
+            )
             mask_written.copy_(self.written)
             mask_written &= self._world_of_slot == world_idx
-            mask_written[ring_idx] = mask_written[ring_idx] & ~write_step
+            mask_written[ring_idx[0]] = mask_written[ring_idx[0]] & ~write_step
 
         if commit:
-            dst = torch.where(write_step, ring_idx, current_idx)
+            dst = torch.where(write_step[:, None], ring_idx, current_idx).flatten()
             ring_scatter(self.kv, self.written, dst, kv, True)
 
         k, v = self.kv.unbind(0)

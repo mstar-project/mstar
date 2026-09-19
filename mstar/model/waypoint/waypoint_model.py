@@ -39,9 +39,9 @@ or refuse it when they are all taken. That refusal is a backstop, though — see
 ``num_worlds`` and ``max_batch_size`` are separate numbers and stay separate.
 ``num_worlds`` is how many sessions are *resident* (one ring span each, folded
 into the token dimension by ``LayerRingCache``); ``max_batch_size`` is how many
-share one *forward step*, and is still 1, so resident worlds take turns across
-steps rather than batching. Raising the second is the next cut and does not
-change the layout chosen for the first.
+share one *forward step*, set by ``step_batch_size`` (<= ``num_worlds``), so up
+to that many resident worlds batch into one step instead of each taking a
+separate turn.
 """
 
 import logging
@@ -135,6 +135,7 @@ class WaypointModel(Model):
         cuda_graph: bool | None = None,
         capture_dit_prime: bool | None = None,
         full_global_ring: bool | None = None,
+        step_batch_size: int | None = None,
         checkpoint_revision: str | None = None,
         ae_revision: str | None = None,
     ):
@@ -161,6 +162,7 @@ class WaypointModel(Model):
                 "cuda_graph": cuda_graph,
                 "capture_dit_prime": capture_dit_prime,
                 "full_global_ring": full_global_ring,
+                "step_batch_size": step_batch_size,
             }.items() if value is not None
         }
         self.config: WaypointConfig = replace(config, **overrides)
@@ -226,7 +228,8 @@ class WaypointModel(Model):
             # business assuming the box; a deployment raises it under
             # ``resources: {kv: {num_worlds: N}}`` and raises
             # ``max_concurrent_requests`` with it (see ``get_worker_graphs``).
-            # Not the step batch — that is ``max_batch_size``, still 1.
+            # Not the step batch — that is ``max_batch_size``, set by
+            # ``step_batch_size`` (<= num_worlds).
             num_worlds=1,
         )
         # Logged, not merely allocated: this declaration is worth ~816 MiB per
@@ -336,11 +339,11 @@ class WaypointModel(Model):
         what changed is that the accepted value is a range rather than the
         single number 1.
 
-        ``max_batch_size = 1`` does NOT cover this, and that is still true with
-        N worlds. It caps how many requests share one *step*; N admitted
-        rollouts alternate steps, which is now the intended shape — each holds
-        its own world and the BlockMask keeps them apart — but it says nothing
-        about how many may exist, which is the thing the pool bounds.
+        ``max_batch_size`` does NOT cover this, independent of its value. It
+        caps how many requests share one *step* (``step_batch_size``, <=
+        ``num_worlds``); worlds beyond that batch still alternate steps — each
+        holds its own world and the BlockMask keeps them apart — but it says
+        nothing about how many may exist, which is the thing the pool bounds.
 
         A limit *below* ``num_worlds`` is legal and only wasteful: it allocates
         rings (~816 MiB each at 720P) for worlds no request can ever reach, so
@@ -392,6 +395,13 @@ class WaypointModel(Model):
                 "is %d: %d world(s) of ring (~816 MiB each at 720P) are allocated "
                 "and can never be filled.",
                 num_worlds, limit, num_worlds - limit,
+            )
+        if self.config.step_batch_size > num_worlds:
+            raise ValueError(
+                f"`step_batch_size: {self.config.step_batch_size}` exceeds "
+                f"`resources.{KV_RESOURCE}.num_worlds: {num_worlds}` in "
+                f"{config_path}. A step cannot batch more rows than there are "
+                "resident worlds to supply them."
             )
         return super().get_worker_graphs(config_path)
 

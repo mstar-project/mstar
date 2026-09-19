@@ -63,6 +63,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.model.waypoint.components.attention import WaypointAttention
 from mstar.model.waypoint.components.dit import WaypointDiT
+from mstar.model.waypoint.components.taehv import decode_latent, initial_decoder_histories
 from mstar.model.waypoint.config import (
     WaypointConfig,
     waypoint_1_5_1b_360p,
@@ -76,6 +77,7 @@ from mstar.model.waypoint.submodules import (
     ROLLOUT_WALK,
     WaypointDitSubmodule,
     WaypointVaeEncoderSubmodule,
+    _rollout_capture_batch_sizes,
 )
 from mstar.model.waypoint.waypoint_model import (
     DIT_NODE,
@@ -464,6 +466,15 @@ def test_no_prepared_tensor_carries_tokens_per_frame_in_its_shape(
     told the real token count -- so the burden falls here. At 720P nothing
     collides, but the margin is thin: a 256-token-per-frame variant would put
     ``button``'s ``n_buttons = 256`` straight into the crosshairs.
+
+    With ``step_batch_size > 1`` the runner's per-bucket count is
+    ``bs * tokens_per_frame``, and 360p at bs=2 does hit ``n_buttons``. That
+    case is handled on the runner side instead: ``_capture_one`` passes the
+    bucket's own batch size alongside its token count, so ``_seq_dim`` checks
+    dim 0 against both before it ever scans for a coincidental match, and
+    ``button`` shares its buffer like any other per-row tensor (see
+    ``test_cuda_graph_capture.py``, which also covers the case of a caller
+    that can't supply a batch size — that one is still a hard failure).
     """
     inputs = _controller_stream(config, frames=4)
     inputs["latent"] = [torch.zeros((1, 1, *config.latent_shape))]
@@ -905,6 +916,32 @@ def test_binding_without_a_declared_resource_fails_at_bind(submodule):
 
 
 # ---------------------------------------------------------------------------
+# Batch size cap
+# ---------------------------------------------------------------------------
+
+
+def test_max_batch_size_is_step_batch_size_for_both_walks(config):
+    """Both walks carry up to ``step_batch_size`` rows -- prime rows batch
+    too, when several requests are admitted in the same step."""
+    batched = dataclasses.replace(config, step_batch_size=4)
+    with torch.device("meta"):
+        dit = WaypointDiT(batched)
+    dit.cast_serving_dtypes()
+    submodule = WaypointDitSubmodule(dit, _FakeTaehv(), batched)
+
+    assert submodule.max_batch_size(PRIME_WALK) == 4
+    assert submodule.max_batch_size(ROLLOUT_WALK) == 4
+
+
+def test_dit_can_batch_is_true(submodule):
+    """The eager path must batch too. A captured lease replays batched
+    regardless, but with ``can_batch`` False a graphs-off (or uncaptured-shape)
+    multi-row step falls to one forward per request instead of a single batched
+    forward -- the one place the port used to diverge from the other models."""
+    assert submodule.can_batch(batch=None, model_inputs=[]) is True
+
+
+# ---------------------------------------------------------------------------
 # Capture configs
 # ---------------------------------------------------------------------------
 
@@ -926,6 +963,13 @@ def test_both_dit_walks_are_optional_captures(submodule, config):
         assert cfg.capture_forward_method == "forward_batched"
         assert cfg.single_request_inputs.input_seq_len == config.tokens_per_frame
 
+    rollout_cfg, prime_cfg = configs
+    # Both walks' captured buckets are a real ceiling on the eager batch size:
+    # prime now captures the same buckets rollout does, so a prime batch bigger
+    # than the largest captured bucket is refused, not run eager.
+    assert rollout_cfg.caps_eager_batch_size is True
+    assert prime_cfg.caps_eager_batch_size is True
+
     rollout, prime = (cfg.single_request_inputs.tensor_inputs for cfg in configs)
     assert "noise" in rollout and "latent" not in rollout
     assert "latent" in prime and "noise" not in prime
@@ -935,6 +979,42 @@ def test_both_dit_walks_are_optional_captures(submodule, config):
     assert rollout["noise"].shape == prime["latent"].shape
     assert rollout["noise"].dtype == prime["latent"].dtype
     assert submodule.disable_torch_compile is True
+
+
+@pytest.mark.parametrize(
+    "step_batch_size, expected",
+    [
+        (1, [1]),
+        (2, [1, 2]),
+        (3, [1, 2, 3]),
+        (4, [1, 2, 4]),
+        (6, [1, 2, 4, 6]),
+        (8, [1, 2, 4, 8]),
+        (16, [1, 2, 4, 8, 16]),
+    ],
+)
+def test_rollout_capture_batch_sizes_is_geometric(step_batch_size, expected):
+    """Powers of two up to B, then B itself -- so startup grows with log B, not
+    B. B that is itself a power of two ends on it once (no duplicate); a B that
+    is not appends the odd top bucket the padding path rounds up to."""
+    assert _rollout_capture_batch_sizes(step_batch_size) == expected
+
+
+def test_both_walks_capture_the_same_geometric_buckets(config):
+    """With ``step_batch_size > 1`` prime captures the same geometric buckets as
+    rollout and caps eagerly at the top of them, so a multi-request prime batch
+    replays a captured, padded graph rather than re-tracing eagerly."""
+    batched = dataclasses.replace(config, step_batch_size=8)
+    with torch.device("meta"):
+        dit = WaypointDiT(batched)
+    dit.cast_serving_dtypes()
+    submodule = WaypointDitSubmodule(dit, _FakeTaehv(), batched)
+
+    configs = submodule.get_cuda_graph_configs(torch.device("meta"))
+    assert [cfg.capture_graph_walk for cfg in configs] == [ROLLOUT_WALK, PRIME_WALK]
+    for cfg in configs:
+        assert cfg.capture_batch_sizes == [1, 2, 4, 8]
+        assert cfg.caps_eager_batch_size is True
 
 
 def test_dit_prime_capture_can_be_declined_on_its_own(config):
@@ -1159,9 +1239,78 @@ def test_the_fused_decode_turns_one_frame_into_one_raw_clip(decoder, ae_config):
     ))
 
     frames = out["video_output"][0]
-    assert frames.shape == (ae_config.temporal_compression, 360, 640, 3)
+    # forward() is the pre-split batched call (row B=1 here); the engine's
+    # forward_batched drops this leading dim per row before postprocess sees it.
+    assert frames.shape == (1, ae_config.temporal_compression, 360, 640, 3)
     assert frames.dtype == torch.uint8
     decoder.cleanup_request("r0")
+
+
+def test_forward_batched_hands_each_request_its_own_row(decoder, monkeypatch):
+    """``forward`` returns ``{key: [batched_tensor]}``; ``forward_batched`` must
+    index the tensor's rows, not the one-element list around it, and hand row
+    ``i`` to ``request_ids[i]``. ``video_output`` drops the batch dim (what
+    ``postprocess`` consumes); every other key keeps a leading 1 (what
+    ``prepare_inputs`` builds for the next step)."""
+    frames = torch.arange(2 * 4 * 2 * 2 * 3, dtype=torch.uint8).reshape(2, 4, 2, 2, 3)
+    clock = torch.tensor([5, 9])
+    history = torch.arange(2 * 3 * 2 * 2, dtype=torch.float32).reshape(2, 3, 2, 2)
+    monkeypatch.setattr(
+        decoder, "forward",
+        lambda *a, **k: {
+            "video_output": [frames], "clock": [clock], "decoder_history_0": [history],
+        },
+    )
+    engine_inputs = ModelInputsFromEngine(
+        request_ids=["a", "b"],
+        per_request_info={rid: _fwd_info(rid, graph_walk=ROLLOUT_WALK) for rid in "ab"},
+    )
+
+    out = decoder.forward_batched(ROLLOUT_WALK, engine_inputs=engine_inputs)
+
+    assert set(out) == {"a", "b"}
+    for i, rid in enumerate("ab"):
+        assert torch.equal(out[rid]["video_output"][0], frames[i])
+        assert torch.equal(out[rid]["clock"][0], clock[i : i + 1])
+        assert torch.equal(out[rid]["decoder_history_0"][0], history[i : i + 1])
+        assert all(isinstance(v[0], torch.Tensor) for v in out[rid].values())
+
+
+def test_decode_latent_batches_rows_independently(taehv_weights, ae_config):
+    """``decode_latent`` at B=2 equals two independent B=1 calls, row for row.
+
+    MemBlock and TGrow (``_FakeTaehv``'s decoder) are convs/reshapes that never
+    mix across the batch dim, so nothing here should make row 1 depend on row
+    0's latent -- the property the batched engine path now relies on.
+    """
+    latent_shape = (1, ae_config.channels, *ae_config.latent_shape[1:])
+    generator = torch.Generator().manual_seed(7)
+    latents = [
+        torch.randn(latent_shape, generator=generator).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    histories = [initial_decoder_histories(taehv_weights, latent) for latent in latents]
+
+    solo = [
+        decode_latent(
+            taehv_weights, latent, history, output_size=(360, 640), initialize=True,
+        )
+        for latent, history in zip(latents, histories)
+    ]
+
+    batched_latent = torch.cat(latents, dim=0)
+    batched_histories = tuple(
+        torch.cat([histories[0][idx], histories[1][idx]], dim=0) for idx in range(9)
+    )
+    batched_frames, batched_state = decode_latent(
+        taehv_weights, batched_latent, batched_histories, output_size=(360, 640), initialize=True,
+    )
+
+    assert batched_frames.shape == (2, ae_config.temporal_compression, 360, 640, 3)
+    for row, (solo_frames, solo_state) in enumerate(solo):
+        assert torch.equal(batched_frames[row], solo_frames[0])
+        for idx in range(9):
+            assert torch.equal(batched_state[idx][row], solo_state[idx][0])
 
 
 def test_prime_and_rollout_use_the_same_fixed_tensor_histories(decoder, ae_config):

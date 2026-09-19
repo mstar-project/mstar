@@ -223,3 +223,170 @@ def test_benchmark_cli_derives_stall_threshold_and_has_no_release_gate(benchmark
         action.dest.startswith("release")
         for action in benchmark["_build_parser"]()._actions
     )
+
+
+def test_streams_worlds_and_batch_default_to_one_without_the_new_flags(benchmark):
+    """--streams 1 (today's only mode) must keep worlds=batch=1, matching the
+    hardcoded worlds=1 _run_config call this replaced."""
+    args = benchmark["_parse_args"](["--variant", "360p", "--physical-gpu", "2"])
+
+    assert args.streams == 1
+    assert args.worlds == 1
+    assert args.batch == 1
+
+
+def test_worlds_and_batch_default_to_streams(benchmark):
+    args = benchmark["_parse_args"](
+        ["--variant", "360p", "--physical-gpu", "2", "--streams", "4"]
+    )
+
+    assert args.worlds == 4
+    assert args.batch == 4
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--streams", "0"], "--streams must be positive"),
+        (["--streams", "4", "--worlds", "0"], "--worlds must be positive"),
+        (["--streams", "4", "--batch", "0"], "--batch must be positive"),
+        (["--streams", "4", "--worlds", "2", "--batch", "4"], "--batch must be <= --worlds"),
+    ],
+)
+def test_benchmark_cli_rejects_invalid_concurrent_stream_configuration(
+    benchmark, capsys, extra, message
+):
+    with pytest.raises(SystemExit, match="2"):
+        benchmark["_parse_args"](["--variant", "360p", "--physical-gpu", "2", *extra])
+    assert message in capsys.readouterr().err
+
+
+def test_measure_stream_waits_on_start_barrier_before_opening_the_stream(benchmark, tmp_path):
+    """The request body (client.stream(...)) must be built before the barrier
+    wait, and consumption (the clock start) must not begin until after it."""
+    variant = benchmark["rollout"].Variant("test", 2, 3, 1, "unused")
+
+    def metadata(frame_index):
+        return {
+            "width": 3,
+            "height": 2,
+            "fps": 60.0,
+            "pixel_format": "rgb24",
+            "frame_index": frame_index,
+            "frame_count": 4,
+        }
+
+    calls = []
+
+    class Barrier:
+        def wait(self, timeout=None):
+            calls.append("barrier_wait")
+
+    class Client:
+        def stream(self, **kwargs):
+            calls.append("stream_called")
+            return iter([VideoFrameChunk(bytes([1]) * 72, metadata(0))])
+
+    clock_values = iter([10.0, 10.5, 10.6])
+    metrics, failures = benchmark["_measure_stream"](
+        Client(),
+        tmp_path / "seed.png",
+        variant,
+        num_steps=1,
+        request_id="rid",
+        rng_seed=1,
+        consumer_pause_seconds=0.0,
+        stall_threshold_seconds=0.4,
+        clock=lambda: next(clock_values),
+        sleep=lambda _seconds: None,
+        start_barrier=Barrier(),
+    )
+
+    assert calls == ["stream_called", "barrier_wait"]
+    assert failures == []
+    assert metrics["chunk_count"] == 1
+
+
+def _chunk_stats(*, ttff_s, p50_s, p95_s, max_s, sustained, stalls):
+    return {
+        "time_to_first_frame_seconds": ttff_s,
+        "inter_chunk_gap_seconds": {"p50": p50_s, "p95": p95_s, "maximum": max_s},
+        "sustained_media_to_wall_ratio": sustained,
+        "stalls": {"count": stalls},
+    }
+
+
+def test_stream_is_realtime_requires_sustained_gap_budget_and_no_stalls(benchmark):
+    is_realtime = benchmark["_stream_is_realtime"]
+    budget_s = benchmark["REALTIME_CHUNK_BUDGET_MS"] / 1000.0
+
+    healthy = _chunk_stats(
+        ttff_s=0.05, p50_s=0.05, p95_s=budget_s - 0.001, max_s=budget_s, sustained=1.05, stalls=0
+    )
+    assert is_realtime(healthy) is True
+
+    under_sustained = {**healthy, "sustained_media_to_wall_ratio": 0.9}
+    assert is_realtime(under_sustained) is False
+
+    over_budget = {
+        **healthy,
+        "inter_chunk_gap_seconds": {**healthy["inter_chunk_gap_seconds"], "p95": budget_s + 0.001},
+    }
+    assert is_realtime(over_budget) is False
+
+    stalled = {**healthy, "stalls": {"count": 1}}
+    assert is_realtime(stalled) is False
+
+
+def test_concurrent_aggregate_computes_worst_median_realtime_and_delivery_bound(benchmark):
+    aggregate = benchmark["_concurrent_aggregate"]
+    budget_s = benchmark["REALTIME_CHUNK_BUDGET_MS"] / 1000.0
+
+    fast = _chunk_stats(ttff_s=0.05, p50_s=0.05, p95_s=0.06, max_s=0.07, sustained=1.2, stalls=0)
+    slow = _chunk_stats(ttff_s=0.20, p50_s=0.15, p95_s=budget_s + 0.01, max_s=0.20, sustained=0.8, stalls=1)
+    per_stream = [fast, slow]
+
+    server_slack = {"step_spacing_ms": {"p50": 200.0, "p95": 220.0}}
+    result = aggregate(per_stream, aggregate_fps=8.0, server=server_slack)
+
+    assert result["aggregate_fps"] == 8.0
+    assert result["ttff_ms"]["p50"] == pytest.approx(125.0)
+    assert result["gap_ms"]["p50_worst"] == pytest.approx(150.0)
+    assert result["gap_ms"]["p95_worst"] == pytest.approx((budget_s + 0.01) * 1000.0)
+    assert result["gap_ms"]["max_worst"] == pytest.approx(200.0)
+    assert result["gap_ms"]["p50_median"] == pytest.approx((50.0 + 150.0) / 2)
+    assert result["sustained_min"] == pytest.approx(0.8)
+    assert result["stall_count_total"] == 1
+    assert result["realtime_per_stream"] == [True, False]
+    assert result["all_realtime"] is False
+    assert result["server"] is server_slack
+    # gap p50_median (100ms) is not > 1.2x a 200ms server step: not delivery-bound.
+    assert result["delivery_bound"] is False
+
+    server_fast = {"step_spacing_ms": {"p50": 50.0, "p95": 60.0}}
+    result_bound = aggregate(per_stream, aggregate_fps=8.0, server=server_fast)
+    # gap p50_median (100ms) > 1.2x a 50ms server step: clients are the bottleneck.
+    assert result_bound["delivery_bound"] is True
+
+
+def test_concurrent_server_metrics_parses_rows_histogram_and_step_spacing(benchmark):
+    server_metrics = benchmark["_concurrent_server_metrics"]
+    log_text = "\n".join(
+        [
+            "2026-09-17 21:38:40,000 DEBUG [worker-0] mstar.worker.worker: "
+            "Executing: dit graph_walk=rollout ('warmup-0',)",
+            "2026-09-17 21:38:40,500 DEBUG [worker-0] mstar.worker.worker: "
+            "Executing: dit graph_walk=rollout ('measured-0', 'measured-1')",
+            "2026-09-17 21:38:40,600 DEBUG [worker-0] mstar.worker.worker: "
+            "Executing: dit graph_walk=rollout ('measured-0', 'measured-1')",
+            "2026-09-17 21:38:40,800 DEBUG [worker-0] mstar.worker.worker: "
+            "Executing: dit graph_walk=rollout ('measured-0', 'measured-1')",
+        ]
+    )
+
+    result = server_metrics(log_text, {"measured-0", "measured-1"}, 12.3)
+
+    assert result["rows_per_step_histogram"] == {2: 3}
+    assert result["step_spacing_ms"]["p50"] == pytest.approx(150.0)
+    assert result["step_spacing_ms"]["p95"] == pytest.approx(195.0)
+    assert result["startup_seconds"] == 12.3

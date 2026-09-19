@@ -20,13 +20,13 @@ eager does not. If eager ever starts agreeing, the pin has stopped being
 load-bearing and the argument for it needs re-deriving rather than the test
 being deleted.
 
-A third section is not a failure but a *derisk*, and is labelled as one: the
-world pool folds N worlds into the token axis of one ring, so the shape a
-batched step would take is B queries against a stride-0 ``expand`` of a single
-K/V with the per-world isolation moved into the BlockMask's leading dim. Nothing
-ships that path today (the step batch is 1), but if it does not hold bit-exactly
-then batching a step is not free and the design owes a different answer, so the
-two properties it rests on are asserted rather than assumed.
+A third section is a *derisk* that now backs a shipped path: the world pool
+folds N worlds into the token axis of one ring, so a batched step is B queries
+against a stride-0 ``expand`` of a single K/V with the per-world isolation
+moved into the BlockMask's leading dim. If this ever stopped holding
+bit-exactly, batching a step would not be free and the design would owe a
+different answer, so the two properties it rests on are asserted rather than
+assumed.
 
 Checkpoint-free, and CPU except where a test is parametrized over the device:
 ``torch.compile(flex_attention)`` works on CPU in torch 2.9, at a few seconds of
@@ -56,6 +56,8 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.flex import (
+    _FLEX_BACKEND,
+    _MASK_MOD,
     FlexAttentionManager,
     flex_attention_masked,
     make_block_mask,
@@ -234,17 +236,17 @@ def test_plan_stages_one_reused_mask_per_geometry_and_slot(monkeypatch):
     manager = build_attention(AttnBackend.FLEX, config)
     ctx = StepContext(
         request_ids=("r",), graph_walk="rollout", slot=1, capture=False,
-        plan_results={"kv": RingPlan("r", 1, 5)},
+        plan_results={"kv": RingPlan(("r",), (1,), (5,))},
     )
 
     manager.plan(AttentionStep(), ctx)
 
     assert manager.needs_token_visibility is False
     assert len(manager._planned_masks) == 2
-    local = manager._mask_for(1, manager._geometry(config.layers[0]))
-    assert local is manager._mask_for(1, manager._geometry(config.layers[1]))
-    global_mask = manager._mask_for(1, manager._geometry(config.layers[2]))
-    assert global_mask is manager._mask_for(1, manager._geometry(config.layers[3]))
+    local = manager._mask_for(1, manager._geometry(config.layers[0]), 1)
+    assert local is manager._mask_for(1, manager._geometry(config.layers[1]), 1)
+    global_mask = manager._mask_for(1, manager._geometry(config.layers[2]), 1)
+    assert global_mask is manager._mask_for(1, manager._geometry(config.layers[3]), 1)
     assert local is not global_mask
 
     # One block per frame. World 1 starts after world 0's five-block span.
@@ -268,7 +270,7 @@ def test_plan_stages_one_reused_mask_per_geometry_and_slot(monkeypatch):
             "mask planning must not allocate a new staging tensor"
         ),
     )
-    ctx.plan_results["kv"] = RingPlan("r", 1, 6)
+    ctx.plan_results["kv"] = RingPlan(("r",), (1,), (6,))
     manager.plan(AttentionStep(), ctx)
     assert addresses == {
         key: (value.full_kv_num_blocks.data_ptr(), value.full_kv_indices.data_ptr())
@@ -324,7 +326,7 @@ def test_planned_masks_match_ring_visibility_across_wraps_and_worlds():
             for cache in caches:
                 *_, visible = cache.upsert(
                     kv,
-                    torch.tensor(frame, dtype=torch.int64),
+                    torch.tensor([frame], dtype=torch.int64),
                     True,
                     torch.tensor([world], dtype=torch.int64),
                 )
@@ -337,21 +339,64 @@ def test_planned_masks_match_ring_visibility_across_wraps_and_worlds():
                 graph_walk="rollout",
                 slot=0,
                 capture=False,
-                plan_results={"kv": RingPlan(f"r{world}", world, frame)},
+                plan_results={"kv": RingPlan((f"r{world}",), (world,), (frame,))},
             )
             manager.plan(AttentionStep(), ctx)
 
             for layer, expected_blocks in zip(layers, expected, strict=True):
-                mask = manager._mask_for(0, manager._geometry(layer))
+                mask = manager._mask_for(0, manager._geometry(layer), 1)
                 count = int(mask.full_kv_num_blocks[0, 0, 0])
                 assert mask.full_kv_indices[0, 0, 0, :count].tolist() == expected_blocks
+
+
+def test_stage_writes_each_rows_own_visibility_at_its_own_world_and_frame():
+    """A two-row plan at different worlds and frame_pos: `_stage` must write
+    row b from `_visibility_table_for(geometry)[w_b, phase_b]`, not row 0's
+    world/frame for every row and not swap the two."""
+    config = RingKVConfig(
+        num_layers=4,
+        num_kv_heads=N_KV_HEADS,
+        head_dim=D_HEAD,
+        num_qo_heads=N_QO_HEADS,
+        tokens_per_frame=TPF,
+        num_worlds=2,
+        layers=(
+            RingKVLayerConfig(4, 4, 1),
+            RingKVLayerConfig(4, 4, 1),
+            RingKVLayerConfig(4, 2, 2),
+            RingKVLayerConfig(4, 2, 2),
+        ),
+    )
+    manager = build_attention(AttnBackend.FLEX, config)
+    rows = ((0, 5), (1, 3))  # (world, frame_pos), distinct on both axes
+    ctx = StepContext(
+        request_ids=("r0", "r1"), graph_walk="rollout", slot=0, capture=False,
+        plan_results={
+            "kv": RingPlan(("r0", "r1"), tuple(w for w, _ in rows), tuple(f for _, f in rows)),
+        },
+    )
+
+    manager.plan(AttentionStep(), ctx)
+
+    for layer in (config.layers[0], config.layers[2]):
+        geometry = manager._geometry(layer)
+        mask = manager._mask_for(0, geometry, 2)
+        counts, indices, period = manager._visibility_table_for(geometry)
+        for row, (world, frame) in enumerate(rows):
+            phase = frame if frame < period else period + frame % period
+            count = int(mask.full_kv_num_blocks[row, 0, 0])
+            assert count == int(counts[world, phase])
+            assert (
+                mask.full_kv_indices[row, 0, 0, :count].tolist()
+                == indices[world, phase, :count].tolist()
+            )
 
 
 def test_capture_plan_requires_preallocated_mask_addresses():
     manager = build_attention(AttnBackend.FLEX, ring_config())
     ctx = StepContext(
         request_ids=("r",), graph_walk="rollout", slot=0, capture=True,
-        plan_results={"kv": RingPlan("r", 0, 0)},
+        plan_results={"kv": RingPlan(("r",), (0,), (0,))},
     )
     with pytest.raises(RuntimeError, match="not allocated before CUDA graph capture"):
         manager.plan(AttentionStep(), ctx)
@@ -557,13 +602,16 @@ def folded_block_mask(rows: list[torch.Tensor], q_len: int) -> "object":
     zeros_n = torch.zeros((b, 1, q_blocks), dtype=torch.int32, device=device)
     zeros_i = torch.zeros((b, 1, q_blocks, kv_blocks), dtype=torch.int32, device=device)
 
+    # Not mask_mod=None: under FLASH that substitutes noop_mask, whose trivial
+    # graph makes inductor attend densely and drop the block list entirely --
+    # the same trap documented above `_flash_mask_mod` in flex.py.
     return BlockMask.from_kv_blocks(
         zeros_n,
         zeros_i,
         full_kv_num_blocks,
         full_kv_indices,
         BLOCK_SIZE=BLOCK,
-        mask_mod=None,
+        mask_mod=_MASK_MOD,
         seq_lengths=(q_len, FOLDED_KV),
         compute_q_blocks=False,
     )
@@ -573,11 +621,16 @@ def folded_ring(device, seed: int = 0x5EED):
     """A folded ring with every world's span filled with distinct noise, and B
     queries. Distinct per span is the point: an output that is invariant to a
     neighbour's bytes has actually been isolated, rather than reading zeros that
-    happened to contribute nothing."""
+    happened to contribute nothing.
+
+    bf16 on cuda: FLASH (flash_attn.cute) only accepts fp16/bf16/fp8, matching
+    the DTYPE the GPU tests compile with. fp32 on cpu, where flex_attention_masked
+    is the TRITON/eager path and has no such restriction."""
+    dtype = torch.bfloat16 if torch.device(device).type == "cuda" else torch.float32
     gen = torch.Generator().manual_seed(seed)
-    k = torch.randn(1, N_KV_HEADS, FOLDED_KV, D_HEAD, generator=gen).to(device)
-    v = torch.randn(1, N_KV_HEADS, FOLDED_KV, D_HEAD, generator=gen).to(device)
-    q = torch.randn(WORLDS, N_QO_HEADS, TPF, D_HEAD, generator=gen).to(device)
+    k = torch.randn(1, N_KV_HEADS, FOLDED_KV, D_HEAD, generator=gen, dtype=dtype).to(device)
+    v = torch.randn(1, N_KV_HEADS, FOLDED_KV, D_HEAD, generator=gen, dtype=dtype).to(device)
+    q = torch.randn(WORLDS, N_QO_HEADS, TPF, D_HEAD, generator=gen, dtype=dtype).to(device)
     return q, k, v
 
 
@@ -684,4 +737,66 @@ def test_a_batched_step_does_not_reach_across_world_spans(device):
         assert not torch.equal(after[others[0]], before[others[0]]), (
             "no world moved at all, so the rewrite landed nowhere the mask reads "
             "and this test is vacuous"
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.skipif(
+    _FLEX_BACKEND != "FLASH",
+    reason="guards the batch-1-to-batch-B expand that only exists on the FLASH path",
+)
+def test_flash_batched_step_does_not_copy_the_unexpanded_ring():
+    """FLASH is handed an *un-expanded* batch-1 ring here (unlike the stride-0
+    test above, which expands before calling) so ``_flash_flex_attention``'s own
+    ``k.expand``/``v.expand`` is what runs. If that ever turned into a real
+    copy -- inside ``flex_attention_masked``'s compile, or inside
+    ``flash_attn.cute``'s ``maybe_contiguous`` -- this is the test that would
+    catch it, since correctness (the equality check below and in the stride-0
+    test) does not: a copy of the expand produces the same numbers.
+
+    Sized so a copy cannot hide under warmup/compile noise. With
+    B=4, N_QO_HEADS=4, BLOCK=128, D_HEAD=32, bf16:
+      output_bytes = 4 * 4 * 128 * 32 * 2 = 131_072
+      threshold    = 2 * output_bytes + 1 MiB = 1_310_720 bytes (~1.25 MiB)
+    A materialized copy of k and v (each ``[1, N_KV_HEADS, KV_LEN, D_HEAD]``,
+    KV_LEN = 64 * BLOCK = 8192) to batch 4 would add
+      B * (k.numel() + v.numel()) * 2 = 4 * (2*8192*32 + 2*8192*32) * 2
+        = 8_388_608 bytes (8 MiB) -- ~6.4x the threshold.
+    """
+    device = torch.device("cuda")
+    B = 4
+    KV_LEN = 64 * BLOCK
+
+    gen = torch.Generator().manual_seed(0x51DE)
+    k = torch.randn(1, N_KV_HEADS, KV_LEN, D_HEAD, generator=gen, dtype=torch.bfloat16).to(device)
+    v = torch.randn(1, N_KV_HEADS, KV_LEN, D_HEAD, generator=gen, dtype=torch.bfloat16).to(device)
+    q = torch.randn(B, N_QO_HEADS, BLOCK, D_HEAD, generator=gen, dtype=torch.bfloat16).to(device)
+    written = torch.ones(KV_LEN, dtype=torch.bool, device=device)
+    block_mask = make_block_mask(BLOCK, KV_LEN, written)
+
+    # Warmup: pay the one-time torch.compile allocation before measuring.
+    warmup = flex_attention_masked(q, k, v, block_mask=block_mask, enable_gqa=True)
+    del warmup
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    baseline = torch.cuda.memory_allocated()
+
+    batched = flex_attention_masked(q, k, v, block_mask=block_mask, enable_gqa=True)
+    torch.cuda.synchronize()
+    growth = torch.cuda.max_memory_allocated() - baseline
+
+    output_bytes = B * N_QO_HEADS * BLOCK * D_HEAD * 2
+    threshold = 2 * output_bytes + (1 << 20)
+    copy_bytes = B * (k.numel() + v.numel()) * 2
+    assert growth < threshold, (
+        f"FLASH allocated {growth} bytes for a batch-{B} step against a "
+        f"batch-1 ring (threshold {threshold} bytes); a materialized copy "
+        f"would add ~{copy_bytes} bytes, so this looks like a hidden copy"
+    )
+
+    manager = build_attention(AttnBackend.FLEX, ring_config())
+    for w in range(B):
+        serial = manager.attend(q[w : w + 1], k, v, written, enable_gqa=True)
+        assert torch.equal(batched[w : w + 1], serial), (
+            f"row {w} in a batch of {B} differs from the same row served alone"
         )

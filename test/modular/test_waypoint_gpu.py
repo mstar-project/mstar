@@ -228,6 +228,30 @@ def admit_frame(
         attn.plan(AttentionStep(), ctx)
 
 
+def _batch_ctx(*rids: str) -> StepContext:
+    return StepContext(request_ids=rids, graph_walk="rollout", slot=0, capture=False)
+
+
+def _batch_step(frames: list[tuple[str, int]]) -> RingKVStep:
+    return RingKVStep(frames=tuple(frames))
+
+
+def admit_batch(
+    kv: RingKVManager,
+    frames: list[tuple[str, int]],
+    attn: AttentionManager,
+) -> None:
+    """`admit_frame`'s multi-row form: one step naming every ``(rid, frame)``
+    pair in ``frames``, in the row order the batched forward's inputs use."""
+    ctx = _batch_ctx(*(rid for rid, _ in frames))
+    step = _batch_step(frames)
+    outcome = kv.admit(step, ctx)
+    assert outcome.ok, f"batch {frames} refused: {outcome.reason}"
+    ring_plan = kv.plan(step, ctx)
+    ctx.plan_results["kv"] = ring_plan
+    attn.plan(AttentionStep(), ctx)
+
+
 def scrub(kv: RingKVManager, *rids: str) -> None:
     """Return every world to the pool and zero every ring. The tests share one
     captured graph, so each one starts from a ring that holds nothing."""
@@ -285,7 +309,7 @@ def test_compile_regions_holds_under_fullgraph():
     with torch.no_grad():
         out = dit.generate_frame(
             noise_for(config, "warm", 0),
-            torch.tensor(0, dtype=torch.int64, device=DEVICE),
+            torch.tensor([0], dtype=torch.int64, device=DEVICE),
             mouse=mouse, button=button, scroll=scroll,
         )
     torch.cuda.synchronize()
@@ -394,7 +418,7 @@ def test_compiled_matches_eager_to_four_bf16_ulp_of_peak():
                 latents.append(
                     dit.generate_frame(
                         noise_for(config, "a2", frame),
-                        torch.tensor(frame, dtype=torch.int64, device=DEVICE),
+                        torch.tensor([frame], dtype=torch.int64, device=DEVICE),
                         mouse=mouse, button=button, scroll=scroll,
                     ).clone()
                 )
@@ -446,7 +470,7 @@ def captured():
     kv.ingest_request("capture")
     admit_frame(kv, "capture", 0, attn)
     static_noise = torch.zeros(1, 1, *config.latent_shape, dtype=DTYPE, device=DEVICE)
-    static_frame = torch.zeros((), dtype=torch.int64, device=DEVICE)
+    static_frame = torch.zeros(1, dtype=torch.int64, device=DEVICE)
 
     static_latent = torch.zeros(1, 1, *config.latent_shape, dtype=DTYPE, device=DEVICE)
 
@@ -520,7 +544,7 @@ def eager_frame(captured, rid: str, frame: int, stream: str) -> torch.Tensor:
     with torch.no_grad():
         latent = captured["dit"].generate_frame(
             noise_for(captured["config"], stream, frame),
-            torch.tensor(frame, dtype=torch.int64, device=DEVICE),
+            torch.tensor([frame], dtype=torch.int64, device=DEVICE),
             mouse=mouse, button=button, scroll=scroll,
         ).clone()
     torch.cuda.synchronize()
@@ -553,7 +577,7 @@ def eager_prime(captured, rid: str, stream: str) -> torch.Tensor:
     with torch.no_grad():
         latent = captured["dit"].append_frame(
             noise_for(captured["config"], stream, 0),
-            torch.tensor(0, dtype=torch.int64, device=DEVICE),
+            torch.tensor([0], dtype=torch.int64, device=DEVICE),
             mouse=mouse, button=button, scroll=scroll,
         ).clone()
     torch.cuda.synchronize()
@@ -717,6 +741,102 @@ def test_two_worlds_interleaved_match_the_same_rollouts_run_alone(captured):
         "the two rollouts are identical; an isolation leak would be invisible"
     )
     scrub(kv, "both_a", "both_b")
+
+
+def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
+    """B=2 across two worlds, 8 frames each, matches the identical rollouts run
+    one row (B=1) at a time -- the row-order invariant BATCH-001 rests on.
+
+    Same weights for both halves: run B=1 alternating first and snapshot every
+    frame and both rings, then scrub and run the same two streams again as a
+    genuinely batched B=2 forward per frame. A batched GEMM may pick a
+    different cuBLAS kernel at M=2T than at M=T, so that cross-run comparison
+    is bounded in bf16 ulp rather than exact -- but two rows of the SAME
+    batched call fed literally identical inputs share one kernel launch and
+    must be bit-exact.
+    """
+    config = gpu_config()
+    frames = 8
+    mouse, button, scroll = controls(config)
+    dit, kv, attn = build(config, seed=0, num_worlds=2)
+    dit.materialize_runtime_tables(DEVICE)
+
+    # ---- B=1, alternating: each world through its own single-row forward.
+    for rid in ("w0", "w1"):
+        kv.ingest_request(rid)
+    solo_latents = {"w0": [], "w1": []}
+    with torch.no_grad():
+        for frame in range(frames):
+            for stream, rid in (("s0", "w0"), ("s1", "w1")):
+                admit_frame(kv, rid, frame, attn)
+                out = dit.generate_frame(
+                    noise_for(config, stream, frame),
+                    torch.tensor([frame], dtype=torch.int64, device=DEVICE),
+                    mouse=mouse, button=button, scroll=scroll,
+                ).clone()
+                solo_latents[rid].append(out)
+                kv.commit(_step(rid, frame), _ctx(rid))
+    torch.cuda.synchronize()
+    solo_ring = {rid: world_snapshot(kv, kv.world_of(rid)) for rid in ("w0", "w1")}
+    scrub(kv, "w0", "w1")
+
+    # ---- B=2, batched: both worlds' row for frame f in one forward.
+    for rid in ("w0", "w1"):
+        kv.ingest_request(rid)
+    mouse2 = mouse.expand(2, -1, -1).contiguous()
+    button2 = button.expand(2, -1, -1).contiguous()
+    scroll2 = scroll.expand(2, -1, -1).contiguous()
+    batched_latents = {"w0": [], "w1": []}
+    with torch.no_grad():
+        for frame in range(frames):
+            batch_frames = [("w0", frame), ("w1", frame)]
+            admit_batch(kv, batch_frames, attn)
+            noise = torch.cat(
+                [noise_for(config, "s0", frame), noise_for(config, "s1", frame)], dim=0,
+            )
+            frame_pos = torch.tensor([frame, frame], dtype=torch.int64, device=DEVICE)
+            out = dit.generate_frame(
+                noise, frame_pos, mouse=mouse2, button=button2, scroll=scroll2,
+            ).clone()
+            batched_latents["w0"].append(out[0:1])
+            batched_latents["w1"].append(out[1:2])
+            kv.commit(_batch_step(batch_frames), _batch_ctx("w0", "w1"))
+    torch.cuda.synchronize()
+    batch_ring = {rid: world_snapshot(kv, kv.world_of(rid)) for rid in ("w0", "w1")}
+    scrub(kv, "w0", "w1")
+
+    for rid in ("w0", "w1"):
+        for frame, (want, got) in enumerate(
+            zip(solo_latents[rid], batched_latents[rid], strict=True)
+        ):
+            peak = want.float().abs().max().item()
+            deviation = (want.float() - got.float()).abs().max().item()
+            assert deviation <= COMPILE_TOL_ULP * BF16_EPS * peak, (
+                f"world {rid} frame {frame}: batching diverged from the same row run "
+                f"alone by {deviation:.3e} ({deviation / peak / BF16_EPS:.2f} ulp of peak)"
+            )
+        assert_worlds_equal(solo_ring[rid], batch_ring[rid], f"world {rid}, batched vs alone")
+
+    # Two rows of the SAME batched call, fed literally identical inputs (same
+    # noise, same frame, same controls): must be bit-exact -- nothing about a
+    # row's own math may read another row's data or depend on its batch position.
+    for rid in ("id0", "id1"):
+        kv.ingest_request(rid)
+    identical_frames = [("id0", 0), ("id1", 0)]
+    admit_batch(kv, identical_frames, attn)
+    same_noise = noise_for(config, "dup", 0).expand(2, -1, -1, -1, -1).contiguous()
+    same_frame_pos = torch.tensor([0, 0], dtype=torch.int64, device=DEVICE)
+    with torch.no_grad():
+        dup_out = dit.generate_frame(
+            same_noise, same_frame_pos, mouse=mouse2, button=button2, scroll=scroll2,
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(dup_out[0], dup_out[1]), (
+        "identical inputs on two rows of the same batched call produced different "
+        "output; a row is reading something batch-position-dependent"
+    )
+    kv.commit(_batch_step(identical_frames), _batch_ctx("id0", "id1"))
+    scrub(kv, "id0", "id1")
 
 
 # ---------------------------------------------------------------------------
