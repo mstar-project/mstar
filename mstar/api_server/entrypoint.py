@@ -8,9 +8,11 @@ import logging
 import multiprocessing as mp
 import os
 import signal
+import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -28,7 +30,9 @@ from mstar.model.multimodal import PromptPart
 from mstar.model.registry import HF_MODELS
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
+from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.logging_config import quiet_noisy_loggers
+from mstar.utils.orphan import watch_parent
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +75,10 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    # Started before the model load so an API server that dies during it is
+    # still caught. SIGINT is the conductor's graceful stop (run() unwinds into
+    # shutdown(), terminating the workers), matching _shutdown_conductor_process.
+    watch_parent("Conductor", "API server", signal.SIGINT)
     # Read yaml early to extract optional `model_kwargs:` section for the model
     # constructor. Lets a yaml override init-time model parameters (e.g.
     # Pi05's action_horizon for the DROID benchmark variant) without code
@@ -156,6 +164,11 @@ class PendingRequest:
     error_status: int = 500
 
 
+class DeadConductorError(RuntimeError):
+    """The conductor process exited before the workers finished setup (it
+    exits when a worker dies during init), so the server must not bind."""
+
+
 class APIServer:
     """Accept multimodal requests, forward to conductor, collect results."""
 
@@ -207,6 +220,17 @@ class APIServer:
         self.request_lock = threading.Lock()
         self.running = True
 
+        # Set by main() once the conductor is spawned. It gets polled because a
+        # conductor that dies sends nothing (see finalize_setup and
+        # _process_messages).
+        self.conductor_proc: mp.Process | None = None
+        # Non-None once the deployment is going down because the conductor
+        # died. It is the error every pending (and later) request gets, and the
+        # reason main() exits non-zero. on_fatal stops the HTTP server.
+        self.fatal_error: str | None = None
+        self.on_fatal: Callable[[], None] | None = None
+        self._liveness_interval_s = 0.5
+
         # ZMQ channel shared with conductor / workers
         self.communicator = make_communicator(
             my_id="api_server",
@@ -225,7 +249,9 @@ class APIServer:
         """Block until the conductor signals that every worker has finished
         setup (weight load + warmup + CUDA-graph capture), then start draining
         results. Called before the HTTP server binds, so ``mstar`` only begins
-        serving once it can actually handle requests.
+        serving once it can actually handle requests. Raises
+        ``DeadConductorError`` if the conductor exits first (it does when a
+        worker fails to initialize), so the server never binds.
         """
         logger.info(
             "Waiting for workers to finish setup "
@@ -243,7 +269,39 @@ class APIServer:
                 logger.warning(
                     "Unexpected message before setup_done: %s", type(message)
                 )
+            exited = self._conductor_exited()
+            if exited is not None:
+                raise DeadConductorError(
+                    f"conductor process exited with {exited} before the workers "
+                    "finished setup"
+                )
             time.sleep(0.01)
+
+    def _conductor_exited(self) -> str | None:
+        """Words for the conductor's exit status, or None while it runs (or
+        when no handle was given)."""
+        proc = self.conductor_proc
+        if proc is None or proc.is_alive():
+            return None
+        return describe_exitcode(proc.exitcode)
+
+    def _fail_pending_for_dead_conductor(self, exited: str) -> None:
+        """The conductor is gone (it exits when a worker dies, or it crashed).
+        Release every waiting client with a 503 now rather than at the request
+        timeout, refuse new requests, and stop the HTTP server so the process
+        exits non-zero instead of serving a deployment that can't run anything.
+        """
+        message = f"conductor process exited with {exited}, so the server is shutting down"
+        logger.error("Conductor process exited with %s, shutting the server down", exited)
+        with self.request_lock:
+            self.fatal_error = message
+            for req in self.pending_requests.values():
+                if req.error is None:
+                    req.error = message
+                    req.error_status = 503
+                req.event.set()
+        if self.on_fatal is not None:
+            self.on_fatal()
 
     # ----------------------------------------------------------
     # Submitting a request
@@ -277,6 +335,8 @@ class APIServer:
 
         # Register pending request
         with self.request_lock:
+            if self.fatal_error is not None:
+                raise HTTPException(status_code=503, detail=self.fatal_error)
             self.pending_requests[request_id] = PendingRequest(
                 streaming=streaming,
                 input_modalities=input_modalities,
@@ -364,8 +424,18 @@ class APIServer:
             self.recently_completed.pop(rid, None)
 
     def _process_messages(self) -> None:
-        """Drain the ZMQ pull socket and route results to pending requests."""
+        """Drain the ZMQ pull socket and route results to pending requests.
+        Also watches the conductor process. Once it exits, every pending
+        request is failed and the HTTP server is told to stop."""
+        next_liveness_check = 0.0
         while self.running:
+            now = time.monotonic()
+            if now >= next_liveness_check:
+                next_liveness_check = now + self._liveness_interval_s
+                exited = self._conductor_exited()
+                if exited is not None:
+                    self._fail_pending_for_dead_conductor(exited)
+                    return
             try:
                 with self.request_lock:
                     if len(self.recently_completed) > 0:
@@ -848,6 +918,9 @@ async def generate(
 
 @app.get("/health")
 async def health_check():
+    # Report unhealthy while shutting down, so a load balancer stops sending here.
+    if api_server is not None and api_server.fatal_error is not None:
+        raise HTTPException(status_code=503, detail=api_server.fatal_error)
     return {"status": "healthy"}
 
 
@@ -985,9 +1058,11 @@ def main(argv: list[str] | None = None):
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
+    api_server.conductor_proc = conductor_proc
 
     rust_proc = None
     bridge_dir = None
+    exit_code = 0
     try:
         # Block until all workers have finished setup, so the server only binds
         # (and logs "Starting…") once it can actually serve requests.
@@ -1010,12 +1085,29 @@ def main(argv: list[str] | None = None):
                 args.port, bridge_dir, args.upload_dir)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
-            RustFrontendBridge(api_server, bridge_dir).run()
+            bridge = RustFrontendBridge(api_server, bridge_dir)
+            api_server.on_fatal = bridge.stop
+            bridge.run()
         else:
             logger.info("Starting mstar API server on %s:%s", args.host, args.port)
-            uvicorn.run(app, host=args.host, port=args.port, access_log=False)
+            # uvicorn.run() inlined so the server object is reachable. The
+            # message thread stops it when the conductor dies.
+            server = uvicorn.Server(
+                uvicorn.Config(app, host=args.host, port=args.port, access_log=False)
+            )
+
+            def _stop_server():
+                server.should_exit = True
+
+            api_server.on_fatal = _stop_server
+            server.run()
+            if not server.started:
+                exit_code = 3  # uvicorn.run()'s own code for a server that never came up
     except KeyboardInterrupt:
         pass
+    except DeadConductorError as e:
+        logger.error("%s", e)
+        exit_code = 1
     finally:
         if rust_proc is not None:
             rust_proc.terminate()
@@ -1025,6 +1117,11 @@ def main(argv: list[str] | None = None):
         if api_server is not None:
             api_server.cleanup()
         _shutdown_conductor_process(conductor_proc)
+    # A worker or conductor death is a failed run. A SIGINT stop still exits 0.
+    if api_server.fatal_error is not None:
+        exit_code = 1
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":
