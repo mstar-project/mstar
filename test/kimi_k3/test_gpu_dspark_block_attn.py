@@ -29,14 +29,21 @@ def reference(q_lat, q_pe, lat, o_ctx, lse_ctx, rows, l, scale):
 
 @pytest.mark.parametrize("rows,k,h,l,r", [(3, 7, 4, 512, 64), (2, 3, 2, 128, 32), (1, 7, 8, 512, 64), (5, 4, 1, 8, 4)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_block_attention_matches_the_torch_glue(rows, k, h, l, r, dtype):
+@pytest.mark.parametrize("strided", [False, True])
+def test_block_attention_matches_the_torch_glue(rows, k, h, l, r, dtype, strided):
     torch.manual_seed(0)
     prev = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
         t = rows * k
-        q_lat = torch.randn(t, h, l, device=DEV).to(dtype)
-        q_pe = torch.randn(t, h, r, device=DEV).to(dtype)
+        if strided:
+            # the queries as the draft hands them over: the latent and rope parts of one projection
+            q = torch.randn(t, h, l + r + 8, device=DEV).to(dtype)
+            q_lat, q_pe = q[:, :, :l], q[:, :, l:l + r]
+            assert not q_lat.is_contiguous() and not q_pe.is_contiguous()
+        else:
+            q_lat = torch.randn(t, h, l, device=DEV).to(dtype)
+            q_pe = torch.randn(t, h, r, device=DEV).to(dtype)
         lat = torch.randn(t, l + r, device=DEV).to(dtype)
         o_ctx = torch.randn(t, h, l, device=DEV).to(dtype)
         lse_ctx = torch.randn(t, h, device=DEV) * 3 + 5
