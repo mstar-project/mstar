@@ -1,5 +1,6 @@
 """Speculative mode of the Kimi K3 model on CPU (``model_kwargs.speculative_tokens``): the acceptance
 resource, the pool's prefix blocks, the KDA manager's width, the submodule's k + 1 token rows."""
+import pytest
 import torch
 
 from mstar.engine.resources import SPEC_ACCEPTANCE, DeltaNetGeometry, resolve_spec_dependencies
@@ -106,3 +107,36 @@ def test_unpack_cuts_at_a_stop_token_unless_eos_is_ignored(tiny_dir):
     info["a"].resource_configs[SAMPLER].ignore_eos = True
     out = sub.unpack_packed_outputs(static, ["a", "b"], [4, 4], [], info)
     assert out["a"]["new_token"][0].tolist() == [5, 6, stop, 8]  # ignore_eos: the whole accepted run
+
+
+def test_a_block_length_schedule_follows_the_step_size(tiny_dir):
+    from mstar.engine.resources import BucketKey, SlotLease
+    from mstar.model.kimi_k3.config import KDA_ATTN
+
+    model = get_model_class("kimi_k3")(model_path_hf=str(tiny_dir), speculative_schedule={2: 3, 4: 1, 8: 0})
+    assert model.speculative_tokens == 3  # the largest block sizes the pool and the acceptance mirrors
+    sub = model.get_submodule("LLM", device="cpu")
+    assert [sub.block_length(n) for n in (1, 2, 3, 4, 5, 8, 64)] == [3, 3, 1, 1, 0, 0, 0]
+    inp = sub.prepare_inputs("decode", None, {"text_inputs": [torch.tensor([42])]})
+    assert inp.input_seq_len == 4  # the budget every bucket is sized for
+    # eager: the real row count decides the block
+    step = sub.declare_step("decode", ["a", "b", "c"], [inp] * 3)
+    assert [s.span for s in step.segments] == [2, 2, 2]
+    assert step.steps[SPEC].verify and step.steps[SPEC].num_drafts == 1 and step.steps[KDA_ATTN].speculative
+    # under a lease: the bucket's row count decides, even for one real row
+    lease = SlotLease(slot=0, bucket=BucketKey(graph_walk="decode", bs=8, num_tokens=32))
+    step = sub.declare_step("decode", ["a"], [inp], slot_lease=lease)
+    assert step.segments[0].span == 1 and step.steps[SPEC].num_drafts == 0 and step.steps[KDA_ATTN].speculative
+    # a prefill step declares no block
+    pre = sub.declare_step("prefill", ["a"], [sub.prepare_inputs("prefill", None, {"text_inputs": [torch.arange(9)]})])
+    assert not pre.steps[SPEC].verify and pre.steps[SPEC].num_drafts is None and not pre.steps[KDA_ATTN].speculative
+    # the stand-in draft follows the step's block
+    assert sub._draft(torch.tensor([[5]]), 1).tolist() == [[5]] and sub._draft(torch.tensor([[5]]), 0).shape == (1, 0)
+    # with graphs the bounds must be capture buckets (a batch and its bucket must agree on the block);
+    # the drafts must fit the pool's block
+    from mstar.model.kimi_k3.submodules import KimiK3LLMSubmodule
+    with pytest.raises(ValueError):
+        KimiK3LLMSubmodule(language_model=sub.language_model, config=sub.config, cuda_graphs=True,
+                           speculative_tokens=3, speculative_schedule={3: 2})
+    with pytest.raises(ValueError):
+        get_model_class("kimi_k3")(model_path_hf=str(tiny_dir), speculative_tokens=2, speculative_schedule={4: 3})
