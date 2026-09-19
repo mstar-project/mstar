@@ -32,7 +32,9 @@ from mstar.model.components.distributed.linear import (
     RowParallelLinear,
 )
 from mstar.model.components.distributed.merged_linear import COLUMN, REPLICATED, MergedParallelLinear
+from mstar.model.kimi_k3.components.gated_norm_kernel import gated_rmsnorm
 from mstar.model.kimi_k3.components.common import (
+    fused_decode_kernels,
     attach_dim0_loader,
     replicated_loader,
     restore_kept_dtypes,
@@ -278,14 +280,15 @@ class ParallelKDAAttention(nn.Module):
 
     def _project(self, x: torch.Tensor):
         """``(qkv [T, 3 P_local], g_raw [T, H, D], beta_raw [T, H], g_out [T, H, D])``: two GEMMs on
-        ``x`` plus the tiny ``f_b`` factor. The merged segments are views; the kernels need
-        contiguous ``beta`` and ``g`` (a no-op for one row, a small copy otherwise)."""
+        ``x`` plus the tiny ``f_b`` factor. ``beta_raw`` and ``g_out`` are column slices of the
+        merged projection's output (row stride = its width); the decode kernels read them in
+        place, the others copy what they need."""
         t = x.shape[0]
         qkv = self.qkv_proj(x)
         mixed = self.in_proj.project(x)
         g_raw = self.f_b_proj(mixed["f_a"]).view(t, self.num_heads, self.head_dim)
-        beta_raw = mixed["b"].contiguous()
-        g_out = mixed["g"].contiguous().view(t, self.num_heads, self.head_dim)
+        beta_raw = mixed["b"]
+        g_out = mixed["g"].view(t, self.num_heads, self.head_dim)
         return qkv, g_raw, beta_raw, g_out
 
     def _finish(self, g_out: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
@@ -294,20 +297,15 @@ class ParallelKDAAttention(nn.Module):
         return self.o_proj(y.reshape(t, self.num_heads * self.head_dim))
 
     def _gated_norm(self, o: torch.Tensor, g_out: torch.Tensor) -> torch.Tensor:
-        """``RMSNorm_headdim(o) * weight * sigmoid(g)``: fla's fused Triton kernel on CUDA
-        (fp32 math, same operation order as the reference), the torch reference elsewhere."""
-        if o.is_cuda and o.dtype in (torch.bfloat16, torch.float16):
-            try:
-                from fla.modules.fused_norm_gate import rms_norm_gated
-            except ImportError:
-                rms_norm_gated = None
-            if rms_norm_gated is not None:
-                d = self.head_dim
-                y = rms_norm_gated(
-                    o.reshape(-1, d).contiguous(), g_out.reshape(-1, d).to(o.dtype).contiguous(),
-                    self.o_norm.weight, None, activation="sigmoid", eps=self.norm_eps,
-                )
-                return y.view_as(o)
+        """``RMSNorm_headdim(o) * weight * sigmoid(g)``: one Triton launch on CUDA that reads the
+        gate slice in place (fp32 math, the reference's operation order), the torch reference
+        elsewhere."""
+        if fused_decode_kernels() and o.is_cuda and o.dtype in (torch.bfloat16, torch.float16) and o.stride(-1) == 1 \
+                and g_out.stride(-1) == 1:
+            t = o.shape[0]
+            o3 = o.view(t, self.num_heads, self.head_dim)
+            if o3.stride(1) == self.head_dim:
+                return gated_rmsnorm(o3, g_out, self.o_norm.weight, self.norm_eps).view_as(o)
         return gated_rms_norm(o, g_out, self.o_norm.weight, self.norm_eps)
 
     # ------------------------------------------------------------------ paths
