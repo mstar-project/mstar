@@ -36,6 +36,9 @@ class SpecStep(ResourceStep):
     # the step verifies a speculative block per row: its forward stages a verdict and its commit
     # registers the rows (a prefill step of the same node declares the resource without either)
     verify: bool = False
+    # the block this step verifies, in drafts per row, when it is shorter than the resource's
+    # ``num_speculative`` (a block length that follows the batch size); None: the full block
+    num_drafts: int | None = None
 
 
 @dataclass(frozen=True)
