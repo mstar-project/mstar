@@ -124,3 +124,52 @@ def test_verify_blocks_match_the_dense_reference_over_the_accepted_sequence():
     assert torch.allclose(o.float(), want_o[-K1:], atol=1e-5, rtol=1e-5)
     _, ckpt, _ = dense(params, acc_qkv, acc_g, acc_beta)
     assert torch.allclose(from_v_first(state[slot]), ckpt, atol=1e-5, rtol=1e-5)
+
+
+def spec_step(rid, span):
+    """A verify block declared as one, whatever its length (down to a single token: no drafts)."""
+    s = SubmoduleStep(segments=[Segment(rid, "main", span)],
+                      steps={POOL: RecurrentStep(), ATTN: LinearAttnStep(speculative=True)})
+    ctx = StepContext(request_ids=[rid], graph_walk="decode", slot=0, capture=False)
+    s.set_ctx(ctx)
+    return s
+
+
+def test_shorter_and_empty_blocks_follow_the_pool_slots():
+    """A block length that changes between steps: a full block, a 2-token block, a 1-token block (a plain
+    decode token that still consumes the pending prefix), a full block again. Every block's outputs must
+    follow the dense reference over the accepted sequence, and the checkpoint must track it."""
+    gen = torch.Generator().manual_seed(1)
+    params = KDAParams(conv_weight=torch.randn(P, W, generator=gen) * 0.3, A_log=torch.randn(H, generator=gen),
+                       dt_bias=torch.randn(H * D, generator=gen) * 0.1, lower_bound=-5.0, num_heads=H, head_dim=D,
+                       scale=D ** -0.5)
+    pool, attn, runner = build()
+    runner.ingest_request("a")
+    conv, state = pool.block("conv", 0), pool.block("state", 0)
+    spec = SpecBlocks(pool.block("spec_prefix", 0), pool.block("spec_g", 0), pool.block("spec_beta", 0),
+                      pool.block("spec_len", 0))
+    acc_qkv, acc_g, acc_beta = inputs(5, gen)
+    s = step("a", 5)
+    assert runner.admit(s).ok
+    runner.plan(s)
+    attn.kernels.run_paged(acc_qkv, acc_g, acc_beta, attn.current_plan(), conv, state, params)
+    runner.commit(s)
+    slot = attn.current_plan().slot_ids_cpu[0]
+    for span, accepted in ((K1, 3), (2, 1), (1, 0), (K1, 0), (2, 0), (1, 0)):
+        b_qkv, b_g, b_beta = inputs(span, gen)
+        s = spec_step("a", span)
+        assert runner.admit(s).ok
+        runner.plan(s)
+        plan = attn.current_plan()
+        assert plan.is_verify and plan.k1 == span and plan.kmax1 == K1 and not plan.is_decode
+        o = attn.run(b_qkv, b_g, b_beta, conv, state, params, spec=spec)
+        _, want_state, want_conv = dense(params, acc_qkv, acc_g, acc_beta)
+        assert torch.allclose(from_v_first(state[slot]), want_state, atol=1e-5, rtol=1e-5)
+        assert torch.allclose(conv[slot], want_conv, atol=1e-6)
+        want_o, _, _ = dense(params, torch.cat([acc_qkv, b_qkv]), torch.cat([acc_g, b_g]), torch.cat([acc_beta, b_beta]))
+        assert o.shape == (span, H, D) and torch.allclose(o.float(), want_o[-span:], atol=1e-5, rtol=1e-5)
+        attn.set_prefix_len(spec.length, torch.tensor([accepted], dtype=torch.int32))
+        runner.commit(s)
+        acc_qkv = torch.cat([acc_qkv, b_qkv[: accepted + 1]])
+        acc_g = torch.cat([acc_g, b_g[: accepted + 1]])
+        acc_beta = torch.cat([acc_beta, b_beta[: accepted + 1]])
