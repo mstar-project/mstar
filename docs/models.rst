@@ -90,6 +90,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        prefix); ``model_kwargs.speculative_draft: <dir>`` loads the ``Inferact/Kimi-K3-DSpark``
        draft (5 rope MLA layers over the target's aux hidden states, its own latent cache
        ``resources.dspark_kv``), without it the drafts are the bonus token repeated (a path test).
+       ``model_kwargs.speculative_schedule: {16: 7, 32: 4, 64: 0}`` lets the block follow the
+       step's batch size (drafts per row up to each bound, the bounds being capture buckets;
+       none beyond the last): a verify step's cost grows with rows times block, so large batches
+       run shorter blocks or, at 0, single tokens that still consume the pending prefix.
 
 Notes
 -----
