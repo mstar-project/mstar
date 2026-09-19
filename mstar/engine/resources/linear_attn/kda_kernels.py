@@ -21,6 +21,7 @@ keeps the last ``W - 1`` of the final state.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from typing import NamedTuple
@@ -28,6 +29,7 @@ from typing import NamedTuple
 import torch
 
 from mstar.engine.resources.linear_attn.conv_update import conv_update_slots, conv_update_slots_supported
+from mstar.engine.resources.linear_attn.kda_decode import kda_decode
 
 
 @dataclass
@@ -74,6 +76,8 @@ class FLAKDAKernels:
 
         self._conv = causal_conv1d
         self._conv_update = causal_conv1d_update
+        # MSTAR_K3_FUSED_DECODE=0 keeps fla's recurrent kernel (and the copies it needs) for an A/B
+        self._decode_strided = os.environ.get("MSTAR_K3_FUSED_DECODE", "1") != "0"
         self._chunk = chunk_kda
         self._recurrent = fused_recurrent_kda_fwd
 
@@ -103,16 +107,22 @@ class FLAKDAKernels:
                                    conv_state.index_select(0, slot_ids)], dim=-1)
                 y, cache = self._conv_update(qkv.view(rows, 1, -1), cache, weight=conv_w, activation="silu")
                 conv_state[slot_ids] = cache[..., 1:].to(conv_state.dtype)
-            # the low-level Triton kernel assumes contiguous [B, T, H, K]: a strided split of
-            # the fused conv output reads the wrong memory for every row after the first, so
-            # re-layout once to [3, rows, P] (one copy) and take contiguous leading slices
+            if self._decode_strided:
+                # one launch that reads q | k | v out of y and the raw beta out of its projection
+                # slice by stride: no re-layout, no contiguous copies (three launches per layer
+                # per step at more than one row before)
+                return kda_decode(y.view(rows, -1), g_raw.view(rows, h, d), beta_raw.view(rows, h), p.A_log, p.dt_bias,
+                                  rec_state, slot_ids, p.scale, p.lower_bound)
+            # fla's kernel assumes contiguous [B, T, H, K]: a strided split of the fused conv
+            # output reads the wrong memory for every row after the first, so re-layout once
+            # to [3, rows, P] (one copy) and take contiguous leading slices
             y3 = y.view(rows, 3, h * d).transpose(0, 1).contiguous()
             q, k, v = y3[0], y3[1], y3[2]
             # every row is its own one-token sequence (cu_seqlens); without it the kernel
             # would chain the rows as one sequence and carry row i's state into row i+1
             o = self._recurrent(
                 q=q.view(1, rows, h, d), k=k.view(1, rows, h, d), v=v.view(1, rows, h, d),
-                g=g_raw.view(1, rows, h, d), beta=beta_raw.view(1, rows, h),
+                g=g_raw.contiguous().view(1, rows, h, d), beta=beta_raw.contiguous().view(1, rows, h),
                 A_log=p.A_log, dt_bias=p.dt_bias, initial_state=rec_state, scale=p.scale,
                 output_final_state=True, inplace_final_state=True, state_v_first=True,
                 cu_seqlens=plan.cu_seqlens[: rows + 1],
@@ -164,8 +174,10 @@ class FLAKDAKernels:
         k1 = plan.cu_seqlens_cpu[1] - plan.cu_seqlens_cpu[0]
         assert rows * k1 == qkv.shape[0], (rows, k1, qkv.shape)
         slots = plan.slot_ids[:rows]
+        # the prep kernel reads the gates and betas flat: the layer hands over views into its
+        # merged projection, so a verify step pays these two small copies
         q, k, v, g, beta, ckpt = kda_verify_prep(
-            qkv, g_raw, beta_raw, conv_state, spec, slots, p.conv_weight, rows, k1, h, d,
+            qkv, g_raw.contiguous(), beta_raw.contiguous(), conv_state, spec, slots, p.conv_weight, rows, k1, h, d,
         )
         o = kda_recurrent_checkpoint(
             q.view(-1, h, d), k.view(-1, h, d), v.view(-1, h, d), g.view(-1, h, d), beta, p.A_log, p.dt_bias,
