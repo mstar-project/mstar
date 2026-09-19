@@ -24,6 +24,9 @@ from mstar.model.kimi_k3.components.common import KimiRMSNorm, fused_decode_kern
 from mstar.utils.streams import Fork
 from mstar.model.kimi_k3.components.mla_out_kernel import mla_out
 
+# rows up to which the one-launch output kernel beats the einsum path (bench/kernels/mla_out_crossover.py)
+MLA_OUT_MAX_ROWS = 32
+
 # the checkpoint's q_a_proj / kv_a_proj_with_mqa land in the merged in_proj by segment name; its
 # g_proj goes through the same ``(".in_proj", ".g_proj", "g")`` rule as the KDA layers'
 MLA_IN_PROJ_PARAMS = [(".in_proj", ".q_a_proj", "q_a"), (".in_proj", ".kv_a_proj_with_mqa", "kv_a")]
@@ -130,10 +133,14 @@ class ParallelMLAAttention(nn.Module):
         _, w_uv = self.absorb()
         w_uv = w_uv.to(o_lat.dtype)
         gate = g if self.use_output_gate else None
-        if fused_decode_kernels() and o_lat.is_cuda and o_lat.dtype in (torch.bfloat16, torch.float16) \
-                and o_lat.stride(-1) == 1 and w_uv.stride(-1) == 1:
+        if fused_decode_kernels() and t <= MLA_OUT_MAX_ROWS and o_lat.is_cuda \
+                and o_lat.dtype in (torch.bfloat16, torch.float16) and o_lat.stride(-1) == 1 and w_uv.stride(-1) == 1:
             # one launch: the per-head product and the gate, written as the [T, H * V] matrix o_proj
-            # reads (the einsum's head-major result costs a copy for more than one row)
+            # reads (the einsum's head-major result costs a copy for more than one row). Only for a
+            # few rows: the kernel is one program per (row, head), so its time grows with the rows
+            # (about 1 us a row at 12 heads) while the einsum path stays at some 35 us up to a
+            # thousand rows. Measured on an H100: even at 32 rows, 25 times slower at 1024 (a prefill
+            # step ran it at 7 ms a layer before this bound).
             return self.o_proj(mla_out(o_lat, w_uv, gate))
         attn = torch.einsum("thl,hlv->thv", o_lat, w_uv).reshape(t, self.num_heads * self.v_head_dim)
         if gate is not None:
