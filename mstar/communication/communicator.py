@@ -133,9 +133,10 @@ class ZMQCommunicator(BaseCommunicator):
 
     def send(self, entity_id: str, msg):
         # TODO: maybe serialize to JSON instead if more efficient
+        # no str(): the repr is ~10us on an InputSignals and DEBUG is off here
         logger.debug(
             "%s to send a message %s to entity %s",
-            self.my_id, str(msg), entity_id
+            self.my_id, msg, entity_id
         )
         if entity_id not in self.push_sockets:
             sock = self.context.socket(zmq.PUSH)

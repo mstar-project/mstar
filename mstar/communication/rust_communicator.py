@@ -153,7 +153,8 @@ class RustZMQCommunicator(BaseCommunicator):
         return bool(self._buffered)
 
     def send(self, entity_id: str, msg) -> None:
-        logger.debug("%s to send a message %s to entity %s", self.my_id, str(msg), entity_id)
+        # no str(): the repr is ~10us on an InputSignals and DEBUG is off here
+        logger.debug("%s to send a message %s to entity %s", self.my_id, msg, entity_id)
         if self.protocol == CommProtocol.TCP:
             self._register(entity_id)
         self._inner.send(entity_id, self.codec.encode(msg))

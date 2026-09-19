@@ -485,12 +485,14 @@ class TensorCommunicationManager(ABC):
             node_name=node_name, graph_walk=graph_walk,
             skip_cuda_sync=skip_cuda_sync,
         )
+        debug_on = logger.isEnabledFor(logging.DEBUG)
         for name in tensors:
-            logger.debug(
-                "Storing tensor %s (uuids %s) for nodes %s",
-                name, str([info.uuid for info in graph_node_info[name]]),
-                str([edge.name for edge in name_to_graph_edges.get(name, [])])
-            )
+            if debug_on:  # both args are list comps; this runs per output per rid
+                logger.debug(
+                    "Storing tensor %s (uuids %s) for nodes %s",
+                    name, [info.uuid for info in graph_node_info[name]],
+                    [edge.name for edge in name_to_graph_edges.get(name, [])]
+                )
             edges = name_to_graph_edges.get(name, [])
             if skip_ref_count:
                 # Safety hold: ref=1 prevents premature GC. The caller

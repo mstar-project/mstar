@@ -1880,7 +1880,7 @@ class Worker:
                     fresh_batch.request_to_worker_graph[rid]
                 )
 
-        logger.debug(f"Speculating: {spec_node_info.node_name} {list(new_node_objects)}")
+        logger.debug("Speculating: %s %s", spec_node_info.node_name, new_node_objects.keys())
         return self._assemble_speculation(
             pending, sample_node, spec_node_info,
             new_node_objects, new_request_to_worker_graph, per_request_inputs,
@@ -2865,7 +2865,7 @@ class Worker:
                         if batch is not None:
                             node_batch = self._build_executing_batch(batch)
                             batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
-                            logger.debug(f"Yield away: {batch.node_name} {node_batch.request_ids}")
+                            logger.debug("Yield away: %s %s", batch.node_name, node_batch.request_ids)
                             speculation = Speculation(
                                 scheduled_batch=batch,
                                 node_batch=node_batch,
@@ -3115,7 +3115,7 @@ class Worker:
                     self._execute_on_gpu_thread, batch, node_batch, None,
                 )
                 self.wakeup_event.register_future(future)
-                logger.debug(f"Scheduling: {batch.node_name} {node_batch.request_ids}")
+                logger.debug("Scheduling: %s %s", batch.node_name, node_batch.request_ids)
                 _set_pending(PendingBatch(
                     batch=batch,
                     node_batch=node_batch,
