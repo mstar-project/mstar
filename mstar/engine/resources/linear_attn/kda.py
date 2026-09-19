@@ -40,16 +40,20 @@ class KDAPlan:
     num_rows: int  # real (unpadded) rows
     num_tokens: int
     is_decode: bool  # every row appends exactly one token
-    # every row is a speculative verify block of k + 1 tokens (the checkpoint recurrence)
+    # every row is a speculative verify block of k1 tokens (the checkpoint recurrence)
     is_verify: bool = False
+    k1: int = 1  # tokens per row of a verify block (drafts + 1)
+    kmax1: int = 0  # the pool's prefix slots per row (the largest block + 1)
     _cpu: dict = field(default_factory=dict, repr=False)
     _dev: dict = field(default_factory=dict, repr=False)
 
     def verify_cu_seqlens(self) -> torch.Tensor:
-        """Token boundaries of the rows' prefix + block sequences (``2 (k + 1)`` each), the packing
-        ``kda_recurrent_checkpoint`` reads; built once per plan (one launch a step, not one a layer)."""
+        """Token boundaries of the rows' prefix + block sequences (``kmax1 + k1`` each, the prefix
+        padded to the pool's slots), the packing ``kda_recurrent_checkpoint`` reads; built once per
+        plan (one launch a step, not one a layer)."""
         if "verify_cu" not in self._dev:
-            self._dev["verify_cu"] = self.cu_seqlens[: self.num_rows + 1] * 2
+            self._dev["verify_cu"] = torch.arange(
+                self.num_rows + 1, dtype=torch.int32, device=self.cu_seqlens.device) * (self.kmax1 + self.k1)
         return self._dev["verify_cu"]
 
     # host copies for reference kernels that loop over rows (a sync on CUDA; the fla kernels never ask)
@@ -132,7 +136,7 @@ class KDAManager(LinearAttnManager):
         addressing: dict[str, RecurrentAddressing] = ctx.plan_results[self._pool_key]
         self._current = {}
         for label, segments in self._group_by_label(step.segments or ()).items():
-            self._current[label] = self._build_plan(label, segments, addressing[label], ctx)
+            self._current[label] = self._build_plan(label, segments, addressing[label], ctx, step.speculative)
         if ctx.is_preplan:
             self._preplanned = True
             self._cached_plan_output = self._current
@@ -169,6 +173,7 @@ class KDAManager(LinearAttnManager):
 
     def _build_plan(
         self, label: str, segments: list[Segment], addressing: RecurrentAddressing, ctx: StepContext,
+        speculative: bool = False,
     ) -> KDAPlan:
         spans = [max(int(seg.span), 0) for seg in segments]
         rows = len(spans)
@@ -179,11 +184,17 @@ class KDAManager(LinearAttnManager):
         # built on the host and copied in: the values come from Python bookkeeping
         host = torch.tensor(cu, dtype=torch.int32, pin_memory=torch.cuda.is_available())
         buf[: rows + 1].copy_(host, non_blocking=True)
-        k1 = self.speculative_tokens + 1
+        # a verify block: declared so, or (the step not saying) every row spanning the full block
+        kmax1 = self.speculative_tokens + 1
+        uniform = rows > 0 and all(s == spans[0] for s in spans)
+        is_verify = self.speculative_tokens > 0 and uniform and (speculative or spans[0] == kmax1)
+        if is_verify:
+            assert 1 <= spans[0] <= kmax1, f"a verify block spans 1..{kmax1} tokens, not {spans[0]}"
         return KDAPlan(
             slot_ids=addressing.slot_indices[:rows], has_state=addressing.has_state[:rows], cu_seqlens=buf,
-            cu_seqlens_cpu=cu, num_rows=rows, num_tokens=cu[-1], is_decode=rows > 0 and all(s == 1 for s in spans),
-            is_verify=self.speculative_tokens > 0 and rows > 0 and all(s == k1 for s in spans),
+            cu_seqlens_cpu=cu, num_rows=rows, num_tokens=cu[-1],
+            is_decode=not is_verify and rows > 0 and all(s == 1 for s in spans),
+            is_verify=is_verify, k1=spans[0] if is_verify else 1, kmax1=kmax1 if self.speculative_tokens > 0 else 0,
         )
 
     def current_plan(self, label: str | None = None) -> KDAPlan:
