@@ -198,17 +198,16 @@ class SpecAcceptance(Resource):
         dev[:rows].copy_(accepted.to(torch.int32))
         host[:rows].copy_(dev[:rows], non_blocking=True)
         if tokens is not None:
-            # a shorter block than the resource's k fills the leading columns
+            # a shorter block than the resource's k fills the leading columns on the device; the mirror
+            # takes whole rows, since a device-to-pinned copy has to be contiguous to be captured
             tdev, thost = self._tok_dev[self._current_slot], self._tok_host[self._current_slot]
-            width = tokens.shape[1]
-            tdev[:rows, :width].copy_(tokens.to(torch.int32))
-            thost[:rows, :width].copy_(tdev[:rows, :width], non_blocking=True)
+            tdev[:rows, : tokens.shape[1]].copy_(tokens.to(torch.int32))
+            thost[:rows].copy_(tdev[:rows], non_blocking=True)
         self._staged_drafts = drafts is not None and drafts.shape[1] > 0
         if self._staged_drafts:
             ddev, dhost = self._drf_dev[self._current_slot], self._drf_host[self._current_slot]
-            width = drafts.shape[1]
-            ddev[:rows, :width].copy_(drafts.to(torch.int32))
-            dhost[:rows, :width].copy_(ddev[:rows, :width], non_blocking=True)
+            ddev[:rows, : drafts.shape[1]].copy_(drafts.to(torch.int32))
+            dhost[:rows].copy_(ddev[:rows], non_blocking=True)
         self._counter_dev.add_(1)
         self._counter_host.copy_(self._counter_dev, non_blocking=True)
 
