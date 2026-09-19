@@ -44,6 +44,7 @@ from mstar.model.kimi_k3.components.common import (
 )
 from mstar.model.kimi_k3.reference.moe import routed_experts_loop
 from mstar.model.kimi_k3.reference.mxfp4 import MXFP4_GROUP, dequant_mxfp4
+from mstar.model.kimi_k3.components.common import fused_decode_kernels
 from mstar.model.kimi_k3.components.router_kernel import fused_route, fused_route_supported, gate_logits
 from mstar.model.kimi_k3.reference.router import noaux_tc_route
 
@@ -204,7 +205,7 @@ class KimiLatentMoE(nn.Module):
         # normalized) latent and the partial rides the same all-reduce as the shared
         # experts' partial -- one collective on hidden, and 1/tp of the up-proj weights
         self.routed_expert_up_proj = RowParallelLinear(
-            comm_group, latent_size, hidden_size, bias=False, input_is_parallel=False, reduce_results=False,
+            comm_group, latent_size, hidden_size, bias=False, input_is_parallel=True, reduce_results=False,
         )
         self.routed_expert_norm = KimiRMSNorm(latent_size, eps=norm_eps) if latent_norm else None
         self.experts = nn.Module()
@@ -390,7 +391,13 @@ class KimiLatentMoE(nn.Module):
             y = self.comm_group.all_reduce(y)
         if self.routed_expert_norm is not None:
             y = self.routed_expert_norm(y)
-        y = self.routed_expert_up_proj(y)  # partial over the latent shards
+        # partial over the latent shards: this rank's columns of the latent, a view the GEMM reads with
+        # its row stride (splitting inside the row-parallel linear copied them for more than one row)
+        up = self.routed_expert_up_proj
+        y = y.narrow(-1, up.tp_rank * up.input_size_per_partition, up.input_size_per_partition)
+        if not fused_decode_kernels():
+            y = y.contiguous()
+        y = up(y)
         if self.shared_experts is not None:
             s_out = self._shared(mixed)  # partial over the intermediate shards
             buf = self.comm_group.symm_buffer(y.shape, y.dtype, y.device)
