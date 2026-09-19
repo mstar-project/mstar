@@ -127,7 +127,7 @@ def test_slot_buffers_are_copied_out_before_reuse():
         res._seq_enqueued += 1
         with res._lock:
             for row, rid in enumerate(rids):
-                res._pending[rid] = (res._seq_enqueued, slot, row)
+                res._pending[rid] = (res._seq_enqueued, slot, row, K)
 
     run(["a", "b"], 0, [4, 0])
     # b is held for two steps; slot 0 is written again by a later step with other rows
@@ -194,3 +194,28 @@ def test_staged_drafts_ride_along_for_a_trace():
     res.stage(torch.tensor([0], dtype=torch.int32), torch.tensor([[3, 0, 0, 0, 0]], dtype=torch.int32))
     res.commit(s2.get("spec_acceptance"), ctx2)
     assert res.verdicts_for(["a"])[0].drafts is None
+
+
+def test_a_shorter_block_settles_its_own_length():
+    # a step of 2 drafts under a resource built for 4: the verdict carries 3 tokens and rejects 2 - accepted
+    res = spec_resource()
+    s = SubmoduleStep(segments=[Segment("a", "main", 3)], steps={"spec_acceptance": SpecStep(verify=True, num_drafts=2)})
+    ctx = StepContext(request_ids=["a"], graph_walk="decode", slot=0, capture=False)
+    s.set_ctx(ctx)
+    res.plan(s.get("spec_acceptance"), ctx)
+    res.stage(torch.tensor([1], dtype=torch.int32), torch.tensor([[7, 8, 9]], dtype=torch.int32))
+    res.commit(s.get("spec_acceptance"), ctx)
+    v = res.verdicts_for(["a"])[0]
+    assert (v.accepted, v.tokens, v.k) == (1, [7, 8, 9], 2)
+    s2, ctx2 = step(["a"], span=1)
+    out = res.plan(s2.get("spec_acceptance"), ctx2)
+    assert out["a"].accepted == 1 and out["a"].rejected == 1
+    # an empty block (no drafts): one token, nothing to reject
+    s3 = SubmoduleStep(segments=[Segment("a", "main", 1)], steps={"spec_acceptance": SpecStep(verify=True, num_drafts=0)})
+    s3.set_ctx(ctx)
+    res.plan(s3.get("spec_acceptance"), ctx)
+    res.stage(torch.tensor([0], dtype=torch.int32), torch.tensor([[11]], dtype=torch.int32))
+    res.commit(s3.get("spec_acceptance"), ctx)
+    v = res.verdicts_for(["a"])[0]
+    assert (v.accepted, v.tokens, v.k) == (0, [11], 0)
+    assert res.plan(s2.get("spec_acceptance"), ctx2)["a"].rejected == 0
