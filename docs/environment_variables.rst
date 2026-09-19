@@ -26,14 +26,22 @@ Communication
        pyzmq.
    * - ``MSTAR_TORCH_PROFILE``
      - unset
-     - ``<start>:<count>[,<start>:<count>...]`` makes a worker profile ``count`` engine
+     - ``<start>:<count>[@<bs>][,...]`` makes a worker profile ``count`` engine
        steps of ``MSTAR_TORCH_PROFILE_WALK`` (default ``decode``) from the ``start``-th such
        step of each window with ``torch.profiler``, then log one per-kernel table per window
        (CUDA time and launches per step, the batch sizes seen; the kernels of CUDA-graph
        replays are listed individually) and write a Chrome trace to
-       ``MSTAR_TORCH_PROFILE_DIR`` (default ``/tmp``). ``MSTAR_TORCH_PROFILE_RANKS`` (default
-       ``0``; comma-separated worker indices or ``all``) selects the workers. Unset, the hook
-       is a counter increment per step.
+       ``MSTAR_TORCH_PROFILE_DIR`` (default ``/tmp``). With ``@<bs>`` a window counts and
+       covers only the steps of that batch size (one served run through several concurrency
+       levels gives one table per bucket). ``MSTAR_TORCH_PROFILE_RANKS`` (default
+       ``0``; comma-separated worker indices or ``all``) selects the workers;
+       ``MSTAR_TORCH_PROFILE_STACK=1`` records Python stacks and shapes, which attributes an
+       eager step's kernels to their ops. Unset, the hook is a counter increment per step.
+   * - ``MSTAR_K3_FUSED_DECODE``
+     - ``1``
+     - ``0`` makes the Kimi K3 decode step fall back to the torch/fla paths its fused Triton
+       kernels replaced (the KDA recurrence and gated norm reading the merged projection's
+       slices in place, MLA's per-head output product with its gate), for a served A/B.
    * - ``MSTAR_SYMM_MEM_ALLREDUCE``
      - ``auto``
      - How small tensor-parallel all-reduces (``CommGroup.all_reduce``) run. ``auto`` runs 2-D
