@@ -212,8 +212,9 @@ class FlashInferMLAManager(AttentionManager):
         self._cg_plan_states: dict[tuple[CGSlotKey, bool], FlashInferMLAWrapper | FlashMLAWrapper] = {}
         self._preplan_states: dict[str, FlashInferMLAWrapper | FlashMLAWrapper] = {}
         self._preplanned = False
-        # DeepSeek's FlashMLA for the plans it takes (causal, one query per row): a few us a layer
-        # against FlashInfer's Hopper kernel's ~15 us floor; MSTAR_MLA_DECODE_BACKEND=flashinfer keeps the latter
+        # DeepSeek's FlashMLA for the plans it takes (causal, one query per row) when
+        # MSTAR_MLA_DECODE_BACKEND=flashmla asks for it; measured no faster than FlashInfer's Hopper kernel
+        # on an H100 at 1 to 64 rows, so FlashInfer stays the default
         self._flashmla = (flashmla_wanted() and flashmla_available()
                           and flashmla_supports(kv_config.kv_lora_rank, kv_config.qk_rope_head_dim))
         if self._flashmla:
