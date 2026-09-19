@@ -20,13 +20,17 @@ Example:
 from __future__ import annotations
 
 import argparse
+import ast
+import concurrent.futures
 import hashlib
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -44,6 +48,16 @@ import serve_rollout as rollout  # noqa: E402
 
 from mstar.client import MStarClient, VideoFrameChunk  # noqa: E402
 from mstar.utils import profiler  # noqa: E402
+
+# One 4-frame chunk at 60 fps is the realtime delivery budget for a single
+# stream (matches the chunk geometry _actions/_check assume elsewhere).
+REALTIME_CHUNK_BUDGET_MS = 4 / 60 * 1000
+
+# Worker DEBUG lines are formatted by logging.basicConfig(format="%(asctime)s
+# %(levelname)s [worker_id] %(name)s: %(message)s") (mstar/conductor/conductor.py);
+# %(asctime)s defaults to "2026-09-17 21:38:40,605".
+_LOG_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})")
+_LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S,%f"
 
 
 @dataclass(frozen=True)
@@ -100,6 +114,8 @@ def _stream_metrics(
         sustained_ratio = None
 
     stalls = [gap for gap in gaps if gap > stall_threshold_seconds]
+    realtime_budget_seconds = REALTIME_CHUNK_BUDGET_MS / 1000.0
+    chunks_within_budget = sum(1 for gap in gaps if gap <= realtime_budget_seconds)
     return {
         "chunk_count": len(observations),
         "frame_count": total_frames,
@@ -128,6 +144,9 @@ def _stream_metrics(
                 gap - stall_threshold_seconds for gap in stalls
             ),
         },
+        "on_time_chunk_fraction": (
+            chunks_within_budget / len(gaps) if gaps else None
+        ),
         "consumer": {
             "pause_seconds": consumer_pause_seconds,
             "pause_count": consumer_pause_count,
@@ -192,6 +211,7 @@ def _measure_stream(
     clock: Callable[[], float] = time.perf_counter,
     sleep: Callable[[float], None] = time.sleep,
     enable_nvtx: bool = False,
+    start_barrier: threading.Barrier | None = None,
 ) -> tuple[dict, list[str]]:
     """Consume one stream while retaining only timings and an incremental hash."""
     stream = client.stream(
@@ -204,6 +224,12 @@ def _measure_stream(
         seed=rng_seed,
     )
     iterator = iter(stream)
+    # Lazy: crossing here means every stream in the wave has built its request
+    # body before any of them open the HTTP request, so the clock below starts
+    # from a synchronized release rather than staggered request construction
+    # (mirrors serve_rollout._rollout's start_barrier).
+    if start_barrier is not None:
+        start_barrier.wait(timeout=30)
     if enable_nvtx:
         profiler.range_push(f"benchmark.stream[{request_id}]")
     started = clock()
@@ -344,6 +370,258 @@ def _backpressure_metrics(
     }
 
 
+def _run_concurrent_wave(
+    client_factory: Callable[[], MStarClient],
+    seed_image: Path,
+    variant: rollout.Variant,
+    *,
+    num_steps: int,
+    request_ids: Sequence[str],
+    seeds: Sequence[int],
+    stall_threshold_seconds: float,
+    enable_nvtx: bool,
+) -> tuple[list[tuple[dict, list[str]]], float, float]:
+    """Run ``len(request_ids)`` streams together, each opening only once every
+    thread has built its request body (mirrors serve_rollout._concurrent_rollouts).
+
+    Returns (per-stream (metrics, failures) in ``request_ids`` order, wave
+    start, wave end) on the driver's own wall clock, for cross-stream
+    aggregate timing that does not require touching _stream_metrics.
+    """
+    barrier = threading.Barrier(len(request_ids) + 1)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(request_ids)) as executor:
+        futures = [
+            executor.submit(
+                _measure_stream,
+                client_factory(),
+                seed_image,
+                variant,
+                num_steps=num_steps,
+                request_id=request_id,
+                rng_seed=seed,
+                consumer_pause_seconds=0.0,
+                stall_threshold_seconds=stall_threshold_seconds,
+                enable_nvtx=enable_nvtx,
+                start_barrier=barrier,
+            )
+            for request_id, seed in zip(request_ids, seeds)
+        ]
+        barrier.wait(timeout=30)
+        wave_start = time.perf_counter()
+        results = [future.result() for future in futures]
+        wave_end = time.perf_counter()
+    return results, wave_start, wave_end
+
+
+def _stream_is_realtime(metrics: dict) -> bool:
+    """A stream stayed realtime iff it sustained >=1x, its p95 inter-chunk gap
+    fit the one-chunk (4 frames @ 60 fps) delivery budget, and it never stalled."""
+    sustained = metrics["sustained_media_to_wall_ratio"]
+    gap_p95 = metrics["inter_chunk_gap_seconds"]["p95"]
+    gap_p95_ms = gap_p95 * 1000.0 if gap_p95 is not None else None
+    return (
+        sustained is not None
+        and sustained >= 1.0
+        and gap_p95_ms is not None
+        and gap_p95_ms <= REALTIME_CHUNK_BUDGET_MS
+        and metrics["stalls"]["count"] == 0
+    )
+
+
+def _concurrent_aggregate(per_stream: Sequence[dict], *, aggregate_fps: float | None, server: dict) -> dict:
+    """Cross-stream realtime summary built from each stream's _measure_stream
+    metrics dict (unmodified _stream_metrics output) plus the already-parsed
+    server-side rollout cadence."""
+    ttff_ms = [
+        metrics["time_to_first_frame_seconds"] * 1000.0
+        for metrics in per_stream
+        if metrics["time_to_first_frame_seconds"] is not None
+    ]
+    gap_p50_ms = [
+        metrics["inter_chunk_gap_seconds"]["p50"] * 1000.0
+        for metrics in per_stream
+        if metrics["inter_chunk_gap_seconds"]["p50"] is not None
+    ]
+    gap_p95_ms = [
+        metrics["inter_chunk_gap_seconds"]["p95"] * 1000.0
+        for metrics in per_stream
+        if metrics["inter_chunk_gap_seconds"]["p95"] is not None
+    ]
+    gap_max_ms = [
+        metrics["inter_chunk_gap_seconds"]["maximum"] * 1000.0
+        for metrics in per_stream
+        if metrics["inter_chunk_gap_seconds"]["maximum"] is not None
+    ]
+    sustained = [
+        metrics["sustained_media_to_wall_ratio"]
+        for metrics in per_stream
+        if metrics["sustained_media_to_wall_ratio"] is not None
+    ]
+    realtime_per_stream = [_stream_is_realtime(metrics) for metrics in per_stream]
+    realtime_count = sum(realtime_per_stream)
+    chunk_fractions = [
+        metrics["on_time_chunk_fraction"]
+        for metrics in per_stream
+        if metrics["on_time_chunk_fraction"] is not None
+    ]
+    gap_p50_median = statistics.median(gap_p50_ms) if gap_p50_ms else None
+    server_step_p50 = server["step_spacing_ms"]["p50"]
+
+    return {
+        "aggregate_fps": aggregate_fps,
+        "ttff_ms": {"p50": _percentile(ttff_ms, 0.50), "p95": _percentile(ttff_ms, 0.95)},
+        "gap_ms": {
+            "p50_worst": max(gap_p50_ms) if gap_p50_ms else None,
+            "p95_worst": max(gap_p95_ms) if gap_p95_ms else None,
+            "max_worst": max(gap_max_ms) if gap_max_ms else None,
+            "p50_median": gap_p50_median,
+        },
+        "sustained_min": min(sustained) if sustained else None,
+        "stall_count_total": sum(metrics["stalls"]["count"] for metrics in per_stream),
+        "realtime_per_stream": realtime_per_stream,
+        "realtime_count": realtime_count,
+        "realtime_fraction": (
+            realtime_count / len(realtime_per_stream) if realtime_per_stream else None
+        ),
+        "all_realtime": all(realtime_per_stream) if realtime_per_stream else False,
+        "on_time_chunk_fraction_min": min(chunk_fractions) if chunk_fractions else None,
+        "on_time_chunk_fraction_mean": (
+            statistics.fmean(chunk_fractions) if chunk_fractions else None
+        ),
+        "server": server,
+        "delivery_bound": (
+            gap_p50_median is not None
+            and server_step_p50 is not None
+            and gap_p50_median > 1.2 * server_step_p50
+        ),
+    }
+
+
+def _dit_step_timestamps(log_text: str, request_ids: set[str]) -> list[float]:
+    """Wall-clock seconds (from each line's %(asctime)s prefix) of every
+    rollout DiT step whose batch includes at least one of ``request_ids``, in
+    log order. Same marker/parsing as serve_rollout._dit_schedule, extended
+    with the timestamp that function does not keep."""
+    marker = "Executing: dit graph_walk=rollout "
+    timestamps = []
+    for line in log_text.splitlines():
+        if marker not in line:
+            continue
+        try:
+            batch = ast.literal_eval(line.split(marker, 1)[1].strip())
+        except (SyntaxError, ValueError):
+            continue
+        if not isinstance(batch, (list, tuple)) or not any(rid in request_ids for rid in batch):
+            continue
+        match = _LOG_TIMESTAMP_RE.match(line)
+        if match is None:
+            continue
+        timestamps.append(datetime.strptime(match.group(1), _LOG_TIMESTAMP_FORMAT).timestamp())
+    return timestamps
+
+
+def _concurrent_server_metrics(log_text: str, request_ids: set[str], startup_seconds: float) -> dict:
+    """Rows-per-step histogram and step-to-step spacing for the measured
+    wave's DiT rollout executions, parsed from worker DEBUG log lines."""
+    schedule = rollout._dit_schedule(log_text, request_ids)
+    histogram: dict[int, int] = {}
+    for batch in schedule:
+        histogram[len(batch)] = histogram.get(len(batch), 0) + 1
+
+    timestamps = sorted(_dit_step_timestamps(log_text, request_ids))
+    spacing_ms = [(later - earlier) * 1000.0 for earlier, later in zip(timestamps, timestamps[1:])]
+    return {
+        "rows_per_step_histogram": histogram,
+        "step_spacing_ms": {"p50": _percentile(spacing_ms, 0.50), "p95": _percentile(spacing_ms, 0.95)},
+        "startup_seconds": startup_seconds,
+    }
+
+
+def _run_concurrent_phase(
+    client_factory: Callable[[], MStarClient],
+    seed_image: Path,
+    variant: rollout.Variant,
+    *,
+    streams: int,
+    worlds: int,
+    batch: int,
+    num_steps: int,
+    warmup_steps: int,
+    request_id_prefix: str,
+    rng_seed: int,
+    stall_threshold_seconds: float,
+    enable_nvtx: bool,
+    log_path: Path,
+    proc: subprocess.Popen,
+    request_timeout: float,
+    sampler: rollout.MemorySampler,
+    startup_seconds: float,
+) -> tuple[dict, list[str]]:
+    """N-stream concurrent phase: a discarded warmup wave (captures/compiles
+    the batch-``streams`` CUDA graph bucket), then a measured wave whose
+    per-stream metrics and server-side rollout cadence decide whether every
+    stream stayed realtime under batch-``streams`` scheduling."""
+    failures: list[str] = []
+
+    warmup_ids = [f"{request_id_prefix}-concurrent-warmup-{i}" for i in range(streams)]
+    warmup_seeds = [rng_seed + i for i in range(streams)]
+    print(f"concurrent warmup: {streams} streams, {warmup_steps} step(s) each")
+    _wait_for_phase_sample(sampler, proc, "concurrent-warmup")
+    warmup_results, _, _ = _run_concurrent_wave(
+        client_factory,
+        seed_image,
+        variant,
+        num_steps=warmup_steps,
+        request_ids=warmup_ids,
+        seeds=warmup_seeds,
+        stall_threshold_seconds=stall_threshold_seconds,
+        enable_nvtx=enable_nvtx,
+    )
+    for request_id, (_, stream_failures) in zip(warmup_ids, warmup_results):
+        failures.extend(f"concurrent-warmup {request_id}: {failure}" for failure in stream_failures)
+    rollout._wait_for_cleanup(log_path, tuple(warmup_ids), proc, request_timeout)
+
+    measured_ids = [f"{request_id_prefix}-concurrent-measured-{i}" for i in range(streams)]
+    measured_seeds = [rng_seed + i for i in range(streams)]
+    print(f"concurrent measured: {streams} streams, {num_steps} step(s) each")
+    _wait_for_phase_sample(sampler, proc, "concurrent-measured")
+    log_offset = log_path.stat().st_size
+    measured_results, wave_start, wave_end = _run_concurrent_wave(
+        client_factory,
+        seed_image,
+        variant,
+        num_steps=num_steps,
+        request_ids=measured_ids,
+        seeds=measured_seeds,
+        stall_threshold_seconds=stall_threshold_seconds,
+        enable_nvtx=enable_nvtx,
+    )
+    per_stream = []
+    for request_id, (metrics, stream_failures) in zip(measured_ids, measured_results):
+        failures.extend(f"concurrent-measured {request_id}: {failure}" for failure in stream_failures)
+        per_stream.append(metrics)
+    rollout._wait_for_cleanup(log_path, tuple(measured_ids), proc, request_timeout, offset=log_offset)
+
+    total_frames = sum(metrics["frame_count"] for metrics in per_stream)
+    aggregate_fps = total_frames / (wave_end - wave_start) if wave_end > wave_start else None
+
+    wave_log = rollout._read_log_since(log_path, log_offset)
+    server = _concurrent_server_metrics(wave_log, set(measured_ids), startup_seconds)
+
+    samples, _ = sampler.snapshot()
+    measured_gpu_mib = [sample.gpu_mib for sample in samples if sample.phase == "concurrent-measured"]
+
+    result = {
+        "streams": streams,
+        "worlds": worlds,
+        "batch": batch,
+        "per_stream": per_stream,
+        "gpu_peak_mib": max(measured_gpu_mib) if measured_gpu_mib else None,
+        **_concurrent_aggregate(per_stream, aggregate_fps=aggregate_fps, server=server),
+    }
+    return result, failures
+
+
 def _format_number(value: float | None, digits: int = 3) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
@@ -379,6 +657,37 @@ def _human_summary(result: dict, artifact: Path) -> str:
             f"{_format_number(startup['p95'])}s "
             f"mean={_format_number(startup['mean'])}s"
         )
+    concurrent = result.get("concurrent")
+    if concurrent is not None:
+        lines.append(
+            f"  concurrent: {concurrent['streams']} streams "
+            f"(worlds={concurrent['worlds']} batch={concurrent['batch']})"
+        )
+        for idx, (stream, realtime) in enumerate(
+            zip(concurrent["per_stream"], concurrent["realtime_per_stream"])
+        ):
+            gaps = stream["inter_chunk_gap_seconds"]
+            lines.append(
+                f"    stream {idx}: TTFF={_format_number(stream['time_to_first_frame_seconds'])}s "
+                f"gap p50/p95/max={_format_number(gaps['p50'])}/{_format_number(gaps['p95'])}/"
+                f"{_format_number(gaps['maximum'])}s "
+                f"sustained={_format_number(stream['sustained_media_to_wall_ratio'])}x "
+                f"stalls={stream['stalls']['count']} "
+                f"realtime={'yes' if realtime else 'no'}"
+            )
+        lines.append(
+            f"    aggregate: fps={_format_number(concurrent['aggregate_fps'])} "
+            f"ttff p50/p95={_format_number(concurrent['ttff_ms']['p50'])}/"
+            f"{_format_number(concurrent['ttff_ms']['p95'])}ms "
+            f"gap p50_median/p95_worst={_format_number(concurrent['gap_ms']['p50_median'])}/"
+            f"{_format_number(concurrent['gap_ms']['p95_worst'])}ms "
+            f"sustained_min={_format_number(concurrent['sustained_min'])}x "
+            f"stalls_total={concurrent['stall_count_total']} "
+            f"all_realtime={concurrent['all_realtime']} "
+            f"delivery_bound={concurrent['delivery_bound']} "
+            f"gpu_peak={_format_number(concurrent['gpu_peak_mib'], 1)}MiB"
+        )
+
     backpressure = result["backpressure"]
     lines.extend(
         [
@@ -410,6 +719,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--warmup-steps", type=int, default=1)
+    parser.add_argument(
+        "--streams",
+        type=int,
+        default=1,
+        help="concurrent streams; >1 runs the concurrent batching phase",
+    )
+    parser.add_argument(
+        "--worlds", type=int, help="server world slots (kv.num_worlds); defaults to --streams"
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        help="rows per rollout step (model_kwargs.step_batch_size); defaults to --streams",
+    )
     parser.add_argument(
         "--startup-repeats",
         type=int,
@@ -454,6 +777,18 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--startup-repeats cannot be negative")
     if args.startup_steps <= 0:
         parser.error("--startup-steps must be positive")
+    if args.streams <= 0:
+        parser.error("--streams must be positive")
+    if args.worlds is None:
+        args.worlds = args.streams
+    if args.batch is None:
+        args.batch = args.streams
+    if args.worlds <= 0:
+        parser.error("--worlds must be positive")
+    if args.batch <= 0:
+        parser.error("--batch must be positive")
+    if args.batch > args.worlds:
+        parser.error("--batch must be <= --worlds")
     if args.slow_consumer_delay < 0:
         parser.error("--slow-consumer-delay cannot be negative")
     if args.stall_threshold is not None and args.stall_threshold <= 0:
@@ -503,14 +838,19 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
         checkpoint_dir,
         ae_path,
         workdir / "run.yaml",
-        worlds=1,
+        worlds=args.worlds,
+        batch=args.batch,
     )
     seed_image = rollout._seed_png(args.seed_image, variant, workdir / "seed.png")
+    # serve_rollout forces DEBUG for its own concurrent mode so the worker's
+    # per-step "Executing: dit graph_walk=..." lines are emitted; the
+    # concurrent phase below needs the same to parse rows/step and spacing.
+    server_log_level = "DEBUG" if args.streams > 1 else args.log_level
     server_command = rollout._server_command(
         config,
         port,
         workdir,
-        args.log_level,
+        server_log_level,
         args.request_timeout,
         args.cache_dir,
         args.enable_nvtx,
@@ -534,6 +874,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
     failures: list[str] = []
     runs: dict[str, dict] = {}
     startup_ttffs: list[float] = []
+    concurrent_result: dict | None = None
     startup_started = time.perf_counter()
     try:
         client = MStarClient(url, timeout=args.request_timeout)
@@ -640,6 +981,32 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
             failures.append(
                 "slow-consumer payload differs from the identical-seed baseline"
             )
+
+        if args.streams > 1:
+            print(
+                f"concurrent: {args.streams} streams, {args.steps} steps each "
+                f"(worlds={args.worlds} batch={args.batch})"
+            )
+            concurrent_result, concurrent_failures = _run_concurrent_phase(
+                client_factory=lambda: MStarClient(url, timeout=args.request_timeout),
+                seed_image=seed_image,
+                variant=variant,
+                streams=args.streams,
+                worlds=args.worlds,
+                batch=args.batch,
+                num_steps=args.steps,
+                warmup_steps=args.warmup_steps,
+                request_id_prefix=args.request_id,
+                rng_seed=args.seed,
+                stall_threshold_seconds=stall_threshold,
+                enable_nvtx=args.enable_nvtx,
+                log_path=args.log,
+                proc=proc,
+                request_timeout=args.request_timeout,
+                sampler=sampler,
+                startup_seconds=startup_seconds,
+            )
+            failures.extend(concurrent_failures)
     finally:
         try:
             if sampler is not None:
@@ -647,7 +1014,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
         finally:
             rollout._shutdown(proc)
 
-    return {
+    result = {
         "schema_version": 1,
         "benchmark": "waypoint_streaming_viability",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -691,12 +1058,55 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
             ),
             "jitter_population_stddev": "population standard deviation of inter-chunk gaps",
             "stall": "inter-chunk gap strictly greater than stall_threshold_seconds",
+            "on_time_chunk_fraction": (
+                f"per stream: fraction of chunks delivered on time (inter-chunk gap <= "
+                f"{REALTIME_CHUNK_BUDGET_MS:.1f}ms, one 4-frame/60fps chunk of playback); "
+                "the pacing pillar of streaming viability"
+            ),
             "memory": "PSS and nvidia-smi GPU process memory summed over the server process group only",
             "backpressure": (
                 "delta between an unpaused stream and an identical stream paused between SDK reads"
             ),
         },
     }
+
+    if concurrent_result is not None:
+        result["concurrent"] = concurrent_result
+        result["metric_definitions"].update(
+            {
+                "concurrent.aggregate_fps": (
+                    "total frames delivered across streams / (last chunk arrival - earliest "
+                    "stream start), wall-clock, over the measured concurrent wave"
+                ),
+                "concurrent.gap_ms.p50_median": "median across streams of each stream's own inter-chunk gap p50",
+                "concurrent.gap_ms.*_worst": (
+                    "largest across streams of each stream's own inter-chunk gap p50/p95/maximum"
+                ),
+                "concurrent.realtime_per_stream": (
+                    f"per stream: sustained ratio >= 1.0 and gap p95 <= {REALTIME_CHUNK_BUDGET_MS:.1f}ms "
+                    "(one 4-frame/60fps chunk) and zero stalls"
+                ),
+                "concurrent.realtime_count": (
+                    "how many of the batch's streams stayed realtime (sum of realtime_per_stream); "
+                    "realtime_fraction is that over the stream count"
+                ),
+                "concurrent.on_time_chunk_fraction_min": (
+                    "smallest per-stream on_time_chunk_fraction across the batch (mean is the average); "
+                    "the worst stream's on-time chunk rate under batch-B scheduling"
+                ),
+                "concurrent.delivery_bound": (
+                    "client gap_ms.p50_median > 1.2x server.step_spacing_ms.p50: clients are "
+                    "slower than the GPU produces steps, so the limit is delivery rather than compute"
+                ),
+                "concurrent.server.rows_per_step_histogram": (
+                    "count of measured-wave DiT rollout steps by batch row count"
+                ),
+                "concurrent.server.step_spacing_ms": (
+                    "gap between consecutive measured-wave DiT rollout step log timestamps"
+                ),
+            }
+        )
+    return result
 
 
 def _write_artifact(path: Path, result: dict) -> None:

@@ -46,10 +46,10 @@ __all__ = ["WaypointDiT", "WaypointDiTBlock", "WaypointPosIds"]
 
 
 class WaypointPosIds(NamedTuple):
-    """The four position streams for one frame.
+    """The four position streams for one frame, per row of the step batch.
 
-    ``f_pos`` is the ``[]`` int64 ring clock (the KV resource's ``upsert`` takes
-    the scalar); ``t_pos`` is the ``[B, T]`` RoPE time coordinate
+    ``f_pos`` is the ``[B]`` int64 ring clock (the KV resource's ``upsert``
+    takes it); ``t_pos`` is the ``[B, T]`` RoPE time coordinate
     ``f_pos * ts_mult``; ``y_pos``/``x_pos`` are ``[B, T]`` token-grid
     coordinates, ``row = i // width`` and ``col = i % width``.
     """
@@ -98,7 +98,7 @@ class WaypointDiTBlock(nn.Module):
         ``cond_idx`` is the ``scheduler_sigmas`` slot, for the cond_head cache.
 
         Only ``f_pos`` reaches this far -- the RoPE angles are built once at the
-        root -- so the scalar ring clock is passed rather than the whole bundle.
+        root -- so the ``[B]`` ring clock is passed rather than the whole bundle.
         """
         s0, b0, g0, s1, b1, g1 = self.cond_head(cond, cond_idx)
 
@@ -265,15 +265,18 @@ class WaypointDiT(nn.Module):
         """Build one frame's position streams from the ring clock."""
         if not torch.compiler.is_compiling():
             torch._check(
-                frame_pos.ndim == 0 and frame_pos.dtype == torch.int64,
-                lambda: f"frame_pos must be a [] int64 tensor; got {tuple(frame_pos.shape)} "
+                frame_pos.ndim == 1 and frame_pos.dtype == torch.int64,
+                lambda: f"frame_pos must be a [B] int64 tensor; got {tuple(frame_pos.shape)} "
                 f"{frame_pos.dtype}",
             )
         y_pos, x_pos = self._grid.get(frame_pos.device)
+        B = frame_pos.shape[0]
         # A no-op at ts_mult == 1, kept because it is the only place the two
         # clocks are related; deleting it drifts silently at another fps.
-        t_pos = (frame_pos * self.config.ts_mult).reshape(1, 1).expand(1, y_pos.numel())
-        return WaypointPosIds(f_pos=frame_pos, t_pos=t_pos, y_pos=y_pos[None], x_pos=x_pos[None])
+        t_pos = (frame_pos * self.config.ts_mult)[:, None].expand(B, y_pos.numel())
+        return WaypointPosIds(
+            f_pos=frame_pos, t_pos=t_pos, y_pos=y_pos[None].expand(B, -1), x_pos=x_pos[None].expand(B, -1)
+        )
 
     # ---- One forward -------------------------------------------------------
 
@@ -291,8 +294,8 @@ class WaypointDiT(nn.Module):
     ) -> Tensor:
         """One pass over one latent frame; returns the rectified-flow velocity.
 
-        ``x`` ``[B, N, C, H, W]`` latent (B == N == 1), ``sigma`` ``[B, N]``,
-        ``frame_pos`` ``[]`` int64 ring clock, controller inputs ``[B, N, 2]`` /
+        ``x`` ``[B, N, C, H, W]`` latent (N == 1), ``sigma`` ``[B, N]``,
+        ``frame_pos`` ``[B]`` int64 ring clock, controller inputs ``[B, N, 2]`` /
         ``[B, N, n_buttons]`` / ``[B, N, 1]``. Returns ``[B, N, C, H, W]``.
 
         ``commit`` says whether this pass keeps its K/V: False for the four
@@ -310,9 +313,9 @@ class WaypointDiT(nn.Module):
             Hp * Wp == self.config.tokens_per_frame,
             f"{Hp} * {Wp} != {self.config.tokens_per_frame}",
         )
-        # One frame per call, batch 1: the ring cache indexes a single frame per
+        # One frame per call per row: the ring cache indexes a single frame per
         # upsert and the whole driver is built on that.
-        torch._assert(B == 1 and N == 1, "WaypointDiT.forward supports B == 1, N == 1")
+        torch._assert(N == 1, "WaypointDiT.forward supports N == 1")
 
         pos_ids = self._pos_ids(frame_pos)
         # Keyword arguments on purpose: a silent x/y swap on a non-square grid

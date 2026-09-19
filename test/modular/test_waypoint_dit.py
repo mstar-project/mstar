@@ -428,7 +428,7 @@ def test_generate_frame_is_four_frozen_denoise_passes_then_one_commit():
     try:
         with torch.no_grad():
             dit.generate_frame(
-                noise, torch.tensor(0, dtype=torch.int64),
+                noise, torch.tensor([0], dtype=torch.int64),
                 mouse=mouse, button=button, scroll=scroll,
             )
     finally:
@@ -463,7 +463,7 @@ def test_cond_head_cache_is_bit_exact_and_replaces_the_live_projection():
     materialized and one not, must return the same latent."""
     config = reduced_config()
     noise, mouse, button, scroll = frame_inputs(config)
-    fp = torch.tensor(0, dtype=torch.int64)
+    fp = torch.tensor([0], dtype=torch.int64)
 
     live, _ = bound_dit(config, seed=0)
     cached, _ = bound_dit(config, seed=0)
@@ -489,7 +489,7 @@ def test_the_ring_only_moves_on_the_committing_pass():
     config = reduced_config()
     dit, kv = bound_dit(config)
     noise, mouse, button, scroll = frame_inputs(config)
-    fp = torch.tensor(0, dtype=torch.int64)
+    fp = torch.tensor([0], dtype=torch.int64)
 
     ring_lens = [layer.ring_len for layer in kv.layers]
     before = [layer.kv[:, :, :, :n].clone() for layer, n in zip(kv.layers, ring_lens, strict=True)]
@@ -530,7 +530,7 @@ def test_generate_frame_clones_the_denoised_latent():
     dit._denoise_pass = spy
     with torch.no_grad():
         x0 = dit.generate_frame(
-            noise, torch.tensor(0, dtype=torch.int64),
+            noise, torch.tensor([0], dtype=torch.int64),
             mouse=mouse, button=button, scroll=scroll,
         )
 
@@ -555,7 +555,7 @@ def test_append_frame_is_the_committing_pass_alone():
     try:
         with torch.no_grad():
             out = dit.append_frame(
-                latent, torch.tensor(0, dtype=torch.int64),
+                latent, torch.tensor([0], dtype=torch.int64),
                 mouse=mouse, button=button, scroll=scroll,
             )
     finally:
@@ -733,7 +733,7 @@ def test_layer_zero_v_reaches_every_block_in_the_dit():
     latent, mouse, button, scroll = frame_inputs(config)
     with torch.no_grad():
         dit.append_frame(
-            latent, torch.tensor(0, dtype=torch.int64),
+            latent, torch.tensor([0], dtype=torch.int64),
             mouse=mouse, button=button, scroll=scroll,
         )
 
@@ -868,7 +868,7 @@ def test_meta_built_model_generates_a_frame_in_the_serving_dtypes():
     noise, mouse, button, scroll = frame_inputs(config, dtype=torch.bfloat16)
     with torch.no_grad():
         x0 = dit.generate_frame(
-            noise, torch.tensor(0, dtype=torch.int64),
+            noise, torch.tensor([0], dtype=torch.int64),
             mouse=mouse, button=button, scroll=scroll,
         )
 
@@ -891,7 +891,7 @@ def test_two_frames_advance_the_ring_clock_together():
     with torch.no_grad():
         for f in range(2):
             dit.generate_frame(
-                noise, torch.tensor(f, dtype=torch.int64),
+                noise, torch.tensor([f], dtype=torch.int64),
                 mouse=mouse, button=button, scroll=scroll,
             )
 
@@ -899,8 +899,8 @@ def test_two_frames_advance_the_ring_clock_together():
     assert len(passes) == 10
     assert [next(iter({u["frame_pos"] for u in group})) for group in passes] == [0] * 5 + [1] * 5
 
-    pos = dit._pos_ids(torch.tensor(3, dtype=torch.int64))
-    assert pos.f_pos.item() == 3 and pos.f_pos.ndim == 0
+    pos = dit._pos_ids(torch.tensor([3], dtype=torch.int64))
+    assert pos.f_pos.item() == 3 and pos.f_pos.ndim == 1
     assert pos.t_pos.shape == (1, config.tokens_per_frame)
     assert bool((pos.t_pos == 3 * config.ts_mult).all())
     assert bool((pos.y_pos == torch.arange(TPF).div(config.width, rounding_mode="floor")).all())

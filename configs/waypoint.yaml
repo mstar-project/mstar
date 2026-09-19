@@ -11,6 +11,8 @@ model_kwargs:
   compile_dit: true
   cuda_graph: true
   full_global_ring: false
+  # Rows per rollout step; must be <= resources.kv.num_worlds below.
+  step_batch_size: 1
 
 # The world state is a ring, not a paged KV cache, so nothing here is sized in
 # sequence positions; max_seq_len only satisfies the conductor's config check

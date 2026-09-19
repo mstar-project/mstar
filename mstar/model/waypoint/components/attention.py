@@ -93,7 +93,7 @@ class WaypointAttention(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """``x`` ``[B, N*T, D]`` -> ``(out [B, N*T, D], v1 [B, H_kv, N*T, d_head])``.
 
-        ``frame_pos`` is the ``[]`` int64 ring clock; ``v1`` is ``None`` at
+        ``frame_pos`` is the ``[B]`` int64 ring clock; ``v1`` is ``None`` at
         layer 0 and layer 0's pre-lerp V thereafter. Both stay arguments rather
         than cursors the KV resource keeps: a cursor that drifts from the
         caller does not raise, it rewrites history.

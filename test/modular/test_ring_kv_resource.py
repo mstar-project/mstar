@@ -114,9 +114,10 @@ def _step(*rids: str, frame: int = 0) -> RingKVStep:
 
 
 def _open(kv: RingKVManager, *rids: str, frame: int = 0) -> None:
-    """Register and admit each rid in turn, one step each — the shape the
-    engine actually produces, since ``max_batch_size`` is 1 and each request
-    gets its own step."""
+    """Register and admit each rid in its own step, one world claimed per
+    call — the ownership tests are about who holds a world, not step
+    batching, so they build it up one rid at a time regardless of
+    ``step_batch_size``."""
     for rid in rids:
         kv.ingest_request(rid)
         outcome = kv.admit(_step(rid, frame=frame), _ctx(rid))
@@ -124,8 +125,8 @@ def _open(kv: RingKVManager, *rids: str, frame: int = 0) -> None:
 
 
 def _frame(kv: RingKVManager, gen: torch.Generator) -> tuple[torch.Tensor, torch.Tensor]:
-    """One frame's K and V. Dim 0 is 1 and stays 1: it is FlexAttention's batch
-    dim, and worlds live in the token dim, not here."""
+    """One row's K and V for a single-row (B=1) step. Dim 0 is the step-batch
+    dim, worlds live in the token dim, not here."""
     shape = (1, kv.config.num_kv_heads, kv.tokens_per_frame, kv.config.head_dim)
     return (
         torch.randn(shape, generator=gen),
@@ -144,7 +145,7 @@ def _rollout(
     the resource lifecycle alongside it and need the two to agree."""
     gen = torch.Generator().manual_seed(seed)
     for f in range(start, start + frames):
-        frame_pos = torch.tensor(f, dtype=torch.int64)
+        frame_pos = torch.tensor([f], dtype=torch.int64)
         for commit in (False, False, False, False, True):
             for layer_idx in range(len(kv.layers)):
                 k, v = _frame(kv, gen)
@@ -226,7 +227,9 @@ def test_num_worlds_is_the_one_yaml_tunable():
     assert config.num_worlds == 4
     kv = _manager(config)
     assert kv.num_worlds == 4
-    assert kv.total_slots(0) == 4 * kv.capacity(0)
+    # 4 resident worlds plus the one shared padding world the ring parks a
+    # replay's dummy tail on.
+    assert kv.total_slots(0) == (4 + 1) * kv.capacity(0)
 
 
 @pytest.mark.parametrize("bad", [0, -1, True, 1.0, 1.9, "2"])
@@ -507,7 +510,7 @@ def test_remove_request_releases_the_world_and_the_registration():
 def test_supports_preplan_stays_false():
     """It keeps `CudaGraphRunner._num_slots` at 1. Two slots exist so a plan for
     step N+1 can write buffers replay N is not reading; the only thing planned
-    here is one `[1]` world index, so the second slot would be an identical
+    here is one `[B]` world index, so the second slot would be an identical
     graph at double the capture cost — and the only reason `_static_world_idx`
     would have to become one buffer per slot."""
     assert _manager().supports_preplan is False
@@ -524,34 +527,62 @@ def test_plan_stages_the_world_index_in_place_as_a_device_tensor():
     buffer that existed at capture, so a rebind leaves every replay reading the
     orphaned original.
 
-    Hence both halves below: the staged value is a `[1]` int64 device tensor,
-    and `plan` writes *through* it rather than replacing it.
+    Hence both halves below: the staged value is a ``[num_worlds]`` int64
+    device tensor (row ``b`` holds row ``b``'s world once staged), and `plan`
+    writes *through* it rather than replacing it.
     """
     kv = _manager(_ring_config(num_worlds=4))
     _open(kv, "a", "b")
     staged = kv._static_world_idx
-    assert staged.shape == (1,) and staged.dtype == torch.int64
+    assert staged.shape == (4,) and staged.dtype == torch.int64
 
     kv.plan(_step("b"), _ctx("b"))
 
     assert kv._static_world_idx is staged, "plan rebound the buffer capture baked"
     assert staged.data_ptr() == kv._static_world_idx.data_ptr()
-    assert int(staged) == kv.world_of("b")
+    assert int(staged[0]) == kv.world_of("b")
 
     kv.plan(_step("a"), _ctx("a"))
-    assert int(staged) == kv.world_of("a")
+    assert int(staged[0]) == kv.world_of("a")
 
 
-def test_plan_refuses_a_batch_it_cannot_stage():
-    """One world index per step, so one request per step. `admit` refuses a
-    mixed batch first; reaching here means it was bypassed, and staging one of
-    the two rids arbitrarily would run the other request's frame into the wrong
-    world."""
+def test_plan_stages_a_batch_of_distinct_rids():
+    """A step can batch worlds each claimed on its own admit -- `admit` no
+    longer refuses a same-step batch of distinct rids, and `plan` stages every
+    row, in `ctx.request_ids` order, rather than just the first."""
     kv = _manager(_ring_config(num_worlds=2))
     _open(kv, "a", "b")
 
-    with pytest.raises(ValueError, match="one world index per step"):
-        kv.plan(_step("a", "b"), _ctx("a", "b"))
+    result = kv.plan(_step("a", "b"), _ctx("a", "b"))
+
+    assert result.request_ids == ("a", "b")
+    assert result.world_idx == (kv.world_of("a"), kv.world_of("b"))
+    assert result.frame_pos == (0, 0)
+    assert kv._static_world_idx[:2].tolist() == list(result.world_idx)
+
+
+def test_plan_parks_padding_rows_on_the_shared_padding_world():
+    """A replay padded past its real rows stages the dummy tail on the padding
+    world -- the one world past the resident pool -- so a padding write never
+    lands in a resident request's history. Real rows keep their own world; the
+    padding rows all share ``_padding_world``, and no admit ever hands it out."""
+    kv = _manager(_ring_config(num_worlds=4))
+    _open(kv, "a", "b")
+    free_before = set(kv._free_worlds)
+
+    ctx = _ctx("a", "b")
+    ctx.set_padded_rids(("a", "b", "__pad0__", "__pad1__"))
+    result = kv.plan(_step("a", "b"), ctx)
+
+    pad = kv._padding_world
+    assert pad == 4, "the padding world is the one index past the resident pool"
+    assert pad not in kv._free_worlds and kv.layers[0].num_worlds == 5
+    assert result.request_ids == ("a", "b", "__pad0__", "__pad1__")
+    assert result.world_idx == (kv.world_of("a"), kv.world_of("b"), pad, pad)
+    assert result.frame_pos == (0, 0, 0, 0)
+    assert kv._static_world_idx[:4].tolist() == list(result.world_idx)
+    # Padding never touched the pool: no free world was consumed for the tail.
+    assert set(kv._free_worlds) == free_before
 
 
 def test_plan_refuses_a_request_holding_no_world():
@@ -561,18 +592,17 @@ def test_plan_refuses_a_request_holding_no_world():
         kv.plan(_step("a"), _ctx("a"))
 
 
-def test_admit_refuses_a_mixed_batch_naming_the_step_limit():
-    """A step advances one world. The message has to say which number capped it
-    — this is `max_batch_size`, not the ring, and a reader who reads it as a
-    ring limit raises `num_worlds` and sees nothing change."""
+def test_admit_refuses_a_batch_naming_the_same_request_twice():
+    """A step batches distinct worlds, one row per request; naming the same
+    rid twice would try to stage two rows into the same world."""
     kv = _manager(_ring_config(num_worlds=4))
-    _open(kv, "a", "b")
+    kv.ingest_request("a")
 
-    outcome = kv.admit(_step("a", "b"), _ctx("a", "b"))
+    outcome = kv.admit(_step("a", "a"), _ctx("a", "a"))
 
     assert not outcome.ok
     assert type(outcome.reason) is AdmitRuntimeError
-    assert "max_batch_size" in outcome.reason.message
+    assert "'a'" in outcome.reason.message
 
 
 # ── the ring clock ──────────────────────────────────────────────────────
@@ -667,6 +697,26 @@ def test_each_world_runs_its_own_clock():
     # each is still refused its neighbour's next frame
     assert not kv.admit(_step("a", frame=42), _ctx("a")).ok
     assert not kv.admit(_step("b", frame=3), _ctx("b")).ok
+
+
+def test_the_clock_check_fires_per_rid_inside_a_batched_admit():
+    """Two rids in one `admit` call, not two: the continuity check must still
+    catch a bad clock on either row of a batch, and a good row ahead of it in
+    `ctx.request_ids` order must not paper over it."""
+    kv = _manager(_ring_config(num_worlds=2))
+    _open(kv, "a", "b")
+    _drive(kv, "a", 0)
+    _drive(kv, "b", 0)
+
+    step = RingKVStep(frames=(("a", 1), ("b", 5)))  # b skips ahead
+    outcome = kv.admit(step, _ctx("a", "b"))
+
+    assert not outcome.ok
+    assert "'b'" in outcome.reason.message
+    assert "declares frame 5" in outcome.reason.message
+
+    # the same two rids with both clocks valid still admits as a batch.
+    assert kv.admit(RingKVStep(frames=(("a", 1), ("b", 1))), _ctx("a", "b")).ok
 
 
 def test_a_step_that_declares_no_clock_for_an_admitted_request_is_refused():
@@ -1094,9 +1144,9 @@ def test_visible_is_the_layers_scratch_buffer_and_must_be_read_immediately():
     gen = torch.Generator().manual_seed(3)
     k, v = _frame(kv, gen)
 
-    _, _, visible0 = kv.upsert(k, v, 0, torch.tensor(0, dtype=torch.int64), commit=True)
+    _, _, visible0 = kv.upsert(k, v, 0, torch.tensor([0], dtype=torch.int64), commit=True)
     snapshot = visible0.clone()
-    _, _, visible1 = kv.upsert(k, v, 0, torch.tensor(1, dtype=torch.int64), commit=True)
+    _, _, visible1 = kv.upsert(k, v, 0, torch.tensor([1], dtype=torch.int64), commit=True)
 
     assert visible1 is visible0
     assert not torch.equal(snapshot, visible1), (
@@ -1113,10 +1163,13 @@ def test_visible_hides_the_slot_this_frame_is_about_to_overwrite():
     gen = torch.Generator().manual_seed(4)
     for f in range(RING_FRAMES + 1):
         k, v = _frame(kv, gen)
-        _, _, visible = kv.upsert(k, v, 0, torch.tensor(f, dtype=torch.int64), commit=True)
+        _, _, visible = kv.upsert(k, v, 0, torch.tensor([f], dtype=torch.int64), commit=True)
         slot = (f % RING_FRAMES) * TPF
         assert not bool(visible[slot : slot + TPF].any()), f"frame {f} sees its own slot"
-        assert bool(visible[kv.layers[0].ring_len :].all()), "scratch must stay visible"
+        # World 0's scratch only: the buffer now holds a padding world past it,
+        # whose slots are (correctly) not visible to this row.
+        cap = kv.layers[0].capacity
+        assert bool(visible[kv.layers[0].ring_len : cap].all()), "scratch must stay visible"
 
 
 def test_upsert_returns_the_whole_buffer_and_delegates_by_layer():
@@ -1131,10 +1184,11 @@ def test_upsert_returns_the_whole_buffer_and_delegates_by_layer():
 
     for layer_idx in range(N_LAYERS):
         k_all, v_all, visible = kv.upsert(
-            k, v, layer_idx, torch.tensor(0, dtype=torch.int64), commit=True
+            k, v, layer_idx, torch.tensor([0], dtype=torch.int64), commit=True
         )
         total = kv.total_slots(layer_idx)
-        assert total == 3 * kv.capacity(layer_idx)
+        # 3 resident worlds + 1 shared padding world.
+        assert total == (3 + 1) * kv.capacity(layer_idx)
         assert k_all.shape[-2] == total and v_all.shape[-2] == total
         assert visible.shape == (total,)
         assert k_all.shape[0] == 1, "the world dim is folded into tokens, not dim 0"
@@ -1157,7 +1211,7 @@ def test_planned_attention_skips_per_upsert_visibility_reconstruction():
         k,
         v,
         0,
-        torch.tensor(0, dtype=torch.int64),
+        torch.tensor([0], dtype=torch.int64),
         commit=False,
         build_visibility=False,
     )
@@ -1178,7 +1232,7 @@ def test_frozen_passes_leave_the_ring_byte_identical():
     for _ in range(4):
         for layer_idx in range(N_LAYERS):
             k, v = _frame(kv, gen)
-            kv.upsert(k, v, layer_idx, torch.tensor(0, dtype=torch.int64), commit=False)
+            kv.upsert(k, v, layer_idx, torch.tensor([0], dtype=torch.int64), commit=False)
 
     for layer, snapshot in zip(kv.layers, before, strict=True):
         assert torch.equal(layer.kv[:, :, :, : layer.ring_len], snapshot[:, :, :, : layer.ring_len])
@@ -1239,7 +1293,7 @@ def test_the_flat_ring_matches_one_ring_per_world(num_worlds, pinned_dilation):
 
     for _ in range(20 * num_worlds):
         w = int(torch.randint(0, num_worlds, (1,), generator=order).item())
-        frame_pos = torch.tensor(clocks[w], dtype=torch.int64)
+        frame_pos = torch.tensor([clocks[w]], dtype=torch.int64)
         for commit in (False, False, False, False, True):
             kv = torch.randn(2, 1, N_KV_HEADS, TPF, D_HEAD, generator=gens[w])
             _, _, flat_vis = flat.upsert(kv, frame_pos, commit, _w(w))
@@ -1312,10 +1366,13 @@ def test_worlds_interleave_without_reaching_each_other():
         world = flat.world_of(rid)
         for i, (layer, ref) in enumerate(zip(flat.layers, solo[rid].layers, strict=True)):
             lo, hi = layer.world_span(world)
-            assert torch.equal(layer.kv[:, :, :, lo:hi], ref.kv), (
+            # The solo manager holds a padding world too, so compare against its
+            # world span, not its whole buffer.
+            ref_lo, ref_hi = ref.world_span(solo[rid].world_of(rid))
+            assert torch.equal(layer.kv[:, :, :, lo:hi], ref.kv[:, :, :, ref_lo:ref_hi]), (
                 f"{rid} layer {i}: interleaving changed what the world holds"
             )
-            assert torch.equal(layer.written[lo:hi], ref.written), (
+            assert torch.equal(layer.written[lo:hi], ref.written[ref_lo:ref_hi]), (
                 f"{rid} layer {i}: interleaving changed what the world can see"
             )
 
@@ -1327,7 +1384,7 @@ def test_worlds_interleave_without_reaching_each_other():
         for layer_idx in range(N_LAYERS):
             k, v = _frame(flat, gen)
             _, _, visible = flat.upsert(
-                k, v, layer_idx, torch.tensor(clocks[rid], dtype=torch.int64), commit=False
+                k, v, layer_idx, torch.tensor([clocks[rid]], dtype=torch.int64), commit=False
             )
             lo, hi = flat.layers[layer_idx].world_span(world)
             seen = visible.clone()
@@ -1368,7 +1425,7 @@ def test_the_captured_world_index_is_read_at_replay_not_baked_at_capture():
 
     static_k = torch.zeros(1, N_KV_HEADS, TPF, D_HEAD, dtype=torch.float32, device="cuda")
     static_v = torch.zeros_like(static_k)
-    static_frame = torch.zeros((), dtype=torch.int64, device="cuda")
+    static_frame = torch.zeros(1, dtype=torch.int64, device="cuda")
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -1455,7 +1512,7 @@ def test_the_bucket_rounding_is_unobservable_off_write_steps():
         # step, this is the call that would write through it. World 1, not 0, so
         # a placeholder address that forgot the world offset lands somewhere
         # this test can see.
-        _, _, visible = layer.upsert(kv, torch.tensor(f, dtype=torch.int64), True, _w(1))
+        _, _, visible = layer.upsert(kv, torch.tensor([f], dtype=torch.int64), True, _w(1))
 
         lo, hi = layer.world_span(1)
         if f % d:
@@ -1499,7 +1556,7 @@ def test_committing_on_every_pass_matches_the_4_plus_1_schedule():
         traces resident at once."""
         gen = torch.Generator().manual_seed(37)
         for f in range(3 * RING_FRAMES):
-            frame_pos = torch.tensor(f, dtype=torch.int64)
+            frame_pos = torch.tensor([f], dtype=torch.int64)
             for commit in schedule:
                 for layer_idx in range(N_LAYERS):
                     k, v = _frame(kv, gen)
@@ -1558,7 +1615,7 @@ def test_upsert_refuses_a_world_index_that_is_not_the_staged_shape(bad):
     kv = torch.zeros(2, 1, N_KV_HEADS, TPF, D_HEAD)
 
     with pytest.raises(RuntimeError, match="world_idx must be a"):
-        layer.upsert(kv, torch.tensor(0, dtype=torch.int64), True, bad)
+        layer.upsert(kv, torch.tensor([0], dtype=torch.int64), True, bad)
 
 
 def test_a_world_index_out_of_range_is_caught_on_the_host_paths():
@@ -1570,7 +1627,9 @@ def test_a_world_index_out_of_range_is_caught_on_the_host_paths():
     layer = _manager(_ring_config(num_worlds=2)).layers[0]
 
     assert layer.world_span(1) == (layer.capacity, 2 * layer.capacity)
-    for bad in (-1, 2):
+    # The layer allocates one world past the pool (the shared padding scratch),
+    # so index 2 is that valid world and 3 is the first out-of-range one.
+    for bad in (-1, 3):
         with pytest.raises(IndexError, match="out of range"):
             layer.world_span(bad)
         with pytest.raises(IndexError, match="out of range"):
