@@ -33,6 +33,7 @@ from mstar.model.components.distributed.linear import (
 )
 from mstar.model.components.distributed.merged_linear import COLUMN, REPLICATED, MergedParallelLinear
 from mstar.model.kimi_k3.components.gated_norm_kernel import gated_rmsnorm
+from mstar.utils.streams import Fork
 from mstar.model.kimi_k3.components.common import (
     fused_decode_kernels,
     attach_dim0_loader,
@@ -195,6 +196,7 @@ class ParallelKDAAttention(nn.Module):
         self._attn_key = attn_key
         self.pool = None  # RecurrentStatePool
         self.attn = None  # KDAManager
+        self._fork = Fork()
         # kernels for the dense/reference paths; the paged path runs the manager's
         self.kernels = kernels or TorchKDAKernels()
 
@@ -284,8 +286,8 @@ class ParallelKDAAttention(nn.Module):
         merged projection's output (row stride = its width); the decode kernels read them in
         place, the others copy what they need."""
         t = x.shape[0]
-        qkv = self.qkv_proj(x)
-        mixed = self.in_proj.project(x)
+        # the two input projections read the same x: two streams under a capture
+        qkv, mixed = self._fork.run(lambda: self.qkv_proj(x), lambda: self.in_proj.project(x))
         g_raw = self.f_b_proj(mixed["f_a"]).view(t, self.num_heads, self.head_dim)
         beta_raw = mixed["b"]
         g_out = mixed["g"].view(t, self.num_heads, self.head_dim)
