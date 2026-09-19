@@ -88,6 +88,16 @@ class KimiK3Model(Model):
         # speculative decoding (plan section 8): k drafted tokens per step, verified in one
         # k + 1 token pass; 0 = one token per step. Greedy verification for now.
         self.speculative_tokens = int(kwargs.get("speculative_tokens", 0))
+        # drafts per row by step size, e.g. {16: 7, 32: 4, 64: 0}: up to 16 rows 7 drafts, up to 32 rows 4,
+        # none beyond (the verify step's cost grows with rows x block); the largest entry sizes the pool
+        self.speculative_schedule = kwargs.get("speculative_schedule")
+        if self.speculative_schedule:
+            sched = self.speculative_schedule
+            ks = [int(k) for k in (sched.values() if isinstance(sched, dict) else (k for _, k in sched))]
+            if self.speculative_tokens <= 0:
+                self.speculative_tokens = max(ks)
+            elif max(ks) > self.speculative_tokens:
+                raise ValueError("speculative_schedule drafts exceed speculative_tokens")
         # the DSpark draft checkpoint (a directory with config.json + model.safetensors); without it a
         # speculating node drafts the bonus token repeated (the stand-in, for exercising the path)
         self.speculative_draft = kwargs.get("speculative_draft")
@@ -370,7 +380,8 @@ class KimiK3Model(Model):
                                        max_capture_batch_size=self.max_capture_batch_size,
                                        max_prefill_batch_size=self.max_prefill_batch_size,
                                        mixed_prefill_decode=self.mixed_prefill_decode,
-                                       speculative_tokens=self.speculative_tokens, draft=draft)
+                                       speculative_tokens=self.speculative_tokens, draft=draft,
+                                       speculative_schedule=self.speculative_schedule)
         self._submodule_cache[node_name] = submodule
         logger.info("Loaded Kimi K3 %s on %s", node_name, device)
         return submodule
