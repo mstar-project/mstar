@@ -81,6 +81,13 @@ class KVCache:
                 cfg.page_size, cfg.num_kv_heads, cfg.head_dim,
                 dtype=dtype, device=device,
             ).contiguous()
+        elif cfg.layout == KVLayout.MLA:
+            # one latent row per token; the attention kernel splits it into
+            # the compressed KV and the RoPE key itself
+            self.tensor = torch.zeros(
+                cfg.num_layers, cfg.max_num_pages, cfg.page_size, cfg.head_dim,
+                dtype=dtype, device=device,
+            ).contiguous()
         else:
             raise NotImplementedError(
                 f"KV layout {cfg.layout} is not recognized."
@@ -125,19 +132,28 @@ class KVCache:
         ``base_ptr`` addresses a remote cache with this same layout/config;
         it defaults to this cache's own storage.
         """
+        if base_ptr is None:
+            base_ptr = self.data_ptr()
+        element_size = self.tensor.element_size()
+
+        if self.layout == KVLayout.MLA:
+            # one chunk: the latent rows of the page are contiguous
+            layer_stride, page_stride, token_stride = self.tensor.stride()[:3]
+            nbytes = (token_end - token_start) * token_stride * element_size
+            return [base_ptr + (
+                layer_idx * layer_stride
+                + page_idx * page_stride
+                + token_start * token_stride
+            ) * element_size], nbytes
         if self.layout != KVLayout.NHD:
             raise NotImplementedError(
                 f"chunk_ptrs is not implemented for layout {self.layout}."
             )
 
         layer_stride, page_stride, kv_stride, token_stride = self.tensor.stride()[:4]
-        element_size = self.tensor.element_size()
 
         # token_stride = num_kv_heads * head_dim
         nbytes = (token_end - token_start) * token_stride * element_size
-
-        if base_ptr is None:
-            base_ptr = self.data_ptr()
 
         ptrs = [
             base_ptr + (
@@ -152,11 +168,7 @@ class KVCache:
     def layer_view(self, layer_idx: int) -> torch.Tensor:
         """One layer's pages, in this cache's layout — what an attention
         kernel consumes. NHD: [max_num_pages, 2, page_size, num_kv_heads,
-        head_dim]."""
-        if self.layout != KVLayout.NHD:
-            raise NotImplementedError(
-                f"layer_view is not implemented for layout {self.layout}."
-            )
+        head_dim]; MLA: [max_num_pages, page_size, head_dim]."""
         return self.tensor[layer_idx]
 
     def read_tokens(
@@ -164,8 +176,11 @@ class KVCache:
         page_idx: torch.Tensor, cache_idx: torch.Tensor,
     ) -> torch.Tensor:
         """Gather the (page, offset-in-page) slots written by ``write_tokens``.
-        Returns [num_tokens, 2, num_kv_heads, head_dim] (K at index 0, V at 1);
-        it is a gather, so a copy rather than a view."""
+        Returns [num_tokens, 2, num_kv_heads, head_dim] (K at index 0, V at 1)
+        under NHD, [num_tokens, head_dim] under MLA; it is a gather, so a copy
+        rather than a view."""
+        if self.layout == KVLayout.MLA:
+            return self.tensor[layer_idx][page_idx, cache_idx]
         if self.layout != KVLayout.NHD:
             raise NotImplementedError(
                 f"read_tokens is not implemented for layout {self.layout}."
@@ -174,19 +189,27 @@ class KVCache:
 
     def write_tokens(
         self, layer_idx: int,
-        k: torch.Tensor, v: torch.Tensor,
+        k: torch.Tensor, v: torch.Tensor | None,
         page_idx: torch.Tensor, cache_idx: torch.Tensor,
         return_tensor: bool=False
     ) -> None:
         """Scatter per-token K/V ([num_tokens, num_kv_heads, head_dim]) into
-        the (page, offset-in-page) slots given by ``page_idx``/``cache_idx``."""
-        if self.layout != KVLayout.NHD:
+        the (page, offset-in-page) slots given by ``page_idx``/``cache_idx``.
+
+        Under MLA ``k`` is the latent row ([num_tokens, head_dim]) and ``v``
+        must be None: the row already holds everything the kernel reads."""
+        if self.layout == KVLayout.MLA:
+            if v is not None:
+                raise ValueError("MLA layout takes one latent row per token; v must be None")
+            self.tensor[layer_idx][page_idx, cache_idx] = k.to(self.tensor.dtype)
+        elif self.layout != KVLayout.NHD:
             raise NotImplementedError(
                 f"write_tokens is not implemented for layout {self.layout}."
             )
-        _kv_scatter_nhd_eager(
-            self.tensor, layer_idx, k, v, page_idx, cache_idx,
-        )
+        else:
+            _kv_scatter_nhd_eager(
+                self.tensor, layer_idx, k, v, page_idx, cache_idx,
+            )
         if return_tensor:
             return self.read_tokens(layer_idx, page_idx, cache_idx)
 
@@ -200,7 +223,7 @@ class KVCache:
             )
         if not src_pages:
             return
-        if self.layout != KVLayout.NHD:
+        if self.layout not in (KVLayout.NHD, KVLayout.MLA):
             raise NotImplementedError(
                 f"copy_pages is not implemented for layout {self.layout}."
             )
@@ -220,11 +243,12 @@ class KVCache:
         covering both K and V. ``tensor`` overrides the backing storage (e.g.
         a tensor rebuilt from another process' cache with this same layout).
         """
+        if tensor is None:
+            tensor = self.tensor
+        if self.layout == KVLayout.MLA:
+            return tensor[layer_idx, page_idx, token_start:token_end]
         if self.layout != KVLayout.NHD:
             raise NotImplementedError(
                 f"chunk_view is not implemented for layout {self.layout}."
             )
-
-        if tensor is None:
-            tensor = self.tensor
         return tensor[layer_idx, page_idx, :, token_start:token_end]
