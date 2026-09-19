@@ -20,7 +20,8 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.distributed.merged_linear import COLUMN, REPLICATED, MergedParallelLinear
-from mstar.model.kimi_k3.components.common import KimiRMSNorm
+from mstar.model.kimi_k3.components.common import KimiRMSNorm, fused_decode_kernels
+from mstar.model.kimi_k3.components.mla_out_kernel import mla_out
 
 # the checkpoint's q_a_proj / kv_a_proj_with_mqa land in the merged in_proj by segment name; its
 # g_proj goes through the same ``(".in_proj", ".g_proj", "g")`` rule as the KDA layers'
@@ -125,9 +126,16 @@ class ParallelMLAAttention(nn.Module):
     def _finish(self, g: torch.Tensor | None, o_lat: torch.Tensor) -> torch.Tensor:
         t = o_lat.shape[0]
         _, w_uv = self.absorb()
-        attn = torch.einsum("thl,hlv->thv", o_lat, w_uv.to(o_lat.dtype)).reshape(t, self.num_heads * self.v_head_dim)
-        if self.use_output_gate:
-            attn = attn * torch.sigmoid(g)
+        w_uv = w_uv.to(o_lat.dtype)
+        gate = g if self.use_output_gate else None
+        if fused_decode_kernels() and o_lat.is_cuda and o_lat.dtype in (torch.bfloat16, torch.float16) \
+                and o_lat.stride(-1) == 1 and w_uv.stride(-1) == 1:
+            # one launch: the per-head product and the gate, written as the [T, H * V] matrix o_proj
+            # reads (the einsum's head-major result costs a copy for more than one row)
+            return self.o_proj(mla_out(o_lat, w_uv, gate))
+        attn = torch.einsum("thl,hlv->thv", o_lat, w_uv).reshape(t, self.num_heads * self.v_head_dim)
+        if gate is not None:
+            attn = attn * torch.sigmoid(gate)
         return self.o_proj(attn)
 
     # ---------------------------------------------------------------- paths
