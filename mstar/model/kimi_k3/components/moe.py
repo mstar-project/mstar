@@ -355,11 +355,12 @@ class KimiLatentMoE(nn.Module):
     def _latent(self, mixed: torch.Tensor) -> torch.Tensor:
         """The routed experts' input ``[T, latent]`` out of the merged projection's output: this
         rank's columns, all-gathered when the down-projection is sharded. The expert kernels read
-        it as a plain row-major matrix (the all-gather writes one; a replicated view is one for a
-        single row and a small copy otherwise)."""
+        it as a plain row-major matrix (the all-gather writes one, from the slice as it is; a
+        replicated view is one for a single row and a small copy otherwise)."""
         z = mixed.narrow(-1, 0, self.latent_local)
         if self.latent_sharded:
-            return self.comm_group.all_gather(z.contiguous(), dim=-1)
+            # the Lamport gather reads the slice with its row stride; the NCCL fallback copies it itself
+            return self.comm_group.all_gather(z if fused_decode_kernels() else z.contiguous(), dim=-1)
         return z.contiguous()
 
     def routed_down(self, x: torch.Tensor) -> torch.Tensor:
