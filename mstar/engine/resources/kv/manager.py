@@ -1416,6 +1416,11 @@ class KVManager(AttentionResource):
             num_new_pages = num_pages_needed - len(stream.page_indices)
             if num_new_pages > 0:
                 new_pages = self._arena.acquire(num_new_pages)
+                if new_pages is None and self._index is not None:
+                    # cached pages are the only ones that can be given back
+                    # without failing a request that is already running
+                    self._index.evict(num_new_pages - self._arena.num_free)
+                    new_pages = self._arena.acquire(num_new_pages)
                 if new_pages is None:
                     pages_short = num_new_pages - self._arena.num_free
                     return AllocResult(
