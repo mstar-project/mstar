@@ -1159,6 +1159,10 @@ class KVManager(AttentionResource):
         with self._lock:
             labels = self._cpu_pool.labels(rid)
             needed = sum(self._cpu_pool.num_pages(rid, label) for label in labels)
+            if needed > self._arena.num_free and self._index is not None:
+                # as `_alloc` does: once the pool is all cached pages, nothing
+                # else would ever free one for this request to come back to
+                self._index.evict(needed - self._arena.num_free)
             if needed > self._arena.num_free:
                 return False
             for label in labels:
