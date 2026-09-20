@@ -84,6 +84,7 @@ class KVReqConfig(ResourceReqConfig):
         prefix_keys: dict[str, list[bytes]] | None=None,
         prefix_tail: dict[str, list[int]] | None=None,
         prefix_decode: dict[str, str] | None=None,
+        prefix_cache: bool | None=None,
         **kwargs,
     ):
         if prefix_keys is not None:
@@ -92,6 +93,8 @@ class KVReqConfig(ResourceReqConfig):
             self.prefix_tail = prefix_tail
         if prefix_decode is not None:
             self.prefix_decode = prefix_decode
+        if prefix_cache is not None:
+            self.prefix_cache = prefix_cache
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:

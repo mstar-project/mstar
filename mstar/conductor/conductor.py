@@ -891,12 +891,14 @@ class Conductor:
         prefix_keys = kwargs.get("prefix_keys") or {}
         prefix_tail = kwargs.get("prefix_tail") or {}
         prefix_decode = kwargs.get("prefix_decode") or {}
+        prefix_cache = kwargs.get("prefix_cache")
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
                 seed=seed,
                 prefix_keys=prefix_keys.get(key),
                 prefix_tail=prefix_tail.get(key),
                 prefix_decode=prefix_decode.get(key),
+                prefix_cache=prefix_cache,
             )
 
         # Send NewRequest to each worker with the appropriate partition's inputs
