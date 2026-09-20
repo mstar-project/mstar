@@ -24,6 +24,10 @@ from mstar.engine.resources.kv.keys import chain, fingerprint
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the host pool pins its memory"
+)
+
 PAGE_SIZE = 16
 ROOT = b"a root"
 NODE = "LLM"
@@ -51,14 +55,16 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _manager(max_num_pages: int = 32) -> KVManager:
+def _manager(max_num_pages: int = 32, cpu_offload_pages: int = 0) -> KVManager:
     kv = KVManager(
         cfg=KVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
             max_num_pages=max_num_pages, page_size=PAGE_SIZE,
+            cpu_offload_pages=cpu_offload_pages,
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None,
-        device=torch.device("cpu"), dtype=torch.float32,
+        device=torch.device("cuda" if cpu_offload_pages else "cpu"),
+        dtype=torch.float32,
     )
     kv.enable_prefix_cache(ROOT)
     return kv
@@ -226,6 +232,57 @@ def test_admit_takes_the_lease_over_and_commit_clears_it():
     )
     assert stream.stored_len == 100
     assert stream.lease is None, "commit left the lease on the stream"
+    kv.assert_pages_conserved()
+
+
+def _converted_by_a_refused_admit(kv: KVManager) -> list[int]:
+    """Probe ``r1``, fill the pool, and let an admit convert the lease and refuse.
+
+    The refusal leaves no step in flight, so the stream can be picked as an
+    offload victim while it still holds the converted pages.
+    """
+    keys = _seed(kv, list(range(100)))
+    kv.remove_request("seed")
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}))
+    matched = kv.resolve_cached_prefix("r1", NODE, WALK)
+    leased = list(kv._streams["r1"]["main"].lease)
+    kv.ingest_request("hog", KVReqConfig())
+    _grow(kv, "hog", kv._arena.num_free * PAGE_SIZE)
+
+    step = KVStep(segments=(Segment("r1", "main", 100 - matched),))
+    assert not kv.admit(step, _ctx("r1")).ok, "the pool was full but admit succeeded"
+    assert kv._streams["r1"]["main"].page_indices == leased, "admit did not convert"
+    return leased
+
+
+@requires_cuda
+def test_a_converted_stream_offloaded_before_its_commit_gives_its_pages_back_once():
+    kv = _manager(max_num_pages=16, cpu_offload_pages=32)
+    leased = _converted_by_a_refused_admit(kv)
+
+    assert kv.offload("r1") > 0, "the refused request did not move to the host"
+    kv.remove_request("r1")
+
+    assert [kv._arena.num_owners[page] for page in leased] == [1] * len(leased), (
+        "the converted pages were given back once with the stream and again as a "
+        "lease, out from under the index"
+    )
+    kv.assert_pages_conserved()
+
+
+def test_a_refused_admit_retried_trims_the_same_and_commits_once():
+    kv = _manager(max_num_pages=16)
+    leased = _converted_by_a_refused_admit(kv)
+    kv.remove_request("hog")
+
+    retried = kv.resolve_cached_prefix("r1", NODE, WALK)
+    _grow(kv, "r1", 100 - retried)
+
+    stream = kv._streams["r1"]["main"]
+    assert retried == len(leased) * PAGE_SIZE, "the retry cut a different length"
+    assert stream.stored_len == 100 and stream.page_indices[:len(leased)] == leased, (
+        "the retried step did not carry on from the converted pages"
+    )
     kv.assert_pages_conserved()
 
 
