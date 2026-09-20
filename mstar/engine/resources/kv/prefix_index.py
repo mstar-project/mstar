@@ -76,6 +76,10 @@ class PrefixIndex:
         heapq.heappush(self._leaves, (self._clock, page))
         return True
 
+    def pages(self) -> list[int]:
+        """Every page the index is holding a reference to."""
+        return list(self._by_key.values())
+
     def evict(self, n: int) -> int:
         """Drop the oldest leaves until ``n`` pages are back on the free list.
 
