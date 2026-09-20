@@ -137,6 +137,8 @@ class CacheStream:
     # partial one whenever the prompt does not end on a boundary, and that key
     # is neither an index entry nor a parent until the page behind it fills
     keyed_pages: int = 0
+    # tokens the chain accounts for: its prompt, and every token sampled since
+    covered_len: int = 0
     offloaded: bool = False
     generation: int = 0
 
@@ -422,6 +424,11 @@ class KVManager(AttentionResource):
             or not stream.keys
         ):
             return
+        # what was here before this write, not after: a decode step can commit
+        # before the token it writes is read back and counted
+        if stream.stored_len - segment.span > stream.covered_len:
+            stream.keys = None
+            return
         filled = min(stream.stored_len // self.config.page_size, stream.keyed_pages)
         # by key: a stream that lost a race, or that came back from the host,
         # is holding a copy of the page the index named
@@ -513,6 +520,7 @@ class KVManager(AttentionResource):
         stream.keys = list(keys)
         stream.pending = tail
         stream.keyed_pages = len(keys) - (1 if tail else 0)
+        stream.covered_len = stream.keyed_pages * self.config.page_size + len(tail)
 
     def extend_prefix_chain(
         self, rid: str, node_name: str, graph_walk: str, outputs,
@@ -535,7 +543,9 @@ class KVManager(AttentionResource):
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.keys is None or stream.pending is None:
                 return
-            stream.pending.extend(sampled[0].flatten().tolist())
+            tokens = sampled[0].flatten().tolist()
+            stream.pending.extend(tokens)
+            stream.covered_len += len(tokens)
             page_size = self.config.page_size
             while len(stream.pending) >= page_size:
                 whole = stream.keyed_pages
@@ -616,6 +626,9 @@ class KVManager(AttentionResource):
                     return AdmitOutcome(ok=True, ready=False)
 
                 stream = self._ensure_label(rid, label)
+                # the rank that published this sampled the first token after
+                # it, so a chain extended here would start one token late
+                stream.pending = None
                 new_len = seq_info.seq_len
                 self._take_local_match(stream, new_len)
                 old_len = stream.stored_len
