@@ -21,7 +21,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.engine import Engine
+from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import Resource, StepContext, StepRunner
 from mstar.model.submodule_base import (
     ARNodeInputs,
@@ -208,4 +208,54 @@ def test_another_nodes_resource_is_never_swept():
     assert cut.input_seq_len == 4, "another node's resource shortened this match"
     assert theirs.resolved == 0 and theirs.applied == [], (
         "another node's resource was asked about this request"
+    )
+
+
+# ── one request's failure ───────────────────────────────────────────────
+
+
+class _RaisingFor(_Answering):
+    """Matches every request, and raises when applied to one of them."""
+
+    def __init__(self, matched: int, rid: str):
+        super().__init__(matched)
+        self._rid = rid
+
+    def apply_cached_prefix(self, rid, node_name, graph_walk, inputs, matched_len):
+        if rid == self._rid:
+            raise RuntimeError("apply failed")
+        super().apply_cached_prefix(rid, node_name, graph_walk, inputs, matched_len)
+
+
+class _Preparing(_Submodule):
+    """Prepares the same prompt for every request, and never batches."""
+
+    def prepare_inputs(self, graph_walk, fwd_info, inputs, resources):
+        return _inputs()
+
+    def can_batch(self, batch, model_inputs):
+        return False
+
+
+def test_a_resource_that_raises_in_apply_fails_only_its_own_request():
+    engine = _engine({"kv": _RaisingFor(96, RID)}, {NODE: ["kv"]})
+    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={})
+    batch = ExecutingBatch(
+        node_name=NODE, per_request_info={RID: None, "r1": None},
+        step_context=StepContext(
+            request_ids=(RID, "r1"), graph_walk=WALK, slot=0, capture=False,
+        ),
+    )
+
+    try:
+        engine._prepare_inputs(batch)
+    except RuntimeError as error:
+        pytest.fail(f"one request's prefix stage failed the whole batch: {error!r}")
+
+    assert set(batch.failed_requests) == {RID}, "the failing request was not failed"
+    assert list(batch.request_ids) == ["r1"] and len(batch.inputs) == 1, (
+        "the request the resource did not raise for was dropped with it"
+    )
+    assert batch.inputs[0].input_seq_len == PROMPT - 96, (
+        "the surviving request lost its own match"
     )
