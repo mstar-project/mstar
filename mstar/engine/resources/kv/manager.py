@@ -415,8 +415,13 @@ class KVManager(AttentionResource):
         ):
             return
         filled = min(stream.stored_len // self.config.page_size, stream.keyed_pages)
+        # by key: a stream that lost a race, or that came back from the host,
+        # is holding a copy of the page the index named
         parent = (
-            stream.page_indices[stream.cursor - 1] if stream.cursor else None
+            self._index.page_for(
+                fingerprint(self._prefix_root, stream.keys[stream.cursor - 1])
+            )
+            if stream.cursor else None
         )
         while stream.cursor < filled:
             key = fingerprint(self._prefix_root, stream.keys[stream.cursor])
