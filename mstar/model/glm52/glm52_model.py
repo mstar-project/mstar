@@ -97,6 +97,26 @@ class Glm52Model(Model):
                     "mtp_num_draft_tokens and dsa_long_context are mutually "
                     "exclusive in v1 — MTP drafting is short-context only"
                 )
+            if (
+                self.config.mtp_num_draft_tokens > 0
+                and self._config_variant in ("reduced", "reduced_fp8")
+            ):
+                from mstar.model.glm52.components.indexer import (
+                    is_full_indexer_layer,
+                )
+
+                # reduced() sizes 2 trunk layers, landing the MTP position
+                # (layer_idx = num_hidden_layers) on a SHARED indexer slot.
+                # Grow the trunk so it lands FULL, as the real
+                # 78 = 2 + 19·freq geometry does; real variants keep the loud
+                # SHARED guard in the MTP constructor.
+                if not is_full_indexer_layer(
+                    self.config, self.config.num_hidden_layers
+                ):
+                    self.config.num_hidden_layers = (
+                        self.config.index_skip_topk_offset - 1
+                        + self.config.index_topk_freq
+                    )
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
@@ -386,6 +406,9 @@ class Glm52Model(Model):
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
                 return_tensors="pt",
+                # transformers 5.x defaults return_dict=True (a BatchEncoding);
+                # keep the bare-tensor return so [0] selects the row
+                return_dict=False,
             )[0]
         else:
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]

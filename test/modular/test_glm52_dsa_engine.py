@@ -244,6 +244,24 @@ def test_model_kwarg_dsa_long_context():
         Glm52Model(model_path_hf="", dsa_long_context=True, mtp_num_draft_tokens=2)
 
 
+def test_reduced_variant_grows_trunk_for_mtp():
+    # reduced() sizes 2 trunk layers, landing the MTP position on a SHARED
+    # indexer slot; a reduced-variant serve yaml with MTP on must still
+    # construct. Real variants keep the loud SHARED guard in the constructor.
+    from mstar.model.glm52.components.indexer import is_full_indexer_layer
+    from mstar.model.glm52.components.mtp import Glm52MTPModule
+
+    off = Glm52Model(model_path_hf="", config_variant="reduced_fp8")
+    assert off.config.num_hidden_layers == 2  # untouched without MTP
+
+    for variant in ("reduced", "reduced_fp8"):
+        m = Glm52Model(
+            model_path_hf="", config_variant=variant, mtp_num_draft_tokens=2)
+        pos = m.config.num_hidden_layers
+        assert is_full_indexer_layer(m.config, pos), variant
+        Glm52MTPModule(m.config)  # the SHARED-slot guard no longer fires
+
+
 def test_no_cuda_graphs_when_long_context():
     cfg = Glm52ModelConfig.reduced()  # would otherwise register 2 configs
     cfg.dsa_long_context = True

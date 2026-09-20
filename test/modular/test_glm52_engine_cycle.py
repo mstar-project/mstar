@@ -375,6 +375,24 @@ def test_mtp_regions_batch_of_two_padded_to_four():
         assert torch.equal(got, singles[rid]), f"{rid}: {got.tolist()} vs {singles[rid].tolist()}"
 
 
+def test_last_rows_slices_padded_prefill_to_real_requests():
+    # A captured prefill plan pads qo_indptr to the bucket and tail-fills it
+    # with the last real offset. _last_rows must return one row per real
+    # request, not one per bucket slot: a padded slot duplicates the final
+    # request's row and hands the sampler more logit rows than it has
+    # per-request params (an out-of-bounds read on the eager sampler).
+    cfg = _cfg(0, mla_absorb=True)
+    sub = Glm52LLMSubmodule(_model(cfg), cfg)
+    # three real requests (lengths 5, 7, 3) captured in a bucket of four
+    qo_indptr = torch.tensor([0, 5, 12, 15, 15])
+    hidden = torch.randn(15, cfg.hidden_size)
+    sub._attn = lambda _ei: SimpleNamespace(qo_indptr_buf=lambda _slot: qo_indptr)
+    engine_inputs = SimpleNamespace(request_ids=["a", "b", "c"])
+    rows = sub._last_rows(engine_inputs, hidden, {})
+    assert rows.shape[0] == 3
+    assert torch.equal(rows, hidden[[4, 11, 14]])
+
+
 @pytest.mark.parametrize("k", [1, 2, 3])
 def test_mtp_draft_phase_hoist_matches_baseline(monkeypatch, k):
     """MSTAR_GLM52_MTP_PHASE_PREPARE=1: sub-plan 0 and the sync inputs go in

@@ -870,7 +870,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         the MLA resource), else from preprocess's real lengths."""
         qo_indptr = self._attn(engine_inputs).qo_indptr_buf(_MAIN)
         if qo_indptr is not None:
-            return hidden.index_select(0, (qo_indptr[1:] - 1).long())
+            # the buffer is sized to the capture bucket and tail-filled with
+            # the last real offset; slice to the real request count so a
+            # padded prefill does not duplicate the final request's row
+            n = len(engine_inputs.request_ids)
+            return hidden.index_select(0, (qo_indptr[1 : n + 1] - 1).long())
         last = kwargs.get("last_token_indices")
         assert last is not None, "eager prefill needs last_token_indices from preprocess"
         return hidden.index_select(0, last)
