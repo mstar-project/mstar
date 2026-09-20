@@ -81,7 +81,7 @@ def test_an_indexed_page_is_sealed_and_kept_by_a_second_owner():
     _assert_pages_partition(arena)
 
 
-def test_a_page_its_request_still_owns_is_dropped_but_not_freed():
+def test_a_page_its_request_still_owns_is_passed_over():
     arena = _arena()
     index = PrefixIndex(arena)
     page, = arena.acquire(1)
@@ -90,7 +90,10 @@ def test_a_page_its_request_still_owns_is_dropped_but_not_freed():
     freed = index.evict(1)
 
     assert freed == 0, "a page a request still owns was counted as freed"
-    assert arena.num_owners[page] == 1 and index.lookup([b"k"]) == []
+    assert arena.num_owners[page] == 2, "the index let go of a page it still names"
+    assert index.lookup([b"k"]) == [page], (
+        "an entry that is still good was dropped to free nothing"
+    )
     _assert_pages_partition(arena)
 
 

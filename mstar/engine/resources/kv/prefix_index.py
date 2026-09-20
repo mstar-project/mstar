@@ -87,22 +87,29 @@ class PrefixIndex:
         return list(self._by_key.values())
 
     def evict(self, n: int) -> int:
-        """Drop the oldest leaves until ``n`` pages are back on the free list.
+        """Drop the oldest leaves the index alone holds, until ``n`` are free.
 
-        Returns how many pages reached the free list, which is fewer than the
-        entries dropped whenever a live request still owns one of them.
+        A leaf a request or a lease also holds is passed over and put back:
+        dropping it would free nothing and lose an entry that is still good.
+        Returns how many pages reached the free list.
         """
         freed = 0
+        passed_over = []
         while freed < n:
-            page = self._pop_leaf()
-            if page is None:
+            entry = self._pop_leaf()
+            if entry is None:
                 break
+            stamp, page = entry
+            if self._arena.num_owners[page] > 1:
+                passed_over.append(entry)
+                continue
             self._remove(page)
-            if self._arena.num_owners[page] == 0:
-                freed += 1
+            freed += 1
+        for entry in passed_over:
+            heapq.heappush(self._leaves, entry)
         return freed
 
-    def _pop_leaf(self) -> int | None:
+    def _pop_leaf(self) -> tuple[int, int] | None:
         while self._leaves:
             stamp, page = heapq.heappop(self._leaves)
             if (
@@ -110,7 +117,7 @@ class PrefixIndex:
                 and self._children[page] == 0
                 and self._stamp[page] == stamp
             ):
-                return page
+                return stamp, page
         return None
 
     def _remove(self, page: int) -> None:
