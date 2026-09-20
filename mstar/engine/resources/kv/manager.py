@@ -433,6 +433,34 @@ class KVManager(AttentionResource):
             parent = page
             stream.cursor += 1
 
+    def _take_local_match(self, stream: CacheStream, published_len: int) -> None:
+        """Take what this cache already holds of a stream about to be read in.
+
+        The pages a prefill rank published are often pages this rank wrote for
+        an earlier request, and moving them again costs a transfer to arrive at
+        bytes that are already here. Converted onto the stream rather than
+        leased: the read is issued under this same lock, so nothing can come
+        between the two.
+        """
+        if (
+            self._index is None
+            or stream.stored_len
+            or stream.offloaded
+            or not stream.keys
+        ):
+            return
+        rooted = [fingerprint(self._prefix_root, key) for key in stream.keys]
+        # never past what the other side published, and only whole pages
+        matched = self._index.lookup(rooted)[
+            :published_len // self.config.page_size
+        ]
+        if not matched:
+            return
+        self._arena.retain(matched)
+        stream.page_indices = list(matched)
+        stream.stored_len = len(matched) * self.config.page_size
+        stream.cursor = len(matched)
+
     def _keyed_label(
         self, rid: str, node_name: str, graph_walk: str,
     ) -> str | None:
@@ -564,6 +592,7 @@ class KVManager(AttentionResource):
 
                 stream = self._ensure_label(rid, label)
                 new_len = seq_info.seq_len
+                self._take_local_match(stream, new_len)
                 old_len = stream.stored_len
                 if new_len <= old_len:
                     continue
