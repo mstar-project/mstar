@@ -63,6 +63,14 @@ class KVReqConfig(ResourceReqConfig):
     needed_labels: list[str] | None = None
     needed_labels_per_node: dict[str, list[str]] = field(default_factory=dict)
     needed_labels_per_node_walk: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    # one page key per page of this request's declared streams, by label,
+    # chained on the preprocess worker and handed over by the conductor
+    prefix_keys: dict[str, list[bytes]] | None = None
+    prefix_cache: bool = True
+
+    def apply_conductor_config(self, prefix_keys: dict[str, list[bytes]] | None=None, **kwargs):
+        if prefix_keys is not None:
+            self.prefix_keys = prefix_keys
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:

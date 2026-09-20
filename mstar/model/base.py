@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
-from typing import Type
+from typing import NamedTuple, Type
 from uuid import uuid4
 
 import torch
@@ -34,6 +34,28 @@ MAX_OUTPUT_TOKENS = 2048
 class TensorAndMetadata:
     data: torch.Tensor
     metadata: dict = field(default_factory=dict)
+
+
+class ProcessPromptOutput(NamedTuple):
+    """Tensors from `process_prompt`, and metadata to carry beside them.
+
+    The data worker folds ``metadata`` into the request's ``model_kwargs``, so
+    what a model settles while tokenizing reaches
+    `get_request_resource_configs` without a field of its own on the request.
+    """
+    new_input_tensors: NameToTensorList
+    metadata: dict
+
+
+class PrefixStream(NamedTuple):
+    """The input tensor whose contents key one cache stream's pages.
+
+    ``keyed_by`` is ``"ids"`` where the tensor holds token ids, or
+    ``"digest"`` where the span is written from embeddings and a digest of the
+    input that produced them stands in.
+    """
+    tensor: str
+    keyed_by: str
 
 
 @dataclass
@@ -368,6 +390,16 @@ class Model(ABC):
         """
         pass
 
+    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+        """Which input tensor keys which ``(resource, label)`` cache stream.
+
+        Declaring one opts a node into cross-request prefix reuse: the
+        preprocess worker keys that tensor and the KV resource matches what it
+        already holds. Empty leaves the model uncached whatever the deployment
+        asks for.
+        """
+        return {}
+
     def get_request_resource_configs(
         self,
         partition_fwd_args: dict[str, ForwardPassArgs],
@@ -421,7 +453,7 @@ class Model(ABC):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> "NameToTensorList | ProcessPromptOutput":
         """Tokenize prompt and produce initial tensors for the request.
 
         Called by the API server data worker AFTER it has loaded raw
