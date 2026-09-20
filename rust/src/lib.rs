@@ -8,6 +8,7 @@
 //! Build: `maturin develop --release` in rust/.
 
 pub mod communicator;
+pub mod graph;
 pub mod shm;
 
 use std::os::raw::{c_int, c_void};
@@ -304,5 +305,8 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyShmArena>()?;
     m.add_class::<PyShmSegment>()?;
     m.add_class::<PySegmentedShmArena>()?;
+    m.add_class::<graph::runtime::GraphRuntime>()?;
+    m.add_class::<graph::runtime::BatchRouting>()?;
+    m.add_class::<graph::runtime::NestedLoopIdx>()?;
     Ok(())
 }

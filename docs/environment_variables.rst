@@ -24,6 +24,26 @@ Communication
        ``0``: always pyzmq. The two transports are wire-compatible, so
        this can be set per-process while the rest of the mesh stays on
        pyzmq.
+   * - ``MSTAR_RUST_GRAPH``
+     - ``0``
+     - Backend for the graph runtime — the per-request walk state of a
+       worker graph (see :mod:`mstar.graph.runtime`).
+       ``0``: Python, i.e. today's ``WorkerGraphIO``; nothing Rust is
+       constructed.
+       ``shadow``: Python answers and stays authoritative, while a Rust
+       runtime is driven through the identical event sequence and its
+       state compared after every one. Divergences are logged; behavior
+       cannot change.
+       ``1``: the Rust runtime answers. Not yet usable end to end — the
+       micro-scheduler and the worker's speculation path still reach past
+       the harness into ``WorkerGraphIO``.
+       A worker graph the Rust core cannot compile falls back to Python
+       for that graph alone, with a logged reason.
+   * - ``MSTAR_RUST_GRAPH_STRICT``
+     - ``0``
+     - ``1`` makes a shadow-mode divergence raise instead of logging and
+       detaching that request's shadow. For parity tests and for a
+       deliberate soak run; not for production.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a

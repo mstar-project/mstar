@@ -25,7 +25,12 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AllocationFailed, StepContext
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.graph.base import GraphEdge, GraphNode, SpeculativeNodeInfo
+from mstar.graph.base import (
+    GraphEdge,
+    GraphNode,
+    SpeculativeNodeInfo,
+    TensorPointerInfo,
+)
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, WorkerGraph
@@ -1077,6 +1082,7 @@ class Worker:
         For outputs staying local: store tensors in tensor_manager.
         Returns the output edges per request (with tensor_info filled in).
         """
+        per_request: dict[str, list[TensorPointerInfo]] = {}
         for request_id, _node in batch.node_objects.items():
             routing = routing_per_request[request_id]
             infos_by_uuid = {}
@@ -1088,10 +1094,12 @@ class Worker:
             ):
                 for info in edge.tensor_info:
                     infos_by_uuid[info.uuid] = info
-            self.tensor_manager.register_for_send(
-                request_id=request_id, tensor_infos=list(infos_by_uuid.values()),
-                skip_cuda_sync=True,
-            )
+            per_request[request_id] = list(infos_by_uuid.values())
+        # Batched: the arena stages the whole batch inside one D2H stream
+        # context and syncs once, instead of a host-blocking sync per request.
+        self.tensor_manager.register_for_send_batch(
+            per_request, skip_cuda_sync=True,
+        )
 
 
     def _send_outputs(
@@ -2309,63 +2317,61 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.route_outputs", synchronize=False)
-        # Mark nodes complete and route
-        routing_per_request: dict[str, NodeOutputRouting] = {}
-        per_request_uuids: dict[str, set[str]] = {}
-        for rid, wg_id in batch_N.batch.request_to_worker_graph.items():
-            # Store output tensors before marking the node as complete so that
-            # loop outputs can be buffered properly.
-            req_output_tensors = outputs.get(rid)
-            node = batch_N.batch.node_objects[rid]
-            node.reset_outputs() # reset stale outputs
-            if req_output_tensors:
-                graph_node_info = self.tensor_manager.store_and_populate_graph_edges(
-                    request_id=rid,
-                    tensors=req_output_tensors,
-                    graph_edges=node.outputs,
-                    node_name=node.name,
-                    graph_walk=batch_N.graph_walk,
-                    skip_cuda_sync=True,
-                    skip_ref_count=True,
-                )
-                per_request_uuids[rid] = {
-                    info.uuid for infos in graph_node_info.values() for info in infos
-                }
+        # Mark nodes complete and route — one batched call apiece, rather than
+        # a pass over the batch per stage. Stores land before any completion
+        # so loop outputs are buffered with their tensor_info in place; each
+        # request owns its own edge objects, so the reordering is safe.
+        rid_to_wg = batch_N.batch.request_to_worker_graph
+        for rid in rid_to_wg:
+            batch_N.batch.node_objects[rid].reset_outputs()  # reset stale outputs
+        with_outputs = {
+            rid: outputs[rid] for rid in rid_to_wg if outputs.get(rid)
+        }
+        graph_node_info = self.tensor_manager.store_and_populate_graph_edges_batch(
+            per_request_tensors=with_outputs,
+            per_request_edges={
+                rid: batch_N.batch.node_objects[rid].outputs for rid in with_outputs
+            },
+            node_name=batch_N.node_name,
+            graph_walk=batch_N.graph_walk,
+            skip_cuda_sync=True,
+            skip_ref_count=True,
+        )
+        per_request_uuids: dict[str, set[str]] = {
+            rid: {info.uuid for infos in info_by_name.values() for info in infos}
+            for rid, info_by_name in graph_node_info.items()
+        }
 
-            completion_output = self.worker_graphs_manager.mark_node_complete(
-                rid, wg_id, batch_N.node_name
+        routing_per_request: dict[str, NodeOutputRouting] = (
+            self.worker_graphs_manager.complete_and_route_batch(
+                node_name=batch_N.node_name,
+                request_to_worker_graph=rid_to_wg,
+                graph_walk=batch_N.graph_walk,
             )
-            real_outputs = [edge.clone() for edge in completion_output.output_edges]
+        )
 
-            routing_per_request[rid] = self.worker_graphs_manager.process_node_outputs(
-                rid, node_name=batch_N.node_name,
-                outputs=real_outputs, graph_walk=batch_N.graph_walk
+        persist_items: list[tuple[str, str]] = []
+        ref_counts: dict[str, tuple[set[str], list[GraphEdge]]] = {}
+        for rid, uuids in per_request_uuids.items():
+            routing = routing_per_request[rid]
+            persist_items.extend(
+                (rid, info.uuid)
+                for edge in routing.persist for info in edge.tensor_info
             )
-
-            if rid in per_request_uuids:
-                routing = routing_per_request[rid]
-
-                for edge in routing.persist:
-                    for info in edge.tensor_info:
-                        self.tensor_manager.set_persist(
-                            request_id=rid, uuid=info.uuid, persist=True
-                        )
-
-                # NOTE: routing.persist is not included here because the tensors are
-                # (1) kept alive by the persist marker, and (2) would otherwise be
-                #  double-counted (e.g., we should not be incrementing the refcount of
-                # a persist signal that has EMPTY_DESTINATION; that's the conductor's
-                # job to properly compute the reference when unpersisting the signal)
-                routed_edges = (
-                    routing.routed_to_this_worker_graph
-                    + routing.emit_to_client
-                    + routing.streaming_local
-                    + sum(routing.to_workers.values(), start=[])
-                    + sum(routing.streaming_to_workers.values(), start=[])
-                )
-                self.tensor_manager.set_output_ref_counts(
-                    rid, per_request_uuids[rid], routed_edges
-                )
+            # NOTE: routing.persist is not included here because the tensors are
+            # (1) kept alive by the persist marker, and (2) would otherwise be
+            #  double-counted (e.g., we should not be incrementing the refcount of
+            # a persist signal that has EMPTY_DESTINATION; that's the conductor's
+            # job to properly compute the reference when unpersisting the signal)
+            ref_counts[rid] = (uuids, (
+                routing.routed_to_this_worker_graph
+                + routing.emit_to_client
+                + routing.streaming_local
+                + sum(routing.to_workers.values(), start=[])
+                + sum(routing.streaming_to_workers.values(), start=[])
+            ))
+        self.tensor_manager.set_persist_batch(persist_items, persist=True)
+        self.tensor_manager.set_output_ref_counts_batch(ref_counts)
 
         if self.enable_nvtx:
             range_pop(synchronize=False)

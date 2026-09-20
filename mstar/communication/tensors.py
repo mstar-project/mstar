@@ -511,6 +511,69 @@ class TensorCommunicationManager(ABC):
                 edge.tensor_info = graph_node_info[name]
         return graph_node_info
 
+    # ---- batched forms ----
+    #
+    # One call per forward pass instead of one per request. The defaults below
+    # are loops, so every transport gets the batched surface for free and only
+    # needs to override where batching buys something real (see
+    # ``ArenaShmCommunicationManager.register_for_send_batch``). What the
+    # defaults do buy: the per-call CUDA sync is hoisted out of the loop, so a
+    # batch costs one default-stream sync rather than B of them.
+
+    def store_and_populate_graph_edges_batch(
+        self,
+        per_request_tensors: dict[str, NameToTensorList],
+        per_request_edges: dict[str, list[GraphEdge]],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+        skip_cuda_sync: bool = False,
+        skip_ref_count: bool = False,
+    ) -> dict[str, dict[str, list[TensorPointerInfo]]]:
+        """Store every request's outputs and populate their graph edges.
+
+        ``per_request_edges`` are that request's own edge objects (each request
+        has its own copy of the section), which this fills in place — the same
+        contract as the single-request form.
+        """
+        if not skip_cuda_sync and torch.cuda.is_available():
+            torch.cuda.default_stream().synchronize()
+        return {
+            rid: self.store_and_populate_graph_edges(
+                request_id=rid, tensors=tensors,
+                graph_edges=per_request_edges.get(rid, []),
+                node_name=node_name, graph_walk=graph_walk,
+                skip_cuda_sync=True,  # done once above
+                skip_ref_count=skip_ref_count,
+            )
+            for rid, tensors in per_request_tensors.items()
+        }
+
+    def set_persist_batch(self, items: list[tuple[str, str]], persist: bool = True):
+        """``items`` is a flat list of ``(request_id, uuid)``."""
+        for request_id, uuid in items:
+            self.set_persist(request_id, uuid, persist)
+
+    def set_output_ref_counts_batch(
+        self, per_request: dict[str, tuple[set[str], list[GraphEdge]]],
+    ):
+        """``per_request`` maps rid -> (safety_hold_uuids, routed_edges)."""
+        for request_id, (safety_hold_uuids, routed_edges) in per_request.items():
+            self.set_output_ref_counts(request_id, safety_hold_uuids, routed_edges)
+
+    def register_for_send_batch(
+        self,
+        per_request: dict[str, list[TensorPointerInfo]],
+        skip_cuda_sync: bool = False,
+    ):
+        """Mark every request's tensors ready for remote consumers."""
+        if not skip_cuda_sync and torch.cuda.is_available():
+            torch.cuda.default_stream().synchronize()
+        for request_id, tensor_infos in per_request.items():
+            self.register_for_send(
+                request_id=request_id, tensor_infos=tensor_infos,
+                skip_cuda_sync=True,  # done once above
+            )
+
     def set_output_ref_counts(
         self,
         request_id: str,

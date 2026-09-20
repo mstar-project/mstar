@@ -359,3 +359,70 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
     )
     assert wg_id in routing.completed_worker_graph_ids, \
         "prefill wg with only EMPTY_DESTINATION outputs must still report done"
+
+
+def _routing_key(routing):
+    """A NodeOutputRouting reduced to what two code paths must agree on."""
+    def edges(lst):
+        return sorted(
+            (e.name, e.next_node, e.persist, e.conductor_new_token,
+             e.is_streaming, e._shard_dim, e._total_fanin,
+             tuple(i.uuid for i in e.tensor_info))
+            for e in lst
+        )
+
+    return {
+        "routed_local": edges(routing.routed_to_this_worker_graph),
+        "persist": edges(routing.persist),
+        "emit": edges(routing.emit_to_client),
+        "new_token": edges(routing.new_token_outputs),
+        "completed": sorted(routing.completed_worker_graph_ids),
+        "to_workers": {w: edges(es) for w, es in routing.to_workers.items()},
+        "streaming_local": edges(routing.streaming_local),
+        "streaming_to_workers": {
+            w: edges(es) for w, es in routing.streaming_to_workers.items()
+        },
+        "is_first_tp_rank": routing.is_first_tp_rank,
+    }
+
+
+def test_complete_and_route_batch_matches_the_per_request_path():
+    """The batched path hoists rid-invariant lookups out of the loop; the
+    routing it produces must be identical to doing it one request at a time."""
+    rids = ["r0", "r1", "r2"]
+    per_request = {}
+    for rid in rids:
+        mgr, wg_id, walk = _make_manager()
+        mgr.add_request(
+            request_id=rid,
+            partition_worker_graph_ids=[wg_id],
+            worker_graph_to_workers={wg_id: ["worker0"]},
+            current_fwd_info=_fwd_info(walk),
+        )
+        mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+        completion = mgr.mark_node_complete(rid, wg_id, "prefill")
+        per_request[rid] = _routing_key(mgr.process_node_outputs(
+            rid, node_name="prefill",
+            outputs=[e.clone() for e in completion.output_edges],
+            graph_walk=walk,
+        ))
+
+    # same three requests, one manager, one batched call
+    mgr, wg_id, walk = _make_manager()
+    for rid in rids:
+        mgr.add_request(
+            request_id=rid,
+            partition_worker_graph_ids=[wg_id],
+            worker_graph_to_workers={wg_id: ["worker0"]},
+            current_fwd_info=_fwd_info(walk),
+        )
+        mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+    batched = mgr.complete_and_route_batch(
+        node_name="prefill",
+        request_to_worker_graph=dict.fromkeys(rids, wg_id),
+        graph_walk="decode",
+    )
+
+    assert sorted(batched) == rids
+    for rid in rids:
+        assert _routing_key(batched[rid]) == per_request[rid], rid

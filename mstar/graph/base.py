@@ -182,7 +182,7 @@ class ReadySignals:
         # ready once the only missing inputs are streaming ones (which arrive incrementally)
         self.is_ready_for_streaming = self.is_ready or \
             self.is_ready_for_streaming or (
-            self.input_names.issuperset(self.ready_names.union(self.streaming_inputs))
+            self.input_names.issubset(self.ready_names.union(self.streaming_inputs))
         )
 
     def clear(self):

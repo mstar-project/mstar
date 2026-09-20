@@ -322,6 +322,52 @@ class ShardingConfig:
             result[item.worker] = new_edge
         return result
 
+    def plan_replicated_fanout(
+        self, signal: str,
+        source_node: str,
+        source_graph_walk: str,
+        dest_node: str,
+        dest_graph_walk: str | None,
+        source_tp_rank: int | None = None,
+    ) -> list[str] | None:
+        """Destination workers for a replicated signal.
+
+        A replicated signal's fanout does not look at tensor dims at all
+        (``compute_fanout`` only uses ``shard_dim_sizes`` on the sharded
+        branch), so a batch can plan it once per (signal, dest) and reuse it
+        for every request. Returns None for a sharded signal, whose slicing is
+        per-request — the caller falls back to ``fanout_graph_edges``.
+        """
+        if self.shard_dim.get(signal) is not None:
+            return None
+        return [
+            item.worker for item in self.compute_fanout(
+                signal=signal, source_graph_walk=source_graph_walk,
+                source_node=source_node, dest_node=dest_node,
+                shard_dim_sizes=[], dest_graph_walk=dest_graph_walk,
+                source_tp_rank=source_tp_rank,
+            )
+        ]
+
+    @staticmethod
+    def apply_replicated_fanout(
+        workers: list[str], graph_edge: GraphEdge,
+    ) -> dict[str, GraphEdge]:
+        """Materialize one edge per planned worker.
+
+        Mirrors ``fanout_graph_edges``'s replicated path exactly: the full
+        tensor_info list is shared (not copied), ``_shard_dim`` is None and
+        ``_total_fanin`` is 1.
+        """
+        result: dict[str, GraphEdge] = {}
+        for worker in workers:
+            new_edge = graph_edge.clone()
+            new_edge._shard_dim = None
+            new_edge._total_fanin = 1
+            new_edge.tensor_info = graph_edge.tensor_info
+            result[worker] = new_edge
+        return result
+
     def compute_fanin(
         self, signal: str, source_tp_size: int,
         dest_node: str, dest_graph_walk: str,

@@ -552,89 +552,118 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             self._sync_segments()
             return seg, off
 
+    def _d2h_ctx(self):
+        return (
+            torch.cuda.stream(self._d2h_stream)
+            if self._d2h_stream is not None
+            else _nullcontext()
+        )
+
+    def _stage_one(self, request_id: str, info_arg: TensorPointerInfo) -> bool:
+        """Stage one tensor into the arena. Returns whether a D2H was queued.
+
+        Caller owns the CUDA sync, the ``_d2h_ctx`` context and the trailing
+        stream sync, so a batch pays for each of those once.
+        """
+        uuid = info_arg.uuid
+        if self.tensor_store.is_registered(request_id, uuid):
+            return False
+        tensor = self.tensor_store.get_tensor(request_id, uuid)
+        t0 = time.perf_counter()
+        t = tensor.detach().contiguous()
+        nbytes = t.numel() * t.element_size()
+        loc = self._reserve(nbytes)
+        if loc is not None and self.tensor_store.is_registered(request_id, uuid):
+            # Lost a concurrent-duplicate race: another thread registered this
+            # uuid while our reserve released the GIL. Return our slot instead
+            # of orphaning it.
+            self._arena.free(*loc)
+            return False
+        if loc is None:
+            # Arena saturated: spill THIS tensor to the per-uuid file protocol
+            # (infos keep shm_segment=None — the consumer falls back to the
+            # file read for exactly those).
+            data = _serialize_tensor(t)
+            path = self._shm_path(self.my_entity_id, uuid)
+            with open(path, "wb") as f:
+                f.write(data)
+            self._shm_files[uuid] = path
+            self._arena_ts[uuid] = time.monotonic()
+            self.tensor_store.set_metadata(request_id, uuid, mem_registered=True)
+            if self.enable_prof:
+                self._record_tx(request_id, uuid, len(data),
+                                time.perf_counter() - t0)
+            logger.debug("ARENA: spilled %s to %s (%d bytes)",
+                         uuid, path, len(data))
+            return False
+        seg, off = loc
+        queued = False
+        try:
+            if nbytes:
+                host = torch.frombuffer(
+                    self._seg_views[seg][off:off + nbytes],
+                    dtype=torch.uint8,
+                ).view(t.dtype).reshape(t.shape)
+                # Async D2H into the pinned segment when a copy stream exists
+                # (the caller's single sync covers the batch); blocking
+                # otherwise, so the descriptor can never ship ahead of the bytes.
+                host.copy_(t, non_blocking=self._d2h_stream is not None)
+                queued = True
+            self._arena_locs[uuid] = (seg, off)
+            self._arena_ts[uuid] = time.monotonic()
+        except BaseException:
+            # Anything that unwinds between reserve and the _arena_locs record
+            # would orphan the slot forever (cleanup can only free what is
+            # recorded).
+            self._arena.free(seg, off)
+            raise
+        seg_name = self._arena.segment_name(seg)
+        info_arg.shm_segment = seg_name
+        info_arg.shm_offset = off
+        self.tensor_store.set_metadata(request_id, uuid, mem_registered=True)
+        if self.enable_prof:
+            self._record_tx(request_id, uuid, nbytes, time.perf_counter() - t0)
+        logger.debug("ARENA: staged %s at %s+%d (%d bytes)",
+                     uuid, seg_name, off, nbytes)
+        return queued
+
     def register_for_send(
         self, request_id: str, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
         if not skip_cuda_sync and torch.cuda.is_available():
             torch.cuda.default_stream().synchronize()
-        ctx = (
-            torch.cuda.stream(self._d2h_stream)
-            if self._d2h_stream is not None
-            else _nullcontext()
-        )
         queued = False
         self._maybe_log_stats()
-        with ctx:
+        with self._d2h_ctx():
             for info_arg in tensor_infos:
-                uuid = info_arg.uuid
-                if self.tensor_store.is_registered(request_id, uuid):
-                    continue
-                tensor = self.tensor_store.get_tensor(request_id, uuid)
-                t0 = time.perf_counter()
-                t = tensor.detach().contiguous()
-                nbytes = t.numel() * t.element_size()
-                loc = self._reserve(nbytes)
-                if loc is not None and self.tensor_store.is_registered(
-                        request_id, uuid):
-                    # Lost a concurrent-duplicate race: another thread
-                    # registered this uuid while our reserve released the
-                    # GIL. Return our slot instead of orphaning it.
-                    self._arena.free(*loc)
-                    continue
-                if loc is None:
-                    # Arena saturated: spill THIS tensor to the per-uuid file
-                    # protocol (infos keep shm_segment=None — the consumer
-                    # falls back to the file read for exactly those).
-                    data = _serialize_tensor(t)
-                    path = self._shm_path(self.my_entity_id, uuid)
-                    with open(path, "wb") as f:
-                        f.write(data)
-                    self._shm_files[uuid] = path
-                    self._arena_ts[uuid] = time.monotonic()
-                    self.tensor_store.set_metadata(
-                        request_id, uuid, mem_registered=True)
-                    if self.enable_prof:
-                        self._record_tx(request_id, uuid, len(data),
-                                        time.perf_counter() - t0)
-                    logger.debug("ARENA: spilled %s to %s (%d bytes)",
-                                 uuid, path, len(data))
-                    continue
-                seg, off = loc
-                try:
-                    if nbytes:
-                        host = torch.frombuffer(
-                            self._seg_views[seg][off:off + nbytes],
-                            dtype=torch.uint8,
-                        ).view(t.dtype).reshape(t.shape)
-                        # Async D2H into the pinned segment when a copy
-                        # stream exists (one sync below covers the batch);
-                        # blocking otherwise, so the descriptor can never
-                        # ship ahead of the bytes.
-                        host.copy_(
-                            t, non_blocking=self._d2h_stream is not None)
-                        queued = True
-                    self._arena_locs[uuid] = (seg, off)
-                    self._arena_ts[uuid] = time.monotonic()
-                except BaseException:
-                    # Anything that unwinds between reserve and the
-                    # _arena_locs record would orphan the slot forever
-                    # (cleanup can only free what is recorded).
-                    self._arena.free(seg, off)
-                    raise
-                seg_name = self._arena.segment_name(seg)
-                info_arg.shm_segment = seg_name
-                info_arg.shm_offset = off
-                self.tensor_store.set_metadata(
-                    request_id, uuid, mem_registered=True)
-                if self.enable_prof:
-                    self._record_tx(
-                        request_id, uuid, nbytes, time.perf_counter() - t0)
-                logger.debug("ARENA: staged %s at %s+%d (%d bytes)",
-                             uuid, seg_name, off, nbytes)
+                queued |= self._stage_one(request_id, info_arg)
         if queued and self._d2h_stream is not None:
             # The control message referencing these bytes is sent after we
             # return; the consumer must never observe a partial copy.
+            self._d2h_stream.synchronize()
+
+    def register_for_send_batch(
+        self,
+        per_request: dict[str, list[TensorPointerInfo]],
+        skip_cuda_sync: bool = False,
+    ):
+        """One arena pass for the whole batch.
+
+        The base-class default would call ``register_for_send`` per request,
+        and each of those ends in a host-blocking ``_d2h_stream.synchronize()``
+        — B serialized stalls per forward pass. Here the whole batch stages
+        inside one stream context and syncs once at the end.
+        """
+        if not skip_cuda_sync and torch.cuda.is_available():
+            torch.cuda.default_stream().synchronize()
+        queued = False
+        self._maybe_log_stats()
+        with self._d2h_ctx():
+            for request_id, tensor_infos in per_request.items():
+                for info_arg in tensor_infos:
+                    queued |= self._stage_one(request_id, info_arg)
+        if queued and self._d2h_stream is not None:
             self._d2h_stream.synchronize()
 
     # -- consumer ---------------------------------------------------------
