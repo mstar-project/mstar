@@ -886,8 +886,12 @@ class Conductor:
         request_data.resource_configs = self._get_resource_configs(
             model_kwargs, partition_fwd_args
         )
-        for cfg in request_data.resource_configs.values():
-            cfg.apply_conductor_config(seed=seed)
+        # keyed by resource, so each config is handed only its own chain
+        prefix_keys = (model_kwargs or {}).get("prefix_keys") or {}
+        for key, cfg in request_data.resource_configs.items():
+            cfg.apply_conductor_config(
+                seed=seed, prefix_keys=prefix_keys.get(key),
+            )
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         for worker_id, worker_graph_ids in worker_to_worker_graph_ids.items():
