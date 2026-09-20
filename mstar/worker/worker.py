@@ -1936,6 +1936,27 @@ class Worker:
         speculation.continuing_rids = threaded_continuing
         speculation.dropped = dropped
 
+    def _sync_spec_loop_iters(self, speculation: "Speculation") -> None:
+        """Sync the spec batch's loop-iter counts from the live graph io.
+
+        The batch carries ``get_fwd_info``'s counts, which lag the io; only the
+        non-spec path resynced, so the spec path read a one-step-stale value.
+        N's routing advances the count after this submit, so a new-iter
+        speculation adds its own step.
+
+        Assumes flat loops: ``loop_name`` is the target's enclosing loop, which
+        is the advancing one only when loops aren't nested. Same assumption as
+        the ``is_stopping`` filter in ``_try_speculate_next``.
+        """
+        for rid, req_info in speculation.node_batch.per_request_info.items():
+            counts = dict(self.worker_graphs_manager.get_dynamic_loop_iters(
+                rid, partition=speculation.partition,
+            ))
+            if speculation.is_new_iter and speculation.loop_name is not None:
+                counts[speculation.loop_name] = \
+                    counts.get(speculation.loop_name, 0) + 1
+            req_info.dynamic_loop_iter_counts.update(counts)
+
     # ------------------------------------------------------------------
     # TP async scheduling — the follower side
     # ------------------------------------------------------------------
@@ -2997,6 +3018,9 @@ class Worker:
                         for node in spec_batch.node_objects.values():
                             # this does not include the dropped rids
                             node._speculatively_scheduled = True
+
+                        # Before submit: the GPU thread reads these in prepare.
+                        self._sync_spec_loop_iters(speculation)
 
                         if spec_batch.node_objects:
                             if self.enable_nvtx:
