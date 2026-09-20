@@ -41,6 +41,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
 )
 from mstar.model.submodule_base import (
+    ARNodeInputs,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
@@ -585,12 +586,43 @@ class Engine:
             if req_inputs is None:
                 batch.skipped_rids.add(rid)
             else:
-                node_inputs.append(req_inputs)
+                node_inputs.append(self._skip_cached_prefix(batch, rid, req_inputs))
 
         batch.register_prepare_batch(node_inputs)
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
+        )
+
+    def _skip_cached_prefix(
+        self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,
+    ) -> NodeInputs:
+        """Cut the leading tokens this node's resources already hold.
+
+        Only a walk whose inputs are entirely sequence-shaped is offered: the
+        opaque fields are the ones the default cut refuses, and a walk that
+        writes more than one span from one set of inputs carries something
+        there to say so, so skipping those walks keeps a one-span match off a
+        step that would apply it to every label it writes.
+        """
+        if (
+            not isinstance(inputs, ARNodeInputs)
+            or inputs.custom_pos_ids is not None
+            or inputs.tensor_inputs
+            or inputs.kwargs
+            or inputs.resource_step_info
+        ):
+            return inputs
+        walk = batch.step_context.graph_walk
+        matched = self._runner.resolve_cached_prefix(rid, batch.node_name, walk)
+        self._runner.apply_cached_prefix(
+            rid, batch.node_name, walk, inputs, matched,
+        )
+        if matched <= 0:
+            return inputs
+        return self._submodules[batch.node_name].submodule.split_inputs(
+            walk, batch.per_request_info[rid], inputs,
+            matched, inputs.input_seq_len,
         )
 
     def exec(
