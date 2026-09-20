@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import torch
 
@@ -31,6 +31,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
@@ -46,6 +47,9 @@ from mstar.model.submodule_base import (
 )
 from mstar.profile.worker import ExecTimings
 from mstar.utils.profiler import mark, range_pop, range_push
+
+if TYPE_CHECKING:
+    from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +326,7 @@ class Engine:
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
+        model: "Model | None" = None,
     ):
         self._device = device
         if kv_cache_type is None:
@@ -366,6 +371,8 @@ class Engine:
             node_resources={n: node_to_resources.get(n, []) for n in node_names},
             enable_nvtx=self._enable_nvtx,
         )
+
+        self._open_prefix_caches(specs_by_key, model)
 
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and
@@ -502,6 +509,33 @@ class Engine:
             )
             runners[label] = runner
         return runners
+
+    def _open_prefix_caches(self, specs_by_key, model) -> None:
+        """Root each KV resource's index in everything its pages depend on.
+
+        A page's contents depend on the weights, the preprocessing that built
+        the prompt, and the configuration of the resources that wrote it — its
+        own, and every resource planned against it. Folding all of that into one
+        root means a deployment that differs anywhere cannot reach pages an
+        older one left behind.
+        """
+        checkpoint = model.checkpoint_path() if model is not None else None
+        shared = [
+            checkpoint_identity(checkpoint) if checkpoint is not None else b"",
+            model.preprocess_fingerprint() if model is not None else "",
+        ]
+        for key, resource in self._resources.items():
+            if not isinstance(resource, KVManager):
+                continue
+            # its own, then its dependents' in key order, so the root does not
+            # move with the order the engine happened to build them in
+            parts = [resource.fingerprint()]
+            for other in sorted(specs_by_key):
+                if key in specs_by_key[other].depends_on():
+                    built = self._resources.get(other)
+                    if built is not None and built.fingerprint() is not None:
+                        parts.append(built.fingerprint())
+            resource.enable_prefix_cache(fingerprint(*shared, *parts))
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.

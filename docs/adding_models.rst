@@ -267,9 +267,10 @@ The spec types are:
      - What it builds
    * - ``KVSpec(config=KVConfig(...))``
      - A paged KV cache. ``KVConfig`` holds ``num_layers``, ``num_kv_heads``,
-       ``head_dim``, ``max_seq_len`` and ``num_qo_heads``. It also holds three fields that
-       a deployment can tune: ``max_num_pages``, ``page_size`` and ``cpu_offload_pages``
-       (the number of pinned host pages used for offload; 0 disables offload).
+       ``head_dim``, ``max_seq_len`` and ``num_qo_heads``. It also holds five fields that
+       a deployment can tune: ``max_num_pages``, ``page_size``, ``cpu_offload_pages``
+       (the number of pinned host pages used for offload; 0 disables offload),
+       ``prefix_cache`` and ``prefix_cache_salt``.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
        ``AttnBackend.FLASHINFER`` (the default) or ``AttnBackend.DENSE``.
@@ -1210,7 +1211,8 @@ that a misspelled setting is never silently ignored:
    * - Spec
      - Accepts
    * - ``KVSpec``
-     - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``
+     - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``,
+       ``prefix_cache``, ``prefix_cache_salt``
    * - ``AttentionSpec`` / ``CrossAttentionSpec``
      - ``backend`` (``flashinfer`` / ``dense``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``)
