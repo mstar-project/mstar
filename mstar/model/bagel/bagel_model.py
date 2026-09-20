@@ -256,6 +256,11 @@ class BagelModel(Model):
     through interleaved text and image inputs.
     """
 
+    # Text + image only (ViT/VAE encoders in, decode/image_gen out); no
+    # audio/video/action encoder or decoder, so reject those at intake.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text", "image"})
+
     def __init__(
         self,
         model_path_hf: str,
