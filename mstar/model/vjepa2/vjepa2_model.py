@@ -156,6 +156,12 @@ def _preprocess_video(
 class VJepa2Model(Model):
     """V-JEPA 2 model (encoder + optional predictor)."""
 
+    # Video in; emits predicted frames, plus scalar/tensor for the MPC and
+    # encoder-only walks. Actions/states arrive in model_kwargs, not as a
+    # modality.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"video"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"video", "scalar", "tensor"})
+
     PREFILL_VIDEO = "prefill_video"
     PREFILL_VIDEO_ENCODER_ONLY = "prefill_video_encoder_only"
     PREFILL_VIDEO_ROLLOUT = "prefill_video_rollout"

@@ -69,6 +69,10 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 class OrpheusModel(Model):
     """Orpheus TTS model: Llama 3.2 3B + SNAC 24kHz decoder."""
 
+    # TTS: text in, audio out.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"audio"})
+
     def __init__(
         self,
         model_path_hf: str,

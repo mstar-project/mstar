@@ -90,6 +90,11 @@ AUDIO_DECODER_NODE = "audio_decoder"
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
+    # Text prompt with optional image/video conditioning; emits an image or a
+    # video (video_sound_gen adds audio) and actions for the world-model walks.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image", "video"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"image", "video", "audio", "action"})
+
     PREFILL_WALK = constants.PREFILL_WALK
     PREFILL_COND_WALK = constants.PREFILL_COND_WALK
     PREFILL_COND_VIDEO_WALK = constants.PREFILL_COND_VIDEO_WALK

@@ -186,6 +186,10 @@ class Qwen3TTSModel(Model):
     prompt processing, configuration, and output encoding.
     """
 
+    # TTS: text in, audio out.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"audio"})
+
     def __init__(
         self,
         model_path_hf: str,

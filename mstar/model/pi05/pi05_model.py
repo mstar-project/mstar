@@ -137,6 +137,11 @@ def _reset_non_persistent_buffers(module: nn.Module, device) -> None:
 class Pi05Model(Model):
     """Pi0.5 vision-language-action model implementation."""
 
+    # VLA: camera frames + task text, emits an action chunk. Robot state
+    # arrives in model_kwargs, not as a modality.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"action"})
+
     PREFILL_WALK = "prefill"
     ACTION_GEN_WALK = "action_gen"
 
