@@ -10,6 +10,7 @@ changes what the engine does.
 
 from __future__ import annotations
 
+import random
 import sys
 
 sys.path.insert(0, ".")
@@ -23,7 +24,12 @@ from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.step import Segment, StepContext
 
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the host pool pins its memory"
+)
+
 PAGE_SIZE = 16
+SEED = 20260920
 
 
 class _StubTransfer:
@@ -47,14 +53,15 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _manager(max_num_pages: int = 16) -> KVManager:
-    """A manager on the CPU. ``cpu_offload_pages`` stays 0: the host pool pins
-    its memory as it is built, and pinning needs a GPU even though this manager
-    does not."""
+def _manager(max_num_pages: int = 16, cpu_offload_pages: int = 0) -> KVManager:
+    """A manager on the CPU. Leave ``cpu_offload_pages`` at 0 unless the test
+    is marked `requires_cuda`: the host pool pins its memory as it is built,
+    and pinning needs a GPU even though this manager does not."""
     return KVManager(
         cfg=KVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
             max_num_pages=max_num_pages, page_size=PAGE_SIZE,
+            cpu_offload_pages=cpu_offload_pages,
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
@@ -185,3 +192,113 @@ def test_a_sealed_page_comes_back_writable_when_it_is_freed():
     kv._arena.release(pages)
 
     assert not kv._arena.any_sealed(pages), "the next owner would inherit the seal"
+
+
+# ── the invariant ───────────────────────────────────────────────────────
+
+
+def _drive(kv: KVManager, rng: random.Random, ops: int, offload: bool = False):
+    """Random operations against ``kv``, with the invariant checked after each.
+
+    The pool is deliberately too small, so admission is refused often and the
+    half-finished paths — a fork reserved, then a segment that does not fit —
+    run here too. Returns the log of what it did, so a failure says what led up
+    to it.
+    """
+    live: list[str] = []
+    log: list[str] = []
+    for i in range(ops):
+        roll = rng.random()
+        if not live or roll < 0.2:
+            rid = f"r{i}"
+            kv.ingest_request(rid)
+            live.append(rid)
+            log.append(f"ingest {rid}")
+        elif roll < 0.6:
+            rid = rng.choice(live)
+            span = rng.randrange(1, 3 * PAGE_SIZE)
+            pre = (("main", "alt"),) if rng.random() < 0.25 else ()
+            post = (("main", "cfg"),) if rng.random() < 0.25 else ()
+            step = KVStep(
+                segments=(Segment(rid, "main", span),),
+                pre_forks=pre, post_forks=post,
+            )
+            ctx = _ctx(rid)
+            admitted = kv.admit(step, ctx).ok
+            if admitted:
+                kv.plan(step, ctx)
+                kv.commit(step, ctx)
+            log.append(
+                f"step {rid} span={span} pre={len(pre)} post={len(post)} "
+                f"admitted={admitted}"
+            )
+        elif roll < 0.75:
+            rid = rng.choice(live)
+            free = rng.random() < 0.5
+            kv.reset_request(rid, free=free)
+            log.append(f"reset {rid} free={free}")
+        elif offload and roll < 0.85:
+            rid = rng.choice(live)
+            kv.offload(rid)
+            kv.assert_pages_conserved()
+            reloaded = kv.reload(rid)
+            log.append(f"offload {rid} reloaded={reloaded}")
+        else:
+            rid = rng.choice(live)
+            live.remove(rid)
+            kv.remove_request(rid)
+            log.append(f"remove {rid}")
+        kv.assert_pages_conserved()
+    return log
+
+
+def _drain(kv: KVManager) -> None:
+    for rid in list(kv._streams):
+        kv.remove_request(rid)
+
+
+def test_the_invariant_survives_a_random_lifecycle():
+    """Ingest, steps with pre- and post-forks, resets and removes in a random
+    order, on a pool too small to hold them all."""
+    kv = _manager(max_num_pages=12)
+
+    log = _drive(kv, random.Random(SEED), ops=400)
+
+    assert sum(1 for line in log if "admitted=True" in line) > 50, (
+        f"seed {SEED}: the pool was too small for the fuzz to store anything"
+    )
+    _drain(kv)
+    assert kv._arena.num_free == kv.config.max_num_pages - 1, (
+        f"seed {SEED}: pages outlived every request that owned them"
+    )
+
+
+@requires_cuda
+def test_the_invariant_survives_offload_and_reload():
+    """The same fuzz with the host pool in play. Offload hands the device pages
+    back while the request lives on, which is the one place today where a page
+    leaves an owner that is still around."""
+    kv = _manager(max_num_pages=12, cpu_offload_pages=16)
+
+    log = _drive(kv, random.Random(SEED), ops=400, offload=True)
+
+    assert any("offload" in line for line in log), f"seed {SEED}: nothing offloaded"
+    _drain(kv)
+    assert kv._arena.num_free == kv.config.max_num_pages - 1, (
+        f"seed {SEED}: pages outlived every request that owned them"
+    )
+
+
+def test_the_flag_puts_the_check_on_the_lifecycle(monkeypatch):
+    """This is about the four call sites rather than the invariant itself: with
+    the flag on, a count that disagrees with the streams is caught by the very
+    operation that broke it."""
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _manager()
+    kv.ingest_request("r0")
+    _grow(kv, "r0", 100)
+
+    kv._arena.retain(kv._streams["r0"]["main"].page_indices[:1])
+
+    with pytest.raises(AssertionError, match="owner counts disagree"):
+        _grow(kv, "r0", PAGE_SIZE)
