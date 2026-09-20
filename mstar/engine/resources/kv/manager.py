@@ -371,10 +371,10 @@ class KVManager(AttentionResource):
         without taking a second reference: an allocation failure sends the batch
         back through `prepare_inputs`, which probes again on untrimmed inputs.
         """
-        label = self._keyed_label(rid, node_name, graph_walk)
-        if label is None:
-            return None
         with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            if label is None:
+                return None
             stream = self._ensure_label(rid, label)
             if stream.lease is not None:
                 return len(stream.lease) * self.config.page_size
@@ -396,10 +396,10 @@ class KVManager(AttentionResource):
     ) -> None:
         """Cut this stream's lease down to ``matched_len``, the agreed length."""
         del inputs
-        label = self._keyed_label(rid, node_name, graph_walk)
-        if label is None:
-            return
         with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            if label is None:
+                return
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.lease is None or stream.stored_len:
                 return
@@ -496,7 +496,11 @@ class KVManager(AttentionResource):
     def _keyed_label(
         self, rid: str, node_name: str, graph_walk: str,
     ) -> str | None:
-        """The one label this request keyed on this node and walk, if any."""
+        """The one label this request keyed on this node and walk, if any.
+
+        Under `_lock`: `remove_request` drops ``rid``'s overrides on another
+        thread, and a label read outside it can name a stream already gone.
+        """
         if self._index is None:
             return None
         overrides = self._overrides.get(rid)
@@ -531,15 +535,14 @@ class KVManager(AttentionResource):
         the stop check already takes, so the page they finish is keyed on the
         step after it filled and `commit` offers it to the index then.
         """
-        label = self._keyed_label(rid, node_name, graph_walk)
-        if label is None:
-            return
-        overrides = self._overrides[rid]
-        tensor = (overrides.prefix_decode or {}).get(label)
-        sampled = outputs.get(tensor) if tensor else None
-        if not sampled:
-            return
         with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            if label is None:
+                return
+            tensor = (self._overrides[rid].prefix_decode or {}).get(label)
+            sampled = outputs.get(tensor) if tensor else None
+            if not sampled:
+                return
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.keys is None or stream.pending is None:
                 return
