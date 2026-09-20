@@ -13,6 +13,8 @@ from mstar.utils.ipc_format import (
     InputSignals,
     MessageSource,
     RemoveRequest,
+    WorkerMessage,
+    WorkerMessageType,
 )
 from mstar.worker.worker import Worker
 
@@ -178,6 +180,25 @@ def test_add_new_request_skips_draining_rid():
     w = _worker(draining=("X",))
     # Bails before touching engine/graph managers (out-of-order NEW after DRAIN).
     Worker._add_new_request(w, SimpleNamespace(request_id="X"))
+
+
+def test_drain_before_new_is_buffered_not_applied():
+    """A DRAIN that beats the NEW must buffer until the NEW lands. Applied early
+    it sets _draining_rids, the NEW gate drops the NEW, and REMOVE strands."""
+    w = _worker(known_rids=(), is_follower=True)
+    w._unprocessed_messages = {}
+    Worker._process_message_list(w, [
+        WorkerMessage(
+            message_type=WorkerMessageType.DRAIN_REQUEST,
+            body=DrainRequest(request_id="X", source=MessageSource.TP_RANK_0),
+        )
+    ])
+    # buffered (rid unknown): no drain state, no premature READS_DONE
+    assert [m.message_type for m in w._unprocessed_messages["X"]] == [
+        WorkerMessageType.DRAIN_REQUEST
+    ]
+    assert "X" not in w._draining_rids
+    assert _reads_done(w) == []
 
 
 # ── preprocess worker ───────────────────────────────────────────────────────

@@ -722,7 +722,10 @@ class Worker:
         msg_types_needing_active_request = [
             WorkerMessageType.REMOVE_REQUEST,
             WorkerMessageType.INPUT_SIGNALS,
-            WorkerMessageType.STOP_LOOPS
+            WorkerMessageType.STOP_LOOPS,
+            # A leader-forwarded DRAIN can beat the conductor's NEW; applying
+            # it early makes the NEW gate drop the NEW and strands the REMOVE.
+            WorkerMessageType.DRAIN_REQUEST,
         ]
         # Snapshot: a REMOVE handled mid-iteration can re-buffer trailing
         # signals onto this same list, and mutating it while iterating it would
