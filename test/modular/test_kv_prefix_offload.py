@@ -189,3 +189,49 @@ def test_a_shared_page_can_be_evicted_while_its_request_is_away():
         "reload took back pages that had been handed to someone else"
     )
     kv.assert_pages_conserved()
+
+
+@requires_cuda
+def test_a_reload_takes_back_pages_only_the_index_was_holding():
+    kv = _manager(max_num_pages=9, cpu_offload_pages=32)
+    tokens = list(range(64))
+    _ingest(kv, "a", tokens)
+    _run(kv, "a", tokens)
+    assert kv.offload("a") > 0, "the request did not move to the host"
+    # a second request fills what is left and ends, so every page in the pool
+    # is one only the index holds
+    other = list(range(1000, 1064))
+    _ingest(kv, "b", other)
+    _run(kv, "b", other)
+    kv.remove_request("b")
+    cached = set(kv._index.pages())
+    assert kv._arena.num_free == 0, "the pool had room, so nothing had to be given back"
+
+    assert kv.reload("a"), (
+        "a request offloaded to make room could not come back to a pool of "
+        "pages nobody was using"
+    )
+    assert set(kv._streams["a"]["main"].page_indices) <= cached, (
+        "the pages the reload took did not come out of the index"
+    )
+    kv.assert_pages_conserved()
+
+
+@requires_cuda
+def test_a_pool_of_running_requests_still_refuses_a_reload():
+    kv = _manager(max_num_pages=9, cpu_offload_pages=32)
+    tokens = list(range(64))
+    kv.ingest_request("a", KVReqConfig())
+    _run(kv, "a", tokens)
+    assert kv.offload("a") > 0, "the request did not move to the host"
+    for rid, base in (("b", 1000), ("c", 2000)):
+        others = list(range(base, base + 64))
+        _ingest(kv, rid, others)
+        _run(kv, rid, others)
+    assert kv._arena.num_free == 0, "the pool had room, so a refusal proves nothing"
+
+    assert not kv.reload("a"), (
+        "the reload took pages two running requests are still reading"
+    )
+    assert kv.is_offloaded("a"), "a refused reload moved the request anyway"
+    kv.assert_pages_conserved()
