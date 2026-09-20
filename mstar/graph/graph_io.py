@@ -141,10 +141,15 @@ class WorkerGraphIO:
                     if isinstance(dest_reg, LoopStateRegistry)
                     else None
                 )
+                is_new_iter = dest in next_iter_nodes
                 ready_for_spec.append(SpeculativeNodeInfo(
                     node_name=dest,
-                    is_new_loop_iter=dest in next_iter_nodes,
+                    is_new_loop_iter=is_new_iter,
                     loop_name=dest_loop_name,
+                    # only a loop-back of the source's loop fires a new iter
+                    advancing_loop_name=(
+                        source_reg.loop.name if is_new_iter else None
+                    ),
                 ))
         return ready_for_spec
 
@@ -180,6 +185,28 @@ class WorkerGraphIO:
         return {
             name: loop.curr_iter for name, loop in self.loops.items()
         }
+
+    def speculative_loop_indices(
+        self, info: SpeculativeNodeInfo
+    ) -> dict[str, int]:
+        """The loop indices ``info.node_name`` runs at if the source's outputs
+        were routed now and no loop stopped: what a speculative step of that
+        node should see, before the real routing lands.
+
+        Mirrors the continue branch of ``Loop.complete_iter``: the advancing
+        loop (the source's, whose loop-back edges fired) moves to
+        ``curr_iter + 1`` and every loop nested inside it restarts at 0
+        (``_advance_one_iter`` -> ``inner_registry.reset_for_iter`` ->
+        ``Loop.reset_for_outer_iter``). A forward transition changes nothing.
+        """
+        indices = self.get_loop_indices()
+        if not info.is_new_loop_iter or info.advancing_loop_name is None:
+            return indices
+        loop = self.loops[info.advancing_loop_name]
+        indices[loop.name] = loop.curr_iter + 1
+        for inner in loop.section.get_loops():
+            indices[inner] = 0
+        return indices
 
     def get_nested_loop_idxs(
         self, target_loop_name: str

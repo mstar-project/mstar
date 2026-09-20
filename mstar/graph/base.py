@@ -120,6 +120,11 @@ class SpeculativeNodeInfo:
     # ``curr_iter`` / ``max_iters`` / ``_finish_signal`` before deciding whether
     # to speculate.
     loop_name: str | None = None
+    # The loop whose loop-back edges made this a new iteration: the *source's*
+    # enclosing loop. Differs from ``loop_name`` only when the destination sits
+    # in a loop nested inside it (that inner loop restarts at 0 rather than
+    # advancing). ``None`` when ``is_new_loop_iter`` is False.
+    advancing_loop_name: str | None = None
 
 
 class GraphSection(ABC):

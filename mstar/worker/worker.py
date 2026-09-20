@@ -9,7 +9,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from time import sleep
 
@@ -974,7 +974,12 @@ class Worker:
                 if edge._final_stream_chunk:
                     final_stream_rids.add(request_id)
             per_request_inputs[request_id] = tensors
-            per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+            per_request_info[request_id] = self._step_info(
+                self.worker_graphs_manager.get_fwd_info(request_id, batch_partition),
+                self.worker_graphs_manager.get_dynamic_loop_iters(
+                    request_id, partition=batch_partition,
+                ),
+            )
 
         return self._make_executing_batch(
             node_name=batch.node_name,
@@ -984,6 +989,38 @@ class Worker:
             per_request_info=per_request_info,
             final_stream_rids=final_stream_rids,
         )
+
+    @staticmethod
+    def _step_info(
+        fwd_info: CurrentForwardPassInfo, loop_iters: dict[str, int],
+    ) -> CurrentForwardPassInfo:
+        """This step's view of the request: the canonical info with its own
+        ``dynamic_loop_iter_counts``, fixed at build time.
+
+        Everything else is shared by reference, so ``update_publish_info`` and
+        ``loop_stop_times`` writes still land on the canonical dicts. Only the
+        counts are per step: batch N and its speculation N+1 are in flight at
+        once for the same rid at different iterations, and one shared dict
+        cannot hold both."""
+        return replace(fwd_info, dynamic_loop_iter_counts=dict(loop_iters))
+
+    def _spec_loop_iters(
+        self, pending: "PendingBatch", spec_node_info: SpeculativeNodeInfo,
+        rid: str, *, continuing: bool,
+    ) -> dict[str, int]:
+        """The loop indices a speculated step runs at.
+
+        A continuing rid's io is still at N's iteration (N's routing lands
+        after the spec submit), so its graph io predicts the post-routing
+        state from its own loop semantics. A fresh rid was already routed to
+        its ready node, so the live counts are the truth."""
+        counts = self.worker_graphs_manager.get_dynamic_loop_iters(
+            rid, partition=pending.partition,
+        )
+        if continuing:
+            wgio = self._get_wgio_for_rid(pending.batch, rid)
+            counts.update(wgio.speculative_loop_indices(spec_node_info))
+        return counts
 
     def _make_executing_batch(
         self,
@@ -1702,7 +1739,12 @@ class Worker:
             request_ids=request_ids,
             per_request_input_tensors=per_request_inputs,
             per_request_info={
-                rid: self.worker_graphs_manager.get_fwd_info(rid, pending.partition)
+                rid: self._step_info(
+                    self.worker_graphs_manager.get_fwd_info(rid, pending.partition),
+                    self._spec_loop_iters(
+                        pending, spec_node_info, rid, continuing=rid in continuing,
+                    ),
+                )
                 for rid in request_ids
             },
             final_stream_rids={
@@ -1724,7 +1766,7 @@ class Worker:
             partition=pending.partition,
             is_new_iter=spec_node_info.is_new_loop_iter,
             is_same_node=is_same_node,
-            loop_name=spec_node_info.loop_name,
+            loop_name=spec_node_info.advancing_loop_name,
             consumed_streaming_edges=consumed_streaming_edges,
             tp_seq=tp_seq,
         )
@@ -1809,12 +1851,14 @@ class Worker:
         max_continuing = self.scheduler.room_for_continuing(spec_target)
         for rid, batch_N_node in batch_N.node_objects.items():
             wgio = self._get_wgio_for_rid(batch_N, rid)
-            loop = wgio.loops.get(spec_node_info.loop_name)
+            # The loop a new iteration advances is the source's; a stop on a
+            # loop nested inside it only restarts that inner loop.
+            loop = wgio.loops.get(spec_node_info.advancing_loop_name)
 
             # check conditions where the rid cannot be furtuer speculated
             already_removed = rid in self._pending_removes
             already_stopped = spec_node_info.is_new_loop_iter and PendingLoopStop(
-                rid, graph_walk, spec_node_info.loop_name
+                rid, graph_walk, spec_node_info.advancing_loop_name
             ) in self._pending_loop_stops
             is_stopping = spec_node_info.is_new_loop_iter and loop is not None and (
                 loop.curr_iter + 1 >= loop.max_iters or loop._finish_signal
@@ -1941,27 +1985,6 @@ class Worker:
                 speculation.consumed_streaming_edges.pop(r, None)
         speculation.continuing_rids = threaded_continuing
         speculation.dropped = dropped
-
-    def _sync_spec_loop_iters(self, speculation: "Speculation") -> None:
-        """Sync the spec batch's loop-iter counts from the live graph io.
-
-        The batch carries ``get_fwd_info``'s counts, which lag the io; only the
-        non-spec path resynced, so the spec path read a one-step-stale value.
-        N's routing advances the count after this submit, so a new-iter
-        speculation adds its own step.
-
-        Assumes flat loops: ``loop_name`` is the target's enclosing loop, which
-        is the advancing one only when loops aren't nested. Same assumption as
-        the ``is_stopping`` filter in ``_try_speculate_next``.
-        """
-        for rid, req_info in speculation.node_batch.per_request_info.items():
-            counts = dict(self.worker_graphs_manager.get_dynamic_loop_iters(
-                rid, partition=speculation.partition,
-            ))
-            if speculation.is_new_iter and speculation.loop_name is not None:
-                counts[speculation.loop_name] = \
-                    counts.get(speculation.loop_name, 0) + 1
-            req_info.dynamic_loop_iter_counts.update(counts)
 
     # ------------------------------------------------------------------
     # TP async scheduling — the follower side
@@ -2256,12 +2279,6 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.check_stop", synchronize=False)
-
-        for rid, req_info in batch_N.node_batch.per_request_info.items():
-            new_iters = self.worker_graphs_manager.get_dynamic_loop_iters(
-                rid, partition=batch_N.partition,
-            )
-            req_info.dynamic_loop_iter_counts.update(new_iters)
 
         # Check for stops
         engine = self.engine_manager.get_engine(batch_N.node_name)
@@ -3029,9 +3046,6 @@ class Worker:
                             # this does not include the dropped rids
                             node._speculatively_scheduled = True
 
-                        # Before submit: the GPU thread reads these in prepare.
-                        self._sync_spec_loop_iters(speculation)
-
                         if spec_batch.node_objects:
                             if self.enable_nvtx:
                                 range_push("worker.submit_spec", synchronize=False)
@@ -3127,13 +3141,6 @@ class Worker:
                     range_push("worker.build_node_batch", synchronize=False)
                 node_batch = self._build_executing_batch(batch)
                 batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
-
-                for request_id, req_info in node_batch.per_request_info.items():
-                    req_info.dynamic_loop_iter_counts.update(
-                        self.worker_graphs_manager.get_dynamic_loop_iters(
-                            request_id, partition=batch_partition,
-                        )
-                    )
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 
