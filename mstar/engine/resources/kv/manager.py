@@ -42,15 +42,38 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PageArena:
-    """physical storage and free list management"""
+    """physical storage, free list, and per-page ownership
+
+    A page goes back to the allocator when its last owner releases it, not its
+    first. Every caller holds the manager's `_lock`, so the counts need none of
+    their own.
+    """
     kv_cache: KVCache
     allocator: PageAllocator
+    num_owners: list[int] = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self.num_owners = [0] * self.allocator.max_num_pages
 
     def acquire(self, n: int) -> list[int] | None:
-        return self.allocator.try_allocate(n)
+        pages = self.allocator.try_allocate(n)
+        if pages is not None:
+            for page in pages:
+                self.num_owners[page] = 1
+        return pages
+
+    def retain(self, pages: list[int]) -> None:
+        for page in pages:
+            self.num_owners[page] += 1
 
     def release(self, pages: list[int]) -> None:
-        return self.allocator.free(pages)
+        freed = []
+        for page in pages:
+            assert self.num_owners[page] > 0, f"page {page} released with no owner"
+            self.num_owners[page] -= 1
+            if self.num_owners[page] == 0:
+                freed.append(page)
+        self.allocator.free(freed)
 
     def copy_pages(self, src: list[int], dst: list[int]) -> None:
         self.kv_cache.copy_pages(src, dst)
