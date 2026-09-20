@@ -45,15 +45,18 @@ class PageArena:
     """physical storage, free list, and per-page ownership
 
     A page goes back to the allocator when its last owner releases it, not its
-    first. Every caller holds the manager's `_lock`, so the counts need none of
-    their own.
+    first. A sealed page is never written again, so a second owner may read it;
+    freeing clears the seal. Every caller holds the manager's `_lock`, so the
+    counts and seals need none of their own.
     """
     kv_cache: KVCache
     allocator: PageAllocator
     num_owners: list[int] = field(init=False, repr=False)
+    sealed: list[bool] = field(init=False, repr=False)
 
     def __post_init__(self):
         self.num_owners = [0] * self.allocator.max_num_pages
+        self.sealed = [False] * self.allocator.max_num_pages
 
     def acquire(self, n: int) -> list[int] | None:
         pages = self.allocator.try_allocate(n)
@@ -66,12 +69,20 @@ class PageArena:
         for page in pages:
             self.num_owners[page] += 1
 
+    def seal(self, pages: list[int]) -> None:
+        for page in pages:
+            self.sealed[page] = True
+
+    def any_sealed(self, pages: list[int]) -> bool:
+        return any(self.sealed[page] for page in pages)
+
     def release(self, pages: list[int]) -> None:
         freed = []
         for page in pages:
             assert self.num_owners[page] > 0, f"page {page} released with no owner"
             self.num_owners[page] -= 1
             if self.num_owners[page] == 0:
+                self.sealed[page] = False
                 freed.append(page)
         self.allocator.free(freed)
 
@@ -929,9 +940,13 @@ class KVManager(AttentionResource):
                 wait([stream.read_future])
         with self._lock:
             for stream in self._streams.get(rid, {}).values():
-                if free:
+                # a rewind would put the next write on the stream's first page,
+                # over a sealed one its other owners still read. drop the pages
+                # and let the next write allocate; `free` asks for the same
+                drop = free or self._arena.any_sealed(stream.page_indices)
+                if drop:
                     self._arena.release(stream.page_indices)
-                stream.reset(freed=free)
+                stream.reset(freed=drop)
 
     def remove_request(self, rid: str):
         streams = self._streams.get(rid)
