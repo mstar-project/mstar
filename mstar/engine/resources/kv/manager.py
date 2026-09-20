@@ -123,8 +123,11 @@ class CacheStream:
     # one key per page of this stream's prompt, from the preprocess worker
     keys: list[bytes] | None = None
     # pages the index matched for this stream and is holding for it, from the
-    # probe until `commit`; `page_indices` is empty until `admit` converts them
+    # probe until `admit` converts them onto `page_indices`
     lease: list[int] | None = None
+    # from the admit that converted a lease until `commit`: a refused admit
+    # sends the step back through the probe, which has to answer the same
+    converted: bool = False
     # how many of this stream's pages the index already holds
     cursor: int = 0
     # generated tokens that have not finished a page, after the prompt's own
@@ -153,6 +156,7 @@ class CacheStream:
         self.released = 0
         self.generation += 1
         self.step_in_flight = False
+        self.converted = False
 
         if freed:
             self.page_indices.clear()
@@ -376,6 +380,8 @@ class KVManager(AttentionResource):
             if label is None:
                 return None
             stream = self._ensure_label(rid, label)
+            if stream.converted:
+                return stream.stored_len
             if stream.lease is not None:
                 return len(stream.lease) * self.config.page_size
             if stream.stored_len or stream.offloaded or stream.read_pending:
@@ -565,8 +571,9 @@ class KVManager(AttentionResource):
                 del stream.pending[:page_size]
 
     def _release_lease(self, stream: CacheStream) -> None:
-        """Give back a lease `admit` never converted."""
-        if stream.lease is not None and not stream.page_indices:
+        """Give back a lease `admit` never converted; a converted one leaves
+        with `page_indices`."""
+        if stream.lease is not None:
             self._arena.release(stream.lease)
         stream.lease = None
 
@@ -703,6 +710,8 @@ class KVManager(AttentionResource):
                     )
                     # they came out of the index, so they are already in it
                     stream.cursor = len(stream.lease)
+                    stream.lease = None
+                    stream.converted = True
                 self._report_admission(segment, stream)
             if ctx.is_preplan:
                 # a preplan that was promoted or abandoned already cleared
@@ -982,7 +991,9 @@ class KVManager(AttentionResource):
                         )
                         continue
                     stream.stored_len += segment.span
-                    stream.lease = None
+                    # the lease's reference has lived in `page_indices` since
+                    # the conversion; past this commit the stream is no fresh one
+                    stream.converted = False
                     self._index_filled_pages(segment, stream, ctx)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
@@ -1301,7 +1312,7 @@ class KVManager(AttentionResource):
                 for stream in streams.values():
                     for page in stream.page_indices:
                         refs[page] = refs.get(page, 0) + 1
-                    if stream.lease is not None and not stream.page_indices:
+                    if stream.lease is not None:
                         # held for a stream `admit` has not converted yet
                         for page in stream.lease:
                             refs[page] = refs.get(page, 0) + 1
