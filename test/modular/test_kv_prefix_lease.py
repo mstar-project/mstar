@@ -11,6 +11,7 @@ second reference being taken.
 from __future__ import annotations
 
 import sys
+import threading
 
 sys.path.insert(0, ".")
 
@@ -244,4 +245,74 @@ def test_a_pre_fork_off_a_leased_stream_covers_the_whole_prefix():
     assert not set(forked.page_indices) & set(kv._streams["r1"]["main"].page_indices), (
         "the fork target aliased the pages it was supposed to be a copy of"
     )
+    kv.assert_pages_conserved()
+
+
+# ── a remove on another thread ──────────────────────────────────────────
+
+
+def _removed_in_the_window(kv: KVManager, monkeypatch, rid: str) -> None:
+    """Remove ``rid`` from another thread once its label has been looked up,
+    whenever that thread can take the manager's lock at that moment."""
+    real = kv._keyed_label
+
+    def _keyed_label(*args):
+        label = real(*args)
+
+        def _remove():
+            if kv._lock.acquire(blocking=False):
+                try:
+                    kv.remove_request(rid)
+                finally:
+                    kv._lock.release()
+
+        remover = threading.Thread(target=_remove)
+        remover.start()
+        remover.join()
+        return label
+
+    monkeypatch.setattr(kv, "_keyed_label", _keyed_label)
+
+
+def test_a_probe_raced_by_a_remove_raises_nothing(monkeypatch):
+    kv = _manager()
+    keys = _seed(kv, list(range(64)))
+    kv.remove_request("seed")
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": keys}))
+    _removed_in_the_window(kv, monkeypatch, "r0")
+
+    try:
+        kv.resolve_cached_prefix("r0", NODE, WALK)
+    except KeyError as error:
+        pytest.fail(
+            f"a remove between the label lookup and the lock failed the batch: {error!r}"
+        )
+    kv.remove_request("r0")
+
+    assert kv.resolve_cached_prefix("r0", NODE, WALK) is None, (
+        "a removed request was still probed"
+    )
+    kv.assert_pages_conserved()
+
+
+def test_a_chain_extension_raced_by_a_remove_raises_nothing(monkeypatch):
+    kv = _manager()
+    tokens = list(range(40))
+    kv.ingest_request("r0", KVReqConfig(
+        prefix_keys={"main": _keys(tokens)},
+        prefix_tail={"main": tokens[32:]},
+        prefix_decode={"main": "text_inputs"},
+    ))
+    _grow(kv, "r0", len(tokens))
+    _removed_in_the_window(kv, monkeypatch, "r0")
+
+    try:
+        kv.extend_prefix_chain(
+            "r0", NODE, WALK, {"text_inputs": [torch.tensor([9000])]},
+        )
+    except KeyError as error:
+        pytest.fail(
+            f"a remove between the label lookup and the lock failed the "
+            f"postprocess path: {error!r}"
+        )
     kv.assert_pages_conserved()
