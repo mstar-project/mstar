@@ -10,7 +10,11 @@ from types import SimpleNamespace
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import (
-    GraphEdge, GraphNode, Loop, Sequential, SpeculativeNodeInfo,
+    GraphEdge,
+    GraphNode,
+    Loop,
+    Sequential,
+    SpeculativeNodeInfo,
 )
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.worker.worker import Worker
