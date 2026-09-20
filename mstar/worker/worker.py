@@ -485,8 +485,11 @@ class Worker:
         # tensor state now would race the GPU thread reading those tensors
         # / KV pages. Queue the remove and apply it once no in-flight step
         # references the rid (see _apply_pending_removes_safe_to_drop in
-        # the run loop).
-        if body.request_id in self._in_flight_rids:
+        # the run loop). A queued committed TP-follow defers the same way:
+        # clear_rid drops the refcount but strands its ScheduleTPNode in the
+        # FIFO, blocking later follows; dropping it hangs the TP group.
+        if body.request_id in self._in_flight_rids or \
+                self.scheduler.pending_tp_follow_count.get(body.request_id, 0) > 0:
             self._pending_removes.add(body.request_id)
             return
 
@@ -2506,9 +2509,13 @@ class Worker:
         self, in_flight_rids: set[str]
     ) -> None:
         """Apply ``REMOVE_REQUEST`` for any rid that is not currently held by
-        an in-flight GPU step. Removes for in-flight rids stay deferred and
-        are reattempted next iter."""
-        to_apply = [r for r in self._pending_removes if r not in in_flight_rids]
+        an in-flight GPU step or a still-queued committed TP-follow batch.
+        Removes for those stay deferred and are reattempted next iter."""
+        to_apply = [
+            r for r in self._pending_removes
+            if r not in in_flight_rids
+            and self.scheduler.pending_tp_follow_count.get(r, 0) == 0
+        ]
         for rid in to_apply:
             self._pending_removes.discard(rid)
             self._remove_request(RemoveRequest(request_id=rid, source=MessageSource.SELF))

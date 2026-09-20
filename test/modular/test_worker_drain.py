@@ -143,6 +143,24 @@ def test_remove_force_cleans_and_clears_drain_state():
     assert "X" not in w._reads_done_sent
 
 
+def test_remove_deferred_while_committed_tp_follow_pending():
+    """Removing while a committed TP-follow is queued strands its ScheduleTPNode
+    in the FIFO, blocking later follows — so defer, like an in-flight rid."""
+    w = _worker(known_rids=("X",), tp_follow=("X",))
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    assert "X" in w._pending_removes
+    assert w.forced == []   # tensors not torn down
+    assert w.cleared == []  # scheduler state kept until the follow runs
+
+
+def test_pending_remove_held_back_while_tp_follow_pending():
+    w = _worker(known_rids=("X",), tp_follow=("X",))
+    w._pending_removes = {"X"}
+    w._apply_pending_removes_safe_to_drop(in_flight_rids=set())
+    assert "X" in w._pending_removes  # still deferred
+    assert w.forced == []
+
+
 def test_process_new_inputs_skips_reads_for_draining_rid():
     w = _worker(draining=("X",))
 
