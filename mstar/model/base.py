@@ -56,6 +56,9 @@ class PrefixStream(NamedTuple):
     """
     tensor: str
     keyed_by: str
+    # whether a decode step's input ids are the token just sampled, so that
+    # what the model generates can be keyed the same way its prompt was
+    chains_decode: bool = False
 
 
 @dataclass

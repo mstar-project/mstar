@@ -108,6 +108,16 @@ class Resource(ABC):
         """
         return
 
+    def extend_prefix_chain(
+        self, rid: str, node_name: str, graph_walk: str, outputs: Any,
+    ) -> None:
+        """Take this step's sampled tokens, so what was generated can be keyed.
+
+        Handed the host copy the stop check already takes, one step after the
+        tokens were written.
+        """
+        return
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 

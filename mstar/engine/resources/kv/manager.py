@@ -17,7 +17,7 @@ from mstar.engine.resources.base import (
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
-from mstar.engine.resources.kv.keys import fingerprint
+from mstar.engine.resources.kv.keys import fingerprint, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     KVPlanOutput,
@@ -127,6 +127,13 @@ class CacheStream:
     lease: list[int] | None = None
     # how many of this stream's pages the index already holds
     cursor: int = 0
+    # generated tokens that have not finished a page, after the prompt's own
+    # tail; the page they finish is keyed over all of them at once
+    pending: list[int] | None = None
+    # how many of `keys` name a whole page. The prompt's last key names a
+    # partial one whenever the prompt does not end on a boundary, and that key
+    # is neither an index entry nor a parent until the page behind it fills
+    keyed_pages: int = 0
     offloaded: bool = False
     generation: int = 0
 
@@ -407,7 +414,7 @@ class KVManager(AttentionResource):
             or not stream.keys
         ):
             return
-        filled = min(stream.stored_len // self.config.page_size, len(stream.keys))
+        filled = min(stream.stored_len // self.config.page_size, stream.keyed_pages)
         parent = (
             stream.page_indices[stream.cursor - 1] if stream.cursor else None
         )
@@ -435,6 +442,56 @@ class KVManager(AttentionResource):
             if keys.get(label):
                 return label
         return None
+
+    def _seed_keys(self, rid: str, label: str, stream: CacheStream) -> None:
+        """Put this request's chain for ``label`` on its stream."""
+        overrides = self._overrides.get(rid)
+        if overrides is None or not overrides.prefix_cache:
+            return
+        keys = (overrides.prefix_keys or {}).get(label)
+        if not keys:
+            return
+        tail = list((overrides.prefix_tail or {}).get(label) or ())
+        stream.keys = list(keys)
+        stream.pending = tail
+        stream.keyed_pages = len(keys) - (1 if tail else 0)
+
+    def extend_prefix_chain(
+        self, rid: str, node_name: str, graph_walk: str, outputs,
+    ) -> None:
+        """Key what this request generated, once a page of it exists.
+
+        The tokens arrive one step after they were written, off the host copy
+        the stop check already takes, so the page they finish is keyed on the
+        step after it filled and `commit` offers it to the index then.
+        """
+        label = self._keyed_label(rid, node_name, graph_walk)
+        if label is None:
+            return
+        overrides = self._overrides[rid]
+        tensor = (overrides.prefix_decode or {}).get(label)
+        sampled = outputs.get(tensor) if tensor else None
+        if not sampled:
+            return
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None or stream.keys is None or stream.pending is None:
+                return
+            stream.pending.extend(sampled[0].flatten().tolist())
+            page_size = self.config.page_size
+            while len(stream.pending) >= page_size:
+                whole = stream.keyed_pages
+                key = page_key(
+                    stream.keys[whole - 1] if whole else b"",
+                    stream.pending[:page_size],
+                )
+                # overwrites the partial key the prompt left here, if any
+                if whole < len(stream.keys):
+                    stream.keys[whole] = key
+                else:
+                    stream.keys.append(key)
+                stream.keyed_pages = whole + 1
+                del stream.pending[:page_size]
 
     def _release_lease(self, stream: CacheStream) -> None:
         """Give back a lease `admit` never converted."""
@@ -464,7 +521,7 @@ class KVManager(AttentionResource):
             self._overrides.setdefault(rid, overrides)
             for label, stream in self._streams[rid].items():
                 if stream.keys is None:
-                    stream.keys = self._keys_for(rid, label)
+                    self._seed_keys(rid, label, stream)
 
     def admit_retrieve(
         self, rid: str,
@@ -1232,17 +1289,9 @@ class KVManager(AttentionResource):
 
     def _ensure_label(self, rid: str, label: str) -> CacheStream:
             if label not in self._streams[rid]:
-                self._streams[rid][label] = CacheStream(
-                    keys=self._keys_for(rid, label)
-                )
+                self._streams[rid][label] = CacheStream()
+                self._seed_keys(rid, label, self._streams[rid][label])
             return self._streams[rid][label]
-
-    def _keys_for(self, rid: str, label: str) -> list[bytes] | None:
-        """The page keys this request carries for ``label``, if it carries any."""
-        overrides = self._overrides.get(rid)
-        if overrides is None or not overrides.prefix_cache:
-            return None
-        return (overrides.prefix_keys or {}).get(label)
 
     def _check_ready(
         self, rid: str, label: str
