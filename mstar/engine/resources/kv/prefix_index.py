@@ -55,8 +55,10 @@ class PrefixIndex:
                     heapq.heappush(self._leaves, (self._clock, page))
         return pages
 
-    def insert(self, key: bytes, page: int, parent: int = _NO_PARENT) -> bool:
+    def insert(self, key: bytes, page: int, parent: int | None = None) -> bool:
         """Name ``page`` by ``key`` under ``parent``; the first writer wins."""
+        if parent is None:
+            parent = _NO_PARENT
         assert parent == _NO_PARENT or self._key[parent] is not None, (
             f"page {page} indexed under parent page {parent}, which the index "
             "does not hold; a parent must outlive its children"
@@ -75,6 +77,10 @@ class PrefixIndex:
             self._children[parent] += 1
         heapq.heappush(self._leaves, (self._clock, page))
         return True
+
+    def page_for(self, key: bytes) -> int | None:
+        """The page under ``key``, without counting it as a hit."""
+        return self._by_key.get(key)
 
     def pages(self) -> list[int]:
         """Every page the index is holding a reference to."""

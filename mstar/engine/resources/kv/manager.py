@@ -125,6 +125,8 @@ class CacheStream:
     # pages the index matched for this stream and is holding for it, from the
     # probe until `commit`; `page_indices` is empty until `admit` converts them
     lease: list[int] | None = None
+    # how many of this stream's pages the index already holds
+    cursor: int = 0
     offloaded: bool = False
     generation: int = 0
 
@@ -389,6 +391,36 @@ class KVManager(AttentionResource):
                 self._arena.release(stream.lease[keep:])
                 stream.lease = stream.lease[:keep] or None
 
+    def _index_filled_pages(
+        self, segment: Segment, stream: CacheStream, ctx: StepContext,
+    ) -> None:
+        """Offer every page this commit filled to the index.
+
+        Only whole pages, because the tail is still being written into and a
+        second owner would be reading bytes that are still moving. A dummy or
+        padded row is left out: its pages hold whatever the capture wrote.
+        """
+        if (
+            self._index is None
+            or ctx.capture
+            or segment.request_id not in ctx.request_ids
+            or not stream.keys
+        ):
+            return
+        filled = min(stream.stored_len // self.config.page_size, len(stream.keys))
+        parent = (
+            stream.page_indices[stream.cursor - 1] if stream.cursor else None
+        )
+        while stream.cursor < filled:
+            key = fingerprint(self._prefix_root, stream.keys[stream.cursor])
+            page = stream.page_indices[stream.cursor]
+            if not self._index.insert(key, page, parent):
+                # another request filled this page first and its copy is the
+                # one the index names; ours stays private to this stream
+                page = self._index.page_for(key)
+            parent = page
+            stream.cursor += 1
+
     def _keyed_label(
         self, rid: str, node_name: str, graph_walk: str,
     ) -> str | None:
@@ -539,6 +571,8 @@ class KVManager(AttentionResource):
                     stream.stored_len = (
                         len(stream.lease) * self.config.page_size
                     )
+                    # they came out of the index, so they are already in it
+                    stream.cursor = len(stream.lease)
             if ctx.is_preplan:
                 # a preplan that was promoted or abandoned already cleared
                 # these; reset anyway so a refused admit can't leave stale
@@ -818,6 +852,7 @@ class KVManager(AttentionResource):
                         continue
                     stream.stored_len += segment.span
                     stream.lease = None
+                    self._index_filled_pages(segment, stream, ctx)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
