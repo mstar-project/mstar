@@ -103,6 +103,34 @@ class StepRunner:
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
 
+    def resolve_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+    ) -> int:
+        """The longest prefix every resource on ``node_name`` can serve.
+
+        The smallest answer wins, because a step is one span: a resource that
+        holds less than another has to be caught up by the tokens that run.
+        A resource with no opinion is not an answer of zero.
+        """
+        matched = None
+        for key in self._sweep(self._node_order, self._order, node_name):
+            answer = self._resources[key].resolve_cached_prefix(
+                rid, node_name, graph_walk,
+            )
+            if answer is not None and (matched is None or answer < matched):
+                matched = answer
+        return matched or 0
+
+    def apply_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+        inputs, matched_len: int,
+    ) -> None:
+        """Hand every resource the length they agreed on, untrimmed inputs."""
+        for key in self._sweep(self._node_order, self._order, node_name):
+            self._resources[key].apply_cached_prefix(
+                rid, node_name, graph_walk, inputs, matched_len,
+            )
+
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
 

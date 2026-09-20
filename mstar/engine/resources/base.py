@@ -86,6 +86,28 @@ class Resource(ABC):
     def depends_on(self) -> set[str]:
         return set()
 
+    def resolve_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+    ) -> int | None:
+        """How many of this request's leading tokens this resource already holds.
+
+        None means the resource has no opinion, which is not the same as zero:
+        the engine takes the smallest answer any resource gives, so one that
+        cannot serve a prefix must not be counted as offering none.
+        """
+        return None
+
+    def apply_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+        inputs: Any, matched_len: int,
+    ) -> None:
+        """Take on the length every resource agreed to skip.
+
+        Called with the untrimmed inputs, so a resource that needs the tokens
+        being skipped can still read them; the engine trims afterwards.
+        """
+        return
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 
