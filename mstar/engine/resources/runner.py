@@ -131,6 +131,15 @@ class StepRunner:
                 rid, node_name, graph_walk, inputs, matched_len,
             )
 
+    def extend_prefix_chains(
+        self, rid: str, node_name: str, graph_walk: str, outputs,
+    ) -> None:
+        """Offer this step's sampled tokens to the node's own resources."""
+        for key in self._sweep(self._node_order, self._order, node_name):
+            self._resources[key].extend_prefix_chain(
+                rid, node_name, graph_walk, outputs,
+            )
+
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
 

@@ -70,11 +70,28 @@ class KVReqConfig(ResourceReqConfig):
     # one page key per page of this request's declared streams, by label,
     # chained on the preprocess worker and handed over by the conductor
     prefix_keys: dict[str, list[bytes]] | None = None
+    # the prompt tokens after its last whole page: the page they will finish
+    # is keyed over them and the tokens generated next, and the manager has
+    # no other way to see them
+    prefix_tail: dict[str, list[int]] | None = None
+    # label -> the output tensor a sampled token arrives under, for the
+    # labels whose node said its decode ids are that token
+    prefix_decode: dict[str, str] | None = None
     prefix_cache: bool = True
 
-    def apply_conductor_config(self, prefix_keys: dict[str, list[bytes]] | None=None, **kwargs):
+    def apply_conductor_config(
+        self,
+        prefix_keys: dict[str, list[bytes]] | None=None,
+        prefix_tail: dict[str, list[int]] | None=None,
+        prefix_decode: dict[str, str] | None=None,
+        **kwargs,
+    ):
         if prefix_keys is not None:
             self.prefix_keys = prefix_keys
+        if prefix_tail is not None:
+            self.prefix_tail = prefix_tail
+        if prefix_decode is not None:
+            self.prefix_decode = prefix_decode
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:

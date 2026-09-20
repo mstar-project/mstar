@@ -2242,6 +2242,9 @@ class Worker:
             outputs, batch_N.node_batch.completion_event,
         )
         stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs)
+        # the same host copy, before the stops are acted on: a request that
+        # ends here still filled whatever pages it filled
+        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs)
         if batch_N.node_batch.failed_requests:
             # A rid whose stop check raised has no trustworthy stop decision:
             # routing it would either run its loop forever or end it early.

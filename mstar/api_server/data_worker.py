@@ -375,9 +375,12 @@ class PreprocessWorkerThread:
                 tensors.update(prompt_tensors)
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
-            prefix_keys = self._prefix_keys(tensors)
+            prefix_keys, prefix_tail, prefix_decode = self._prefix_keys(tensors)
             if prefix_keys:
                 model_kwargs["prefix_keys"] = prefix_keys
+                model_kwargs["prefix_tail"] = prefix_tail
+                if prefix_decode:
+                    model_kwargs["prefix_decode"] = prefix_decode
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
             byte_data = input.text.encode("utf-8")
@@ -428,13 +431,19 @@ class PreprocessWorkerThread:
                 inputs=self._summarize_inputs(input),
             ))
 
-    def _prefix_keys(self, tensors: dict) -> dict[str, dict[str, list[bytes]]]:
+    def _prefix_keys(self, tensors: dict) -> tuple[dict, dict, dict]:
         """Chain a page key per page of every id-keyed stream the model declared.
 
         The root is left empty here: the KV manager folds in the one that names
         the process, so a key computed here means the same thing in any of them.
+
+        Also gives back the tokens after the prompt's last whole page, and
+        where a sampled token will arrive: a page that a generated token
+        completes is keyed over both halves, and only this side sees the first.
         """
         keys: dict[str, dict[str, list[bytes]]] = {}
+        tails: dict[str, dict[str, list[int]]] = {}
+        decode: dict[str, dict[str, str]] = {}
         for resource_key, by_label in self._prefix_streams.items():
             page_size = self._prefix_page_sizes[resource_key]
             for label, stream in by_label.items():
@@ -447,7 +456,11 @@ class PreprocessWorkerThread:
                     for at in range(0, len(flat), page_size)
                 ]
                 keys.setdefault(resource_key, {})[label] = chain(pages)
-        return keys
+                whole = len(flat) // page_size
+                tails.setdefault(resource_key, {})[label] = flat[whole * page_size:]
+                if stream.chains_decode:
+                    decode.setdefault(resource_key, {})[label] = stream.tensor
+        return keys, tails, decode
 
     @staticmethod
     def _summarize_inputs(input: PreprocessInput) -> list[InputInfo]:

@@ -582,6 +582,18 @@ class Engine:
             batch=batch, model_inputs=node_inputs
         )
 
+    def extend_prefix_chains(
+        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+    ) -> None:
+        """Key what this step generated, from the stop check's host copy."""
+        walk = batch.step_context.graph_walk
+        for rid in batch.request_ids:
+            per_rid = outputs.get(rid)
+            if isinstance(per_rid, dict):
+                self._runner.extend_prefix_chains(
+                    rid, batch.node_name, walk, per_rid,
+                )
+
     def _skip_cached_prefix(
         self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,
     ) -> NodeInputs:

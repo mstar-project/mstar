@@ -771,10 +771,16 @@ class Conductor:
             model_kwargs, partition_fwd_args
         )
         # keyed by resource, so each config is handed only its own chain
-        prefix_keys = (model_kwargs or {}).get("prefix_keys") or {}
+        kwargs = model_kwargs or {}
+        prefix_keys = kwargs.get("prefix_keys") or {}
+        prefix_tail = kwargs.get("prefix_tail") or {}
+        prefix_decode = kwargs.get("prefix_decode") or {}
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
-                seed=seed, prefix_keys=prefix_keys.get(key),
+                seed=seed,
+                prefix_keys=prefix_keys.get(key),
+                prefix_tail=prefix_tail.get(key),
+                prefix_decode=prefix_decode.get(key),
             )
 
         # Send NewRequest to each worker with the appropriate partition's inputs
