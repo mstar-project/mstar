@@ -189,3 +189,66 @@ def test_each_resource_config_is_handed_only_its_own_chain():
 
 def test_a_request_config_is_cached_until_it_says_otherwise():
     assert KVReqConfig().prefix_cache is True
+
+
+# ── one request opting out ──────────────────────────────────────────────
+
+
+def test_a_request_can_turn_the_cache_off_for_itself():
+    configs = {"kv": KVReqConfig()}
+
+    # what the conductor does with a request that sent prefix_cache=False
+    for cfg in configs.values():
+        cfg.apply_conductor_config(seed=1, prefix_cache=False)
+
+    assert configs["kv"].prefix_cache is False
+
+
+def test_a_request_that_says_nothing_is_still_cached():
+    cfg = KVReqConfig()
+
+    cfg.apply_conductor_config(seed=1, prefix_keys={"main": [b"k"]})
+
+    assert cfg.prefix_cache is True, (
+        "a request that never mentioned the cache was opted out of it"
+    )
+
+
+def test_a_request_that_opted_out_keys_no_stream_at_ingest():
+    import torch
+
+    from mstar.engine.resources.kv import manager as kv_manager_mod
+    from mstar.engine.resources.kv.manager import KVManager
+
+    class _NoTransfer:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_kv_transfer_info(self):
+            return None
+
+        def cleanup(self):
+            pass
+
+    original = kv_manager_mod.KVTransferManager
+    kv_manager_mod.KVTransferManager = _NoTransfer
+    try:
+        kv = KVManager(
+            cfg=KVConfig(
+                num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64,
+                max_num_pages=16, page_size=PAGE_SIZE,
+            ),
+            name="kv", joint_comm_group=None, transfer_engine_info=None,
+            device=torch.device("cpu"), dtype=torch.float32,
+        )
+        kv.enable_prefix_cache(b"root")
+        cfg = KVReqConfig(prefix_keys={"main": [b"k0"]})
+        cfg.apply_conductor_config(seed=1, prefix_cache=False)
+
+        kv.ingest_request("r0", cfg)
+
+        assert kv._streams["r0"]["main"].keys is None, (
+            "the opt-out reached the config but not the stream"
+        )
+    finally:
+        kv_manager_mod.KVTransferManager = original
