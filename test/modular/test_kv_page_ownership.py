@@ -140,3 +140,48 @@ def test_an_admitted_request_owns_each_of_its_pages_once():
     assert [kv._arena.num_owners[page] for page in pages] == [1] * len(pages), (
         "nothing calls retain yet, so a request is the only owner of its pages"
     )
+
+
+# ── sealed pages ────────────────────────────────────────────────────────
+
+
+def test_a_reset_across_a_sealed_page_drops_the_pages():
+    kv = _manager()
+    kv.ingest_request("r0")
+    _grow(kv, "r0", 100)
+    stream = kv._streams["r0"]["main"]
+    pages = list(stream.page_indices)
+    free = kv._arena.num_free
+    kv._arena.seal(pages[:1])
+
+    kv.reset_request("r0")
+
+    assert stream.page_indices == []
+    assert kv._arena.num_free == free + len(pages), (
+        "the stream kept pages it would have written over while others read them"
+    )
+
+
+def test_a_reset_on_an_unsealed_stream_keeps_its_pages():
+    kv = _manager()
+    kv.ingest_request("r0")
+    _grow(kv, "r0", 100)
+    stream = kv._streams["r0"]["main"]
+    pages = list(stream.page_indices)
+    free = kv._arena.num_free
+
+    kv.reset_request("r0")
+
+    assert stream.stored_len == 0
+    assert stream.page_indices == pages
+    assert kv._arena.num_free == free, "a rewind with nothing sealed still reuses its pages"
+
+
+def test_a_sealed_page_comes_back_writable_when_it_is_freed():
+    kv = _manager()
+    pages = kv._arena.acquire(1)
+    kv._arena.seal(pages)
+
+    kv._arena.release(pages)
+
+    assert not kv._arena.any_sealed(pages), "the next owner would inherit the seal"
