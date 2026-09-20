@@ -65,6 +65,8 @@ class SamplerResource(Resource):
         # pre-planned a step ahead, promoted by the next non-preplan plan
         self._preplan_cg_sampler: CudaGraphableSampler | None = None
         self._preplanned = False
+        # rid -> the prompt tokens a cache hit kept out of this step's inputs
+        self._cached_prefix: dict[str, torch.Tensor] = {}
 
     @property
     def _penalty_live(self) -> bool:
@@ -128,9 +130,26 @@ class SamplerResource(Resource):
                 rid, sampling_config=self._sampler._sampling_config[rid]
             )
 
+    def apply_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+        inputs, matched_len: int,
+    ) -> None:
+        """Keep the tokens the cache is about to skip, for `plan` to fold in.
+
+        A step declares its tracked tokens from the inputs it is given, and by
+        then the matched prefix has been cut out of them; without these the
+        mask would hold the tail of the prompt and the penalty would let the
+        model repeat everything before it.
+        """
+        del node_name, graph_walk
+        ids = getattr(inputs, "input_ids", None)
+        if matched_len > 0 and ids is not None:
+            self._cached_prefix[rid] = ids[:matched_len]
+
     def remove_request(self, rid: str):
         self._sampler.remove_request(rid)
         self._penalty_rids.discard(rid)
+        self._cached_prefix.pop(rid, None)
         if self._cg_buffers is not None:
             self._cg_buffers.unregister_request(rid)
 
@@ -186,6 +205,12 @@ class SamplerResource(Resource):
         if not ctx.is_preplan and self._penalty_live:
             for rid, tokens in step.prefill_tracked_tokens.items():
                 self._sampler.get_token_mask(rid).add_tokens(tokens)
+            # dropped as they are used: `plan` runs on every step of a resident
+            # request, and these belong to the one prefill that was cut
+            for rid in ctx.request_ids:
+                skipped = self._cached_prefix.pop(rid, None)
+                if skipped is not None:
+                    self._sampler.get_token_mask(rid).add_tokens(skipped)
 
         # A step planned ahead promotes here. Its static config was gathered in
         # the preplan; the per-step state (RNG offset + seen-token mask) is NOT
