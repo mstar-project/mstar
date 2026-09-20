@@ -164,8 +164,15 @@ class RopeManager(PositionManager):
         would rotate the step's own tokens over the top of them.
         """
         del ctx
+        # taken by the step it was held for: a label the request writes later
+        # has no cached prefix of its own
+        seeds = {
+            segment.request_id: self._matched.pop(segment.request_id)
+            for segment in step.segments or ()
+            if segment.request_id in self._matched
+        }
         for segment in step.segments or ():
-            matched = self._matched.get(segment.request_id)
+            matched = seeds.get(segment.request_id)
             if matched is None:
                 continue
             counters = self._counters.setdefault(segment.request_id, {})
