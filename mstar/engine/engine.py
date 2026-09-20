@@ -564,6 +564,8 @@ class Engine:
                     inputs=batch.per_request_input_tensors.get(rid, {}),
                     resources=self._submodules[batch.node_name].resources,
                 )
+                if req_inputs is not None:
+                    req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
             except Exception as error:
                 logger.exception(
                     "prepare_inputs failed for request %s (node=%s, walk=%s)",
@@ -574,7 +576,7 @@ class Engine:
             if req_inputs is None:
                 batch.skipped_rids.add(rid)
             else:
-                node_inputs.append(self._skip_cached_prefix(batch, rid, req_inputs))
+                node_inputs.append(req_inputs)
 
         batch.register_prepare_batch(node_inputs)
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
