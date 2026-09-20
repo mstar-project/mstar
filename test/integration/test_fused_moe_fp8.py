@@ -129,18 +129,3 @@ def test_fp8_reduce_results_false_shape():
     # Routed weights are folded into GEMM-2, so summing the slots must match
     # the reduced path up to bf16-sum vs fp32-reduce rounding.
     torch.testing.assert_close(per_slot.sum(dim=1), reduced, rtol=1e-2, atol=1e-2)
-
-
-def test_per_token_group_quant_fp8_roundtrip():
-    from mstar.utils.fused_moe.kernels import per_token_group_quant_fp8
-
-    torch.manual_seed(2)
-    x = torch.randn(64, 256, device=DEVICE).to(torch.bfloat16)
-    x_q, x_s = per_token_group_quant_fp8(x, 128)
-
-    assert x_q.dtype == FP8
-    assert x_s.dtype == torch.float32 and x_s.shape == (64, 2)
-    deq = x_q.to(torch.float32) * x_s.repeat_interleave(128, dim=1)
-    # e4m3's 3-bit mantissa bounds the relative error at 2^-4 once the group
-    # scale is divided out; atol covers the subnormal tail near zero.
-    torch.testing.assert_close(deq, x.to(torch.float32), rtol=0.07, atol=1e-3)

@@ -12,17 +12,15 @@ The kernels mirror sglang's layout:
   both the gate+up GEMM and the down GEMM.
 * :func:`fused_moe_kernel_fp8_w8a8` -- the same grouped GEMM with
   in-kernel block-scale rescale for e4m3 weights and activations.
-* :func:`per_token_group_quant_fp8_kernel` -- per-token per-group e4m3
-  activation quant feeding the W8A8 GEMMs.
 * :func:`act_and_mul_kernel` -- per-slot SwiGLU activation on the
   ``(M*topk, 2*inter)`` intermediate.
 * :func:`moe_sum_reduce_kernel` -- weight-free sum over the top-k
   dimension of the ``(M, topk, hidden)`` down-GEMM output.
 
 The Python wrappers :func:`invoke_fused_moe_kernel`,
-:func:`invoke_fused_moe_kernel_fp8_w8a8`, :func:`per_token_group_quant_fp8`,
-:func:`act_and_mul_triton`, :func:`moe_sum_reduce_triton` set up launch
-grids and keep the Triton-specific boilerplate out of the runner.
+:func:`invoke_fused_moe_kernel_fp8_w8a8`, :func:`act_and_mul_triton`,
+:func:`moe_sum_reduce_triton` set up launch grids and keep the
+Triton-specific boilerplate out of the runner.
 """
 
 from __future__ import annotations
@@ -33,8 +31,7 @@ import torch
 import triton
 import triton.language as tl
 
-# e4m3; declared here so utils/ keeps no dependency on model/.
-FP8_DTYPE = torch.float8_e4m3fn
+from mstar.utils.quant_fp8 import FP8_DTYPE
 
 # ---------------------------------------------------------------------------
 # Main grouped-GEMM kernel (used for both gate_up and down projections)
@@ -431,82 +428,6 @@ def invoke_fused_moe_kernel_fp8_w8a8(
         even_Ks=even_Ks,
         **config,
     )
-
-
-# ---------------------------------------------------------------------------
-# Per-token-group FP8 activation quantization (for the W8A8 path)
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def per_token_group_quant_fp8_kernel(
-    y_ptr,
-    y_q_ptr,
-    y_s_ptr,
-    group_size,
-    eps,
-    fp8_min,
-    fp8_max,
-    BLOCK: tl.constexpr,
-):
-    """Quantize one contiguous ``group_size`` slice to e4m3 with an fp32 scale.
-
-    One program per group; groups tile the rows of a contiguous 2-D tensor,
-    so program ``g`` covers ``y.view(-1)[g*group_size:(g+1)*group_size]`` and
-    writes scale slot ``g`` of the row-major ``(M, K // group_size)`` scales.
-    """
-    g_id = tl.program_id(0).to(tl.int64)
-    y_ptr += g_id * group_size
-    y_q_ptr += g_id * group_size
-    y_s_ptr += g_id
-
-    cols = tl.arange(0, BLOCK)
-    mask = cols < group_size
-    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    # amax / e4m3-max with an eps floor so all-zero groups get a finite scale.
-    y_s = tl.maximum(tl.max(tl.abs(y)), eps) / fp8_max
-    y_q = tl.minimum(tl.maximum(y / y_s, fp8_min), fp8_max).to(y_q_ptr.dtype.element_ty)
-    tl.store(y_q_ptr + cols, y_q, mask=mask)
-    tl.store(y_s_ptr, y_s)
-
-
-@torch.compiler.disable
-def per_token_group_quant_fp8(
-    x: torch.Tensor,
-    group_size: int,
-    eps: float = 1e-10,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``x`` to e4m3, one fp32 scale per ``group_size`` K-slice per row.
-
-    Returns ``(x_q, x_s)`` with ``x_q`` e4m3 of ``x.shape`` and ``x_s`` fp32 of
-    shape ``(M, K // group_size)``; dequant is ``x_q * x_s`` (the same
-    multiply-back convention as the checkpoint's ``weight_scale_inv``).
-
-    ``torch.compiler.disable``: Inductor's (re)compile of this kernel fails in
-    Triton's make_llir ("PassManager::run failed") while the kernel's own JIT
-    path is fine.  The graph break keeps Inductor out of the launch while
-    stream capture still records it.  Remove when the toolchain bug is fixed.
-    """
-    assert x.dim() == 2 and x.is_contiguous()
-    assert x.shape[-1] % group_size == 0, f"last dim {x.shape[-1]} must be a multiple of group_size {group_size}"
-
-    M, K = x.shape
-    finfo = torch.finfo(FP8_DTYPE)
-    x_q = torch.empty_like(x, dtype=FP8_DTYPE)
-    x_s = torch.empty((M, K // group_size), dtype=torch.float32, device=x.device)
-
-    num_groups = M * (K // group_size)
-    per_token_group_quant_fp8_kernel[(num_groups,)](
-        x,
-        x_q,
-        x_s,
-        group_size,
-        eps,
-        finfo.min,
-        finfo.max,
-        BLOCK=triton.next_power_of_2(group_size),
-    )
-    return x_q, x_s
 
 
 # ---------------------------------------------------------------------------

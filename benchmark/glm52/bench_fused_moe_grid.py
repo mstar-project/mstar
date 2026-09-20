@@ -16,7 +16,7 @@ kernel, the valid slots and the outputs are identical — and times both
 launches eagerly and inside a CUDA graph (where they actually run). Run it on
 any idle GPU:
 
-    CUDA_VISIBLE_DEVICES=<idle> .venv/bin/python env/bench_fused_moe_grid.py
+    CUDA_VISIBLE_DEVICES=<idle> python benchmark/glm52/bench_fused_moe_grid.py
 """
 import argparse
 

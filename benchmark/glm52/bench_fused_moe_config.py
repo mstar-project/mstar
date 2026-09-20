@@ -1,59 +1,26 @@
 #!/usr/bin/env python3
-"""ONE GPU, minutes: sweep Triton tile configs for M*'s fused fp8 MoE kernel
-at GLM-5.2's decode shape and report the fastest per launch.
+"""Sweep Triton tile configs for the fp8 fused-MoE GEMMs at GLM-5.2's decode
+shape and report the fastest per launch.  One GPU, minutes.
 
-Companion to ``env/bench_fused_moe_grid.py`` (which measures the grid-size
-clamp at a FIXED default config, now baked into ``invoke_fused_moe_kernel_fp8_w8a8``
-via ``_grid_rows``). This script instead fixes the grid-size question and
-sweeps the compile-time tile knobs Triton exposes for
-``fused_moe_kernel_fp8_w8a8``: ``BLOCK_SIZE_N``, ``GROUP_SIZE_M``,
-``num_warps``, ``num_stages``. Same decode-shape inputs as that script
-(tokens=4, top_k=8, E=256, hidden=6144, inter/rank=256, fp8 block (128,128)).
+Companion to ``bench_fused_moe_grid.py``, which measures the grid-size clamp
+at a fixed config; this script fixes the grid and sweeps the compile-time
+tiles of ``fused_moe_kernel_fp8_w8a8`` -- ``BLOCK_SIZE_N``, ``GROUP_SIZE_M``,
+``num_warps``, ``num_stages`` -- for the gate/up and down GEMMs separately.
+``fused_experts_fp8`` tunes only gate/up today and reuses that config for
+down, so whether the split matters is part of what this measures.
 
-``BLOCK_SIZE_M`` is NOT swept -- it is fixed at 16, matching today's
-``get_default_config`` for the ``M <= E`` branch (decode is always M <= E
-here: 4 <= 256). Why it can't be swept independently: ``moe_align_block_size``
-(``align.py``) pads and sorts ``topk_ids`` into blocks of whatever size YOU
-pass it (``max_num_tokens_padded = topk_ids.numel() + num_experts *
-(block_size - 1)``; ``expert_ids`` has one entry per that-size block), and
-the kernel's grid / pid-swizzle math (``_grid_rows``,
-``fused_moe_kernel_fp8_w8a8``'s ``num_pid_m = cdiv(EM, BLOCK_SIZE_M)``) reads
-``sorted_token_ids``/``expert_ids`` assuming its OWN ``BLOCK_SIZE_M`` is the
-one they were built with. Trying a different ``BLOCK_SIZE_M`` means a fresh
-``moe_align_block_size`` call, not just relabelling the tile size -- out of
-scope here since the ask is specifically 16 (which is also today's default).
+``BLOCK_SIZE_M`` stays at 16: ``moe_align_block_size`` builds the padded slot
+layout and ``expert_ids`` for one block size, so another value needs a fresh
+alignment pass, not a relabelled tile.  ``BLOCK_SIZE_K`` stays at 128: the
+kernel static-asserts it equals the weight's fp8 quant-block K.
 
-``BLOCK_SIZE_K`` is likewise fixed at 128, not because of alignment but
-because the kernel itself requires it: ``tl.static_assert(BLOCK_SIZE_K ==
-group_k, ...)`` in ``fused_moe_kernel_fp8_w8a8``, and ``fused_experts_fp8``
-forces ``config["BLOCK_SIZE_K"] = block_k`` (the fp8 weight's quant-block K)
-right after calling ``get_default_config``. It is not a free tile parameter
-for this kernel at all.
+Every swept config is checked bit-identical against the default's output
+before it competes on speed.
 
-Also notable while reading the runner: ``fused_experts_fp8`` calls
-``get_default_config`` ONCE, with the gate/up GEMM's shape, and reuses that
-SAME dict for the down GEMM too (``runner.py`` lines ~329-397). The ``M <=
-E`` branch of ``get_default_config`` ignores N/K/top_k entirely, so this is
-shape-consistent today (both branches give the same dict regardless of which
-GEMM's shape you feed it) -- but it does mean the down GEMM (N=6144, K=256)
-has never had a config tuned for ITS shape; it just inherits gate/up's
-(N=512, K=6144) pick. This sweep tunes both independently and reports
-whether that matters.
+    CUDA_VISIBLE_DEVICES=<idle> python benchmark/glm52/bench_fused_moe_config.py
 
-Correctness: every swept config is checked with ``torch.equal`` against the
-current default's output before it is allowed to compete on speed (bit
-identity is expected -- BLOCK_SIZE_N/GROUP_SIZE_M/num_warps/num_stages only
-change *how* the tile is scheduled and pipelined, not the K-loop's
-summation order -- but this is measured, not assumed).
-
-Run on the box, GPU verified idle first:
-
-    CUDA_VISIBLE_DEVICES=<idle> $VENV/bin/python env/bench_fused_moe_config.py
-
-Smoke-test the plumbing fast (few configs, few iters) before the full grid:
-
-    ... env/bench_fused_moe_config.py --block-n 32 64 --group-m 1 \\
-        --num-warps 4 --num-stages 3 --iters 20
+    # smoke-test the plumbing first
+    ... --block-n 32 64 --group-m 1 --num-warps 4 --num-stages 3 --iters 20
 """
 from __future__ import annotations
 

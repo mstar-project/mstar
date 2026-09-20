@@ -14,14 +14,13 @@ import triton.language as tl
 
 from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import (
-    FP8_DTYPE,
     act_and_mul_triton,
     get_default_config,
     invoke_fused_moe_kernel,
     invoke_fused_moe_kernel_fp8_w8a8,
     moe_sum_reduce_triton,
-    per_token_group_quant_fp8,
 )
+from mstar.utils.quant_fp8 import FP8_DTYPE, per_token_group_quant_fp8
 
 
 def _tl_compute_type(dtype: torch.dtype) -> tl.dtype:

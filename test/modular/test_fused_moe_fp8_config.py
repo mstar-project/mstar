@@ -5,11 +5,11 @@ import inspect
 
 import pytest
 import torch
-import triton
 
 from mstar.utils.fused_moe import kernels, runner
 from mstar.utils.fused_moe.align import moe_align_block_size
-from mstar.utils.fused_moe.kernels import FP8_DTYPE, _grid_rows, get_default_config
+from mstar.utils.fused_moe.kernels import _grid_rows, get_default_config
+from mstar.utils.quant_fp8 import FP8_DTYPE
 
 BLOCK = (128, 128)
 
@@ -153,31 +153,6 @@ def test_invoke_fp8_launcher_grid_em_and_constexprs(monkeypatch):
             A.view(torch.uint8), B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids, expert_ids,
             n_post, mul_routed_weight=False, top_k=top_k, config=config, compute_type="bf16", block_shape=BLOCK,
         )
-
-
-# ----------------------------------------------------------------------------
-# per_token_group_quant_fp8: host-side allocation + launch contract
-# ----------------------------------------------------------------------------
-
-
-def test_per_token_group_quant_fp8_host_contract(monkeypatch):
-    rec = _Recorder()
-    monkeypatch.setattr(kernels, "per_token_group_quant_fp8_kernel", rec)
-    # The conftest triton stub has no next_power_of_2; real triton does.
-    monkeypatch.setattr(triton, "next_power_of_2", lambda n: 1 << (n - 1).bit_length(), raising=False)
-
-    x = torch.randn(6, 384, dtype=torch.bfloat16)
-    x_q, x_s = kernels.per_token_group_quant_fp8(x, 128)
-
-    assert x_q.dtype == FP8_DTYPE and x_q.shape == x.shape
-    assert x_s.dtype == torch.float32 and x_s.shape == (6, 3)
-    (call,) = rec.calls
-    assert call["grid"] == (6 * 3,)  # one program per (row, group)
-    assert call["args"][3] == 128 and call["kwargs"]["BLOCK"] == 128
-    assert call["args"][5] == torch.finfo(FP8_DTYPE).min and call["args"][6] == torch.finfo(FP8_DTYPE).max
-
-    with pytest.raises(AssertionError, match="multiple of group_size"):
-        kernels.per_token_group_quant_fp8(torch.randn(2, 100, dtype=torch.bfloat16), 128)
 
 
 # ----------------------------------------------------------------------------
