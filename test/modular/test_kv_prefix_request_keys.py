@@ -99,6 +99,19 @@ def _deployment(page_size: int = PAGE_SIZE) -> dict:
     return {"model": "stub", "resources": {"kv": {"page_size": page_size}}}
 
 
+def _handed_over(model_kwargs: dict, key: str = "kv") -> KVReqConfig:
+    """The config one resource ends up with, as the conductor's loop builds it."""
+    cfg = KVReqConfig()
+    cfg.apply_conductor_config(
+        seed=1,
+        prefix_keys=(model_kwargs.get("prefix_keys") or {}).get(key),
+        prefix_tail=(model_kwargs.get("prefix_tail") or {}).get(key),
+        prefix_decode=(model_kwargs.get("prefix_decode") or {}).get(key),
+        prefix_cache=model_kwargs.get("prefix_cache"),
+    )
+    return cfg
+
+
 def _run(worker: PreprocessWorkerThread, model_kwargs: dict | None = None) -> dict:
     """Preprocess one request and return the kwargs the conductor was sent."""
     worker._process_input(PreprocessInput(
@@ -145,6 +158,42 @@ def test_a_worker_without_a_deployment_config_keys_no_stream():
 
     assert "prefix_keys" not in _run(worker), (
         "a stream was keyed without a page size to page it by"
+    )
+
+
+# ── keys a client sent ──────────────────────────────────────────────────
+
+_PLANTED = {
+    "prefix_keys": {"kv": {"main": [b"another request's page"]}},
+    "prefix_tail": {"kv": {"main": [7, 7, 7]}},
+    "prefix_decode": {"kv": {"main": "text_inputs"}},
+}
+
+
+def test_keys_a_client_sent_never_reach_an_undeclared_models_cache():
+    worker = _worker(_Model(declares=False), _deployment())
+
+    cfg = _handed_over(_run(worker, dict(_PLANTED)))
+
+    assert (cfg.prefix_keys, cfg.prefix_tail, cfg.prefix_decode) == (None, None, None), (
+        "a request named pages by keys it made up, and would attend whatever "
+        "another request left under them"
+    )
+
+
+def test_a_declared_model_is_keyed_by_its_own_prompt_not_by_the_client():
+    worker = _worker(_Model(), _deployment())
+
+    cfg = _handed_over(_run(worker, dict(_PLANTED)))
+
+    assert cfg.prefix_keys == {"main": chain([
+        PROMPT[at:at + PAGE_SIZE] for at in range(0, len(PROMPT), PAGE_SIZE)
+    ])}, "the client's keys survived beside the ones the worker chained"
+    assert cfg.prefix_tail == {"main": PROMPT[len(PROMPT) // PAGE_SIZE * PAGE_SIZE:]}, (
+        "the client's tail replaced the prompt's own"
+    )
+    assert cfg.prefix_decode is None, (
+        "the client made a node chain its generation that never declared it"
     )
 
 
