@@ -80,7 +80,7 @@ from mstar.model.bagel.submodules import (
     VAEEncoderSubmodule,
     ViTEncoderSubmodule,
 )
-from mstar.model.base import DECODE, ForwardPassArgs, Model
+from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
@@ -733,6 +733,19 @@ class BagelModel(Model):
             head_dim=self.config.hidden_size // self.config.num_attention_heads,
             max_seq_len=self.config.max_position_embeddings,
             num_qo_heads=self.config.num_attention_heads,
+        )
+
+    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+        """The text walk's prompt is its token ids, and so is every step after it.
+
+        The image walks share this cache but carry position ids of their own,
+        which is what keeps the engine from offering them a prefix.
+        """
+        return {"kv": {"main": PrefixStream("text_inputs", "ids", True)}}
+
+    def checkpoint_path(self) -> str:
+        return snapshot_download(
+            repo_id=self.model_path_hf, cache_dir=self.cache_dir,
         )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
