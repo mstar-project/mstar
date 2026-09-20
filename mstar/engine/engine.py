@@ -5,6 +5,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import torch
@@ -30,6 +31,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
@@ -53,6 +55,29 @@ logger = logging.getLogger(__name__)
 # GPU(N+1)/postprocess(N) overlap. Enable only where 2 steps overflow the CUDA
 # launch queue and block a launch (machine/driver dependent).
 _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
+
+
+def checkpoint_identity(path: str | Path) -> bytes:
+    """Name the weights a cached page was produced under, without reading them.
+
+    The safetensors index already names every shard and its tensors, so hashing
+    it plus ``config.json`` costs a few kilobytes where hashing the weights
+    would cost the whole checkpoint. A checkpoint shipped without an index falls
+    back to its shard names and sizes, which catches a replaced shard but not
+    one edited in place at the same length.
+    """
+    root = Path(path)
+    index = root / "model.safetensors.index.json"
+    parts: list[object] = []
+    if index.is_file():
+        parts.append(index.read_bytes())
+    else:
+        for shard in sorted(root.glob("*.safetensors")):
+            parts += [shard.name, shard.stat().st_size]
+    config = root / "config.json"
+    if config.is_file():
+        parts.append(config.read_bytes())
+    return fingerprint(*parts)
 
 
 @dataclass

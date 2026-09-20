@@ -390,6 +390,15 @@ class Model(ABC):
         """
         pass
 
+    def preprocess_fingerprint(self) -> str:
+        """What this model's preprocessing contributes to the cache's root.
+
+        Two deployments that tokenize or template a prompt differently must not
+        match each other's pages; the class name separates them, and a model
+        whose preprocessing changes shape between versions overrides this.
+        """
+        return type(self).__name__
+
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
         """Which input tensor keys which ``(resource, label)`` cache stream.
 

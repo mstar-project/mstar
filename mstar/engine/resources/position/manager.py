@@ -2,11 +2,12 @@
 
 has ownership of per-(request,label) position counter"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 import torch
 
 from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, PublishedInfo, Resource
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs, SequenceView
 from mstar.engine.resources.position.config import (
     PosBackend,
@@ -125,6 +126,13 @@ class RopeManager(PositionManager):
                 num_tokens, dtype=torch.long, device=self._device
             )
         return buffer
+
+    def fingerprint(self) -> bytes:
+        # every field, so a rope parameter nobody thought to list still
+        # invalidates what an older setting wrote
+        return fingerprint(*(
+            getattr(self._config, f.name) for f in fields(self._config)
+        ))
 
     def ingest_request(self, rid: str, overrides=None):
         del overrides

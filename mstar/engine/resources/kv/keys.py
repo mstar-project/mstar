@@ -21,6 +21,20 @@ def _field(payload: bytes) -> bytes:
     return len(payload).to_bytes(_LEN_BYTES, "little") + payload
 
 
+def fingerprint(*fields: object) -> bytes:
+    """SHA-256 over ``fields``, in the encoding page keys use.
+
+    For the process constants a hit depends on rather than a page's contents,
+    so a deployment that changes one of them cannot match what an older one
+    wrote.
+    """
+    hasher = hashlib.sha256()
+    for field in fields:
+        payload = field if isinstance(field, bytes) else str(field).encode()
+        hasher.update(_field(payload))
+    return hasher.digest()
+
+
 def page_key(
     prev: bytes, tokens: Sequence[int], digests: Sequence[bytes] = (),
 ) -> bytes:

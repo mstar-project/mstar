@@ -86,6 +86,14 @@ class Resource(ABC):
     def depends_on(self) -> set[str]:
         return set()
 
+    def fingerprint(self) -> bytes | None:
+        """What this resource contributes to the prefix cache's root.
+
+        Everything a stored page depends on beyond its own tokens. None leaves
+        the resource out of the root, which is right only where it cannot
+        change what a page holds.
+        """
+        return None
 
     # Request lifecycle
 
