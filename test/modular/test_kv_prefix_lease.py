@@ -174,7 +174,7 @@ def test_a_refused_admit_answers_the_same_and_holds_one_lease():
     assert kv.resolve_cached_prefix("r1", NODE, WALK) == first, (
         "the second probe answered a different length"
     )
-    assert kv._streams["r1"]["main"].lease == held
+    assert kv._streams["r1"]["main"].page_indices[:len(held)] == held
     assert [kv._arena.num_owners[page] for page in held] == owners, (
         "the second probe took a second reference"
     )
