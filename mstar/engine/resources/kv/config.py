@@ -32,6 +32,9 @@ class KVConfig:
     layout: KVLayout = KVLayout.NHD
     # pages of pinned host memory to keep for offloading; 0 disables it
     cpu_offload_pages: int = 0
+    # keeps deployments that should not read each other's cached pages apart,
+    # by changing the root rather than by checking anything at match time
+    prefix_cache_salt: str = ""
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -98,6 +101,7 @@ class KVSpec(NodeResourceSpec):
         page_size: int | None = None,
         max_seq_len: int | None = None,
         cpu_offload_pages: int | None = None,
+        prefix_cache_salt: str | None = None,
     ):
         """How much cache this deployment gets, and how it is cut up."""
         for name, value in (
@@ -105,6 +109,7 @@ class KVSpec(NodeResourceSpec):
             ("page_size", page_size),
             ("max_seq_len", max_seq_len),
             ("cpu_offload_pages", cpu_offload_pages),
+            ("prefix_cache_salt", prefix_cache_salt),
         ):
             if value is not None:
                 setattr(self.config, name, value)

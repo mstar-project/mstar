@@ -17,6 +17,7 @@ from mstar.engine.resources.base import (
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     KVPlanOutput,
@@ -315,6 +316,13 @@ class KVManager(AttentionResource):
                 ),
             )
         return state
+
+    def fingerprint(self) -> bytes:
+        return fingerprint(
+            self.config.layout.value, self.config.page_size,
+            self.kv_cache.tensor.dtype, self._world_size,
+            self.config.prefix_cache_salt,
+        )
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
         if overrides is None:
