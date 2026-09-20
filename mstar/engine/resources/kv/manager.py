@@ -130,6 +130,9 @@ class CacheStream:
     # generated tokens that have not finished a page, after the prompt's own
     # tail; the page they finish is keyed over all of them at once
     pending: list[int] | None = None
+    # set once this stream has been reported, so a request that is admitted
+    # again (a refused admit, a second partition) is still one line
+    reported: bool = False
     # how many of `keys` name a whole page. The prompt's last key names a
     # partial one whenever the prompt does not end on a boundary, and that key
     # is neither an index entry nor a parent until the page behind it fills
@@ -271,6 +274,11 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
+        # its entity id is the worker id, and one worker is one copy of a node
+        self._replica = (
+            transfer_engine_info.my_entity_id
+            if transfer_engine_info is not None else None
+        )
         self._prefix_root: bytes | None = None
         self._index: PrefixIndex | None = None
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
@@ -432,6 +440,23 @@ class KVManager(AttentionResource):
                 page = self._index.page_for(key)
             parent = page
             stream.cursor += 1
+
+    def _report_admission(self, segment: Segment, stream: CacheStream) -> None:
+        """One line per request that a declared stream admitted."""
+        # silent where the cache is closed: the keys are still on the stream,
+        # and a line saying nothing matched would read as a miss
+        if self._index is None or not stream.keys or stream.reported:
+            return
+        stream.reported = True
+        matched = stream.cursor
+        logger.info(
+            "KV %s: %s/%s matched %d of its %d pages, whole prompt already "
+            "cached %s, replica %s",
+            self.name, segment.request_id, segment.label,
+            matched, stream.keyed_pages,
+            bool(matched) and matched == stream.keyed_pages,
+            self._replica,
+        )
 
     def _take_local_match(self, stream: CacheStream, published_len: int) -> None:
         """Take what this cache already holds of a stream about to be read in.
@@ -653,17 +678,16 @@ class KVManager(AttentionResource):
                 stream = self._streams.get(
                     segment.request_id, {},
                 ).get(segment.label)
-                if (
-                    stream is not None
-                    and stream.lease is not None
-                    and not stream.page_indices
-                ):
+                if stream is None:
+                    continue
+                if stream.lease is not None and not stream.page_indices:
                     stream.page_indices = list(stream.lease)
                     stream.stored_len = (
                         len(stream.lease) * self.config.page_size
                     )
                     # they came out of the index, so they are already in it
                     stream.cursor = len(stream.lease)
+                self._report_admission(segment, stream)
             if ctx.is_preplan:
                 # a preplan that was promoted or abandoned already cleared
                 # these; reset anyway so a refused admit can't leave stale
