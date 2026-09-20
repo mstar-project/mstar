@@ -122,6 +122,9 @@ class CacheStream:
     read_error: BaseException | None = None
     # one key per page of this stream's prompt, from the preprocess worker
     keys: list[bytes] | None = None
+    # pages the index matched for this stream and is holding for it, from the
+    # probe until `commit`; `page_indices` is empty until `admit` converts them
+    lease: list[int] | None = None
     offloaded: bool = False
     generation: int = 0
 
@@ -340,6 +343,73 @@ class KVManager(AttentionResource):
         self._prefix_root = root
         self._index = PrefixIndex(self._arena)
 
+    def resolve_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+    ) -> int | None:
+        """Match this request's prefix against the index and hold what matched.
+
+        Answers the same length every time it is asked while the lease is held,
+        without taking a second reference: an allocation failure sends the batch
+        back through `prepare_inputs`, which probes again on untrimmed inputs.
+        """
+        label = self._keyed_label(rid, node_name, graph_walk)
+        if label is None:
+            return None
+        with self._lock:
+            stream = self._ensure_label(rid, label)
+            if stream.lease is not None:
+                return len(stream.lease) * self.config.page_size
+            if stream.stored_len or stream.offloaded or stream.read_pending:
+                return None
+            # the chain has ceil(seq_len / page_size) keys and only a full page
+            # is ever indexed, so stopping one key short leaves the request at
+            # least one token to sample, whatever its length
+            rooted = [fingerprint(self._prefix_root, key) for key in stream.keys]
+            matched = self._index.lookup(rooted)[:len(rooted) - 1]
+            if not matched:
+                return None
+            self._arena.retain(matched)
+            stream.lease = matched
+            return len(matched) * self.config.page_size
+
+    def apply_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
+    ) -> None:
+        """Cut this stream's lease down to ``matched_len``, the agreed length."""
+        del inputs
+        label = self._keyed_label(rid, node_name, graph_walk)
+        if label is None:
+            return
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None or stream.lease is None or stream.stored_len:
+                return
+            keep = matched_len // self.config.page_size
+            if keep < len(stream.lease):
+                self._arena.release(stream.lease[keep:])
+                stream.lease = stream.lease[:keep] or None
+
+    def _keyed_label(
+        self, rid: str, node_name: str, graph_walk: str,
+    ) -> str | None:
+        """The one label this request keyed on this node and walk, if any."""
+        if self._index is None:
+            return None
+        overrides = self._overrides.get(rid)
+        if overrides is None or not overrides.prefix_cache:
+            return None
+        keys = overrides.prefix_keys or {}
+        for label in overrides.get_labels(node_name, graph_walk):
+            if keys.get(label):
+                return label
+        return None
+
+    def _release_lease(self, stream: CacheStream) -> None:
+        """Give back a lease `admit` never converted."""
+        if stream.lease is not None and not stream.page_indices:
+            self._arena.release(stream.lease)
+        stream.lease = None
+
     def fingerprint(self) -> bytes:
         return fingerprint(
             self.config.layout.value, self.config.page_size,
@@ -454,6 +524,21 @@ class KVManager(AttentionResource):
         # one critical section so the read-of-stored_len then alloc is atomic
         # against a concurrent reset/remove/commit on another thread
         with self._lock:
+            # before the fork loop and the segment loop, both of which size
+            # off `stored_len`: a pre-fork target has to cover the whole prefix
+            for segment in step.segments:
+                stream = self._streams.get(
+                    segment.request_id, {},
+                ).get(segment.label)
+                if (
+                    stream is not None
+                    and stream.lease is not None
+                    and not stream.page_indices
+                ):
+                    stream.page_indices = list(stream.lease)
+                    stream.stored_len = (
+                        len(stream.lease) * self.config.page_size
+                    )
             if ctx.is_preplan:
                 # a preplan that was promoted or abandoned already cleared
                 # these; reset anyway so a refused admit can't leave stale
@@ -732,6 +817,7 @@ class KVManager(AttentionResource):
                         )
                         continue
                     stream.stored_len += segment.span
+                    stream.lease = None
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
@@ -986,6 +1072,7 @@ class KVManager(AttentionResource):
                 # a rewind would put the next write on the stream's first page,
                 # over a sealed one its other owners still read. drop the pages
                 # and let the next write allocate; `free` asks for the same
+                self._release_lease(stream)
                 drop = free or self._arena.any_sealed(stream.page_indices)
                 if drop:
                     self._arena.release(stream.page_indices)
@@ -1003,6 +1090,7 @@ class KVManager(AttentionResource):
         with self._lock:
             if rid in self._streams:
                 for stream in self._streams[rid].values():
+                    self._release_lease(stream)
                     self._arena.release(stream.page_indices)
             if self._cpu_pool is not None:
                 self._cpu_pool.remove_request(rid)
@@ -1036,10 +1124,17 @@ class KVManager(AttentionResource):
             # past that
             refs: dict[int, int] = {SINK_PAGE: 1}
             frontier: set[int] = set()
+            if self._index is not None:
+                for page in self._index.pages():
+                    refs[page] = refs.get(page, 0) + 1
             for streams in self._streams.values():
                 for stream in streams.values():
                     for page in stream.page_indices:
                         refs[page] = refs.get(page, 0) + 1
+                    if stream.lease is not None and not stream.page_indices:
+                        # held for a stream `admit` has not converted yet
+                        for page in stream.lease:
+                            refs[page] = refs.get(page, 0) + 1
                     full = stream.stored_len // self.config.page_size
                     frontier.update(stream.page_indices[full:])
 
@@ -1205,6 +1300,15 @@ class KVManager(AttentionResource):
                 f"fork target {rid}/{to_label} holds "
                 f"{len(to_stream.page_indices)} pages but its source "
                 f"{from_label} needs {n}; _reserve_fork under-reserved"
+            )
+            shared = [
+                page for page in to_stream.page_indices[:n]
+                if self._arena.num_owners[page] > 1
+            ]
+            assert not shared, (
+                f"fork target {rid}/{to_label} would be written over pages "
+                f"{shared}, which another owner still reads; a fork target "
+                "cannot be a stream the index holds"
             )
             self._arena.copy_pages(
                 from_stream.page_indices[:n], to_stream.page_indices[:n],
