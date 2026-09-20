@@ -390,6 +390,15 @@ class Model(ABC):
         """
         pass
 
+    def checkpoint_path(self) -> str | None:
+        """Where this model's weights and config sit on disk.
+
+        The prefix cache hashes the checkpoint's manifest into its root, so a
+        model that does not name one is never matched against pages another
+        build of it wrote. Not every model resolves a local snapshot.
+        """
+        return None
+
     def preprocess_fingerprint(self) -> str:
         """What this model's preprocessing contributes to the cache's root.
 

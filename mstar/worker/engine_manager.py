@@ -93,6 +93,7 @@ class EngineManager:
             device=device,
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
+            model=model,
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 

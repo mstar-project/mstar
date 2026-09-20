@@ -194,7 +194,8 @@ them by that name:
 
    resources:
      kv_cache:
-       max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages
+       max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
+                                # prefix_cache, prefix_cache_salt
      talker_attn:
        flashinfer_backend: fa2  # also: backend (flashinfer / dense)
      vit_attn:                  # a cacheless (ragged) attention resource
@@ -205,6 +206,10 @@ its encoder context, can therefore size each one separately. If a block names a 
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
 no longer read. It raises an error with a message describing the migration.
+
+``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
+``prefix_cache_salt`` keeps two otherwise identical deployments off each other's
+cached pages; one request opts out with ``prefix_cache=False``.
 
 **Single GPU.** Everything on rank 0:
 

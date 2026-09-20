@@ -27,6 +27,7 @@ from mstar.engine.resources.kv.plan import (
     build_paged_indptrs,
     group_by_plan_label,
 )
+from mstar.engine.resources.kv.prefix_index import PrefixIndex
 from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -119,6 +120,8 @@ class CacheStream:
     # a failed retrieve, latched: the future is consumed once, but every later
     # readiness check has to keep reporting the stream as unusable
     read_error: BaseException | None = None
+    # one key per page of this stream's prompt, from the preprocess worker
+    keys: list[bytes] | None = None
     offloaded: bool = False
     generation: int = 0
 
@@ -256,6 +259,8 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
+        self._prefix_root: bytes | None = None
+        self._index: PrefixIndex | None = None
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
@@ -317,6 +322,24 @@ class KVManager(AttentionResource):
             )
         return state
 
+    def enable_prefix_cache(self, root: bytes) -> None:
+        """Open the index under ``root``, the identity every key hangs from.
+
+        Refused above one rank: the ranks index independently, so they would
+        match different lengths and diverge mid-prefill. Lifting that needs the
+        ranks to agree on one length before the step is declared.
+        """
+        if not self.config.prefix_cache:
+            return
+        if self._world_size > 1:
+            logger.info(
+                "KV %s: prefix cache off at world size %d; it needs the "
+                "cross-rank match exchange", self.name, self._world_size,
+            )
+            return
+        self._prefix_root = root
+        self._index = PrefixIndex(self._arena)
+
     def fingerprint(self) -> bytes:
         return fingerprint(
             self.config.layout.value, self.config.page_size,
@@ -337,6 +360,9 @@ class KVManager(AttentionResource):
             # named more tokens than the stream held.
             self._streams.setdefault(rid, {"main": CacheStream()})
             self._overrides.setdefault(rid, overrides)
+            for label, stream in self._streams[rid].items():
+                if stream.keys is None:
+                    stream.keys = self._keys_for(rid, label)
 
     def admit_retrieve(
         self, rid: str,
@@ -1076,8 +1102,17 @@ class KVManager(AttentionResource):
 
     def _ensure_label(self, rid: str, label: str) -> CacheStream:
             if label not in self._streams[rid]:
-                self._streams[rid][label] = CacheStream()
+                self._streams[rid][label] = CacheStream(
+                    keys=self._keys_for(rid, label)
+                )
             return self._streams[rid][label]
+
+    def _keys_for(self, rid: str, label: str) -> list[bytes] | None:
+        """The page keys this request carries for ``label``, if it carries any."""
+        overrides = self._overrides.get(rid)
+        if overrides is None or not overrides.prefix_cache:
+            return None
+        return (overrides.prefix_keys or {}).get(label)
 
     def _check_ready(
         self, rid: str, label: str
