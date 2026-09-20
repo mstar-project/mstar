@@ -138,6 +138,17 @@ def test_a_shorter_match_never_rewinds_the_counter():
     assert node.step(1) == [100], "a stale match pulled the counter backwards"
 
 
+def test_a_label_the_request_writes_after_its_hit_starts_at_zero():
+    node = _Node()
+    node.rope.apply_cached_prefix(RID, NODE, WALK, None, 96)
+    node.step(4)
+
+    assert node.step(2, label="cfg_text") == [0, 1], (
+        "a label written after the hit started past a prefix only another "
+        "label holds"
+    )
+
+
 def test_a_reset_forgets_what_the_cache_matched():
     node = _Node()
     node.rope.apply_cached_prefix(RID, NODE, WALK, None, 96)
