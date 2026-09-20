@@ -96,6 +96,8 @@ class RopeManager(PositionManager):
 
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
+        # rid -> tokens the prefix cache matched, until `admit`
+        self._matched: dict[str, int] = {}
 
         self._static_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
         # plan label -> ids of this step on device
@@ -140,9 +142,36 @@ class RopeManager(PositionManager):
 
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
+        self._matched.pop(rid, None)
 
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
+        self._matched.pop(rid, None)
+
+    def apply_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
+    ) -> None:
+        """Hold the matched length for the `admit` that is about to seed it."""
+        del node_name, graph_walk, inputs
+        if matched_len:
+            self._matched[rid] = matched_len
+
+    def admit(self, step: "PositionStep", ctx: StepContext) -> AdmitOutcome:
+        """Start a matched prefix's counter past it, as a published one starts.
+
+        Those tokens were written at the positions the run that cached them
+        gave them, and this run never planned them, so a counter left at zero
+        would rotate the step's own tokens over the top of them.
+        """
+        del ctx
+        for segment in step.segments or ():
+            matched = self._matched.get(segment.request_id)
+            if matched is None:
+                continue
+            counters = self._counters.setdefault(segment.request_id, {})
+            if matched > counters.get(segment.label, 0):
+                counters[segment.label] = matched
+        return ADMIT_OK
 
     def publish(self, request_id: str) -> "PublishedPositionInfo | None":
         counters = self._counters.get(request_id)

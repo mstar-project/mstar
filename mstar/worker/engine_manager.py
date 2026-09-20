@@ -5,11 +5,43 @@ import torch
 
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
-from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
+from mstar.engine.resources import (
+    NodeResourceSpec,
+    ResourceReqConfig,
+    apply_yaml_overrides,
+)
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
+
+
+def _refuse_uncacheable_positions(
+    specs: list[NodeResourceSpec], model: Model,
+) -> None:
+    """Refuse a keyed cache whose positions are not a token's index.
+
+    A cached page is only reusable where the tokens land at the positions they
+    were written at, and rotation is applied before a key is stored. Only a
+    declared stream is checked: a model that keys nothing is free to place
+    positions however it likes.
+    """
+    declared = set(model.prefix_key_streams())
+    if not declared:
+        return
+    for spec in specs:
+        if not isinstance(spec, PositionSpec):
+            continue
+        cached = declared & spec.depends_on()
+        if cached and spec.config.scheme is not PosScheme.SEQUENTIAL:
+            raise ValueError(
+                f"resource {spec.resource_key!r} places positions by "
+                f"{spec.config.scheme.value}, but it sits over "
+                f"{sorted(cached)}, which the model keyed for prefix reuse; "
+                "either drop the stream or give the resource a sequential "
+                "scheme"
+            )
 
 
 @dataclass
@@ -42,6 +74,7 @@ class EngineManager:
         """
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, model_config)
+        _refuse_uncacheable_positions(specs, model)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to
