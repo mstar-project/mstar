@@ -8,6 +8,7 @@
 //! Build: `maturin develop --release` in rust/.
 
 pub mod communicator;
+pub mod graph;
 pub mod shm;
 
 use std::os::raw::{c_int, c_void};
