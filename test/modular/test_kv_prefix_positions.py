@@ -176,6 +176,14 @@ def _specs(scheme: PosScheme) -> list:
     ]
 
 
+def _built_rope(specs: list) -> RopeManager:
+    """The position resource the load builds once the check has passed it."""
+    spec = next(spec for spec in specs if isinstance(spec, PositionSpec))
+    return RopeManager(
+        config=spec.config, device=torch.device("cpu"), dtype=torch.float32,
+    )
+
+
 class _Model:
     """Declares whichever resources the test wants keyed."""
 
@@ -193,12 +201,31 @@ def test_a_declared_node_over_a_block_scheme_is_refused_at_load():
 
 
 def test_a_declared_node_over_a_sequential_scheme_loads():
-    _refuse_uncacheable_positions(_specs(PosScheme.SEQUENTIAL), _Model(KV))
+    specs = _specs(PosScheme.SEQUENTIAL)
+
+    _refuse_uncacheable_positions(specs, _Model(KV))
+
+    assert _built_rope(specs)._config.scheme is PosScheme.SEQUENTIAL, (
+        "the node the model keyed did not load under the scheme it asked for"
+    )
 
 
 def test_an_undeclared_node_is_not_checked():
-    _refuse_uncacheable_positions(_specs(PosScheme.BLOCK), _Model())
+    specs = _specs(PosScheme.BLOCK)
+
+    _refuse_uncacheable_positions(specs, _Model())
+
+    assert _built_rope(specs)._config.scheme is PosScheme.BLOCK, (
+        "a node nobody keyed lost the scheme the deployment asked for"
+    )
 
 
 def test_only_the_cache_that_was_declared_is_checked():
-    _refuse_uncacheable_positions(_specs(PosScheme.BLOCK), _Model("some_other_kv"))
+    specs = _specs(PosScheme.BLOCK)
+
+    _refuse_uncacheable_positions(specs, _Model("some_other_kv"))
+
+    assert _built_rope(specs)._config.scheme is PosScheme.BLOCK, (
+        "a position resource over a cache nobody keyed was held to the "
+        "sequential rule"
+    )

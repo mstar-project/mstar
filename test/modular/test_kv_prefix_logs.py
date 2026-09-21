@@ -162,23 +162,32 @@ def test_a_whole_prompt_that_came_back_says_so(caplog):
 def test_an_undeclared_request_is_not_reported(caplog):
     kv = _manager()
     _ingest(kv, "r0", list(range(64)), keyed=False)
+    _ingest(kv, "r1", list(range(64)))
 
     with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
         _run(kv, "r0", 64)
+        undeclared = _lines(caplog)
+        _run(kv, "r1", 64)
 
-    assert _lines(caplog) == [], "a request nobody keyed was reported anyway"
+    assert undeclared == [], "a request nobody keyed was reported anyway"
+    assert len(_lines(caplog)) == 1, "the keyed request beside it was not reported"
 
 
 def test_a_deployment_that_turned_the_cache_off_reports_nothing(caplog):
-    kv = _manager(prefix_cache=False)
-    _ingest(kv, "r0", list(range(64)))
+    closed = _manager(prefix_cache=False)
+    _ingest(closed, "r0", list(range(64)))
+    open_cache = _manager()
+    _ingest(open_cache, "r0", list(range(64)))
 
     with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
-        _run(kv, "r0", 64)
+        _run(closed, "r0", 64)
+        shut = _lines(caplog)
+        _run(open_cache, "r0", 64)
 
-    assert _lines(caplog) == [], (
+    assert shut == [], (
         "a closed cache logged a miss for a request that could never hit"
     )
+    assert len(_lines(caplog)) == 1, "the same request on an open cache was silent too"
 
 
 def test_a_request_admitted_twice_is_still_one_line(caplog):

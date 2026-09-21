@@ -193,9 +193,14 @@ def test_a_capture_step_indexes_nothing():
     kv = _manager()
     kv.ingest_request("d0", KVReqConfig(prefix_keys={"main": _keys(256)}))
 
+    # the rid is in the batch, so only the capture itself can keep it out
     _step(kv, "d0", 256, capture=True)
+    captured = _indexed(kv)
+    kv.reset_request("d0", free=True)
+    _step(kv, "d0", 256)
 
-    assert _indexed(kv) == 0, "a captured graph's dummy data entered the index"
+    assert captured == 0, "a captured graph's dummy data entered the index"
+    assert _indexed(kv) == 2, "the same step outside a capture indexed nothing either"
 
 
 def test_a_padded_row_indexes_nothing():
@@ -203,8 +208,12 @@ def test_a_padded_row_indexes_nothing():
     kv.ingest_request("pad", KVReqConfig(prefix_keys={"main": _keys(256)}))
 
     _step(kv, "pad", 256, padded=True)
+    padded = _indexed(kv)
+    kv.reset_request("pad", free=True)
+    _step(kv, "pad", 256)
 
-    assert _indexed(kv) == 0, "a row that is not a request left pages behind"
+    assert padded == 0, "a row that is not a request left pages behind"
+    assert _indexed(kv) == 2, "the same row as a request indexed nothing either"
 
 
 def test_a_label_the_request_never_keyed_indexes_nothing():
@@ -212,8 +221,11 @@ def test_a_label_the_request_never_keyed_indexes_nothing():
     kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": _keys(256)}))
 
     _step(kv, "r0", 256, label="cfg_text")
+    unkeyed = _indexed(kv)
+    _step(kv, "r0", 256)
 
-    assert _indexed(kv) == 0, "an unkeyed label was indexed under another's keys"
+    assert unkeyed == 0, "an unkeyed label was indexed under another's keys"
+    assert _indexed(kv) == 2, "the keyed label of the same request indexed nothing"
     kv.assert_pages_conserved()
 
 
@@ -222,8 +234,12 @@ def test_a_request_that_opted_out_indexes_nothing():
     kv.ingest_request("r0", KVReqConfig(
         prefix_keys={"main": _keys(256)}, prefix_cache=False,
     ))
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": _keys(256)}))
 
     _step(kv, "r0", 256)
+    opted_out = _indexed(kv)
+    _step(kv, "r1", 256)
 
-    assert _indexed(kv) == 0
+    assert opted_out == 0, "a request that turned the cache off was indexed"
+    assert _indexed(kv) == 2, "the request beside it, on the same keys, was not"
     kv.assert_pages_conserved()
