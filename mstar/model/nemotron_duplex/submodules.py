@@ -6,12 +6,12 @@ Nodes, and the resources each declares (``NemotronDuplexModel.get_node_resources
     nano_llm           nano_kv, nano_attn,        Nemotron-H hybrid Mamba-2 / attention / MLP (9B):
                        mamba_state, mamba,        paged KV for the 4 attention layers, recurrent-pool
                        nano_sampler               slots for the 27 Mamba-2 layers, the text sampler
-    eartts_talker      (none yet)                Gemma3 talker -> 31 RVQ codes per frame
+    eartts_talker      talker_kv, talker_attn,    Gemma3 talker -> 31 RVQ codes per frame; two KV
+                       talker_pos                 labels per session (cond / uncond) in one plan
     audio_codec        (none)                    RVQ codes -> 22.05 kHz PCM, per-request left context
 
-The talker's KV still lives in ``PerRequestState`` (a dict keyed by request
-id), which is neither compile- nor capture-safe; moving it onto the KV pool is
-what unlocks its CUDA graph. The nano's state is all in engine resources.
+Both autoregressive nodes keep their whole state in engine resources and capture
+their decode step as a CUDA graph; the encoder and the codec run eager.
 """
 from __future__ import annotations
 
@@ -26,15 +26,28 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
-from mstar.engine.resources import AttentionStep, KVStep, SamplerStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import (
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
+)
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.model.nemotron_duplex.components.eartts_talker import maskgit_schedule
 from mstar.model.nemotron_duplex.config import (
     MAMBA,
     MAMBA_STATE,
     NANO_ATTN,
     NANO_KV,
     NANO_SAMPLER,
+    TALKER_ATTN,
+    TALKER_CFG_LABEL,
+    TALKER_KV,
+    TALKER_POS,
     NemotronDuplexConfig,
 )
 from mstar.model.submodule_base import (
@@ -347,21 +360,28 @@ class ConformerEncoderSubmodule(NodeSubmodule):
 
 
 class EarTTSTalkerSubmodule(ARNodeSubmodule):
-    """Gemma3 talker: one agent text token -> ``num_quantizers`` RVQ codes.
+    """Gemma3 talker: one agent text token -> ``num_quantizers`` RVQ codes per
+    session per frame, all live sessions in one backbone pass.
 
-    The MoG / MaskGIT / CFG sampling is internal (not the engine's categorical
-    sampler). Every live session is advanced in ONE backbone pass per step
-    (``EarTTSTalker.infer_codes_batched``: caches right-padded and masked,
-    per-row RoPE positions, per-row seeded noise so a session's audio does not
-    depend on who shares its batch). The per-session KV still lives in
-    ``PerRequestState``; putting it on the KV pool is what removes the padding
-    copies and unlocks a CUDA graph.
+    The talker's KV lives in the engine's paged KV pool under two labels per
+    request: ``main`` (text-conditioned stream) and ``uncond`` (null-conditioned
+    stream for classifier-free guidance), combined into one attention plan
+    whose rows are ``[cond rows; uncond rows]`` -- the order ``mog_head.infer``
+    expects. A session's first step prefills the 37 speaker warm-up positions
+    together with its first frame (38 tokens per label); every later step is
+    one token per label. The MoG / MaskGIT sampling is internal (not the
+    engine's categorical sampler); its noise is drawn per row, with the row's
+    own seeded generator, in ``preprocess`` -- so a session's speech does not
+    depend on its batch mates and the whole step is a CUDA graph replay for
+    all-decode batches.
     """
 
     disable_torch_compile = True
 
-    STATE_KEY = "talker_state"
+    PREV_CODES_KEY = "talker_prev_codes"
     GEN_KEY = "talker_gen"
+    SPEAKER = "Aria"
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
     def __init__(self, talker: nn.Module, config: NemotronDuplexConfig,
                  subword_to_char: dict | None = None, char_pad_idx: int | None = None):
@@ -370,71 +390,158 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         self.config = config
         self._s2c = subword_to_char
         self._char_pad = char_pad_idx
+        self._warmup: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
+    # -- per-speaker constants -------------------------------------------
+
+    def warmup(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(cond [P, H], uncond [P, H], prev_codes [Q])`` of the speaker warm-up."""
+        if self._warmup is None:
+            cfg = self.config
+            self._warmup = self.talker.warmup_inputs(
+                self.SPEAKER, self._s2c, self._char_pad,
+                text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id, speech_pad_id=cfg.eartts.codebook_size,
+            )
+        return self._warmup
+
+    @property
+    def warmup_len(self) -> int:
+        return self.talker.audio_prompt_latents[self.SPEAKER].shape[1]
+
+    def _generator(self, rid: str, device: torch.device) -> torch.Generator:
+        st = self.request_state(rid)
+        gen = st.get(self.GEN_KEY)
+        if gen is None:
+            gen = torch.Generator(device=device).manual_seed(self.config.eartts.inference_seed)
+            st.add(self.GEN_KEY, gen)
+        return gen
+
+    def _noise(self, gens: list[torch.Generator], device: torch.device) -> dict[str, torch.Tensor]:
+        """The step's sampling noise for N rows, drawn per row from each row's
+        generator: ``u`` for the Gumbel mixture pick and ``eps`` for the latent
+        noise, one pair per MaskGIT iteration."""
+        e = self.config.eartts
+        n = len(gens)
+        u = torch.empty(e.inference_num_iter, n, 1, e.mog_num_predictions, device=device)
+        eps = torch.empty(e.inference_num_iter, n, 1, e.code_dim, device=device)
+        for i, k in enumerate(maskgit_schedule(e.inference_num_iter, e.mog_exponent, e.num_quantizers)):
+            if k == 0:
+                continue
+            # the same draws, in the same order, as the sequential per-session step
+            u[i] = torch.stack([torch.rand((1, e.mog_num_predictions), device=device, generator=g) for g in gens])
+            eps[i] = torch.stack([torch.randn((1, e.code_dim), device=device, generator=g) for g in gens])
+        return {"noise_u": u, "noise_eps": eps}
+
+    # -- engine contract -------------------------------------------------
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> ARNodeInputs:
-        # The LLM streams the sampled agent text token under "new_token".
-        tok = inputs["new_token"][0]
-        return ARNodeInputs(input_ids=tok.reshape(1), input_seq_len=1)
+        # The LLM streams the sampled agent text token under "new_token". A
+        # session's first step also prefills the speaker warm-up.
+        tok = inputs["new_token"][0].reshape(1)
+        first = self.request_state(fwd_info.request_id).get(self.PREV_CODES_KEY) is None
+        span = self.warmup_len + 1 if first else 1
+        return ARNodeInputs(input_ids=tok, input_seq_len=span, kwargs={"first": first})
 
-    def preprocess(self, graph_walk, engine_inputs, inputs):
-        # One device-to-host copy for the whole batch: the text conditioning is
-        # built from host-side char ids. Eager-only; goes with the KV-pool talker.
-        ids = torch.cat([inp.input_ids.reshape(-1)[:1] for inp in inputs])
-        return {"tokens": ids.tolist()}
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[ARNodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
+    ) -> SubmoduleStep:
+        # label-major: every request's cond segment, then every request's
+        # uncond segment; the combined plan packs the rows in that order
+        segments = [
+            Segment(request_id=rid, label=label, span=inp.input_seq_len)
+            for label in ("main", "uncond")
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        ]
+        return SubmoduleStep(
+            segments=segments,
+            steps={
+                TALKER_KV: KVStep(combined_labels={("main", "uncond"): TALKER_CFG_LABEL}),
+                TALKER_ATTN: AttentionStep(causal=True),
+                TALKER_POS: PositionStep(),
+            },
+        )
 
     def can_batch(self, batch, model_inputs) -> bool:
         return True
 
-    def _warm_up(self, rids: list[str], device: torch.device) -> None:
-        """Warm the new sessions' caches from the speaker prompt in one batched
-        ``init_state`` (they share the speaker), and seed each session's RNG."""
-        fresh = [rid for rid in rids if self.request_state(rid).get(self.STATE_KEY) is None]
-        if not fresh:
-            return
-        cfg, talker = self.config, self.talker
-        state = talker.init_state(
-            len(fresh), speaker="Aria", device=device,
-            subword_id_to_char_ids=self._s2c, char_pad_idx=self._char_pad,
-            text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id,
-            speech_pad_id=cfg.eartts.codebook_size,
-        )
-        prev = state.get("prev_codes")
-        if prev is None:
-            prev = talker.initial_prev_codes(len(fresh), device=device)
-        for i, rid in enumerate(fresh):
-            st = self.request_state(rid)
-            st.add(self.STATE_KEY, {
-                "kv": [(k[i:i + 1], v[i:i + 1]) for k, v in state["kv"]],
-                "kv_uncond": (
-                    [(k[i:i + 1], v[i:i + 1]) for k, v in state["kv_uncond"]]
-                    if state.get("kv_uncond") is not None else None
+    def get_cuda_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[CudaGraphConfig]:
+        """Capture the steady-state step (one token per label per session).
+        ``preprocess`` (text conditioning, noise, warm-up assembly) runs eagerly
+        before the graph; the captured region is the 2N-row backbone over the
+        pool and the MaskGIT sampling loop."""
+        return [
+            BatchedCudaGraphConfig(
+                capture_graph_walk="talker_decode",
+                single_request_inputs=ARNodeInputs(
+                    input_ids=torch.tensor([self.config.text_pad_id], dtype=torch.long, device=device),
+                    input_seq_len=1, kwargs={"first": False},
                 ),
-                "pos": state["pos"],
-                "_prev_codes": prev[i:i + 1],
-            })
-            st.add(self.GEN_KEY, torch.Generator(device=device).manual_seed(cfg.eartts.inference_seed))
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+                # each request commits one token on each of its two labels
+                total_tokens_multiplier=2,
+                compile=False,
+            ),
+        ]
 
-    def forward(self, graph_walk, engine_inputs, tokens=None, **kwargs) -> NameToTensorList:
-        return self.forward_batched(graph_walk, engine_inputs, tokens=tokens)[engine_inputs.request_ids[0]]
-
-    def forward_batched(self, graph_walk, engine_inputs, tokens=None, **kwargs) -> dict[str, NameToTensorList]:
+    def preprocess(self, graph_walk, engine_inputs, inputs):
         cfg, talker = self.config, self.talker
         dev = talker.embed_code.weight.device
         rids = list(engine_inputs.request_ids)
-        self._warm_up(rids, dev)
-        states = [self.request_state(rid)[self.STATE_KEY] for rid in rids]
-        gens = [self.request_state(rid)[self.GEN_KEY] for rid in rids]
-        conds = talker.text_conditioning_from_ids(tokens, self._s2c, self._char_pad)     # [N, 1, H]
-        ids = torch.tensor(tokens, dtype=torch.long, device=dev)
-        codes, new_states = talker.infer_codes_batched(
-            states, ids, conds, text_eos_id=cfg.text_eos_id,
-            num_iter=cfg.eartts.inference_num_iter, guidance_scale=cfg.eartts.inference_guidance_scale,
-            noise_scale=cfg.eartts.inference_noise_scale, top_p=cfg.eartts.inference_top_p,
-            generators=gens,
-        )
-        for rid, ns in zip(rids, new_states, strict=True):
-            self.request_state(rid).add(self.STATE_KEY, ns)
+        ids = torch.cat([inp.input_ids.reshape(-1)[:1] for inp in inputs]).to(dev)
+        tokens = ids.tolist()                                           # one D2H copy for the batch
+        firsts = [bool(inp.kwargs.get("first", False)) for inp in inputs]
+        warm_c, warm_u, warm_prev = self.warmup()
+        prev_codes = torch.stack([
+            warm_prev if first or self.request_state(rid).get(self.PREV_CODES_KEY) is None
+            else self.request_state(rid)[self.PREV_CODES_KEY].reshape(-1)
+            for rid, first in zip(rids, firsts, strict=True)
+        ])                                                              # [N, Q]
+        conds = talker.text_conditioning_from_ids(tokens, self._s2c, self._char_pad)   # [N, 1, H]
+        frame_c, frame_u = talker.frame_inputs(prev_codes, conds, ids, cfg.text_eos_id)  # [N, H] each
+        if any(firsts):
+            # a first step's rows carry the warm-up positions before the frame
+            rows_c = [torch.cat([warm_c, frame_c[i:i + 1]]) if f else frame_c[i:i + 1] for i, f in enumerate(firsts)]
+            rows_u = [torch.cat([warm_u, frame_u[i:i + 1]]) if f else frame_u[i:i + 1] for i, f in enumerate(firsts)]
+            x = torch.cat(rows_c + rows_u)                              # [total_tokens, H], label-major
+        else:
+            x = torch.cat([frame_c, frame_u])                           # [2N, H]
+        gens = [self._generator(rid, dev) for rid in rids]
+        return {"x": x, "spans": [inp.input_seq_len for inp in inputs], **self._noise(gens, dev)}
+
+    def forward_batched(self, graph_walk, engine_inputs, x=None, spans=None, noise_u=None, noise_eps=None,
+                        **kwargs) -> dict[str, NameToTensorList]:
+        e = self.config.eartts
+        rids = list(engine_inputs.request_ids)
+        n = len(rids)
+        hidden = self.talker.backbone_pooled(x, TALKER_CFG_LABEL)         # [total_tokens, H]
+        if all(s == 1 for s in spans):
+            last = hidden                                                 # [2N, H]: cond rows, uncond rows
+        else:
+            last = engine_inputs.resources[TALKER_ATTN].select_last_hidden(hidden, label=TALKER_CFG_LABEL)
+        noise = [(noise_u[i], noise_eps[i]) for i in range(e.inference_num_iter)]
+        codes = self.talker.generate_step(
+            last[:n].unsqueeze(1), hidden_uncond=last[n:].unsqueeze(1),
+            num_iter=e.inference_num_iter, guidance_scale=e.inference_guidance_scale,
+            noise_scale=e.inference_noise_scale, top_p=e.inference_top_p, noise=noise,
+        ).squeeze(1)                                                      # [N, Q]
         return {rid: {"codec_tokens": [codes[i]]} for i, rid in enumerate(rids)}
+
+    def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
+        return self.forward_batched(graph_walk, engine_inputs, **kwargs)[engine_inputs.request_ids[0]]
+
+    def postprocess(self, request_id, request_info, outputs, **kwargs):
+        # This frame's codes are the next frame's ``prev_codes`` (metadata only:
+        # the tensor is already a copy out of the graph's output buffer).
+        if "codec_tokens" in outputs:
+            self.request_state(request_id).add(self.PREV_CODES_KEY, outputs["codec_tokens"][0])
 
 
 class AudioCodecDecoderSubmodule(NodeSubmodule):
