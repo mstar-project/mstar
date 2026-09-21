@@ -4,12 +4,13 @@ knob reaches both denoise nodes."""
 
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
 from mstar.model.flux2_klein.components.transformer import Flux2DiT
 from mstar.model.flux2_klein.config import Flux2TransformerConfig
-from mstar.model.flux2_klein.submodules import EXACT_OP_TYPES, exclude_from_compile
+from mstar.model.flux2_klein.submodules import EXACT_OP_TYPES, exact_op_types, exclude_from_compile
 from mstar.model.z_image.components.transformer import ScaledRMSNorm
 
 TINY = Flux2TransformerConfig(
@@ -64,6 +65,22 @@ def test_scaled_rmsnorm_opts_in_by_attribute():
     assert getattr(norm.forward, "_torchdynamo_disable", False)
 
 
+def test_exact_op_classes_can_be_chosen():
+    assert exact_op_types(True) == EXACT_OP_TYPES and exact_op_types(False) is None and exact_op_types([]) is None
+    assert exact_op_types(["activations"]) == (nn.SiLU,)
+    assert set(exact_op_types(["norms"])) == {nn.LayerNorm, nn.RMSNorm, nn.GroupNorm}
+    with pytest.raises(ValueError, match="unknown op class"):
+        exact_op_types(["gelu"])
+    dit = Flux2DiT(TINY)
+    silus = sum(isinstance(m, nn.SiLU) for m in dit.modules())
+    assert exclude_from_compile(dit, exact_op_types(["activations"])) == silus
+    norm_only = Flux2DiT(TINY)
+    assert exclude_from_compile(norm_only, exact_op_types(["norms"])) == len(_excluded(norm_only)) - silus
+    # a marked norm (ScaledRMSNorm) counts as a norm, not as an activation
+    assert exclude_from_compile(nn.Sequential(ScaledRMSNorm(4, 1e-5)), exact_op_types(["activations"])) == 0
+    assert exclude_from_compile(nn.Sequential(ScaledRMSNorm(4, 1e-5)), exact_op_types(["norms"])) == 1
+
+
 def test_knob_reaches_both_models():
     from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
     from mstar.model.z_image.z_image_model import ZImageModel
@@ -71,5 +88,6 @@ def test_knob_reaches_both_models():
     klein = Flux2KleinModel(model_path_hf="x", compile=True, compile_exact_ops=True, cuda_graph=False)
     z = ZImageModel(model_path_hf="x", compile=True, compile_exact_ops=True, cuda_graph=False)
     assert klein.compile_exact_ops is True and z.compile_exact_ops is True
+    assert Flux2KleinModel(model_path_hf="x", compile_exact_ops=["norms"]).compile_exact_ops == ["norms"]
     assert Flux2KleinModel(model_path_hf="x").compile_exact_ops is False
     assert ZImageModel(model_path_hf="x").compile_exact_ops is False
