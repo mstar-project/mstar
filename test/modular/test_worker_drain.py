@@ -179,6 +179,7 @@ def _preprocess(inflight_reads=False):
     )
     wt.tensor_uuid_to_metadata_per_request = {}
     wt.request_model_kwargs = {}
+    wt.in_flight_requests = set()
     return wt
 
 
@@ -243,6 +244,7 @@ def test_preprocess_hard_cleanup_force_drops_and_clears():
     wt._reads_done_sent.add("X")
     wt.tensor_uuid_to_metadata_per_request["X"] = {"u": {}}
     wt.request_model_kwargs["X"] = {}
+    wt.in_flight_requests.add("X")
 
     wt._hard_cleanup("X")
     assert wt.forced == ["X"]
@@ -250,3 +252,4 @@ def test_preprocess_hard_cleanup_force_drops_and_clears():
     assert "X" not in wt._reads_done_sent
     assert "X" not in wt.tensor_uuid_to_metadata_per_request
     assert "X" not in wt.request_model_kwargs
+    assert "X" not in wt.in_flight_requests
