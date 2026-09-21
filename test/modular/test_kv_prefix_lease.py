@@ -190,6 +190,25 @@ def test_a_request_that_matches_nothing_gets_no_lease():
     kv.assert_pages_conserved()
 
 
+def test_a_rank_reports_the_length_it_matched():
+    kv = _manager()
+    keys = _seed(kv, list(range(100)))
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}))
+
+    assert kv.matched_prefix("r1") == {"main": 96}, (
+        "what this rank brings to the agreement is not what it matched"
+    )
+
+
+def test_a_request_with_no_keys_reports_no_length():
+    kv = _manager()
+    kv.ingest_request("r1", KVReqConfig())
+
+    assert kv.matched_prefix("r1") == {}, (
+        "an unkeyed stream was given a length for the ranks to agree on"
+    )
+
+
 # ── the window ──────────────────────────────────────────────────────────
 
 

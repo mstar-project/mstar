@@ -144,6 +144,18 @@ def test_remove_force_cleans_and_clears_drain_state():
     assert "X" not in w._reads_done_sent
 
 
+def test_remove_forgets_the_tp_prefix_replies():
+    w = _worker()
+    w._tp_prefix_replies = {"X": {1: {"main": 64}}}
+
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+
+    assert w._tp_prefix_replies == {}, (
+        "a removed request's replies outlive it, and the next request to "
+        "reuse its id is scheduled on a length no rank matched"
+    )
+
+
 def test_process_new_inputs_skips_reads_for_draining_rid():
     w = _worker(draining=("X",))
 
