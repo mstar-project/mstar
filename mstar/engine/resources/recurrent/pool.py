@@ -199,16 +199,27 @@ class RecurrentStatePool(Resource):
     # Step lifecycle
 
     def admit(self, step: RecurrentStep, ctx: StepContext) -> AdmitOutcome:
-        """Reserve a slot per addressed (rid, label), plus fork targets."""
-        del ctx
+        """Reserve a slot per addressed (rid, label), plus fork targets.
+
+        Capture rows and a replay's padding rows reserve nothing: they stand
+        for no request and address the sink instead (see `_build_addressing`).
+        A slot handed to a padding row would otherwise have to be given back
+        after every step, or the runner's dummy names (two capture slots times
+        the widest bucket of them) would drain a pool sized for the real
+        concurrency.
+        """
+        if ctx.capture:
+            return ADMIT_OK
         for segment in step.segments or ():
-            if segment.span <= 0:
+            if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                 # reads its state without extending it, or a padding row
                 continue
             if self._alloc(segment.request_id, segment.label) is None:
                 return self._out_of_slots(segment.request_id, segment.label)
 
         for rid in self._fork_rids(step):
+            if ctx.is_padding_row(rid):
+                continue
             for _, to_label in (*step.pre_forks, *step.post_forks):
                 if self._alloc(rid, to_label) is None:
                     return self._out_of_slots(rid, to_label)
@@ -239,8 +250,10 @@ class RecurrentStatePool(Resource):
     def supports_preplan(self):
         return True
 
-    def _maybe_apply_forks(self, step: RecurrentStep):
+    def _maybe_apply_forks(self, step: RecurrentStep, ctx: StepContext):
         for rid in self._fork_rids(step):
+            if ctx.capture or ctx.is_padding_row(rid):
+                continue
             for from_label, to_label in step.pre_forks:
                 self._apply_fork(rid, from_label, to_label)
 
@@ -270,7 +283,7 @@ class RecurrentStatePool(Resource):
             # fork had happened; this is the copy itself, which staging left
             # undone. `_pending_fork_state` says why.
             self._current = self._cached_plan_output
-            self._maybe_apply_forks(step)
+            self._maybe_apply_forks(step, ctx)
             self.clear_preplan()
             return self._current
 
@@ -281,7 +294,7 @@ class RecurrentStatePool(Resource):
             pending = self._pending_fork_state(step)
         else:
             pending = {}
-            self._maybe_apply_forks(step)
+            self._maybe_apply_forks(step, ctx)
 
         self._current = {}
         for label, segments in self._group_by_label(step.segments or ()).items():
@@ -304,10 +317,11 @@ class RecurrentStatePool(Resource):
         self._cached_plan_output = None
 
     def commit(self, step: RecurrentStep, ctx: StepContext) -> None:
-        del ctx
+        if ctx.capture:
+            return
         with self._lock:
             for segment in step.segments or ():
-                if segment.span <= 0:
+                if segment.span <= 0 or ctx.is_padding_row(segment.request_id):
                     continue
                 slot = self._slots.get(segment.request_id, {}).get(segment.label)
                 if slot is not None:
@@ -316,6 +330,8 @@ class RecurrentStatePool(Resource):
                     slot.has_state = True
 
         for rid in self._fork_rids(step):
+            if ctx.is_padding_row(rid):
+                continue
             for from_label, to_label in step.post_forks:
                 self._apply_fork(rid, from_label, to_label)
 
@@ -361,8 +377,13 @@ class RecurrentStatePool(Resource):
         indices = []
         has_state = []
         for seg in segments:
-            slot = self._slots.get(seg.request_id, {}).get(label)
+            slot = (
+                None if ctx.capture or ctx.is_padding_row(seg.request_id)
+                else self._slots.get(seg.request_id, {}).get(label)
+            )
             if slot is None or seg.span <= 0:
+                # no slot, a zero-span row, a capture row or a padding row: the
+                # sink (or the sentinel), which nothing reads back
                 indices.append(pad)
                 has_state.append(False)
             else:
