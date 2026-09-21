@@ -1,5 +1,6 @@
 from mstar.engine.resources.recurrent.config import (
     DeltaNetGeometry,
+    Mamba2Geometry,
     RecurrentBlockConfig,
     RecurrentGeometry,
     RecurrentStateConfig,
@@ -17,6 +18,7 @@ __all__ = [
     "NO_SLOT",
     "SINK_SLOT",
     "DeltaNetGeometry",
+    "Mamba2Geometry",
     "RecurrentGeometry",
     "RecurrentAddressing",
     "RecurrentBlockConfig",
