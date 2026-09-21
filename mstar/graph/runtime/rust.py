@@ -23,6 +23,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphSection, Loop
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.runtime.base import (
+    EdgeSpec,
     GraphRuntime,
     ParallelList,
 )
@@ -302,6 +303,28 @@ class RustGraphRuntime(GraphRuntime):
     def clear_pending_loop_stops(self):
         self._rust.clear_pending_loop_stops()
 
+    # --------- Inputs ----------
+
+    def ingest_inputs_batch(
+        self,
+        signals: ParallelList[int, EdgeSpec],
+        can_buffer: bool = True,
+        is_streaming: bool = False,
+    ) -> list[int]:
+        return self._rust.ingest_inputs_batch(
+            signals.keys,
+            [
+                {
+                    "signal": s.signal,
+                    "next_node": s.next_node,
+                    "uuids": s.uuids,
+                    "is_final_streaming_chunk": s.is_final_streaming_chunk,
+                } for s in signals.values
+            ],
+            can_buffer,
+            is_streaming,
+        )
+
     # --------- not ported yet ----------
     #
     # Everything a forward pass needs. Until these land, MSTAR_RUST_GRAPH=1
@@ -310,7 +333,6 @@ class RustGraphRuntime(GraphRuntime):
     get_dynamic_loop_iters = _unported("get_dynamic_loop_iters")
     reset_outputs = _unported("reset_outputs")
     cleanup_consumed_inputs = _unported("cleanup_consumed_inputs")
-    ingest_inputs_batch = _unported("ingest_inputs_batch")
     pop_rids = _unported("pop_rids")
     has_ready_excluding = _unported("has_ready_excluding")
     get_ready_nodes = _unported("get_ready_nodes")

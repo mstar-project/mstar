@@ -189,6 +189,13 @@ impl RequestState {
     }
 
     #[inline]
+    /// Python's `ReadySignals.is_ready_for_streaming`: every non-streaming
+    /// input has arrived, so a streaming chunk can be taken now.
+    pub fn is_ready_for_streaming(&self, id: NodeId) -> bool {
+        let (w, b) = Self::bit(id);
+        self.ready_streaming[w] >> b & 1 == 1
+    }
+
     pub fn is_ready(&self, id: NodeId) -> bool {
         let (w, b) = Self::bit(id);
         self.ready[w] >> b & 1 == 1

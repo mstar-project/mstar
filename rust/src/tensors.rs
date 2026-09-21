@@ -10,6 +10,7 @@
 //! disaggregated loop re-emitting its external inputs) looks it up here.
 
 use crate::graph::spec::{StrToId, Sym};
+use crate::graph::state::TensorRef;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
@@ -320,6 +321,24 @@ impl Bookkeeping {
 
     fn len(&self) -> usize {
         self.ref_info.len()
+    }
+
+    /// The shape facts routing needs, without rebuilding the whole descriptor.
+    ///
+    /// A uuid with no descriptor keeps its identity and zeroes the rest: the
+    /// uuid is what downstream routes on, and Python tolerates the same case
+    /// (`get_info` returning None inside a tensor_info list). It means the
+    /// store lost the descriptor, which is a bug upstream of here.
+    pub fn tensor_ref(&self, uuid: u64) -> TensorRef {
+        match self.tensor_info.get(&uuid) {
+            Some(i) => TensorRef {
+                uuid,
+                dim0: i.dims.first().copied().unwrap_or(0),
+                nbytes: i.nbytes,
+                offset: i.offset,
+            },
+            None => TensorRef { uuid, dim0: 0, nbytes: 0, offset: 0 },
+        }
     }
 }
 

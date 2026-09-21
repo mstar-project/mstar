@@ -5,7 +5,7 @@ use crate::graph::compile::{EMIT_TO_CLIENT, EMPTY_DESTINATION, LoopArg, NodeArg,
 use crate::graph::shard::{GroupTemplate, ShardingTemplate};
 use crate::graph::spec::*;
 use crate::graph::request::{RequestInfo, WgIndex, WorkerGraphMeta};
-use crate::graph::state::RequestState;
+use crate::graph::state::{RequestState, TensorRef};
 use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -182,6 +182,66 @@ pub struct GraphRuntime {
         self.wg_ids.iter().position(|&id| id == wg_id).map(|i| i as WgIndex)
     }
 
+    /// Offer one signal to each live worker graph until one claims it.
+    ///
+    /// A claim loop, not a lookup: a node can refuse a signal it owns when the
+    /// name does not match an input or both ready slots are already full.
+    fn ingest_one(
+        &mut self,
+        rid: u32,
+        spec: &EdgeSpecArg,
+        can_buffer: bool,
+        is_streaming: bool,
+    ) -> bool {
+        let (Some(dest), Some(signal)) = (
+            self.interner.get(&spec.next_node),
+            self.interner.get(&spec.signal),
+        ) else {
+            return false; // a name this worker never compiled
+        };
+        let Some(info) = self.requests.get(rid as usize).and_then(|r| r.as_ref())
+        else {
+            return false; // never admitted here, or already removed
+        };
+        // Resolved once: the descriptors are the same whichever worker graph
+        // claims the signal.
+        let tensors: Vec<TensorRef> = {
+            let bk = self.bookkeeping.lock().unwrap();
+            spec.uuids.iter().map(|&u| bk.tensor_ref(u)).collect()
+        };
+
+        let live: Vec<WgIndex> = info
+            .partitions
+            .values()
+            .flat_map(|p| p.walk_worker_graphs.iter().copied())
+            .collect();
+        for wg in live {
+            let Some(node) = self.graphs[wg as usize].by_name.get(&dest).copied()
+            else {
+                continue;
+            };
+            let Some(slot) = self.graphs[wg as usize].node(node).slot_of(signal)
+            else {
+                continue; // the node does not take this input
+            };
+            let Some(state) = &mut self.states[wg as usize][rid as usize] else {
+                continue;
+            };
+            // The streaming gate is re-checked per signal on purpose:
+            // ingesting one can be what makes the next node eligible.
+            if is_streaming && !state.is_ready_for_streaming(node) {
+                continue;
+            }
+            if state.ingest(
+                node, slot, tensors.clone(), can_buffer,
+                spec.is_final_streaming_chunk,
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn owner_of(&self, node: &str, walk: &str) -> Option<WgIndex> {
         let n = self.interner.get(node)?;
         let w = self.interner.get(walk)?;
@@ -205,6 +265,15 @@ pub struct GraphRuntime {
             Dest::Empty => EMPTY_DESTINATION.to_string(),
         }
     }
+}
+
+/// Python's `EdgeSpec`: what crosses for one arriving signal.
+#[derive(FromPyObject)]
+pub struct EdgeSpecArg {
+    #[pyo3(item)] signal: String,
+    #[pyo3(item)] next_node: String,
+    #[pyo3(item)] uuids: Vec<u64>,
+    #[pyo3(item)] is_final_streaming_chunk: bool,
 }
 
 /// One `ShardingGroup` as configured.
@@ -638,6 +707,33 @@ impl GraphRuntime {
             }
         }
         Ok(())
+    }
+
+    // --------- Inputs ----------
+
+    /// Returns the INDICES of signals no worker graph claimed. The streaming
+    /// path hands the original edge back to its buffer, so an index is enough
+    /// and the edge never has to survive the round trip.
+    #[pyo3(signature = (rids, signals, can_buffer = true, is_streaming = false))]
+    fn ingest_inputs_batch(
+        &mut self,
+        rids: Vec<u32>,
+        signals: Vec<EdgeSpecArg>,
+        can_buffer: bool,
+        is_streaming: bool,
+    ) -> PyResult<Vec<usize>> {
+        if rids.len() != signals.len() {
+            return Err(PyValueError::new_err(
+                "ingest_inputs_batch: rids and signals must be the same length",
+            ));
+        }
+        let mut uningested = Vec::new();
+        for (i, (rid, spec)) in rids.iter().zip(&signals).enumerate() {
+            if !self.ingest_one(*rid, spec, can_buffer, is_streaming) {
+                uningested.push(i);
+            }
+        }
+        Ok(uningested)
     }
 
     fn num_handles(&self) -> usize {

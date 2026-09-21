@@ -22,6 +22,7 @@ rust_runtime = pytest.importorskip(
     reason="mstar_rust not built (maturin develop --release in rust/)",
 )
 from mstar.communication.rust_tensor_store import RustTensorBookkeeping
+from mstar.graph.runtime import base as rust_runtime_base
 
 WG_ID = 0
 WALK = "decode"
@@ -251,3 +252,85 @@ def test_streaming_inputs_cross():
     )
     args = worker_graph_args(wg)
     assert args["nodes"][0]["streaming_inputs"] == ["chunk"]
+
+
+# --- ingest ------------------------------------------------------------------
+
+def _spec(signal, next_node, uuids=(), final=False):
+    return rust_runtime_base.EdgeSpec(
+        signal=signal, next_node=next_node, uuids=list(uuids),
+        is_final_streaming_chunk=final,
+    )
+
+
+def test_a_signal_reaches_its_node(runtime):
+    rid = _admit(runtime)
+    assert runtime.ingest_inputs_batch(
+        ParallelList([rid], [_spec("prompt", "prefill")])
+    ) == []
+
+
+def test_a_signal_for_an_unknown_node_comes_back_by_index(runtime):
+    rid = _admit(runtime)
+    uningested = runtime.ingest_inputs_batch(
+        ParallelList(
+            [rid, rid],
+            [_spec("prompt", "prefill"), _spec("x", "not_here")],
+        )
+    )
+    assert uningested == [1], "index 1, not 0: prefill claimed the first"
+
+
+def test_a_signal_a_node_does_not_take_is_refused(runtime):
+    # The node exists but has no such input, so the claim loop must not
+    # silently drop it into some other slot.
+    rid = _admit(runtime)
+    assert runtime.ingest_inputs_batch(
+        ParallelList([rid], [_spec("not_an_input", "prefill")])
+    ) == [0]
+
+
+def test_a_second_signal_buffers_then_refuses(runtime):
+    # Both ready slots full is the refusal Python returns False for; the
+    # caller re-queues rather than losing the chunk.
+    rid = _admit(runtime)
+    assert runtime.ingest_inputs_batch(
+        ParallelList([rid], [_spec("prompt", "prefill")])
+    ) == []
+    assert runtime.ingest_inputs_batch(
+        ParallelList([rid], [_spec("prompt", "prefill")]), can_buffer=True
+    ) == [], "the second goes to the next-iter slot"
+    assert runtime.ingest_inputs_batch(
+        ParallelList([rid], [_spec("prompt", "prefill")]), can_buffer=True
+    ) == [0], "the third has nowhere to go"
+
+
+def test_can_buffer_false_refuses_the_second(runtime):
+    rid = _admit(runtime)
+    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    assert runtime.ingest_inputs_batch(
+        ParallelList([rid], [_spec("prompt", "prefill")]), can_buffer=False
+    ) == [0], "streaming must not buffer for an iteration that may not come"
+
+
+def test_an_unknown_rid_is_refused_not_raised(runtime):
+    # A signal can arrive for a request this rank already removed.
+    assert runtime.ingest_inputs_batch(
+        ParallelList([9999], [_spec("prompt", "prefill")])
+    ) == [0]
+
+
+def test_streaming_gates_on_the_non_streaming_inputs(runtime):
+    # ar_decode's inputs are not streaming, so it never reports
+    # ready-for-streaming and a streaming ingest must not land.
+    rid = _admit(runtime)
+    assert runtime.ingest_inputs_batch(
+        ParallelList([rid], [_spec("token", "ar_decode")]), is_streaming=True
+    ) == [0]
+
+
+def test_mismatched_lengths_are_rejected(runtime):
+    with pytest.raises((ValueError, RuntimeError)):
+        runtime.ingest_inputs_batch(
+            ParallelList([1, 2], [_spec("prompt", "prefill")])
+        )
