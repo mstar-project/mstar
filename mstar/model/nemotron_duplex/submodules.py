@@ -380,6 +380,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
 
     PREV_CODES_KEY = "talker_prev_codes"
     GEN_KEY = "talker_gen"
+    DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
     SPEAKER = "Aria"
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
@@ -436,11 +437,23 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
 
     # -- engine contract -------------------------------------------------
 
+    def _is_first_step(self, rid: str) -> bool:
+        return self.request_state(rid).get(self.PREV_CODES_KEY) is None
+
+    def cg_key_info(self, graph_walk: str, per_request_info: Mapping[str, Any]) -> str | None:
+        """Which capture serves this batch: the steady-state decode capture
+        (``DECODE_KEY``) when every session is past its first step, None (run
+        eager) when any session prefills its warm-up this step. The engine
+        leases the slot before ``prepare_inputs`` runs, so this answers from
+        the request state, like ``declare_step`` does."""
+        del graph_walk
+        return None if any(self._is_first_step(rid) for rid in per_request_info) else self.DECODE_KEY
+
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> ARNodeInputs:
         # The LLM streams the sampled agent text token under "new_token". A
         # session's first step also prefills the speaker warm-up.
         tok = inputs["new_token"][0].reshape(1)
-        first = self.request_state(fwd_info.request_id).get(self.PREV_CODES_KEY) is None
+        first = self._is_first_step(fwd_info.request_id)
         span = self.warmup_len + 1 if first else 1
         return ARNodeInputs(input_ids=tok, input_seq_len=span, kwargs={"first": first})
 
@@ -462,6 +475,9 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         ]
         return SubmoduleStep(
             segments=segments,
+            # the same answer as cg_key_info(): a warm-up prefill in the batch
+            # keeps the step off the fixed-shape decode capture
+            cg_key_info=None if any(inp.kwargs.get("first") for inp in inputs) else self.DECODE_KEY,
             steps={
                 TALKER_KV: KVStep(combined_labels={("main", "uncond"): TALKER_CFG_LABEL}),
                 TALKER_ATTN: AttentionStep(causal=True),
@@ -489,6 +505,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 # each request commits one token on each of its two labels
                 total_tokens_multiplier=2,
+                additional_key_info=self.DECODE_KEY,
                 compile=False,
             ),
         ]
