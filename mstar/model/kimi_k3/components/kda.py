@@ -122,9 +122,10 @@ class TorchKDAKernels:
         conv from the checkpoint window and its recurrence from the checkpoint state advance both
         blocks to the new checkpoint (nothing when the prefix is empty, as after a prefill); the
         block's conv and recurrence continue from there for the outputs, their final state and
-        window discarded; the block's pre-conv inputs, raw gates and raw betas replace the prefix.
-        ``spec.length`` is set afterwards by ``KDAManager.set_prefix_len`` once the accepted counts
-        are known. Returns ``o [rows * k1, H, D]``."""
+        window discarded, unless the block is one token (the bonus alone, always accepted): then
+        they are the new checkpoint; the block's pre-conv inputs, raw gates and raw betas replace
+        the prefix. ``spec.length`` is set afterwards by ``KDAManager.set_prefix_len`` once the
+        accepted counts are known (zero after a committed one-token block). Returns ``o [rows * k1, H, D]``."""
         h, d = p.num_heads, p.head_dim
         rows = plan.num_rows
         k1 = qkv.shape[0] // max(rows, 1)
@@ -150,14 +151,17 @@ class TorchKDAKernels:
                 conv_state[slot].copy_(cache[:, 1:].to(conv_state.dtype))
                 rec_state[slot].copy_(to_v_first(state))
             x = qkv[rows_i]
-            y, _ = short_conv(x, p.conv_weight, cache)
+            y, cache = short_conv(x, p.conv_weight, cache)
             q, k, v = y.split([h * d, h * d, h * d], dim=-1)
             g_log = kda_gate(g_raw[rows_i], p.A_log, p.dt_bias, p.lower_bound)
-            o, _ = kda_recurrent(
+            o, state = kda_recurrent(
                 l2norm(q.reshape(-1, h, d)), l2norm(k.reshape(-1, h, d)), v.reshape(-1, h, d),
                 g_log, torch.sigmoid(beta_raw[rows_i].float()), state, p.scale,
             )
             out[rows_i] = o.to(out.dtype)
+            if k1 == 1:  # the block is the bonus token: committed now
+                conv_state[slot].copy_(cache[:, 1:].to(conv_state.dtype))
+                rec_state[slot].copy_(to_v_first(state))
             # the block becomes the pending prefix (a shorter block fills the leading slots)
             spec.prefix[slot, :k1].copy_(x.to(spec.prefix.dtype))
             spec.g[slot, :k1].copy_(g_raw[rows_i].to(spec.g.dtype))
