@@ -446,7 +446,8 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
     ``PerRequestState``); a chunk of NEW frames is decoded as ``context + new``
     and only the new frames' samples are emitted. Same "decode with left
     context, emit the tail" math as the verified standalone path, but O(1) per
-    chunk instead of re-decoding the whole history. Declares no resources.
+    chunk instead of re-decoding the whole history. Requests whose windows have
+    the same length are decoded in one batched call. Declares no resources.
     """
 
     # Per-request context is keyed by request id -> eager; fp32 codec.
@@ -464,23 +465,50 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
         # ``codec_tokens`` is this chunk's NEW RVQ frames (T_new, num_q); the
         # Talker->Codec connection is a non-overlapping FixedChunkPolicy, so the
         # left context comes from per-request state, not the stream.
-        return NodeInputs(tensor_inputs={"codes": inputs["codec_tokens"][0]})
-
-    def forward(self, graph_walk, engine_inputs, codes=None, **kwargs) -> NameToTensorList:
-        st = self.request_state(engine_inputs.request_ids[0])
-        lc = self.config.eartts.codec_left_context_frames
+        codes = inputs["codec_tokens"][0]
         if codes.dim() == 3:
             codes = codes[0]                                            # (T_new, num_q)
         elif codes.dim() == 1:
             codes = codes.unsqueeze(0)                                  # single frame -> (1, num_q)
-        prev = st.get(self.CONTEXT_KEY)                                 # (n_ctx, num_q) or None
-        n_ctx = 0 if prev is None else prev.shape[0]
-        full = codes if prev is None else torch.cat([prev, codes], dim=0)
-        Tf = full.shape[0]
-        code_len = torch.tensor([Tf], device=full.device)
-        audio, _ = self.codec.decode(full.long().unsqueeze(0), code_len)  # (1, 1, samples)
-        wav = audio.squeeze(1)[0]                                       # (samples,)
-        spf = wav.shape[0] // Tf                                        # samples per frame
-        new_wav = wav[n_ctx * spf:]                                     # emit only the new frames
-        st.add(self.CONTEXT_KEY, full[-lc:].detach())                  # roll the context forward
-        return {"audio_chunk": [(new_wav.clamp(-1, 1) * 32767).to(torch.int16)]}
+        return NodeInputs(tensor_inputs={"codes": codes}, input_seq_len=codes.shape[0])
+
+    def preprocess(self, graph_walk, engine_inputs, inputs):
+        return {"codes": [inp.tensor_inputs["codes"] for inp in inputs]}
+
+    def can_batch(self, batch, model_inputs) -> bool:
+        return True
+
+    def _window(self, rid: str, codes: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """This request's ``context + new`` code window and its context length."""
+        prev = self.request_state(rid).get(self.CONTEXT_KEY)             # (n_ctx, num_q) or None
+        if prev is None:
+            return codes, 0
+        return torch.cat([prev, codes], dim=0), prev.shape[0]
+
+    def forward_batched(self, graph_walk, engine_inputs, codes=None, **kwargs) -> dict[str, NameToTensorList]:
+        lc = self.config.eartts.codec_left_context_frames
+        rids = list(engine_inputs.request_ids)
+        windows = [self._window(rid, c) for rid, c in zip(rids, codes, strict=True)]
+        out: dict[str, NameToTensorList] = {}
+        # one decode per distinct window length (steady state: every request is
+        # at the full context + chunk length, so one call for the whole batch)
+        by_len: dict[int, list[int]] = {}
+        for i, (full, _) in enumerate(windows):
+            by_len.setdefault(full.shape[0], []).append(i)
+        for tf, idxs in by_len.items():
+            batch = torch.stack([windows[i][0] for i in idxs]).long()   # (G, Tf, num_q)
+            code_len = torch.full((len(idxs),), tf, device=batch.device)
+            audio, _ = self.codec.decode(batch, code_len)               # (G, 1, samples)
+            wav = audio.squeeze(1)                                      # (G, samples)
+            spf = wav.shape[1] // tf                                    # samples per frame
+            for row, i in enumerate(idxs):
+                full, n_ctx = windows[i]
+                new_wav = wav[row, n_ctx * spf:]                        # emit only the new frames
+                self.request_state(rids[i]).add(self.CONTEXT_KEY, full[-lc:].detach())
+                out[rids[i]] = {"audio_chunk": [(new_wav.clamp(-1, 1) * 32767).to(torch.int16)]}
+        return out
+
+    def forward(self, graph_walk, engine_inputs, codes=None, **kwargs) -> NameToTensorList:
+        if isinstance(codes, torch.Tensor):                              # one request's window
+            codes = [codes[0] if codes.dim() == 3 else codes.reshape(-1, codes.shape[-1])]
+        return self.forward_batched(graph_walk, engine_inputs, codes=codes)[engine_inputs.request_ids[0]]
