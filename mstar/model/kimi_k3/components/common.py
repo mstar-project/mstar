@@ -32,6 +32,18 @@ class KimiRMSNorm(nn.Module):
         xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
         return self.weight * xf.to(x.dtype)
 
+    def forward_sharded(self, x: torch.Tensor, comm_group, chunk: int) -> torch.Tensor:
+        """The norm of rows spread over ``comm_group``'s ranks, this rank holding columns
+        ``[chunk * rank, chunk * (rank + 1))`` of each (``x [..., chunk]``): the rows' sums of squares
+        are summed over the group (one small fp32 all-reduce) and each rank normalizes its own columns
+        with its slice of the weight. The math of ``forward`` on the whole rows, up to the order of the
+        fp32 sum; what a reduce-scatter's receiver needs where an all-reduce would have handed every
+        rank the whole rows to normalize and then slice."""
+        xf = x.float()
+        ss = comm_group.all_reduce_plain(xf.pow(2).sum(-1, keepdim=True))
+        xf = xf * torch.rsqrt(ss / (chunk * comm_group.world_size) + self.variance_epsilon)
+        return self.weight.narrow(0, chunk * comm_group.rank, chunk) * xf.to(x.dtype)
+
 
 class SiTUAndMul(nn.Module):
     def __init__(self, beta: float = 4.0, linear_beta: float | None = 25.0):
