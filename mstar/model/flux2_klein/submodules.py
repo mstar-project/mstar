@@ -408,10 +408,19 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
         self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
         # compiled: only these batch sizes are ever decoded (larger batches are split into them)
         self._decode_batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
+        # latent shapes (batch, H, W) the compiled decode was warmed with; any other shape decodes eager:
+        # a fresh max-autotune compile inside a request cost 40-100 s (measured on 1024x768 / 512^2 edits)
+        self._warmed: set[tuple[int, int, int]] = set()
         self.warmup(warmup_grids)
 
+    def _decode_chunk(self, latent: torch.Tensor) -> torch.Tensor:
+        key = (int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1]))
+        if self._compiled and key not in self._warmed:
+            return self.vae.decode(latent)
+        return self._decode_one(latent)
+
     def _decode(self, latents: torch.Tensor) -> torch.Tensor:
-        return decode_in_chunks(self._decode_one, latents, self._decode_batch_sizes)
+        return decode_in_chunks(self._decode_chunk, latents, self._decode_batch_sizes)
 
     def warmup(self, grids: Sequence[tuple[int, int]]) -> None:
         """Decode zeros at every decode batch size for every token grid at load, so the compiles
@@ -427,6 +436,7 @@ class KleinVaeDecoderSubmodule(_BatchedRows, NodeSubmodule):
                 )
                 with torch.no_grad():
                     self._decode_one(latent)
+                self._warmed.add((int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1])))
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         grid = self.config.latent_grid(int(fwd_info.step_metadata["height"]), int(fwd_info.step_metadata["width"]))
