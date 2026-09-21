@@ -38,6 +38,16 @@ def test_mismatched_lengths_raise_on_iteration():
         list(ParallelList([1, 2, 3], ["a"]))
 
 
+def test_dict_of_a_parallel_list_needs_an_explicit_iter():
+    """``dict`` probes for a ``.keys()`` METHOD to decide it was handed a
+    mapping. ParallelList.keys is a list attribute, so the probe calls it and
+    raises. The failure is loud but the cause is not obvious."""
+    pl = ParallelList([1, 2], ["a", "b"])
+    with pytest.raises(TypeError, match="not callable"):
+        dict(pl)
+    assert dict(iter(pl)) == {1: "a", 2: "b"}
+
+
 def test_from_dict_round_trips():
     d = {1: "a", 2: "b"}
     pl = ParallelList.from_dict(d)

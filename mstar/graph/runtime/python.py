@@ -1,14 +1,18 @@
 import logging
 from dataclasses import dataclass, field
 
+from mstar.api_server.request_types import APIServerMessage, ResultTensors
+from mstar.communication import wire
 from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import TensorCommunicationManager, TensorStore
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
     NameAndDest,
     NodeAndGraphWalk,
+    TensorPointerInfo,
 )
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -32,7 +36,11 @@ from mstar.graph.special_destinations import (
 )
 from mstar.model.base import WorkerGraph
 from mstar.utils.ipc_format import (
+    ConductorMessage,
+    ConductorMessageType,
+    InputSignals,
     StopLoops,
+    WorkerGraphsDone,
     WorkerMessage,
     WorkerMessageType,
 )
@@ -70,6 +78,14 @@ class GraphRuntimeRequestInfo:
     # Per-loop stop indices. Worker-only, so it lives here rather than riding
     # on CurrentForwardPassInfo across the wire.
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
+    # Buffered between send_outputs calls and flushed onto WORKER_GRAPHS_DONE,
+    # so a persist signal cannot race the message that announces it.
+    pending_persist_signals: list[GraphEdge] = field(default_factory=list)
+    pending_new_token_counts: dict[str, int] = field(default_factory=dict)
+    current_output_chunks: list[str] = field(default_factory=list)
+    output_loop_indices: dict[str, NestedLoopIndices] = field(
+        default_factory=dict
+    )
 
 
 class PythonGraphRuntime(GraphRuntime):
@@ -900,15 +916,135 @@ class PythonGraphRuntime(GraphRuntime):
             elif delta < 0:
                 tensor_store.dereference(uuid, n=-delta)
 
-    def take_completion(self, completion_id: int) -> "CompletionState":
-        """TRANSITIONAL: hands the stored routing to the worker's sender.
+    def peek_completion(self, completion_id: int) -> "CompletionState":
+        """TRANSITIONAL: lets the worker see the routing before it sends.
 
-        send_outputs will consume this internally and it goes away then.
+        Does NOT consume -- send_outputs is what pops the entry. The worker
+        still needs this for the parts that touch real tensors (local
+        streaming, new-token numel) and for what _postprocess_batch returns.
         """
-        return self._completions.pop(completion_id)
+        return self._completions[completion_id]
 
     def send_outputs(
         self,
         input: SendInput,
     ):
-        raise NotImplementedError
+        completion = self._completions.pop(input.completion_id)
+        partition = completion.partition
+        fwd_infos = dict(iter(input.per_request_info))
+        new_token_counts = dict(iter(input.new_token_counts))
+        nested_idxs = dict(iter(input.nested_loop_indices))
+        consumed = (
+            {} if input.stream_tokens_consumed is None
+            else dict(iter(input.stream_tokens_consumed))
+        )
+        partition_done = set(input.partition_done_rids or ())
+        profiling = (
+            {} if input.profiling is None else dict(iter(input.profiling))
+        )
+
+        for rid, routing in completion.routing.items():
+            fwd_info = fwd_infos.get(rid)
+            info = self._request_info.get(rid)
+
+            for worker_id, edges in routing.to_workers.items():
+                self._send_input_signals(rid, worker_id, edges, fwd_info, partition)
+
+            if routing.persist and info is not None:
+                info.pending_persist_signals.extend(routing.persist)
+
+            counts = new_token_counts.get(rid)
+            if counts and info is not None:
+                for name, count in counts.items():
+                    info.pending_new_token_counts[name] = (
+                        info.pending_new_token_counts.get(name, 0) + count
+                    )
+
+            if routing.emit_to_client and info is not None:
+                info.current_output_chunks.extend(
+                    edge.name for edge in routing.emit_to_client
+                )
+                for edge in routing.emit_to_client:
+                    info.output_loop_indices[edge.name] = nested_idxs.get(rid)
+                    self._communicator.send("api_server", APIServerMessage(
+                        message_type="result_tensors",
+                        body=ResultTensors(
+                            request_id=self.get_rid_string(rid),
+                            modality=edge.output_modality,
+                            graph_edge=edge,
+                            loop_indices=nested_idxs.get(rid),
+                            metadata={},
+                        ),
+                    ))
+
+            # streaming_local is NOT here: it feeds a StreamBuffer, which holds
+            # real tensors and so stays on the Python side. RouteOutput's
+            # local_streaming_tensor_idxs is how the caller finds those.
+            for worker_id, edges in routing.streaming_to_workers.items():
+                self._send_input_signals(rid, worker_id, edges, fwd_info, partition)
+
+            if routing.completed_worker_graph_ids and info is not None:
+                self._send_worker_graphs_done(
+                    rid, routing, info, fwd_info, partition,
+                    stream_tokens_consumed=consumed.get(rid, {}),
+                    partition_done=rid in partition_done,
+                    profiling=profiling.get(rid),
+                )
+
+    def _send_input_signals(
+        self, rid: int, worker_id: str, edges: list[GraphEdge],
+        fwd_info: CurrentForwardPassInfo | None, partition: str,
+    ):
+        self._communicator.send(worker_id, WorkerMessage(
+            message_type=WorkerMessageType.INPUT_SIGNALS,
+            body=InputSignals(
+                request_id=self.get_rid_string(rid),
+                inputs=edges,
+                request_info=fwd_info,
+                partition_name=partition,
+            ),
+        ))
+
+    def _send_worker_graphs_done(
+        self, rid: int, routing: NodeOutputRouting,
+        info: GraphRuntimeRequestInfo,
+        fwd_info: CurrentForwardPassInfo | None,
+        partition: str,
+        stream_tokens_consumed: dict[str, int],
+        partition_done: bool,
+        profiling: bytes | None,
+    ):
+        persist_signals: dict[str, list[TensorPointerInfo]] = {}
+        for edge in info.pending_persist_signals:
+            persist_signals[edge.name] = edge.tensor_info
+        info.pending_persist_signals = []
+        new_token_counts = info.pending_new_token_counts
+        info.pending_new_token_counts = {}
+        output_signal_names = list(info.current_output_chunks)
+        info.current_output_chunks.clear()
+
+        rx_info, tx_info, graph_timings = [], [], {}
+        if profiling is not None:
+            rx_info, tx_info, graph_timings = wire.decode(profiling)
+
+        self._communicator.send("conductor", ConductorMessage(
+            message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
+            body=WorkerGraphsDone(
+                request_id=self.get_rid_string(rid),
+                worker_graph_ids=routing.completed_worker_graph_ids,
+                is_first_tp_rank=routing.is_first_tp_rank,
+                persist_signals=persist_signals,
+                new_token_counts=new_token_counts,
+                output_signal_names=output_signal_names,
+                resource_publish_info=(
+                    {} if fwd_info is None else fwd_info.resource_publish_info
+                ),
+                partition_name=partition,
+                partition_done=partition_done,
+                stream_tokens_consumed=stream_tokens_consumed,
+                output_loop_indices=info.output_loop_indices,
+                graph_timings=graph_timings,
+                rx_info=rx_info,
+                tx_info=tx_info,
+            ),
+        ))

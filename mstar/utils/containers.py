@@ -48,6 +48,18 @@ TK = TypeVar('TK')
 TV = TypeVar('TV')
 
 class ParallelList(NamedTuple, Generic[TK, TV]):
+    """Struct-of-arrays pairing, so a batch crosses a language boundary as two
+    flat lists instead of a dict of objects.
+
+    Two sharp edges come from the field names plus the custom ``__iter__``:
+
+    * ``dict(pl)`` does NOT work. ``dict`` probes for a ``.keys()`` method to
+      decide whether it was handed a mapping; here ``keys`` is a list
+      attribute, so it raises ``'list' object is not callable``. Use
+      ``dict(iter(pl))``.
+    * ``k, v = pl`` does not give the two lists -- see ``__iter__``.
+    """
+
     keys: list[TK]
     values: list[TV]
 

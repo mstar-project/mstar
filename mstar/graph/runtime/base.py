@@ -156,6 +156,10 @@ class SendInput(NamedTuple):
     # msgpack without owning the type.
     per_request_info: ParallelList[int, CurrentForwardPassInfo]
     new_token_counts: ParallelList[int, dict[str, int]]
+    # Snapshotted BEFORE the completion that produced this batch, because
+    # mark_node_complete and stop_loops both advance loop state -- the runtime
+    # cannot re-derive the pre-completion value at send time.
+    nested_loop_indices: ParallelList[int, NestedLoopIndices]
 
     # WORKER_GRAPHS_DONE fields the runtime cannot derive, so they come in here.
     # rid -> {edge name -> tokens consumed}; from StreamBuffer._consumed

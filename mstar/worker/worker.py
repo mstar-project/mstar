@@ -15,7 +15,7 @@ from time import sleep
 
 import torch
 
-from mstar.api_server.request_types import APIServerMessage, ResultTensors
+from mstar.communication import wire
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
@@ -32,8 +32,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.graph_io import format_graph_edge_list
-from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.graph.runtime.base import RouteInput, RouteOutput
+from mstar.graph.runtime.base import RouteInput, RouteOutput, SendInput
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
@@ -55,7 +54,6 @@ from mstar.utils.ipc_format import (
     TensorReceived,
     TPNoSpeculation,
     UnpersistTensors,
-    WorkerGraphsDone,
     WorkerMessage,
     WorkerMessageType,
 )
@@ -1138,6 +1136,52 @@ class Worker:
             [batch.request_to_worker_graph[rid] for rid in rids],
         )
 
+    def _count_new_tokens(self, routing: NodeOutputRouting) -> dict[str, int]:
+        """Token counts for the conductor. Needs numel(), hence the tensors."""
+        counts: dict[str, int] = {}
+        for signal in routing.new_token_outputs:
+            if signal.name in counts:
+                continue  # don't double-count new tokens
+            counts[signal.name] = sum(
+                self.tensor_manager.get_tensor(info.uuid).numel()
+                for info in signal.tensor_info
+            )
+        return counts
+
+    def _stream_consumption(self, rid: int) -> dict[str, int]:
+        req_info = self.worker_graphs_manager.per_request_info.get(rid)
+        if req_info is None:
+            return {}
+        return {
+            edge_name: sbuf._consumed
+            for edge_name, sbuf in req_info.stream_buffers.items()
+        }
+
+    def _partition_done(
+        self, rid: int, batch_N: PendingBatch, routing: NodeOutputRouting,
+    ) -> bool:
+        """A speculatively-scheduled node has not really finished the
+        partition, so it must not report done."""
+        req_info = self.worker_graphs_manager.per_request_info.get(rid)
+        if req_info is None:
+            return False
+        node = batch_N.batch.node_objects.get(rid)
+        speculative = node is not None and node._speculatively_scheduled
+        return (
+            req_info.per_partition_info[batch_N.partition].stream_partition_done
+            and not speculative
+        )
+
+    def _profiling_payloads(self, rids: list[int]) -> ParallelList:
+        """rx/tx/timings, msgpacked so the runtime need not own the types."""
+        return ParallelList(rids, [
+            wire.encode([
+                self.tensor_manager.get_rx_info(rid),
+                self.tensor_manager.get_tx_info(rid),
+                self.profile_info.per_rid_graph_timings.get(rid, {}),
+            ]) for rid in rids
+        ])
+
     def _register_outputs(
         self,
         route_output: RouteOutput,
@@ -1166,131 +1210,6 @@ class Worker:
             skip_cuda_sync=True,
         )
 
-
-    def _send_outputs(
-        self, rid: str, outputs: NodeOutputRouting,
-        nested_loop_indices: NestedLoopIndices,
-        graph_walk: str | None = None,
-        partition_name: str | None = None,
-        node_speculatively_scheduled: bool=False
-    ) -> None:
-        """
-        Send outputs to other workers and to the conductor.
-        Persist signals and new-token counts are buffered and sent together
-        with the WORKER_GRAPHS_DONE message to avoid race conditions.
-        """
-        if graph_walk is None:
-            graph_walk = self.worker_graphs_manager.get_graph_walk(rid, partition_name)
-        for worker_id, edges in outputs.to_workers.items():
-            message = WorkerMessage(
-                message_type=WorkerMessageType.INPUT_SIGNALS,
-                body=InputSignals(
-                    request_id=self._rid_str(rid),
-                    inputs=edges,
-                    request_info=self.worker_graphs_manager.get_fwd_info(rid, partition_name),
-                    partition_name=partition_name
-                ),
-            )
-            self.communicator.send(worker_id, message)
-
-        # Buffer persist signals for this request
-        if outputs.persist:
-            self.worker_graphs_manager.buffer_persist_signals(
-                rid, outputs.persist
-            )
-
-        if outputs.new_token_outputs:
-            name_to_count: dict[str, int] = {}
-            for signal in outputs.new_token_outputs:
-                if signal.name in name_to_count:
-                    continue  # don't double-count new tokens
-                count = 0
-                for tensor_info in signal.tensor_info:
-                    tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
-                    count += tensor.numel()
-                name_to_count[signal.name] = count
-            self.worker_graphs_manager.buffer_new_token_counts(
-                rid, name_to_count
-            )
-
-        if outputs.emit_to_client:
-            self.worker_graphs_manager.buffer_output_signals(
-                rid, outputs.emit_to_client
-            )
-            for graph_edge in outputs.emit_to_client:
-                self.worker_graphs_manager.register_output_loop_indices(
-                    rid=rid, loop_indices=nested_loop_indices,
-                    output_name=graph_edge.name
-                )
-                message = APIServerMessage(
-                    message_type="result_tensors",
-                    body=ResultTensors(
-                        request_id=self._rid_str(rid),
-                        modality=graph_edge.output_modality,
-                        graph_edge=graph_edge,
-                        loop_indices=nested_loop_indices,
-                        metadata={}
-                    )
-                )
-                self.communicator.send("api_server", message)
-
-        # Handle streaming edges
-        # Local streaming: route to StreamBuffer
-        req_info = self.worker_graphs_manager.per_request_info[rid]
-        for edge in outputs.streaming_local:
-            stream_buf = req_info.stream_buffers[edge.name]
-            for info in edge.tensor_info:
-                stream_buf.pre_read_register(info.uuid)
-            self._route_streaming_tensor(rid, edge)
-
-        # Remote streaming: send to destination workers
-        for worker_id, edges in outputs.streaming_to_workers.items():
-            message = WorkerMessage(
-                message_type=WorkerMessageType.INPUT_SIGNALS,
-                body=InputSignals(
-                    request_id=self._rid_str(rid),
-                    inputs=edges,
-                    request_info=self.worker_graphs_manager.get_fwd_info(rid, partition_name),
-                    partition_name=partition_name
-                ),
-            )
-            self.communicator.send(worker_id, message)
-        if outputs.completed_worker_graph_ids:
-            fwd_info = self.worker_graphs_manager.get_fwd_info(rid, partition_name)
-            if partition_name is None:
-                partition_name = getattr(fwd_info, 'partition_name', 'default')
-            req_info = self.worker_graphs_manager.per_request_info.get(rid)
-            p_done = (
-                req_info.per_partition_info[partition_name].stream_partition_done \
-                    and not node_speculatively_scheduled
-            ) if req_info else False
-
-            # Collect stream consumption info
-            stream_consumed = {}
-            if req_info:
-                for edge_name, sbuf in req_info.stream_buffers.items():
-                    stream_consumed[edge_name] = sbuf._consumed
-
-            message = ConductorMessage(
-                message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
-                body=WorkerGraphsDone(
-                    request_id=self._rid_str(rid),
-                    worker_graph_ids=outputs.completed_worker_graph_ids,
-                    is_first_tp_rank=outputs.is_first_tp_rank,
-                    persist_signals=self.worker_graphs_manager.flush_persist_signals(rid),
-                    new_token_counts=self.worker_graphs_manager.flush_new_token_counts(rid),
-                    output_signal_names=self.worker_graphs_manager.flush_output_signals(rid),
-                    resource_publish_info=self.worker_graphs_manager.get_publish_info(rid, partition_name),
-                    partition_name=partition_name,
-                    partition_done=p_done,
-                    stream_tokens_consumed=stream_consumed,
-                    output_loop_indices=self.worker_graphs_manager.get_output_loop_indices(rid),
-                    graph_timings=self.profile_info.per_rid_graph_timings.get(rid, {}),
-                    rx_info=self.tensor_manager.get_rx_info(rid),
-                    tx_info=self.tensor_manager.get_tx_info(rid),
-                ),
-            )
-            self.communicator.send("conductor", message)
 
     # ------------------------------------------------------------------
     # Main loop — async scheduling
@@ -2384,7 +2303,7 @@ class Worker:
             ),
             self.tensor_manager.tensor_store,
         )
-        completion = self._rid_runtime.take_completion(
+        completion = self._rid_runtime.peek_completion(
             route_output.completion_id
         )
         routing_per_request = completion.routing
@@ -2414,14 +2333,51 @@ class Worker:
                 batch_N.node_batch.request_ids,
                 batch_N.node_batch.exec_timings,
             )
+
+        # Local streaming stays here: a StreamBuffer holds real tensors, so it
+        # cannot move behind the runtime's contract.
         for rid, routing in routing_per_request.items():
-            self._send_outputs(
-                rid, routing,
-                nested_loop_indices=per_req_nested_idxs[rid],
-                graph_walk=batch_N.graph_walk,
-                partition_name=batch_N.partition,
-                node_speculatively_scheduled=batch_N.batch.node_objects[rid]._speculatively_scheduled
-            )
+            req_info = self.worker_graphs_manager.per_request_info[rid]
+            for edge in routing.streaming_local:
+                stream_buf = req_info.stream_buffers[edge.name]
+                for info in edge.tensor_info:
+                    stream_buf.pre_read_register(info.uuid)
+                self._route_streaming_tensor(rid, edge)
+
+        send_rids = list(routing_per_request)
+        self._rid_runtime.send_outputs(SendInput(
+            completion_id=route_output.completion_id,
+            per_request_info=ParallelList(
+                send_rids,
+                [
+                    self.worker_graphs_manager.get_fwd_info(
+                        rid, batch_N.partition
+                    ) for rid in send_rids
+                ],
+            ),
+            # numel() needs the tensors, so the counting stays on this side.
+            new_token_counts=ParallelList(
+                send_rids,
+                [
+                    self._count_new_tokens(routing_per_request[rid])
+                    for rid in send_rids
+                ],
+            ),
+            nested_loop_indices=ParallelList(
+                send_rids,
+                [per_req_nested_idxs[rid] for rid in send_rids],
+            ),
+            stream_tokens_consumed=ParallelList(
+                send_rids,
+                [self._stream_consumption(rid) for rid in send_rids],
+            ),
+            partition_done_rids=[
+                rid for rid in send_rids
+                if self._partition_done(rid, batch_N, routing_per_request[rid])
+            ],
+            profiling=self._profiling_payloads(send_rids) if self.enable_prof
+            else None,
+        ))
 
         if self.enable_nvtx:
             range_pop(synchronize=False)

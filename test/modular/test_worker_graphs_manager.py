@@ -18,10 +18,12 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.graph.runtime.base import RouteInput
+from mstar.graph.runtime.base import RouteInput, SendInput
 from mstar.graph.runtime.python import PythonGraphRuntime
+from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
+from mstar.utils.ipc_format import ConductorMessageType
 from mstar.worker.node_manager_utils import (
     WorkerGraphsManager,
 )
@@ -302,7 +304,6 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
     SNAC) never reported done and the conductor hung.
     """
     # Build a 1-node wg whose single output goes to EMPTY_DESTINATION.
-    from mstar.graph.special_destinations import EMPTY_DESTINATION
     single_node_graph = GraphNode(
         name="prefill",
         input_names={"prompt"},
@@ -503,7 +504,7 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
         ),
         store,
     )
-    completion = runtime.take_completion(out.completion_id)
+    completion = runtime.peek_completion(out.completion_id)
 
     # Each rid's edges carry exactly its own uuids, per signal.
     for rid, own in ((rid_a, a), (rid_b, b)):
@@ -536,8 +537,93 @@ def test_route_batch_parks_routing_under_a_fresh_completion_id():
         store,
     )
     assert out.completion_id not in (0,), "ids start above the unset sentinel"
-    state = runtime.take_completion(out.completion_id)
+    state = runtime.peek_completion(out.completion_id)
     assert state.node_name == "prefill" and state.graph_walk == "decode"
-    # Taken once: a second take must not resurrect it.
+    # peek does not consume; send_outputs is what pops the entry, so peeking
+    # twice has to keep working.
+    assert runtime.peek_completion(out.completion_id) is state
+
+
+# --- send_outputs -------------------------------------------------------------
+
+class _RecordingCommunicator:
+    def __init__(self):
+        self.sent: list[tuple[str, object]] = []
+
+    def send(self, entity_id, msg=None, **kwargs):
+        self.sent.append((entity_id, msg if msg is not None else kwargs))
+
+
+def _route_one(runtime, mgr, rid, store, minter, signal="token"):
+    import torch
+
+    uuids = _store_outputs(store, minter, rid, {signal: [torch.ones(2)]})[signal]
+    out = runtime.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk="decode", node_name="prefill",
+            output_signals=[signal],
+            wg_ids=ParallelList([rid], [0]),
+            tensors=uuids, num_tensors=[1],
+        ),
+        store,
+    )
+    return out, uuids
+
+
+def _send_input(runtime, rid, completion_id, fwd_info):
+    return SendInput(
+        completion_id=completion_id,
+        per_request_info=ParallelList([rid], [fwd_info]),
+        new_token_counts=ParallelList([rid], [{}]),
+        nested_loop_indices=ParallelList([rid], [None]),
+    )
+
+
+def test_send_outputs_consumes_the_completion():
+    """complete_and_route_batch parks the routing and send_outputs is what
+    frees it. The worker peeks in between, so a double-pop here would only
+    show up on the live path."""
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+    runtime._communicator = _RecordingCommunicator()
+    store, minter = TensorStore(), TensorUuidMinter("worker_0")
+
+    out, _ = _route_one(runtime, mgr, rid, store, minter)
+    # Peeking must not consume.
+    runtime.peek_completion(out.completion_id)
+    runtime.peek_completion(out.completion_id)
+
+    runtime.send_outputs(_send_input(runtime, rid, out.completion_id, _fwd_info("decode")))
     with pytest.raises(KeyError):
-        runtime.take_completion(out.completion_id)
+        runtime.peek_completion(out.completion_id)
+
+
+def test_persist_signals_are_buffered_until_a_worker_graph_finishes():
+    """They ride WORKER_GRAPHS_DONE rather than going out on their own, so a
+    persist cannot race the message announcing it."""
+    single = GraphNode(
+        name="prefill", input_names={"prompt"},
+        outputs=[GraphEdge(name="token", next_node=EMPTY_DESTINATION,
+                           persist=True)],
+    )
+    mgr, runtime, rid = _build(single, 0, "decode", nodes={"prefill"})
+    mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+    comm = _RecordingCommunicator()
+    runtime._communicator = comm
+    store, minter = TensorStore(), TensorUuidMinter("worker_0")
+
+    out, uuids = _route_one(runtime, mgr, rid, store, minter)
+    runtime.send_outputs(_send_input(runtime, rid, out.completion_id, _fwd_info("decode")))
+
+    wgd = [
+        m for e, m in comm.sent
+        if e == "conductor"
+        and m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE
+    ]
+    assert len(wgd) == 1, "the finished worker graph must report exactly once"
+    assert wgd[0].body.persist_signals["token"][0].uuid == uuids[0]
+    # Flushed, so a second pass does not resend them.
+    assert runtime._request_info[rid].pending_persist_signals == []

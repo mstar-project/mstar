@@ -12,10 +12,8 @@ from mstar.graph.base import (
     NameAndDest,
     NodeAndGraphWalk,
     NodeCompletionOutput,
-    TensorPointerInfo,
 )
 from mstar.graph.graph_io import WorkerGraphIO
-from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import WorkerGraph
 from mstar.streaming.stream_buffer import StreamBuffer
 
@@ -201,8 +199,6 @@ class PerRequestInfo:
     - graph_walk_worker_graph_ids: worker graph IDs used in the current graph walk (e.g., if there
         is a prefill LLM worker graph and decode LLM worker graph and we are in decode,
         this list only includes the decode worker graph)
-    - pending_persist_signals: buffered persist signals awaiting flush on
-        WORKER_GRAPHS_DONE
     - partition_fwd_infos: per-partition forward info for the colocated case
         where multiple partitions run on the same worker
     - tensors: TBD
@@ -212,11 +208,7 @@ class PerRequestInfo:
     worker_graph_ids: list[int] # for this worker
     sharding_config: ShardingConfig
 
-    pending_persist_signals: list[GraphEdge] = field(default_factory=list)
-    pending_new_token_counts: dict[str, int] = field(default_factory=dict)
     stream_buffers: dict[str, StreamBuffer] = field(default_factory=dict)  # edge_name -> StreamBuffer
-    current_output_chunks: list[str] = field(default_factory=list)
-    output_loop_indices: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
     per_partition_info: dict[str, PerPartitionInfo] = field(default_factory=dict)
 
@@ -334,16 +326,6 @@ class WorkerGraphsManager:
                 )
         return inputs
 
-    def register_output_loop_indices(
-        self, rid: int,
-        loop_indices: NestedLoopIndices,
-        output_name: str
-    ):
-        self.per_request_info[rid].output_loop_indices[output_name] = loop_indices
-
-    def get_output_loop_indices(self, rid: int):
-        return self.per_request_info[rid].output_loop_indices
-
     def add_request(
         self, rid: int,
         partition_worker_graph_ids: list[int], # for this worker's worker graphs
@@ -420,49 +402,3 @@ class WorkerGraphsManager:
         # Queue teardown belongs to PythonGraphRuntime.remove_request.
         self.per_request_info.pop(rid, None)
 
-    def buffer_persist_signals(
-            self, rid: int,
-            signals: list[GraphEdge]
-        ):
-        """Extend the pending persist signals for a request."""
-        self.per_request_info[rid].pending_persist_signals.extend(signals)
-
-    def buffer_new_token_counts(
-        self, rid: int, counts: dict[str, int]
-    ) -> None:
-        """Update the pending new token count for a request."""
-        pending = self.per_request_info[rid].pending_new_token_counts
-        for name, count in counts.items():
-            pending[name] = pending.get(name, 0) + count
-
-    def buffer_output_signals(self, rid: int, out_signals: list[GraphEdge]):
-        self.per_request_info[rid].current_output_chunks += [
-            signal.name for signal in out_signals
-        ]
-
-    def flush_persist_signals(self, rid: int) -> dict[str, list[TensorPointerInfo]]:
-        """Pop and return all buffered persist signals for a request.
-
-        Converts from internal list[GraphEdge] to the dict format
-        expected by the conductor (name -> list[TensorPointerInfo]).
-        """
-        info = self.per_request_info[rid]
-        signals = info.pending_persist_signals
-        info.pending_persist_signals = []
-        result: dict[str, list[TensorPointerInfo]] = {}
-        for edge in signals:
-            result[edge.name] = edge.tensor_info
-        return result
-
-    def flush_new_token_counts(self, rid: int) -> dict[str, int]:
-        """Pop and return all buffered new token counts for a request."""
-        info = self.per_request_info[rid]
-        counts = info.pending_new_token_counts
-        info.pending_new_token_counts = {}
-        return counts
-
-    def flush_output_signals(self, rid: int) -> list[str]:
-        info = self.per_request_info[rid]
-        out_chunks = list(info.current_output_chunks)  # copy before clearing
-        info.current_output_chunks.clear()
-        return out_chunks
