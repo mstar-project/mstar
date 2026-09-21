@@ -714,8 +714,8 @@ pub struct SendPlan {
     #[pyo3(get)] pub persist: Vec<(u32, String, Vec<u64>)>,
     /// (rid, signal, modality, uuids)
     #[pyo3(get)] pub emit: Vec<(u32, String, String, Vec<u64>)>,
-    /// (rid, finished worker graph ids)
-    #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>)>,
+    /// (rid, finished worker graph ids, is_first_tp_rank)
+    #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool)>,
 }
 
 /// One `NestedLoopIndices` as Python hands it over.
@@ -758,6 +758,10 @@ pub struct Completion {
     pub wg: WgIndex,
     pub routing: FxHashMap<u32, Vec<RoutedEdge>>,
     pub completed_wgs: FxHashMap<u32, Vec<u32>>,
+    /// Per rid: is this rank the TP group's rank 0 for the completed node?
+    /// Computed at completion, not at send: the conductor counts one report
+    /// per request, so every rank claiming rank 0 multiplies it by tp_size.
+    pub first_tp_rank: FxHashMap<u32, bool>,
 }
 
 /// `SpeculationPrepInput`.
@@ -1565,6 +1569,7 @@ impl GraphRuntime {
         let mut out = RouteOut::default();
         let mut routing: FxHashMap<u32, Vec<RoutedEdge>> = FxHashMap::default();
         let mut completed_wgs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        let mut first_tp_rank: FxHashMap<u32, bool> = FxHashMap::default();
         let mut staged: FxHashSet<u64> = FxHashSet::default();
         let mut cursor = 0usize;
 
@@ -1600,6 +1605,18 @@ impl GraphRuntime {
                 continue;
             };
             let (edges, _filtered, freed_inputs) = state.complete(node, &out_tensors);
+
+            // No group means singleton / non-TP, which is rank 0. The
+            // conductor counts one report per request, so a rank wrongly
+            // claiming rank 0 multiplies that count by tp_size.
+            let node_sym = self.interner.get(&input.node_name);
+            first_tp_rank.insert(
+                rid,
+                self.info(rid)
+                    .zip(node_sym)
+                    .and_then(|(i, n)| i.shard.as_ref()?.group_of(n, walk_sym))
+                    .is_none_or(|g| g.tp_rank == 0),
+            );
 
             // Sweep EVERY worker graph this request runs in this walk, not
             // just the one owning the completed node: a wg can become done
@@ -1756,6 +1773,7 @@ impl GraphRuntime {
                 wg,
                 routing,
                 completed_wgs,
+                first_tp_rank,
             },
         );
         Ok(out)
@@ -1872,6 +1890,58 @@ impl GraphRuntime {
 
     /// The snapshot this rank holds, for the STOP_LOOPS it sends.
     #[allow(clippy::type_complexity)]
+    /// Python's `WorkerGraphIO.get_nested_loop_idxs_for_node`: the loop
+    /// context a node runs in, as (order, indices, wg_fwd_pass_idx).
+    ///
+    /// Snapshotted BEFORE the completion that produced a batch -- completing
+    /// and stopping loops both advance `curr_iter`, so it cannot be
+    /// re-derived at send time.
+    fn get_nested_loop_idxs_for_node(
+        &self, rid: u32, partition: &str, node_name: &str,
+    ) -> PyResult<(Vec<String>, Vec<(String, u32)>, u32)> {
+        let Some(part) = self.interner.get(partition) else {
+            return Err(PyValueError::new_err("unknown partition"));
+        };
+        let Some(walk) = self.info(rid).and_then(|i| Some(i.partitions.get(&part)?.graph_walk))
+        else {
+            return Err(PyValueError::new_err("request not in that partition"));
+        };
+        let Some(node_sym) = self.interner.get(node_name) else {
+            return Err(PyValueError::new_err("unknown node"));
+        };
+        let Some(&wg) = self.node_owner.get(&(walk, node_sym)) else {
+            return Err(PyValueError::new_err("no worker graph for that node"));
+        };
+        let Some(state) = self.state(wg, rid) else {
+            return Err(PyValueError::new_err("request not in that worker graph"));
+        };
+        let g = self.g(wg);
+        let fwd = state.num_times_run;
+
+        // A node outside every loop has no context, only the pass index.
+        let Some(lid) = g.node(g.by_name[&node_sym]).loop_id else {
+            return Ok((vec![], vec![], fwd));
+        };
+        let order = g
+            .loop_order(lid)
+            .into_iter()
+            .map(|l| self.interner.name(g.lp(l).name).to_string())
+            .collect();
+        // Every loop in the graph, as Python's get_loop_indices returns.
+        let indices = g
+            .loops
+            .iter()
+            .enumerate()
+            .map(|(i, lp)| {
+                (
+                    self.interner.name(lp.name).to_string(),
+                    state.loop_iter(i as LoopId),
+                )
+            })
+            .collect();
+        Ok((order, indices, fwd))
+    }
+
     fn get_loop_stop_times(
         &self, rid: u32,
     ) -> Vec<(String, Vec<String>, Vec<(String, u32)>, u32)> {
@@ -1948,7 +2018,11 @@ impl GraphRuntime {
             }
             if let Some(wgs) = c.completed_wgs.get(&rid) {
                 let _ = &g;
-                plan.completed.push((rid, wgs.clone()));
+                plan.completed.push((
+                    rid,
+                    wgs.clone(),
+                    c.first_tp_rank.get(&rid).copied().unwrap_or(true),
+                ));
             }
         }
         Ok(plan)

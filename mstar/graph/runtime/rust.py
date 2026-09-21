@@ -579,6 +579,18 @@ class RustGraphRuntime(GraphRuntime):
             ],
         )
 
+    def get_nested_loop_idxs_for_node(
+        self, rid: int, partition: str, node_name: str
+    ) -> NestedLoopIndices:
+        order, indices, fwd = self._rust.get_nested_loop_idxs_for_node(
+            rid, partition, node_name,
+        )
+        return NestedLoopIndices(
+            loop_name_order=order,
+            loop_indices=dict(indices),
+            wg_fwd_pass_idx=fwd,
+        )
+
     def _loop_stop_times(self, rid: int) -> dict[str, NestedLoopIndices]:
         return {
             name: NestedLoopIndices(
@@ -648,7 +660,7 @@ class RustGraphRuntime(GraphRuntime):
             for name, n in (cnts or {}).items():
                 pending[name] = pending.get(name, 0) + n
 
-        for rid, wg_ids in plan.completed:
+        for rid, wg_ids, is_first_tp_rank in plan.completed:
             rx, tx, timings = [], [], {}
             if profiling.get(rid) is not None:
                 rx, tx, timings = wire.decode(profiling[rid])
@@ -658,7 +670,7 @@ class RustGraphRuntime(GraphRuntime):
                 body=WorkerGraphsDone(
                     request_id=self.get_rid_string(rid),
                     worker_graph_ids=wg_ids,
-                    is_first_tp_rank=True,
+                    is_first_tp_rank=is_first_tp_rank,
                     persist_signals=self._pending_persist.pop(rid, {}),
                     new_token_counts=self._pending_new_tokens.pop(rid, {}),
                     output_signal_names=self._buffered_outputs.pop(rid, []),
