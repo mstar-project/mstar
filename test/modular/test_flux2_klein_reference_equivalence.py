@@ -221,3 +221,47 @@ def test_edit_trajectory_and_image_match_oracle(model, meta):
     psnr = _psnr(image, _load_png(ORACLE_DIR / "edit" / "image.png"))
     print(f"edit image PSNR={psnr:.2f} dB")
     assert psnr >= MIN_PSNR_DB
+
+
+def test_multi_reference_edit_matches_oracle(model, meta):
+    """Edit conditioned on several references (``record_oracle.py --refs N``; the second one is non-square):
+    every reference's latents in request order, the ids ``(10(i+1), h, w, 0)`` per grid, every step and the image."""
+    if "edit_multi_prompt" not in meta:
+        pytest.skip("oracle recorded without --refs N")
+    text: KleinTextEncoderSubmodule = model.get_submodule("text_encoder", device=DEVICE)
+    encoder: KleinVaeEncoderSubmodule = model.get_submodule("vae_encoder", device=DEVICE)
+    dit: KleinDenoiseSubmodule = model.get_submodule("dit", device=DEVICE)
+    decoder: KleinVaeDecoderSubmodule = model.get_submodule("vae_decoder", device=DEVICE)
+    references = [model.load_image(str(ORACLE_DIR / rel), "cpu").data for rel in meta["edit_multi_references"]]
+    ref_grids = [model.config.latent_grid(ref.shape[1], ref.shape[2]) for ref in references]
+    assert len(ref_grids) >= 2 and len({tuple(g) for g in ref_grids}) >= 2, "expected references of different sizes"
+    ids, mask = model.tokenize(meta["edit_multi_prompt"])
+    with torch.no_grad():
+        embeds = text.forward(IMAGE_EDIT_WALK, _engine_inputs(), text_inputs=ids[None],
+                              text_mask=mask[None])[TEXT_EMBEDS][0]
+        expected_embeds = torch.load(ORACLE_DIR / "edit_multi" / "prompt_embeds.pt")
+        assert (embeds.cpu().float() - expected_embeds.float()).abs().max().item() <= TEXT_MAX_ABS
+        images = {f"image_{i}": ref for i, ref in enumerate(references)}
+        ref_latents = encoder.forward(IMAGE_EDIT_WALK, _engine_inputs(), **images)[REF_LATENTS][0]
+        assert ref_latents.shape == (1, sum(h * w for h, w in ref_grids), model.config.transformer.in_channels)
+        inputs = {TEXT_EMBEDS: [embeds], REF_LATENTS: [ref_latents]}
+        latents, worst = None, 0.0
+        for k in range(meta["steps"]):
+            info = _fwd_info(meta, k, meta["edit_multi_seed"], ref_grids=ref_grids, walk=IMAGE_EDIT_WALK)
+            node_inputs = dit.prepare_inputs(IMAGE_EDIT_WALK, info,
+                                             {**inputs, **({LATENTS: [latents]} if latents is not None else {})})
+            kwargs = dit.preprocess(IMAGE_EDIT_WALK, _engine_inputs(), [node_inputs])
+            latents = dit.forward(IMAGE_EDIT_WALK, _engine_inputs(), **kwargs)[LATENTS][0]
+            expected = torch.load(ORACLE_DIR / "edit_multi" / f"latents_step_{k:03d}.pt")[0]
+            diff = (latents.cpu().float() - expected.float()).abs().max().item()
+            worst = max(worst, diff)
+            print(f"multi-ref edit step {k}: latents max_abs={diff:.3e}")
+        assert worst <= STEP_MAX_ABS, f"multi-reference edit diverges from the oracle (max {worst:.3e})"
+        image = decoder.forward(
+            IMAGE_EDIT_WALK, _engine_inputs(), latents=latents[None],
+            grid=model.config.latent_grid(meta["height"], meta["width"]),
+        )["image_output"][0][0].cpu()
+    dit.cleanup_request("oracle")
+    psnr = _psnr(image, _load_png(ORACLE_DIR / "edit_multi" / "image.png"))
+    print(f"multi-ref edit image PSNR={psnr:.2f} dB (references {[tuple(g) for g in ref_grids]})")
+    assert psnr >= MIN_PSNR_DB
