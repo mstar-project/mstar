@@ -19,11 +19,12 @@ remapper) so weights load by name with no per-tensor renames:
 
 Design notes:
   * NoPE — attention layers apply no RoPE; we subclass ``Attention`` and make
-    ``_apply_rope`` a no-op.
-  * Mamba state (Option A) — the engine has no SSM-state pool yet, so conv/ssm
-    state lives in the submodule's per-request ``PerRequestState`` and is
-    threaded here via ``MambaStateAccessor``. Eager-only; the Option-B pool
-    (batching + CUDA graphs) is the Phase-10 follow-up.
+    ``_apply_rope`` a no-op. The layers bind the ``NANO_KV`` / ``NANO_ATTN``
+    resources the model declares (no position resource).
+  * Mamba state — conv/ssm state lives in the submodule's per-request
+    ``PerRequestState`` and is threaded here via ``MambaStateAccessor``.
+    Eager-only; moving it onto the engine's recurrent-state pool (batching +
+    CUDA graphs) is the next step.
 
 The Mamba-2 forward is a pure-PyTorch reference scan (no ``mamba_ssm`` kernel
 dependency) — correct but not fast; the kernel fast path is a later swap.
@@ -37,10 +38,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.cache_manager import BatchedCacheManager
 from mstar.model.components.attention import Attention
 from mstar.model.components.norm import RMSNorm
-from mstar.model.nemotron_duplex.config import NanoConfig
+from mstar.model.nemotron_duplex.config import NANO_ATTN, NANO_KV, NanoConfig
 
 # ---------------------------------------------------------------------------
 # Per-request Mamba state plumbing (Option A: submodule-owned state)
@@ -141,7 +141,7 @@ def _rms_fp32(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor
 class NemotronHAttention(Attention):
     """GQA self-attention with NoPE (Nemotron-H applies no positional encoding)."""
 
-    def _apply_rope(self, q, k, cache_handle):  # noqa: ARG002 - override to disable RoPE
+    def _apply_rope(self, q, k, label):  # noqa: ARG002 - override to disable RoPE
         return q, k
 
     def offline_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -209,7 +209,7 @@ class NemotronHMLP(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
 
-    def forward(self, hidden_states: torch.Tensor, cache_handle=None, mamba_state=None) -> torch.Tensor:  # noqa: ARG002
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.down_proj(torch.square(F.relu(self.up_proj(hidden_states))))
 
 
@@ -323,7 +323,6 @@ class Mamba2Mixer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_handle: BatchedCacheManager | None = None,  # noqa: ARG002
         mamba_state: MambaStateAccessor | None = None,
     ) -> torch.Tensor:
         """Engine forward over a packed batch ``hidden_states`` [sum(seq_lens), H].
@@ -545,6 +544,9 @@ def _build_mixer(config: NanoConfig, kind: str, layer_idx: int) -> nn.Module:
             o_bias=config.attention_bias,
             qk_norm=False,
             rms_norm_eps=config.rms_norm_eps,
+            attn_key=NANO_ATTN,
+            kv_key=NANO_KV,
+            pos_key=None,  # NoPE
         )
     if kind == "mlp":
         return NemotronHMLP(config)
@@ -561,17 +563,16 @@ class NemotronHBlock(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mixer = _build_mixer(config, kind, layer_idx)
 
-    def forward(self, hidden_states, cache_handle, mamba_state):
+    def forward(self, hidden_states, mamba_state):
         residual = hidden_states
         normed = self.norm(hidden_states)
-        # Only the Mamba mixer consumes mamba_state; the attention mixer
-        # (paged KV via cache_handle) and the stateless MLP inherit the base
-        # Attention.forward(hidden_states, cache_handle) signature, which has no
-        # mamba_state parameter — passing it there is a TypeError.
+        # Only the Mamba mixer consumes mamba_state; the attention mixer reads
+        # its KV/attention resources through its bound cursors, and the MLP is
+        # stateless.
         if self.kind == "mamba":
-            out = self.mixer(normed, cache_handle=cache_handle, mamba_state=mamba_state)
+            out = self.mixer(normed, mamba_state=mamba_state)
         else:  # attention / mlp
-            out = self.mixer(normed, cache_handle=cache_handle)
+            out = self.mixer(normed)
         return residual + out
 
     def offline_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -580,7 +581,7 @@ class NemotronHBlock(nn.Module):
         if self.kind == "attention":
             out = self.mixer.offline_forward(normed)
         else:  # mamba (full-seq scan) / mlp — both run engine-free with no state
-            out = self.mixer(normed, cache_handle=None, mamba_state=None)
+            out = self.mixer(normed)
         return hidden_states + out
 
     def prefill(self, hidden_states: torch.Tensor, cache: NemotronHCache) -> torch.Tensor:
@@ -598,7 +599,7 @@ class NemotronHBlock(nn.Module):
             cache.conv[self.layer_idx] = conv_state
             cache.ssm[self.layer_idx] = ssm_state
         else:  # mlp — stateless
-            out = self.mixer(normed, cache_handle=None, mamba_state=None)
+            out = self.mixer(normed)
         return hidden_states + out
 
     def decode_step(self, hidden_state: torch.Tensor, cache: NemotronHCache) -> torch.Tensor:
@@ -614,7 +615,7 @@ class NemotronHBlock(nn.Module):
             cache.conv[self.layer_idx] = new_conv
             cache.ssm[self.layer_idx] = new_ssm
         else:  # mlp — stateless
-            out = self.mixer(normed, cache_handle=None, mamba_state=None)
+            out = self.mixer(normed)
         return hidden_state + out
 
 
@@ -638,13 +639,22 @@ class NemotronHLLM(nn.Module):
                 self._attn_cache_idx[i] = a
                 a += 1
 
-    def forward(self, input_embeds, cache_handle, mamba_state=None):
+    def forward(self, input_embeds, mamba_state=None, *, label: str = "main"):
+        """Engine forward over packed rows ``[sum(seq_lens), H]``.
+
+        The KV label and the dense attention-layer index are cursors on the
+        shared resources: bound once per step, advanced per attention layer
+        (see ``Attention.forward``). The runner commits the cache advance from
+        the step declaration, so nothing is advanced here.
+        """
         hidden = input_embeds
+        first_attn = next((b for b in self.layers if b.kind == "attention"), None)
+        if first_attn is not None:
+            first_attn.mixer.attend.bind_step(label)
         for block in self.layers:
             if block.kind == "attention":
-                cache_handle.set_layer_idx(self._attn_cache_idx[block.layer_idx])
-            hidden = block(hidden, cache_handle=cache_handle, mamba_state=mamba_state)
-        cache_handle.advance_seq_lens()
+                block.mixer.attend.set_layer_idx(self._attn_cache_idx[block.layer_idx])
+            hidden = block(hidden, mamba_state=mamba_state)
         return self.norm_f(hidden)
 
     def offline_forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
@@ -692,8 +702,8 @@ class NemotronHForCausalLM(nn.Module):
     def embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, input_embeds, cache_handle, mamba_state=None) -> torch.Tensor:
-        return self.llm(input_embeds, cache_handle=cache_handle, mamba_state=mamba_state)
+    def forward(self, input_embeds, mamba_state=None, *, label: str = "main") -> torch.Tensor:
+        return self.llm(input_embeds, mamba_state=mamba_state, label=label)
 
     def offline_forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Full-sequence offline forward: ``input_ids`` (L,) -> logits (L, vocab)."""
