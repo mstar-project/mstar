@@ -14,6 +14,7 @@ from collections import Counter
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
@@ -218,3 +219,16 @@ def test_children_churning_under_a_held_parent_leave_it_one_heap_entry():
         assert index.evict(1) == 1, "the one child nobody holds was not given back"
         _one_entry_per_indexed_page(index)
     _assert_pages_partition(arena)
+
+
+# ── one key a page ──────────────────────────────────────────────────────
+
+
+def test_a_page_already_indexed_cannot_take_a_second_key():
+    arena = _arena()
+    index = PrefixIndex(arena)
+    (page,) = arena.acquire(1)
+    index.insert(b"first key", page)
+
+    with pytest.raises(AssertionError, match=f"page {page} indexed under .* while it is still indexed under"):
+        index.insert(b"second key", page)
