@@ -519,6 +519,8 @@ class KVManager(AttentionResource):
         if not matched:
             return
         self._arena.retain(matched)
+        # anything it held is empty: `stored_len` is 0 here
+        self._arena.release(stream.page_indices)
         stream.page_indices = list(matched)
         stream.stored_len = len(matched) * self.config.page_size
         stream.cursor = len(matched)
@@ -741,7 +743,16 @@ class KVManager(AttentionResource):
                 ).get(segment.label)
                 if stream is None:
                     continue
-                if stream.lease is not None and not stream.page_indices:
+                if (
+                    stream.lease is not None
+                    and not stream.stored_len
+                    and not stream.offloaded
+                    and not stream.read_pending
+                ):
+                    # a refused batch admit can leave pages reserved on a stream
+                    # its retry then leases for, and they hold nothing yet; an
+                    # offload or a read in flight owns them until it finishes
+                    self._arena.release(stream.page_indices)
                     stream.page_indices = list(stream.lease)
                     stream.stored_len = (
                         len(stream.lease) * self.config.page_size
