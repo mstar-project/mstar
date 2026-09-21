@@ -286,8 +286,10 @@ measured as fast as FlashInfer in the served path; ``flashinfer``: the DiT's joi
 attention runs on the engine's ragged FlashInfer resource, also CUDA-graph replayable),
 ``compile`` (``torch.compile`` of the transformer, one trace per shape) with
 ``compile_eager_rounding`` (inductor rounds intermediates where eager PyTorch does and fuses
-no FMAs) and ``compile_exact_ops`` (the norms and activations stay on the eager kernels inside
-the compiled forward, so inductor only fuses the chains around the GEMMs and attention; the
+no FMAs) and ``compile_exact_ops`` (``true``, or a list of op classes among ``norms`` and
+``activations``: those modules stay on the eager kernels inside the compiled forward, so inductor
+only fuses the chains around the GEMMs and attention; each excluded module is a graph break, which
+costs klein-4B 8% of its B=1 latency and Z-Image 48%, so Z-Image may prefer a subset or ``false``; the
 compiled transformer is then bit-exact with the eager one — measured on klein-4B and 9B — where
 the plain compile, even with eager rounding, lands at a median 35 to 38 dB PSNR from the eager
 path over the 100 protocol prompts, because a 4- or 8-step distilled sampler amplifies the last
