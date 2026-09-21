@@ -80,3 +80,13 @@ def test_audiobuffer_wav_bytes():
     pcm = np.array([0, 16000, -16000], dtype="<i2").tobytes()
     wav = AudioBuffer(pcm, 24000).wav_bytes()
     assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE" and wav[44:] == pcm
+
+
+def test_build_files_accepts_one_filename_bytes_pair():
+    """A bare ``(filename, bytes)`` pair is one upload, not two items (the SDK docstring's contract)."""
+    from mstar.client.client import MStarClient
+
+    client = MStarClient("http://localhost:1")
+    assert client._build_files(("ref.png", b"\x89PNG"), None, None) == [("files", ("ref.png", b"\x89PNG"))]
+    names = [f[1][0] for f in client._build_files([("a.png", b"1"), b"2"], None, None)]
+    assert names == ["a.png", "image_1.png"]
