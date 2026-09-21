@@ -293,6 +293,7 @@ class GraphNode(GraphSection):
             return False
         if edge.name not in self.ready_signals.ready_names:
             self.ready_signals.update(edge)
+            for_next_iter = False
         elif can_buffer and (
             edge.name not in self.ready_next_iter.ready_names
         ):
@@ -300,9 +301,14 @@ class GraphNode(GraphSection):
             # we do not buffer streaming signals, or else we may lose streaming signals if
             # there is actually no next iter
             self.ready_next_iter.update(edge)
+            for_next_iter = True
         else:
             return False
-        self._managing_registry.register_ingested_input(edge)
+        # Report which slot took the edge. The other slot did not change,
+        # so a queue decision on it would use an old value.
+        self._managing_registry.register_ingested_input(
+            edge, for_next_iter=for_next_iter
+        )
         return True
 
     def get_inputs_outputs(self):
@@ -344,11 +350,18 @@ class GraphNode(GraphSection):
         self.ready_signals, self.ready_next_iter = (
             self.ready_next_iter, self.ready_signals
         )
+        self._resync_registry()
 
     def clear(self):
         self.ready_signals.clear()
         self.ready_next_iter.clear()
         self.speculative_signals.clear()
+        self._resync_registry()
+
+    def _resync_registry(self):
+        """Tell the registry that a promotion or a clear moved the slots."""
+        if self._managing_registry is not None:
+            self._managing_registry.resync_node(self)
 
     def reset_outputs(self):
         for out in self.outputs:
@@ -507,14 +520,18 @@ class Loop(GraphSection):
         self.inner_registry.reset_for_iter()
         self._uncache_outputs()
 
-    def ingest_external_input(self, graph_edge: GraphEdge):
+    def ingest_external_input(
+        self, graph_edge: GraphEdge, for_next_iter: bool=False
+    ):
         # track one copy of each external input for re-injection on the next iteration
         if (graph_edge.name, graph_edge.next_node) in self._external_inputs \
                 and graph_edge.name not in self._ingested_external_input_names:
             self._ingested_external_inputs.append(graph_edge)
             self._ingested_external_input_names.add(graph_edge.name)
             graph_edge._persist_for_loop = True
-        self._managing_registry.register_ingested_input(graph_edge)
+        self._managing_registry.register_ingested_input(
+            graph_edge, for_next_iter=for_next_iter
+        )
 
     def complete_iter(self):
         """Called when every entity in the loop's section has finished for this iteration.
@@ -659,31 +676,43 @@ class GraphStateRegistry(ABC):
         _set_managed_entities(graph_section)
 
         self.is_done = False
-        self._num_completed_entities = 0
+        # Which entities finished this iteration. With a count, one entity
+        # that finishes twice completes it, and another never runs.
+        self._completed_entities: set[str] = set()
         self._num_managed_entities = len(self.managed_entities)
+
+    @property
+    def _num_completed_entities(self) -> int:
+        return len(self._completed_entities)
 
     def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:
         """Record that an entity has finished; no-ops if already done (safeguard only)."""
         if not self.is_done and entity_name in self.managed_entities:
-            self._num_completed_entities += 1
+            self._completed_entities.add(entity_name)
             self.is_done = self._num_completed_entities == self._num_managed_entities
         return NodeCompletionOutput(
             output_edges=self.managed_entities[entity_name].outputs
         )
 
     @abstractmethod
-    def register_ingested_input(self, graph_edge: GraphEdge):
+    def register_ingested_input(
+        self, graph_edge: GraphEdge, for_next_iter: bool=False
+    ):
         pass
+
+    @abstractmethod
+    def resync_node(self, node: "GraphNode"):
+        """Update the ready sets for one node from its slots."""
 
     def reset_for_iter(self):
         self.is_done = False
-        self._num_completed_entities = 0
+        self._completed_entities.clear()
         for entity in self.managed_entities.values():
             entity.reset_for_outer_iter()
 
     def clear(self):
         self.is_done = False
-        self._num_completed_entities = 0
+        self._completed_entities.clear()
         for entity in self.managed_entities.values():
             entity.clear()
 
@@ -711,8 +740,19 @@ class LoopStateRegistry(GraphStateRegistry):
             output.output_edges.extend(loop_out.output_edges)
         return output
 
-    def register_ingested_input(self, graph_edge: GraphEdge):
-        self.loop.ingest_external_input(graph_edge)
+    def register_ingested_input(
+        self, graph_edge: GraphEdge, for_next_iter: bool=False
+    ):
+        if self.loop.is_done:
+            # `complete_iter` cleared this registry, so a late edge is not
+            # part of any iteration. The slot keeps the edge for `clear`. The
+            # node stays off the ready queue: it would start the body again.
+            return
+        self.loop.ingest_external_input(graph_edge, for_next_iter=for_next_iter)
+
+    def resync_node(self, node: "GraphNode"):
+        # The worker registry holds the ready queues. Pass it up.
+        self.loop._managing_registry.resync_node(node)
 
 
 class WorkerGraphStateRegistry(GraphStateRegistry):
@@ -732,13 +772,28 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         self.ready_for_streaming = set(self.only_streaming_inputs)
         self.ready_streaming_next_iter = set(self.only_streaming_inputs)
 
-    def register_ingested_input(self, graph_edge: GraphEdge):
+    def register_ingested_input(
+        self, graph_edge: GraphEdge, for_next_iter: bool=False
+    ):
         node = self.nodes[graph_edge.next_node]
+        # Only the slot that took the edge can be ready now. The other slot
+        # did not change: a loop-back edge held for the next iteration would
+        # re-queue the node for the iteration that already ran.
         # If node._speculatively_scheduled, the node is already executing as
         # a spec batch. We don't want to double-queue it (either for the
         # current iter via ``ready_names`` or for the next iter via
         # ``ready_next_iter`` — both eventually feed the scheduler) so we
         # gate every queue add on the flag.
+        if for_next_iter:
+            if node.ready_next_iter.is_ready:
+                if not node._speculatively_scheduled:
+                    self.ready_next_iter.add(node.name)
+                self.ready_streaming_next_iter.discard(node.name)
+            elif node.ready_next_iter.is_ready_for_streaming:
+                if not node._speculatively_scheduled:
+                    self.ready_streaming_next_iter.add(node.name)
+            return
+
         if node.ready_signals.is_ready:
             if not node._speculatively_scheduled:
                 self.ready_names.add(node.name)
@@ -746,14 +801,6 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         elif node.ready_signals.is_ready_for_streaming:
             if not node._speculatively_scheduled:
                 self.ready_for_streaming.add(node.name)
-
-        if node.ready_next_iter.is_ready:
-            if not node._speculatively_scheduled:
-                self.ready_next_iter.add(node.name)
-            self.ready_streaming_next_iter.discard(node.name)
-        elif node.ready_next_iter.is_ready_for_streaming:
-            if not node._speculatively_scheduled:
-                self.ready_streaming_next_iter.add(node.name)
 
     def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:
         # Top-level entities have no outer loop to drive a reset_for_iter, so
@@ -766,18 +813,46 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
             entity.ready_signals.clear()
         return output
 
+    def resync_node(self, node: GraphNode):
+        """Update the ready sets for one node from its slots.
+
+        ``reset_for_outer_iter`` promotes the next-iter slot, and ``clear``
+        empties both slots. Neither calls ``register_ingested_input``, so the
+        ready sets still hold the old slot. A promoted node would never reach
+        the queue, and a cleared node would stay on it.
+        """
+        name = node.name
+        self.ready_next_iter.discard(name)
+        self.ready_streaming_next_iter.discard(name)
+        if node.ready_next_iter.is_ready:
+            if not node._speculatively_scheduled:
+                self.ready_next_iter.add(name)
+        elif node.ready_next_iter.is_ready_for_streaming:
+            if not node._speculatively_scheduled:
+                self.ready_streaming_next_iter.add(name)
+        elif name in self.only_streaming_inputs:
+            self.ready_streaming_next_iter.add(name)
+
+        self.ready_names.discard(name)
+        self.ready_for_streaming.discard(name)
+        if node.ready_signals.is_ready:
+            if not node._speculatively_scheduled:
+                self.ready_names.add(name)
+        elif node.ready_signals.is_ready_for_streaming:
+            if not node._speculatively_scheduled:
+                self.ready_for_streaming.add(name)
+        elif name in self.only_streaming_inputs:
+            self.ready_for_streaming.add(name)
+
     def reset_for_iter(self):
-        super().reset_for_iter()
+        # Clear first. ``super().reset_for_iter()`` promotes the slot of
+        # each managed node, and each promotion calls ``resync_node``, which
+        # fills these sets again.
         self.ready_names.clear()
+        self.ready_next_iter.clear()
         self.ready_for_streaming = set(self.only_streaming_inputs)
-        # promote next-iter ready sets to current; nodes that already received their
-        # loop-back inputs are immediately ready for the new iteration
-        self.ready_names, self.ready_next_iter = (
-            self.ready_next_iter, self.ready_names
-        )
-        self.ready_for_streaming, self.ready_streaming_next_iter = (
-            self.ready_streaming_next_iter, self.ready_for_streaming
-        )
+        self.ready_streaming_next_iter = set(self.only_streaming_inputs)
+        super().reset_for_iter()
 
     def clear(self):
         super().clear()

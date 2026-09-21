@@ -427,10 +427,19 @@ class MicroScheduler:
         # A failed rid is not "not ready yet": excluding it would put it
         # straight back in the backlog. This chunk is out of `self.backlog`
         # right now, so `_drop_backlogged_rid` cannot reach it.
-        for rid in not_ready_rids & self.failed_rids:
+        for rid in set(batch.node_objects) & self.failed_rids:
             batch.node_objects.pop(rid, None)
             batch.request_to_worker_graph.pop(rid, None)
         not_ready_rids -= self.failed_rids
+        # The fresh scan in `get_next_batch` skips a rid with a deferred
+        # remove, and a rid in an OOM backoff. The backlog drain skips the
+        # same two. Exclude them, do not drop them: `clear_rid` removes the
+        # first, and the hold on the second expires.
+        now = time.monotonic()
+        not_ready_rids |= {
+            rid for rid in batch.node_objects
+            if rid in self.pending_removes or self.held_until.get(rid, 0.0) > now
+        }
         return self._cap_batch_and_schedule(batch, max_bs, not_ready_rids)
 
 
@@ -446,6 +455,10 @@ class MicroScheduler:
         look perpetually least-recent once it drains.
         """
         node_walk = (batch.node_name, batch.graph_walk)
+        if not batch.node_objects:
+            # The filter above dropped every rid of this chunk. An empty
+            # batch is not work, and a parked one blocks its key.
+            return None
         if max_bs is not None and max_bs <= 0:
             self._backlog(node_walk, batch)
             return None
@@ -466,6 +479,11 @@ class MicroScheduler:
         off the ready queues when they were first assembled, so nothing would
         ever schedule them again and the requests hang.
         """
+        if not batch.node_objects:
+            # An entry with no rid is never schedulable. `_backlog` merges a
+            # later batch into the entry under the key, so an empty entry
+            # stays there.
+            return
         existing = self.backlog.get(node_walk)
         if existing is None:
             self.backlog[node_walk] = batch
