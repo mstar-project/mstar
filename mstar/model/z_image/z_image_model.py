@@ -197,8 +197,8 @@ class ZImageModel(Model):
     ) -> NameToTensorList:
         if (output_modalities or ["image"])[0] != "image":
             raise ValueError(f"Z-Image only generates images; got output modality {output_modalities!r}")
-        if prompt is None:
-            raise ValueError("Z-Image requires a text prompt")
+        if prompt is None or not prompt.strip():
+            raise ValueError("Z-Image requires a non-empty text prompt")
         if "image" in input_modalities:
             raise ValueError("Z-Image-Turbo is text-to-image only; reference images are not supported")
         self._resolve_size(kwargs)
