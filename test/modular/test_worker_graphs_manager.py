@@ -648,3 +648,66 @@ def test_persist_signals_are_buffered_until_a_worker_graph_finishes():
     assert wgd[0].body.persist_signals["token"][0].uuid == uuids[0]
     # Flushed, so a second pass does not resend them.
     assert runtime._request_info[rid].pending_persist_signals == []
+
+
+# --- speculate_node -----------------------------------------------------------
+
+def test_speculate_node_finds_the_downstream_target():
+    """prefill's outputs feed ar_decode, so speculating from prefill offers
+    ar_decode as the next node."""
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+
+    out = runtime.speculate_node("prefill", "decode", rid)
+    assert [o.node_name for o in out] == ["ar_decode"]
+    assert out[0].graph_walk == "decode"
+
+
+def test_speculate_node_skips_a_target_that_opted_out_of_async():
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+    wgio = runtime.queues[0].per_request_queues[rid]
+    wgio.nodes["ar_decode"].enable_async_scheduling = False
+
+    assert runtime.speculate_node("prefill", "decode", rid) == []
+
+
+def test_speculate_node_refuses_a_parallel_target_without_tp_async():
+    """A parallel node is only a valid target as a leader-side same-node
+    loop-back under TP async; a transition INTO one gives a follower no
+    in-flight batch to rebuild a head from."""
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+
+    runtime.set_node_metadata(
+        parallel_nodes={"ar_decode"},
+        parallel_leader_nodes={"ar_decode"},
+        tp_async_nodes=set(),  # feature off
+    )
+    assert runtime.speculate_node("prefill", "decode", rid) == []
+
+    # Even with TP async on, a TRANSITION into the parallel node is refused:
+    # only a same-node loop-back qualifies.
+    runtime.set_node_metadata(
+        parallel_nodes={"ar_decode"},
+        parallel_leader_nodes={"ar_decode"},
+        tp_async_nodes={"ar_decode"},
+    )
+    assert runtime.speculate_node("prefill", "decode", rid) == []
+
+
+def test_speculate_node_returns_nothing_for_an_unknown_rid():
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    assert runtime.speculate_node("prefill", "decode", rid + 999) == []

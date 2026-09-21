@@ -549,7 +549,39 @@ class PythonGraphRuntime(GraphRuntime):
         graph_walk: str,
         sample_rid: int,
     ) -> list[SpeculationOutput]:
-        raise NotImplementedError
+        wg_id = self.get_worker_graph_id_for_node(node_name, graph_walk)
+        wgio = self._queues[wg_id].per_request_queues.get(sample_rid)
+        if wgio is None:
+            return []
+        node = wgio.nodes[node_name]
+        if not node.outputs:
+            return []  # nothing to feed a spec target
+
+        ready = wgio.ingest_for_speculation(node.outputs, node_name)
+        wgio.clear_speculative_inputs()
+
+        out: list[SpeculationOutput] = []
+        for info in ready:
+            target = wgio.nodes[info.node_name]
+            if not target.enable_async_scheduling:
+                # The destination opts out of async scheduling; mirrors the
+                # source-side check. Without it a structurally ineligible
+                # destination could be picked and then dropped per rid.
+                continue
+            if info.node_name in self._parallel_nodes:
+                # A parallel node is a target only under TP async, from the
+                # leader, as a same-node loop-back: for a transition INTO one
+                # a follower has no in-flight batch to rebuild a head from.
+                if not (
+                    info.node_name in self._tp_async_nodes
+                    and info.node_name in self._parallel_leader_nodes
+                    and info.node_name == node_name
+                ):
+                    continue
+            out.append(SpeculationOutput(
+                node_name=info.node_name, graph_walk=graph_walk,
+            ))
+        return out
 
     def prep_spec_rids(
         self, input: SpeculationPrepInput
