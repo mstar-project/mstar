@@ -306,13 +306,11 @@ class WhisperModel(Model):
                 name=DECODER_NODE,
                 input_names=["text_inputs", "ts_rules"],
                 outputs=[
-                    # persisted as well: the align walk needs the whole transcript
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="new_token",
-                        output_modality="text",
-                        persist=True,
-                    ),
+                    # The token loops back to the node, which does not list it
+                    # as an input, so it only lands in the loop's accumulated
+                    # cache. The client gets the transcript in one message when
+                    # the loop ends instead of one message per token.
+                    GraphEdge(next_node=DECODER_NODE, name="new_token"),
                     GraphEdge(
                         next_node=DECODER_NODE,
                         name="text_inputs",
@@ -326,6 +324,10 @@ class WhisperModel(Model):
             ),
             max_iters=self.get_max_output_tokens(),
             outputs=[],
+            # persisted as well, the align walk needs the whole transcript
+            accumulated_outputs=[
+                GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text", persist=True),
+            ],
         )
 
         align = GraphNode(
