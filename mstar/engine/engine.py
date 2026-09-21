@@ -609,7 +609,9 @@ class Engine:
                 nvtx=self._enable_nvtx, step=batch.step
             )
             if not admit.ok:
-                return {rid: {} for rid in batch.request_ids}
+                return BatchedModelOutput(
+                    per_rid_outputs={rid: {} for rid in batch.request_ids}
+                )
 
             raw, batch.step = self._drive_step(
                 batch, submodule_mgmt, batch.request_ids, inputs, req_info,
@@ -1136,7 +1138,11 @@ class Engine:
         )
         return BatchedModelOutput(
             per_rid_outputs=outputs,
-            check_stop_buffers=raw_outputs.clone_check_stop_buffers()
+            check_stop_buffers=raw_outputs.clone_check_stop_buffers(),
+            # row i of those buffers is request_ids[i] *as the forward ran
+            # them*; the worker maps rows through this rather than through
+            # its own, later-rewritten request list
+            row_request_ids=tuple(request_ids),
         )
 
     def _merge_per_rid(
