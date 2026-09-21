@@ -560,3 +560,17 @@ def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
     assert [s[0] for s in vae.compiled] == [2, 1] and vae.eager == []
     node._decode(torch.zeros(2, lc, 48 * ph, 64 * pw))  # unwarmed grid: eager, no compile
     assert vae.eager == [(2, lc, 48 * ph, 64 * pw)] and [s[0] for s in vae.compiled] == [2, 1]
+
+
+def test_blank_prompts_are_rejected():
+    """An empty or whitespace prompt used to generate an image from an empty caption; it is a 400 now."""
+    import pytest
+
+    from mstar.model.flux2_klein.config import Flux2KleinConfig
+    from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
+
+    model = Flux2KleinModel(model_path_hf="x")
+    model.set_config(Flux2KleinConfig())
+    for bad in (None, "", "   "):
+        with pytest.raises(ValueError, match="text prompt"):
+            model.process_prompt(bad, ["text"], ["image"])
