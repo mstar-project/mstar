@@ -140,6 +140,10 @@ class EarTTSConfig:
     num_attention_heads: int = 16
     num_key_value_heads: int = 16
     head_dim: int = 72
+    # head dim of the talker's paged KV in the engine: FlashInfer's paged
+    # attention is exact for 64/128/256 and returns wrong values for 72 (probed
+    # 2026-09-20 against a torch reference), so q/k/v are zero-padded to this
+    kv_head_dim: int = 128
     sliding_window: int = 7500
     rms_norm_eps: float = 1e-6
     # Gemma3TextConfig defaults (not in the checkpoint's backbone_config subset).
