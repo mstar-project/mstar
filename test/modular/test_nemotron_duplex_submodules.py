@@ -259,3 +259,26 @@ def test_codec_requests_are_isolated():
     _run_codec(codec, "a", 5)
     _run_codec(codec, "b", 3)
     assert _ctx(codec, "a").shape[0] == 5 and _ctx(codec, "b").shape[0] == 3
+
+
+def test_nano_frame_batch_fuses_rows_exactly_like_the_per_request_path():
+    """The steady-state preprocess fuses the whole batch at once; each row must
+    equal the per-request fusion (same weights, same terms, same order)."""
+    from types import SimpleNamespace
+
+    from mstar.model.nemotron_duplex.submodules import _MODE_FRAME
+    from mstar.model.submodule_base import ARNodeInputs
+
+    nano = _make_nano()
+    torch.manual_seed(0)
+    inputs = [
+        ARNodeInputs(input_seq_len=1, kwargs={"mode": _MODE_FRAME}, tensor_inputs={
+            "audio_frame": torch.randn(1, H), "prev_text": torch.tensor([3 + i]), "prev_func": torch.tensor([9 - i]),
+        })
+        for i in range(3)
+    ]
+    eng = SimpleNamespace(request_ids=["a", "b", "c"], resources={}, per_request_states=None)
+    pre = nano.preprocess("decode", eng, inputs)
+    per_request = torch.cat([nano._fuse(inp, torch.device("cpu")) for inp in inputs])
+    assert pre["seq_lens"] == [1, 1, 1]
+    torch.testing.assert_close(pre["input_embeds"], per_request)
