@@ -186,3 +186,20 @@ def test_slot_indexed_conv_update_matches_fla(rows, d, dtype):
     y1 = conv_update_slots(view, st1, slot_ids, weight)
     y2 = conv_update_slots(view.contiguous(), st2, slot_ids, weight)
     assert torch.equal(y1, y2) and torch.equal(st1, st2)
+
+
+@pytest.mark.parametrize("t,chunks", [(1, 2), (9, 4), (300, 8)])
+def test_topk_sum_reduce_writes_column_chunks(t, chunks):
+    """The top-k sum written into a ``[T, chunks, D / chunks]`` view of a ``[chunks, T, D / chunks]``
+    buffer (the layout a reduce-scatter over the columns takes) equals the plain ``[T, D]`` result."""
+    from mstar.utils.fused_moe.kernels import moe_sum_reduce_triton
+
+    torch.manual_seed(t)
+    d, top_k = 3584, 16
+    x = torch.randn(t, top_k, d, device=DEV).to(torch.bfloat16)
+    plain = torch.empty(t, d, device=DEV, dtype=torch.bfloat16)
+    moe_sum_reduce_triton(x, plain)
+    torch.testing.assert_close(plain, x.sum(1), rtol=1e-2, atol=1e-2)  # fp32 accumulation, rounded once
+    stacked = torch.empty(chunks, t, d // chunks, device=DEV, dtype=torch.bfloat16)
+    moe_sum_reduce_triton(x, stacked.permute(1, 0, 2))
+    assert torch.equal(stacked.permute(1, 0, 2).reshape(t, d), plain)  # the same sums, laid out by chunk
