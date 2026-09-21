@@ -25,19 +25,20 @@ from mstar.worker.worker import Worker  # noqa: E402
 
 NODE = "LLM"
 WALK = "prefill"
-WORKERS = ["worker_0", "worker_1"]
 
 
-def _group(tp_rank: int) -> ShardingGroup:
-    group = ShardingGroup(nodes={NODE}, tp_size=len(WORKERS), _tp_rank=tp_rank)
-    group.register_workers(WORKERS)
+def _group(tp_rank: int, tp_size: int) -> ShardingGroup:
+    group = ShardingGroup(nodes={NODE}, tp_size=tp_size, _tp_rank=tp_rank)
+    group.register_workers([f"worker_{rank}" for rank in range(tp_size)])
     return group
 
 
-def _worker(tp_rank: int, matched: list[dict[str, int]]) -> Worker:
-    """A rank of a two-rank group, with its engine's answer scripted."""
+def _worker(
+    tp_rank: int, matched: list[dict[str, int]], tp_size: int = 2,
+) -> Worker:
+    """A rank of a ``tp_size`` group, with its engine's answer scripted."""
     w = Worker.__new__(Worker)
-    w.worker_id = WORKERS[tp_rank]
+    w.worker_id = f"worker_{tp_rank}"
     w.sent = []
     w.communicator = SimpleNamespace(
         send=lambda entity, msg: w.sent.append((entity, msg)),
@@ -46,7 +47,7 @@ def _worker(tp_rank: int, matched: list[dict[str, int]]) -> Worker:
     w.parallel_leader_nodes = {NODE} if tp_rank == 0 else set()
     w._tp_prefix_replies = {}
     w._tp_prefix_waiting = {}
-    group = _group(tp_rank)
+    group = _group(tp_rank, tp_size)
     w.worker_graphs_manager = SimpleNamespace(
         per_request_info={"r1": SimpleNamespace(
             sharding_config=SimpleNamespace(
@@ -153,4 +154,60 @@ def test_a_rank_that_answers_twice_is_counted_once():
 
     assert w._tp_prefix_replies["r1"] == {1: {"main": 64}}, (
         "a resent reply was counted as a second rank"
+    )
+
+
+# ── the wait ────────────────────────────────────────────────────────────
+
+
+def test_the_leader_holds_the_first_step_until_every_rank_answers():
+    w = _worker(0, [{"main": 96}])
+
+    Worker._await_prefix_match(w, "r1")
+
+    assert ("r1", NODE) in w._tp_prefix_waiting, (
+        "the first step could run on the length this rank alone matched"
+    )
+
+
+def test_the_last_reply_lets_the_step_go():
+    w = _worker(0, [{"main": 96}])
+    Worker._await_prefix_match(w, "r1")
+
+    Worker._record_prefix_match(w, TPPrefixMatch("r1", NODE, 1, {"main": 64}))
+
+    assert w._tp_prefix_waiting == {}, (
+        "the whole group had answered and the step was still held"
+    )
+
+
+def test_one_rank_short_keeps_the_step_held():
+    w = _worker(0, [{"main": 96}], tp_size=3)
+    Worker._await_prefix_match(w, "r1")
+
+    Worker._record_prefix_match(w, TPPrefixMatch("r1", NODE, 1, {"main": 64}))
+
+    assert ("r1", NODE) in w._tp_prefix_waiting, (
+        "two of three ranks settled a length the third never agreed to"
+    )
+
+
+def test_a_group_of_one_waits_for_nobody():
+    w = _worker(0, [{"main": 96}], tp_size=1)
+
+    Worker._await_prefix_match(w, "r1")
+
+    assert w._tp_prefix_waiting == {}, (
+        "a single-rank deployment held its first step for a reply nobody sends"
+    )
+
+
+def test_a_node_that_keys_nothing_waits_for_nobody():
+    w = _worker(0, [])
+
+    Worker._await_prefix_match(w, "r1")
+
+    assert w._tp_prefix_waiting == {}, (
+        "an undeclared node held its first step over a length that has no "
+        "meaning for it"
     )

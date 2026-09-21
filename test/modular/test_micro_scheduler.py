@@ -8,12 +8,17 @@ backlog. Three things have to hold across that split:
 * a backlogged chunk is re-checked before it goes out again — after a KV OOM
   the pages it needs may be gone, and it must not skip the hold backoff;
 * every batch handed out counts as scheduling its (node, walk), or round-robin
-  stops rotating.
+  stops rotating;
+* a first step whose TP group has not all reported what its prefix index
+  matched is left where it is, since the length it would skip is whatever this
+  rank alone matched.
 """
 
 from __future__ import annotations
 
+import logging
 import sys
+import time
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -498,3 +503,64 @@ def test_clearing_a_rid_forgets_its_undelivered_admit_error():
 
     assert sched.take_admit_errors() == {}
     assert sched.failed_rids == set()
+
+
+# ── the prefix wait ─────────────────────────────────────────────────────
+
+
+def test_a_first_step_waits_for_the_rest_of_its_tp_group():
+    sched = _scheduler(_Engine())
+    sched.tp_prefix_waiting[("r0", NODE)] = time.monotonic()
+
+    batch = sched.get_next_batch(_Manager(["r0", "r1"]))
+
+    assert list(batch.node_objects) == ["r1"], (
+        "a request whose group has not all answered was scheduled, so the "
+        "ranks would each skip whatever their own index matched"
+    )
+
+
+def test_the_step_goes_once_the_last_reply_lands():
+    sched = _scheduler(_Engine())
+    manager = _Manager(["r0"])
+    sched.tp_prefix_waiting[("r0", NODE)] = time.monotonic()
+    assert sched.get_next_batch(manager) is None
+
+    sched.tp_prefix_waiting.pop(("r0", NODE))
+
+    assert list(sched.get_next_batch(manager).node_objects) == ["r0"], (
+        "every rank had answered and the request still did not run"
+    )
+
+
+def test_a_wait_on_one_node_leaves_another_alone():
+    sched = _scheduler(_Engine())
+    sched.parallel_leader_nodes = {NODE, "other"}
+    manager = _Manager(["r0"])
+    manager.queues["wg1"] = _Queue(["r0"], node="other")
+    sched.tp_prefix_waiting[("r0", NODE)] = time.monotonic()
+
+    batch = sched.get_next_batch(manager)
+
+    assert batch.node_name == "other", (
+        "a wait on one node held the request out of every other node too"
+    )
+
+
+def test_a_long_wait_says_so_once(caplog):
+    sched = _scheduler(_Engine())
+    sched.tp_prefix_waiting[("r0", NODE)] = (
+        time.monotonic() - 2 * MicroScheduler.PREFIX_WAIT_WARN_SECONDS
+    )
+
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.micro_scheduler"):
+        sched.get_next_batch(_Manager([]))
+        sched.get_next_batch(_Manager([]))
+
+    said = [r for r in caplog.records if "prefix index matched" in r.getMessage()]
+    assert len(said) == 1, (
+        f"a wait with no timeout said so {len(said)} times, once a scan"
+    )
+    assert ("r0", NODE) in sched.tp_prefix_waiting, (
+        "saying so dropped the wait, which would let the step run unsettled"
+    )
