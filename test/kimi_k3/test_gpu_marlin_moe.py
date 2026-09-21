@@ -189,3 +189,69 @@ def test_marlin_expert_parallel_partials_sum_to_full(world, ep):
     with torch.no_grad():
         out = torch.empty_like(parts[0])
         assert ranks[0]._routed(z, idx, w, out=out) is out and torch.equal(out, parts[0])
+
+
+@cuda
+def test_bf16_path_matches_marlin_on_long_slices():
+    """From ``bf16_min_tokens`` tokens a slice runs as bf16 grouped GEMMs on weights dequantized from the
+    Marlin tiles (``_forward_bf16``): the same result as Marlin's kernels up to the GEMMs' accumulation
+    order, on a plain output, a given output and a column-chunked view of it."""
+    pytest.importorskip("triton")
+    if not hasattr(torch, "_grouped_mm"):
+        pytest.skip("torch._grouped_mm missing")
+    moe, hidden = _small_moe()
+    moe.prepare_experts_backend("marlin", DEV)
+    be = moe._backend
+    torch.manual_seed(5)
+    m = 300
+    z = (torch.randn(m, moe.latent_size, device=DEV) * 0.5).to(torch.bfloat16)
+    idx = torch.rand(m, moe.num_experts, device=DEV).topk(moe.top_k, dim=1).indices.to(torch.int32)
+    w = torch.softmax(torch.randn(m, moe.top_k, device=DEV), dim=1)
+    be.bf16_min_tokens = 0
+    want = be(z, idx, w)
+    be.bf16_min_tokens = 1
+    assert be._bf16_applies(z)
+    got = be(z, idx, w)
+    rel = ((got.float() - want.float()).norm() / want.float().norm()).item()
+    assert rel < 1e-2, rel
+    # both against the fp32 reference on the same dequantized weights: the bf16 path is no farther from it
+    from mstar.model.kimi_k3.reference.moe import routed_experts_loop
+    from mstar.utils.fused_moe.marlin.dequant import dequant_marlin_experts
+
+    w13 = dequant_marlin_experts(be.w13, be.s13, 2 * moe.inter_local, moe.latent_size).float()
+    w2 = dequant_marlin_experts(be.w2, be.s2, moe.latent_size, moe.inter_local).float()
+    ref = routed_experts_loop(z.float(), idx.long(), w, w13, w2, moe.situ_beta, moe.situ_linear_beta)
+    err_marlin = ((want.float() - ref).norm() / ref.norm()).item()
+    err_bf16 = ((got.float() - ref).norm() / ref.norm()).item()
+    assert err_bf16 < 1.5 * err_marlin + 1e-3, (err_bf16, err_marlin)
+    out = torch.empty_like(want)
+    assert be(z, idx, w, out=out) is out and torch.equal(out, got)
+    chunks = torch.empty(4, m, moe.latent_size // 4, dtype=z.dtype, device=DEV)
+    view = chunks.permute(1, 0, 2)
+    assert be(z, idx, w, out=view) is view
+    assert torch.equal(view.reshape(m, moe.latent_size), got)
+    # slices: a long input runs slice by slice through the same path
+    be.max_chunk_tokens = 128
+    sliced = be(z, idx, w)
+    assert torch.equal(sliced, got)
+    be.max_chunk_tokens = type(be).max_chunk_tokens
+    # no host sync anywhere in the path (a prefill of 92 layers must not stall on it)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        again = be(z, idx, w)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    assert torch.equal(again, got)
+    # under a CUDA-graph capture the path steps aside and Marlin's kernels are captured
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            assert not be._bf16_applies(z)
+            captured = be(z, idx, w)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, want)
+    be.bf16_min_tokens = type(be).bf16_min_tokens
