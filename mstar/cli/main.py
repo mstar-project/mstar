@@ -39,7 +39,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "whisper_large": "whisper_large.yaml",
     "higgs_audio": "higgs_audio.yaml",
     "wan22": "wan22.yaml",
-    # Half-duplex S2S (Beta) — text path first; audio stages Phase 4/5.
+    # Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B).
     "nemotron_duplex": "nemotron_duplex.yaml",
 }
 
