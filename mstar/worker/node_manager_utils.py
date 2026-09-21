@@ -510,51 +510,6 @@ class WorkerGraphsManager:
             is_first_tp_rank=is_first_tp_rank
         )
 
-    def stop_loops(
-        self, rid: int,
-        partition: str,
-        loop_names: set[str],
-        req_info: CurrentForwardPassInfo | None = None,
-        last_node_run: str | None = None
-    ) -> set[NameAndDest]:
-        """Register a finish signal for each named loop across this partition's
-        worker graphs and return the union of their loop-back ``(name, dest)``
-        pairs so the caller can drop them from output routing on the iter
-        that triggered the stop.
-
-        If ``req_info`` and ``last_node_run`` are provided AND the last-run
-        node lives on a given worker graph, this also snapshots the current
-        nested-loop iteration indices into ``req_info.loop_stop_times[name]``
-        as a ``NestedLoopIndices`` (used by the conductor's stop-ordering to
-        suppress duplicate stop messages).
-        """
-        part_info = self.per_request_info[rid].per_partition_info[partition]
-        worker_graph_ids = part_info.graph_walk_worker_graph_ids
-        stopped_loop_back_signals: set[NameAndDest] = set()
-        # In disaggregated mode the same Loop name can exist on multiple worker
-        # graphs (each with its own _finish_signal), so this still has to fan out.
-        for worker_graph_id in worker_graph_ids:
-            stopped_loop_back_signals |= self.queues[worker_graph_id].stop_loops(
-                rid, loop_names,
-            )
-
-        # loop_stop_times is a single observation per loop, so we only need
-        # the worker graph that owns the last-run node. Direct index lookup
-        # instead of iterating.
-        if req_info is not None and last_node_run is not None:
-            graph_walk = self.get_graph_walk(rid, partition)
-            owner_wg_id = self.walk_node_to_worker_graph_id.get(
-                (graph_walk, last_node_run)
-            )
-            if owner_wg_id is not None and owner_wg_id in self.queues:
-                wgio = self.queues[owner_wg_id].per_request_queues.get(rid)
-                if wgio is not None:
-                    for name in loop_names & wgio.loops.keys():
-                        req_info.loop_stop_times[name] = wgio.get_nested_loop_idxs(
-                            target_loop_name=name,
-                        )
-        return stopped_loop_back_signals
-
     def get_nested_loop_idxs_for_node(
         self, rid: int, partition: str, node_name: str
     ) -> NestedLoopIndices:

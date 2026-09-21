@@ -1,9 +1,11 @@
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import NamedTuple
 
 from mstar.communication.tensors import TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.utils.containers import ParallelList
 
 #
@@ -65,6 +67,18 @@ from mstar.utils.containers import ParallelList
 class SpeculationOutput(NamedTuple):
     node_name: str
     graph_walk: str
+
+
+@dataclass(frozen=True)
+class PendingLoopStop:
+    """A loop stop produced by this iteration's check_stop.
+
+    Lives for exactly one iteration: the routing pass that follows uses it to
+    drop the outputs of rids that "overstayed" their stop, then clears it.
+    """
+    rid: int
+    graph_walk: str
+    loop_name: str
 
 
 class EdgeSpec(NamedTuple):
@@ -355,14 +369,55 @@ class GraphRuntime(ABC):
     # --------- Postprocess ----------
     @abstractmethod
     def stop_loops_batched(
-        self, partition: str, graph_walk: str,
+        self, partition: str,
+        graph_walk: str,
+        last_node_run: str,
         loop_names: ParallelList[int, list[str]]
     ):
         """
         (1) Stop loops in the graph
         (2) Updates pending_loop_stops list
         (3) Send loop done messages to peer workers
+
+        Rids whose current walk does not contain a named loop are filtered out
+        here (that is a model bug, logged and dropped), so callers pass whatever
+        check_stop produced.
         """
+        pass
+
+    @abstractmethod
+    def apply_peer_loop_stops(
+        self, rid: int, partition: str,
+        loop_stop_times: dict[str, NestedLoopIndices],
+    ):
+        """A peer's STOP_LOOPS landing here.
+
+        Stops only the loops whose incoming stop is NEWER than what this rank
+        has (``label_context_gt``), and does NOT fan out again -- the loop that
+        originated the stop already told everyone.
+        """
+        pass
+
+    @abstractmethod
+    def get_loop_stop_times(self, rid: int) -> dict[str, NestedLoopIndices]:
+        """The snapshot this rank has, for putting on the wire."""
+        pass
+
+    @abstractmethod
+    def has_pending_loop_stop(
+        self, rid: int, graph_walk: str, loop_name: str,
+    ) -> bool:
+        pass
+
+    @abstractmethod
+    def pending_loop_stop_rids(
+        self, graph_walk: str, loop_name: str,
+    ) -> set[int]:
+        pass
+
+    @abstractmethod
+    def clear_pending_loop_stops(self):
+        """Pending stops are good for one iteration only."""
         pass
 
     @abstractmethod

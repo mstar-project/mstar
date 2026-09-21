@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 
 from mstar.engine.resources import PublishedInfo, ResourceReqConfig
-from mstar.graph.loop_indices import NestedLoopIndices
 
 
 @dataclass
@@ -53,13 +52,9 @@ class CurrentForwardPassInfo:
     # per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default=DEFAULT_PARTITION)
 
-    # Per-loop stop indices; stop decisions come from each submodule's check_stop.
-    loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
+    # Per-loop stop indices are worker-only, so they live on the graph runtime
+    # rather than riding on this object across the wire.
     dynamic_loop_iter_counts: dict[str, int] = field(default_factory=dict)
-
-    def clear_loop_stop_info(self):
-        self.loop_stop_times.clear()
-        self.dynamic_loop_iter_counts.clear()
 
     def update_publish_info(self, other: dict[str, PublishedInfo]):
         merge_publish_info(self.resource_publish_info, other)

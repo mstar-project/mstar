@@ -15,6 +15,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
+from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
@@ -207,10 +208,8 @@ def test_stop_loops_returns_loop_back_signal_set():
     mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
     mgr.mark_node_complete(rid, wg_id, "prefill")
 
-    stopped = mgr.stop_loops(
-        rid=rid,
-        partition="default",
-        loop_names={"ar_loop"},
+    stopped = runtime._stop_loops_for_rid(
+        rid, "default", {"ar_loop"}, last_node_run=None,
     )
     # ar_loop has two loop-back inputs: (token, ar_decode) and (kv_cache, ar_decode).
     assert stopped == {("token", "ar_decode"), ("kv_cache", "ar_decode")}
@@ -219,21 +218,17 @@ def test_stop_loops_returns_loop_back_signal_set():
     assert wgio.loops["ar_loop"]._finish_signal is True
 
 
-def test_stop_loops_snapshots_loop_stop_times_when_req_info_provided():
+def test_stop_loops_snapshots_loop_stop_times_for_the_last_node_run():
     mgr, wg_id, walk, runtime, rid = _make_manager()
     mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
     mgr.mark_node_complete(rid, wg_id, "prefill")
     fwd_info = mgr.get_fwd_info(rid, "default")
 
-    mgr.stop_loops(
-        rid=rid,
-        partition="default",
-        loop_names={"ar_loop"},
-        req_info=fwd_info,
-        last_node_run="ar_decode",
+    runtime._stop_loops_for_rid(
+        rid, "default", {"ar_loop"}, last_node_run="ar_decode",
     )
-    # NestedLoopIndices snapshot should be in loop_stop_times.
-    snapshot = fwd_info.loop_stop_times.get("ar_loop")
+    # The snapshot lives on the runtime now, not on the wire-forwarded fwd_info.
+    snapshot = runtime.get_loop_stop_times(rid).get("ar_loop")
     assert snapshot is not None
     assert snapshot.wg_fwd_pass_idx == fwd_info.fwd_index
     assert snapshot.loop_name_order == ["ar_loop"]
@@ -258,7 +253,7 @@ def test_loop_done_drops_loop_back_and_keeps_terminal_outputs():
         GraphEdge(name="token", next_node="ar_decode"),
         GraphEdge(name="kv_cache", next_node="ar_decode"),
     ])
-    mgr.stop_loops(rid, "default", {"ar_loop"})
+    runtime._stop_loops_for_rid(rid, "default", {"ar_loop"}, None)
     completion = mgr.mark_node_complete(rid, wg_id, "ar_decode")
 
     assert sorted(completion.filtered_signals) == [
@@ -328,3 +323,101 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
     )
     assert wg_id in routing.completed_worker_graph_ids, \
         "prefill wg with only EMPTY_DESTINATION outputs must still report done"
+
+
+# --- loop stops on the runtime ------------------------------------------------
+
+def test_peer_loop_stop_is_applied_only_when_newer():
+    """A peer's STOP_LOOPS stops the loop only if its observation is newer than
+    what this rank already has. Re-applying an older one must be a no-op, or a
+    late duplicate would re-stop a loop that has since restarted."""
+    _mgr, _wg_id, _walk, runtime, rid = _make_manager()
+    mgr, wg_id = _mgr, _wg_id
+    mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+    mgr.mark_node_complete(rid, wg_id, "prefill")
+    wgio = runtime.queues[wg_id].per_request_queues[rid]
+
+    newer = NestedLoopIndices(
+        loop_name_order=["ar_loop"], loop_indices={"ar_loop": 5},
+        wg_fwd_pass_idx=1,
+    )
+    runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": newer})
+    assert wgio.loops["ar_loop"]._finish_signal is True
+    assert runtime.get_loop_stop_times(rid)["ar_loop"] is newer
+
+    # An older observation for the same loop is recorded but stops nothing new.
+    wgio.loops["ar_loop"]._finish_signal = False
+    older = NestedLoopIndices(
+        loop_name_order=["ar_loop"], loop_indices={"ar_loop": 1},
+        wg_fwd_pass_idx=0,
+    )
+    runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": older})
+    assert wgio.loops["ar_loop"]._finish_signal is False, \
+        "an older peer stop must not re-stop the loop"
+
+
+def test_peer_loop_stop_for_an_unknown_partition_is_dropped():
+    _mgr, _wg_id, _walk, runtime, rid = _make_manager()
+    runtime.apply_peer_loop_stops(rid, "no_such_partition", {"ar_loop": None})
+    assert runtime.get_loop_stop_times(rid) == {}
+
+
+def test_pending_loop_stops_are_recorded_and_live_one_iteration():
+    _mgr, _wg_id, walk, runtime, rid = _make_manager()
+    mgr, wg_id = _mgr, _wg_id
+    mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+    mgr.mark_node_complete(rid, wg_id, "prefill")
+
+    runtime.stop_loops_batched(
+        partition="default", graph_walk=walk, last_node_run="ar_decode",
+        loop_names=ParallelList([rid], [["ar_loop"]]),
+    )
+    assert runtime.has_pending_loop_stop(rid, walk, "ar_loop")
+    assert runtime.pending_loop_stop_rids(walk, "ar_loop") == {rid}
+    # A different walk must not match.
+    assert runtime.pending_loop_stop_rids("other_walk", "ar_loop") == set()
+
+    runtime.clear_pending_loop_stops()
+    assert not runtime.has_pending_loop_stop(rid, walk, "ar_loop")
+
+
+def test_stop_for_a_loop_not_in_the_walk_is_dropped():
+    """check_dyn_loop filtering: a stop naming a loop this walk does not have
+    is a model bug, logged and dropped rather than raised."""
+    _mgr, _wg_id, walk, runtime, rid = _make_manager()
+    runtime.stop_loops_batched(
+        partition="default", graph_walk=walk, last_node_run="ar_decode",
+        loop_names=ParallelList([rid], [["not_a_real_loop"]]),
+    )
+    assert runtime.pending_loop_stop_rids(walk, "not_a_real_loop") == set()
+
+
+def test_peer_loop_stop_compares_enclosing_loop_indices():
+    """Same forward pass, so label_context_gt has to fall through to comparing
+    the indices of the loops ENCLOSING the target. The previous assertions all
+    differ in wg_fwd_pass_idx, which short-circuits before that point."""
+    _mgr, _wg_id, _walk, runtime, rid = _make_manager()
+    mgr, wg_id = _mgr, _wg_id
+    mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+    mgr.mark_node_complete(rid, wg_id, "prefill")
+    wgio = runtime.queues[wg_id].per_request_queues[rid]
+
+    def _at(outer_idx):
+        return NestedLoopIndices(
+            loop_name_order=["outer", "ar_loop"],
+            loop_indices={"outer": outer_idx, "ar_loop": 0},
+            wg_fwd_pass_idx=3,
+        )
+
+    runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": _at(1)})
+    assert wgio.loops["ar_loop"]._finish_signal is True
+
+    wgio.loops["ar_loop"]._finish_signal = False
+    runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": _at(2)})
+    assert wgio.loops["ar_loop"]._finish_signal is True, \
+        "a later enclosing iteration is a newer stop"
+
+    wgio.loops["ar_loop"]._finish_signal = False
+    runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": _at(2)})
+    assert wgio.loops["ar_loop"]._finish_signal is False, \
+        "the same observation twice must not re-stop"

@@ -4,11 +4,13 @@ from dataclasses import dataclass, field
 from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import TensorCommunicationManager, TensorStore
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import NodeAndGraphWalk
+from mstar.graph.base import NameAndDest, NodeAndGraphWalk
+from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import (
     EdgeSpec,
     GraphRuntime,
     ParallelList,
+    PendingLoopStop,
     PopRidsOutput,
     ReadyNodeSpec,
     RouteInput,
@@ -19,6 +21,11 @@ from mstar.graph.runtime.base import (
     SpeculationPrepOutput,
 )
 from mstar.model.base import WorkerGraph
+from mstar.utils.ipc_format import (
+    StopLoops,
+    WorkerMessage,
+    WorkerMessageType,
+)
 from mstar.worker.node_manager_utils import WorkerGraphQueues
 
 logger = logging.getLogger(__name__)
@@ -37,6 +44,9 @@ class GraphRuntimeRequestInfo:
     node_to_workers: dict[NodeAndGraphWalk, list[str]]
     dyn_loop_to_workers: dict[NodeAndGraphWalk, list[str]]
     sharding_config: ShardingConfig
+    # Per-loop stop indices. Worker-only, so it lives here rather than riding
+    # on CurrentForwardPassInfo across the wire.
+    loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
 
 class PythonGraphRuntime(GraphRuntime):
@@ -73,6 +83,9 @@ class PythonGraphRuntime(GraphRuntime):
 
         # per-request info needed by the graph runtime
         self._request_info: dict[int, GraphRuntimeRequestInfo] = {}
+
+        # Loop stops from this iteration's check_stop; cleared every iteration.
+        self._pending_loop_stops: set[PendingLoopStop] = set()
 
         if my_worker_graphs is None:
             return # TODO: remove once rest is written
@@ -351,10 +364,121 @@ class PythonGraphRuntime(GraphRuntime):
     # --------- Postprocess ----------
 
     def stop_loops_batched(
-        self, partition: str, graph_walk: str,
+        self, partition: str,
+        graph_walk: str,
+        last_node_run: str,
         loop_names: ParallelList[int, list[str]]
     ):
-        raise NotImplementedError
+        for rid, names in loop_names:
+            wanted = {
+                name for name in names
+                if self.check_dyn_loop(rid, partition, name)
+            }
+            if not wanted:
+                continue
+            self._stop_loops_for_rid(rid, partition, wanted, last_node_run)
+            self._pending_loop_stops.update(
+                PendingLoopStop(rid, graph_walk, name) for name in wanted
+            )
+            self._fan_out_loop_stops(rid, partition, wanted)
+
+    def _stop_loops_for_rid(
+        self, rid: int, partition: str, loop_names: set[str],
+        last_node_run: str | None,
+    ) -> set[NameAndDest]:
+        """Register the finish signal on every worker graph carrying a named
+        loop, and return the union of their loop-back (name, dest) pairs so the
+        caller drops those from the triggering iteration's output routing.
+
+        In disaggregated mode one loop name can exist on several worker graphs,
+        each with its own finish signal, so this still fans out locally.
+        """
+        part_info = self._request_info[rid].partition_info[partition]
+        stopped: set[NameAndDest] = set()
+        for wg_id in part_info.graph_walk_worker_graph_ids:
+            stopped |= self._queues[wg_id].stop_loops(rid, loop_names)
+
+        # A stop time is one observation per loop, so only the worker graph
+        # owning the last-run node needs to be asked.
+        if last_node_run is not None:
+            owner = self._walk_node_to_wg_id.get(
+                (part_info.graph_walk, last_node_run)
+            )
+            wgio = (
+                None if owner is None or owner not in self._queues
+                else self._queues[owner].per_request_queues.get(rid)
+            )
+            if wgio is not None:
+                times = self._request_info[rid].loop_stop_times
+                for name in loop_names & wgio.loops.keys():
+                    times[name] = wgio.get_nested_loop_idxs(
+                        target_loop_name=name,
+                    )
+        return stopped
+
+    def _fan_out_loop_stops(
+        self, rid: int, partition: str, loop_names: set[str],
+    ):
+        """Tell the peers sharing each loop that it is done."""
+        if self._communicator is None:
+            return
+        per_worker: dict[str, set[str]] = {}
+        for loop_name in loop_names:
+            for worker in self.get_dyn_loop_workers(rid, partition, loop_name):
+                per_worker.setdefault(worker, set()).add(loop_name)
+        for worker, names in per_worker.items():
+            if worker == self._my_worker_id:
+                continue
+            self._communicator.send(
+                entity_id=worker,
+                msg=WorkerMessage(
+                    message_type=WorkerMessageType.STOP_LOOPS,
+                    body=StopLoops(
+                        request_id=self.get_rid_string(rid),
+                        loop_names=names,
+                        loop_stop_times=self.get_loop_stop_times(rid),
+                        partition_name=partition,
+                    ),
+                ),
+            )
+
+    def apply_peer_loop_stops(
+        self, rid: int, partition: str,
+        loop_stop_times: dict[str, NestedLoopIndices],
+    ):
+        request_info = self._request_info.get(rid)
+        if request_info is None or partition not in request_info.partition_info:
+            return
+        mine = request_info.loop_stop_times
+        newer: set[str] = set()
+        for name, stop_time in loop_stop_times.items():
+            if name not in mine or stop_time.label_context_gt(mine[name], name):
+                newer.add(name)
+            mine[name] = stop_time
+        if newer:
+            # No last_node_run and no fan-out: the originating rank already
+            # took the snapshot and told everyone.
+            self._stop_loops_for_rid(rid, partition, newer, None)
+
+    def get_loop_stop_times(self, rid: int) -> dict[str, NestedLoopIndices]:
+        return self._request_info[rid].loop_stop_times
+
+    def has_pending_loop_stop(
+        self, rid: int, graph_walk: str, loop_name: str,
+    ) -> bool:
+        return PendingLoopStop(rid, graph_walk, loop_name) \
+            in self._pending_loop_stops
+
+    def pending_loop_stop_rids(
+        self, graph_walk: str, loop_name: str,
+    ) -> set[int]:
+        return {
+            stop.rid for stop in self._pending_loop_stops
+            if stop.loop_name == loop_name and stop.graph_walk == graph_walk
+        }
+
+    def clear_pending_loop_stops(self):
+        self._pending_loop_stops.clear()
 
     def complete_and_route_batch(
         self, input: RouteInput,

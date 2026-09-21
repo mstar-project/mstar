@@ -124,13 +124,6 @@ class Speculation:
     tp_seq: int = -1
 
 
-@dataclass(frozen=True)
-class PendingLoopStop:
-    rid: int
-    graph_walk: str
-    loop_name: str
-
-
 class EvictionPolicy(Enum):
     """Strategy for choosing which request to offload to CPU on OOM."""
     LRU = "lru"  # least-recently-used (by execution time)
@@ -353,10 +346,6 @@ class Worker:
         # _in_flight_rids: rids referenced by an in-flight GPU step or its
         #   speculation; REMOVE_REQUEST for these is deferred.
         # _pending_removes: deferred REMOVE_REQUESTs.
-        # _pending_loop_stops: loop-stops produced by check_stop in this iter's
-        #   postprocess, consumed by next iter's speculation to drop rids whose
-        #   loop has ended. Keyed by (rid, graph_walk, loop_name) — see
-        #   PendingLoopStop.
         # handle-keyed: both are compared against batch rids
         self._in_flight_rids: set[int] = set()
         self._pending_removes: set[int] = set()
@@ -373,7 +362,6 @@ class Worker:
         # request's ADMITTED lifetime keys on the handle; the lifecycle sets
         # below stay strings because DRAIN can arrive before NEW, so no handle
         # exists yet. Messages always carry the string.
-        self._pending_loop_stops: set[PendingLoopStop] = set()
         # Let the scheduler see deferred removes so it stops initiating new work
         # for those rids (shared by reference — mutations are visible to both).
         self.scheduler.pending_removes = self._pending_removes
@@ -786,24 +774,11 @@ class Worker:
 
     def _stop_loops(self, body: StopLoops):
         rid = self._rid(body.request_id)
-        if rid is None or not self.worker_graphs_manager.has_partition(
-            rid, body.partition_name
-        ):
+        if rid is None:
             return
-        fwd_info = self.worker_graphs_manager.get_fwd_info(
-            rid, body.partition_name
+        self._rid_runtime.apply_peer_loop_stops(
+            rid, body.partition_name, body.loop_stop_times,
         )
-        loop_names = set()
-        for name, stop_time in body.loop_stop_times.items():
-            if name not in fwd_info.loop_stop_times or stop_time.label_context_gt(
-                fwd_info.loop_stop_times[name], name
-            ):
-                loop_names.add(name)
-            fwd_info.loop_stop_times[name] = stop_time
-        if loop_names:
-            self.worker_graphs_manager.stop_loops(
-                rid, body.partition_name, loop_names
-            )
 
     def _process_message_list(self, messages: list[WorkerMessage]):
         msg_types_needing_active_request = [
@@ -1895,9 +1870,10 @@ class Worker:
 
             # check conditions where the rid cannot be furtuer speculated
             already_removed = rid in self._pending_removes
-            already_stopped = spec_node_info.is_new_loop_iter and PendingLoopStop(
-                rid, graph_walk, spec_node_info.loop_name
-            ) in self._pending_loop_stops
+            already_stopped = spec_node_info.is_new_loop_iter \
+                and self._rid_runtime.has_pending_loop_stop(
+                    rid, graph_walk, spec_node_info.loop_name
+                )
             is_stopping = spec_node_info.is_new_loop_iter and loop is not None and (
                 loop.curr_iter + 1 >= loop.max_iters or loop._finish_signal
             )
@@ -2255,12 +2231,10 @@ class Worker:
         # sure to not route their outputs
         valid_rids = set(batch_N.node_batch.request_ids)
         if batch_N.speculative_new_iter:
-            for pending_stop in self._pending_loop_stops:
-                if pending_stop.loop_name != batch_N.loop_name \
-                        or pending_stop.graph_walk != batch_N.graph_walk \
-                        or pending_stop.rid not in batch_N.node_batch.request_ids:
-                    continue
-                stopped_rid = pending_stop.rid
+            stopped_rids = self._rid_runtime.pending_loop_stop_rids(
+                batch_N.graph_walk, batch_N.loop_name,
+            ) & set(batch_N.node_batch.request_ids)
+            for stopped_rid in stopped_rids:
                 outputs.pop(stopped_rid, None)
                 valid_rids.discard(stopped_rid)
                 batch_N.batch.node_objects.pop(stopped_rid, None)
@@ -2272,7 +2246,7 @@ class Worker:
             return
 
         # pending stops are only needed for one iteration, so can be cleared now
-        self._pending_loop_stops.clear()
+        self._rid_runtime.clear_pending_loop_stops()
 
         # An engine can drop rids that were skipped during execution (a
         # submodule's prepare_inputs returned None) from node_batch.request_ids,
@@ -2352,52 +2326,18 @@ class Worker:
             range_pop(synchronize=False)
             range_push("worker.postprocess.stop_loops", synchronize=False)
 
-        # Stop loops, if applicable
-        for rid, requested_stops in stops.items():
-            loop_names = {
-                ln for ln in requested_stops
-                if self._rid_runtime.check_dyn_loop(rid, batch_N.partition, ln)
-            }
-            if not loop_names:
-                continue
-            self.worker_graphs_manager.stop_loops(
-                rid, partition=batch_N.partition,
-                loop_names=loop_names,
-                req_info=batch_N.node_batch.per_request_info[rid],
-                last_node_run=batch_N.node_name
+        # Stop loops, if applicable. The runtime filters rids whose walk does
+        # not contain the loop, snapshots the stop times, records the pending
+        # stops and fans out to peers.
+        if stops:
+            self._rid_runtime.stop_loops_batched(
+                partition=batch_N.partition,
+                graph_walk=batch_N.graph_walk,
+                last_node_run=batch_N.node_name,
+                loop_names=ParallelList(
+                    list(stops), [list(v) for v in stops.values()],
+                ),
             )
-            self._pending_loop_stops.update([
-                PendingLoopStop(
-                    rid=rid,
-                    graph_walk=batch_N.graph_walk,
-                    loop_name=name
-                ) for name in loop_names
-            ])
-
-            # Send "loop done" messages to peer workers (small ZMQ msgs)
-            stop_loop_workers: dict[str, set[str]] = {}
-            for loop_name in loop_names:
-                for worker in self._rid_runtime.get_dyn_loop_workers(
-                    rid, batch_N.partition, loop_name
-                ):
-                    stop_loop_workers.setdefault(worker, set()).add(loop_name)
-            # Bind a fresh name: reusing loop_names here would clobber the set
-            # the enclosing iteration is still working from.
-            for worker, workers_loop_names in stop_loop_workers.items():
-                if worker == self.worker_id:
-                    continue
-                self.communicator.send(
-                    entity_id=worker,
-                    msg=WorkerMessage(
-                        message_type=WorkerMessageType.STOP_LOOPS,
-                        body=StopLoops(
-                            request_id=self._rid_str(rid),
-                            loop_names=workers_loop_names,
-                            loop_stop_times=batch_N.node_batch.per_request_info[rid].loop_stop_times,
-                            partition_name=batch_N.partition
-                        )
-                    )
-                )
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
