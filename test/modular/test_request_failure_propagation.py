@@ -247,9 +247,10 @@ def test_engine_failure_does_not_clobber_an_earlier_error():
 
 
 def _preprocess_thread(model):
-    from mstar.api_server.data_worker import PreprocessWorkerThread
+    from mstar.api_server.data_worker import DeliveryProgress, PreprocessWorkerThread
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    wt.delivery = DeliveryProgress()
     wt.out_queue = queue.Queue()
     wt.model = model
     wt.request_model_kwargs = {}

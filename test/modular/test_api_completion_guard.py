@@ -12,7 +12,7 @@ import queue
 import threading
 from types import SimpleNamespace
 
-from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+from mstar.api_server.data_worker import DeliveryProgress, PreprocessWorker, PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
 from mstar.graph.loop_indices import NestedLoopIndices
 
@@ -48,6 +48,7 @@ def test_preprocess_failure_emits_error_chunk():
             raise ValueError("bad knob")
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    wt.delivery = DeliveryProgress()
     wt.in_queue = queue.Queue()
     wt.out_queue = queue.Queue()
     wt.result_tensor_queue = queue.Queue()

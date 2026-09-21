@@ -400,7 +400,15 @@ class APIServer:
             )
             if drained or req is None:
                 stale.append((rid, False, drained))
-            elif (now - ts) >= self._recently_completed_ttl:
+            elif (now - ts) >= self._recently_completed_ttl and not (
+                self.preprocess_worker.delivery_active(
+                    rid, now - self._recently_completed_ttl,
+                )
+            ):
+                # Nothing has moved this request's outputs for a whole TTL
+                # and the data worker is idle, so the chunks are not coming.
+                # A long read or postprocess (a video encode) is delivery in
+                # progress and holds the TTL instead of tripping it.
                 stale.append((rid, True, drained))
         for rid, lost_outputs, drained in stale:
             # only set the event when there are no more pending chunks
