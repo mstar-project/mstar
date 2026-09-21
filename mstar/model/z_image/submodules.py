@@ -275,10 +275,17 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
         self._compiled = bool(compile_decode)
         self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
         self._decode_batch_sizes = tuple(decode_batch_sizes) if compile_decode else ()
+        self._warmed: set[tuple[int, int, int]] = set()  # shapes the compiled decode was warmed with
         self.warmup(warmup_grids)
 
+    def _decode_chunk(self, latent: torch.Tensor) -> torch.Tensor:
+        key = (int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1]))
+        if self._compiled and key not in self._warmed:
+            return self.vae.decode(latent)  # unwarmed shape: eager beats a 40-100 s in-request autotune
+        return self._decode_one(latent)
+
     def _decode_fn(self, latents: torch.Tensor) -> torch.Tensor:
-        return decode_in_chunks(self._decode_one, latents, self._decode_batch_sizes)
+        return decode_in_chunks(self._decode_chunk, latents, self._decode_batch_sizes)
 
     def warmup(self, grids: Sequence[tuple[int, int]]) -> None:
         """Decode zeros at every decode batch size per latent grid at load (compiled decode only)."""
@@ -293,6 +300,7 @@ class ZImageVaeDecoderSubmodule(NodeSubmodule):
                 )
                 with torch.no_grad():
                     self._decode_one(latent)
+                self._warmed.add((int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1])))
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         latents = inputs[LATENTS][0]
