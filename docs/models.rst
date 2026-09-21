@@ -288,8 +288,10 @@ attention runs on the engine's ragged FlashInfer resource, also CUDA-graph repla
 ``compile_eager_rounding`` (inductor rounds intermediates where eager PyTorch does and fuses
 no FMAs) and ``compile_exact_ops`` (``true``, or a list of op classes among ``norms`` and
 ``activations``: those modules stay on the eager kernels inside the compiled forward, so inductor
-only fuses the chains around the GEMMs and attention; each excluded module is a graph break, which
-costs klein-4B 8% of its B=1 latency and Z-Image 48%, so Z-Image may prefer a subset or ``false``; the
+only fuses the chains around the GEMMs and attention; each excluded module is a graph break: the
+norms alone make the transformer exact (the shipped ``[norms]`` costs klein-4B 4% of its B=1
+latency, 0.371 vs 0.356 s; excluding the activations too adds cost and nothing else) while Z-Image's
+180 norms per step cost 45%, so it ships ``false``; the
 compiled transformer is then bit-exact with the eager one — measured on klein-4B and 9B — where
 the plain compile, even with eager rounding, lands at a median 35 to 38 dB PSNR from the eager
 path over the 100 protocol prompts, because a 4- or 8-step distilled sampler amplifies the last
