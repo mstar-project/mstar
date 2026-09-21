@@ -24,7 +24,11 @@ import torch
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep
 from mstar.engine.resources.kv.keys import chain
-from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.manager import (
+    KVManager,
+    KVSequenceInfo,
+    PublishedKVInfo,
+)
 from mstar.engine.resources.step import Segment, StepContext
 
 requires_cuda = pytest.mark.skipif(
@@ -103,14 +107,10 @@ def _run(kv: KVManager, rid: str, tokens: list[int]) -> None:
 
 def _published(kv: KVManager, rid: str, seq_len: int, pages: list[int]):
     """What a prefill rank would publish for ``rid``."""
-    kv.ingest_request("donor")
-    info = kv.publish("donor")
-    seq = info.get(0)["main"]
-    info.info[0]["main"] = type(seq)(
+    del kv, rid
+    return PublishedKVInfo.build_for_rank(0, 1, {"main": KVSequenceInfo(
         seq_len=seq_len, latest_kv_transfer_info=PEER, page_indices=pages,
-    )
-    kv.remove_request("donor")
-    return info
+    )})
 
 
 # ── read-in ─────────────────────────────────────────────────────────────

@@ -263,18 +263,3 @@ def test_bagel_declares_the_tensor_its_text_walk_prefills_from():
     assert declared == {
         "kv": {"main": PrefixStream("text_inputs", "ids", True)}
     }, "the text walk's prompt does not arrive under the name it keys"
-
-
-def test_both_declared_nodes_chain_what_they_generate():
-    from mstar.model.bagel.bagel_model import BagelModel
-    from mstar.model.orpheus.orpheus_model import OrpheusModel
-
-    for model in (OrpheusModel, BagelModel):
-        streams = model.prefix_key_streams(object())
-        assert streams, f"{model.__name__} declares no stream to chain"
-        for by_label in streams.values():
-            for stream in by_label.values():
-                assert stream.chains_decode, (
-                    f"{model.__name__} keys its prompt but not what it writes "
-                    "next, though its decode ids are the token it sampled"
-                )

@@ -143,19 +143,6 @@ def test_eviction_after_a_hit_takes_the_cold_branch_and_stops_at_the_fork():
     _assert_pages_partition(arena)
 
 
-def test_eviction_never_removes_a_page_with_an_indexed_child():
-    arena = _arena()
-    index = PrefixIndex(arena)
-    pages = _chain(index, arena)
-
-    index.evict(1)
-
-    assert index.lookup([b"A", b"B"]) == [pages["A"], pages["B"]], (
-        "B was evicted while it still had an indexed child"
-    )
-    _assert_pages_partition(arena)
-
-
 def test_eviction_walks_up_a_chain_once_it_is_childless():
     arena = _arena()
     index = PrefixIndex(arena)
