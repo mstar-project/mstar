@@ -245,3 +245,52 @@ def test_a_stream_with_no_window_indexes_every_page_it_fills():
     assert _indexed(kv) == len(PROMPT) // PAGE_SIZE, (
         "a stream nobody windowed lost pages to the window rule"
     )
+
+
+# ── a walk the keys never described ─────────────────────────────────────
+
+WALKS = {"main": ("prefill_text", "decode")}
+
+
+def _first_write(walk: str) -> KVManager:
+    """Key 40 tokens, then commit 50 under ``walk`` before anything else."""
+    kv = KVManager(
+        cfg=KVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
+            max_num_pages=16, page_size=PAGE_SIZE,
+        ),
+        name="kv", joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.enable_prefix_cache(ROOT, WALKS)
+    prompt = list(range(40))
+    kv.ingest_request("r0", KVReqConfig(
+        prefix_keys={"main": chain([prompt[:16], prompt[16:32], prompt[32:]])},
+        prefix_tail={"main": prompt[32:]},
+    ))
+    step = KVStep(segments=(Segment("r0", "main", 50),))
+    ctx = StepContext(request_ids=("r0",), graph_walk=walk, slot=0, capture=False)
+    assert kv.admit(step, ctx).ok
+    kv.plan(step, ctx)
+    kv.commit(step, ctx)
+    return kv
+
+
+def test_an_image_walk_writing_first_files_nothing_and_ends_the_chain():
+    kv = _first_write("prefill_vae")
+
+    assert _indexed(kv) == 0, (
+        "pages the image walk wrote were filed under keys chained over the "
+        "prompt's text"
+    )
+    assert kv._streams["r0"]["main"].keys is None, (
+        "the chain outlived a walk it never described"
+    )
+    kv.assert_pages_conserved()
+
+
+def test_the_keyed_walk_writing_the_same_span_files_its_whole_pages():
+    kv = _first_write("prefill_text")
+
+    assert _indexed(kv) == 2, "the walk the model keyed filed nothing"
+    kv.assert_pages_conserved()

@@ -192,6 +192,43 @@ def test_a_falsy_step_info_is_not_opaque():
     )
 
 
+# ── which walks are probed ──────────────────────────────────────────────
+
+
+def test_a_walk_the_model_did_not_key_is_never_probed():
+    resource = _Answering(96)
+    engine = _engine({"kv": resource}, {NODE: ["kv"]})
+    engine._keyed_walks = {NODE: {"prefill_text"}}
+
+    _stage(engine, _inputs())
+
+    assert resource.resolved == 0, "a walk the model never named was offered a prefix"
+
+
+def test_a_node_with_no_keyed_stream_is_never_probed():
+    resource = _Answering(96)
+    engine = _engine({"kv": resource}, {NODE: ["kv"]})
+    engine._keyed_walks = {}
+
+    _stage(engine, _inputs())
+
+    assert resource.resolved == 0, "a node nobody declared was probed"
+
+
+def test_the_keyed_walk_placing_its_own_positions_names_the_model_and_walk():
+    engine = _engine({"kv": _Answering(96)}, {NODE: ["kv"]})
+
+    with pytest.raises(AssertionError, match=f"_Model keys the '{WALK}' walk of {NODE}"):
+        _stage(engine, _inputs(custom_pos_ids=torch.arange(PROMPT)))
+
+
+def test_the_keyed_walk_with_no_ids_to_cut_names_the_model_and_walk():
+    engine = _engine({"kv": _Answering(96)}, {NODE: ["kv"]})
+
+    with pytest.raises(AssertionError, match=f"_Model keys the '{WALK}' walk"):
+        _stage(engine, NodeInputs(input_seq_len=PROMPT))
+
+
 # ── scope ───────────────────────────────────────────────────────────────
 
 

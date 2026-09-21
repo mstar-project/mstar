@@ -208,3 +208,19 @@ def test_a_request_can_opt_out_of_the_cache():
     assert kv._streams["r0"]["main"].keys is None, (
         "an opted-out request still carried its keys onto the stream"
     )
+
+
+def test_the_engine_hands_each_cache_the_walks_its_streams_name():
+    from mstar.model.base import PrefixStream
+
+    class _Declaring(_Model):
+        def prefix_key_streams(self):
+            return {KV: {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}}
+
+    kv = _kv()
+    _root(kv=kv, model=_Declaring())
+
+    assert kv._keyed_walks == {"main": {"prefill_text", "decode"}}, (
+        "the cache was opened without the walks its keys describe, so every "
+        "walk's pages would be filed under them"
+    )

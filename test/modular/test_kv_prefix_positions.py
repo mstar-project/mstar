@@ -33,8 +33,10 @@ from mstar.engine.resources.position.config import PositionSpec, PositionStep, P
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import Segment, SubmoduleStep
+from mstar.model.base import PrefixStream
 from mstar.worker.engine_manager import (
     _refuse_uncacheable_positions,
+    _refuse_unknown_walks,
     _refuse_unskippable_resources,
 )
 
@@ -289,3 +291,33 @@ def test_a_resource_that_cannot_skip_loads_beside_a_declared_node():
 
 def test_a_declared_node_of_caches_positions_attention_and_sampling_loads():
     _refuse_unskippable_resources(_specs(PosScheme.SEQUENTIAL), _Model(KV))
+
+
+# ── the walks a declaration names ───────────────────────────────────────
+
+
+class _Walking:
+    """Declares one stream on ``walk`` and runs the walks it is given."""
+
+    def __init__(self, walk: str, runs: tuple[str, ...] = ("prefill", "decode")):
+        self._walk = walk
+        self._runs = runs
+
+    def prefix_key_streams(self):
+        return {KV: {"main": PrefixStream("text_inputs", "ids", self._walk, "decode")}}
+
+    def get_graph_walk_graphs(self):
+        return {walk: None for walk in self._runs}
+
+
+def test_a_stream_naming_a_walk_the_model_never_runs_is_refused_at_load():
+    with pytest.raises(ValueError, match="prefill_text") as refusal:
+        _refuse_unknown_walks(_Walking("prefill_text"))
+
+    assert "prefill" in str(refusal.value) and "decode" in str(refusal.value), (
+        "the refusal does not say which walks the model does run"
+    )
+
+
+def test_a_stream_naming_walks_the_model_runs_loads():
+    _refuse_unknown_walks(_Walking("prefill"))
