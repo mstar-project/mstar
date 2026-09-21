@@ -239,18 +239,21 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         """``_fuse`` for a batch of frame steps at once: ``[N, H]``, row ``i`` equal
         to ``_fuse(inputs[i])`` (same weights, same terms)."""
         cfg = self.config
-        prev_text = torch.cat([t["prev_text"].reshape(-1) for t in tensors]).to(device)          # [N]
+        # rows arrive on either device (a session's first prev_text is built on
+        # the host, later ones are the fed-back GPU token), so move each first
+        prev_text = torch.cat([t["prev_text"].reshape(-1).to(device) for t in tensors])          # [N]
         fused = self.embeddings(prev_text) * cfg.agent_text_weight                                # [N, H]
         frames = [t.get("audio_frame") for t in tensors]
         present = [f for f in frames if f is not None]
         if present:
             # a row past the end of its audio (the stream closed, the loop
             # still runs on the fed-back text) has no frame: its audio term is 0
-            zero = torch.zeros_like(present[0].reshape(1, -1))
-            audio = torch.cat([zero if f is None else f.reshape(1, -1) for f in frames])           # [N, H]
-            fused = fused + audio.to(device=device, dtype=fused.dtype) * cfg.user_audio_weight
+            zero = torch.zeros(1, fused.shape[1], device=device, dtype=fused.dtype)
+            audio = torch.cat([zero if f is None else f.reshape(1, -1).to(device=device, dtype=fused.dtype)
+                               for f in frames])                                                  # [N, H]
+            fused = fused + audio * cfg.user_audio_weight
         if cfg.use_function_head:
-            prev_func = torch.cat([t["prev_func"].reshape(-1) for t in tensors]).to(device)
+            prev_func = torch.cat([t["prev_func"].reshape(-1).to(device) for t in tensors])
             fused = fused + self.embeddings(prev_func) * cfg.function_weight
         return fused
 
