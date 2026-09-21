@@ -1070,6 +1070,16 @@ impl GraphRuntime {
         if !self.rids.release(rid) {
             return;
         }
+        // Routing parked by complete_and_route_batch whose send never ran --
+        // an exception between the two abandons it. Handles are recycled, so
+        // a stale entry would make the next request to get this integer send
+        // another request's outputs.
+        self.completions.retain(|_, c| {
+            c.routing.remove(&rid);
+            c.completed_wgs.remove(&rid);
+            !c.routing.is_empty()
+        });
+
         if let Some(info) = self.requests[rid as usize].take() {
             for &wg in &info.worker_graphs {
                 self.states[wg as usize][rid as usize] = None;
@@ -1879,6 +1889,13 @@ impl GraphRuntime {
     fn stream_partition_done(&self, rid: u32, partition: &str) -> bool {
         let Some(p) = self.interner.get(partition) else { return false };
         self.info(rid).is_some_and(|i| i.stream_done(p))
+    }
+
+    /// Parked routing awaiting a send. Non-zero between
+    /// complete_and_route_batch and send_outputs; a number that only grows
+    /// means sends are being abandoned.
+    fn num_parked_completions(&self) -> usize {
+        self.completions.len()
     }
 
     fn num_handles(&self) -> usize {

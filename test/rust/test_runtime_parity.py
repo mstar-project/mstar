@@ -456,3 +456,35 @@ def test_an_input_is_released_whichever_order_runs(pair, cleanup_first):
         cleanup()
 
     assert book.can_gc(100), "the consumed input leaked a reference"
+
+
+def test_removal_purges_routing_parked_for_a_send_that_never_ran(pair):
+    """An exception between complete_and_route_batch and send_outputs
+    abandons the parked routing.
+
+    Handles are RECYCLED, so a stale entry is not merely a leak: the next
+    request to get that integer would have another request's outputs sent
+    under its name.
+    """
+    rt, _book, store = pair
+    for i in range(20):
+        rid = _admit(rt, f"r{i}")
+        rt.ingest_inputs_batch(
+            ParallelList([rid], [_spec("prompt", "prefill")])
+        )
+        rt.pop_rids("prefill", WALK, [rid])
+        rt.complete_and_route_batch(
+            RouteInput(
+                partition="default", graph_walk=WALK, node_name="prefill",
+                output_signals=[], wg_ids=ParallelList([rid], [WG_ID]),
+                tensors=[], num_tensors=[],
+            ),
+            store,
+        )
+        rt.remove_request(rid)  # aborted before the send
+
+    parked = (
+        len(rt._completions) if hasattr(rt, "_completions")
+        else rt._rust.num_parked_completions()
+    )
+    assert parked == 0, f"{parked} completions left parked"

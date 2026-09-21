@@ -268,6 +268,18 @@ class PythonGraphRuntime(GraphRuntime):
         request_id = self._rids[rid]
         if request_id is None:
             return  # already removed; remove is idempotent by design
+        # Routing parked by complete_and_route_batch whose send never ran --
+        # an exception between the two abandons it. Handles are recycled, so a
+        # stale entry would make the next request to get this integer send
+        # another request's outputs.
+        for cid in [
+            cid for cid, c in self._completions.items()
+            if rid in c.routing and len(c.routing) == 1
+        ]:
+            del self._completions[cid]
+        for c in self._completions.values():
+            c.routing.pop(rid, None)
+
         info = self._request_info.pop(rid, None)
         if info is not None:
             for wg_id in info.worker_graph_ids:
