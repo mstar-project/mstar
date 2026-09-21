@@ -2257,11 +2257,14 @@ class Worker:
             for signal in signals:
                 infos = info_by_signal.get(signal, [])
                 num_tensors.append(len(infos))
-                for info in infos:
-                    # Safety hold: ref=1 until the real fanout is known, which
-                    # complete_and_route_batch settles.
-                    self.tensor_manager.increment_ref(info.uuid, n=1)
-                    flat_uuids.append(info.uuid)
+                flat_uuids.extend(info.uuid for info in infos)
+        # Safety hold: ref=1 until the real fanout is known, which
+        # complete_and_route_batch settles. One call for the batch rather than
+        # one per tensor -- with a Rust bookkeeper each is a boundary crossing,
+        # and a 128-request batch has hundreds of them.
+        self.tensor_manager.increment_ref_batch(
+            flat_uuids, [1] * len(flat_uuids)
+        )
 
         route_output = self._rid_runtime.complete_and_route_batch(
             RouteInput(

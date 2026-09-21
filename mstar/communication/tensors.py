@@ -819,6 +819,11 @@ class TensorCommunicationManager(ABC):
     def increment_ref(self, uuid: int, n: int = 1):
         self.tensor_store.increment_ref(uuid, n=n)
 
+    def increment_ref_batch(self, uuids: list[int], counts: list[int]):
+        """One call for the batch. With a Rust bookkeeper each single call is
+        a boundary crossing, and an output batch has hundreds."""
+        self.tensor_store.increment_ref_batch(uuids, counts)
+
     def has_inflight_reads(self, rid: int) -> bool:
         """Whether any async read for this request is still touching a remote
         segment. Synchronous (SHM) reads complete inside ``start_read_tensors``

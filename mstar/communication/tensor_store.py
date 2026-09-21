@@ -282,6 +282,9 @@ class TensorStore:
     def increment_ref(self, uuid: int, n: int = 1):
         self.bookkeeping.increment_ref(uuid, n)
 
+    def increment_ref_batch(self, uuids: list[int], counts: list[int]):
+        self.bookkeeping.increment_ref_batch(uuids, counts)
+
     def dereference(self, uuid: int, n: int = 1):
         self.bookkeeping.dereference(uuid, n)
 
