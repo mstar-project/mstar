@@ -608,6 +608,17 @@ class Engine:
                 nvtx=self._enable_nvtx, step=batch.step
             )
             if not admit.ok:
+                # Empty outputs for the WHOLE batch. Silent, this reads
+                # downstream as "the node ran and produced nothing" -- the
+                # routing still happens, with no tensors on any edge, so the
+                # pipeline stalls with no error anywhere.
+                logger.warning(
+                    "%s: admit refused the step for %d rid(s); returning empty "
+                    "outputs. reason=%s failed_resource=%s",
+                    batch.node_name, len(batch.request_ids),
+                    getattr(admit, "reason", None),
+                    getattr(admit, "failed_resource", None),
+                )
                 return {rid: {} for rid in batch.request_ids}
 
             raw, batch.step = self._drive_step(
@@ -616,6 +627,14 @@ class Engine:
                 step=batch.step, set_launch=True,
             )
             if raw is None:
+                # Same hazard as the admit path above: empty outputs for every
+                # rid, which downstream cannot tell from a node that genuinely
+                # emitted nothing.
+                logger.warning(
+                    "%s: the step produced no raw outputs for %d rid(s); "
+                    "returning empty outputs.",
+                    batch.node_name, len(batch.request_ids),
+                )
                 return {rid: {} for rid in batch.request_ids}
             # Commit first: releasing `commit_done` here is what lets a pre-plan
             # of N+1 overlap this step's per-request tail.
@@ -1110,9 +1129,16 @@ class Engine:
         req_info: Mapping[str, CurrentForwardPassInfo],
     ) -> None:
         """Fold the forward's per-rid entries into ``outputs``."""
+        missed = 0
         for rid, out_id in zip(request_ids, out_ids, strict=False):
             rid_out = raw_outputs.get(out_id)
             if not isinstance(rid_out, dict):
+                # A miss here is usually a KEY-TYPE mismatch, not a submodule
+                # that emitted nothing: out_ids are the worker's integer rid
+                # handles, and a submodule that keyed its dict by the request
+                # id STRING misses every one of them. Silent, that looks
+                # identical to a node with no outputs.
+                missed += 1
                 continue
             # captured output keys are fixed for graph compat; the submodule
             # decides which of them this real request should receive
@@ -1125,6 +1151,14 @@ class Engine:
                     merged[key] = [value.clone()]
                 else:
                     merged[key] = value
+        if missed and missed == len(out_ids):
+            logger.warning(
+                "%s: none of the %d rid(s) matched a key in the forward's "
+                "outputs (looked up %r, the dict has %r). Every edge will "
+                "carry no tensors.",
+                submodule.__class__.__name__, missed,
+                out_ids[:3], list(raw_outputs)[:3],
+            )
 
     def _merge_unpacked(
         self,
