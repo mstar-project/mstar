@@ -178,10 +178,17 @@ class SlotStateManager(Resource):
 
     def admit(self, step: SlotStateStep, ctx: StepContext) -> AdmitOutcome:
         real = set(ctx.request_ids)
+        leased: list[str] = []
         for segment in step.segments:
             if segment.span <= 0 or segment.request_id not in real:
                 continue
+            resident = self.slot_of(segment.request_id) is not None
             if not self._alloc(segment.request_id):
+                # Hand back what this admit leased: the worker retries the
+                # batch in another composition, and slots pinned to requests
+                # that never ran would refuse every batch with a newcomer.
+                for rid in leased:
+                    self._release(rid)
                 # AllocationFailed, like the KV cache: it is what the worker's
                 # hold/backoff path keys on. Nothing here is evictable, so the
                 # batch is held until a resident request releases a slot.
@@ -196,6 +203,8 @@ class SlotStateManager(Resource):
                         request_id=segment.request_id,
                     ),
                 )
+            if not resident:
+                leased.append(segment.request_id)
         return ADMIT_OK
 
     def _index_buffer(self, ctx: StepContext, rows: int) -> torch.Tensor:
