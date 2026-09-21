@@ -4,3 +4,4 @@ pub mod shard;
 pub mod spec;
 pub mod state;
 pub mod compile;
+pub mod frames;

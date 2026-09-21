@@ -1296,12 +1296,8 @@ class PythonGraphRuntime(GraphRuntime):
             elif delta < 0:
                 tensor_store.dereference(uuid, n=-delta)
 
-    def peek_completion(self, completion_id: int) -> "CompletionState":
-        """TRANSITIONAL: lets the worker see the routing before it sends.
-
-        Does NOT consume -- send_outputs is what pops the entry. The worker
-        still needs this for the parts that touch real tensors (local
-        streaming, new-token numel) and for what _postprocess_batch returns.
+    def _peek_completion(self, completion_id: int) -> "CompletionState":
+        """For testing purposes only.
         """
         return self._completions[completion_id]
 

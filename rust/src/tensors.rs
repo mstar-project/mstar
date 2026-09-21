@@ -109,6 +109,17 @@ pub struct Bookkeeping {
 pub type SharedBookkeeping = Arc<Mutex<Bookkeeping>>;
 
 impl Bookkeeping {
+    /// The descriptor as stored, symbols unresolved. For a caller that is
+    /// building a wire frame and resolves them through `strings()`.
+    pub fn info_raw(&self, uuid: u64) -> Option<&TensorPointerInfo> {
+        self.tensor_info.get(&uuid)
+    }
+
+    /// The table a descriptor's symbols were interned in. Not the runtime's.
+    pub fn strings(&self) -> &StrToId {
+        &self.strings
+    }
+
     fn intern_info(&mut self, arg: &TensorInfoArg) -> TensorPointerInfo {
         TensorPointerInfo {
             dims: arg.dims.clone(),

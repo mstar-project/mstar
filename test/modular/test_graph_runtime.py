@@ -513,7 +513,7 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
         ),
         store,
     )
-    completion = runtime.peek_completion(out.completion_id)
+    completion = runtime._peek_completion(out.completion_id)
 
     # Each rid's edges carry exactly its own uuids, per signal.
     for rid, own in ((rid_a, a), (rid_b, b)):
@@ -546,11 +546,11 @@ def test_route_batch_parks_routing_under_a_fresh_completion_id():
         store,
     )
     assert out.completion_id not in (0,), "ids start above the unset sentinel"
-    state = runtime.peek_completion(out.completion_id)
+    state = runtime._peek_completion(out.completion_id)
     assert state.node_name == "prefill" and state.graph_walk == "decode"
     # peek does not consume; send_outputs is what pops the entry, so peeking
     # twice has to keep working.
-    assert runtime.peek_completion(out.completion_id) is state
+    assert runtime._peek_completion(out.completion_id) is state
 
 
 # --- send_outputs -------------------------------------------------------------
@@ -602,12 +602,12 @@ def test_send_outputs_consumes_the_completion():
 
     out, _ = _route_one(runtime, mgr, rid, store, minter)
     # Peeking must not consume.
-    runtime.peek_completion(out.completion_id)
-    runtime.peek_completion(out.completion_id)
+    runtime._peek_completion(out.completion_id)
+    runtime._peek_completion(out.completion_id)
 
     runtime.send_outputs(_send_input(runtime, rid, out.completion_id, _fwd_info("decode")))
     with pytest.raises(KeyError):
-        runtime.peek_completion(out.completion_id)
+        runtime._peek_completion(out.completion_id)
 
 
 def test_persist_signals_are_buffered_until_a_worker_graph_finishes():

@@ -10,7 +10,7 @@ use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
 use crate::communicator::RawZmqCommunicator;
 use crate::PyZmqCommunicator;
 use std::sync::Arc;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -1909,6 +1909,103 @@ impl GraphRuntime {
 
     /// The snapshot this rank holds, for the STOP_LOOPS it sends.
     #[allow(clippy::type_complexity)]
+    /// Build one WORKER_GRAPHS_DONE frame and, if this runtime was given a
+    /// transport, send it. Returns the frame either way so a caller without
+    /// one (and the parity test) can still see it.
+    ///
+    /// The four `*_encoded` arguments are fields whose types belong to Python;
+    /// they arrive from `wire.encode_field` and are spliced untouched.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        rid, worker_graph_ids, is_first_tp_rank, partition_name, partition_done,
+        persist_uuids, new_token_counts, output_signal_names,
+        stream_tokens_consumed, output_loop_indices,
+        resource_publish_info = None, graph_timings = None,
+        rx_info = None, tx_info = None, send = true,
+    ))]
+    fn emit_worker_graphs_done(
+        &mut self,
+        rid: u32,
+        worker_graph_ids: Vec<u32>,
+        is_first_tp_rank: bool,
+        partition_name: String,
+        partition_done: bool,
+        persist_uuids: Vec<(String, Vec<u64>)>,
+        new_token_counts: Vec<(String, i64)>,
+        output_signal_names: Vec<String>,
+        stream_tokens_consumed: Vec<(String, i64)>,
+        output_loop_indices: Vec<(String, (Vec<String>, Vec<(String, u32)>, u32))>,
+        resource_publish_info: Option<Vec<u8>>,
+        graph_timings: Option<Vec<u8>>,
+        rx_info: Option<Vec<u8>>,
+        tx_info: Option<Vec<u8>>,
+        send: bool,
+    ) -> PyResult<Vec<u8>> {
+        let request_id = self
+            .rids
+            .name(rid)
+            .ok_or_else(|| PyValueError::new_err("unknown rid handle"))?
+            .to_string();
+
+        let persist_signals: Vec<(Sym, Vec<crate::tensors::TensorPointerInfo>)> = {
+            let bk = self.bookkeeping.lock().unwrap();
+            persist_uuids
+                .iter()
+                .map(|(sig, uuids)| {
+                    (
+                        self.interner.intern(sig),
+                        // A uuid whose descriptor is already gone is skipped,
+                        // matching the Python shim's _infos.
+                        uuids.iter().filter_map(|u| bk.info_raw(*u).cloned()).collect(),
+                    )
+                })
+                .collect()
+        };
+        let names: Vec<Sym> =
+            output_signal_names.iter().map(|n| self.interner.intern(n)).collect();
+        let loop_idxs: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))> = output_loop_indices
+            .iter()
+            .map(|(sig, (order, idxs, fwd))| {
+                (
+                    self.interner.intern(sig),
+                    (
+                        order.iter().map(|n| self.interner.intern(n)).collect(),
+                        idxs.iter().map(|(n, i)| (self.interner.intern(n), *i)).collect(),
+                        *fwd,
+                    ),
+                )
+            })
+            .collect();
+
+        let frame = crate::graph::frames::WorkerGraphsDone {
+            request_id: &request_id,
+            worker_graph_ids: &worker_graph_ids,
+            is_first_tp_rank,
+            persist_signals,
+            new_token_counts: &new_token_counts,
+            output_signal_names: names,
+            partition_name: &partition_name,
+            partition_done,
+            stream_tokens_consumed: &stream_tokens_consumed,
+            output_loop_indices: loop_idxs,
+            resource_publish_info_encoded: resource_publish_info.as_deref(),
+            graph_timings_encoded: graph_timings.as_deref(),
+            rx_info_encoded: rx_info.as_deref(),
+            tx_info_encoded: tx_info.as_deref(),
+        };
+        let bytes = {
+            let bk = self.bookkeeping.lock().unwrap();
+            frame.encode(&self.interner, bk.strings())
+        };
+        if send {
+            if let Some(comm) = &self.communicator {
+                comm.send("conductor", &bytes)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Python's `WorkerGraphIO.get_nested_loop_idxs_for_node`: the loop
     /// context a node runs in, as (order, indices, wg_fwd_pass_idx).
     ///
