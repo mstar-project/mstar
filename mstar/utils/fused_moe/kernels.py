@@ -311,7 +311,8 @@ def moe_sum_reduce_kernel(
     input_stride_2,
     output_ptr,
     output_stride_0,
-    output_stride_1,
+    output_stride_chunk,
+    chunk_dim: int,
     token_num: int,
     topk_num: int,
     hidden_dim: int,
@@ -323,11 +324,14 @@ def moe_sum_reduce_kernel(
     """Sum ``input`` over its ``topk`` dim, optionally scaling the result.
 
     ``input`` is ``(token_num, topk_num, hidden_dim)``; ``output`` is
-    ``(token_num, hidden_dim)``.  The output dtype matches ``input``.
+    ``(token_num, hidden_dim)``, its columns in chunks of ``chunk_dim`` that are
+    ``output_stride_chunk`` apart (``chunk_dim = hidden_dim`` for a plain row-major
+    output). The output dtype matches ``input``.
     """
     input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
     input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
     output_stride_0 = tl.cast(output_stride_0, dtype=tl.int64)
+    output_stride_chunk = tl.cast(output_stride_chunk, dtype=tl.int64)
 
     token_block_id = tl.program_id(0)
     dim_block_id = tl.program_id(1)
@@ -348,7 +352,8 @@ def moe_sum_reduce_kernel(
         accumulator += tile.to(tl.float32)
     accumulator *= routed_scaling_factor
 
-    store_ptrs = output_ptr + offs_token[:, None] * output_stride_0 + offs_dim[None, :]
+    out_cols = (offs_dim // chunk_dim) * output_stride_chunk + offs_dim % chunk_dim
+    store_ptrs = output_ptr + offs_token[:, None] * output_stride_0 + out_cols[None, :]
     tl.store(
         store_ptrs,
         accumulator.to(input_ptr.dtype.element_ty),
@@ -361,12 +366,19 @@ def moe_sum_reduce_triton(
     output: torch.Tensor,
     routed_scaling_factor: float = 1.0,
 ) -> None:
-    """Launch :func:`moe_sum_reduce_kernel`."""
+    """Launch :func:`moe_sum_reduce_kernel`. ``output`` is ``[token_num, hidden_dim]`` with contiguous
+    rows, or ``[token_num, chunks, hidden_dim / chunks]`` whose column chunks each are contiguous and lie
+    at their own stride (a ``permute(1, 0, 2)`` of a ``[chunks, token_num, hidden_dim / chunks]`` buffer: the
+    layout a reduce-scatter over the columns takes without a copy)."""
     assert input.is_contiguous()
-    assert output.is_contiguous()
-
     token_num, topk_num, hidden_dim = input.shape
-    assert output.shape[0] == token_num and output.shape[1] == hidden_dim
+    if output.dim() == 3:
+        assert output.shape[0] == token_num and output.shape[1] * output.shape[2] == hidden_dim
+        assert output.stride(2) == 1
+        chunk_dim, stride_chunk = output.shape[2], output.stride(1)
+    else:
+        assert output.shape[0] == token_num and output.shape[1] == hidden_dim and output.stride(1) == 1
+        chunk_dim, stride_chunk = hidden_dim, 0
 
     BLOCK_M = 1
     BLOCK_DIM = 2048
@@ -381,7 +393,9 @@ def moe_sum_reduce_triton(
         input,
         *input.stride(),
         output,
-        *output.stride(),
+        output.stride(0),
+        stride_chunk,
+        chunk_dim=chunk_dim,
         token_num=token_num,
         topk_num=topk_num,
         hidden_dim=hidden_dim,
