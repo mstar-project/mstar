@@ -212,6 +212,12 @@ no longer read. It raises an error with a message describing the migration.
 cached pages. A single request opts out by sending ``prefix_cache=False``, which
 travels with its other ``model_kwargs``.
 
+Under tensor parallelism each rank keeps its own index. Their contents are not
+the same — a page is keyed on each rank's own postprocess path — so the ranks
+agree on a *length* rather than on pages: every rank matches its own prefix when
+the request arrives, rank 0 takes the smallest answer, and every rank skips
+that many tokens. A request is not scheduled until every rank has answered.
+
 **Single GPU.** Everything on rank 0:
 
 .. code-block:: yaml

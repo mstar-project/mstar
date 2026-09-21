@@ -5,8 +5,9 @@ root that folds the checkpoint, the preprocessing, and the configuration of the
 KV resource and of every resource planned against it. Anything left out of that
 fold is a way for one deployment to match pages another one wrote.
 
-The other half is where the cache stays shut: above one rank, because the ranks
-walk their indexes independently and would match different lengths.
+The other half is where the cache stays shut, which is a deployment or a
+request turning it off. Rank is not one of those: every rank opens its own
+index and the group agrees a length rather than an index.
 """
 
 from __future__ import annotations
@@ -143,14 +144,15 @@ def test_the_root_changes_with_the_checkpoint(tmp_path):
 # ── where the cache stays shut ──────────────────────────────────────────
 
 
-def test_a_rank_above_one_never_opens_its_index():
+def test_every_rank_opens_its_own_index():
     kv = _kv()
     kv._world_size = 2
 
     _root(kv=kv)
 
-    assert kv._index is None and kv._prefix_root is None, (
-        "the index opened at a world size that cannot agree on a match length"
+    assert kv._index is not None and kv._prefix_root is not None, (
+        "a rank above the first has no index to bring to the agreement, so "
+        "the group's minimum would be nothing for every request"
     )
 
 

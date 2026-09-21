@@ -369,13 +369,6 @@ class KVManager(AttentionResource):
         """Open the index under ``root``, the identity every key hangs from."""
         if not self.config.prefix_cache:
             return
-        if self._world_size > 1:
-            logger.info(
-                "KV %s: prefix cache off at world size %d: the ranks index "
-                "independently and would match different lengths",
-                self.name, self._world_size,
-            )
-            return
         self._prefix_root = root
         self._index = PrefixIndex(self._arena)
 
@@ -679,9 +672,9 @@ class KVManager(AttentionResource):
                     # removed while the chain was hashing
                     continue
                 matched = self._take_lease(stream, rooted[label])
-                if matched:
-                    # nothing else weighs in before the step, so the probe is
-                    # the whole agreement
+                if matched and self._world_size == 1:
+                    # at one rank the probe is the whole agreement; above one
+                    # it is this rank's offer, and `agree_prefix` settles it
                     stream.agreed = matched
 
     def admit_retrieve(
