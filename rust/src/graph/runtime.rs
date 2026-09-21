@@ -1557,9 +1557,8 @@ impl GraphRuntime {
 
         // The local worker graphs live in this walk; the done-sweep below
         // intersects each request's registered graphs with these.
-        let walk_wgs: Vec<WgIndex> = self
-            .interner
-            .get(&input.graph_walk)
+        let walk_sym = self.interner.get(&input.graph_walk);
+        let walk_wgs: Vec<WgIndex> = walk_sym
             .and_then(|w| self.walk_to_local_wgs.get(&w).cloned())
             .unwrap_or_default();
 
@@ -1689,6 +1688,34 @@ impl GraphRuntime {
                 }
             }
 
+            // How many references each edge really represents. Python counts
+            // the POST-fanout edges -- to_workers is keyed by worker, so a
+            // tensor read by N workers is counted N times -- while the edges
+            // here are pre-fanout, one per graph edge. Counting them once
+            // settles the hold to 1 with N reads outstanding, and the first
+            // release frees a tensor the other N-1 are still reading.
+            //
+            // EMPTY_DESTINATION is 0, not 1: it routes nowhere, and Python
+            // drops it before the count.
+            let edge_refs: Vec<i64> = edges
+                .iter()
+                .map(|e| {
+                    if e.persist {
+                        return 0;
+                    }
+                    match e.dest {
+                        // Already in local_counts.
+                        Dest::Local(_) | Dest::Empty => 0,
+                        Dest::EmitToClient => 1,
+                        Dest::External(d) => walk_sym
+                            .and_then(|w| {
+                                Some(self.info(rid)?.node_to_workers.get(&(d, w))?.len())
+                            })
+                            .unwrap_or(0) as i64,
+                    }
+                })
+                .collect();
+
             // Settle from the safety hold of 1 to the real fanout. persist is
             // excluded: those are held by the marker, and counting them would
             // double-count a signal whose destination is EMPTY_DESTINATION.
@@ -1696,11 +1723,12 @@ impl GraphRuntime {
                 let mut bk = self.bookkeeping.lock().unwrap();
                 for uuid in owned {
                     let mut count = local_counts.get(&uuid).copied().unwrap_or(0);
-                    for e in &edges {
-                        if e.persist || matches!(e.dest, Dest::Local(_)) {
+                    for (e, &refs) in edges.iter().zip(&edge_refs) {
+                        if refs == 0 {
                             continue;
                         }
-                        count += e.tensors.iter().filter(|t| t.uuid == uuid).count() as i64;
+                        count += refs
+                            * e.tensors.iter().filter(|t| t.uuid == uuid).count() as i64;
                     }
                     if e_persist(&edges, uuid) {
                         bk.set_persist(uuid, true);

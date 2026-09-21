@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from mstar.communication.tensor_store import PythonTensorBookkeeping
-from mstar.distributed.base import ShardingConfig
+from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.runtime.base import EdgeSpec, RouteInput, SpeculationPrepInput
 from mstar.graph.runtime.python import PythonGraphRuntime
@@ -661,3 +661,82 @@ def test_a_worker_graph_completes_on_every_pass_not_just_the_first(one_node):
 
     second = _one_pass(rt, book, store, rid, uuid=2)
     assert second.completion_id != first.completion_id
+
+
+# --- a tensor read by N workers needs N references ---------------------------
+
+@pytest.fixture(params=["python", "rust"])
+def two_consumers(request):
+    """One local node whose output goes to a node owned by TWO workers.
+
+    Every other fixture puts a single worker on each node, so an edge and a
+    destination are indistinguishable there -- which is exactly the confusion
+    the Rust refcount had.
+    """
+    section = GraphNode(
+        name="only", input_names={"prompt"},
+        outputs=[GraphEdge(name="out", next_node="remote")],
+    )
+    wg = WorkerGraph(
+        section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}, 1: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: set(), 1: set()},
+        all_wg_ids_to_nodes={WG_ID: {"only"}, 1: {"remote"}},
+        node_to_partition={"only": "default", "remote": "default"},
+        # "remote" is a real TP group of two; shard_dim is empty so the
+        # tensor is replicated to both rather than split.
+        sharding_config=ShardingConfig(
+            groups=[ShardingGroup(nodes={"remote"}, tp_size=2)],
+            tp_enabled_nodes=set(), shard_dim={},
+        ),
+    )
+    if request.param == "python":
+        book = PythonTensorBookkeeping()
+        tm = _StubTensorManager(book)
+        return (
+            PythonGraphRuntime(tensor_manager=tm, communicator=None, **common),
+            book, tm.tensor_store,
+        )
+    book = RustTensorBookkeeping()
+    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
+
+
+def test_a_tensor_read_by_two_workers_holds_two_references(two_consumers):
+    """Rust counted one reference per EDGE, Python one per destination WORKER.
+
+    The per-worker expansion happens later, in take_send_plan, so the count
+    was settled before the fanout existed. With two readers the hold drops to
+    1 and the first release frees a tensor the other is still reading.
+    """
+    rt, book, store = two_consumers
+    # "remote" runs on two workers for this request.
+    rid = rt.add_request(
+        request_id="r1", partition="default", graph_walk=WALK,
+        partition_worker_graph_ids=[WG_ID, 1],
+        worker_graph_to_workers=ParallelList(
+            [WG_ID, 1], [[WORKER], ["worker1", "worker2"]],
+        ),
+    )
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "only")]))
+    rt.pop_rids("only", WALK, [rid])
+
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)  # the safety hold
+    rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="only",
+            output_signals=["out"],
+            wg_ids=ParallelList([rid], [WG_ID]),
+            tensors=[1], num_tensors=[1],
+        ),
+        store,
+    )
+
+    # Two outstanding reads: one release must not free it.
+    book.dereference(1, 1)
+    assert not book.can_gc(1), "still being read by the second worker"
+    book.dereference(1, 1)
+    assert book.can_gc(1)
