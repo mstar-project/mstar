@@ -67,6 +67,7 @@ class ZImageModel(Model):
         capture_caption_lengths: list[int] | None = None,
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 8,
+        max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
         **kwargs,
     ):
@@ -86,6 +87,8 @@ class ZImageModel(Model):
         self.capture_caption_lengths = [int(n) for n in (capture_caption_lengths or [32, 64])]
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2, 4, 8])]
         self.max_batch_size = int(max_batch_size)
+        # largest output (pixels) a request may ask for; larger requests are rejected before scheduling
+        self.max_image_area = int(max_image_area)
         self.vae_compile = bool(vae_compile)
         self._snapshot = None
         self._config: ZImageConfig | None = None
@@ -175,6 +178,11 @@ class ZImageModel(Model):
         for name, value in (("height", height), ("width", width)):
             if value <= 0 or value % align:
                 raise ValueError(f"Z-Image {name}={value} must be a positive multiple of {align}")
+        if height * width > self.max_image_area:
+            raise ValueError(
+                f"Z-Image {width}x{height} exceeds this server's max_image_area of {self.max_image_area} pixels "
+                f"({int(self.max_image_area ** 0.5)}^2)"
+            )
         return height, width
 
     def _resolve_steps(self, model_kwargs: dict) -> int:
