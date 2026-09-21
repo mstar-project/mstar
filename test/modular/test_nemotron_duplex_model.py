@@ -76,7 +76,9 @@ def test_duplex_node_resources():
     eartts = model.config.eartts
     tkv = by_key[TALKER_KV]
     assert isinstance(tkv, KVSpec)
-    assert (tkv.config.num_layers, tkv.config.num_kv_heads, tkv.config.head_dim) == (28, 16, 72)
+    # the pool's head dim is the talker's 72 zero-padded to a size FlashInfer computes exactly
+    assert (tkv.config.num_layers, tkv.config.num_kv_heads, tkv.config.head_dim) == (28, 16, 128)
+    assert tkv.config.head_dim == eartts.kv_head_dim > eartts.head_dim
     assert tkv.config.max_seq_len > eartts.sliding_window + 37   # window + speaker warm-up
     assert isinstance(by_key[TALKER_ATTN], AttentionSpec) and by_key[TALKER_ATTN].config.kv_cache == TALKER_KV
     tpos = by_key[TALKER_POS]
