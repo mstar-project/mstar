@@ -29,6 +29,7 @@ from mstar.engine.resources.kv.manager import (
     KVManager,
     KVSequenceInfo,
     PublishedKVInfo,
+    RetentionPolicy,
 )
 from mstar.engine.resources.step import Segment, StepContext
 
@@ -191,4 +192,56 @@ def test_a_decode_step_that_commits_before_its_token_is_read_back_keeps_the_chai
     )
     assert _indexed(kv) == (len(PROMPT) + 30) // PAGE_SIZE, (
         "the generated pages were never indexed"
+    )
+
+
+# ── what a window releases ──────────────────────────────────────────────
+
+
+def test_a_stream_that_released_its_front_keys_nothing_further():
+    kv = _manager()
+    _ingest(kv, "r0")
+    _step(kv, "r0", len(PROMPT))
+    indexed = _indexed(kv)
+    _sampled(kv, "r0", 9000)
+
+    # what a sliding window leaves behind: the pages moved, the lengths did not
+    kv._streams["r0"]["main"].released = PAGE_SIZE
+    for token in range(9001, 9031):
+        _step(kv, "r0", 1)
+        _sampled(kv, "r0", token)
+    kv.assert_pages_conserved()
+
+    assert _indexed(kv) == indexed, (
+        "a page was filed under a key for whatever used to be at its index"
+    )
+    assert kv._streams["r0"]["main"].keys is None, (
+        "the chain carried on over a stream whose pages had moved under it"
+    )
+
+
+def test_a_windowed_stream_indexes_up_to_its_protected_prefix():
+    kv = _manager()
+    _ingest(kv, "r0")
+    kv._streams["r0"]["main"].retention = RetentionPolicy(
+        context_budget=4 * PAGE_SIZE, protected_prefix=PAGE_SIZE,
+    )
+
+    _step(kv, "r0", len(PROMPT))
+    kv.assert_pages_conserved()
+
+    assert _indexed(kv) == 1, (
+        "a windowed stream filed pages its window is free to release"
+    )
+
+
+def test_a_stream_with_no_window_indexes_every_page_it_fills():
+    kv = _manager()
+    _ingest(kv, "r0")
+
+    _step(kv, "r0", len(PROMPT))
+    kv.assert_pages_conserved()
+
+    assert _indexed(kv) == len(PROMPT) // PAGE_SIZE, (
+        "a stream nobody windowed lost pages to the window rule"
     )
