@@ -80,10 +80,12 @@ class ResnetBlock(nn.Module):
         self.norm2 = nn.GroupNorm(groups, out_channels, eps=eps, affine=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         self.conv_shortcut = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else None
+        # the activation as a module (same kernel as F.silu) so a compiled decode can keep it eager
+        self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(F.silu(self.norm1(x)))
-        h = self.conv2(F.silu(self.norm2(h)))
+        h = self.conv1(self.act(self.norm1(x)))
+        h = self.conv2(self.act(self.norm2(h)))
         if self.conv_shortcut is not None:
             x = self.conv_shortcut(x)
         return x + h
@@ -179,6 +181,7 @@ class Encoder(nn.Module):
             prev = out
         self.mid = MidBlock(chans[-1], groups, eps, config.mid_block_add_attention)
         self.norm_out = nn.GroupNorm(groups, chans[-1], eps=eps)
+        self.act_out = nn.SiLU()
         self.conv_out = nn.Conv2d(chans[-1], 2 * config.latent_channels, 3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -186,7 +189,7 @@ class Encoder(nn.Module):
         for stage in self.down_stages:
             x = stage(x)
         x = self.mid(x)
-        return self.conv_out(F.silu(self.norm_out(x)))
+        return self.conv_out(self.act_out(self.norm_out(x)))
 
 
 class Decoder(nn.Module):
@@ -204,13 +207,14 @@ class Decoder(nn.Module):
             )
             prev = out
         self.norm_out = nn.GroupNorm(groups, rev[-1], eps=eps)
+        self.act_out = nn.SiLU()
         self.conv_out = nn.Conv2d(rev[-1], config.out_channels, 3, padding=1)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         x = self.mid(self.conv_in(z))
         for stage in self.up_stages:
             x = stage(x)
-        return self.conv_out(F.silu(self.norm_out(x)))
+        return self.conv_out(self.act_out(self.norm_out(x)))
 
 
 class AutoencoderKL(nn.Module):
