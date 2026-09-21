@@ -130,9 +130,9 @@ class CacheStream:
     converted: bool = False
     # how many of this stream's pages the index already holds
     cursor: int = 0
-    # generated tokens that have not finished a page, after the prompt's own
-    # tail; the page they finish is keyed over all of them at once
-    pending: list[int] | None = None
+    # tokens after the last page this stream keyed: the prompt's own tail and
+    # the generated ids after it, keyed together once they fill a page
+    unkeyed: list[int] | None = None
     # set once this stream has been reported, so a request that is admitted
     # again (a refused admit, a second partition) is still one line
     reported: bool = False
@@ -167,7 +167,7 @@ class CacheStream:
         same tokens back, so the chain that describes them has to survive it.
         """
         self.keys = None
-        self.pending = None
+        self.unkeyed = None
         self.cursor = 0
         self.keyed_pages = 0
         self.covered_len = 0
@@ -547,7 +547,7 @@ class KVManager(AttentionResource):
             return
         tail = list((overrides.prefix_tail or {}).get(label) or ())
         stream.keys = list(keys)
-        stream.pending = tail
+        stream.unkeyed = tail
         stream.keyed_pages = len(keys) - (1 if tail else 0)
         stream.covered_len = stream.keyed_pages * self.config.page_size + len(tail)
 
@@ -569,17 +569,17 @@ class KVManager(AttentionResource):
             if not sampled:
                 return
             stream = self._streams.get(rid, {}).get(label)
-            if stream is None or stream.keys is None or stream.pending is None:
+            if stream is None or stream.keys is None or stream.unkeyed is None:
                 return
             tokens = sampled[0].flatten().tolist()
-            stream.pending.extend(tokens)
+            stream.unkeyed.extend(tokens)
             stream.covered_len += len(tokens)
             page_size = self.config.page_size
-            while len(stream.pending) >= page_size:
+            while len(stream.unkeyed) >= page_size:
                 whole = stream.keyed_pages
                 key = page_key(
                     stream.keys[whole - 1] if whole else b"",
-                    stream.pending[:page_size],
+                    stream.unkeyed[:page_size],
                 )
                 # overwrites the partial key the prompt left here, if any
                 if whole < len(stream.keys):
@@ -587,7 +587,7 @@ class KVManager(AttentionResource):
                 else:
                     stream.keys.append(key)
                 stream.keyed_pages = whole + 1
-                del stream.pending[:page_size]
+                del stream.unkeyed[:page_size]
 
     def _release_lease(self, stream: CacheStream) -> None:
         """Give back a lease `admit` never converted; a converted one leaves
@@ -666,7 +666,7 @@ class KVManager(AttentionResource):
                 stream = self._ensure_label(rid, label)
                 # the rank that published this sampled the first token after
                 # it, so a chain extended here would start one token late
-                stream.pending = None
+                stream.unkeyed = None
                 new_len = seq_info.seq_len
                 self._take_local_match(stream, new_len, rooted.get(label))
                 old_len = stream.stored_len

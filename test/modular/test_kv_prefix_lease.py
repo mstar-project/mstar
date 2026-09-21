@@ -104,7 +104,7 @@ def _seed(kv: KVManager, tokens: list[int]) -> list[bytes]:
     kv.ingest_request("seed", KVReqConfig(prefix_keys={"main": keys}))
     _grow(kv, "seed", len(tokens))
     pages = kv._streams["seed"]["main"].page_indices
-    parent = -1
+    parent = None
     for index, key in enumerate(keys[:len(tokens) // PAGE_SIZE]):
         kv._index.insert(fingerprint(ROOT, key), pages[index], parent)
         parent = pages[index]
