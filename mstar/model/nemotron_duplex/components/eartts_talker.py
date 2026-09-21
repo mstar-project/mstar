@@ -74,11 +74,23 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def _rope_cos_sin(positions: torch.Tensor, theta: float, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Standard rotary cos/sin over the full ``dim`` head, computed in fp32."""
+    """Standard rotary cos/sin over the full ``dim`` head, computed in fp32.
+    ``positions`` is ``[T]`` (shared by the batch) or ``[B, T]`` (per row)."""
     inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, device=positions.device, dtype=torch.float32) / dim))
-    freqs = positions.float()[:, None] * inv_freq[None, :]   # [T, dim/2]
-    emb = torch.cat((freqs, freqs), dim=-1)                  # [T, dim]
+    freqs = positions.float()[..., None] * inv_freq          # [..., T, dim/2]
+    emb = torch.cat((freqs, freqs), dim=-1)                  # [..., T, dim]
     return emb.cos(), emb.sin()
+
+
+def _rand_rows(shape, device, dtype, generator, fn=torch.rand) -> torch.Tensor:
+    """Noise of ``shape`` whose leading dim is the batch row. ``generator`` is one
+    ``torch.Generator`` for the whole batch, or one per row: then each row draws
+    exactly the numbers it would draw as a batch of one, so a session's sampling
+    does not depend on which other sessions share its step."""
+    if isinstance(generator, (list, tuple)):
+        assert len(generator) == shape[0], (len(generator), shape)
+        return torch.stack([fn(tuple(shape[1:]), device=device, dtype=dtype, generator=g) for g in generator])
+    return fn(shape, device=device, dtype=dtype, generator=generator)
 
 
 def _masking_rate(rate: torch.Tensor, exponent: float) -> torch.Tensor:
@@ -166,8 +178,9 @@ class _Attn(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         if cos is not None:
-            cos_b = cos[None, None, :, :]
-            sin_b = sin[None, None, :, :]
+            # [t, hd] shared by the batch, or [b, t, hd] per row
+            cos_b = cos[:, None] if cos.dim() == 3 else cos[None, None]
+            sin_b = sin[:, None] if sin.dim() == 3 else sin[None, None]
             q = q * cos_b + _rotate_half(q) * sin_b
             k = k * cos_b + _rotate_half(k) * sin_b
         if past_kv is not None:
@@ -211,13 +224,17 @@ class TalkerLayer(nn.Module):
         sin: torch.Tensor,
         past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         return_kv: bool = False,
+        attn_bias: torch.Tensor | None = None,
     ):
         """Gemma3 decoder layer with its 4 RMSNorms (input / post-attn /
         pre-ff / post-ff), each ``(1 + w)`` in fp32. Optionally reads/updates a
-        per-layer ``(k, v)`` cache for autoregressive decoding."""
+        per-layer ``(k, v)`` cache for autoregressive decoding; ``attn_bias``
+        masks padded cache positions in a batch of unequal caches."""
         residual = x
         h = _gemma_rmsnorm(x, self.input_layernorm.weight, self.eps)
-        attn_out = self.self_attn(h, cos, sin, causal=True, past_kv=past_kv, return_kv=return_kv)
+        attn_out = self.self_attn(
+            h, cos, sin, causal=True, attn_bias=attn_bias, past_kv=past_kv, return_kv=return_kv,
+        )
         if return_kv:
             h, new_kv = attn_out
         else:
@@ -489,7 +506,7 @@ class MogHead(nn.Module):
         if (top_p is not None and top_p < 1.0) or (temperature and temperature > 0.0):
             temp = temperature if (temperature and temperature > 0.0) else 1.0
             logp = F.log_softmax(logits, dim=-1) / temp
-            u = torch.rand(logp.shape, device=logp.device, dtype=logp.dtype, generator=generator)
+            u = _rand_rows(logp.shape, logp.device, logp.dtype, generator, torch.rand)
             gumbel = -torch.log(-torch.log(u + 1e-8) + 1e-8)
             idx = (logp + gumbel).argmax(-1)                                # [b, t]
         else:
@@ -555,6 +572,7 @@ class EarTTSTalker(nn.Module):
         kv_cache: list | None = None,
         start_pos: int = 0,
         return_cache: bool = False,
+        attn_bias: torch.Tensor | None = None,
     ):
         """Gemma3-text decoder stack over ``inputs_embeds`` [b, t, H].
 
@@ -566,6 +584,9 @@ class EarTTSTalker(nn.Module):
         For autoregressive decoding, pass the per-layer ``kv_cache`` list and the
         absolute ``start_pos`` of the new tokens; with ``return_cache`` the
         updated per-layer ``(k, v)`` list is returned alongside the hidden state.
+        ``position_ids`` may be ``[b, t]`` (one position per row) and
+        ``attn_bias`` an additive mask over the cache columns, for a batch of
+        sessions with unequal caches (see ``infer_codes_batched``).
         """
         cfg = self.config
         b, t, _ = inputs_embeds.shape
@@ -579,7 +600,7 @@ class EarTTSTalker(nn.Module):
             full = (i + 1) % cfg.sliding_window_pattern == 0
             cos, sin = (cos_g, sin_g) if full else (cos_l, sin_l)
             past = kv_cache[i] if kv_cache is not None else None
-            out = layer(x, cos, sin, past_kv=past, return_kv=return_cache)
+            out = layer(x, cos, sin, past_kv=past, return_kv=return_cache, attn_bias=attn_bias)
             if return_cache:
                 x, kv = out
                 new_cache.append(kv)
@@ -660,7 +681,7 @@ class EarTTSTalker(nn.Module):
                 )
             z = mu
             if noise_scale:
-                eps = torch.randn(mu.shape, device=device, dtype=mu.dtype, generator=generator)
+                eps = _rand_rows(mu.shape, device, mu.dtype, generator, torch.randn)
                 z = z + torch.exp(logs) * eps * noise_scale
             code = self._rvq_quantize(z, code, cnt, k)
             cnt += k
@@ -902,6 +923,108 @@ class EarTTSTalker(nn.Module):
             subword_ids, subword_mask, subword_id_to_char_ids, char_pad_idx
         )
         return self.embed_subword(char_ids, char_lengths, subword_ids, subword_mask)
+
+    def text_conditioning_from_ids(
+        self, token_ids: list[int], subword_id_to_char_ids: dict, char_pad_idx: int,
+    ) -> torch.Tensor:
+        """``text_conditioning`` for one token per row from host-side ids: the
+        char ids are built on the host (no device-to-host sync) and embedded in
+        one call. Returns ``[N, 1, H]``."""
+        device = self.embed_code.weight.device
+        n = len(token_ids)
+        subword_ids = torch.tensor(token_ids, dtype=torch.long, device=device).view(n, 1)
+        mask = torch.ones_like(subword_ids, dtype=torch.bool)
+        char_lists = [subword_id_to_char_ids.get(int(t), ()) for t in token_ids]
+        max_len = max((len(c) for c in char_lists), default=0)
+        char_ids = torch.full((n, max_len), char_pad_idx, dtype=torch.long)
+        for i, c in enumerate(char_lists):
+            if c:
+                char_ids[i, : len(c)] = torch.tensor(c, dtype=torch.long)
+        lengths = torch.tensor([len(c) for c in char_lists], dtype=torch.long, device=device)
+        return self.embed_subword(char_ids.to(device), lengths, subword_ids, mask)
+
+    @torch.no_grad()
+    def infer_codes_batched(
+        self,
+        states: list[dict],
+        current_ids: torch.Tensor,
+        conds: torch.Tensor,
+        text_eos_id: int | None = None,
+        num_iter: int = 8,
+        temperature: float = 0.0,
+        guidance_scale: float = 0.0,
+        noise_scale: float = 0.0,
+        top_p: float | None = None,
+        generators: list[torch.Generator] | torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, list[dict]]:
+        """``infer_codes_one_step`` for N sessions in one backbone pass.
+
+        ``states`` are the N per-session dicts (``kv``, ``kv_uncond``, ``pos``,
+        ``_prev_codes``), each with its own cache length; ``current_ids`` is
+        ``[N]``, ``conds`` ``[N, 1, H]``. Every session's cache is right-padded
+        to the longest and the padded columns masked, RoPE positions are per
+        row, and the conditional and unconditional streams are stacked as
+        ``[cond rows; uncond rows]`` (the ``mog_head.infer`` convention). With
+        one generator per row the sampling is exactly the sequential step's.
+        Returns ``(codes [N, Q], new_states)``.
+        """
+        n = len(states)
+        h = self.config.hidden_size
+        dev = conds.device
+        prev_codes = torch.stack([s["_prev_codes"].reshape(-1) for s in states])           # [N, Q]
+        if text_eos_id is not None:
+            silence = self.codec_silence_tokens.to(dev).view(1, -1).expand_as(prev_codes)
+            prev_codes = torch.where(current_ids.view(-1, 1) == text_eos_id, silence, prev_codes)
+        code_embeds = self.embed_code(self.depthsum_embedding(prev_codes.unsqueeze(1)))    # [N, 1, H]
+        guided = bool(guidance_scale and guidance_scale > 0.0) and all(s.get("kv_uncond") is not None for s in states)
+        streams = ["kv", "kv_uncond"] if guided else ["kv"]
+        x = self.gated_fusion_audio_text(code_embeds, conds)
+        if guided:
+            null_cond = self.null_emb.to(code_embeds).view(1, 1, h).expand_as(code_embeds)
+            x = torch.cat([x, self.gated_fusion_audio_text(code_embeds, null_cond)], dim=0)
+        rows = len(streams) * n
+
+        lengths = [int(s["pos"]) for s in states]
+        lmax = max(lengths)
+        kv_cache = []
+        for li in range(len(self.backbone.layers)):
+            ks, vs = [], []
+            for key in streams:
+                for s in states:
+                    k, v = s[key][li]                                       # [1, nh, L_i, hd]
+                    pad = lmax - k.shape[2]
+                    ks.append(F.pad(k, (0, 0, 0, pad)))
+                    vs.append(F.pad(v, (0, 0, 0, pad)))
+            kv_cache.append((torch.cat(ks, dim=0), torch.cat(vs, dim=0)))
+        pos = torch.tensor(lengths, device=dev).repeat(len(streams))                         # [rows]
+        col = torch.arange(lmax + 1, device=dev)[None, :]
+        valid = (col < pos[:, None]) | (col == lmax)                        # own cache + the new key
+        attn_bias = torch.zeros(rows, 1, 1, lmax + 1, device=dev, dtype=torch.float32)
+        attn_bias = attn_bias.masked_fill(~valid[:, None, None, :], float("-inf"))
+        hidden, new_cache = self.backbone_forward(
+            x, position_ids=pos.view(rows, 1), kv_cache=kv_cache, return_cache=True, attn_bias=attn_bias,
+        )
+
+        new_states = []
+        for i in range(n):
+            ns = {"pos": lengths[i] + 1, "kv_uncond": None}
+            for si, key in enumerate(streams):
+                row = si * n + i
+                ns[key] = [
+                    (torch.cat([k[row:row + 1, :, :lengths[i]], k[row:row + 1, :, lmax:]], dim=2),
+                     torch.cat([v[row:row + 1, :, :lengths[i]], v[row:row + 1, :, lmax:]], dim=2))
+                    for k, v in new_cache
+                ]
+            new_states.append(ns)
+
+        codes = self.generate_step(
+            hidden[:n], hidden_uncond=hidden[n:] if guided else None, num_iter=num_iter,
+            temperature=temperature, guidance_scale=guidance_scale if guided else 0.0,
+            noise_scale=noise_scale, top_p=top_p, generator=generators,
+        ).squeeze(1)                                                                        # [N, Q]
+        for i, ns in enumerate(new_states):
+            ns["_prev_codes"] = codes[i:i + 1]
+        return codes, new_states
 
     @torch.no_grad()
     def generate_codes(
