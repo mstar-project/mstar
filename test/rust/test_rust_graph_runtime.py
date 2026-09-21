@@ -23,6 +23,7 @@ rust_runtime = pytest.importorskip(
 )
 from mstar.communication.rust_tensor_store import RustTensorBookkeeping
 from mstar.graph.runtime import base as rust_runtime_base
+from mstar.graph.runtime.base import SpeculationPrepInput
 
 WG_ID = 0
 WALK = "decode"
@@ -537,3 +538,138 @@ def test_get_spec_target_reports_a_target_chosen_elsewhere(runtime):
 def test_get_spec_target_returns_none_for_an_unreachable_node(runtime):
     rid = _admit(runtime)
     assert runtime.get_spec_target("prefill", "prefill", WALK, rid) is None
+
+
+# --- speculation prep --------------------------------------------------------
+
+def _prep_input(rids, spec="ar_decode", curr="prefill", room=None, edges=()):
+    return SpeculationPrepInput(
+        spec_node_name=spec, curr_node_name=curr, graph_walk=WALK,
+        rids=list(rids), room_for_continuing=room,
+        streaming_edges=list(edges),
+        streaming_edges_per_rid=[0] * len(rids),
+    )
+
+
+def _drive_into_loop(runtime, rid):
+    """Get the request as far as ar_decode being ready to loop back."""
+    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.pop_rids("prefill", WALK, [rid])
+    runtime.ingest_inputs_batch(ParallelList(
+        [rid, rid],
+        [_spec("token", "ar_decode"), _spec("kv_cache", "ar_decode")],
+    ))
+
+
+def test_prep_reports_the_worker_graph_per_ready_rid(runtime):
+    rid = _admit(runtime)
+    _drive_into_loop(runtime, rid)
+    out = runtime.prep_spec_rids(_prep_input([rid], curr="ar_decode"))
+    assert out.ready_rids == [rid]
+    assert out.wg_ids == [WG_ID], "wg_ids is parallel to ready_rids"
+    assert len(out.input_edges_per_rid) == len(out.ready_rids)
+    assert sum(out.input_edges_per_rid) == len(out.input_edges)
+
+
+def test_prep_respects_room_for_continuing(runtime):
+    rid = _admit(runtime)
+    _drive_into_loop(runtime, rid)
+    assert runtime.prep_spec_rids(
+        _prep_input([rid], curr="ar_decode", room=0)
+    ).ready_rids == []
+    assert runtime.prep_spec_rids(
+        _prep_input([rid], curr="ar_decode", room=1)
+    ).ready_rids == [rid]
+
+
+def _two_node_runtime():
+    """a -> b, where b ALSO needs an input a does not produce.
+
+    A same-node loop-back is a poor subject for not-ready: it checks the
+    next-iter slot, which a loop's external input never occupies, so such a
+    loop simply cannot be speculated. A cross-node target checks the current
+    slot, which is the case the prep filters actually see.
+    """
+    wg = WorkerGraph(
+        section=Sequential(sections=[
+            GraphNode(
+                name="a", input_names={"in"},
+                outputs=[GraphEdge(name="x", next_node="b")],
+            ),
+            GraphNode(name="b", input_names={"x", "y"}, outputs=[]),
+        ]),
+        graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    return rust_runtime.RustGraphRuntime(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: set()},
+        all_wg_ids_to_nodes={WG_ID: {"a", "b"}},
+        node_to_partition={"a": "default", "b": "default"},
+        sharding_config=ShardingConfig(
+            groups=[], tp_enabled_nodes=set(), shard_dim={},
+        ),
+        bookkeeping=RustTensorBookkeeping(),
+    )
+
+
+def _ab(rids, room=None):
+    return _prep_input(rids, spec="b", curr="a", room=room)
+
+
+def test_prep_skips_a_rid_whose_other_input_has_not_arrived():
+    rt = _two_node_runtime()
+    rid = _admit(rt)
+    # a's outputs cover x; y has to be there already.
+    assert rt.prep_spec_rids(_ab([rid])).ready_rids == []
+
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("y", "b")]))
+    assert rt.prep_spec_rids(_ab([rid])).ready_rids == [rid]
+
+
+def test_the_follower_prep_is_all_or_nothing():
+    rt = _two_node_runtime()
+    ready = _admit(rt, "ra")
+    blank = _admit(rt, "rb")
+    rt.ingest_inputs_batch(ParallelList([ready], [_spec("y", "b")]))
+
+    # The leader's best-effort prep takes the one that is ready...
+    assert rt.prep_spec_rids(_ab([ready, blank])).ready_rids == [ready]
+    # ...but a follower runs the leader's exact composition or none of it.
+    assert rt.prep_follow_spec_rids(_ab([ready, blank])) is None
+
+
+def test_a_failed_follower_prep_leaves_no_ingest_behind():
+    """The all-or-nothing unwind: a rid prepped before the failure must have
+    its chunks pulled back out, or they are stranded in a node that never ran.
+    """
+    rt = _two_node_runtime()
+    ready = _admit(rt, "ra")
+    blank = _admit(rt, "rb")
+    rt.ingest_inputs_batch(ParallelList([ready], [_spec("y", "b")]))
+
+    assert rt.prep_follow_spec_rids(_ab([ready, blank])) is None
+    # The ready rid is still preppable, so nothing was consumed or left set.
+    assert rt.prep_spec_rids(_ab([ready])).ready_rids == [ready]
+
+
+def test_the_follower_prep_succeeds_when_every_rid_is_ready():
+    rt = _two_node_runtime()
+    a = _admit(rt, "ra")
+    b = _admit(rt, "rb")
+    for r in (a, b):
+        rt.ingest_inputs_batch(ParallelList([r], [_spec("y", "b")]))
+    out = rt.prep_follow_spec_rids(_ab([a, b]))
+    assert out is not None
+    assert out.ready_rids == [a, b], "wire order is the leader's batch order"
+
+
+def test_prep_room_cap_applies_before_any_ingest():
+    rt = _two_node_runtime()
+    a = _admit(rt, "ra")
+    b = _admit(rt, "rb")
+    for r in (a, b):
+        rt.ingest_inputs_batch(ParallelList([r], [_spec("y", "b")]))
+    assert rt.prep_spec_rids(_ab([a, b], room=1)).ready_rids == [a]
+    # The capped rid was skipped before any ingest, so it is untouched.
+    assert rt.prep_spec_rids(_ab([b])).ready_rids == [b]

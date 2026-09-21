@@ -29,6 +29,8 @@ from mstar.graph.runtime.base import (
     PopRidsOutput,
     ReadyNodeSpec,
     SpeculationOutput,
+    SpeculationPrepInput,
+    SpeculationPrepOutput,
 )
 from mstar.model.base import WorkerGraph
 
@@ -424,13 +426,56 @@ class RustGraphRuntime(GraphRuntime):
             is_new_loop_iter=new_iter, loop_name=loop_name,
         )
 
+    def _spec_prep_arg(self, input: SpeculationPrepInput) -> dict:
+        return {
+            "spec_node_name": input.spec_node_name,
+            "curr_node_name": input.curr_node_name,
+            "graph_walk": input.graph_walk,
+            "rids": list(input.rids),
+            "room_for_continuing": input.room_for_continuing,
+            "streaming_edges": [
+                {
+                    "signal": e.signal, "next_node": e.next_node,
+                    "uuids": e.uuids,
+                    "is_final_streaming_chunk": e.is_final_streaming_chunk,
+                } for e in input.streaming_edges
+            ],
+            "streaming_edges_per_rid": list(input.streaming_edges_per_rid),
+        }
+
+    @staticmethod
+    def _spec_prep_out(out) -> SpeculationPrepOutput:
+        return SpeculationPrepOutput(
+            consumed_streaming_edge_idxs=out.consumed_streaming_edge_idxs,
+            ready_rids=out.ready_rids,
+            wg_ids=out.wg_ids,
+            input_edges=[
+                EdgeSpec(
+                    signal=s, next_node=n, uuids=u,
+                    is_final_streaming_chunk=f,
+                ) for s, n, u, f in out.input_edges
+            ],
+            input_edges_per_rid=out.input_edges_per_rid,
+        )
+
+    def prep_spec_rids(
+        self, input: SpeculationPrepInput,
+    ) -> SpeculationPrepOutput:
+        return self._spec_prep_out(
+            self._rust.prep_spec_rids(self._spec_prep_arg(input))
+        )
+
+    def prep_follow_spec_rids(
+        self, input: SpeculationPrepInput,
+    ) -> SpeculationPrepOutput | None:
+        out = self._rust.prep_follow_spec_rids(self._spec_prep_arg(input))
+        return None if out is None else self._spec_prep_out(out)
+
     # --------- not ported yet ----------
     #
     # Everything a forward pass needs. Until these land, MSTAR_RUST_GRAPH=1
     # admits requests and answers the structural queries but cannot run a step.
 
-    prep_spec_rids = _unported("prep_spec_rids")
-    prep_follow_spec_rids = _unported("prep_follow_spec_rids")
     stop_loops_batched = _unported("stop_loops_batched")
     apply_peer_loop_stops = _unported("apply_peer_loop_stops")
     complete_and_route_batch = _unported("complete_and_route_batch")

@@ -340,6 +340,209 @@ pub struct GraphRuntime {
         )
     }
 
+    fn prep_spec(
+        &mut self, input: SpecPrepArg, follower: bool,
+    ) -> PyResult<SpecPrepOut> {
+        if input.rids.len() != input.streaming_edges_per_rid.len() {
+            return Err(PyValueError::new_err(
+                "prep_spec_rids: rids and streaming_edges_per_rid must match",
+            ));
+        }
+        let Some(wg) = self.owner_of(&input.spec_node_name, &input.graph_walk)
+        else {
+            return Ok(SpecPrepOut::default());
+        };
+        let (Some(spec_node), Some(curr_node)) = (
+            self.nid(wg, &input.spec_node_name),
+            self.nid(wg, &input.curr_node_name),
+        ) else {
+            return Ok(SpecPrepOut::default());
+        };
+        let wg_id = self.wg_ids[wg as usize];
+        let same_node = spec_node == curr_node;
+
+        // Loop context from ONE rid, applied to the batch: which loop a node
+        // belongs to and whether the target is a loop-back are structural.
+        let loop_ctx = if follower {
+            None
+        } else {
+            input.rids.first().and_then(|&r| {
+                self.spec_targets(wg, curr_node, r)?
+                    .into_iter()
+                    .find(|sn| sn.node == spec_node)
+            })
+        };
+
+        let mut out = SpecPrepOut::default();
+        let mut undo: Vec<(u32, Vec<(u8, bool)>)> = Vec::new();
+        let mut cursor = 0usize;
+
+        for (i, &rid) in input.rids.iter().enumerate() {
+            let count = input.streaming_edges_per_rid[i];
+            let slice = cursor..cursor + count;
+            cursor += count;
+
+            if !follower {
+                if let Some(ctx) = &loop_ctx {
+                    if !self.can_continue_loop(wg, rid, ctx, &input.graph_walk) {
+                        continue; // the loop has ended; nothing more to run
+                    }
+                }
+                if let Some(room) = input.room_for_continuing {
+                    if out.ready_rids.len() as u32 >= room {
+                        // Room is spoken for by the backlog. Skipped BEFORE
+                        // any ingest, so there is nothing to roll back.
+                        continue;
+                    }
+                }
+            }
+
+            match self.prep_one(
+                wg, rid, spec_node, curr_node, same_node,
+                &input.streaming_edges[slice.clone()], slice.start,
+            ) {
+                Some((kept, edges, ingested)) => {
+                    undo.push((rid, ingested));
+                    out.consumed_streaming_edge_idxs.extend(kept);
+                    out.ready_rids.push(rid);
+                    out.wg_ids.push(wg_id);
+                    out.input_edges_per_rid.push(edges.len());
+                    out.input_edges.extend(edges);
+                }
+                None if follower => {
+                    // Undo every rid prepped so far, or this rank joins the
+                    // collective with a batch the leader never sent.
+                    for (done_rid, slots) in undo {
+                        self.undo_spec_ingest(wg, done_rid, spec_node, &slots);
+                    }
+                    return Ok(SpecPrepOut {
+                        all_or_nothing_failed: true,
+                        ..Default::default()
+                    });
+                }
+                None => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// False once this rid's loop has ended: a stop is already pending, or the
+    /// next iteration would be past the last.
+    fn can_continue_loop(
+        &self, wg: WgIndex, rid: u32, ctx: &SpecNode, graph_walk: &str,
+    ) -> bool {
+        if !ctx.is_new_loop_iter {
+            return true;
+        }
+        let Some(lid) = ctx.loop_id else { return true };
+        let g = &self.graphs[wg as usize];
+        let loop_name = g.lp(lid).name;
+        if let Some(w) = self.interner.get(graph_walk) {
+            if self.pending_loop_stops.contains(&(rid, w, loop_name)) {
+                return false;
+            }
+        }
+        let Some(state) = self.states[wg as usize][rid as usize].as_ref() else {
+            return false;
+        };
+        state.loop_iter(lid) + 1 < g.lp(lid).max_iters && !state.loop_finished(lid)
+    }
+
+    /// One rid: ingest its chunks, check readiness, gather inputs. Returns
+    /// (consumed indices, input edges, what was ingested) or None after
+    /// rolling its own back.
+    #[allow(clippy::type_complexity)]
+    fn prep_one(
+        &mut self,
+        wg: WgIndex,
+        rid: u32,
+        spec_node: NodeId,
+        curr_node: NodeId,
+        same_node: bool,
+        edges: &[EdgeSpecArg],
+        base_idx: usize,
+    ) -> Option<(Vec<usize>, Vec<(String, String, Vec<u64>, bool)>, Vec<(u8, bool)>)> {
+        let g = self.graphs[wg as usize].clone();
+        let tensors_of = |spec: &EdgeSpecArg| -> Vec<TensorRef> {
+            let bk = self.bookkeeping.lock().unwrap();
+            spec.uuids.iter().map(|&u| bk.tensor_ref(u)).collect()
+        };
+        let resolved: Vec<(usize, u8, Vec<TensorRef>, bool)> = edges
+            .iter()
+            .enumerate()
+            .filter_map(|(k, e)| {
+                let signal = self.interner.get(&e.signal)?;
+                let slot = g.node(spec_node).slot_of(signal)?;
+                Some((base_idx + k, slot, tensors_of(e), e.is_final_streaming_chunk))
+            })
+            .collect();
+
+        let state = self.states[wg as usize][rid as usize].as_mut()?;
+        // Held True across the ingest so a streaming input cannot re-add the
+        // node to the ready queue underneath us.
+        state.set_spec_scheduled(spec_node, true);
+
+        // ingest reports success without saying WHICH slot it used, so the
+        // slot is inferred by peeking first -- the rollback removes from the
+        // two separately.
+        let mut kept = Vec::new();
+        let mut ingested = Vec::new();
+        for (idx, slot, tensors, final_chunk) in resolved {
+            let already = state.has_input(spec_node, slot, false);
+            if state.ingest(spec_node, slot, tensors, same_node, final_chunk) {
+                kept.push(idx);
+                ingested.push((slot, already));
+            }
+        }
+
+        let source_edges: Vec<RoutedEdge> = g
+            .node(curr_node)
+            .outputs
+            .iter()
+            .map(|e| RoutedEdge {
+                name: e.name, dest: e.dest, persist: e.persist,
+                new_token: e.new_token, streaming: e.streaming,
+                modality: e.modality, tensors: vec![], persist_for_loop: false,
+            })
+            .collect();
+        state.ingest_for_speculation(curr_node, &source_edges);
+        let ready = state.ready_for_speculation(spec_node, same_node, false);
+        state.clear_speculative_inputs();
+        state.set_spec_scheduled(spec_node, false); // reset if the rid drops
+
+        if !ready {
+            for &(slot, from_next) in &ingested {
+                state.remove_input(spec_node, slot, from_next);
+            }
+            return None;
+        }
+
+        let node_name = self.interner.name(g.node(spec_node).name).to_string();
+        let edges_out = state
+            .input_tensors(spec_node, same_node)
+            .into_iter()
+            .map(|(name, tensors, final_chunk)| {
+                (
+                    self.interner.name(name).to_string(),
+                    node_name.clone(),
+                    tensors.iter().map(|t| t.uuid).collect(),
+                    final_chunk,
+                )
+            })
+            .collect();
+        Some((kept, edges_out, ingested))
+    }
+
+    fn undo_spec_ingest(
+        &mut self, wg: WgIndex, rid: u32, node: NodeId, slots: &[(u8, bool)],
+    ) {
+        if let Some(state) = self.states[wg as usize][rid as usize].as_mut() {
+            for &(slot, from_next) in slots {
+                state.remove_input(node, slot, from_next);
+            }
+        }
+    }
+
     fn owner_of(&self, node: &str, walk: &str) -> Option<WgIndex> {
         let n = self.interner.get(node)?;
         let w = self.interner.get(walk)?;
@@ -375,6 +578,32 @@ pub struct PopRidsOut {
     /// (signal, next_node, uuids, is_final_streaming_chunk)
     #[pyo3(get)] pub input_edges: Vec<(String, String, Vec<u64>, bool)>,
     #[pyo3(get)] pub input_edges_per_rid: Vec<usize>,
+}
+
+/// `SpeculationPrepInput`.
+#[derive(FromPyObject)]
+pub struct SpecPrepArg {
+    #[pyo3(item)] spec_node_name: String,
+    #[pyo3(item)] curr_node_name: String,
+    #[pyo3(item)] graph_walk: String,
+    #[pyo3(item)] rids: Vec<u32>,
+    #[pyo3(item)] room_for_continuing: Option<u32>,
+    #[pyo3(item)] streaming_edges: Vec<EdgeSpecArg>,
+    #[pyo3(item)] streaming_edges_per_rid: Vec<usize>,
+}
+
+/// `SpeculationPrepOutput`.
+#[pyclass]
+#[derive(Default)]
+pub struct SpecPrepOut {
+    #[pyo3(get)] pub consumed_streaming_edge_idxs: Vec<usize>,
+    #[pyo3(get)] pub ready_rids: Vec<u32>,
+    #[pyo3(get)] pub wg_ids: Vec<u32>,
+    /// (signal, next_node, uuids, is_final_streaming_chunk)
+    #[pyo3(get)] pub input_edges: Vec<(String, String, Vec<u64>, bool)>,
+    #[pyo3(get)] pub input_edges_per_rid: Vec<usize>,
+    /// Follower path only: the batch could not be built and was rolled back.
+    all_or_nothing_failed: bool,
 }
 
 /// Python's `EdgeSpec`: what crosses for one arriving signal.
@@ -1069,6 +1298,26 @@ impl GraphRuntime {
             .into_iter()
             .find(|sn| sn.node == want)
             .map(|sn| self.spec_output(&g, graph_walk, &sn))
+    }
+
+    /// Ingest each rid's stream chunks, check readiness, gather inputs.
+    ///
+    /// Per-rid best-effort: a rid that fails is rolled back and skipped. The
+    /// loop-completion filter (a stop already pending, or the next iteration
+    /// being past the last) lives here.
+    fn prep_spec_rids(&mut self, input: SpecPrepArg) -> PyResult<SpecPrepOut> {
+        self.prep_spec(input, false)
+    }
+
+    /// The TP-follower counterpart: ALL or nothing, no room cap, no loop
+    /// filter. Rank 0 committed to this exact composition and sits on the
+    /// collective until every follower joins, so one rid failing has to roll
+    /// the whole batch back.
+    fn prep_follow_spec_rids(
+        &mut self, input: SpecPrepArg,
+    ) -> PyResult<Option<SpecPrepOut>> {
+        let out = self.prep_spec(input, true)?;
+        Ok(if out.all_or_nothing_failed { None } else { Some(out) })
     }
 
     fn num_handles(&self) -> usize {

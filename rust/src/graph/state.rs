@@ -267,6 +267,13 @@ impl RequestState {
         t
     }
 
+    /// Whether a slot is already filled, for inferring which slot an ingest
+    /// will land in before making it.
+    pub fn has_input(&self, node: NodeId, slot: u8, next_iter: bool) -> bool {
+        let st = &self.nodes[node as usize];
+        if next_iter { st.next.has(slot) } else { st.cur.has(slot) }
+    }
+
     pub fn input_tensors(
         &self, node: NodeId, next_iter: bool,
     ) -> Vec<(Sym, Vec<TensorRef>, bool)> {
