@@ -252,11 +252,13 @@ class KDAManager(LinearAttnManager):
     @torch.compiler.disable
     def set_prefix_len(self, spec_len: torch.Tensor, accepted: torch.Tensor, label: str | None = None) -> None:
         """After the verification: the rows' blocks become their pending prefixes, ``accepted + 1``
-        tokens long (the bonus token is always kept). ``spec_len`` is the shared ``[slots, 1]`` int32
-        block; padding rows write the sink. Tensor ops only."""
+        tokens long (the bonus token is always kept); a one-token block was committed by the step
+        (the bonus alone needs no verdict), so nothing pends after it. ``spec_len`` is the shared
+        ``[slots, 1]`` int32 block; padding rows write the sink. Tensor ops only."""
         plan = self.current_plan(label)
         rows = plan.num_rows
-        values = (accepted[:rows].to(torch.int32) + 1).unsqueeze(1)
+        accepted = accepted[:rows].to(torch.int32)
+        values = (accepted + 1 if plan.k1 > 1 else torch.zeros_like(accepted)).unsqueeze(1)
         spec_len.index_copy_(0, plan.slot_ids[:rows].to(torch.long), values)
 
     # Engine lifecycle
