@@ -320,6 +320,44 @@ def test_a_pre_fork_off_a_leased_stream_covers_the_whole_prefix():
     kv.assert_pages_conserved()
 
 
+# ── what is done with the lock down ─────────────────────────────────────
+
+
+def _assert_hashed_with_the_lock_down(kv: KVManager, monkeypatch) -> None:
+    """Fail any key hashed while this manager's lock is held."""
+    real = manager_mod.fingerprint
+
+    def _fingerprint(*fields):
+        free = []
+
+        def _try():
+            if kv._lock.acquire(blocking=False):
+                kv._lock.release()
+                free.append(True)
+
+        attempt = threading.Thread(target=_try)
+        attempt.start()
+        attempt.join()
+        assert free, (
+            "a key was hashed with the manager's lock held, so every admit, "
+            "commit and remove waited on the chain"
+        )
+        return real(*fields)
+
+    monkeypatch.setattr(manager_mod, "fingerprint", _fingerprint)
+
+
+def test_a_probe_hashes_the_prompt_with_the_lock_down(monkeypatch):
+    kv = _manager()
+    keys = _seed(kv, list(range(100)))
+    kv.remove_request("seed")
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}))
+    _assert_hashed_with_the_lock_down(kv, monkeypatch)
+
+    assert kv.resolve_cached_prefix("r1", NODE, WALK), "the probe matched nothing"
+    kv.assert_pages_conserved()
+
+
 # ── a remove on another thread ──────────────────────────────────────────
 
 
