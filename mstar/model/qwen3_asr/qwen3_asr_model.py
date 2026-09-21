@@ -216,12 +216,18 @@ class Qwen3ASRModel(Model):
                 name=LLM_NODE,
                 input_names=["text_inputs"],
                 outputs=[
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
+                    # Loops back to a node that does not take it as an input,
+                    # so the token only lands in the accumulated cache and the
+                    # client gets the whole answer in one message at the end.
+                    GraphEdge(next_node=LLM_NODE, name="new_token"),
                     GraphEdge(next_node=LLM_NODE, name="text_inputs"),
                 ],
             ),
             max_iters=self.get_max_output_tokens(),
             outputs=[],
+            accumulated_outputs=[
+                GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
+            ],
         )
         return {PREFILL_WALK: prefill, DECODE_WALK: decode}
 
