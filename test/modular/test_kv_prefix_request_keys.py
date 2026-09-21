@@ -12,6 +12,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -19,9 +20,13 @@ import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
+from mstar.conductor.conductor import Conductor
+from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec
 from mstar.engine.resources.kv.keys import chain
 from mstar.model.base import PrefixStream, ProcessPromptOutput
+from mstar.model.orpheus.config import OrpheusModelConfig
+from mstar.model.orpheus.orpheus_model import OrpheusModel
 
 PAGE_SIZE = 16
 PROMPT = list(range(100))
@@ -105,16 +110,22 @@ def _deployment(page_size: int = PAGE_SIZE) -> dict:
     return {"model": "stub", "resources": {"kv": {"page_size": page_size}}}
 
 
+def _apply_chain(cfg, key: str, model_kwargs: dict | None) -> None:
+    """One config's share of the conductor's loop over a request's chains."""
+    kwargs = model_kwargs or {}
+    cfg.apply_conductor_config(
+        seed=1,
+        prefix_keys=(kwargs.get("prefix_keys") or {}).get(key),
+        prefix_tail=(kwargs.get("prefix_tail") or {}).get(key),
+        prefix_decode=(kwargs.get("prefix_decode") or {}).get(key),
+        prefix_cache=kwargs.get("prefix_cache"),
+    )
+
+
 def _handed_over(model_kwargs: dict, key: str = "kv") -> KVReqConfig:
     """The config one resource ends up with, as the conductor's loop builds it."""
     cfg = KVReqConfig()
-    cfg.apply_conductor_config(
-        seed=1,
-        prefix_keys=(model_kwargs.get("prefix_keys") or {}).get(key),
-        prefix_tail=(model_kwargs.get("prefix_tail") or {}).get(key),
-        prefix_decode=(model_kwargs.get("prefix_decode") or {}).get(key),
-        prefix_cache=model_kwargs.get("prefix_cache"),
-    )
+    _apply_chain(cfg, key, model_kwargs)
     return cfg
 
 
@@ -299,4 +310,51 @@ def test_a_request_that_says_nothing_is_still_cached():
 
     assert cfg.prefix_cache is True, (
         "a request that never mentioned the cache was opted out of it"
+    )
+
+
+# ── a config for every resource that declared a stream ──────────────────
+
+
+class _SamplerOnlyModel(_Model):
+    """Declares a stream and asks for no config of its own, as Orpheus did."""
+
+    def get_request_resource_configs(self, partition_fwd_args, model_kwargs=None):
+        del partition_fwd_args, model_kwargs
+        return {"sampler": SamplingReqConfig()}
+
+
+def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
+    """The configs a request is opened with, as the conductor resolves them:
+    the model's own, a default for anything it declared a stream for, and then
+    each handed its own chain."""
+    configs = Conductor._get_resource_configs(
+        SimpleNamespace(model=model), model_kwargs, {},
+    )
+    for key, cfg in configs.items():
+        _apply_chain(cfg, key, model_kwargs)
+    return configs
+
+
+def test_a_model_returning_only_a_sampler_config_still_gets_its_keys():
+    model = _SamplerOnlyModel()
+    model_kwargs = _run(_worker(model, _deployment()))
+
+    handed = _conductor_configs(model, model_kwargs).get("kv")
+
+    assert handed is not None and handed.prefix_keys == model_kwargs["prefix_keys"]["kv"], (
+        "the resource that declared the stream was handed no config of its "
+        "own, so the chain the worker built for it went nowhere"
+    )
+
+
+def test_orpheus_is_handed_a_config_for_the_stream_it_declares():
+    orpheus = OrpheusModel.__new__(OrpheusModel)
+    orpheus.config = OrpheusModelConfig()
+
+    configs = _conductor_configs(orpheus)
+
+    assert set(orpheus.prefix_key_streams()) <= set(configs), (
+        "orpheus returns a sampler config alone, so the resource it declared "
+        "a stream for had nothing to carry its chain"
     )
