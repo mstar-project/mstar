@@ -500,3 +500,23 @@ def test_compile_eager_rounding_knob_sets_inductor_precision_emulation(monkeypat
     inductor_config.emulate_precision_casts = False  # leave the process default behind
     assert _make_model().compile_eager_rounding is True
     assert _make_model(compile_eager_rounding=False).compile_eager_rounding is False
+
+
+def test_requests_above_max_image_area_are_rejected():
+    """An unbounded size let one request occupy the worker for minutes; the default cap is 2048^2 pixels."""
+    import pytest
+
+    from mstar.model.flux2_klein.config import Flux2KleinConfig
+    from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
+
+    model = Flux2KleinModel(model_path_hf="x")
+    model.set_config(Flux2KleinConfig())
+    assert model.max_image_area == 2048 * 2048
+    kwargs = dict(height=2048, width=2048)
+    assert model._resolve_size(kwargs, []) == (2048, 2048)
+    with pytest.raises(ValueError, match="max_image_area"):
+        model._resolve_size(dict(height=2048, width=2064), [])
+    small = Flux2KleinModel(model_path_hf="x", max_image_area=1024 * 1024)
+    small.set_config(Flux2KleinConfig())
+    with pytest.raises(ValueError, match="max_image_area"):
+        small._resolve_size(dict(height=1024, width=1040), [])
