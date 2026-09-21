@@ -332,12 +332,18 @@ def test_whole_stack_reassembles_across_ranks():
     # Everything halves except the norms, which are head *dims* and layer
     # norms — replicated by design, and the only thing a rank holds whole.
     # The alignment pad is storage a rank carries and the reference does not.
-    total = sum(p.numel() for p in ref.parameters())
-    pad = sum(
-        module.output_sizes[BLOCK_INDEX["pad"]] // 2 * module.weight.shape[1]
-        for module in ranks[0].modules()
-        if type(module).__name__ == "_FusedBlockColumnParallelLinear"
-    )
+    # Both sides carry a pad sized from their own head count (the reference
+    # too, now that the pad rounds `b` up to a 32-byte line), so take each
+    # one's out before comparing what is sharded.
+    def pad_rows(model):
+        return sum(
+            module.in_proj_blocks[BLOCK_INDEX["pad"]]
+            * module.in_proj_fused.weight.shape[1]
+            for module in model.modules()
+            if type(module).__name__ in ("GatedDeltaNet", "ParallelGatedDeltaNet")
+        )
+    total = sum(p.numel() for p in ref.parameters()) - pad_rows(ref)
+    pad = pad_rows(ranks[0])
     assert sum(p.numel() for p in ranks[0].parameters()) == (
         (total - replicated) // 2 + replicated + pad
     )
