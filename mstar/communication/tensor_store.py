@@ -35,7 +35,10 @@ class TensorBookkeeping(ABC):
     """Per-uuid reference state. Never sees a tensor or a request id.
 
     The batched forms are what the graph runtime calls; the defaults loop so a
-    backend only overrides where batching buys something.
+    backend only overrides where batching buys something. They take two
+    parallel lists rather than a ParallelList because that is what crosses the
+    Rust boundary -- pyo3 converts a list of ints directly, where a NamedTuple
+    would need unpacking on every call.
     """
 
     @abstractmethod
@@ -43,9 +46,9 @@ class TensorBookkeeping(ABC):
         pass
 
     def put_tensor_batch(
-        self, tensor_info: ParallelList[int, TensorPointerInfo]
+        self, uuids: list[int], infos: list[TensorPointerInfo]
     ):
-        for uuid, info in tensor_info:
+        for uuid, info in zip(uuids, infos, strict=True):
             self.put_tensor(uuid, info)
 
     @abstractmethod
@@ -59,9 +62,9 @@ class TensorBookkeeping(ABC):
         pass
 
     def update_info_batch(
-        self, tensor_info: ParallelList[int, TensorPointerInfo]
+        self, uuids: list[int], infos: list[TensorPointerInfo]
     ):
-        for uuid, info in tensor_info:
+        for uuid, info in zip(uuids, infos, strict=True):
             self.update_info(uuid, info)
 
     @abstractmethod
@@ -93,16 +96,16 @@ class TensorBookkeeping(ABC):
     def increment_ref(self, uuid: int, n: int = 1):
         pass
 
-    def increment_ref_batch(self, counts: ParallelList[int, int]):
-        for uuid, n in counts:
+    def increment_ref_batch(self, uuids: list[int], counts: list[int]):
+        for uuid, n in zip(uuids, counts, strict=True):
             self.increment_ref(uuid, n)
 
     @abstractmethod
     def dereference(self, uuid: int, n: int = 1):
         pass
 
-    def dereference_batch(self, counts: ParallelList[int, int]):
-        for uuid, n in counts:
+    def dereference_batch(self, uuids: list[int], counts: list[int]):
+        for uuid, n in zip(uuids, counts, strict=True):
             self.dereference(uuid, n)
 
     # -- flags --------------------------------------------------------------
@@ -232,9 +235,7 @@ class TensorStore:
             self._tensors[uuid] = tensor
             owned.add(uuid)
             self._uuid_to_rid[uuid] = rid
-        self.bookkeeping.put_tensor_batch(
-            ParallelList(tensors.keys, info)
-        )
+        self.bookkeeping.put_tensor_batch(tensors.keys, info)
 
     def check_uuid_presence(self, uuid: int) -> bool:
         return uuid in self._tensors

@@ -164,6 +164,12 @@ pub struct GraphRuntime {
     fn lid(&self, wg: u32, name: &str) -> Option<LoopId> {
         self.interner.get(name).and_then(|s| self.g(wg).loop_by_name.get(&s).copied())
     }
+    /// Python passes the deployment-wide worker graph id; `states` and
+    /// `graphs` are indexed by this worker's local position.
+    fn wg_index(&self, wg_id: u32) -> Option<WgIndex> {
+        self.wg_ids.iter().position(|&id| id == wg_id).map(|i| i as WgIndex)
+    }
+
     fn live_wgs(&self, walk: Sym) -> Vec<WgIndex> {
         self.walk_to_local_wgs.get(&walk).cloned().unwrap_or_default()
     }
@@ -497,17 +503,25 @@ impl GraphRuntime {
     fn set_speculatively_scheduled(
         &mut self, node: String,
         wg_id: u32, rids: Vec<u32>,
-        specultively_scheduled: bool,
-    ) -> PyResult<()>{
-        let node_id = self.interner.get(&node).unwrap();
-        let mut states = &mut self.states[wg_id as usize];
+        speculatively_scheduled: bool,
+    ) -> PyResult<()> {
+        let wg = self.wg_index(wg_id).ok_or_else(|| {
+            PyValueError::new_err(format!("unknown worker graph id {wg_id}"))
+        })?;
+        // NOT interner.get(): that is the STRING id, and set_spec_scheduled
+        // wants the node's index within this worker graph. The two id spaces
+        // are both u32, so only the Option here made the mix-up visible.
+        let node_id = self.nid(wg, &node).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "node {node:?} is not in worker graph {wg_id}"
+            ))
+        })?;
+        let states = &mut self.states[wg as usize];
         for rid in rids {
             if let Some(state) = &mut states[rid as usize] {
-                state.set_spec_scheduled(node, on);
+                state.set_spec_scheduled(node_id, speculatively_scheduled);
             }
         }
-        // TODO
-
         Ok(())
     }
 }
