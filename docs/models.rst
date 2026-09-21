@@ -285,14 +285,21 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 measured as fast as FlashInfer in the served path; ``flashinfer``: the DiT's joint
 attention runs on the engine's ragged FlashInfer resource, also CUDA-graph replayable),
 ``compile`` (``torch.compile`` of the transformer, one trace per shape) with
-``compile_eager_rounding`` (inductor rounds intermediates where eager PyTorch does, which
-keeps the compiled transformer within about 41 dB PSNR of the eager path on a 4-step
-sampler instead of 35 to 39 dB), ``cuda_graph`` with ``capture_sizes`` / ``capture_batch_sizes``
-(the denoise step, Euler update included, is captured per listed ``[height, width]``
-and batch size; other shapes run the eager batched path), ``max_batch_size``, and
-``vae_compile`` (``torch.compile`` of the VAE decode with inductor autotuning: 89 to 29 ms
-at 1024² on an H100; its fused bf16 reductions move the image by about 56 dB PSNR from the
-eager decode, so the parity suite runs with it off).
+``compile_eager_rounding`` (inductor rounds intermediates where eager PyTorch does and fuses
+no FMAs) and ``compile_exact_ops`` (the norms and activations stay on the eager kernels inside
+the compiled forward, so inductor only fuses the chains around the GEMMs and attention; the
+compiled transformer is then bit-exact with the eager one — measured on klein-4B and 9B — where
+the plain compile, even with eager rounding, lands at a median 35 to 38 dB PSNR from the eager
+path over the 100 protocol prompts, because a 4- or 8-step distilled sampler amplifies the last
+bit of inductor's own reductions and activation decompositions), ``cuda_graph`` with
+``capture_sizes`` / ``capture_batch_sizes`` (the denoise step, Euler update included, is captured
+per listed ``[height, width]`` and batch size; other shapes run the eager batched path),
+``max_batch_size``, and ``vae_compile`` (``torch.compile`` of the VAE decode with inductor
+autotuning: 89 to 29 ms at 1024² on an H100; its fused reductions move the image by about 55 dB
+PSNR from the eager decode on every prompt, and the autotuner may pick other conv kernels in
+another server process, so set it to ``false`` for bit-exact, repeatable output; the parity
+suite runs with it off). With the defaults, every served image is within 53 dB of the eager path
+(all 100 protocol prompts, all three models); with ``vae_compile: false`` it is bit-exact.
 Requests at the same output size batch across users in every node, including the
 text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the
 transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or
