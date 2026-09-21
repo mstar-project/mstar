@@ -447,7 +447,7 @@ class NemotronDuplexModel(Model):
                 config=KVConfig(
                     num_layers=eartts.num_hidden_layers,
                     num_kv_heads=eartts.num_key_value_heads,
-                    head_dim=eartts.head_dim,
+                    head_dim=eartts.kv_head_dim,    # 72 zero-padded to a FlashInfer head dim
                     # the sliding window plus the speaker warm-up, rounded up
                     max_seq_len=eartts.sliding_window + 512,
                     num_qo_heads=eartts.num_attention_heads,
