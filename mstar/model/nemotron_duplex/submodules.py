@@ -396,13 +396,20 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     # -- per-speaker constants -------------------------------------------
 
     def warmup(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``(cond [P, H], uncond [P, H], prev_codes [Q])`` of the speaker warm-up."""
+        """``(cond [P, H], uncond [P, H], prev_codes [Q])`` of the speaker warm-up.
+        Computed once per speaker, under the serving autocast (bf16 on CUDA) no
+        matter who asks first: the CUDA-graph capture's first preprocess runs
+        outside the engine's autocast scope, and a warm-up computed there
+        differs in the last bits from one computed under it -- enough to move
+        a session's first frame (the talker's frame-0 decision is a knife-edge)."""
         if self._warmup is None:
             cfg = self.config
-            self._warmup = self.talker.warmup_inputs(
-                self.SPEAKER, self._s2c, self._char_pad,
-                text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id, speech_pad_id=cfg.eartts.codebook_size,
-            )
+            dev = self.talker.embed_code.weight.device
+            with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"):
+                self._warmup = self.talker.warmup_inputs(
+                    self.SPEAKER, self._s2c, self._char_pad,
+                    text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id, speech_pad_id=cfg.eartts.codebook_size,
+                )
         return self._warmup
 
     @property
@@ -425,8 +432,8 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         n = len(gens)
         # rows first: the engine's static-input buffers are narrowed along the
         # leading (batch) dim when a smaller batch replays a capture
-        u = torch.empty(n, e.inference_num_iter, 1, e.mog_num_predictions, device=device)
-        eps = torch.empty(n, e.inference_num_iter, 1, e.code_dim, device=device)
+        u = torch.zeros(n, e.inference_num_iter, 1, e.mog_num_predictions, device=device)
+        eps = torch.zeros(n, e.inference_num_iter, 1, e.code_dim, device=device)
         for i, k in enumerate(maskgit_schedule(e.inference_num_iter, e.mog_exponent, e.num_quantizers)):
             if k == 0:
                 continue
