@@ -397,10 +397,16 @@ class KVManager(AttentionResource):
                 return len(stream.lease) * self.config.page_size
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
+            keys = list(stream.keys)
+        # with the lock down: one SHA-256 a page of prompt, and every admit,
+        # commit and remove on this manager waits behind it
+        rooted = [fingerprint(self._prefix_root, key) for key in keys]
+        with self._lock:
+            if self._streams.get(rid, {}).get(label) is not stream:
+                return None
             # the chain has ceil(seq_len / page_size) keys and only a full page
             # is ever indexed, so stopping one key short leaves the request at
             # least one token to sample, whatever its length
-            rooted = [fingerprint(self._prefix_root, key) for key in stream.keys]
             matched = self._index.lookup(rooted)[:len(rooted) - 1]
             if not matched:
                 return None
@@ -482,7 +488,9 @@ class KVManager(AttentionResource):
             self._replica,
         )
 
-    def _take_local_match(self, stream: CacheStream, published_len: int) -> None:
+    def _take_local_match(
+        self, stream: CacheStream, published_len: int, rooted: list[bytes] | None,
+    ) -> None:
         """Take what this cache already holds of a stream about to be read in.
 
         The pages a prefill rank published are often pages this rank wrote for
@@ -493,12 +501,12 @@ class KVManager(AttentionResource):
         """
         if (
             self._index is None
+            or not rooted
             or stream.stored_len
             or stream.offloaded
             or not stream.keys
         ):
             return
-        rooted = [fingerprint(self._prefix_root, key) for key in stream.keys]
         # never past what the other side published, and only whole pages
         matched = self._index.lookup(rooted)[
             :published_len // self.config.page_size
@@ -631,7 +639,16 @@ class KVManager(AttentionResource):
                     f"local {self._world_size})"
                 ),
             )
-        needed_labels = self._overrides[rid].get_labels(node_name, graph_walk)
+        overrides = self._overrides[rid]
+        needed_labels = overrides.get_labels(node_name, graph_walk)
+        rooted: dict[str, list[bytes]] = {}
+        if self._index is not None and overrides.prefix_cache:
+            # hashed here, as `resolve_cached_prefix` hashes outside its lock
+            for label, keys in (overrides.prefix_keys or {}).items():
+                if label in needed_labels and keys:
+                    rooted[label] = [
+                        fingerprint(self._prefix_root, key) for key in keys
+                    ]
         # one critical section: reading stored_len, comparing to published, and
         # firing the retrieve must be atomic against a concurrent commit/reset
         # (both non-blocking inside, so holding the lock is safe)
@@ -651,7 +668,7 @@ class KVManager(AttentionResource):
                 # it, so a chain extended here would start one token late
                 stream.pending = None
                 new_len = seq_info.seq_len
-                self._take_local_match(stream, new_len)
+                self._take_local_match(stream, new_len, rooted.get(label))
                 old_len = stream.stored_len
                 if new_len <= old_len:
                     continue
