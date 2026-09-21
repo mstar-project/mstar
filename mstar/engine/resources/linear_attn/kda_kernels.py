@@ -188,8 +188,10 @@ class FLAKDAKernels:
         recurrence (k = v = 0, raw gate and beta at -1e4: decay 1, beta 0, verified bit-identical),
         writes the window after the prefix to the pool and saves the block's raw inputs as the next
         prefix; ``kda_recurrent_checkpoint`` runs prefix + block from the slot's state and writes
-        the slot after the prefix. The block's outputs are returned. Same semantics as
-        ``TorchKDAKernels.run_verify``."""
+        the slot after the prefix, running the real prefix tokens and the block only. A one-token
+        block (the bonus alone, always accepted) is committed in the step: the state is stored after it
+        and ``KDAManager.set_prefix_len`` leaves nothing pending, so a zero-draft bucket costs a plain
+        step's recurrence. The block's outputs are returned. Same semantics as ``TorchKDAKernels.run_verify``."""
         from mstar.engine.resources.linear_attn.kda_spec_prep import kda_verify_prep
         from mstar.engine.resources.linear_attn.kda_spec_recurrent import kda_recurrent_checkpoint
 
@@ -200,14 +202,14 @@ class FLAKDAKernels:
         slots = plan.slot_ids[:rows]
         # the prep kernel reads the gates and betas with their row strides: the layer's views into
         # its merged projection go in as they are
-        q, k, v, g, beta, ckpt = kda_verify_prep(
-            qkv, g_raw, beta_raw, conv_state, spec, slots, p.conv_weight, rows, k1, h, d,
+        q, k, v, g, beta, ckpt, plen = kda_verify_prep(
+            qkv, g_raw, beta_raw, conv_state, spec, slots, p.conv_weight, rows, k1, h, d, commit_block=k1 == 1,
         )
         # the kernel stores the block positions only, straight into [rows * k1, H, D]
         kp = spec.prefix.shape[1]  # the prefix part is padded to the pool's slots
         return kda_recurrent_checkpoint(
             q.view(-1, h, d), k.view(-1, h, d), v.view(-1, h, d), g.view(-1, h, d), beta, p.A_log, p.dt_bias,
-            rec_state, slots, ckpt, plan.verify_cu_seqlens(), p.scale, p.lower_bound, out_skip=kp,
+            rec_state, slots, ckpt, plan.verify_cu_seqlens(), p.scale, p.lower_bound, out_skip=kp, prefix_len=plen,
         )
 
 
