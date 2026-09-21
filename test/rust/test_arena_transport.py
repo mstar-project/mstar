@@ -16,6 +16,7 @@ from mstar.communication.tensors import (
     create_tensor_communication_manager,
 )
 from mstar.graph.base import GraphEdge
+from mstar.utils.containers import ParallelList
 
 
 class _NullCommunicator:
@@ -362,3 +363,50 @@ KEEP_ALIVE = m   # global reference survives to interpreter exit
     seg_path = out.stdout.strip().splitlines()[-1]
     assert seg_path.startswith("/dev/shm/mstar_arena_exitcase_")
     assert not os.path.exists(seg_path), "segment survived interpreter exit"
+
+
+def test_register_for_send_batch_matches_the_per_request_loop(tmp_path):
+    """The arena overrides the batched form to sync its D2H stream once instead
+    of once per request. That override must stage exactly what B separate
+    register_for_send calls would."""
+    looped = _manager("w0", tmp_path)
+    batched = _manager("w1", tmp_path)
+    cons = _manager("w2", tmp_path)
+
+    def _stage(mgr, use_batch):
+        per_request = {}
+        for rid in (10, 11, 12):
+            infos = mgr.store_and_return_tensor_info(
+                rid, {"h": [torch.randn(4, 8)], "e": [torch.empty(0, 3)]},
+            )
+            per_request[rid] = [i for il in infos.values() for i in il]
+        if use_batch:
+            mgr.register_for_send_batch(
+                ParallelList(list(per_request), list(per_request.values()))
+            )
+        else:
+            for rid, infos in per_request.items():
+                mgr.register_for_send(rid, infos)
+        return per_request
+
+    torch.manual_seed(0)
+    loop_out = _stage(looped, use_batch=False)
+    torch.manual_seed(0)
+    batch_out = _stage(batched, use_batch=True)
+
+    for rid in loop_out:
+        for a, b in zip(loop_out[rid], batch_out[rid], strict=True):
+            # Staged into the arena (not spilled) in both, at the same offset.
+            assert (a.shm_segment is None) == (b.shm_segment is None)
+            assert a.shm_offset == b.shm_offset
+            assert a.dims == b.dims and a.nbytes == b.nbytes
+            assert looped.tensor_store.is_registered(a.uuid)
+            assert batched.tensor_store.is_registered(b.uuid)
+
+    # And the bytes actually survive a read by a third party.
+    edges = [GraphEdge(name="h", next_node="n", tensor_info=[batch_out[10][0]])]
+    cons.start_read_tensors(10, edges)
+    assert torch.equal(
+        cons.tensor_store.get_tensor(batch_out[10][0].uuid),
+        batched.tensor_store.get_tensor(batch_out[10][0].uuid),
+    )

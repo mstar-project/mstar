@@ -25,7 +25,12 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AllocationFailed, StepContext
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.graph.base import GraphEdge, GraphNode, SpeculativeNodeInfo
+from mstar.graph.base import (
+    GraphEdge,
+    GraphNode,
+    SpeculativeNodeInfo,
+    TensorPointerInfo,
+)
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.python import PythonGraphRuntime
@@ -1146,7 +1151,7 @@ class Worker:
     def _register_outputs(
         self,
         batch: ScheduledBatch,
-        routing_per_request: dict[str, NodeOutputRouting],
+        routing_per_request: dict[int, NodeOutputRouting],
     ):
         """
         For outputs going to other workers: register tensors for RDMA send
@@ -1154,7 +1159,9 @@ class Worker:
         For outputs staying local: store tensors in tensor_manager.
         Returns the output edges per request (with tensor_info filled in).
         """
-        for rid, _node in batch.node_objects.items():
+        rids: list[int] = []
+        per_request_infos: list[list[TensorPointerInfo]] = []
+        for rid in batch.node_objects:
             routing = routing_per_request[rid]
             infos_by_uuid = {}
             for edge in (
@@ -1165,10 +1172,13 @@ class Worker:
             ):
                 for info in edge.tensor_info:
                     infos_by_uuid[info.uuid] = info
-            self.tensor_manager.register_for_send(
-                rid=rid, tensor_infos=list(infos_by_uuid.values()),
-                skip_cuda_sync=True,
-            )
+            rids.append(rid)
+            per_request_infos.append(list(infos_by_uuid.values()))
+        # One staging pass for the batch: the arena override collapses B
+        # host-blocking D2H stream syncs into one.
+        self.tensor_manager.register_for_send_batch(
+            ParallelList(rids, per_request_infos), skip_cuda_sync=True,
+        )
 
 
     def _send_outputs(
@@ -2437,7 +2447,7 @@ class Worker:
                     + sum(routing.streaming_to_workers.values(), start=[])
                 )
                 self.tensor_manager.set_output_ref_counts(
-                    rid, per_request_uuids[rid], routed_edges
+                    per_request_uuids[rid], routed_edges
                 )
 
         if self.enable_nvtx:
