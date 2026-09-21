@@ -105,6 +105,9 @@ class PageArena:
 class RetentionPolicy:
     """fifo retention of `context_budget`"""
     context_budget: int
+    # tokens at the front the window never releases; only pages inside it stay
+    # what their keys describe
+    protected_prefix: int = 0
 
 
 @dataclass
@@ -447,10 +450,14 @@ class KVManager(AttentionResource):
             return
         # what was here before this write, not after: a decode step can commit
         # before the token it writes is read back and counted
-        if stream.stored_len - segment.span > stream.covered_len:
+        if stream.released or stream.stored_len - segment.span > stream.covered_len:
             stream.keys = None
             return
         filled = min(stream.stored_len // self.config.page_size, stream.keyed_pages)
+        if stream.retention is not None:
+            filled = min(
+                filled, stream.retention.protected_prefix // self.config.page_size
+            )
         # by key: a stream that lost a race, or that came back from the host,
         # is holding a copy of the page the index named
         parent = (
@@ -568,6 +575,11 @@ class KVManager(AttentionResource):
                 return
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.keys is None or stream.unkeyed is None:
+                return
+            if stream.released:
+                # past a front release `page_indices[k]` is no longer page k of
+                # the chain, and nothing here can say which page a key names
+                stream.keys = None
                 return
             tokens = sampled[0].flatten().tolist()
             stream.unkeyed.extend(tokens)
