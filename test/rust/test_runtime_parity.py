@@ -556,3 +556,29 @@ def test_a_target_that_refuses_async_is_never_speculated(opted_out):
     """
     rid = _admit(opted_out)
     assert opted_out.speculate_node("prefill", WALK, rid) == []
+
+
+def test_the_per_request_sharding_config_agrees(pair):
+    """``register_request`` and the TP fan-out paths need the Python object.
+
+    Rust derives its own copy for routing, but that one cannot come back out,
+    so the shim derives a second from the same input by the same rule. This
+    pins them together -- and that the config is dropped on removal, since
+    handles are recycled.
+    """
+    rt, _book, _store = pair
+    rid = _admit(rt)
+    cfg = rt.get_sharding_config(rid)
+    assert cfg is not None
+    assert cfg.groups == []            # the fixture is un-sharded
+    assert cfg is not _sharding(), "must not hand back the shared base"
+
+    rt.remove_request(rid)
+    assert rt.get_sharding_config(rid) is None
+
+
+def test_an_unknown_rid_has_no_sharding_config(pair):
+    # Teardown and TP fan-out can race a removal; both runtimes answer None
+    # rather than raising.
+    rt, _book, _store = pair
+    assert rt.get_sharding_config(9999) is None

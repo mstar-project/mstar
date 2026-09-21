@@ -16,6 +16,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.runtime import sharding
 from mstar.graph.runtime.base import (
     EdgeSpec,
     GraphRuntime,
@@ -219,19 +220,16 @@ class PythonGraphRuntime(GraphRuntime):
             # Note: conductor.py passes the same worker_graph_to_worker dict
             # on every NewRequest for a given request(i.e., for every partition).
             # So the below logic only needs to be done once.
-            node_to_workers = {}
+            node_to_workers = sharding.node_to_workers(
+                worker_graph_to_workers,
+                self._all_wg_ids_to_graph_walks,
+                self._all_wg_ids_to_nodes,
+            )
             dyn_loop_to_workers = {}
             for worker_graph_id, worker_ids in worker_graph_to_workers:
                 if worker_graph_id not in self._all_wg_ids_to_graph_walks:
                     continue
                 for wg_graph_walk in self._all_wg_ids_to_graph_walks[worker_graph_id]:
-                    node_to_workers.update({
-                        NodeAndGraphWalk(
-                            node=name,
-                            graph_walk=wg_graph_walk
-                        ): worker_ids for name in self._all_wg_ids_to_nodes[worker_graph_id]
-                    })
-
                     for loop_name in self._all_wg_ids_to_dyn_loops[worker_graph_id]:
                         dyn_loop_to_workers.setdefault(NodeAndGraphWalk(
                             node=loop_name,

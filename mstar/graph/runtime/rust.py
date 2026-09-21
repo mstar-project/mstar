@@ -27,6 +27,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphSection, Loop
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.runtime import sharding
 from mstar.graph.runtime.base import (
     EdgeSpec,
     GraphRuntime,
@@ -221,6 +222,14 @@ class RustGraphRuntime(GraphRuntime):
         self._node_to_partition = node_to_partition
         self._communicator = communicator
         self._bookkeeping = bookkeeping
+        # Rust derives its own per-request sharding for routing, but that copy
+        # cannot come back out: register_request wants the Python object and
+        # the TP fan-out paths read group._workers. Derived here by the same
+        # rule from the same input, so the two cannot disagree.
+        self._sharding_base = sharding_config
+        self._all_wg_ids_to_graph_walks = all_wg_ids_to_graph_walks
+        self._all_wg_ids_to_nodes = all_wg_ids_to_nodes
+        self._sharding: dict[int, ShardingConfig] = {}
         # Buffered until the worker graph finishes, so a persist signal cannot
         # race the WORKER_GRAPHS_DONE announcing it.
         self._pending_persist: dict[int, dict] = {}
@@ -250,10 +259,18 @@ class RustGraphRuntime(GraphRuntime):
         for _wg_id, workers in worker_graph_to_workers:
             flat.extend(workers)
             counts.append(len(workers))
-        return self._rust.add_request(
+        handle = self._rust.add_request(
             request_id, partition, graph_walk,
             list(worker_graph_to_workers.keys), flat, counts,
         )
+        # One NewRequest arrives PER PARTITION, all carrying the same map, so
+        # the first one settles it.
+        if handle not in self._sharding:
+            self._sharding[handle] = sharding.for_request(
+                self._sharding_base, worker_graph_to_workers,
+                self._all_wg_ids_to_graph_walks, self._all_wg_ids_to_nodes,
+            )
+        return handle
 
     def remove_request(self, rid: int):
         # Handles are recycled, so anything left keyed by this one attaches to
@@ -265,10 +282,13 @@ class RustGraphRuntime(GraphRuntime):
         self._pending_new_tokens.pop(rid, None)
         self._buffered_outputs.pop(rid, None)
         self._output_loop_indices.pop(rid, None)
+        self._sharding.pop(rid, None)
         self._rust.remove_request(rid)
 
     def get_sharding_config(self, rid: int) -> ShardingConfig | None:
-        pass # TODO
+        """None for a rid this rank does not know: the teardown and TP-fanout
+        callers can legitimately race a removal."""
+        return self._sharding.get(rid)
 
     def get_rid_string(self, handle: int) -> str:
         return self._rust.get_rid_string(handle)
