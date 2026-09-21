@@ -301,8 +301,8 @@ class Flux2KleinModel(Model):
         """Validate the request at the 400-producing seam and tokenize the prompt."""
         if (output_modalities or ["image"])[0] != "image":
             raise ValueError(f"FLUX.2 klein only generates images; got output modality {output_modalities!r}")
-        if prompt is None:
-            raise ValueError("FLUX.2 klein requires a text prompt")
+        if prompt is None or not prompt.strip():
+            raise ValueError("FLUX.2 klein requires a non-empty text prompt")
         images = (tensors or {}).get(IMAGE_INPUTS) or []
         if "image" in input_modalities and not images:
             raise ValueError("request declared an image input but no image arrived; editing needs the reference image")
