@@ -1,30 +1,31 @@
 """CPU unit tests for the Nemotron-Duplex NodeSubmodules — the per-node compute
 wrappers — using lightweight fakes (no real weights / GPU).
 
-Regression coverage for the E5 serving fixes:
-  * nano ``check_stop`` must NOT stop on EOS (a normal per-frame token in duplex);
-  * nano ``_fuse_frame`` must tolerate the empty terminal ``audio_frame`` chunk;
-  * the codec keeps a per-request left-context and emits ONLY the new frames
-    (a stateless full-window emit balloons the audio ~window/chunk×).
+Covers the engine contract of the nano node (host-only ``prepare_inputs``,
+AddFusion in ``preprocess``, the step declaration per walk, the reference's
+prompt priming, stop rule) and the codec's per-request left context.
 """
 from types import SimpleNamespace
 
 import torch
 from torch import nn
 
-from mstar.model.nemotron_duplex.config import NemotronDuplexConfig
+from mstar.engine.resources import AttentionStep, KVStep, SamplerStep
+from mstar.model.nemotron_duplex.config import NANO_ATTN, NANO_KV, NANO_SAMPLER, NemotronDuplexConfig
 from mstar.model.nemotron_duplex.submodules import (
     AudioCodecDecoderSubmodule,
     NemotronHLLMSubmodule,
 )
 
+H = 8
+
 
 def _make_nano() -> NemotronHLLMSubmodule:
     cfg = NemotronDuplexConfig()
     lm = nn.Module()
-    lm.embeddings = nn.Embedding(64, 8)   # covers the special ids (bos/pad/eos)
-    lm.lm_head = nn.Linear(8, 64)
-    lm.function_head = nn.Linear(8, 64)
+    lm.embeddings = nn.Embedding(64, H)   # covers the special ids (bos/pad/eos)
+    lm.lm_head = nn.Linear(H, 64)
+    lm.function_head = nn.Linear(H, 64)
     return NemotronHLLMSubmodule(language_model=lm, config=cfg)
 
 
@@ -32,6 +33,15 @@ def _fwd_info(iters: int, max_tokens: int) -> SimpleNamespace:
     return SimpleNamespace(
         dynamic_loop_iter_counts={"decode_loop": iters}, max_tokens=max_tokens,
     )
+
+
+_ENGINE = SimpleNamespace(request_ids=["r"], resources={}, per_request_states=None)
+
+
+def _fuse(nano, walk, inputs):
+    """prepare_inputs (host) -> preprocess (fusion) for one request."""
+    inp = nano.prepare_inputs(walk, None, inputs, resources={})   # the engine passes ``resources=``
+    return inp, nano.preprocess(walk, _ENGINE, [inp])
 
 
 def test_nano_check_stop_ignores_eos():
@@ -48,23 +58,73 @@ def test_nano_check_stop_hits_max_tokens():
     assert nano.check_stop("r", _fwd_info(max_tokens=8, iters=7), out) == {"decode_loop"}
 
 
+def test_nano_prepare_inputs_is_host_only_and_fusion_runs_in_preprocess():
+    nano = _make_nano()
+    inp, pre = _fuse(nano, "decode", {"audio_frame": [torch.ones(H)],
+                                      "prev_text": [torch.tensor([3])], "prev_func": [torch.tensor([4])]})
+    assert inp.input_embeds is None and inp.input_ids is None       # nothing embedded yet
+    assert inp.input_seq_len == 1
+    assert set(inp.tensor_inputs) == {"audio_frame", "prev_text", "prev_func"}
+    assert pre["input_embeds"].shape == (1, H) and pre["seq_lens"] == [1]
+    cfg, emb = nano.config, nano.embeddings
+    expected = (emb(torch.tensor([3])) * cfg.agent_text_weight + torch.ones(1, H) * cfg.user_audio_weight
+                + emb(torch.tensor([4])) * cfg.function_weight)
+    assert torch.allclose(pre["input_embeds"], expected)
+
+
 def test_nano_fuse_frame_handles_empty_audio_frame():
     """The terminal audio_frame stream chunk (producer_done race) arrives with the
-    key present but an empty tensor list; _fuse_frame must run a no-audio step
-    instead of IndexError-ing on ``inputs["audio_frame"][0]``."""
+    key present but an empty tensor list: run a no-audio step instead of
+    IndexError-ing on ``inputs["audio_frame"][0]``; missing carry-ins default to BOS / PAD."""
     nano = _make_nano()
-    empty = nano.prepare_inputs("decode", None, {"audio_frame": []})
-    assert empty.input_embeds is not None
-    assert empty.input_embeds.shape == (1, 8) and empty.input_seq_len == 1
+    inp, pre = _fuse(nano, "decode", {"audio_frame": []})
+    assert "audio_frame" not in inp.tensor_inputs
+    assert int(inp.tensor_inputs["prev_text"]) == nano.config.text_bos_id
+    assert int(inp.tensor_inputs["prev_func"]) == nano.config.text_pad_id
+    assert pre["input_embeds"].shape == (1, H)
+    _, with_audio = _fuse(nano, "decode", {"audio_frame": [torch.ones(H)]})
+    assert not torch.allclose(with_audio["input_embeds"], pre["input_embeds"])
 
 
-def test_nano_fuse_frame_adds_audio_when_present():
+def test_nano_prompt_priming_matches_reference():
+    """System-prompt prefill fuses each prompt token with the agent channel (BOS
+    on the first token, PAD after) and a PAD function token — the reference's
+    ``_prime_prompt`` — instead of embedding the raw ids."""
     nano = _make_nano()
-    got = nano.prepare_inputs("decode", None, {"audio_frame": [torch.ones(8)]})
-    assert got.input_embeds.shape == (1, 8)
-    # with a nonzero audio frame the fused embed differs from the no-audio (empty) step
-    no_audio = nano.prepare_inputs("decode", None, {"audio_frame": []})
-    assert not torch.allclose(got.input_embeds, no_audio.input_embeds)
+    cfg, emb = nano.config, nano.embeddings
+    ids = torch.tensor([10, 11, 12, 13])
+    inp, pre = _fuse(nano, "prefill_text", {"text_inputs": [ids]})
+    assert inp.input_seq_len == 4 and pre["seq_lens"] == [4]
+    agent = torch.tensor([cfg.text_bos_id] + [cfg.text_pad_id] * 3)
+    expected = (emb(agent) * cfg.agent_text_weight + emb(ids) * cfg.user_audio_weight
+                + emb(torch.tensor([cfg.text_pad_id])) * cfg.function_weight)
+    assert torch.allclose(pre["input_embeds"], expected)
+
+
+def test_nano_declare_step_per_walk():
+    """Prefill steps the KV + attention only (the prompt region is never sampled);
+    decode also steps the text sampler. One 'main' segment per request, spanning
+    its token count — padding rows included (strict zip)."""
+    nano = _make_nano()
+    p_inp = nano.prepare_inputs("prefill_text", None, {"text_inputs": [torch.arange(5)]})
+    step = nano.declare_step("prefill_text", ["a"], [p_inp])
+    assert set(step.keys()) == {NANO_KV, NANO_ATTN}
+    assert isinstance(step.get(NANO_KV), KVStep) and isinstance(step.get(NANO_ATTN), AttentionStep)
+    assert step.get(NANO_ATTN).causal is True
+    assert [(s.request_id, s.label, s.span) for s in step.segments] == [("a", "main", 5)]
+
+    d_inp = nano.prepare_inputs("decode", None, {"audio_frame": [torch.ones(H)]})
+    step = nano.declare_step("decode", ["a", "b"], [d_inp, d_inp])
+    assert set(step.keys()) == {NANO_KV, NANO_ATTN, NANO_SAMPLER}
+    assert isinstance(step.get(NANO_SAMPLER), SamplerStep)
+    assert [(s.request_id, s.span) for s in step.segments] == [("a", 1), ("b", 1)]
+
+
+def test_nano_postprocess_feeds_tokens_back():
+    nano = _make_nano()
+    out = {"new_token": [torch.tensor([7])], "new_func": [torch.tensor([12])]}
+    nano.postprocess("r", None, out)
+    assert out["prev_text"] is out["new_token"] and out["prev_func"] is out["new_func"]
 
 
 class _FakeCodec(nn.Module):
@@ -89,6 +149,10 @@ def _run_codec(codec, rid, n_frames):
     return codec.forward("codec_chunk", eng, codes=codes)["audio_chunk"][0]
 
 
+def _ctx(codec, rid):
+    return codec.request_state(rid).get(AudioCodecDecoderSubmodule.CONTEXT_KEY)
+
+
 def test_codec_emits_only_new_frames_with_left_context():
     """First chunk emits all its frames; later chunks decode context+new but
     emit ONLY the new frames — so a 5+5 frame stream yields 10 frames of audio,
@@ -100,19 +164,21 @@ def test_codec_emits_only_new_frames_with_left_context():
     b = _run_codec(codec, "r", 5)
     assert b.shape[0] == 5 * spf                       # second chunk: only the 5 NEW frames
     # context rolled forward, capped at codec_left_context_frames
-    assert codec._ctx["r"].shape[0] == min(10, codec.config.eartts.codec_left_context_frames)
+    assert _ctx(codec, "r").shape[0] == min(10, codec.config.eartts.codec_left_context_frames)
 
 
 def test_codec_cleanup_clears_per_request_context():
+    """The context lives in engine-owned per-request state, so the engine's
+    ``cleanup_request`` drops it with everything else."""
     codec = _make_codec()
     _run_codec(codec, "r", 5)
-    assert "r" in codec._ctx
+    assert _ctx(codec, "r") is not None
     codec.cleanup_request("r")
-    assert "r" not in codec._ctx
+    assert "r" not in codec.request_states
 
 
 def test_codec_requests_are_isolated():
     codec = _make_codec()
     _run_codec(codec, "a", 5)
     _run_codec(codec, "b", 3)
-    assert codec._ctx["a"].shape[0] == 5 and codec._ctx["b"].shape[0] == 3
+    assert _ctx(codec, "a").shape[0] == 5 and _ctx(codec, "b").shape[0] == 3
