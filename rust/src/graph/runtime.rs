@@ -4,7 +4,7 @@
 use crate::graph::compile::{EMIT_TO_CLIENT, EMPTY_DESTINATION, LoopArg, NodeArg, compile_one};
 use crate::graph::shard::{GroupTemplate, ShardingTemplate};
 use crate::graph::spec::*;
-use crate::graph::request::{RequestInfo, WgIndex, WorkerGraphMeta};
+use crate::graph::request::{LoopStopTime, RequestInfo, WgIndex, WorkerGraphMeta};
 use crate::graph::state::{RequestState, RoutedEdge, SpecNode, TensorRef};
 use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
 use pyo3::exceptions::PyValueError;
@@ -546,6 +546,103 @@ pub struct GraphRuntime {
         }
     }
 
+    /// Whether this request's current walk actually contains the loop. A stop
+    /// for one it does not is a model bug: logged by the caller and dropped.
+    fn check_dyn_loop(&self, rid: u32, partition: &str, loop_name: &str) -> bool {
+        let (Some(p), Some(l)) = (
+            self.interner.get(partition),
+            self.interner.get(loop_name),
+        ) else {
+            return false;
+        };
+        let Some(info) = self.info(rid) else { return false };
+        let Some(walk) = info.walk(p) else { return false };
+        info.dyn_loop_to_workers.contains_key(&(l, walk))
+    }
+
+    fn dyn_loop_workers(&self, rid: u32, partition: &str, name: &str) -> Vec<Sym> {
+        let (Some(p), Some(l)) = (
+            self.interner.get(partition),
+            self.interner.get(name),
+        ) else {
+            return vec![];
+        };
+        let Some(info) = self.info(rid) else { return vec![] };
+        let Some(walk) = info.walk(p) else { return vec![] };
+        info.dyn_loop_to_workers
+            .get(&(l, walk))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Register the finish signal on every worker graph carrying a named loop,
+    /// and snapshot the stop time from the one owning the last-run node.
+    fn stop_loops_for_rid(
+        &mut self,
+        rid: u32,
+        partition: &str,
+        loop_names: &[String],
+        last_node_run: Option<&str>,
+    ) {
+        let Some(p) = self.interner.get(partition) else { return };
+        let live: Vec<WgIndex> = match self.info(rid).and_then(|i| i.partitions.get(&p)) {
+            Some(part) => part.walk_worker_graphs.clone(),
+            None => return,
+        };
+        let syms: Vec<Sym> = loop_names
+            .iter()
+            .filter_map(|n| self.interner.get(n))
+            .collect();
+
+        // In disaggregated mode one loop name can live on several worker
+        // graphs, each with its own finish signal, so this still fans out.
+        for &wg in &live {
+            let g = self.graphs[wg as usize].clone();
+            for &sym in &syms {
+                let Some(&lid) = g.loop_by_name.get(&sym) else { continue };
+                if let Some(state) = self.states[wg as usize][rid as usize].as_mut() {
+                    state.register_loop_finish(lid);
+                }
+            }
+        }
+
+        // A stop time is one observation per loop, so only the worker graph
+        // owning the last-run node is asked.
+        let Some(node_name) = last_node_run else { return };
+        let walk = match self.info(rid).and_then(|i| i.walk(p)) {
+            Some(w) => w,
+            None => return,
+        };
+        let walk_name = self.interner.name(walk).to_string();
+        let Some(owner) = self.owner_of(node_name, &walk_name) else { return };
+        let g = self.graphs[owner as usize].clone();
+        for &sym in &syms {
+            let Some(&lid) = g.loop_by_name.get(&sym) else { continue };
+            let Some(state) = self.states[owner as usize][rid as usize].as_ref()
+            else {
+                continue;
+            };
+            let order: Vec<Sym> = g
+                .loop_order(lid)
+                .into_iter()
+                .map(|l| g.lp(l).name)
+                .collect();
+            let indices: FxHashMap<Sym, u32> = g
+                .loop_order(lid)
+                .into_iter()
+                .map(|l| (g.lp(l).name, state.loop_iter(l)))
+                .collect();
+            let stop = LoopStopTime {
+                loop_name_order: order,
+                loop_indices: indices,
+                wg_fwd_pass_idx: state.num_times_run,
+            };
+            if let Some(info) = self.requests[rid as usize].as_mut() {
+                info.loop_stop_times.insert(sym, stop);
+            }
+        }
+    }
+
     fn owner_of(&self, node: &str, walk: &str) -> Option<WgIndex> {
         let n = self.interner.get(node)?;
         let w = self.interner.get(walk)?;
@@ -588,6 +685,14 @@ fn e_persist(edges: &[RoutedEdge], uuid: u64) -> bool {
     edges
         .iter()
         .any(|e| e.persist && e.tensors.iter().any(|t| t.uuid == uuid))
+}
+
+/// One `NestedLoopIndices` as Python hands it over.
+#[derive(FromPyObject)]
+pub struct LoopStopArg {
+    #[pyo3(item)] loop_name_order: Vec<String>,
+    #[pyo3(item)] loop_indices: Vec<(String, u32)>,
+    #[pyo3(item)] wg_fwd_pass_idx: u32,
 }
 
 /// `RouteInput`.
@@ -1546,6 +1651,140 @@ impl GraphRuntime {
             },
         );
         Ok(out)
+    }
+
+    /// Stop loops, record the pending stops, and report who to tell.
+    ///
+    /// Returns (worker, loop names) per rid for the caller to send. The frames
+    /// are still built in Python: a Rust encoder has to reproduce the typed
+    /// msgpack wire.py emits byte for byte, which is its own piece of work.
+    #[allow(clippy::type_complexity)]
+    fn stop_loops_batched(
+        &mut self,
+        partition: &str,
+        graph_walk: &str,
+        last_node_run: &str,
+        rids: Vec<u32>,
+        loop_names: Vec<Vec<String>>,
+    ) -> PyResult<Vec<(u32, String, Vec<String>)>> {
+        if rids.len() != loop_names.len() {
+            return Err(PyValueError::new_err(
+                "stop_loops_batched: rids and loop_names must be the same length",
+            ));
+        }
+        let Some(walk) = self.interner.get(graph_walk) else {
+            return Ok(vec![]);
+        };
+        let mut fanout = Vec::new();
+        for (rid, names) in rids.into_iter().zip(loop_names) {
+            let wanted: Vec<String> = names
+                .into_iter()
+                .filter(|n| self.check_dyn_loop(rid, partition, n))
+                .collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            self.stop_loops_for_rid(rid, partition, &wanted, Some(last_node_run));
+            for name in &wanted {
+                if let Some(l) = self.interner.get(name) {
+                    self.pending_loop_stops.insert((rid, walk, l));
+                }
+            }
+            let mut per_worker: FxHashMap<Sym, Vec<String>> = FxHashMap::default();
+            for name in &wanted {
+                for w in self.dyn_loop_workers(rid, partition, name) {
+                    per_worker.entry(w).or_default().push(name.clone());
+                }
+            }
+            let me = self.shard.me;
+            for (worker, names) in per_worker {
+                if worker == me {
+                    continue;
+                }
+                fanout.push((
+                    rid,
+                    self.interner.name(worker).to_string(),
+                    names,
+                ));
+            }
+        }
+        Ok(fanout)
+    }
+
+    /// A peer's STOP_LOOPS landing here.
+    ///
+    /// Stops only the loops whose incoming observation is NEWER than this
+    /// rank's, and does NOT fan out: the rank that originated the stop already
+    /// told everyone, so re-sending would loop.
+    fn apply_peer_loop_stops(
+        &mut self,
+        rid: u32,
+        partition: &str,
+        loop_names: Vec<String>,
+        stop_times: Vec<LoopStopArg>,
+    ) -> PyResult<()> {
+        if loop_names.len() != stop_times.len() {
+            return Err(PyValueError::new_err(
+                "apply_peer_loop_stops: names and times must be the same length",
+            ));
+        }
+        let Some(p) = self.interner.get(partition) else { return Ok(()) };
+        if self.info(rid).is_none_or(|i| !i.partitions.contains_key(&p)) {
+            return Ok(());
+        }
+        let mut newer = Vec::new();
+        for (name, arg) in loop_names.iter().zip(stop_times) {
+            let sym = self.interner.intern(name);
+            let stop = LoopStopTime {
+                loop_name_order: arg
+                    .loop_name_order
+                    .iter()
+                    .map(|n| self.interner.intern(n))
+                    .collect(),
+                loop_indices: arg
+                    .loop_indices
+                    .iter()
+                    .map(|(n, i)| (self.interner.intern(n), *i))
+                    .collect(),
+                wg_fwd_pass_idx: arg.wg_fwd_pass_idx,
+            };
+            let info = self.requests[rid as usize].as_mut().expect("checked");
+            if stop.later_than(info.loop_stop_times.get(&sym), sym) {
+                newer.push(name.clone());
+            }
+            info.loop_stop_times.insert(sym, stop);
+        }
+        if !newer.is_empty() {
+            // No last_node_run and no fan-out: the originating rank took the
+            // snapshot and told everyone already.
+            self.stop_loops_for_rid(rid, partition, &newer, None);
+        }
+        Ok(())
+    }
+
+    /// The snapshot this rank holds, for the STOP_LOOPS it sends.
+    #[allow(clippy::type_complexity)]
+    fn get_loop_stop_times(
+        &self, rid: u32,
+    ) -> Vec<(String, Vec<String>, Vec<(String, u32)>, u32)> {
+        let Some(info) = self.info(rid) else { return vec![] };
+        info.loop_stop_times
+            .iter()
+            .map(|(&name, t)| {
+                (
+                    self.interner.name(name).to_string(),
+                    t.loop_name_order
+                        .iter()
+                        .map(|&n| self.interner.name(n).to_string())
+                        .collect(),
+                    t.loop_indices
+                        .iter()
+                        .map(|(&n, &i)| (self.interner.name(n).to_string(), i))
+                        .collect(),
+                    t.wg_fwd_pass_idx,
+                )
+            })
+            .collect()
     }
 
     fn num_handles(&self) -> usize {

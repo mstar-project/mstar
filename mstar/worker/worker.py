@@ -125,6 +125,7 @@ def _make_graph_runtime(**kwargs) -> PythonGraphRuntime:
         node_to_partition=kwargs["node_to_partition"],
         sharding_config=kwargs["sharding_config"],
         bookkeeping=bookkeeping,
+        communicator=communicator,
     )
 
 

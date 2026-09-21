@@ -23,6 +23,7 @@ rust_runtime = pytest.importorskip(
 )
 from mstar.communication.rust_tensor_store import RustTensorBookkeeping
 from mstar.graph.runtime import base as rust_runtime_base
+from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import RouteInput, SpeculationPrepInput
 
 WG_ID = 0
@@ -765,3 +766,58 @@ def test_routing_settles_the_safety_hold(runtime):
     # One local consumer each: the hold is replaced by one real reference.
     assert not bk.can_gc(20)
     assert not bk.can_gc(21)
+
+
+# --- loop stops --------------------------------------------------------------
+
+def test_a_stop_records_a_pending_stop(runtime):
+    rid = _admit(runtime)
+    assert not runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
+    runtime.stop_loops_batched(
+        partition="default", graph_walk=WALK, last_node_run="ar_decode",
+        loop_names=ParallelList([rid], [["ar_loop"]]),
+    )
+    assert runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
+    assert runtime.pending_loop_stop_rids(WALK, "ar_loop") == {rid}
+    runtime.clear_pending_loop_stops()
+    assert not runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
+
+
+def test_a_stop_for_a_loop_not_in_the_walk_is_dropped(runtime):
+    # A model bug rather than a protocol one: logged and dropped, not raised.
+    rid = _admit(runtime)
+    runtime.stop_loops_batched(
+        partition="default", graph_walk=WALK, last_node_run="ar_decode",
+        loop_names=ParallelList([rid], [["not_a_loop"]]),
+    )
+    assert runtime.pending_loop_stop_rids(WALK, "not_a_loop") == set()
+
+
+def test_a_peer_stop_applies_only_when_newer(runtime):
+    rid = _admit(runtime)
+
+    def at(fwd):
+        return NestedLoopIndices(
+            loop_name_order=["ar_loop"], loop_indices={"ar_loop": 0},
+            wg_fwd_pass_idx=fwd,
+        )
+
+    runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": at(3)})
+    kept = runtime._loop_stop_times(rid)["ar_loop"]
+    assert kept.wg_fwd_pass_idx == 3
+
+    # An older observation is recorded but must not re-stop a loop that has
+    # since restarted.
+    runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": at(1)})
+    assert runtime._loop_stop_times(rid)["ar_loop"].wg_fwd_pass_idx == 1
+
+
+def test_a_peer_stop_for_an_unknown_partition_is_dropped(runtime):
+    rid = _admit(runtime)
+    runtime.apply_peer_loop_stops(
+        rid, "no_such_partition",
+        {"ar_loop": NestedLoopIndices(
+            loop_name_order=[], loop_indices={}, wg_fwd_pass_idx=0,
+        )},
+    )
+    assert runtime._loop_stop_times(rid) == {}

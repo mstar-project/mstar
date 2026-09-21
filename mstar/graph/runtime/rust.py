@@ -22,6 +22,7 @@ from mstar.communication.tensor_store import TensorBookkeeping
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphSection, Loop
 from mstar.graph.graph_io import WorkerGraphIO
+from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import (
     EdgeSpec,
     GraphRuntime,
@@ -35,6 +36,7 @@ from mstar.graph.runtime.base import (
     SpeculationPrepOutput,
 )
 from mstar.model.base import WorkerGraph
+from mstar.utils.ipc_format import StopLoops, WorkerMessage, WorkerMessageType
 
 
 def _unported(name: str):
@@ -199,6 +201,7 @@ class RustGraphRuntime(GraphRuntime):
         node_to_partition: dict[str, str],
         sharding_config: ShardingConfig,
         bookkeeping: TensorBookkeeping,
+        communicator=None,
     ):
         mine = {wg.worker_graph_id for wg in my_worker_graphs}
         self._rust = _RustGraphRuntime(
@@ -220,6 +223,7 @@ class RustGraphRuntime(GraphRuntime):
             me=my_worker_id,
         )
         self._node_to_partition = node_to_partition
+        self._communicator = communicator
 
     # --------- Bookkeeping ----------
 
@@ -499,11 +503,60 @@ class RustGraphRuntime(GraphRuntime):
             local_streaming_tensor_idxs=out.local_streaming_tensor_idxs,
         )
 
+    def stop_loops_batched(
+        self, partition: str, graph_walk: str, last_node_run: str,
+        loop_names: ParallelList[int, list[str]],
+    ):
+        # Rust stops the loops and reports who to tell; the frames are built
+        # here because a Rust encoder has to reproduce wire.py's typed msgpack
+        # byte for byte. See the module docstring.
+        fanout = self._rust.stop_loops_batched(
+            partition, graph_walk, last_node_run,
+            list(loop_names.keys), [list(v) for v in loop_names.values],
+        )
+        for rid, worker, names in fanout:
+            self._communicator.send(
+                entity_id=worker,
+                msg=WorkerMessage(
+                    message_type=WorkerMessageType.STOP_LOOPS,
+                    body=StopLoops(
+                        request_id=self.get_rid_string(rid),
+                        loop_names=set(names),
+                        loop_stop_times=self._loop_stop_times(rid),
+                        partition_name=partition,
+                    ),
+                ),
+            )
+
+    def apply_peer_loop_stops(
+        self, rid: int, partition: str,
+        loop_stop_times: dict[str, NestedLoopIndices],
+    ):
+        names = list(loop_stop_times)
+        self._rust.apply_peer_loop_stops(
+            rid, partition, names,
+            [
+                {
+                    "loop_name_order": list(loop_stop_times[n].loop_name_order),
+                    "loop_indices": list(loop_stop_times[n].loop_indices.items()),
+                    "wg_fwd_pass_idx": loop_stop_times[n].wg_fwd_pass_idx,
+                } for n in names
+            ],
+        )
+
+    def _loop_stop_times(self, rid: int) -> dict[str, NestedLoopIndices]:
+        return {
+            name: NestedLoopIndices(
+                loop_name_order=order,
+                loop_indices=dict(indices),
+                wg_fwd_pass_idx=fwd,
+            )
+            for name, order, indices, fwd in self._rust.get_loop_stop_times(rid)
+        }
+
     # --------- not ported yet ----------
     #
     # Everything a forward pass needs. Until these land, MSTAR_RUST_GRAPH=1
     # admits requests and answers the structural queries but cannot run a step.
 
-    stop_loops_batched = _unported("stop_loops_batched")
-    apply_peer_loop_stops = _unported("apply_peer_loop_stops")
     send_outputs = _unported("send_outputs")
