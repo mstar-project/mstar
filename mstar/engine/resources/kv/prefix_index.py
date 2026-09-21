@@ -3,8 +3,9 @@
 Inserting makes the index a page's second owner, so evicting releases that one
 reference and the page reaches the free list only once no live request holds it
 too. Leaves are ordered by a clock that ticks on every insert and every matching
-lookup; a page that is re-stamped or gains a child leaves a stale heap entry
-behind, which is why an entry's stamp is checked against the page's own.
+lookup. A hit re-stamps a page without pushing it again, so a leaf keeps one heap
+entry however often it is read, and an entry that surfaces under an older stamp
+is pushed back under the page's own.
 
 Every caller holds the manager's lock, so none of this takes one of its own.
 """
@@ -42,8 +43,6 @@ class PrefixIndex:
             self._clock += 1
             for page in pages:
                 self._stamp[page] = self._clock
-                if self._children[page] == 0:
-                    heapq.heappush(self._leaves, (self._clock, page))
         return pages
 
     def insert(self, key: bytes, page: int, parent: int | None = None) -> bool:
@@ -101,12 +100,12 @@ class PrefixIndex:
     def _pop_leaf(self) -> tuple[int, int] | None:
         while self._leaves:
             stamp, page = heapq.heappop(self._leaves)
-            if (
-                self._key[page] is not None
-                and self._children[page] == 0
-                and self._stamp[page] == stamp
-            ):
-                return stamp, page
+            if self._key[page] is None or self._children[page]:
+                continue
+            if self._stamp[page] != stamp:
+                heapq.heappush(self._leaves, (self._stamp[page], page))
+                continue
+            return stamp, page
         return None
 
     def _remove(self, page: int) -> None:
