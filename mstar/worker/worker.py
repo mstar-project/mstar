@@ -2544,7 +2544,7 @@ class Worker:
                 host[name] = buf
         side.synchronize()
 
-        return self._rows_to_per_rid(host, request_ids)
+        return Worker._rows_to_per_rid(host, request_ids)
 
     @staticmethod
     def _rows_to_per_rid(
@@ -2592,7 +2592,7 @@ class Worker:
         if not torch.cuda.is_available() or completion_event is None:
             if outputs.check_stop_buffers is not None and row_rids is not None:
                 # host tensors already (a CPU device): only the re-keying
-                return self._rows_to_per_rid(outputs.check_stop_buffers, row_rids)
+                return Worker._rows_to_per_rid(outputs.check_stop_buffers, row_rids)
             return source
         if not source:
             return source
