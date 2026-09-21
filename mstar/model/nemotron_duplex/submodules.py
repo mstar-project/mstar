@@ -241,12 +241,14 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         cfg = self.config
         prev_text = torch.cat([t["prev_text"].reshape(-1) for t in tensors]).to(device)          # [N]
         fused = self.embeddings(prev_text) * cfg.agent_text_weight                                # [N, H]
-        frames = [t["audio_frame"] for t in tensors if "audio_frame" in t]
-        if frames:
-            if len(frames) != len(tensors):
-                raise ValueError("a frame step batch mixes rows with and without an audio frame")
-            audio = torch.cat([f.reshape(1, -1) for f in frames]).to(device=device, dtype=fused.dtype)  # [N, H]
-            fused = fused + audio * cfg.user_audio_weight
+        frames = [t.get("audio_frame") for t in tensors]
+        present = [f for f in frames if f is not None]
+        if present:
+            # a row past the end of its audio (the stream closed, the loop
+            # still runs on the fed-back text) has no frame: its audio term is 0
+            zero = torch.zeros_like(present[0].reshape(1, -1))
+            audio = torch.cat([zero if f is None else f.reshape(1, -1) for f in frames])           # [N, H]
+            fused = fused + audio.to(device=device, dtype=fused.dtype) * cfg.user_audio_weight
         if cfg.use_function_head:
             prev_func = torch.cat([t["prev_func"].reshape(-1) for t in tensors]).to(device)
             fused = fused + self.embeddings(prev_func) * cfg.function_weight
