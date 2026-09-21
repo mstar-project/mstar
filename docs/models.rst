@@ -179,12 +179,19 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   PCM, decoded with a per-request left context and emitted as new frames only).
   The decode loops are stream-terminated: they end when the upstream stream
   closes, not on EOS, which is an ordinary per-frame token in duplex speech.
-- ``nano_llm`` declares a paged KV cache over its four attention layers, the
-  attention plan on it and the agent-text sampler (``resources: nano_kv`` /
-  ``nano_attn`` / ``nano_sampler`` in the YAML). The attention layers use no
-  positional encoding, so there is no position resource. The Mamba-2 conv/SSM
-  state and the talker KV are still held in per-request submodule state, so all
-  four nodes run eager for now.
+- ``nano_llm`` declares a paged KV cache over its four attention layers with
+  the attention plan on it (``resources: nano_kv`` / ``nano_attn``; no
+  positional encoding, so no position resource), a recurrent-state pool holding
+  the 27 Mamba-2 layers' conv window and SSM state, one slot per session
+  (``mamba_state``: 64 sessions by default, ~137 MB per slot in fp32, tunable
+  with ``max_slots`` / ``state_dtype``), the Mamba-2 resource planned on it
+  (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
+  captured as a CUDA graph for batch sizes 1 to 64.
+- ``eartts_talker`` advances every live session in one backbone pass per frame
+  (caches padded and masked to the longest session, per-row positions, per-row
+  seeded sampling noise), so a session's speech does not depend on which other
+  sessions share the step. Its KV still lives in per-request state and it runs
+  eager; it is the largest per-frame cost.
 - The nano text tokenizer is read from the ``nano/`` folder of
   ``pipecat-ai/NVIDIA-NemotronLabs-VoiceChat-11B-Spark`` (the base checkpoint
   ships only the RNN-T tokenizer); prefetch both repositories on machines
