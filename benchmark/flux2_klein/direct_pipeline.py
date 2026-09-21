@@ -10,6 +10,8 @@ image against a recorded diffusers run (``test/flux2_klein/record_oracle.py``).
     python benchmark/flux2_klein/direct_pipeline.py --prompt "a cat holding a sign" --seed 42 \\
         --attention flashinfer --compile --out cat.png
     python benchmark/flux2_klein/direct_pipeline.py --oracle-dir /path/to/oracle --attention sdpa
+    python benchmark/flux2_klein/direct_pipeline.py --prompts-file prompts_100.txt --count 100 \\
+        --out-dir sdpa_ref   # one process, seed = prompt index, sdpa_NNN.png (for psnr.py --dirs)
 """
 
 from __future__ import annotations
@@ -77,6 +79,28 @@ def generate(model, subs, prompt, height, width, steps, seed, timer: _Timer, ora
     return image[0]
 
 
+def generate_many(model, subs, args) -> None:
+    """Prompts ``[seed_start, seed_start + count)`` of ``--prompts-file`` with seed = index, as the
+    benchmark client requests them (``--seed 0``), written as ``<out-dir>/<prefix>_NNN.png``."""
+    from mstar.model.components.diffusion.image_io import uint8_to_png
+
+    prompts = Path(args.prompts_file).read_text().splitlines()
+    indices = range(args.seed_start, args.seed_start + args.count)
+    if indices.stop > len(prompts):
+        raise SystemExit(f"{args.prompts_file} has {len(prompts)} prompts, need {indices.stop}")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    generate(model, subs, prompts[indices.start], args.height, args.width, args.steps, indices.start, _Timer())
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for i in indices:
+        image = generate(model, subs, prompts[i], args.height, args.width, args.steps, i, _Timer())
+        (out_dir / f"{args.out_prefix}_{i:03d}.png").write_bytes(uint8_to_png(image.cpu()))
+    torch.cuda.synchronize()
+    wall = time.perf_counter() - t0
+    print(f"wrote {len(indices)} images to {out_dir} in {wall:.1f}s ({wall / len(indices) * 1000:.0f} ms/image)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="black-forest-labs/FLUX.2-klein-4B")
@@ -92,6 +116,13 @@ def main():
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--oracle-dir", default="")
     ap.add_argument("--out", default="direct.png")
+    ap.add_argument("--prompts-file", default="",
+                    help="one prompt per line: generate prompts [seed-start, seed-start + count) with seed = "
+                         "index into --out-dir in this one process (the reference side of a PSNR distribution)")
+    ap.add_argument("--seed-start", type=int, default=0)
+    ap.add_argument("--count", type=int, default=100)
+    ap.add_argument("--out-dir", default="direct_out")
+    ap.add_argument("--out-prefix", default="sdpa", help="file names <prefix>_NNN.png")
     args = ap.parse_args()
     if args.attention != "sdpa":
         raise SystemExit("direct_pipeline runs the modules without the engine, so only --attention sdpa is available")
@@ -109,6 +140,10 @@ def main():
         meta = json.load(open(oracle / "metadata.json"))
         args.prompt, args.height, args.width, args.steps, args.seed = (
             meta["prompt"], meta["height"], meta["width"], meta["steps"], meta["seed"])
+
+    if args.prompts_file:
+        generate_many(model, subs, args)
+        return
 
     for _ in range(args.warmup):
         generate(model, subs, args.prompt, args.height, args.width, args.steps, args.seed, _Timer())
