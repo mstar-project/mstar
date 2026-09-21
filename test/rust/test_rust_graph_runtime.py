@@ -479,3 +479,61 @@ def test_push_back_makes_a_popped_node_ready_again(runtime):
     assert runtime.get_ready_nodes(set()) == []
     runtime.push_back_node("prefill", [rid], [WG_ID])
     assert len(runtime.get_ready_nodes(set())) == 1
+
+
+# --- speculation -------------------------------------------------------------
+
+def test_speculate_finds_the_downstream_target(runtime):
+    rid = _admit(runtime)
+    out = runtime.speculate_node("prefill", WALK, rid)
+    assert [o.node_name for o in out] == ["ar_decode"]
+    assert out[0].graph_walk == WALK
+    # prefill -> ar_decode ENTERS the loop, so it is not a new iteration.
+    assert out[0].is_new_loop_iter is False
+    assert out[0].loop_name == "ar_loop"
+
+
+def test_a_loop_back_is_reported_as_a_new_iteration(runtime):
+    # ar_decode -> ar_decode is the loop-back; the per-rid loop filters key off
+    # exactly this flag, so getting it wrong disables them silently.
+    rid = _admit(runtime)
+    out = runtime.speculate_node("ar_decode", WALK, rid)
+    assert [o.node_name for o in out] == ["ar_decode"]
+    assert out[0].is_new_loop_iter is True
+
+
+def test_speculation_leaves_no_state_behind(runtime):
+    # ingest_for_speculation fills the speculative slots; they must be cleared
+    # or the node reads as ready when nothing actually arrived.
+    rid = _admit(runtime)
+    runtime.speculate_node("prefill", WALK, rid)
+    assert runtime.get_ready_nodes(set()) == []
+
+
+def test_speculate_refuses_a_node_that_opted_out(runtime):
+    rid = _admit(runtime)
+    runtime.set_node_metadata(
+        parallel_nodes={"ar_decode"}, parallel_leader_nodes=set(),
+        tp_async_nodes=set(),
+    )
+    # A parallel target is only valid as a leader-side same-node loop-back.
+    assert runtime.speculate_node("prefill", WALK, rid) == []
+
+
+def test_get_spec_target_reports_a_target_chosen_elsewhere(runtime):
+    # The follower path: no eligibility filter, since a follower is not the
+    # leader and would fail it by construction.
+    rid = _admit(runtime)
+    runtime.set_node_metadata(
+        parallel_nodes={"ar_decode"}, parallel_leader_nodes=set(),
+        tp_async_nodes=set(),
+    )
+    assert runtime.speculate_node("ar_decode", WALK, rid) == []
+    got = runtime.get_spec_target("ar_decode", "ar_decode", WALK, rid)
+    assert got is not None and got.node_name == "ar_decode"
+    assert got.is_new_loop_iter is True
+
+
+def test_get_spec_target_returns_none_for_an_unreachable_node(runtime):
+    rid = _admit(runtime)
+    assert runtime.get_spec_target("prefill", "prefill", WALK, rid) is None

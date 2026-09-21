@@ -28,6 +28,7 @@ from mstar.graph.runtime.base import (
     ParallelList,
     PopRidsOutput,
     ReadyNodeSpec,
+    SpeculationOutput,
 )
 from mstar.model.base import WorkerGraph
 
@@ -393,14 +394,42 @@ class RustGraphRuntime(GraphRuntime):
             )
         ]
 
+    # --------- Speculation ----------
+
+    def speculate_node(
+        self, node_name: str, graph_walk: str, sample_rid: int,
+    ) -> list[SpeculationOutput]:
+        return [
+            SpeculationOutput(
+                node_name=n, graph_walk=w,
+                is_new_loop_iter=new_iter, loop_name=loop_name,
+            )
+            for n, w, new_iter, loop_name in self._rust.speculate_node(
+                node_name, graph_walk, sample_rid
+            )
+        ]
+
+    def get_spec_target(
+        self, curr_node_name: str, spec_node_name: str,
+        graph_walk: str, sample_rid: int,
+    ) -> SpeculationOutput | None:
+        out = self._rust.get_spec_target(
+            curr_node_name, spec_node_name, graph_walk, sample_rid
+        )
+        if out is None:
+            return None
+        node_name, walk, new_iter, loop_name = out
+        return SpeculationOutput(
+            node_name=node_name, graph_walk=walk,
+            is_new_loop_iter=new_iter, loop_name=loop_name,
+        )
+
     # --------- not ported yet ----------
     #
     # Everything a forward pass needs. Until these land, MSTAR_RUST_GRAPH=1
     # admits requests and answers the structural queries but cannot run a step.
 
-    speculate_node = _unported("speculate_node")
     prep_spec_rids = _unported("prep_spec_rids")
-    get_spec_target = _unported("get_spec_target")
     prep_follow_spec_rids = _unported("prep_follow_spec_rids")
     stop_loops_batched = _unported("stop_loops_batched")
     apply_peer_loop_stops = _unported("apply_peer_loop_stops")

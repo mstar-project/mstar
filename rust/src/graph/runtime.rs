@@ -5,7 +5,7 @@ use crate::graph::compile::{EMIT_TO_CLIENT, EMPTY_DESTINATION, LoopArg, NodeArg,
 use crate::graph::shard::{GroupTemplate, ShardingTemplate};
 use crate::graph::spec::*;
 use crate::graph::request::{RequestInfo, WgIndex, WorkerGraphMeta};
-use crate::graph::state::{RequestState, TensorRef};
+use crate::graph::state::{RequestState, RoutedEdge, SpecNode, TensorRef};
 use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -292,6 +292,52 @@ pub struct GraphRuntime {
                 }
             }
         }
+    }
+
+    /// Run the source node's outputs through the speculative slots and report
+    /// which destinations become ready. Mutates and then clears those slots,
+    /// exactly as Python's ingest_for_speculation / clear_speculative_inputs
+    /// pair does.
+    fn spec_targets(
+        &mut self, wg: WgIndex, source: NodeId, rid: u32,
+    ) -> Option<Vec<SpecNode>> {
+        let g = self.graphs[wg as usize].clone();
+        if g.node(source).outputs.is_empty() {
+            return None; // nothing to feed a spec target
+        }
+        // Structure only: readiness turns on WHICH slots fill, not on the
+        // tensors, and the real outputs do not exist until the step lands.
+        let edges: Vec<RoutedEdge> = g
+            .node(source)
+            .outputs
+            .iter()
+            .map(|e| RoutedEdge {
+                name: e.name,
+                dest: e.dest,
+                persist: e.persist,
+                new_token: e.new_token,
+                streaming: e.streaming,
+                modality: e.modality,
+                tensors: vec![],
+                persist_for_loop: false,
+            })
+            .collect();
+        let state = self.states[wg as usize].get_mut(rid as usize)?.as_mut()?;
+        let out = state.ingest_for_speculation(source, &edges);
+        state.clear_speculative_inputs();
+        Some(out)
+    }
+
+    fn spec_output(
+        &self, g: &GraphRef, graph_walk: &str, sn: &SpecNode,
+    ) -> (String, String, bool, Option<String>) {
+        (
+            self.interner.name(g.node(sn.node).name).to_string(),
+            graph_walk.to_string(),
+            sn.is_new_loop_iter,
+            sn.loop_id
+                .map(|lid| self.interner.name(g.lp(lid).name).to_string()),
+        )
     }
 
     fn owner_of(&self, node: &str, walk: &str) -> Option<WgIndex> {
@@ -973,6 +1019,56 @@ impl GraphRuntime {
             }
         }
         Some(out)
+    }
+
+    // --------- Speculation ----------
+
+    /// Which nodes could run next, after the current node's outputs land.
+    ///
+    /// Filters for async eligibility; the per-rid loop-completion filter lives
+    /// in prep_spec_rids.
+    fn speculate_node(
+        &mut self, node_name: &str, graph_walk: &str, sample_rid: u32,
+    ) -> Vec<(String, String, bool, Option<String>)> {
+        let Some(wg) = self.owner_of(node_name, graph_walk) else {
+            return vec![];
+        };
+        let Some(source) = self.nid(wg, node_name) else { return vec![] };
+        let Some(spec_nodes) = self.spec_targets(wg, source, sample_rid) else {
+            return vec![];
+        };
+        let g = self.graphs[wg as usize].clone();
+        spec_nodes
+            .into_iter()
+            .filter(|sn| {
+                self.async_checker
+                    .can_speculate(g.node(source).name, g.node(sn.node).name)
+            })
+            .map(|sn| self.spec_output(&g, graph_walk, &sn))
+            .collect()
+    }
+
+    /// The loop context of a target chosen elsewhere.
+    ///
+    /// A follower cannot use speculate_node: that filter requires the node be
+    /// a parallel LEADER node, and a follower by definition is not. The leader
+    /// already decided; this reports what the target is.
+    fn get_spec_target(
+        &mut self,
+        curr_node_name: &str,
+        spec_node_name: &str,
+        graph_walk: &str,
+        sample_rid: u32,
+    ) -> Option<(String, String, bool, Option<String>)> {
+        let wg = self.owner_of(curr_node_name, graph_walk)?;
+        let source = self.nid(wg, curr_node_name)?;
+        let want = self.nid(wg, spec_node_name)?;
+        let spec_nodes = self.spec_targets(wg, source, sample_rid)?;
+        let g = self.graphs[wg as usize].clone();
+        spec_nodes
+            .into_iter()
+            .find(|sn| sn.node == want)
+            .map(|sn| self.spec_output(&g, graph_walk, &sn))
     }
 
     fn num_handles(&self) -> usize {
