@@ -37,7 +37,6 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent import RecurrentStep
-from mstar.model.nemotron_duplex.components.eartts_talker import maskgit_schedule
 from mstar.model.nemotron_duplex.config import (
     MAMBA,
     MAMBA_STATE,
@@ -223,10 +222,35 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         device = self.embeddings.weight.device
+        seq_lens = [inp.input_seq_len for inp in inputs]
+        if all(inp.kwargs.get("mode") == _MODE_FRAME for inp in inputs):
+            # the steady state: one frame per session, fused for the whole
+            # batch in a handful of launches instead of a handful per session
+            # (at 64 sessions the per-request loop cost ~28 ms of host time
+            # per step, more than the forward itself)
+            return {"input_embeds": self._fuse_frames([inp.tensor_inputs for inp in inputs], device),
+                    "seq_lens": seq_lens}
         return {
             "input_embeds": torch.cat([self._fuse(inp, device) for inp in inputs], dim=0),
-            "seq_lens": [inp.input_seq_len for inp in inputs],
+            "seq_lens": seq_lens,
         }
+
+    def _fuse_frames(self, tensors: list[NameToTensorList | dict], device: torch.device) -> torch.Tensor:
+        """``_fuse`` for a batch of frame steps at once: ``[N, H]``, row ``i`` equal
+        to ``_fuse(inputs[i])`` (same weights, same terms)."""
+        cfg = self.config
+        prev_text = torch.cat([t["prev_text"].reshape(-1) for t in tensors]).to(device)          # [N]
+        fused = self.embeddings(prev_text) * cfg.agent_text_weight                                # [N, H]
+        frames = [t["audio_frame"] for t in tensors if "audio_frame" in t]
+        if frames:
+            if len(frames) != len(tensors):
+                raise ValueError("a frame step batch mixes rows with and without an audio frame")
+            audio = torch.cat([f.reshape(1, -1) for f in frames]).to(device=device, dtype=fused.dtype)  # [N, H]
+            fused = fused + audio * cfg.user_audio_weight
+        if cfg.use_function_head:
+            prev_func = torch.cat([t["prev_func"].reshape(-1) for t in tensors]).to(device)
+            fused = fused + self.embeddings(prev_func) * cfg.function_weight
+        return fused
 
     # -- forward ---------------------------------------------------------
 
@@ -427,19 +451,15 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     def _noise(self, gens: list[torch.Generator], device: torch.device) -> dict[str, torch.Tensor]:
         """The step's sampling noise for N rows, drawn per row from each row's
         generator: ``u`` for the Gumbel mixture pick and ``eps`` for the latent
-        noise, one pair per MaskGIT iteration."""
+        noise, for every MaskGIT iteration at once (two draws per row, so a
+        64-session step costs 128 launches rather than ~900). A row's noise
+        depends only on its own generator, never on the batch around it.
+        Rows first: the engine's static-input buffers are narrowed along the
+        leading (batch) dim when a smaller batch replays a capture."""
         e = self.config.eartts
-        n = len(gens)
-        # rows first: the engine's static-input buffers are narrowed along the
-        # leading (batch) dim when a smaller batch replays a capture
-        u = torch.zeros(n, e.inference_num_iter, 1, e.mog_num_predictions, device=device)
-        eps = torch.zeros(n, e.inference_num_iter, 1, e.code_dim, device=device)
-        for i, k in enumerate(maskgit_schedule(e.inference_num_iter, e.mog_exponent, e.num_quantizers)):
-            if k == 0:
-                continue
-            # the same draws, in the same order, as the sequential per-session step
-            u[:, i] = torch.stack([torch.rand((1, e.mog_num_predictions), device=device, generator=g) for g in gens])
-            eps[:, i] = torch.stack([torch.randn((1, e.code_dim), device=device, generator=g) for g in gens])
+        it = e.inference_num_iter
+        u = torch.stack([torch.rand((it, 1, e.mog_num_predictions), device=device, generator=g) for g in gens])
+        eps = torch.stack([torch.randn((it, 1, e.code_dim), device=device, generator=g) for g in gens])
         return {"noise_u": u, "noise_eps": eps}
 
     # -- engine contract -------------------------------------------------
