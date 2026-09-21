@@ -31,6 +31,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
+    "omnivoice": "omnivoice.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
@@ -108,6 +109,9 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("                           raw_action_dim=10, action_chunk_size=16)")
     if model == "qwen3_omni":
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
+    if model == "omnivoice":
+        lines.append("    client.tts(\"Xin chào\", language=\"Vietnamese\").to_wav(\"out.wav\")")
+        lines.append("    # clone a voice: ref_audio=\"ref.wav\", ref_text=\"<its transcript>\"")
     if model in ("orpheus", "qwen3_omni", "qwen3_tts"):
         voice = {
             "orpheus": "tara",
