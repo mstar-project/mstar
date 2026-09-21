@@ -28,6 +28,8 @@ from mstar.graph.runtime.base import (
     ParallelList,
     PopRidsOutput,
     ReadyNodeSpec,
+    RouteInput,
+    RouteOutput,
     SpeculationOutput,
     SpeculationPrepInput,
     SpeculationPrepOutput,
@@ -471,6 +473,32 @@ class RustGraphRuntime(GraphRuntime):
         out = self._rust.prep_follow_spec_rids(self._spec_prep_arg(input))
         return None if out is None else self._spec_prep_out(out)
 
+    # --------- Postprocess ----------
+
+    def complete_and_route_batch(
+        self, input: RouteInput, tensor_store,
+    ) -> RouteOutput:
+        # tensor_store is unused: Rust holds a share of the same bookkeeper,
+        # so it reads descriptors and settles refcounts without it.
+        del tensor_store
+        out = self._rust.complete_and_route_batch({
+            "partition": input.partition,
+            "graph_walk": input.graph_walk,
+            "node_name": input.node_name,
+            "output_signals": list(input.output_signals),
+            "rids": list(input.wg_ids.keys),
+            "wg_ids": list(input.wg_ids.values),
+            "tensors": list(input.tensors),
+            "num_tensors": list(input.num_tensors),
+        })
+        return RouteOutput(
+            completion_id=out.completion_id,
+            register_tensor_idxs=out.register_tensor_idxs,
+            register_rids=out.register_rids,
+            new_token_output_idxs=out.new_token_output_idxs,
+            local_streaming_tensor_idxs=out.local_streaming_tensor_idxs,
+        )
+
     # --------- not ported yet ----------
     #
     # Everything a forward pass needs. Until these land, MSTAR_RUST_GRAPH=1
@@ -478,5 +506,4 @@ class RustGraphRuntime(GraphRuntime):
 
     stop_loops_batched = _unported("stop_loops_batched")
     apply_peer_loop_stops = _unported("apply_peer_loop_stops")
-    complete_and_route_batch = _unported("complete_and_route_batch")
     send_outputs = _unported("send_outputs")

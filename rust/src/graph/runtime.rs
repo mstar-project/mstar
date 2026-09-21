@@ -159,6 +159,9 @@ pub struct GraphRuntime {
     node_owner: FxHashMap<(Sym, Sym), WgIndex>,
     /// Loop stops from this iteration's check_stop; cleared every iteration.
     pending_loop_stops: FxHashSet<(u32, Sym, Sym)>,
+    /// Routing parked between complete_and_route_batch and send_outputs.
+    completions: FxHashMap<u64, Completion>,
+    completion_counter: u64,
 
     /// A share of the SAME bookkeeper Python handed TensorStore, taken at
     /// construction. Routing reads descriptors and adjusts refcounts through
@@ -580,6 +583,47 @@ pub struct PopRidsOut {
     #[pyo3(get)] pub input_edges_per_rid: Vec<usize>,
 }
 
+/// Whether any edge carrying this uuid is a persist signal.
+fn e_persist(edges: &[RoutedEdge], uuid: u64) -> bool {
+    edges
+        .iter()
+        .any(|e| e.persist && e.tensors.iter().any(|t| t.uuid == uuid))
+}
+
+/// `RouteInput`.
+#[derive(FromPyObject)]
+pub struct RouteArg {
+    #[pyo3(item)] partition: String,
+    #[pyo3(item)] graph_walk: String,
+    #[pyo3(item)] node_name: String,
+    #[pyo3(item)] output_signals: Vec<String>,
+    #[pyo3(item)] rids: Vec<u32>,
+    #[pyo3(item)] wg_ids: Vec<u32>,
+    #[pyo3(item)] tensors: Vec<u64>,
+    #[pyo3(item)] num_tensors: Vec<usize>,
+}
+
+/// `RouteOutput`.
+#[pyclass]
+#[derive(Default)]
+pub struct RouteOut {
+    #[pyo3(get)] pub completion_id: u64,
+    #[pyo3(get)] pub register_tensor_idxs: Vec<usize>,
+    #[pyo3(get)] pub register_rids: Vec<u32>,
+    #[pyo3(get)] pub new_token_output_idxs: Vec<usize>,
+    #[pyo3(get)] pub local_streaming_tensor_idxs: Vec<usize>,
+}
+
+/// Routing parked between complete_and_route_batch and send_outputs.
+pub struct Completion {
+    pub partition: String,
+    pub graph_walk: String,
+    pub node_name: String,
+    pub wg: WgIndex,
+    pub routing: FxHashMap<u32, Vec<RoutedEdge>>,
+    pub completed_wgs: FxHashMap<u32, Vec<u32>>,
+}
+
 /// `SpeculationPrepInput`.
 #[derive(FromPyObject)]
 pub struct SpecPrepArg {
@@ -773,6 +817,8 @@ impl GraphRuntime {
             walk_to_local_wgs,
             node_owner,
             pending_loop_stops: FxHashSet::default(),
+            completions: FxHashMap::default(),
+            completion_counter: 0,
             bookkeeping: bookkeeping.share(),
         })
     }
@@ -1318,6 +1364,188 @@ impl GraphRuntime {
     ) -> PyResult<Option<SpecPrepOut>> {
         let out = self.prep_spec(input, true)?;
         Ok(if out.all_or_nothing_failed { None } else { Some(out) })
+    }
+
+    // --------- Postprocess ----------
+
+    /// Mark each node complete, route its outputs, and settle the refcounts.
+    ///
+    /// `tensors` is flat and rid-major over `rids`;
+    /// `num_tensors[i * output_signals.len() + s]` of them belong to rid i's
+    /// signal s. The routing is parked under the returned completion id for
+    /// `send_outputs` to consume.
+    fn complete_and_route_batch(
+        &mut self, input: RouteArg,
+    ) -> PyResult<RouteOut> {
+        let n_sig = input.output_signals.len();
+        if input.rids.len() * n_sig != input.num_tensors.len() {
+            return Err(PyValueError::new_err(
+                "complete_and_route_batch: num_tensors must be \
+                 rids * output_signals",
+            ));
+        }
+        let Some(wg) = self.owner_of(&input.node_name, &input.graph_walk)
+        else {
+            return Err(PyValueError::new_err(format!(
+                "no worker graph for node {:?} in walk {:?}",
+                input.node_name, input.graph_walk
+            )));
+        };
+        let Some(node) = self.nid(wg, &input.node_name) else {
+            return Err(PyValueError::new_err("unknown node"));
+        };
+        let g = self.graphs[wg as usize].clone();
+        let signals: Vec<Option<Sym>> = input
+            .output_signals
+            .iter()
+            .map(|s| self.interner.get(s))
+            .collect();
+        let uuid_to_idx: FxHashMap<u64, usize> = input
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(i, &u)| (u, i))
+            .collect();
+
+        let mut out = RouteOut::default();
+        let mut routing: FxHashMap<u32, Vec<RoutedEdge>> = FxHashMap::default();
+        let mut completed_wgs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        let mut staged: FxHashSet<u64> = FxHashSet::default();
+        let mut cursor = 0usize;
+
+        for (i, &rid) in input.rids.iter().enumerate() {
+            // Slice this rid's uuids back out of the flat, rid-major layout.
+            let mut by_signal: FxHashMap<Sym, Vec<TensorRef>> =
+                FxHashMap::default();
+            let mut owned: Vec<u64> = Vec::new();
+            {
+                let bk = self.bookkeeping.lock().unwrap();
+                for (s, sig) in signals.iter().enumerate() {
+                    let count = input.num_tensors[i * n_sig + s];
+                    let slice = &input.tensors[cursor..cursor + count];
+                    cursor += count;
+                    if let Some(sig) = sig {
+                        by_signal.insert(
+                            *sig,
+                            slice.iter().map(|&u| bk.tensor_ref(u)).collect(),
+                        );
+                    }
+                    owned.extend_from_slice(slice);
+                }
+            }
+
+            let out_tensors: Vec<Vec<TensorRef>> = g
+                .node(node)
+                .outputs
+                .iter()
+                .map(|e| by_signal.get(&e.name).cloned().unwrap_or_default())
+                .collect();
+
+            let Some(state) = self.states[wg as usize]
+                .get_mut(rid as usize)
+                .and_then(|s| s.as_mut())
+            else {
+                continue;
+            };
+            let (edges, _filtered) = state.complete(node, &out_tensors);
+            let done = state.is_done;
+            if done {
+                completed_wgs
+                    .entry(rid)
+                    .or_default()
+                    .push(self.wg_ids[wg as usize]);
+            }
+
+            // Local destinations ingest now, so a consumer on this worker sees
+            // the routed tensors without a round trip.
+            let mut local_counts: FxHashMap<u64, i64> = FxHashMap::default();
+            for e in &edges {
+                for t in &e.tensors {
+                    if matches!(e.dest, Dest::Local(_)) {
+                        *local_counts.entry(t.uuid).or_insert(0) += 1;
+                    }
+                }
+                if let Dest::Local(d) = e.dest {
+                    if let Some(slot) = g.node(d).slot_of(e.name) {
+                        if let Some(st) = self.states[wg as usize]
+                            [rid as usize]
+                            .as_mut()
+                        {
+                            st.ingest(d, slot, e.tensors.clone(), true, false);
+                        }
+                    }
+                }
+            }
+
+            for e in &edges {
+                let idxs: Vec<usize> = e
+                    .tensors
+                    .iter()
+                    .filter_map(|t| uuid_to_idx.get(&t.uuid).copied())
+                    .collect();
+                if e.new_token {
+                    out.new_token_output_idxs.extend(&idxs);
+                }
+                if e.streaming && matches!(e.dest, Dest::Local(_)) {
+                    out.local_streaming_tensor_idxs.extend(&idxs);
+                }
+                // What a remote consumer will read. Deduped by uuid and
+                // skipping anything already staged, so a re-emitted edge does
+                // not stage twice.
+                let remote = e.persist
+                    || matches!(e.dest, Dest::External(_) | Dest::EmitToClient);
+                if remote {
+                    for (&idx, t) in idxs.iter().zip(&e.tensors) {
+                        if staged.insert(t.uuid) {
+                            out.register_tensor_idxs.push(idx);
+                            out.register_rids.push(rid);
+                        }
+                    }
+                }
+            }
+
+            // Settle from the safety hold of 1 to the real fanout. persist is
+            // excluded: those are held by the marker, and counting them would
+            // double-count a signal whose destination is EMPTY_DESTINATION.
+            {
+                let mut bk = self.bookkeeping.lock().unwrap();
+                for uuid in owned {
+                    let mut count = local_counts.get(&uuid).copied().unwrap_or(0);
+                    for e in &edges {
+                        if e.persist || matches!(e.dest, Dest::Local(_)) {
+                            continue;
+                        }
+                        count += e.tensors.iter().filter(|t| t.uuid == uuid).count() as i64;
+                    }
+                    if e_persist(&edges, uuid) {
+                        bk.set_persist(uuid, true);
+                    }
+                    let delta = count - 1;
+                    if delta > 0 {
+                        bk.increment_ref(uuid, delta)?;
+                    } else if delta < 0 {
+                        bk.dereference(uuid, -delta);
+                    }
+                }
+            }
+
+            routing.insert(rid, edges);
+        }
+
+        self.completion_counter += 1;
+        out.completion_id = self.completion_counter;
+        self.completions.insert(
+            self.completion_counter,
+            Completion {
+                partition: input.partition.clone(),
+                graph_walk: input.graph_walk.clone(),
+                node_name: input.node_name.clone(),
+                wg,
+                routing,
+                completed_wgs,
+            },
+        );
+        Ok(out)
     }
 
     fn num_handles(&self) -> usize {

@@ -23,7 +23,7 @@ rust_runtime = pytest.importorskip(
 )
 from mstar.communication.rust_tensor_store import RustTensorBookkeeping
 from mstar.graph.runtime import base as rust_runtime_base
-from mstar.graph.runtime.base import SpeculationPrepInput
+from mstar.graph.runtime.base import RouteInput, SpeculationPrepInput
 
 WG_ID = 0
 WALK = "decode"
@@ -62,7 +62,8 @@ def runtime():
     wg = WorkerGraph(
         section=_graph(), graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
     )
-    return rust_runtime.RustGraphRuntime(
+    book = RustTensorBookkeeping()
+    rt = rust_runtime.RustGraphRuntime(
         my_worker_id=WORKER,
         my_worker_graphs=[wg],
         all_wg_ids_to_graph_walks={WG_ID: {WALK}},
@@ -72,7 +73,20 @@ def runtime():
         sharding_config=ShardingConfig(
             groups=[], tp_enabled_nodes=set(), shard_dim={},
         ),
-        bookkeeping=RustTensorBookkeeping(),
+        bookkeeping=book,
+    )
+    # Tests seed descriptors through the same bookkeeper the runtime holds.
+    rt._bookkeeping_for_test = book
+    return rt
+
+
+def _tensor_info(uuid):
+    import torch
+
+    from mstar.graph.base import TensorPointerInfo
+    return TensorPointerInfo(
+        dims=[4], dtype=torch.float16, nbytes=8, address=0, stride=(1,),
+        uuid=uuid, source_session_id="h:1", source_entity=WORKER,
     )
 
 
@@ -182,7 +196,7 @@ def test_an_unported_method_says_so(runtime):
     # A silent AttributeError would surface as "NoneType has no attribute"
     # three frames away.
     with pytest.raises(NotImplementedError, match="not ported yet"):
-        runtime.complete_and_route_batch(None, None)
+        runtime.send_outputs(None)
 
 
 # --- the compile seam's loop handling ----------------------------------------
@@ -673,3 +687,81 @@ def test_prep_room_cap_applies_before_any_ingest():
     assert rt.prep_spec_rids(_ab([a, b], room=1)).ready_rids == [a]
     # The capped rid was skipped before any ingest, so it is untouched.
     assert rt.prep_spec_rids(_ab([b])).ready_rids == [b]
+
+
+# --- routing -----------------------------------------------------------------
+
+def _route(runtime, rids, node, signals, per_rid_uuids, walk=WALK):
+    """per_rid_uuids: [[uuids for signal 0, uuids for signal 1, ...], ...]"""
+    flat, counts = [], []
+    for row in per_rid_uuids:
+        for uuids in row:
+            counts.append(len(uuids))
+            flat.extend(uuids)
+    return runtime.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=walk, node_name=node,
+            output_signals=signals,
+            wg_ids=ParallelList(list(rids), [WG_ID] * len(rids)),
+            tensors=flat, num_tensors=counts,
+        ),
+        None,
+    )
+
+
+def test_routing_decodes_the_flat_rid_major_layout(runtime):
+    """num_tensors is indexed [rid_i * n_signals + signal_i]. Getting that
+    wrong attaches one rid's tensors to another's edges, silently."""
+    a = _admit(runtime, "ra")
+    b = _admit(runtime, "rb")
+    for r in (a, b):
+        runtime.ingest_inputs_batch(ParallelList([r], [_spec("prompt", "prefill")]))
+        runtime.pop_rids("prefill", WALK, [r])
+
+    bk = runtime._bookkeeping_for_test
+    for u in (1, 2, 3, 4, 5, 6):
+        bk.put_tensor(u, _tensor_info(u))
+
+    # Asymmetric counts, or a transposed read gives the same answer.
+    out = _route(
+        runtime, [a, b], "prefill", ["kv_cache", "token"],
+        [[[1], [2, 3]], [[4, 5, 6], [7]]],
+    )
+    assert out.completion_id > 0
+    # Every uuid that a remote consumer reads is reported once.
+    assert len(out.register_tensor_idxs) == len(set(out.register_tensor_idxs))
+
+
+def test_routing_ingests_a_local_destination(runtime):
+    # prefill -> ar_decode is local, so ar_decode becomes ready without any
+    # round trip through the worker.
+    rid = _admit(runtime)
+    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.pop_rids("prefill", WALK, [rid])
+
+    bk = runtime._bookkeeping_for_test
+    for u in (10, 11):
+        bk.put_tensor(u, _tensor_info(u))
+    _route(runtime, [rid], "prefill", ["kv_cache", "token"], [[[10], [11]]])
+
+    ready = runtime.get_ready_nodes(set())
+    assert [(r.node_name, r.rids) for r in ready] == [("ar_decode", [rid])]
+
+
+def test_routing_settles_the_safety_hold(runtime):
+    """Outputs come in with a hold of 1; routing corrects to the real fanout.
+    Too low frees a tensor a consumer still needs, too high leaks it."""
+    rid = _admit(runtime)
+    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.pop_rids("prefill", WALK, [rid])
+
+    bk = runtime._bookkeeping_for_test
+    bk.put_tensor(20, _tensor_info(20))
+    bk.increment_ref(20, 1)  # the safety hold
+    bk.put_tensor(21, _tensor_info(21))
+    bk.increment_ref(21, 1)
+
+    _route(runtime, [rid], "prefill", ["kv_cache", "token"], [[[20], [21]]])
+    # One local consumer each: the hold is replaced by one real reference.
+    assert not bk.can_gc(20)
+    assert not bk.can_gc(21)
