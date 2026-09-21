@@ -198,7 +198,7 @@ class GraphRuntime(ABC):
         partition: str,
         graph_walk: str,
         partition_worker_graph_ids: list[int],
-        worker_graph_to_worker: ParallelList[int, str]
+        worker_graph_to_workers: ParallelList[int, list[str]]
     ) -> int:
         """
         Returns the integer handle for this request.
