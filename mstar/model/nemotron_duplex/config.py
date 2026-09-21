@@ -18,6 +18,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# Resource keys shared by the nano submodule, its layers and the model's
+# ``get_node_resources`` (a deployment YAML tunes them under ``resources:``).
+NANO_KV = "nano_kv"                 # paged KV cache of the 4 attention layers
+NANO_ATTN = "nano_attn"             # attention planned over NANO_KV (NoPE: no position resource)
+NANO_SAMPLER = "nano_sampler"       # agent-text channel sampler
+FUNCTION_SAMPLER = "function_sampler"  # tool-call channel sampler (greedy)
+
 
 @dataclass
 class NanoConfig:
