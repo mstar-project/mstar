@@ -153,3 +153,44 @@ def test_requests_above_max_image_area_are_rejected():
     small.set_config(ZImageConfig())
     with pytest.raises(ValueError, match="max_image_area"):
         small._resolve_size(dict(height=1024, width=1040))
+
+
+def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
+    """Mirror of the klein test: unwarmed latent shapes skip the compiled decode (no in-request autotune)."""
+    import mstar.model.z_image.submodules as subs
+    from mstar.model.z_image.config import ZImageConfig
+    from mstar.model.z_image.submodules import ZImageVaeDecoderSubmodule
+
+    class RecordingVae(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+            self.eager, self.compiled = [], []
+
+        @property
+        def dtype(self):
+            return self.weight.dtype
+
+        def decode(self, x):
+            self.eager.append(tuple(x.shape))
+            return x
+
+    def fake_compile(vae):
+        def compiled(x):
+            vae.compiled.append(tuple(x.shape))
+            return x
+        return compiled
+
+    monkeypatch.setattr(subs, "compile_vae_decode", fake_compile)
+    config = ZImageConfig()
+    vae = RecordingVae()
+    node = ZImageVaeDecoderSubmodule(vae, config, compile_decode=True, warmup_grids=[config.latent_grid(1024, 1024)],
+                                     decode_batch_sizes=(1, 2))
+    c, p = config.transformer.in_channels, config.transformer.patch_size
+    h, w = config.latent_grid(1024, 1024)
+    assert len(vae.compiled) == 2 and vae.eager == []
+    vae.compiled.clear()
+    node._decode_fn(torch.zeros(2, c, h * p, w * p))
+    assert [s[0] for s in vae.compiled] == [2] and vae.eager == []
+    node._decode_fn(torch.zeros(1, c, h * p // 2, w * p))
+    assert len(vae.eager) == 1 and [s[0] for s in vae.compiled] == [2]
