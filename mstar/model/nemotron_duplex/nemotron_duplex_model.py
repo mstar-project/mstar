@@ -6,7 +6,10 @@ A full-duplex speech-to-speech model with four nodes:
     nano_llm          — Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B);
                         resources nano_kv / nano_attn (4 attention layers),
                         mamba_state / mamba (27 Mamba-2 layers), nano_sampler
-    eartts_talker     — Gemma3 talker → 31-codebook RVQ codes
+    eartts_talker     — Gemma3 talker → 31-codebook RVQ codes; resources
+                        talker_kv / talker_attn / talker_pos (two KV labels per
+                        session: the text-conditioned and the null-conditioned
+                        stream of classifier-free guidance)
     audio_codec       — RVQ codes → 22.05 kHz PCM
 
 Full-duplex: the model consumes user speech continuously and emits agent text +
@@ -28,8 +31,8 @@ The M* serving path is the walk graphs below: four async partitions
 (Encoder → LLM → Talker → Codec) joined by ``StreamingGraphEdge``s, with the nano
 decode loop consuming one encoder frame per step. ``get_node_resources`` declares
 the nano's paged KV cache, attention, recurrent-state pool (Mamba-2 conv + SSM
-slots), the Mamba-2 resource and the sampler; the talker KV still lives in
-per-request submodule state (eager).
+slots), the Mamba-2 resource and the sampler, and the talker's paged KV cache,
+attention and positions. Both decode steps are CUDA graphs.
 
 Contract methods crib from ``mstar/model/orpheus/orpheus_model.py`` (single
 streaming LLM+codec) and ``mstar/model/qwen3_omni/qwen3_omni_model.py`` (omni,
@@ -49,8 +52,11 @@ from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
     KVConfig,
+    KVReqConfig,
     KVSpec,
     NodeResourceSpec,
+    PositionConfig,
+    PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
@@ -67,6 +73,9 @@ from mstar.model.nemotron_duplex.config import (
     NANO_ATTN,
     NANO_KV,
     NANO_SAMPLER,
+    TALKER_ATTN,
+    TALKER_KV,
+    TALKER_POS,
     NemotronDuplexConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
@@ -368,20 +377,27 @@ class NemotronDuplexModel(Model):
         return types.SimpleNamespace(tokenizer=types.SimpleNamespace(vocab=v), vocab=v)
 
     # -------------------------------------------------------------------
-    # Resources: the nano's paged KV (attention layers only) and attention
+    # Resources. nano_llm: the paged KV (attention layers only) and attention
     # plan, the recurrent-state pool holding every Mamba-2 layer's conv window
     # and SSM state (one slot per session) with the Mamba-2 resource planned
-    # against it, and the agent-text sampler. NoPE: no position resource. The
-    # other three nodes declare nothing (encoder/codec are stateless; the
-    # talker keeps its own KV in per-request state for now).
+    # against it, and the agent-text sampler (NoPE: no position resource).
+    # eartts_talker: a paged KV over its 28 Gemma3 layers with attention and
+    # positions; each session holds two streams (labels ``main`` / ``uncond``)
+    # and RoPE runs over the full head dim with a per-layer theta the layer
+    # passes at call time. The encoder and the codec declare nothing.
     # -------------------------------------------------------------------
 
     # Sessions resident at once (one recurrent slot each; ~137 MB per slot in
     # fp32 for Nemotron-H). A deployment tunes it under ``resources: mamba_state``.
     DEFAULT_MAMBA_SLOTS = 64
+    # Talker KV pages (128 positions each, ~16.5 MB a page over 28 layers):
+    # 1024 pages = ~17 GB = ~65 000 positions = e.g. 8 sessions x 10 min x 2
+    # streams. Tune under ``resources: talker_kv``.
+    DEFAULT_TALKER_KV_PAGES = 1024
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         nano = self.config.nano
+        eartts = self.config.eartts
         kv_config = KVConfig(
             # Only the ``*`` (attention) layers hold a KV cache; the Mamba and
             # MLP layers do not. The backbone maps global layer -> dense
@@ -426,6 +442,31 @@ class NemotronDuplexModel(Model):
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
             ),
+            KVSpec(
+                resource_key=TALKER_KV, nodes={"eartts_talker"},
+                config=KVConfig(
+                    num_layers=eartts.num_hidden_layers,
+                    num_kv_heads=eartts.num_key_value_heads,
+                    head_dim=eartts.head_dim,
+                    # the sliding window plus the speaker warm-up, rounded up
+                    max_seq_len=eartts.sliding_window + 512,
+                    num_qo_heads=eartts.num_attention_heads,
+                    max_num_pages=self.DEFAULT_TALKER_KV_PAGES,
+                ),
+            ),
+            AttentionSpec(
+                resource_key=TALKER_ATTN, nodes={"eartts_talker"},
+                config=AttentionConfig(kv_cache=TALKER_KV),
+            ),
+            PositionSpec(
+                resource_key=TALKER_POS, nodes={"eartts_talker"},
+                config=PositionConfig(
+                    kv_cache=TALKER_KV,
+                    rotary_dim=eartts.head_dim,     # Gemma3: RoPE over the full head
+                    interleave=False,
+                    rope_theta=eartts.rope_theta_local,   # default; full-attention layers pass 1e6
+                ),
+            ),
         ]
 
     def get_request_resource_configs(
@@ -440,6 +481,8 @@ class NemotronDuplexModel(Model):
             NANO_SAMPLER: SamplingReqConfig(
                 **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys}
             ),
+            # every talker session reads both of its streams
+            TALKER_KV: KVReqConfig(needed_labels=["main", "uncond"]),
         }
 
     # -------------------------------------------------------------------
