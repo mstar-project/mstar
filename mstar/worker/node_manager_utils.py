@@ -639,24 +639,6 @@ class WorkerGraphsManager:
         # Queue teardown belongs to PythonGraphRuntime.remove_request.
         self.per_request_info.pop(rid, None)
 
-    def check_dyn_loop(self, rid: int, partition_name: str, loop_name: str) -> bool:
-        ngw = NodeAndGraphWalk(
-            node=loop_name, graph_walk=self.get_graph_walk(rid, partition_name)
-        )
-        if ngw not in self.per_request_info[rid].dyn_loop_to_workers:
-            logger.error((
-                f"Tried to stop loop {loop_name} from graph walk {ngw.graph_walk}, which does not include this loop! "
-                "Ignoring this signal. This indicates a potential logical bug in the model."
-            ))
-            return False
-        return True
-
-    def get_dyn_loop_workers(self, rid: int, partition_name: str, loop_name: str):
-        ngw = NodeAndGraphWalk(
-            node=loop_name, graph_walk=self.get_graph_walk(rid, partition_name)
-        )
-        return self.per_request_info[rid].dyn_loop_to_workers[ngw]
-
     def buffer_persist_signals(
             self, rid: int,
             signals: list[GraphEdge]

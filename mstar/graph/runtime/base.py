@@ -69,6 +69,7 @@ class SpeculationOutput(NamedTuple):
 
 class EdgeSpec(NamedTuple):
     signal: str
+    next_node: str
     uuids: list[int]
 
     # only valid for streaming edges

@@ -259,6 +259,7 @@ class Worker:
             node_to_partition=node_to_partition,
             sharding_config=sharding_config,
             tensor_manager=self.tensor_manager,
+            communicator=self.communicator,
         )
 
         self.worker_graphs_manager = WorkerGraphsManager(
@@ -488,8 +489,7 @@ class Worker:
             rid, body.request_info.resource_configs,
         )
         self.tensor_manager.register_request(
-            rid,
-            self.worker_graphs_manager.per_request_info[rid].sharding_config
+            rid, self._rid_runtime.get_sharding_config(rid),
         )
 
         # Create StreamBuffers for consumer connections on this worker
@@ -2353,11 +2353,11 @@ class Worker:
             range_push("worker.postprocess.stop_loops", synchronize=False)
 
         # Stop loops, if applicable
-        for rid, loop_names in stops.items():
-            loop_names = set([
-                ln for ln in loop_names if \
-                    self.worker_graphs_manager.check_dyn_loop(rid, batch_N.partition, ln)
-            ])
+        for rid, requested_stops in stops.items():
+            loop_names = {
+                ln for ln in requested_stops
+                if self._rid_runtime.check_dyn_loop(rid, batch_N.partition, ln)
+            }
             if not loop_names:
                 continue
             self.worker_graphs_manager.stop_loops(
@@ -2377,11 +2377,13 @@ class Worker:
             # Send "loop done" messages to peer workers (small ZMQ msgs)
             stop_loop_workers: dict[str, set[str]] = {}
             for loop_name in loop_names:
-                for worker in self.worker_graphs_manager.get_dyn_loop_workers(
+                for worker in self._rid_runtime.get_dyn_loop_workers(
                     rid, batch_N.partition, loop_name
                 ):
                     stop_loop_workers.setdefault(worker, set()).add(loop_name)
-            for worker, loop_names in stop_loop_workers.items():
+            # Bind a fresh name: reusing loop_names here would clobber the set
+            # the enclosing iteration is still working from.
+            for worker, workers_loop_names in stop_loop_workers.items():
                 if worker == self.worker_id:
                     continue
                 self.communicator.send(
@@ -2390,7 +2392,7 @@ class Worker:
                         message_type=WorkerMessageType.STOP_LOOPS,
                         body=StopLoops(
                             request_id=self._rid_str(rid),
-                            loop_names=loop_names,
+                            loop_names=workers_loop_names,
                             loop_stop_times=batch_N.node_batch.per_request_info[rid].loop_stop_times,
                             partition_name=batch_N.partition
                         )

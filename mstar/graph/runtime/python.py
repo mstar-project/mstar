@@ -1,5 +1,7 @@
+import logging
 from dataclasses import dataclass, field
 
+from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import TensorCommunicationManager, TensorStore
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import NodeAndGraphWalk
@@ -18,6 +20,8 @@ from mstar.graph.runtime.base import (
 )
 from mstar.model.base import WorkerGraph
 from mstar.worker.node_manager_utils import WorkerGraphQueues
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -52,8 +56,10 @@ class PythonGraphRuntime(GraphRuntime):
         node_to_partition: dict[str, str]=None,
         sharding_config: ShardingConfig=None,
         tensor_manager: TensorCommunicationManager=None,
+        communicator: BaseCommunicator=None,
     ):
         self._my_worker_id = my_worker_id
+        self._communicator = communicator
 
         # rid interning
         self._rids: list[str | None] = []
@@ -243,6 +249,39 @@ class PythonGraphRuntime(GraphRuntime):
                 iter_counts.update(self._queues[wg_id].get_dynamic_loop_iters(rid))
             values.append(iter_counts)
         return ParallelList(list(request_ids), values)
+
+    def get_walk(self, rid: int, partition: str) -> str:
+        return self._request_info[rid].partition_info[partition].graph_walk
+
+    def check_dyn_loop(self, rid: int, partition: str, loop_name: str) -> bool:
+        """Whether this request's current walk actually contains ``loop_name``.
+
+        A stop for a loop the walk does not have is a model bug, not a
+        protocol one, so it is logged and dropped rather than raised.
+        """
+        ngw = NodeAndGraphWalk(
+            node=loop_name, graph_walk=self.get_walk(rid, partition),
+        )
+        if ngw not in self._request_info[rid].dyn_loop_to_workers:
+            logger.error(
+                "Tried to stop loop %s from graph walk %s, which does not "
+                "include this loop! Ignoring this signal. This indicates a "
+                "potential logical bug in the model.",
+                loop_name, ngw.graph_walk,
+            )
+            return False
+        return True
+
+    def get_dyn_loop_workers(
+        self, rid: int, partition: str, loop_name: str,
+    ) -> list[str]:
+        ngw = NodeAndGraphWalk(
+            node=loop_name, graph_walk=self.get_walk(rid, partition),
+        )
+        return self._request_info[rid].dyn_loop_to_workers[ngw]
+
+    def get_sharding_config(self, rid: int) -> ShardingConfig:
+        return self._request_info[rid].sharding_config
 
     def get_worker_graph_id_for_node(
         self, node: str, graph_walk: str,
