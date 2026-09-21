@@ -23,7 +23,8 @@ from dataclasses import dataclass, field
 NANO_KV = "nano_kv"                 # paged KV cache of the 4 attention layers
 NANO_ATTN = "nano_attn"             # attention planned over NANO_KV (NoPE: no position resource)
 NANO_SAMPLER = "nano_sampler"       # agent-text channel sampler
-FUNCTION_SAMPLER = "function_sampler"  # tool-call channel sampler (greedy)
+MAMBA_STATE = "mamba_state"         # recurrent-state pool: conv + SSM state of the 27 Mamba-2 layers
+MAMBA = "mamba"                     # the Mamba-2 (SSD) resource planned against MAMBA_STATE
 
 
 @dataclass
@@ -63,6 +64,7 @@ class NanoConfig:
     mamba_expand: int = 2             # d_inner = expand * hidden_size
     mamba_chunk_size: int = 1         # voicechat runs chunk_size=1 (streaming)
     time_step_rank: int = 256
+    time_step_limit: tuple[float, float] = (0.0, float("inf"))  # HF ``time_step_limit`` (open for Nemotron-H)
     use_conv_bias: bool = True
     mamba_proj_bias: bool = False
     mamba_hidden_act: str = "silu"
@@ -108,6 +110,10 @@ class NanoConfig:
         )
         kind = {"M": "mamba", "*": "attention", "-": "mlp"}
         return [kind[c] for c in self.hybrid_override_pattern]
+
+    @property
+    def num_mamba_layers(self) -> int:
+        return sum(1 for k in self.layer_types if k == "mamba")
 
     @property
     def num_attention_layers(self) -> int:
