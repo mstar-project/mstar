@@ -270,6 +270,21 @@ def test_a_converted_stream_offloaded_before_its_commit_gives_its_pages_back_onc
     kv.assert_pages_conserved()
 
 
+@requires_cuda
+def test_a_converted_stream_answers_the_same_after_an_offload_and_a_reload():
+    kv = _manager(max_num_pages=16, cpu_offload_pages=32)
+    leased = _converted_by_a_refused_admit(kv)
+
+    assert kv.offload("r1") > 0, "the refused request did not move to the host"
+    assert kv.reload("r1"), "the request could not come back"
+
+    assert kv.resolve_cached_prefix("r1", NODE, WALK) == len(leased) * PAGE_SIZE, (
+        "after the reload the probe forgot what admit converted, so the retried "
+        "step would declare the whole prompt over the tokens already held"
+    )
+    kv.assert_pages_conserved()
+
+
 def test_a_refused_admit_retried_trims_the_same_and_commits_once():
     kv = _manager(max_num_pages=16)
     leased = _converted_by_a_refused_admit(kv)
