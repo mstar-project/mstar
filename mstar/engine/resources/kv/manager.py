@@ -128,9 +128,10 @@ class CacheStream:
     # pages the index matched for this stream and is holding for it, from the
     # probe until `admit` converts them onto `page_indices`
     lease: list[int] | None = None
-    # from the admit that converted a lease until `commit`: a refused admit
-    # sends the step back through the probe, which has to answer the same
-    converted: bool = False
+    # leading tokens this stream skips, from the probe until `commit`. Read in
+    # the lease's place, which a trim empties and `admit` moves onto
+    # `page_indices` while a refused admit still has to be answered the same
+    agreed: int | None = None
     # how many of this stream's pages the index already holds
     cursor: int = 0
     # tokens after the last page this stream keyed: the prompt's own tail and
@@ -381,39 +382,17 @@ class KVManager(AttentionResource):
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
     ) -> int | None:
-        """Match this request's prefix against the index and hold what matched.
+        """How many of this request's leading tokens this cache already holds.
 
-        Answers the same length every time it is asked, and takes one reference
-        however often that is: a probe is repeated whenever a step is prepared
-        again.
+        Reads what the probe at ingest settled rather than matching again, so
+        a refused admit is answered the length its first attempt skipped.
         """
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
             if label is None:
                 return None
-            stream = self._ensure_label(rid, label)
-            if stream.converted:
-                return stream.stored_len
-            if stream.lease is not None:
-                return len(stream.lease) * self.config.page_size
-            if stream.stored_len or stream.offloaded or stream.read_pending:
-                return None
-            keys = list(stream.keys)
-        # with the lock down: one SHA-256 a page of prompt, and every admit,
-        # commit and remove on this manager waits behind it
-        rooted = [fingerprint(self._prefix_root, key) for key in keys]
-        with self._lock:
-            if self._streams.get(rid, {}).get(label) is not stream:
-                return None
-            # the chain has ceil(seq_len / page_size) keys and only a full page
-            # is ever indexed, so stopping one key short leaves the request at
-            # least one token to sample, whatever its length
-            matched = self._index.lookup(rooted)[:len(rooted) - 1]
-            if not matched:
-                return None
-            self._arena.retain(matched)
-            stream.lease = matched
-            return len(matched) * self.config.page_size
+            stream = self._streams.get(rid, {}).get(label)
+            return None if stream is None else stream.agreed
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
@@ -427,10 +406,30 @@ class KVManager(AttentionResource):
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.lease is None or stream.stored_len:
                 return
-            keep = matched_len // self.config.page_size
-            if keep < len(stream.lease):
-                self._arena.release(stream.lease[keep:])
-                stream.lease = stream.lease[:keep] or None
+            self._trim_lease(stream, matched_len)
+
+    def _take_lease(self, stream: CacheStream, rooted: list[bytes]) -> int:
+        # the chain has ceil(seq_len / page_size) keys and only a full page
+        # is ever indexed, so stopping one key short leaves the request at
+        # least one token to sample, whatever its length
+        matched = self._index.lookup(rooted)[:len(rooted) - 1]
+        if not matched:
+            return 0
+        self._arena.retain(matched)
+        stream.lease = matched
+        return len(matched) * self.config.page_size
+
+    def _trim_lease(self, stream: CacheStream, matched_len: int) -> None:
+        """Give back the pages past ``matched_len`` and settle on what is left.
+
+        A length between two boundaries settles on the lower one: the tokens
+        above it are in no page this stream owns.
+        """
+        keep = matched_len // self.config.page_size
+        if keep < len(stream.lease):
+            self._arena.release(stream.lease[keep:])
+            stream.lease = stream.lease[:keep] or None
+        stream.agreed = keep * self.config.page_size
 
     def _index_filled_pages(
         self, segment: Segment, stream: CacheStream, ctx: StepContext,
@@ -626,9 +625,35 @@ class KVManager(AttentionResource):
             # named more tokens than the stream held.
             self._streams.setdefault(rid, {"main": CacheStream()})
             self._overrides.setdefault(rid, overrides)
+            for label in self._overrides[rid].prefix_keys or {}:
+                self._streams[rid].setdefault(label, CacheStream())
+            seeded: dict[str, CacheStream] = {}
             for label, stream in self._streams[rid].items():
                 if stream.keys is None:
                     self._seed_keys(rid, label, stream)
+                    if stream.keys:
+                        seeded[label] = stream
+            if self._index is None or not seeded:
+                return
+            chains = {
+                label: list(stream.keys) for label, stream in seeded.items()
+            }
+        # with the lock down: one SHA-256 a page of prompt, and every admit,
+        # commit and remove on this manager waits behind it
+        rooted = {
+            label: [fingerprint(self._prefix_root, key) for key in keys]
+            for label, keys in chains.items()
+        }
+        with self._lock:
+            for label, stream in seeded.items():
+                if self._streams.get(rid, {}).get(label) is not stream:
+                    # removed while the chain was hashing
+                    continue
+                matched = self._take_lease(stream, rooted[label])
+                if matched:
+                    # nothing else weighs in before the step, so the probe is
+                    # the whole agreement
+                    stream.agreed = matched
 
     def admit_retrieve(
         self, rid: str,
@@ -677,6 +702,11 @@ class KVManager(AttentionResource):
                 # the rank that published this sampled the first token after
                 # it, so a chain extended here would start one token late
                 stream.unkeyed = None
+                # its pages come from the published image now, so there is
+                # nothing for `admit` to convert and nothing for the step to
+                # skip; the local match below takes what is worth keeping
+                self._release_lease(stream)
+                stream.agreed = None
                 new_len = seq_info.seq_len
                 self._take_local_match(stream, new_len, rooted.get(label))
                 old_len = stream.stored_len
@@ -749,7 +779,6 @@ class KVManager(AttentionResource):
                     # they came out of the index, so they are already in it
                     stream.cursor = len(stream.lease)
                     stream.lease = None
-                    stream.converted = True
                 self._report_admission(segment, stream)
             if ctx.is_preplan:
                 # a preplan that was promoted or abandoned already cleared
@@ -1031,7 +1060,7 @@ class KVManager(AttentionResource):
                     stream.stored_len += segment.span
                     # the lease's reference has lived in `page_indices` since
                     # the conversion; past this commit the stream is no fresh one
-                    stream.converted = False
+                    stream.agreed = None
                     self._index_filled_pages(segment, stream, ctx)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
@@ -1293,8 +1322,8 @@ class KVManager(AttentionResource):
                 # and let the next write allocate; `free` asks for the same
                 self._release_lease(stream)
                 # here, not in `CacheStream.reset`: an offload resets the stream
-                # too, and the probe after its reload still owes the same length
-                stream.converted = False
+                # too, and the step after its reload still skips the same length
+                stream.agreed = None
                 drop = free or self._arena.any_sealed(stream.page_indices)
                 if drop:
                     self._arena.release(stream.page_indices)
