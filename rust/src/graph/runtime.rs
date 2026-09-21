@@ -242,6 +242,58 @@ pub struct GraphRuntime {
         false
     }
 
+    /// Walk every (node, walk, rid) whose graph inputs are satisfied, calling
+    /// `f` for each. `f` returns false to stop -- that is what lets the peek
+    /// bail on the first match instead of building the whole list.
+    fn scan_ready(
+        &self,
+        exclude_rids: &FxHashSet<u32>,
+        target: Option<&(String, String)>,
+        exclude_target: Option<&(String, String)>,
+        mut f: impl FnMut(Sym, Sym, u32) -> bool,
+    ) {
+        let sym_of = |s: &String| self.interner.get(s);
+        let target = target.map(|(n, w)| (sym_of(n), sym_of(w)));
+        let exclude_target = exclude_target.map(|(n, w)| (sym_of(n), sym_of(w)));
+
+        for (rid, slot) in self.requests.iter().enumerate() {
+            let rid = rid as u32;
+            let Some(info) = slot.as_ref() else { continue };
+            if exclude_rids.contains(&rid) {
+                continue;
+            }
+            for part in info.partitions.values() {
+                for &wg in &part.walk_worker_graphs {
+                    let Some(state) = &self.states[wg as usize][rid as usize]
+                    else {
+                        continue;
+                    };
+                    let g = &self.graphs[wg as usize];
+                    for node in 0..g.nodes.len() as NodeId {
+                        if !state.is_ready(node) {
+                            continue;
+                        }
+                        let name = g.node(node).name;
+                        let walk = part.graph_walk;
+                        if let Some((tn, tw)) = target {
+                            if tn != Some(name) || tw != Some(walk) {
+                                continue;
+                            }
+                        }
+                        if let Some((xn, xw)) = exclude_target {
+                            if xn == Some(name) && xw == Some(walk) {
+                                continue;
+                            }
+                        }
+                        if !f(name, walk, rid) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn owner_of(&self, node: &str, walk: &str) -> Option<WgIndex> {
         let n = self.interner.get(node)?;
         let w = self.interner.get(walk)?;
@@ -265,6 +317,18 @@ pub struct GraphRuntime {
             Dest::Empty => EMPTY_DESTINATION.to_string(),
         }
     }
+}
+
+/// `PopRidsOutput`. Edges are flat and rid-major, `input_edges_per_rid[i]`
+/// belonging to `rids[i]`.
+#[pyclass]
+#[derive(Default)]
+pub struct PopRidsOut {
+    #[pyo3(get)] pub rids: Vec<u32>,
+    #[pyo3(get)] pub wg_ids: Vec<u32>,
+    /// (signal, next_node, uuids, is_final_streaming_chunk)
+    #[pyo3(get)] pub input_edges: Vec<(String, String, Vec<u64>, bool)>,
+    #[pyo3(get)] pub input_edges_per_rid: Vec<usize>,
 }
 
 /// Python's `EdgeSpec`: what crosses for one arriving signal.
@@ -803,6 +867,112 @@ impl GraphRuntime {
             }
         }
         Ok(())
+    }
+
+    // --------- Scheduling ----------
+
+    /// Every (node, walk, rid) whose GRAPH inputs are satisfied.
+    ///
+    /// Graph level only. Engine readiness stays with the caller because it can
+    /// FAIL a request, which is a scheduling decision rather than a graph one.
+    #[pyo3(signature = (exclude_rids, target = None, exclude_target = None))]
+    fn get_ready_nodes(
+        &self,
+        exclude_rids: Vec<u32>,
+        target: Option<(String, String)>,
+        exclude_target: Option<(String, String)>,
+    ) -> Vec<(String, String, Vec<u32>)> {
+        let excluded: FxHashSet<u32> = exclude_rids.into_iter().collect();
+        let mut grouped: FxHashMap<(Sym, Sym), Vec<u32>> = FxHashMap::default();
+        self.scan_ready(&excluded, target.as_ref(), exclude_target.as_ref(),
+            |node, walk, rid| {
+                grouped.entry((node, walk)).or_default().push(rid);
+                true // keep scanning
+            });
+        grouped
+            .into_iter()
+            .map(|((n, w), rids)| {
+                (
+                    self.interner.name(n).to_string(),
+                    self.interner.name(w).to_string(),
+                    rids,
+                )
+            })
+            .collect()
+    }
+
+    /// Stops at the first match rather than building the list. Graph readiness
+    /// is necessary but not sufficient, so a False here is final and lets the
+    /// caller skip its engine pass entirely.
+    #[pyo3(signature = (exclude_rids, exclude_target = None))]
+    fn has_ready_excluding(
+        &self,
+        exclude_rids: Vec<u32>,
+        exclude_target: Option<(String, String)>,
+    ) -> bool {
+        let excluded: FxHashSet<u32> = exclude_rids.into_iter().collect();
+        let mut found = false;
+        self.scan_ready(&excluded, None, exclude_target.as_ref(), |_, _, _| {
+            found = true;
+            false // stop
+        });
+        found
+    }
+
+    /// Pop `node_name` for exactly `request_ids`.
+    ///
+    /// With `check_ready`, all or none: verified for every rid before anything
+    /// is popped, so a partially ready set is retried intact. Engine readiness
+    /// is assumed to have been checked already.
+    #[pyo3(signature = (node_name, graph_walk, request_ids, check_ready = false))]
+    fn pop_rids(
+        &mut self,
+        node_name: &str,
+        graph_walk: &str,
+        request_ids: Vec<u32>,
+        check_ready: bool,
+    ) -> Option<PopRidsOut> {
+        let wg = self.owner_of(node_name, graph_walk)?;
+        let node = self.nid(wg, node_name)?;
+        let wg_id = self.wg_ids[wg as usize];
+
+        if check_ready {
+            for &rid in &request_ids {
+                let ready = self.states[wg as usize]
+                    .get(rid as usize)
+                    .and_then(|s| s.as_ref())
+                    .is_some_and(|s| s.is_ready(node));
+                if !ready {
+                    return None; // unknown rid counts as not ready
+                }
+            }
+        }
+
+        let mut out = PopRidsOut::default();
+        for rid in request_ids {
+            let Some(state) = self.states[wg as usize]
+                .get_mut(rid as usize)
+                .and_then(|s| s.as_mut())
+            else {
+                continue;
+            };
+            if !state.take_for_schedule(node) {
+                continue;
+            }
+            let inputs = state.input_tensors(node, false);
+            out.rids.push(rid);
+            out.wg_ids.push(wg_id);
+            out.input_edges_per_rid.push(inputs.len());
+            for (name, tensors, final_chunk) in inputs {
+                out.input_edges.push((
+                    self.interner.name(name).to_string(),
+                    node_name.to_string(),
+                    tensors.iter().map(|t| t.uuid).collect(),
+                    final_chunk,
+                ));
+            }
+        }
+        Some(out)
     }
 
     fn num_handles(&self) -> usize {

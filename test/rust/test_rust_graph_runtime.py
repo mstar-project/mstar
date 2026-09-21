@@ -402,3 +402,80 @@ def test_dynamic_loop_iters_report_per_rid(runtime):
 def test_dynamic_loop_iters_for_an_unknown_partition_are_empty(runtime):
     rid = _admit(runtime)
     assert runtime.get_dynamic_loop_iters([rid], "nope").values == [{}]
+
+
+# --- scheduling --------------------------------------------------------------
+
+def test_a_ready_node_is_reported(runtime):
+    rid = _admit(runtime)
+    assert runtime.get_ready_nodes(set()) == []
+    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    ready = runtime.get_ready_nodes(set())
+    assert [(r.node_name, r.graph_walk, r.rids) for r in ready] == [
+        ("prefill", WALK, [rid])
+    ]
+
+
+def test_excluded_rids_are_invisible(runtime):
+    rid = _admit(runtime)
+    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    assert runtime.get_ready_nodes({rid}) == []
+    assert not runtime.has_ready_excluding({rid})
+
+
+def test_target_and_exclude_target_filter(runtime):
+    rid = _admit(runtime)
+    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    assert len(runtime.get_ready_nodes(set(), target=("prefill", WALK))) == 1
+    assert runtime.get_ready_nodes(set(), target=("ar_decode", WALK)) == []
+    assert runtime.get_ready_nodes(
+        set(), exclude_target=("prefill", WALK)
+    ) == []
+
+
+def test_the_peek_agrees_with_the_scan(runtime):
+    rid = _admit(runtime)
+    assert not runtime.has_ready_excluding(set())
+    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    assert runtime.has_ready_excluding(set())
+    assert not runtime.has_ready_excluding(set(), exclude_target=("prefill", WALK))
+
+
+def test_pop_returns_the_inputs_it_popped(runtime):
+    rid = _admit(runtime)
+    runtime.ingest_inputs_batch(
+        ParallelList([rid], [_spec("prompt", "prefill", uuids=[11, 12])])
+    )
+    out = runtime.pop_rids("prefill", WALK, [rid])
+    assert out.wg_ids.keys == [rid] and out.wg_ids.values == [WG_ID]
+    assert out.input_edges_per_rid == [1]
+    edge = out.input_edges[0]
+    assert edge.signal == "prompt" and edge.uuids == [11, 12]
+
+    # Popped, so it is no longer ready.
+    assert runtime.get_ready_nodes(set()) == []
+
+
+def test_pop_with_check_ready_is_all_or_nothing(runtime):
+    # One not-ready rid must leave the whole set intact for a later retry.
+    a = _admit(runtime, "ra")
+    b = _admit(runtime, "rb")
+    runtime.ingest_inputs_batch(ParallelList([a], [_spec("prompt", "prefill")]))
+
+    assert runtime.pop_rids("prefill", WALK, [a, b], check_ready=True) is None
+    # a was NOT popped by the failed attempt.
+    out = runtime.pop_rids("prefill", WALK, [a], check_ready=True)
+    assert out.wg_ids.keys == [a]
+
+
+def test_pop_of_an_unknown_node_returns_none(runtime):
+    assert runtime.pop_rids("nope", WALK, []) is None
+
+
+def test_push_back_makes_a_popped_node_ready_again(runtime):
+    rid = _admit(runtime)
+    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.pop_rids("prefill", WALK, [rid])
+    assert runtime.get_ready_nodes(set()) == []
+    runtime.push_back_node("prefill", [rid], [WG_ID])
+    assert len(runtime.get_ready_nodes(set())) == 1

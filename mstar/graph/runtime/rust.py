@@ -26,6 +26,8 @@ from mstar.graph.runtime.base import (
     EdgeSpec,
     GraphRuntime,
     ParallelList,
+    PopRidsOutput,
+    ReadyNodeSpec,
 )
 from mstar.model.base import WorkerGraph
 
@@ -348,14 +350,54 @@ class RustGraphRuntime(GraphRuntime):
     ):
         self._rust.cleanup_consumed_inputs(node_name, rids, wg_ids)
 
+    # --------- Scheduling ----------
+
+    def pop_rids(
+        self, node_name: str, graph_walk: str, request_ids: list[int],
+        check_ready: bool = False,
+    ) -> PopRidsOutput | None:
+        out = self._rust.pop_rids(
+            node_name, graph_walk, list(request_ids), check_ready
+        )
+        if out is None:
+            return None
+        return PopRidsOutput(
+            wg_ids=ParallelList(out.rids, out.wg_ids),
+            input_edges=[
+                EdgeSpec(
+                    signal=signal, next_node=next_node, uuids=uuids,
+                    is_final_streaming_chunk=final,
+                )
+                for signal, next_node, uuids, final in out.input_edges
+            ],
+            input_edges_per_rid=out.input_edges_per_rid,
+        )
+
+    def has_ready_excluding(
+        self, exclude_rids: set[int],
+        exclude_target: tuple[str, str] | None = None,
+    ) -> bool:
+        return self._rust.has_ready_excluding(
+            sorted(exclude_rids), exclude_target
+        )
+
+    def get_ready_nodes(
+        self, exclude_rids: set[int],
+        target: tuple[str, str] | None = None,
+        exclude_target: tuple[str, str] | None = None,
+    ) -> list[ReadyNodeSpec]:
+        return [
+            ReadyNodeSpec(node_name=n, graph_walk=w, rids=rids)
+            for n, w, rids in self._rust.get_ready_nodes(
+                sorted(exclude_rids), target, exclude_target
+            )
+        ]
+
     # --------- not ported yet ----------
     #
     # Everything a forward pass needs. Until these land, MSTAR_RUST_GRAPH=1
     # admits requests and answers the structural queries but cannot run a step.
 
-    pop_rids = _unported("pop_rids")
-    has_ready_excluding = _unported("has_ready_excluding")
-    get_ready_nodes = _unported("get_ready_nodes")
     speculate_node = _unported("speculate_node")
     prep_spec_rids = _unported("prep_spec_rids")
     get_spec_target = _unported("get_spec_target")
