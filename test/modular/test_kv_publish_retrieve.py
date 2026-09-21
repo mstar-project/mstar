@@ -32,6 +32,7 @@ class _StubTransfer:
     """Records retrieves instead of touching CUDA."""
 
     started: list[dict] = []
+    published: list[dict] = []
     remove_started: threading.Event | None = None
     allow_remove: threading.Event | None = None
 
@@ -39,7 +40,7 @@ class _StubTransfer:
         del transfer_engine_info, kv_cache, kwargs
 
     def get_kv_transfer_info(self, **kwargs):
-        del kwargs
+        type(self).published.append(kwargs)
         return OWN_HANDLE
 
     def start_async_retrieve(self, **kwargs):
@@ -63,6 +64,7 @@ class _StubTransfer:
 @pytest.fixture(autouse=True)
 def _stub(monkeypatch):
     _StubTransfer.started = []
+    _StubTransfer.published = []
     _StubTransfer.remove_started = None
     _StubTransfer.allow_remove = None
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
@@ -206,6 +208,31 @@ def test_publish_exports_only_labels_declared_for_remote_consumers():
 
     assert set(published.get(0)) == {"branch"}
     assert set(final_published.get(0)) == {"branch"}
+
+
+def test_decode_exports_kv_once_after_stop():
+    kv = _manager()
+    kv.ingest_request(
+        "r0",
+        KVReqConfig(
+            publish_labels_per_node_walk={},
+            final_publish_labels_per_node_walk={
+                ("LLM", "decode"): ["main"],
+            },
+        ),
+    )
+
+    for _ in range(4):
+        _grow(kv, "r0", 16)
+        assert kv.publish("r0", "LLM", "decode") is None
+
+    assert _StubTransfer.published == []
+
+    published = kv.publish_after_stop("r0", "LLM", "decode")
+
+    assert set(published.get(0)) == {"main"}
+    assert len(_StubTransfer.published) == 1
+    assert _StubTransfer.published[0]["seq_len"] == 64
 
 
 def test_publish_is_consistent_against_a_concurrent_commit():
