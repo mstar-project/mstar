@@ -37,6 +37,13 @@ import torch
 
 PROMPT = "A cat holding a sign that says hello world, studio lighting, detailed fur"
 EDIT_PROMPT = "Make the sign say goodbye and turn the scene into a watercolor painting"
+# extra references for --refs N (generated text-to-image, one per entry; the second is non-square on purpose)
+REF_PROMPTS = (
+    ("A cozy cabin in a snowy forest at night, warm light in the windows", 768, 1024),
+    ("A red bicycle leaning against a yellow wall in Lisbon, afternoon sun", 1024, 1024),
+    ("Macro photograph of a dew-covered spider web at dawn", 1024, 768),
+)
+MULTI_EDIT_PROMPT = "Put the cat with its sign from the first image in front of the scene from the second image"
 
 
 def _record_run(pipe, out_dir: Path, *, prompt: str, image, height: int, width: int, steps: int, seed: int):
@@ -71,7 +78,12 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--edit-seed", type=int, default=7)
     ap.add_argument("--skip-edit", action="store_true")
+    ap.add_argument("--refs", type=int, default=1,
+                    help="references for an additional multi-reference edit (edit_multi/): the t2i image plus refs-1 "
+                         "generated ones (REF_PROMPTS), edit seed = --edit-seed + 1")
     args = ap.parse_args()
+    if not 1 <= args.refs <= 1 + len(REF_PROMPTS):
+        raise SystemExit(f"--refs must be in [1, {1 + len(REF_PROMPTS)}]")
 
     import diffusers
     import transformers
@@ -103,6 +115,17 @@ def main():
         _record_run(pipe, out / "edit", prompt=EDIT_PROMPT, image=image, height=args.height, width=args.width,
                     steps=args.steps, seed=args.edit_seed)
         meta.update({"edit_prompt": EDIT_PROMPT, "edit_seed": args.edit_seed, "edit_reference": "t2i/image.png"})
+    if not args.skip_edit and args.refs > 1:
+        references, paths = [image], ["t2i/image.png"]
+        for i, (ref_prompt, h, w) in enumerate(REF_PROMPTS[: args.refs - 1], start=1):
+            ref = _record_run(pipe, out / "refs" / f"ref_{i}", prompt=ref_prompt, image=None, height=h, width=w,
+                              steps=args.steps, seed=args.seed + 100 + i)
+            references.append(ref)
+            paths.append(f"refs/ref_{i}/image.png")
+        _record_run(pipe, out / "edit_multi", prompt=MULTI_EDIT_PROMPT, image=references, height=args.height,
+                    width=args.width, steps=args.steps, seed=args.edit_seed + 1)
+        meta.update({"edit_multi_prompt": MULTI_EDIT_PROMPT, "edit_multi_seed": args.edit_seed + 1,
+                     "edit_multi_references": paths})
     with open(out / "metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
     print(f"oracle written to {out}")
