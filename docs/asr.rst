@@ -109,6 +109,12 @@ threads sleep. Shrinking the pool instead (``OMP_NUM_THREADS=1`` or
 ``torch.set_num_threads(1)`` in the process) is not recommended: it was in
 place during several unexplained request hangs in our runs.
 
+Both decode loops hand a window's tokens to the client in one message when
+the loop ends (``Loop.accumulated_outputs``) rather than one message per
+token. At concurrency 32 the per-token messages and their acknowledgements
+were a large share of the worker's host time. A streaming request therefore
+receives one delta per window, not one per token.
+
 Benchmarks and parity
 ---------------------
 
