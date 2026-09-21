@@ -199,7 +199,7 @@ def _has_ready(sched: MicroScheduler, manager: _Manager, exclude_target=None):
 def _batch(rids, node=NODE, walk=WALK) -> ScheduledBatch:
     return ScheduledBatch(
         node_name=node, graph_walk=walk,
-        node_objects={rid: object() for rid in rids},
+        input_edges=dict.fromkeys(rids, []),
         request_to_worker_graph=dict.fromkeys(rids, "wg0"),
     )
 
@@ -214,7 +214,7 @@ def test_an_uncapped_node_takes_the_whole_ready_set():
 
     batch = _next_batch(sched, _Manager([f"r{i}" for i in range(5)]))
 
-    assert len(batch.node_objects) == 5
+    assert len(batch) == 5
     assert not sched.backlog
 
 
@@ -225,7 +225,7 @@ def test_an_uncapped_node_survives_a_pre_existing_batch_size():
         _Manager([f"r{i}" for i in range(3)]), pre_existing_batch_size=2,
     )
 
-    assert len(batch.node_objects) == 3
+    assert len(batch) == 3
 
 
 def test_the_cap_counts_rows_the_caller_already_has():
@@ -237,8 +237,8 @@ def test_the_cap_counts_rows_the_caller_already_has():
         _Manager([f"r{i}" for i in range(4)]), pre_existing_batch_size=3,
     )
 
-    assert len(batch.node_objects) == 1, "4 cap - 3 already held = 1"
-    assert len(sched.backlog[(NODE, WALK)].node_objects) == 3
+    assert len(batch) == 1, "4 cap - 3 already held = 1"
+    assert len(sched.backlog[(NODE, WALK)].request_to_worker_graph) == 3
 
 
 def test_a_full_caller_batch_schedules_nothing_and_leaves_the_queue_alone():
@@ -276,8 +276,8 @@ def test_a_backlogged_chunk_is_rechecked_before_going_back_out():
 
     batch = _next_batch(sched, _Manager([]))
 
-    assert list(batch.node_objects) == ["r3"]
-    assert list(sched.backlog[(NODE, WALK)].node_objects) == ["r2"]
+    assert list(batch.request_to_worker_graph) == ["r3"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r2"]
 
 
 def test_an_uncapped_node_can_be_served_from_the_backlog():
@@ -288,7 +288,7 @@ def test_an_uncapped_node_can_be_served_from_the_backlog():
 
     batch = _next_batch(sched, _Manager([]), pre_existing_batch_size=1)
 
-    assert list(batch.node_objects) == ["r0", "r1"]
+    assert list(batch.request_to_worker_graph) == ["r0", "r1"]
     assert sched.backlog == {}
 
 
@@ -298,7 +298,7 @@ def test_a_backlogged_chunk_that_is_wholly_unready_stays_put():
     sched.backlog[(NODE, WALK)] = _batch(["r2", "r3"])
 
     assert _next_batch(sched, _Manager([])) is None
-    assert list(sched.backlog[(NODE, WALK)].node_objects) == ["r2", "r3"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r2", "r3"]
 
 
 def test_a_blocked_chunk_is_skipped_for_the_next_one():
@@ -312,7 +312,7 @@ def test_a_blocked_chunk_is_skipped_for_the_next_one():
 
     assert batch.node_name == "B"
     # the blocked one is kept, for a later pass
-    assert list(sched.backlog[("A", WALK)].node_objects) == ["r0"]
+    assert list(sched.backlog[("A", WALK)].request_to_worker_graph) == ["r0"]
 
 
 def test_skipping_does_not_lose_a_blocked_chunk_when_nothing_else_runs():
@@ -345,8 +345,8 @@ def test_a_backlogged_chunk_still_respects_the_nodes_cap():
 
     batch = _next_batch(sched, _Manager([]))
 
-    assert list(batch.node_objects) == ["r0", "r1"]
-    assert list(sched.backlog[(NODE, WALK)].node_objects) == ["r2", "r3"]
+    assert list(batch.request_to_worker_graph) == ["r0", "r1"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r2", "r3"]
 
 
 def test_the_hold_backoff_expires_before_the_backlog_is_taken():
@@ -400,7 +400,7 @@ def test_a_full_caller_batch_does_not_clobber_the_backlog():
     )
 
     assert batch is None, "no capacity left, so nothing should be scheduled"
-    still_queued = set(sched.backlog[(NODE, WALK)].node_objects)
+    still_queued = set(sched.backlog[(NODE, WALK)].request_to_worker_graph)
     assert set(backlogged) <= still_queued, (
         f"lost {sorted(set(backlogged) - still_queued)} from the backlog"
     )
@@ -415,8 +415,8 @@ def test_fresh_work_does_not_evict_a_blocked_backlog_chunk():
 
     batch = _next_batch(sched, _Manager(["f0", "f1", "f2"]))
 
-    assert set(batch.node_objects) == {"f0", "f1"}
-    held = set(sched.backlog[(NODE, WALK)].node_objects)
+    assert set(batch.request_to_worker_graph) == {"f0", "f1"}
+    held = set(sched.backlog[(NODE, WALK)].request_to_worker_graph)
     assert held == {"b0", "b1", "f2"}, f"lost the blocked chunk: {held}"
 
 
@@ -426,7 +426,7 @@ def test_fresh_work_merges_into_an_existing_backlog_entry():
 
     _next_batch(sched, _Manager(["f0", "f1", "f2"]), pre_existing_batch_size=2)
 
-    held = set(sched.backlog[(NODE, WALK)].node_objects)
+    held = set(sched.backlog[(NODE, WALK)].request_to_worker_graph)
     assert {"b0", "b1"} <= held, "the older chunk must survive"
 
 
@@ -481,7 +481,7 @@ def test_the_reserved_room_is_exactly_what_the_backlog_then_fills():
         _Manager([]), target=(NODE, WALK), pre_existing_batch_size=keep,
     )
 
-    assert set(batch.node_objects) == set(backlogged)
+    assert set(batch.request_to_worker_graph) == set(backlogged)
     assert sched.backlog == {}
 
 
@@ -550,8 +550,8 @@ def test_the_cursor_does_not_advance_when_nothing_is_scheduled():
 def test_split_off_first_accepts_an_empty_exclusion(exclude):
     first, rest = _batch(["r0", "r1", "r2"]).split_off_first(2, exclude)
 
-    assert list(first.node_objects) == ["r0", "r1"]
-    assert list(rest.node_objects) == ["r2"]
+    assert list(first.request_to_worker_graph) == ["r0", "r1"]
+    assert list(rest.request_to_worker_graph) == ["r2"]
 
 
 # ── terminal admit failures ─────────────────────────────────────────────
@@ -565,7 +565,7 @@ def test_an_unservable_rid_is_parked_for_the_worker_to_fail():
 
     batch = _next_batch(sched, _Manager(["r0", "r1"]))
 
-    assert list(batch.node_objects) == ["r1"]
+    assert list(batch.request_to_worker_graph) == ["r1"]
     assert sched.failed_rids == {"r0"}
     errors = sched.take_admit_errors()
     assert set(errors) == {"r0"}
@@ -580,7 +580,7 @@ def test_an_unservable_rid_is_dropped_from_the_backlog():
 
     batch = _next_batch(sched, _Manager([]))
 
-    assert list(batch.node_objects) == ["r1"]
+    assert list(batch.request_to_worker_graph) == ["r1"]
     assert set(sched.take_admit_errors()) == {"r0"}
     assert sched.backlog == {}
 

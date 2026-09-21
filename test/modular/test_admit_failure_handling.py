@@ -31,6 +31,7 @@ from mstar.engine.resources import (
     StepContext,
     SubmoduleStep,
 )
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
 
 
@@ -123,13 +124,12 @@ class _FakeWorker:
         self.offload_calls.append(node_batch.node_name)
         # the real one push-backs and holds; stand in for both
         self._push_back_batch(batch)
-        self.scheduler.hold_requests(list(batch.node_objects))
+        self.scheduler.hold_requests(list(batch.request_to_worker_graph))
 
 
 def _batches(reason):
-    batch = SimpleNamespace(
+    batch = ScheduledBatch(
         node_name="node", graph_walk="walk",
-        node_objects={"r0": object(), "r1": object()},
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
     node_batch = SimpleNamespace(node_name="node", admit_error=reason)

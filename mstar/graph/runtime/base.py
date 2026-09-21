@@ -173,8 +173,6 @@ class SendInput(NamedTuple):
     # WORKER_GRAPHS_DONE fields the runtime cannot derive, so they come in here.
     # rid -> {edge name -> tokens consumed}; from StreamBuffer._consumed
     stream_tokens_consumed: ParallelList[int, dict[str, int]] | None = None
-    # rids whose partition finished on this pass (from final_stream_rids)
-    partition_done_rids: list[int] | None = None
     # rid -> msgpack(rx_info, tx_info, graph_timings). All three are populated
     # only under enable_prof, so this is None in production.
     profiling: ParallelList[int, bytes] | None = None
@@ -261,6 +259,50 @@ class GraphRuntime(ABC):
         self, request_ids: list[int],
         partition: str,
     ) -> ParallelList[int, dict[str,int]]:
+        pass
+
+    @abstractmethod
+    def is_async_schedulable(self, node_name: str, graph_walk: str) -> bool:
+        """Whether this node opts into async scheduling. Structural, so it
+        takes no rid."""
+        pass
+
+    @abstractmethod
+    def get_output_signals(self, node_name: str, graph_walk: str) -> list[str]:
+        """The node's output signal names. Structural: the edge objects are
+        per-request copies, but their names are not."""
+        pass
+
+    @abstractmethod
+    def reset_outputs(
+        self, node_name: str, rids: list[int], wg_ids: list[int],
+    ):
+        """Drop stale output tensor_info before a pass writes new ones."""
+        pass
+
+    @abstractmethod
+    def cleanup_consumed_inputs(
+        self, node_name: str, rids: list[int], wg_ids: list[int],
+    ):
+        """Release the input tensors the just-executed node consumed."""
+        pass
+
+    @abstractmethod
+    def mark_stream_partition_done(self, rid: int, partition: str):
+        """The consuming pass saw the final streaming chunk. Reported on the
+        WORKER_GRAPHS_DONE that follows, unless the node was speculative."""
+        pass
+
+    @abstractmethod
+    def get_consumed_edges(
+        self, source_node: str, dest_node: str, graph_walk: str,
+    ) -> set[tuple[str, str]]:
+        """The (signal, dest) pairs ``source_node`` emits into ``dest_node``.
+
+        Structural -- edge names and destinations do not vary by request -- so
+        it takes no rid. A speculative batch uses it to know which of the
+        in-flight batch's outputs it will consume.
+        """
         pass
 
     @abstractmethod
@@ -376,6 +418,34 @@ class GraphRuntime(ABC):
         This also checks pending loop stops and loops that are on their final
         iter, automatically filtering out those rids. It is assumed that rids
         are pre-filtered for removes.
+        """
+        pass
+
+    @abstractmethod
+    def get_spec_target(
+        self, curr_node_name: str, spec_node_name: str,
+        graph_walk: str, sample_rid: int,
+    ) -> SpeculationOutput | None:
+        """Loop context for a spec target chosen elsewhere.
+
+        ``speculate_node`` applies the eligibility filter, which a follower
+        cannot: that filter requires the node be in ``parallel_leader_nodes``,
+        and a follower is by definition not the leader. The leader already
+        decided; this just reports what the target is.
+        """
+        pass
+
+    @abstractmethod
+    def prep_follow_spec_rids(
+        self, input: SpeculationPrepInput
+    ) -> SpeculationPrepOutput | None:
+        """The TP-follower counterpart of ``prep_spec_rids``.
+
+        A follower runs the leader's composition exactly: rank 0 committed to
+        it and sits on the collective until every follower joins, so this is
+        ALL-OR-NOTHING (None rolls the whole set back) and applies neither the
+        loop-completion filter nor ``room_for_continuing`` -- both are local
+        decisions the leader already made for everyone.
         """
         pass
 

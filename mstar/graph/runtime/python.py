@@ -60,6 +60,17 @@ class GraphRuntimePartitionInfo:
     stream_partition_done: bool = False  # set True when last chunk pops with is_final
 
 @dataclass
+class _SpecRidPrep:
+    """One rid prepped for speculation, with enough to undo it."""
+    rid: int
+    node: GraphNode
+    consumed_idxs: list[int]
+    input_edges: list[EdgeSpec]
+    into_signals: list[tuple[int, str]]
+    into_next_iter: list[tuple[int, str]]
+
+
+@dataclass
 class CompletionState:
     """What a completed batch needs to hand to the send that follows it."""
     partition: str
@@ -345,6 +356,55 @@ class PythonGraphRuntime(GraphRuntime):
     def get_sharding_config(self, rid: int) -> ShardingConfig:
         return self._request_info[rid].sharding_config
 
+    def _section_node(self, node_name: str, graph_walk: str):
+        wg_id = self.get_worker_graph_id_for_node(node_name, graph_walk)
+        return self._queues[wg_id].worker_graph.section.get_nodes().get(node_name)
+
+    def is_async_schedulable(self, node_name: str, graph_walk: str) -> bool:
+        node = self._section_node(node_name, graph_walk)
+        return node is not None and node.enable_async_scheduling
+
+    def get_output_signals(self, node_name: str, graph_walk: str) -> list[str]:
+        node = self._section_node(node_name, graph_walk)
+        if node is None:
+            return []
+        return sorted({edge.name for edge in node.outputs})
+
+    def reset_outputs(
+        self, node_name: str, rids: list[int], wg_ids: list[int],
+    ):
+        for rid, wg_id in zip(rids, wg_ids, strict=True):
+            wgio = self._queues[wg_id].per_request_queues.get(rid)
+            if wgio is not None:
+                wgio.get_node(node_name).reset_outputs()
+
+    def cleanup_consumed_inputs(
+        self, node_name: str, rids: list[int], wg_ids: list[int],
+    ):
+        for rid, wg_id in zip(rids, wg_ids, strict=True):
+            wgio = self._queues[wg_id].per_request_queues.get(rid)
+            if wgio is not None:
+                wgio.get_node(node_name).ready_signals.clear()
+
+    def mark_stream_partition_done(self, rid: int, partition: str):
+        info = self._request_info.get(rid)
+        if info is not None and partition in info.partition_info:
+            info.partition_info[partition].stream_partition_done = True
+
+    def get_consumed_edges(
+        self, source_node: str, dest_node: str, graph_walk: str,
+    ) -> set[tuple[str, str]]:
+        wg_id = self.get_worker_graph_id_for_node(source_node, graph_walk)
+        section = self._queues[wg_id].worker_graph.section
+        nodes = section.get_nodes()
+        node = nodes.get(source_node)
+        if node is None:
+            return set()
+        return {
+            (edge.name, edge.next_node) for edge in node.outputs
+            if edge.next_node == dest_node
+        }
+
     def get_worker_graph_id_for_node(
         self, node: str, graph_walk: str,
     ) -> int:
@@ -456,21 +516,6 @@ class PythonGraphRuntime(GraphRuntime):
             input_edges=input_edges,
             input_edges_per_rid=input_edges_per_rid,
         )
-
-    def get_nodes(
-        self, node_name: str, rids: list[int], wg_ids: list[int],
-    ) -> list[GraphNode]:
-        """TRANSITIONAL: hands out the live graph objects.
-
-        The worker still carries GraphNodes through its batch for postprocess
-        (reset_outputs, outputs, _speculatively_scheduled). Those uses move
-        into complete_and_route_batch, and this goes away with them -- a Rust
-        backend cannot implement it.
-        """
-        return [
-            self._queues[wg_id].per_request_queues[rid].get_node(node_name)
-            for rid, wg_id in zip(rids, wg_ids, strict=True)
-        ]
 
     def _scan_ready(
         self, exclude_rids: set[int],
@@ -602,6 +647,80 @@ class PythonGraphRuntime(GraphRuntime):
                 return info
         return None
 
+    @staticmethod
+    def _streaming_edges_by_rid(
+        input: SpeculationPrepInput,
+    ) -> list[tuple[int, list[tuple[int, EdgeSpec]]]]:
+        """Slice the flat streaming edges per rid, keeping each one's index in
+        the flat list so the caller can be told what was consumed."""
+        per_rid: list[tuple[int, list[tuple[int, EdgeSpec]]]] = []
+        cursor = 0
+        for i, rid in enumerate(input.rids):
+            count = input.streaming_edges_per_rid[i]
+            per_rid.append((rid, [
+                (cursor + k, input.streaming_edges[cursor + k])
+                for k in range(count)
+            ]))
+            cursor += count
+        return per_rid
+
+    def get_spec_target(
+        self, curr_node_name: str, spec_node_name: str,
+        graph_walk: str, sample_rid: int,
+    ) -> SpeculationOutput | None:
+        wg_id = self.get_worker_graph_id_for_node(curr_node_name, graph_walk)
+        wgio = self._queues[wg_id].per_request_queues.get(sample_rid)
+        if wgio is None or not wgio.nodes[curr_node_name].outputs:
+            return None
+        info = self._spec_target_info(
+            sample_rid, wgio, curr_node_name, spec_node_name,
+        )
+        if info is None:
+            return None
+        return SpeculationOutput(
+            node_name=info.node_name,
+            graph_walk=graph_walk,
+            is_new_loop_iter=info.is_new_loop_iter,
+            loop_name=info.loop_name,
+        )
+
+    def prep_follow_spec_rids(
+        self, input: SpeculationPrepInput
+    ) -> SpeculationPrepOutput | None:
+        wg_id = self.get_worker_graph_id_for_node(
+            input.spec_node_name, input.graph_walk
+        )
+        queue = self._queues[wg_id]
+        # A follower always speculates the same node it is running.
+        same_node = True
+
+        prepped: list[_SpecRidPrep] = []
+        for rid, indexed_edges in self._streaming_edges_by_rid(input):
+            wgio = queue.per_request_queues.get(rid)
+            result = None if wgio is None else self._prep_one_spec_rid(
+                rid, wgio, indexed_edges, input.curr_node_name,
+                input.spec_node_name, same_node,
+            )
+            if result is None:
+                # All or nothing: undo everything prepped so far, or this rank
+                # joins the collective with a batch the leader never sent.
+                for done in prepped:
+                    self._undo_spec_ingest(
+                        done.node, done.into_signals, done.into_next_iter,
+                    )
+                return None
+            prepped.append(result)
+
+        return SpeculationPrepOutput(
+            consumed_streaming_edge_idxs=[
+                idx for p in prepped for idx in p.consumed_idxs
+            ],
+            ready_rids=[p.rid for p in prepped],
+            wg_ids=[wg_id] * len(prepped),
+            input_edges=[e for p in prepped for e in p.input_edges],
+            input_edges_per_rid=[len(p.input_edges) for p in prepped],
+        )
+
     def prep_spec_rids(
         self, input: SpeculationPrepInput
     ) -> SpeculationPrepOutput:
@@ -611,16 +730,7 @@ class PythonGraphRuntime(GraphRuntime):
         queue = self._queues[wg_id]
         same_node = input.spec_node_name == input.curr_node_name
 
-        # Slice the flat streaming edges back out, per rid.
-        per_rid_edges: list[tuple[int, list[tuple[int, EdgeSpec]]]] = []
-        cursor = 0
-        for i, rid in enumerate(input.rids):
-            count = input.streaming_edges_per_rid[i]
-            per_rid_edges.append((rid, [
-                (cursor + k, input.streaming_edges[cursor + k])
-                for k in range(count)
-            ]))
-            cursor += count
+        per_rid_edges = self._streaming_edges_by_rid(input)
 
         sample_wgio = queue.per_request_queues.get(input.rids[0]) \
             if input.rids else None
@@ -657,12 +767,11 @@ class PythonGraphRuntime(GraphRuntime):
             )
             if prepped is None:
                 continue
-            kept_idxs, edges = prepped
-            consumed_idxs.extend(kept_idxs)
+            consumed_idxs.extend(prepped.consumed_idxs)
             ready_rids.append(rid)
             wg_ids.append(wg_id)
-            input_edges.extend(edges)
-            input_edges_per_rid.append(len(edges))
+            input_edges.extend(prepped.input_edges)
+            input_edges_per_rid.append(len(prepped.input_edges))
 
         return SpeculationPrepOutput(
             consumed_streaming_edge_idxs=consumed_idxs,
@@ -688,14 +797,31 @@ class PythonGraphRuntime(GraphRuntime):
             return False
         return True
 
+    @staticmethod
+    def _undo_spec_ingest(
+        node, into_signals: list[tuple[int, str]],
+        into_next_iter: list[tuple[int, str]],
+    ):
+        """Pull ingested streaming chunks back out of the node's ready slots.
+
+        The two slots are removed from separately, which is why the ingest
+        tracks which one each chunk landed in. Registry state was never
+        touched -- _speculatively_scheduled was held True across the ingest --
+        so the caller only has to return the chunks to their StreamBuffers.
+        """
+        for _idx, name in into_signals:
+            node.ready_signals.remove(name)
+        for _idx, name in into_next_iter:
+            node.ready_next_iter.remove(name)
+
     def _prep_one_spec_rid(
         self, rid: int, wgio, indexed_edges: list[tuple[int, EdgeSpec]],
         curr_node_name: str, spec_node_name: str, same_node: bool,
-    ) -> tuple[list[int], list[EdgeSpec]] | None:
+    ) -> "_SpecRidPrep | None":
         """Ingest this rid's stream chunks, check readiness, gather inputs.
 
-        Returns (consumed streaming edge indices, input edges), or None after
-        rolling the ingests back.
+        Returns the prep (including what it ingested, so a caller doing
+        all-or-nothing can undo it), or None after rolling its own back.
         """
         node = wgio.nodes[spec_node_name]
         # Held True across the ingest so a streaming input cannot re-add the
@@ -726,20 +852,15 @@ class PythonGraphRuntime(GraphRuntime):
         node._speculatively_scheduled = False  # reset in case the rid is dropped
 
         if not fully_ready:
-            # Pull the chunks back out so a later scheduling of this node
-            # consumes them normally. The caller returns them to their
-            # StreamBuffers; registry state was never touched, because
-            # _speculatively_scheduled was held True above.
-            for _idx, name in into_signals:
-                node.ready_signals.remove(name)
-            for _idx, name in into_next_iter:
-                node.ready_next_iter.remove(name)
+            self._undo_spec_ingest(node, into_signals, into_next_iter)
             return None
 
         slots = node.ready_next_iter if same_node else node.ready_signals
-        return (
-            [idx for idx, _name in into_next_iter + into_signals],
-            [
+        return _SpecRidPrep(
+            rid=rid,
+            node=node,
+            consumed_idxs=[idx for idx, _name in into_next_iter + into_signals],
+            input_edges=[
                 EdgeSpec(
                     signal=name,
                     next_node=edge.next_node,
@@ -747,6 +868,8 @@ class PythonGraphRuntime(GraphRuntime):
                     is_final_streaming_chunk=edge._final_stream_chunk,
                 ) for name, edge in slots.ready_inputs.items()
             ],
+            into_signals=into_signals,
+            into_next_iter=into_next_iter,
         )
 
     def _process_node_outputs(
@@ -1181,7 +1304,6 @@ class PythonGraphRuntime(GraphRuntime):
             {} if input.stream_tokens_consumed is None
             else dict(iter(input.stream_tokens_consumed))
         )
-        partition_done = set(input.partition_done_rids or ())
         profiling = (
             {} if input.profiling is None else dict(iter(input.profiling))
         )
@@ -1227,10 +1349,24 @@ class PythonGraphRuntime(GraphRuntime):
                 self._send_input_signals(rid, worker_id, edges, fwd_info, partition)
 
             if routing.completed_worker_graph_ids and info is not None:
+                part = info.partition_info.get(partition)
+                node = self._queues[
+                    self.get_worker_graph_id_for_node(
+                        completion.node_name, completion.graph_walk,
+                    )
+                ].per_request_queues.get(rid)
+                speculative = node is not None and node.get_node(
+                    completion.node_name
+                )._speculatively_scheduled
                 self._send_worker_graphs_done(
                     rid, routing, info, fwd_info, partition,
                     stream_tokens_consumed=consumed.get(rid, {}),
-                    partition_done=rid in partition_done,
+                    # A speculatively-scheduled node has not really finished
+                    # the partition, so it must not report done.
+                    partition_done=(
+                        part is not None and part.stream_partition_done
+                        and not speculative
+                    ),
                     profiling=profiling.get(rid),
                 )
 

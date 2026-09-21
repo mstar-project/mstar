@@ -158,7 +158,7 @@ def test_targeted_call_never_pops_tp_follow():
     batch = sched.get_next_batch(manager)
     assert batch is not None
     assert batch.node_name == NODE
-    assert set(batch.node_objects) == {"r0", "r1"}
+    assert set(batch.request_to_worker_graph) == {"r0", "r1"}
 
 
 def test_untargeted_call_serves_and_drains():
@@ -169,7 +169,7 @@ def test_untargeted_call_serves_and_drains():
     assert batch is not None
     assert batch.node_name == NODE
     assert batch.graph_walk == WALK
-    assert set(batch.node_objects) == {"r0", "r1"}
+    assert set(batch.request_to_worker_graph) == {"r0", "r1"}
     assert len(sched.tp_batches_pending_schedule) == 0
 
 
@@ -182,7 +182,7 @@ def test_exclude_target_skips_head_but_keeps_it_queued():
 
     batch = sched.get_next_batch(manager)
     assert batch is not None
-    assert set(batch.node_objects) == {"r0", "r1"}
+    assert set(batch.request_to_worker_graph) == {"r0", "r1"}
 
 
 def test_fifo_order_survives_refused_targeted_calls():
@@ -193,7 +193,7 @@ def test_fifo_order_survives_refused_targeted_calls():
     assert sched.get_next_batch(manager, target=(NODE, WALK)) is None
 
     first = sched.get_next_batch(manager)
-    assert set(first.node_objects) == {"r0", "r1"}
+    assert set(first.request_to_worker_graph) == {"r0", "r1"}
     second = sched.get_next_batch(manager)
-    assert set(second.node_objects) == {"r2", "r3"}
+    assert set(second.request_to_worker_graph) == {"r2", "r3"}
     assert len(sched.tp_batches_pending_schedule) == 0

@@ -154,9 +154,10 @@ def test_pop_ready_rids_pops_exactly_the_named_set():
 
     popped = sched.pop_ready_rids(manager, NODE, WALK, ["r1", "r2"])
     assert popped is not None
-    nodes, wg = popped
-    assert list(nodes) == ["r1", "r2"]  # wire order preserved
+    wg, input_edges = popped
+    assert list(wg) == ["r1", "r2"]  # wire order preserved
     assert wg == {"r1": "wg0", "r2": "wg0"}
+    assert set(input_edges) == {"r1", "r2"}
     # r0 untouched, r1/r2 consumed
     assert NODE in queue.per_request_queues["r0"].ready_node_names
     assert NODE not in queue.per_request_queues["r1"].ready_node_names
@@ -204,7 +205,7 @@ def test_serial_tp_follow_path_still_serves_via_shared_pop():
     sched.register_tp_follow(_head(["r0", "r1"], seq=9))
     batch = sched.get_next_batch(manager)
     assert batch is not None
-    assert set(batch.node_objects) == {"r0", "r1"}
+    assert set(batch.request_to_worker_graph) == {"r0", "r1"}
     assert batch.tp_seq == 9
     assert sched.peek_tp_follow() is None
 

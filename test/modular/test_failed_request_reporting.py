@@ -20,7 +20,6 @@ from mstar.worker.worker import Worker
 def _pending(rids, failed):
     return SimpleNamespace(
         batch=SimpleNamespace(
-            node_objects={rid: object() for rid in rids},
             request_to_worker_graph=dict.fromkeys(rids, "wg0"),
         ),
         node_batch=SimpleNamespace(
@@ -44,7 +43,7 @@ def test_a_handled_failure_leaves_the_batch():
 
     assert pending.node_batch.request_ids == ["r1"]
     assert "r0" not in outputs
-    assert "r0" not in pending.batch.node_objects
+    assert "r0" not in pending.batch.request_to_worker_graph
     assert "r0" not in pending.node_batch.per_request_info
 
 
