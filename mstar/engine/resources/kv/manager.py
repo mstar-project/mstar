@@ -303,6 +303,8 @@ class KVManager(AttentionResource):
         )
         self._prefix_root: bytes | None = None
         self._index: PrefixIndex | None = None
+        # label -> the walks its keys describe; a label not here is not gated
+        self._keyed_walks: dict[str, frozenset[str]] = {}
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
@@ -364,8 +366,18 @@ class KVManager(AttentionResource):
             )
         return state
 
-    def enable_prefix_cache(self, root: bytes) -> None:
-        """Open the index under ``root``, the identity every key hangs from."""
+    def enable_prefix_cache(
+        self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
+    ) -> None:
+        """Open the index under ``root``, the identity every key hangs from.
+
+        ``walks`` names, per label, the walk that writes the keyed span and the
+        one that decodes after it.
+        """
+        self._keyed_walks = {
+            label: frozenset(walk for walk in named if walk is not None)
+            for label, named in (walks or {}).items()
+        }
         if not self.config.prefix_cache:
             return
         if self._world_size > 1:
@@ -447,6 +459,12 @@ class KVManager(AttentionResource):
             or segment.request_id not in ctx.request_ids
             or not stream.keys
         ):
+            return
+        walks = self._keyed_walks.get(segment.label)
+        if walks is not None and ctx.graph_walk not in walks:
+            # a walk the keys never described wrote this span: an image written
+            # where the keyed text would sit would be filed under the text's keys
+            stream.keys = None
             return
         # what was here before this write, not after: a decode step can commit
         # before the token it writes is read back and counted

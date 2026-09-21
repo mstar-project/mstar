@@ -63,17 +63,17 @@ class _Model:
 
     def __init__(
         self, declares: bool = True, metadata: dict | None = None,
-        chains_decode: bool = False,
+        decode_walk: str | None = None,
     ):
         self._declares = declares
         self._metadata = metadata
-        self._chains_decode = chains_decode
+        self._decode_walk = decode_walk
 
     def prefix_key_streams(self):
         if not self._declares:
             return {}
         return {"kv": {"main": PrefixStream(
-            "text_inputs", "ids", self._chains_decode,
+            "text_inputs", "ids", "prefill", self._decode_walk,
         )}}
 
     def get_node_resources(self):
@@ -191,7 +191,7 @@ def test_the_tail_the_manager_cannot_see_travels_with_the_keys():
 
 
 def test_a_node_that_chains_its_decode_says_where_the_token_arrives():
-    worker = _worker(_Model(chains_decode=True), _deployment())
+    worker = _worker(_Model(decode_walk="decode"), _deployment())
 
     cfg = _handed_over(_run(worker))
 
@@ -201,7 +201,7 @@ def test_a_node_that_chains_its_decode_says_where_the_token_arrives():
 
 
 def test_a_node_that_does_not_chain_its_decode_sends_no_name():
-    worker = _worker(_Model(chains_decode=False), _deployment())
+    worker = _worker(_Model(decode_walk=None), _deployment())
 
     cfg = _handed_over(_run(worker))
 

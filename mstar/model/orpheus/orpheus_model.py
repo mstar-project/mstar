@@ -353,7 +353,7 @@ class OrpheusModel(Model):
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
         """The LLM's prompt is its token ids, and so is every step after it."""
         return {
-            KV_CACHE: {"main": PrefixStream("text_inputs", "ids", True)},
+            KV_CACHE: {"main": PrefixStream("text_inputs", "ids", "prefill", "decode")},
         }
 
     def checkpoint_path(self) -> str:

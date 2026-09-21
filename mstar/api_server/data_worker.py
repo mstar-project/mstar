@@ -464,7 +464,7 @@ class PreprocessWorkerThread:
                 keys.setdefault(resource_key, {})[label] = chain(pages)
                 whole = len(flat) // page_size
                 tails.setdefault(resource_key, {})[label] = flat[whole * page_size:]
-                if stream.chains_decode:
+                if stream.decode_walk is not None:
                     decode.setdefault(resource_key, {})[label] = stream.tensor
         return keys, tails, decode
 

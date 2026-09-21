@@ -535,6 +535,16 @@ class Engine:
             checkpoint_identity(checkpoint) if checkpoint is not None else b"",
             model.preprocess_fingerprint() if model is not None else "",
         ]
+        declared = model.prefix_key_streams() if model is not None else {}
+        self._prefix_model = type(model).__name__
+        # node -> the walks a probe may run on: the keyed walk of every stream
+        # declared on a cache the node uses
+        self._keyed_walks: dict[str, set[str]] = {}
+        for key, by_label in declared.items():
+            for node in specs_by_key[key].nodes:
+                self._keyed_walks.setdefault(node, set()).update(
+                    stream.walk for stream in by_label.values()
+                )
         for key, resource in self._resources.items():
             if not isinstance(resource, KVManager):
                 continue
@@ -547,7 +557,10 @@ class Engine:
                     mark = built.fingerprint() if built is not None else None
                     if mark is not None:
                         parts.append(mark)
-            resource.enable_prefix_cache(fingerprint(*shared, *parts))
+            resource.enable_prefix_cache(fingerprint(*shared, *parts), {
+                label: (stream.walk, stream.decode_walk)
+                for label, stream in declared.get(key, {}).items()
+            })
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.
@@ -612,21 +625,20 @@ class Engine:
     ) -> NodeInputs:
         """Cut the leading tokens this node's resources already hold.
 
-        Only a walk whose inputs are entirely sequence-shaped is offered: the
-        opaque fields are the ones the default cut refuses, and a walk that
-        writes more than one span from one set of inputs carries something
-        there to say so, so skipping those walks keeps a one-span match off a
-        step that would apply it to every label it writes.
+        Only the walk the model keyed is probed, and on it only inputs the
+        default cut can slice: a guided walk writes more than one span from one
+        set of inputs and carries its step info to say so, so a one-span match
+        would reach only one of them.
         """
-        if (
-            not isinstance(inputs, ARNodeInputs)
-            or inputs.custom_pos_ids is not None
-            or inputs.tensor_inputs
-            or inputs.kwargs
-            or inputs.resource_step_info
-        ):
-            return inputs
         walk = batch.step_context.graph_walk
+        if walk not in self._keyed_walks.get(batch.node_name, ()):
+            return inputs
+        assert isinstance(inputs, ARNodeInputs) and inputs.custom_pos_ids is None, (
+            f"{self._prefix_model} keys the {walk!r} walk of {batch.node_name} "
+            "for prefix reuse, but that walk places positions of its own"
+        )
+        if inputs.tensor_inputs or inputs.kwargs or inputs.resource_step_info:
+            return inputs
         matched = self._runner.resolve_cached_prefix(rid, batch.node_name, walk)
         self._runner.apply_cached_prefix(
             rid, batch.node_name, walk, inputs, matched,

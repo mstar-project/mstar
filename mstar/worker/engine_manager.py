@@ -72,6 +72,26 @@ def _refuse_unskippable_resources(
         )
 
 
+def _refuse_unknown_walks(model: Model) -> None:
+    """Refuse a declared stream that names a walk the model never runs.
+
+    Only the named walks may file pages or be probed, so a name that matches
+    nothing leaves that cache empty for good, and nothing says why.
+    """
+    walks = set(model.get_graph_walk_graphs())
+    for key, by_label in model.prefix_key_streams().items():
+        for label, stream in by_label.items():
+            unknown = sorted(
+                {stream.walk, stream.decode_walk} - walks - {None}
+            )
+            if unknown:
+                raise ValueError(
+                    f"{type(model).__name__} keys {key!r}/{label!r} on "
+                    f"{unknown}, which it never runs; its walks are "
+                    f"{sorted(walks)}"
+                )
+
+
 @dataclass
 class EngineManager:
     """Owns the worker's engine.
@@ -104,6 +124,7 @@ class EngineManager:
         apply_yaml_overrides(specs, model_config)
         _refuse_uncacheable_positions(specs, model)
         _refuse_unskippable_resources(specs, model)
+        _refuse_unknown_walks(model)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to

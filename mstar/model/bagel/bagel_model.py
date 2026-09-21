@@ -738,10 +738,12 @@ class BagelModel(Model):
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
         """The text walk's prompt is its token ids, and so is every step it takes.
 
-        The image walks share this cache but carry position ids of their own,
-        which is what keeps the engine from offering them a prefix.
+        The image walks write into this stream too, and an edit's picture lands
+        at the positions its keyed text would have; only the text walk is named.
         """
-        return {"kv": {"main": PrefixStream("text_inputs", "ids", True)}}
+        return {"kv": {"main": PrefixStream(
+            "text_inputs", "ids", "prefill_text", "decode",
+        )}}
 
     def checkpoint_path(self) -> str:
         return snapshot_download(

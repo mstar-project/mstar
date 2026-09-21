@@ -56,9 +56,12 @@ class PrefixStream(NamedTuple):
     """
     tensor: str
     keyed_by: str
-    # whether a decode step's input ids are the token just sampled, so that
-    # what the model generates can be keyed the same way its prompt was
-    chains_decode: bool = False
+    # the walk that writes the keyed span: a page any other walk writes into
+    # this stream is not a page the keys describe
+    walk: str
+    # the walk whose input ids are the token just sampled, so that what the
+    # model generates is keyed the way its prompt was; None keys no generation
+    decode_walk: str | None = None
 
 
 @dataclass

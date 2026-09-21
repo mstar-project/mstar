@@ -63,6 +63,9 @@ class _Model:
     def preprocess_fingerprint(self):
         return self._name
 
+    def prefix_key_streams(self):
+        return {}
+
 
 def _kv(dtype=torch.float32, **overrides) -> KVManager:
     cfg = dict(

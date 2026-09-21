@@ -78,6 +78,9 @@ def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]
         node: SimpleNamespace(submodule=_Submodule())
         for node in node_resources
     }
+    # every node keys WALK, as a declaration would name it
+    engine._keyed_walks = {node: {WALK} for node in node_resources}
+    engine._prefix_model = "_Model"
     return engine
 
 
@@ -162,7 +165,6 @@ def test_apply_is_handed_the_untrimmed_inputs():
 
 
 @pytest.mark.parametrize("opaque", [
-    {"custom_pos_ids": torch.arange(PROMPT)},
     {"resource_step_info": True},
     {"kwargs": {"guidance": 1.0}},
     {"tensor_inputs": {"extra": torch.zeros(PROMPT)}},
@@ -176,19 +178,6 @@ def test_a_walk_carrying_anything_opaque_never_probes(opaque):
     assert resource.resolved == 0, (
         f"a walk carrying {sorted(opaque)} was probed and would have been cut "
         "to a length only one of its labels agreed to"
-    )
-
-
-def test_a_walk_whose_inputs_are_not_token_shaped_never_probes():
-    resource = _Answering(96)
-    engine = _engine({"kv": resource}, {NODE: ["kv"]})
-    inputs = NodeInputs(input_seq_len=PROMPT)
-
-    assert _stage(engine, inputs) is inputs, (
-        "inputs with no ids to slice were rebuilt"
-    )
-    assert resource.resolved == 0, (
-        "a walk with nothing sequence-shaped in it was probed"
     )
 
 
