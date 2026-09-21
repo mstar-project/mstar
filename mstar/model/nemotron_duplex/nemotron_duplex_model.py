@@ -390,10 +390,20 @@ class NemotronDuplexModel(Model):
     # Sessions resident at once (one recurrent slot each; ~137 MB per slot in
     # fp32 for Nemotron-H). A deployment tunes it under ``resources: mamba_state``.
     DEFAULT_MAMBA_SLOTS = 64
+    # Slots for the CUDA-graph padding rows: a batch padded to its capture
+    # bucket admits its padding rows like requests, so with every session slot
+    # taken a bucket-N step of N-1 live sessions stalls until a finished
+    # session's slot is released (its codec tail runs first). Observed at 64
+    # sessions: "recurrent state pool is full ... __cg_nano_llm". ~137 MB each.
+    MAMBA_PAD_SLOTS = 8
     # Talker KV pages (128 positions each, ~16.5 MB a page over 28 layers):
-    # 1024 pages = ~17 GB = ~65 000 positions = e.g. 8 sessions x 10 min x 2
-    # streams. Tune under ``resources: talker_kv``.
-    DEFAULT_TALKER_KV_PAGES = 1024
+    # Talker KV pool, both CFG streams of every session. A page is 128
+    # positions: 28 layers x 128 x 16 heads x 128 (the padded head dim) x K,V x
+    # bf16 = 28 MiB, so 512 pages = 14 GiB = 65 536 positions = 64 sessions x 2
+    # streams x 512 positions (the 38-token warm-up + ~38 s of frames). Size by
+    # sessions x 2 x ceil((38 + frames) / 128); a stream that outgrows the pool
+    # stalls its session (no sliding-window eviction yet).
+    DEFAULT_TALKER_KV_PAGES = 512
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         nano = self.config.nano
@@ -426,7 +436,7 @@ class NemotronDuplexModel(Model):
                         conv_kernel_size=nano.conv_kernel,
                     ).to_blocks(),
                     # + 1 for the pool's sink slot, so DEFAULT_MAMBA_SLOTS sessions fit
-                    max_slots=self.DEFAULT_MAMBA_SLOTS + 1,
+                    max_slots=self.DEFAULT_MAMBA_SLOTS + self.MAMBA_PAD_SLOTS + 1,
                 ),
             ),
             LinearAttnSpec(
