@@ -6,6 +6,7 @@ against the pool's blocks with the same numbers as the explicit-state reference.
 CPU-only: the reference kernels loop over rows, so no device is needed."""
 from __future__ import annotations
 
+import pytest
 import torch
 
 from mstar.engine.resources import (
@@ -253,3 +254,28 @@ def test_capture_rows_take_no_slots():
     assert runner.admit(s2).ok
     runner.plan(s2)
     assert attn.current_plan().slot_ids_cpu[0] != SINK_SLOT
+
+
+def test_plan_builds_its_per_step_values_once():
+    """The values every layer of a step reads (int64 indices, the state mask, fla's chunk table) are built
+    on the first request and handed back as the same objects after; the chunk table built on the host
+    equals fla's own for chunk-sized, empty, short and long rows."""
+    from mstar.engine.resources.linear_attn.kda_kernels import FLA_CHUNK, _fla_chunk_indices
+
+    cu = [0, 64, 64, 67, 224]
+    plan = KDAPlan(
+        slot_ids=torch.tensor([3, 1, 2, 0], dtype=torch.int32), has_state=torch.tensor([True, False, True, False]),
+        cu_seqlens=torch.tensor(cu, dtype=torch.int32), cu_seqlens_cpu=cu, num_rows=4, num_tokens=224, is_decode=False,
+    )
+    assert plan.cu_seqlens_long() is plan.cu_seqlens_long() and plan.cu_seqlens_long().tolist() == cu
+    assert plan.cu_seqlens_host().device.type == "cpu" and plan.cu_seqlens_host().tolist() == cu
+    assert plan.slot_ids_long() is plan.slot_ids_long() and plan.slot_ids_long().tolist() == [3, 1, 2, 0]
+    assert plan.state_mask(torch.float32).tolist() == [1.0, 0.0, 1.0, 0.0]
+    assert plan.state_mask(torch.bfloat16) is plan.state_mask(torch.bfloat16)
+    assert plan.state_mask(torch.bfloat16).dtype == torch.bfloat16
+    table = _fla_chunk_indices(plan)
+    want = [[0, 0], [2, 0], [3, 0], [3, 1], [3, 2]]  # one chunk of 64, none, one, three for 157 tokens
+    assert table is _fla_chunk_indices(plan) and table.dtype == torch.long and table.tolist() == want
+    index = pytest.importorskip("fla.ops.utils.index")
+    fla_table = index.prepare_chunk_indices(plan.cu_seqlens_long(), FLA_CHUNK, cu_seqlens_cpu=plan.cu_seqlens_host())
+    assert fla_table.tolist() == want
