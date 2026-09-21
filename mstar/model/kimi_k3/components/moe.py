@@ -384,6 +384,20 @@ class KimiLatentMoE(nn.Module):
             y = self.comm_group.all_reduce(y)
         return y
 
+    def _routed_scattered(self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+        """This rank's columns of the routed experts' output summed over the ranks, ``[T, latent / tp]``:
+        the partial is written with its columns chunked by rank (the fused backends do so in place) and
+        reduce-scattered, which moves half of what the all-reduce did, and every rank normalizes and
+        up-projects its own columns afterwards instead of the whole rows. For the sizes where the
+        all-reduce would run NCCL (a prefill); a decode step keeps the symmetric-memory all-reduce."""
+        tp, t = self.comm_group.world_size, z.shape[0]
+        chunks = torch.empty(tp, t, self.latent_local, dtype=z.dtype, device=z.device)
+        view = chunks.permute(1, 0, 2)  # [T, tp, latent / tp]: row t's columns, chunk by chunk
+        y = self._routed(z, topk_idx, topk_weight, out=view)
+        if y is not view:  # a backend that writes its own buffer
+            view.copy_(y.view(t, tp, self.latent_local))
+        return self.comm_group.reduce_scatter_stacked(chunks)
+
     def _shared(self, mixed: torch.Tensor) -> torch.Tensor:
         """Shared experts' partial ``[T, hidden]`` from the merged projection's gate | up block (a
         strided view: the SiTU kernel takes the row stride)."""
@@ -396,19 +410,26 @@ class KimiLatentMoE(nn.Module):
         # the router and the merged projection read the same input: two streams under a capture
         (topk_idx, topk_weight), mixed = self._fork_in.run(lambda: self.gate(x), lambda: self.in_proj(x))
         z = self._latent(mixed)
+        up = self.routed_expert_up_proj
+        scatter = self.latent_sharded and self.comm_group.all_reduce_is_nccl(z.shape, z.dtype, z.device)
         # the shared experts only need the projection: they run beside the routed path
         y, s_out = self._fork_experts.run(
-            lambda: self._routed_reduced(z, topk_idx, topk_weight),
+            lambda: self._routed_scattered(z, topk_idx, topk_weight) if scatter
+            else self._routed_reduced(z, topk_idx, topk_weight),
             lambda: self._shared(mixed) if self.shared_experts is not None else None,  # partial over the intermediate shards
         )
-        if self.routed_expert_norm is not None:
-            y = self.routed_expert_norm(y)
-        # partial over the latent shards: this rank's columns of the latent, a view the GEMM reads with
-        # its row stride (splitting inside the row-parallel linear copied them for more than one row)
-        up = self.routed_expert_up_proj
-        y = y.narrow(-1, up.tp_rank * up.input_size_per_partition, up.input_size_per_partition)
-        if not fused_decode_kernels():
-            y = y.contiguous()
+        if scatter:
+            # this rank's columns of the sum, normalized with the rows' statistics summed over the group
+            if self.routed_expert_norm is not None:
+                y = self.routed_expert_norm.forward_sharded(y, self.comm_group, up.input_size_per_partition)
+        else:
+            if self.routed_expert_norm is not None:
+                y = self.routed_expert_norm(y)
+            # partial over the latent shards: this rank's columns of the latent, a view the GEMM reads with
+            # its row stride (splitting inside the row-parallel linear copied them for more than one row)
+            y = y.narrow(-1, up.tp_rank * up.input_size_per_partition, up.input_size_per_partition)
+            if not fused_decode_kernels():
+                y = y.contiguous()
         if self.shared_experts is not None:
             buf = self.comm_group.symm_buffer((y.shape[0], self.hidden_size), y.dtype, y.device)
             if buf is not None and fused_decode_kernels():
