@@ -18,6 +18,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources import Resource, StepRunner
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep
 from mstar.engine.resources.kv.keys import chain, fingerprint
@@ -316,6 +317,47 @@ def test_a_pre_fork_off_a_leased_stream_covers_the_whole_prefix():
     assert len(forked.page_indices) >= matched // PAGE_SIZE
     assert not set(forked.page_indices) & set(kv._streams["r1"]["main"].page_indices), (
         "the fork target aliased the pages it was supposed to be a copy of"
+    )
+    kv.assert_pages_conserved()
+
+
+# ── the length every resource agreed to ─────────────────────────────────
+
+
+class _Holding(Resource):
+    """A resource that holds a prefix of its own, shorter than the cache's."""
+
+    def __init__(self, matched: int):
+        self._matched = matched
+
+    @classmethod
+    def build(cls, spec, info):
+        raise NotImplementedError
+
+    def resolve_cached_prefix(self, rid, node_name, graph_walk):
+        return self._matched
+
+
+def test_a_lease_is_cut_to_the_smallest_answer_and_the_rest_given_back():
+    kv = _manager()
+    keys = _seed(kv, list(range(100)))
+    kv.remove_request("seed")
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}))
+    runner = StepRunner(
+        {"kv": kv, "other": _Holding(PAGE_SIZE)},
+        node_resources={NODE: ["kv", "other"]},
+    )
+
+    matched = runner.resolve_cached_prefix("r1", NODE, WALK)
+    leased = list(kv._streams["r1"]["main"].lease)
+    runner.apply_cached_prefix("r1", NODE, WALK, None, matched)
+
+    assert matched == PAGE_SIZE, "the runner did not take the smallest answer"
+    assert kv._streams["r1"]["main"].lease == leased[:1], (
+        "the lease still covers pages the step will now recompute"
+    )
+    assert all(kv._arena.num_owners[page] == 1 for page in leased[1:]), (
+        "the pages past the agreed length are held by a lease nobody will convert"
     )
     kv.assert_pages_conserved()
 
