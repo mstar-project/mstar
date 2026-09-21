@@ -37,6 +37,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_omni``
      - ``Qwen/Qwen3-Omni-30B-A3B-Instruct``
      - Omni-modal (text/image/audio/video in, text/audio out): Thinker + Talker + codec.
+   * - ``qwenvl``
+     - ``Qwen/Qwen3-VL-30B-A3B-Instruct``
+     - Vision-language MoE (image/text in, text out). The single-GPU
+       correctness baseline is the default while TP and scale acceptance remain gated.
    * - ``qwen3_tts``
      - ``Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice``
      - Streaming text-to-speech with built-in speakers: Talker + 12 Hz speech codec.
@@ -110,6 +114,16 @@ The benchmark stops on the model's natural codec EOS by default. Use
 fixed-length decode throughput rather than end-user latency.
 The first process-local request can include eager FlashInfer kernel JIT, so
 keep the warmup requests enabled when reporting steady-state latency.
+
+QwenVL integration status
+-------------------------
+
+``qwenvl`` is being delivered as a gated sequence rather than one broad
+acceptance claim. ``mstar serve qwenvl`` resolves to the bounded single-GPU
+correctness configuration. This documentation snapshot records its non-TP
+correctness scope only.
+
+See :doc:`qwenvl/README` and :doc:`qwenvl/PR_0_SINGLE_GPU_CORRECTNESS`.
 
 Cosmos3 environment requirements
 --------------------------------
