@@ -34,9 +34,9 @@ def build(kernels):
     return pool, attn, StepRunner({POOL: pool, ATTN: attn})
 
 
-def step(rids, span):
+def step(rids, span, speculative=False):
     s = SubmoduleStep(segments=[Segment(r, "main", span) for r in rids],
-                      steps={POOL: RecurrentStep(), ATTN: LinearAttnStep()})
+                      steps={POOL: RecurrentStep(), ATTN: LinearAttnStep(speculative=speculative)})
     ctx = StepContext(request_ids=list(rids), graph_walk="decode", slot=0, capture=False)
     s.set_ctx(ctx)
     return s
@@ -83,26 +83,29 @@ def test_fla_verify_matches_the_torch_reference():
         for name in ("conv", "state", "spec_prefix", "spec_g", "spec_beta", "spec_len"):
             dst.block(name, 0).copy_(src.block(name, 0))
 
-    # verify blocks with different acceptance per request and per step
-    for accepted in ((3, 0), (7, 2), (0, 5)):
+    # verify blocks with different acceptance per request and per step; the one-token blocks (a zero-draft
+    # bucket) consume the pending prefix, are committed in the step and leave nothing pending
+    for span, accepted in ((K1, (3, 0)), (1, (0, 0)), (1, (0, 0)), (K1, (7, 2)), (1, (0, 0)), (K1, (0, 5))):
         sync_fla_to_torch()
-        blk = inputs(2 * K1)
-        outs, states, wins = {}, {}, {}
+        blk = inputs(2 * span)
+        outs, states, wins, lens = {}, {}, {}, {}
         for name, (pool, attn, runner) in trees.items():
-            s = step(rids, K1)
+            s = step(rids, span, speculative=True)
             assert runner.admit(s).ok
             runner.plan(s)
             plan = attn.current_plan()
-            assert plan.is_verify
+            assert plan.is_verify and plan.k1 == span
             outs[name] = attn.run(*blk, pool.block("conv", 0), pool.block("state", 0), params, spec=spec_of(pool)).float()
             attn.set_prefix_len(spec_of(pool).length, torch.tensor(accepted, dtype=torch.int32, device=DEV))
             runner.commit(s)
             slots = plan.slot_ids_cpu
             states[name] = pool.block("state", 0)[slots].clone()
             wins[name] = pool.block("conv", 0)[slots].float().clone()
+            lens[name] = pool.block("spec_len", 0)[slots, 0].tolist()
         assert torch.allclose(outs["fla"], outs["torch"], atol=3e-2, rtol=3e-2), (outs["fla"] - outs["torch"]).abs().max()
         assert torch.allclose(states["fla"], states["torch"], atol=1e-3, rtol=1e-3), (states["fla"] - states["torch"]).abs().max()
         assert torch.equal(wins["fla"], wins["torch"])
+        assert lens["fla"] == lens["torch"] == ([a + 1 for a in accepted] if span > 1 else [0, 0]), lens
 
 
 def test_checkpoint_kernel_matches_fla_on_plain_rows():
@@ -169,3 +172,36 @@ def test_checkpoint_kernel_block_only_output_matches_the_full_one():
     assert block.shape == (n * k1, H, D)
     assert torch.equal(block, full.view(n, kp + k1, H, D)[:, kp:].reshape(n * k1, H, D))
     assert torch.equal(pool_a, pool_b)
+
+
+def test_checkpoint_kernel_skips_the_slots_after_the_prefix_exactly():
+    """Block-only rows whose prefix slots past ``prefix_len`` hold no-op tokens (k = v = 0, raw gate and
+    beta -1e4: decay 1, beta 0), as the prep kernel writes them: running the real prefix and the block
+    alone gives the same outputs and states, bit for bit, as running every slot."""
+    from mstar.engine.resources.linear_attn.kda_spec_recurrent import kda_recurrent_checkpoint
+
+    torch.manual_seed(5)
+    n, kp, k1 = 3, K1, 4
+    t = n * (kp + k1)
+    q, k, v, g = (torch.randn(t, H, D, device=DEV).to(torch.bfloat16) for _ in range(4))
+    beta = torch.randn(t, H, device=DEV).to(torch.bfloat16)
+    plen = [3, 0, kp]
+    for i, pl in enumerate(plen):  # the dead slots of every row
+        rows = slice(i * (kp + k1) + pl, i * (kp + k1) + kp)
+        k[rows] = 0
+        v[rows] = 0
+        g[rows] = -1e4
+        beta[rows] = -1e4
+    A_log = torch.randn(H, device=DEV)
+    dt_bias = torch.randn(H * D, device=DEV) * 0.1
+    S0 = torch.randn(n + 1, H, D, D, device=DEV)
+    slots = torch.tensor([2, 0, 3], device=DEV, dtype=torch.int32)
+    cu = torch.arange(n + 1, device=DEV, dtype=torch.int32) * (kp + k1)
+    for ckpt in ([2, -1, kp - 1], [kp + k1 - 1] * n):  # after the prefix, and a committed block
+        ckpt_t = torch.tensor(ckpt, device=DEV, dtype=torch.int32)
+        pool_a, pool_b = S0.clone(), S0.clone()
+        every = kda_recurrent_checkpoint(q, k, v, g, beta, A_log, dt_bias, pool_a, slots, ckpt_t, cu, D ** -0.5, -5.0,
+                                         out_skip=kp)
+        real = kda_recurrent_checkpoint(q, k, v, g, beta, A_log, dt_bias, pool_b, slots, ckpt_t, cu, D ** -0.5, -5.0,
+                                        out_skip=kp, prefix_len=torch.tensor(plen, device=DEV, dtype=torch.int32))
+        assert torch.equal(real, every) and torch.equal(pool_a, pool_b)
