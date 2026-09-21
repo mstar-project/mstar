@@ -4,7 +4,8 @@ A full-duplex speech-to-speech model with four nodes:
 
     conformer_encoder — 16 kHz speech → per-frame LLM embeds (+ RNN-T transcript)
     nano_llm          — Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B);
-                        resources nano_kv / nano_attn / nano_sampler
+                        resources nano_kv / nano_attn (4 attention layers),
+                        mamba_state / mamba (27 Mamba-2 layers), nano_sampler
     eartts_talker     — Gemma3 talker → 31-codebook RVQ codes
     audio_codec       — RVQ codes → 22.05 kHz PCM
 
@@ -26,8 +27,9 @@ INFERENCE PATHS (all live, verified vs the NeMo reference):
 The M* serving path is the walk graphs below: four async partitions
 (Encoder → LLM → Talker → Codec) joined by ``StreamingGraphEdge``s, with the nano
 decode loop consuming one encoder frame per step. ``get_node_resources`` declares
-the nano's paged KV cache, attention and sampler; the Mamba conv/SSM state and the
-talker KV still live in per-request submodule state (eager).
+the nano's paged KV cache, attention, recurrent-state pool (Mamba-2 conv + SSM
+slots), the Mamba-2 resource and the sampler; the talker KV still lives in
+per-request submodule state (eager).
 
 Contract methods crib from ``mstar/model/orpheus/orpheus_model.py`` (single
 streaming LLM+codec) and ``mstar/model/qwen3_omni/qwen3_omni_model.py`` (omni,
@@ -53,11 +55,20 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
+from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.multimodal import PromptPart
-from mstar.model.nemotron_duplex.config import NANO_ATTN, NANO_KV, NANO_SAMPLER, NemotronDuplexConfig
+from mstar.model.nemotron_duplex.config import (
+    MAMBA,
+    MAMBA_STATE,
+    NANO_ATTN,
+    NANO_KV,
+    NANO_SAMPLER,
+    NemotronDuplexConfig,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -357,11 +368,17 @@ class NemotronDuplexModel(Model):
         return types.SimpleNamespace(tokenizer=types.SimpleNamespace(vocab=v), vocab=v)
 
     # -------------------------------------------------------------------
-    # Resources: the nano's paged KV (attention layers only), its attention
-    # plan and the agent-text sampler. NoPE: no position resource. The other
-    # three nodes declare nothing (encoder/codec are stateless; the talker
-    # keeps its own KV in per-request state for now).
+    # Resources: the nano's paged KV (attention layers only) and attention
+    # plan, the recurrent-state pool holding every Mamba-2 layer's conv window
+    # and SSM state (one slot per session) with the Mamba-2 resource planned
+    # against it, and the agent-text sampler. NoPE: no position resource. The
+    # other three nodes declare nothing (encoder/codec are stateless; the
+    # talker keeps its own KV in per-request state for now).
     # -------------------------------------------------------------------
+
+    # Sessions resident at once (one recurrent slot each; ~137 MB per slot in
+    # fp32 for Nemotron-H). A deployment tunes it under ``resources: mamba_state``.
+    DEFAULT_MAMBA_SLOTS = 64
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         nano = self.config.nano
@@ -380,6 +397,29 @@ class NemotronDuplexModel(Model):
             AttentionSpec(
                 resource_key=NANO_ATTN, nodes={"nano_llm"},
                 config=AttentionConfig(kv_cache=NANO_KV),
+            ),
+            RecurrentStateSpec(
+                resource_key=MAMBA_STATE, nodes={"nano_llm"},
+                config=RecurrentStateConfig(
+                    num_layers=nano.num_mamba_layers,
+                    blocks=Mamba2Geometry(
+                        num_heads=nano.mamba_num_heads,
+                        head_dim=nano.mamba_head_dim,
+                        state_size=nano.ssm_state_size,
+                        n_groups=nano.n_groups,
+                        conv_kernel_size=nano.conv_kernel,
+                    ).to_blocks(),
+                    # + 1 for the pool's sink slot, so DEFAULT_MAMBA_SLOTS sessions fit
+                    max_slots=self.DEFAULT_MAMBA_SLOTS + 1,
+                ),
+            ),
+            LinearAttnSpec(
+                resource_key=MAMBA, nodes={"nano_llm"},
+                config=LinearAttnConfig(
+                    recurrent_state=MAMBA_STATE,
+                    variant=LinearAttnVariant.MAMBA2,
+                    time_step_limit=nano.time_step_limit,
+                ),
             ),
             SamplerSpec(
                 resource_key=NANO_SAMPLER, nodes={"nano_llm"},
