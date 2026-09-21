@@ -139,3 +139,50 @@ def test_qwen3_5_hands_over_a_batch_tensor():
     src = inspect.getsource(submodules.LLMSubmodule.forward_batched)
     assert "check_stop_buffers" in src
     assert "BatchedModelOutput" in src
+
+
+def test_rows_map_through_the_forward_order_not_the_batch_list():
+    """The worker rewrites its batch's request list between the forward and
+    the stop check (dropping requests whose loops stopped, and until recently
+    through a set, so in hash order). Rows have to be sliced by the order the
+    forward ran, which the engine stamps on the output."""
+    host = {"new_token": torch.tensor([[248046], [53031]])}
+    forward_order = ["p1", "p3"]
+    out = Worker._rows_to_per_rid(host, forward_order)
+    assert out["p1"]["new_token"][0].item() == 248046
+    assert out["p3"]["new_token"][0].item() == 53031
+    # the batch list after a stop dropped p1: row 0 still belongs to p1, not p3
+    shrunk = Worker._rows_to_per_rid(host, ["p3"])
+    assert shrunk["p3"]["new_token"][0].item() == 248046, (
+        "slicing by the shrunk list is the bug: p3 would stop on p1's token"
+    )
+
+
+def test_row_request_ids_default_none_and_survive_a_single_merge():
+    a = BatchedModelOutput(per_rid_outputs={"a": {}, "b": {}})
+    assert a.row_request_ids is None
+    b = BatchedModelOutput(
+        per_rid_outputs={"a": {}, "b": {}},
+        check_stop_buffers={"new_token": torch.tensor([1, 2])},
+        row_request_ids=("a", "b"),
+    )
+    a.update(b)
+    assert a.row_request_ids == ("a", "b")
+    assert a.check_stop_buffers["new_token"].tolist() == [1, 2]
+
+
+def test_merging_two_row_addressed_outputs_drops_the_buffers():
+    """Two forwards merged into one output cannot share one row-addressed
+    buffer, so the merge keeps neither and the stop check falls back to the
+    per-rid outputs, which are always present."""
+    merged = BatchedModelOutput(per_rid_outputs={"a": {}, "b": {}})
+    merged.update(BatchedModelOutput(
+        per_rid_outputs={"a": {"new_token": [torch.tensor([1])]}},
+        check_stop_buffers={"new_token": torch.tensor([1])}, row_request_ids=("a",),
+    ))
+    merged.update(BatchedModelOutput(
+        per_rid_outputs={"b": {"new_token": [torch.tensor([2])]}},
+        check_stop_buffers={"new_token": torch.tensor([2])}, row_request_ids=("b",),
+    ))
+    assert merged.check_stop_buffers is None and merged.row_request_ids is None
+    assert merged.get_check_stop_input()["b"]["new_token"][0].item() == 2
