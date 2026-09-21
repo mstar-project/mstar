@@ -285,6 +285,12 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
@@ -558,6 +564,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-python-frontend">Serving (Python frontend)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
 </ul>
@@ -739,6 +746,41 @@ preprocess option emits.</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1,2,4</span></code></p></td>
 <td><p>Comma-separated batch sizes to capture. Read only when
 <code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_BATCHING=1</span></code>; otherwise only batch size 1 is captured.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_OMNIVOICE_MODEL_PATH</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>OmniVoice: load weights from this local directory instead of the
+checkpoint the registry names. For serving a fine-tune of the same
+architecture off a mounted volume, where the registry entry would
+otherwise pull the public weights from the Hub.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="serving-python-frontend">
+<h2>Serving (Python frontend)<a class="headerlink" href="#serving-python-frontend" title="Link to this heading">#</a></h2>
+<p>Read by <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code> / <code class="docutils literal notranslate"><span class="pre">mstar.api_server.entrypoint</span></code>.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 28.0%" />
+<col style="width: 14.0%" />
+<col style="width: 58.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ROOT_PATH</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&quot;&quot;</span></code></p></td>
+<td><p>Mount the app under a URL sub-path. Set it when an ingress routes the
+deployment at a prefix and does not strip that prefix before the
+request reaches the pod (Run:AI serves a workload at
+<code class="docutils literal notranslate"><span class="pre">/&lt;project&gt;/&lt;job-name&gt;/</span></code>, for instance); without it FastAPI 404s
+every route. Empty by default, so a direct deployment is unaffected.</p></td>
 </tr>
 </tbody>
 </table>
@@ -930,6 +972,7 @@ worker main loop (speculate, await_gpu, submit_spec, …).</p></td>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-python-frontend">Serving (Python frontend)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-frontend-limitations">Rust frontend limitations</a></li>
 </ul>

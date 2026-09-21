@@ -33,6 +33,7 @@
    higgs_audio
    loader
    multimodal
+   omnivoice
    orpheus
    pi05
    qwen3_omni

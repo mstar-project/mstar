@@ -285,6 +285,12 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
@@ -561,6 +567,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-from-source">Install from source</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-dependencies">Optional dependencies</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-libraries">GPU libraries</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-omnivoice">omnivoice (OmniVoice)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#no-matching-wheel-build-from-source">No matching wheel — build from source</a></li>
 </ul>
@@ -674,22 +681,27 @@ see <a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen
 <td><p>Orpheus TTS runtime: <code class="docutils literal notranslate"><span class="pre">transformers</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
 <code class="docutils literal notranslate"><span class="pre">einops</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[pi05]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[omnivoice]</span></code></p></td>
+<td><p>OmniVoice TTS. The extra is empty on purpose: the runtime is the
+<code class="docutils literal notranslate"><span class="pre">omnivoice</span></code> package, installed separately from git —
+see <a class="reference internal" href="#omnivoice-omnivoice">omnivoice (OmniVoice)</a>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[pi05]</span></code></p></td>
 <td><p>Pi0.5 runtime: <code class="docutils literal notranslate"><span class="pre">transformers</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
 <code class="docutils literal notranslate"><span class="pre">triton</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[vjepa2]</span></code> / <code class="docutils literal notranslate"><span class="pre">.[vjepa2_ac]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[vjepa2]</span></code> / <code class="docutils literal notranslate"><span class="pre">.[vjepa2_ac]</span></code></p></td>
 <td><p>V-JEPA 2 runtime: <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>, <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>,
 <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code> (<code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code> also adds <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[audio]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[audio]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">soundfile</span></code> — only needed to return <strong>non-WAV</strong> audio containers (mp3/flac/…)
 from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[dev]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[dev]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">ruff</span></code> + <code class="docutils literal notranslate"><span class="pre">pytest</span></code> for linting and the test suite.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[all]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[all]</span></code></p></td>
 <td><p>The union of every model extra above — installs the full runtime for all model
 families in one shot. Convenient for a machine that serves multiple models; heavier
 and slower to install than a single family’s extra. (Still excludes <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> —
@@ -734,6 +746,24 @@ instead (see <a class="reference internal" href="serving.html"><span class="doc"
 <p>Apart from <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>, these are installed by the extras above. Your installed <code class="docutils literal notranslate"><span class="pre">torch</span></code>
 must match your system CUDA toolkit — <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code> handles that for you (next
 section).</p>
+</section>
+<section id="omnivoice-omnivoice">
+<h2>omnivoice (OmniVoice)<a class="headerlink" href="#omnivoice-omnivoice" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">omnivoice</span></code> is only needed for <strong>OmniVoice</strong>, and it is <strong>not</strong> pulled in by
+<code class="docutils literal notranslate"><span class="pre">.[omnivoice]</span></code> or <code class="docutils literal notranslate"><span class="pre">.[all]</span></code> — you install it as a separate step:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="s2">"git+https://github.com/k2-fsa/OmniVoice.git"</span>
+</pre></div>
+</div>
+<p>It has to come from git rather than PyPI: the released package has no
+<code class="docutils literal notranslate"><span class="pre">omnivoice.models.omnivoice_flashinfer</span></code>, and that is the packed-attention
+forward mstar’s graph calls, so a PyPI install fails at model load with
+<code class="docutils literal notranslate"><span class="pre">ImportError:</span> <span class="pre">cannot</span> <span class="pre">import</span> <span class="pre">name</span> <span class="pre">'omnivoice_flashinfer'</span></code>. A direct git URL
+cannot live in <code class="docutils literal notranslate"><span class="pre">pyproject.toml</span></code> either, because PyPI rejects any
+<code class="docutils literal notranslate"><span class="pre">requires_dist</span></code> entry carrying one, which is why this is an install step
+and not a dependency. Verify with:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"from omnivoice.models import omnivoice_flashinfer; print('ok')"</span>
+</pre></div>
+</div>
 </section>
 <section id="flash-attn-qwen3-omni">
 <h2>flash-attn (Qwen3-Omni)<a class="headerlink" href="#flash-attn-qwen3-omni" title="Link to this heading">#</a></h2>
@@ -959,6 +989,7 @@ Boxes with no system cuDNN, or a matching one, are unaffected, as are CUDA 13 in
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#install-from-source">Install from source</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-dependencies">Optional dependencies</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gpu-libraries">GPU libraries</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-omnivoice">omnivoice (OmniVoice)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#no-matching-wheel-build-from-source">No matching wheel — build from source</a></li>
 </ul>

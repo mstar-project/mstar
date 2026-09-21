@@ -638,6 +638,12 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
@@ -1225,6 +1231,69 @@ window.runMermaid = runMermaid;</script>
 
 
 
+
+<div class="viewcode-block" id="OmniVoiceAdapter">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OmniVoiceAdapter">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">OmniVoiceAdapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""OmniVoice: zero-shot TTS in three modes over one endpoint.</span>
+
+<span class="sd">    Mode follows from what the caller sends, as it does in the reference:</span>
+<span class="sd">    ``ref_audio`` + ``ref_text`` clones a voice, ``instruct`` designs one from a</span>
+<span class="sd">    description, and neither lets the model pick. ``voice`` is accepted as an</span>
+<span class="sd">    alias for ``instruct`` so an OpenAI client that only knows the standard</span>
+<span class="sd">    field can still reach voice design.</span>
+
+<span class="sd">    ``speed`` is a real OmniVoice knob (it scales the estimated duration), so</span>
+<span class="sd">    unlike the other speech adapters it is forwarded rather than dropped. The</span>
+<span class="sd">    decoding knobs -- ``num_step``, ``guidance_scale``, ``t_shift``,</span>
+<span class="sd">    ``language``, ``duration``, the two temperatures -- arrive through</span>
+<span class="sd">    ``extra_body`` and stay per-request all the way to the unmask loop.</span>
+
+<span class="sd">    ``temperature`` / ``top_p`` are NOT mapped: OmniVoice does not sample one</span>
+<span class="sd">    token per position, it ranks the whole canvas by confidence. The nearest</span>
+<span class="sd">    knobs are ``class_temperature`` (which token) and ``position_temperature``</span>
+<span class="sd">    (which cell reveals next), and silently aliasing the OpenAI fields onto</span>
+<span class="sd">    either would mislead.</span>
+<span class="sd">    """</span>
+
+    <span class="n">supports_speech</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="OmniVoiceAdapter.speech_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OmniVoiceAdapter.speech_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">speech_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">SpeechRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
+        <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"voice"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">mk</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"instruct"</span><span class="p">):</span>
+            <span class="n">mk</span><span class="p">[</span><span class="s2">"instruct"</span><span class="p">]</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">voice</span>
+        <span class="n">mk</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"voice"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"speed"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"speed"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">speed</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"seed"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
+
+        <span class="n">file_paths</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">ref_audio</span> <span class="o">=</span> <span class="n">mk</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"ref_audio"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">input_modalities</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">ref_audio</span><span class="p">:</span>
+            <span class="c1"># A data URL, a base64 blob, a local path or (when allowed) a URL.</span>
+            <span class="n">path</span><span class="p">,</span> <span class="n">_mime</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">resolve_media_ref</span><span class="p">(</span>
+                <span class="n">ref_audio</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">,</span> <span class="n">allow_remote</span><span class="o">=</span><span class="kc">True</span>
+            <span class="p">)</span>
+            <span class="c1"># Keyed by modality: the data worker iterates the dict and</span>
+            <span class="c1"># loads each group through the matching loader.</span>
+            <span class="n">file_paths</span> <span class="o">=</span> <span class="p">{</span><span class="s2">"audio"</span><span class="p">:</span> <span class="p">[</span><span class="n">path</span><span class="p">]}</span>
+            <span class="n">input_modalities</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">]</span>
+
+        <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">input</span><span class="p">,</span>
+            <span class="n">file_paths</span><span class="o">=</span><span class="n">file_paths</span><span class="p">,</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="n">input_modalities</span><span class="p">,</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"audio"</span><span class="p">],</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="Cosmos3Adapter">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Cosmos3Adapter">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3Adapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
@@ -1369,6 +1438,7 @@ window.runMermaid = runMermaid;</script>
 <span class="n">ADAPTER_REGISTRY</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">OpenAIAdapter</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
     <span class="s2">"bagel"</span><span class="p">:</span> <span class="n">BagelAdapter</span><span class="p">(),</span>
     <span class="s2">"qwen3_omni"</span><span class="p">:</span> <span class="n">Qwen3OmniAdapter</span><span class="p">(),</span>
+    <span class="s2">"omnivoice"</span><span class="p">:</span> <span class="n">OmniVoiceAdapter</span><span class="p">(),</span>
     <span class="s2">"orpheus"</span><span class="p">:</span> <span class="n">OrpheusAdapter</span><span class="p">(),</span>
     <span class="s2">"cosmos3"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
     <span class="s2">"cosmos3_droid"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>

@@ -285,6 +285,12 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.omnivoice.submodules.html">mstar.model.omnivoice.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
@@ -571,6 +577,11 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.video_to_request"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.video_to_request()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter"><code class="docutils literal notranslate"><span class="pre">OmniVoiceAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter.speech_to_request"><code class="docutils literal notranslate"><span class="pre">OmniVoiceAdapter.speech_to_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter.supports_speech"><code class="docutils literal notranslate"><span class="pre">OmniVoiceAdapter.supports_speech</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.chat_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.chat_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.image_edit_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.image_edit_to_request()</span></code></a></li>
@@ -666,19 +677,22 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Cosmos3Adapter" title="mstar.api_server.openai.adapters.Cosmos3Adapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3Adapter</span></code></a>()</p></td>
 <td><p>NVIDIA Cosmos3: text-to-image and text/image-to-video generation.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OpenAIAdapter" title="mstar.api_server.openai.adapters.OpenAIAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter" title="mstar.api_server.openai.adapters.OmniVoiceAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OmniVoiceAdapter</span></code></a>()</p></td>
+<td><p>OmniVoice: zero-shot TTS in three modes over one endpoint.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OpenAIAdapter" title="mstar.api_server.openai.adapters.OpenAIAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a>()</p></td>
 <td><p>Base adapter.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OrpheusAdapter" title="mstar.api_server.openai.adapters.OrpheusAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OrpheusAdapter</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OrpheusAdapter" title="mstar.api_server.openai.adapters.OrpheusAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OrpheusAdapter</span></code></a>()</p></td>
 <td><p>Orpheus: text-to-speech (audio out only).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter" title="mstar.api_server.openai.adapters.Qwen3OmniAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Qwen3OmniAdapter</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter" title="mstar.api_server.openai.adapters.Qwen3OmniAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Qwen3OmniAdapter</span></code></a>()</p></td>
 <td><p>Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SubmitArgs</span></code></a>(text, file_paths, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SubmitArgs</span></code></a>(text, file_paths, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Wan22Adapter" title="mstar.api_server.openai.adapters.Wan22Adapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Wan22Adapter</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Wan22Adapter" title="mstar.api_server.openai.adapters.Wan22Adapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Wan22Adapter</span></code></a>()</p></td>
 <td><p>Wan2.2-TI2V-5B: text/image-to-video generation (video only).</p></td>
 </tr>
 </tbody>
@@ -802,6 +816,49 @@ and for video <code class="docutils literal notranslate"><span class="pre">num_f
 </dd>
 </dl>
 </dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OmniVoiceAdapter">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.adapters.</span></span><span class="sig-name descname"><span class="pre">OmniVoiceAdapter</span></span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#OmniVoiceAdapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.api_server.openai.adapters.OpenAIAdapter" title="mstar.api_server.openai.adapters.OpenAIAdapter"><code class="xref py py-class docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a></p>
+<p>OmniVoice: zero-shot TTS in three modes over one endpoint.</p>
+<p>Mode follows from what the caller sends, as it does in the reference:
+<code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> + <code class="docutils literal notranslate"><span class="pre">ref_text</span></code> clones a voice, <code class="docutils literal notranslate"><span class="pre">instruct</span></code> designs one from a
+description, and neither lets the model pick. <code class="docutils literal notranslate"><span class="pre">voice</span></code> is accepted as an
+alias for <code class="docutils literal notranslate"><span class="pre">instruct</span></code> so an OpenAI client that only knows the standard
+field can still reach voice design.</p>
+<p><code class="docutils literal notranslate"><span class="pre">speed</span></code> is a real OmniVoice knob (it scales the estimated duration), so
+unlike the other speech adapters it is forwarded rather than dropped. The
+decoding knobs – <code class="docutils literal notranslate"><span class="pre">num_step</span></code>, <code class="docutils literal notranslate"><span class="pre">guidance_scale</span></code>, <code class="docutils literal notranslate"><span class="pre">t_shift</span></code>,
+<code class="docutils literal notranslate"><span class="pre">language</span></code>, <code class="docutils literal notranslate"><span class="pre">duration</span></code>, the two temperatures – arrive through
+<code class="docutils literal notranslate"><span class="pre">extra_body</span></code> and stay per-request all the way to the unmask loop.</p>
+<p><code class="docutils literal notranslate"><span class="pre">temperature</span></code> / <code class="docutils literal notranslate"><span class="pre">top_p</span></code> are NOT mapped: OmniVoice does not sample one
+token per position, it ranks the whole canvas by confidence. The nearest
+knobs are <code class="docutils literal notranslate"><span class="pre">class_temperature</span></code> (which token) and <code class="docutils literal notranslate"><span class="pre">position_temperature</span></code>
+(which cell reveals next), and silently aliasing the OpenAI fields onto
+either would mislead.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OmniVoiceAdapter.speech_to_request">
+<span class="sig-name descname"><span class="pre">speech_to_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#OmniVoiceAdapter.speech_to_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter.speech_to_request" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>req</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest" title="mstar.api_server.openai.protocol.SpeechRequest"><em>SpeechRequest</em></a>)</p></li>
+<li><p><strong>upload_dir</strong> (<em>Path</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs">SubmitArgs</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OmniVoiceAdapter.supports_speech">
+<span class="sig-name descname"><span class="pre">supports_speech</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter.supports_speech" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 </dd></dl>
 
@@ -1190,6 +1247,11 @@ apply their own prompt formatting in <code class="docutils literal notranslate">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.supports_images"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.supports_images</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.supports_videos"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.supports_videos</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3Adapter.video_to_request"><code class="docutils literal notranslate"><span class="pre">Cosmos3Adapter.video_to_request()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter"><code class="docutils literal notranslate"><span class="pre">OmniVoiceAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter.speech_to_request"><code class="docutils literal notranslate"><span class="pre">OmniVoiceAdapter.speech_to_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter.supports_speech"><code class="docutils literal notranslate"><span class="pre">OmniVoiceAdapter.supports_speech</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
