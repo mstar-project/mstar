@@ -56,13 +56,35 @@ class SpecBlocks(NamedTuple):
 
 
 def _fla_conv_state(
-    state: torch.Tensor, slot_ids: torch.Tensor, has_state: torch.Tensor, dtype: torch.dtype,
+    state: torch.Tensor, slot_ids: torch.Tensor, mask: torch.Tensor, dtype: torch.dtype,
 ) -> torch.Tensor:
     """The rows' conv windows as fla wants them, ``[N, D, W]``: a zero (dead) oldest column in front
-    of the pool's ``W - 1`` kept inputs, zeroed where the row has no state yet."""
-    kept = state.index_select(0, slot_ids) * has_state[:, None, None].to(state.dtype)
+    of the pool's ``W - 1`` kept inputs, zeroed where the row has no state yet (``mask`` is the plan's
+    ``state_mask`` in the pool's dtype)."""
+    kept = state.index_select(0, slot_ids) * mask[:, None, None]
     n, d, s = kept.shape
     return torch.cat([kept.new_zeros(n, d, 1), kept], dim=-1).to(dtype)
+
+
+# fla's chunk size for the varlen convolution and the chunked scan (its default; the parity tests against the
+# torch reference fail loudly if it ever moves)
+FLA_CHUNK = 64
+
+
+def _fla_chunk_indices(plan, chunk_size: int = FLA_CHUNK) -> torch.Tensor:
+    """fla's ``[NT, 2]`` int64 (row, chunk) table for the plan's packed rows, built on the host from the plan's
+    boundaries and copied in once per plan (pinned, asynchronous). Handed to the kernels so they skip
+    ``prepare_chunk_indices``, which rebuilds it from the device boundaries with two host syncs
+    (``torch.repeat_interleave`` reads the total and checks the sign) whenever its identity-keyed cache
+    misses; a fresh ``cu_seqlens`` conversion per layer made it miss at every KDA layer of a prefill."""
+    def build():
+        cu = plan.cu_seqlens_cpu
+        table = [(n, i) for n in range(plan.num_rows) for i in range(-(-(cu[n + 1] - cu[n]) // chunk_size))]
+        host = torch.tensor(table, dtype=torch.long).reshape(-1, 2)
+        if plan.cu_seqlens.is_cuda:
+            return host.pin_memory().to(plan.cu_seqlens.device, non_blocking=True)
+        return host
+    return plan.cached(("fla_chunks", chunk_size), build)
 
 
 class FLAKDAKernels:
@@ -131,25 +153,27 @@ class FLAKDAKernels:
                 lower_bound=p.lower_bound,
             )[0]
             return o.view(rows, h, d)
-        # prefill: varlen over the packed rows with gathered initial states
-        slot_ids = plan.slot_ids[:rows].to(torch.long)
-        has_state = plan.has_state[:rows]
-        cu = plan.cu_seqlens[: rows + 1].to(torch.long)
+        # prefill: varlen over the packed rows with gathered initial states. The int64 indices, the state mask
+        # and fla's chunk table come from the plan, built once a step for all the layers (KDAPlan.cached); the
+        # host copy of the boundaries keeps fla's own bookkeeping off the device
+        slot_ids = plan.slot_ids_long()
+        cu, cu_host = plan.cu_seqlens_long(), plan.cu_seqlens_host()
         y, conv_final = self._conv(
             qkv.view(1, t, -1), weight=conv_w, output_final_state=True, activation="silu", cu_seqlens=cu,
-            initial_state=_fla_conv_state(conv_state, slot_ids, has_state, qkv.dtype),
+            cu_seqlens_cpu=cu_host, chunk_indices=_fla_chunk_indices(plan),
+            initial_state=_fla_conv_state(conv_state, slot_ids, plan.state_mask(conv_state.dtype), qkv.dtype),
         )
         conv_state.index_copy_(0, slot_ids, conv_final[..., 1:].to(conv_state.dtype))
         y3 = y.view(t, 3, h * d).transpose(0, 1).contiguous()  # one copy, three contiguous views
         q, k, v = y3[0], y3[1], y3[2]
-        rec_init = rec_state.index_select(0, slot_ids) * has_state[:, None, None, None].to(rec_state.dtype)
+        rec_init = rec_state.index_select(0, slot_ids) * plan.state_mask(rec_state.dtype)[:, None, None, None]
         o, rec_final = self._chunk(
             q=q.view(1, t, h, d), k=k.view(1, t, h, d), v=v.view(1, t, h, d),
             g=g_raw.view(1, t, h, d), beta=beta_raw.view(1, t, h),
             A_log=p.A_log, dt_bias=p.dt_bias, initial_state=rec_init.float(), output_final_state=True,
             use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, use_beta_sigmoid_in_kernel=True,
             safe_gate=p.lower_bound is not None, lower_bound=p.lower_bound, state_v_first=True,
-            cu_seqlens=cu,
+            cu_seqlens=cu, cu_seqlens_cpu=cu_host,
         )
         rec_state.index_copy_(0, slot_ids, rec_final.to(rec_state.dtype))
         return o.view(t, h, d)
@@ -213,18 +237,19 @@ class FlashKDAKernels(FLAKDAKernels):
             return super().run_paged(qkv, g_raw, beta_raw, plan, conv_state, rec_state, p)
         h, d = p.num_heads, p.head_dim
         rows = plan.num_rows
-        slot_ids = plan.slot_ids[:rows].to(torch.long)
-        has_state = plan.has_state[:rows]
         t = qkv.shape[0]
         conv_w = p.conv_weight.to(qkv.dtype)
-        cu = plan.cu_seqlens[: rows + 1].to(torch.long)
+        # the indices, the mask and fla's chunk table come from the plan, once a step (see FLAKDAKernels)
+        slot_ids = plan.slot_ids_long()
+        cu = plan.cu_seqlens_long()
         y, conv_final = self._conv(
             qkv.view(1, t, -1), weight=conv_w, output_final_state=True, activation="silu", cu_seqlens=cu,
-            initial_state=_fla_conv_state(conv_state, slot_ids, has_state, qkv.dtype),
+            cu_seqlens_cpu=plan.cu_seqlens_host(), chunk_indices=_fla_chunk_indices(plan),
+            initial_state=_fla_conv_state(conv_state, slot_ids, plan.state_mask(conv_state.dtype), qkv.dtype),
         )
         conv_state.index_copy_(0, slot_ids, conv_final[..., 1:].to(conv_state.dtype))
         q, k, v = y.view(t, -1).split([h * d, h * d, h * d], dim=-1)
-        rec_init = (rec_state.index_select(0, slot_ids) * has_state[:, None, None, None].to(rec_state.dtype))
+        rec_init = rec_state.index_select(0, slot_ids) * plan.state_mask(rec_state.dtype)[:, None, None, None]
         rec_init = rec_init.float().contiguous()
         rec_final = torch.empty_like(rec_init)
         out = torch.empty(1, t, h, d, dtype=torch.bfloat16, device=qkv.device)
@@ -234,7 +259,7 @@ class FlashKDAKernels(FLAKDAKernels):
             beta_raw.view(1, t, h).to(torch.bfloat16).contiguous(), float(p.scale), out,
             p.A_log.float().contiguous(), p.dt_bias.float().view(h, d).contiguous(), float(p.lower_bound),
             initial_state=rec_init, final_state=rec_final,
-            cu_seqlens=cu.to(torch.int32), workspace=self._get_workspace(t, h, rows, qkv.device),
+            cu_seqlens=cu, workspace=self._get_workspace(t, h, rows, qkv.device),
         )
         rec_state.index_copy_(0, slot_ids, rec_final.to(rec_state.dtype))
         return out.view(t, h, d).to(qkv.dtype)
