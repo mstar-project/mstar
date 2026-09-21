@@ -350,12 +350,18 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
     """Gemma3 talker: one agent text token -> ``num_quantizers`` RVQ codes.
 
     The MoG / MaskGIT / CFG sampling is internal (not the engine's categorical
-    sampler), and the talker keeps its own KV + CFG-unconditional state per
-    request in ``PerRequestState``. Declares no resources yet; putting its KV on
-    the engine's KV pool is the next step.
+    sampler). Every live session is advanced in ONE backbone pass per step
+    (``EarTTSTalker.infer_codes_batched``: caches right-padded and masked,
+    per-row RoPE positions, per-row seeded noise so a session's audio does not
+    depend on who shares its batch). The per-session KV still lives in
+    ``PerRequestState``; putting it on the KV pool is what removes the padding
+    copies and unlocks a CUDA graph.
     """
 
     disable_torch_compile = True
+
+    STATE_KEY = "talker_state"
+    GEN_KEY = "talker_gen"
 
     def __init__(self, talker: nn.Module, config: NemotronDuplexConfig,
                  subword_to_char: dict | None = None, char_pad_idx: int | None = None):
@@ -365,66 +371,70 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         self._s2c = subword_to_char
         self._char_pad = char_pad_idx
 
-    def _step(self, state, text_tok: int, device, generator):
-        """One talker frame: agent text token -> ``num_quantizers`` RVQ codes.
-        ``state`` is the per-request talker state (``None`` warms up from the
-        speaker prompt). Returns ``(codes (num_q,), new_state)``; same math as
-        ``DuplexStream._talker_codec_frame`` (the verified streaming path)."""
-        cfg, talker = self.config, self.talker
-        if state is None:
-            state = talker.init_state(
-                1, speaker="Aria", device=device,
-                subword_id_to_char_ids=self._s2c, char_pad_idx=self._char_pad,
-                text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id,
-                speech_pad_id=cfg.eartts.codebook_size,
-            )
-            prev = state.get("prev_codes")
-            state["_prev_codes"] = prev if prev is not None else talker.initial_prev_codes(1, device=device)
-        cur = torch.tensor([[text_tok]], device=device)
-        cond = talker.text_conditioning(cur, torch.ones_like(cur, dtype=torch.bool), self._s2c, self._char_pad)
-        codes, new_state = talker.infer_codes_one_step(
-            state, cur, cur, state["_prev_codes"], cond=cond, text_eos_id=cfg.text_eos_id,
-            num_iter=cfg.eartts.inference_num_iter, guidance_scale=cfg.eartts.inference_guidance_scale,
-            noise_scale=cfg.eartts.inference_noise_scale, top_p=cfg.eartts.inference_top_p,
-            generator=generator,
-        )
-        new_state["_prev_codes"] = codes
-        return codes.squeeze(0), new_state
-
-    def _request_step(self, st, text_tok: int, device) -> torch.Tensor:
-        """Advance one request (state carried in its PerRequestState) -> codes."""
-        state = st.get("talker_state")
-        gen = st.get("talker_gen")
-        if gen is None:
-            gen = torch.Generator(device=device).manual_seed(self.config.eartts.inference_seed)
-            st.add("talker_gen", gen)
-        codes, state = self._step(state, text_tok, device, gen)
-        st.add("talker_state", state)
-        return codes
-
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> ARNodeInputs:
         # The LLM streams the sampled agent text token under "new_token".
         tok = inputs["new_token"][0]
         return ARNodeInputs(input_ids=tok.reshape(1), input_seq_len=1)
 
     def preprocess(self, graph_walk, engine_inputs, inputs):
-        # Host read of the token ids: the talker's text conditioning is built
-        # per token on the host. Eager-only; goes away with the batched talker.
-        return {"tokens": [int(inp.input_ids.reshape(-1)[0].item()) for inp in inputs]}
+        # One device-to-host copy for the whole batch: the text conditioning is
+        # built from host-side char ids. Eager-only; goes with the KV-pool talker.
+        ids = torch.cat([inp.input_ids.reshape(-1)[:1] for inp in inputs])
+        return {"tokens": ids.tolist()}
 
     def can_batch(self, batch, model_inputs) -> bool:
         return True
+
+    def _warm_up(self, rids: list[str], device: torch.device) -> None:
+        """Warm the new sessions' caches from the speaker prompt in one batched
+        ``init_state`` (they share the speaker), and seed each session's RNG."""
+        fresh = [rid for rid in rids if self.request_state(rid).get(self.STATE_KEY) is None]
+        if not fresh:
+            return
+        cfg, talker = self.config, self.talker
+        state = talker.init_state(
+            len(fresh), speaker="Aria", device=device,
+            subword_id_to_char_ids=self._s2c, char_pad_idx=self._char_pad,
+            text_pad_id=cfg.text_pad_id, text_eos_id=cfg.text_eos_id,
+            speech_pad_id=cfg.eartts.codebook_size,
+        )
+        prev = state.get("prev_codes")
+        if prev is None:
+            prev = talker.initial_prev_codes(len(fresh), device=device)
+        for i, rid in enumerate(fresh):
+            st = self.request_state(rid)
+            st.add(self.STATE_KEY, {
+                "kv": [(k[i:i + 1], v[i:i + 1]) for k, v in state["kv"]],
+                "kv_uncond": (
+                    [(k[i:i + 1], v[i:i + 1]) for k, v in state["kv_uncond"]]
+                    if state.get("kv_uncond") is not None else None
+                ),
+                "pos": state["pos"],
+                "_prev_codes": prev[i:i + 1],
+            })
+            st.add(self.GEN_KEY, torch.Generator(device=device).manual_seed(cfg.eartts.inference_seed))
 
     def forward(self, graph_walk, engine_inputs, tokens=None, **kwargs) -> NameToTensorList:
         return self.forward_batched(graph_walk, engine_inputs, tokens=tokens)[engine_inputs.request_ids[0]]
 
     def forward_batched(self, graph_walk, engine_inputs, tokens=None, **kwargs) -> dict[str, NameToTensorList]:
-        dev = self.talker.embed_code.weight.device
-        out: dict[str, NameToTensorList] = {}
-        for i, rid in enumerate(engine_inputs.request_ids):
-            codes = self._request_step(engine_inputs.per_request_states[rid], tokens[i], dev)
-            out[rid] = {"codec_tokens": [codes]}
-        return out
+        cfg, talker = self.config, self.talker
+        dev = talker.embed_code.weight.device
+        rids = list(engine_inputs.request_ids)
+        self._warm_up(rids, dev)
+        states = [self.request_state(rid)[self.STATE_KEY] for rid in rids]
+        gens = [self.request_state(rid)[self.GEN_KEY] for rid in rids]
+        conds = talker.text_conditioning_from_ids(tokens, self._s2c, self._char_pad)     # [N, 1, H]
+        ids = torch.tensor(tokens, dtype=torch.long, device=dev)
+        codes, new_states = talker.infer_codes_batched(
+            states, ids, conds, text_eos_id=cfg.text_eos_id,
+            num_iter=cfg.eartts.inference_num_iter, guidance_scale=cfg.eartts.inference_guidance_scale,
+            noise_scale=cfg.eartts.inference_noise_scale, top_p=cfg.eartts.inference_top_p,
+            generators=gens,
+        )
+        for rid, ns in zip(rids, new_states, strict=True):
+            self.request_state(rid).add(self.STATE_KEY, ns)
+        return {rid: {"codec_tokens": [codes[i]]} for i, rid in enumerate(rids)}
 
 
 class AudioCodecDecoderSubmodule(NodeSubmodule):
