@@ -1,2 +1,2 @@
-"""Nemotron-VoiceChat components: the Nemotron-H backbone (implemented),
-and the Conformer STT encoder / EarTTS talker + RVQ codec (Phase 4/5 stubs)."""
+"""Nemotron-VoiceChat components: the Nemotron-H backbone, the Fast-Conformer
+STT perception + RNN-T head, the EarTTS talker and the RVQ audio codec."""
