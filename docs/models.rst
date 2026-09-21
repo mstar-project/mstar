@@ -302,7 +302,9 @@ per listed ``[height, width]`` and batch size; other shapes run the eager batche
 autotuning: 89 to 29 ms at 1024² on an H100; its fused reductions move the image by about 55 dB
 PSNR from the eager decode on every prompt, and the autotuner may pick other conv kernels in
 another server process, so set it to ``false`` for bit-exact, repeatable output; the parity
-suite runs with it off). With the klein defaults every served image is within 53 dB of the eager
+suite runs with it off; the compiled decode is warmed at load for the ``capture_sizes`` grids
+and the decode batch sizes, and any other latent shape decodes eagerly rather than paying a
+40 to 100 s autotune inside a request). With the klein defaults every served image is within 53 dB of the eager
 path on all 100 protocol prompts, and with ``vae_compile: false`` it is bit-exact. Z-Image ships
 the plain compile (``compile_exact_ops: false``: 0.86 s at B=1, a median 34 dB from the eager path)
 because keeping its 180 norms per step eager costs 45% (1.25 s); ``compile_exact_ops: [norms]``
