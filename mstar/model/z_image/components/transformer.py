@@ -23,7 +23,6 @@ import math
 from collections.abc import Mapping
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
@@ -38,6 +37,9 @@ class ScaledRMSNorm(nn.Module):
     """diffusers ``RMSNorm``: ``x * rsqrt(mean(x^2) + eps)`` with an fp32 variance, cast to
     the weight's (half) dtype, then ``* weight``. Differs from ``torch.nn.RMSNorm`` in the
     last bit under bf16, which the port has to reproduce."""
+
+    # a norm the compiled transformer may keep eager (``exclude_from_compile``)
+    compile_exact_op = True
 
     def __init__(self, dim: int, eps: float):
         super().__init__()
@@ -112,10 +114,11 @@ class ZImageFeedForward(nn.Module):
         self.hidden = hidden
         self.w13 = FusedColumnLinear(dim, {"w1": hidden, "w3": hidden}, bias=False)
         self.w2 = nn.Linear(hidden, dim, bias=False)
+        self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.w13(x).split(self.hidden, dim=-1)
-        return self.w2(F.silu(gate) * up)
+        return self.w2(self.act(gate) * up)
 
 
 # The three spans a forward attends over: the noise refiner over the (padded) image tokens
@@ -169,6 +172,7 @@ class ZImageDiT(nn.Module):
         self.freq_dim = TIMESTEP_FREQ_DIM
         self.time_in = nn.Linear(self.freq_dim, config.t_mid_size, bias=True)
         self.time_out = nn.Linear(config.t_mid_size, config.adaln_dim, bias=True)
+        self.time_act = nn.SiLU()
         self.x_embedder = nn.Linear(config.patch_dim, dim, bias=True)
         self.cap_norm = ScaledRMSNorm(config.cap_feat_dim, config.norm_eps)
         self.cap_proj = nn.Linear(config.cap_feat_dim, dim, bias=True)
@@ -179,6 +183,7 @@ class ZImageDiT(nn.Module):
         self.layers = nn.ModuleList(ZImageBlock(config, True) for _ in range(config.n_layers))
         self.final_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.final_mod = nn.Linear(config.adaln_dim, dim, bias=True)
+        self.final_act = nn.SiLU()
         self.final_proj = nn.Linear(dim, config.patch_dim, bias=True)
 
     @property
@@ -189,7 +194,7 @@ class ZImageDiT(nn.Module):
         """``adaln_input [B, 256]`` from ``t = 1 - sigma`` (fp32): scaled by ``t_scale``, sinusoidal
         features cast to the weight dtype, then the two-layer MLP."""
         features = timestep_features(t * self.config.t_scale, self.freq_dim).to(self.dtype)
-        return self.time_out(F.silu(self.time_in(features)))
+        return self.time_out(self.time_act(self.time_in(features)))
 
     def forward(
         self,
@@ -225,7 +230,7 @@ class ZImageDiT(nn.Module):
         freqs = torch.cat([image_freqs, caption_freqs], dim=0)
         for block in self.layers:
             unified = block(unified, freqs, adaln_input, attn.get(MAIN_SPAN))
-        scale = 1.0 + self.final_mod(F.silu(adaln_input))
+        scale = 1.0 + self.final_mod(self.final_act(adaln_input))
         out = self.final_norm(unified) * scale.unsqueeze(1)
         return self.final_proj(out)[:, :num_image]
 
