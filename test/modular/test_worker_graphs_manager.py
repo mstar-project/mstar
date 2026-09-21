@@ -10,12 +10,15 @@ Covers:
 
 import pytest
 
+from mstar.communication.tensor_store import TensorStore
+from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.conductor.request_info import (
     CurrentForwardPassInfo,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
+from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.runtime.base import RouteInput
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
@@ -183,7 +186,7 @@ def test_mark_node_complete_returns_node_completion_output():
     ])
     assert leftovers == []  # prefill is in this wg, edge claimed
 
-    completion = mgr.mark_node_complete(rid, wg_id, "prefill")
+    completion = runtime._mark_node_complete(rid, wg_id, "prefill")
     # Top-level GraphNode completion returns its outputs (token + kv_cache → ar_decode)
     # with no filtered signals (prefill isn't loop-managed).
     names = sorted((e.name, e.next_node) for e in completion.output_edges)
@@ -206,7 +209,7 @@ def test_stop_loops_returns_loop_back_signal_set():
     mgr, wg_id, walk, runtime, rid = _make_manager()
     # Drive prefill → ar_decode so the loop is active.
     mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
-    mgr.mark_node_complete(rid, wg_id, "prefill")
+    runtime._mark_node_complete(rid, wg_id, "prefill")
 
     stopped = runtime._stop_loops_for_rid(
         rid, "default", {"ar_loop"}, last_node_run=None,
@@ -221,7 +224,7 @@ def test_stop_loops_returns_loop_back_signal_set():
 def test_stop_loops_snapshots_loop_stop_times_for_the_last_node_run():
     mgr, wg_id, walk, runtime, rid = _make_manager()
     mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
-    mgr.mark_node_complete(rid, wg_id, "prefill")
+    runtime._mark_node_complete(rid, wg_id, "prefill")
     fwd_info = mgr.get_fwd_info(rid, "default")
 
     runtime._stop_loops_for_rid(
@@ -240,13 +243,13 @@ def test_loop_done_drops_loop_back_and_keeps_terminal_outputs():
     signals in ``filtered_signals`` and return only the terminal outputs."""
     mgr, wg_id, walk, runtime, rid = _make_manager()
     mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
-    mgr.mark_node_complete(rid, wg_id, "prefill")
+    runtime._mark_node_complete(rid, wg_id, "prefill")
     # Route prefill's outputs back in.
     mgr.process_new_inputs(rid, [
         GraphEdge(name="token", next_node="ar_decode"),
         GraphEdge(name="kv_cache", next_node="ar_decode"),
     ])
-    mgr.mark_node_complete(rid, wg_id, "ar_decode")  # advance: iter 0 done
+    runtime._mark_node_complete(rid, wg_id, "ar_decode")  # advance: iter 0 done
 
     # Now request a stop on ar_loop, then complete the next iter.
     mgr.process_new_inputs(rid, [
@@ -254,7 +257,7 @@ def test_loop_done_drops_loop_back_and_keeps_terminal_outputs():
         GraphEdge(name="kv_cache", next_node="ar_decode"),
     ])
     runtime._stop_loops_for_rid(rid, "default", {"ar_loop"}, None)
-    completion = mgr.mark_node_complete(rid, wg_id, "ar_decode")
+    completion = runtime._mark_node_complete(rid, wg_id, "ar_decode")
 
     assert sorted(completion.filtered_signals) == [
         ("kv_cache", "ar_decode"), ("token", "ar_decode"),
@@ -278,12 +281,12 @@ def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
         outputs=[],  # no declared outputs — KV-cache-only step
     )
     wg_id = 1
-    mgr, _runtime, rid = _build(
+    mgr, runtime, rid = _build(
         empty_outputs_graph, wg_id, "prefill_text", nodes={"prefill_text"},
     )
     mgr.process_new_inputs(rid, [GraphEdge(name="text_inputs", next_node="prefill_text")])
     assert not mgr.queues[wg_id].is_done(rid)  # not done before complete
-    mgr.mark_node_complete(rid, wg_id, "prefill_text")
+    runtime._mark_node_complete(rid, wg_id, "prefill_text")
     assert mgr.queues[wg_id].is_done(rid), \
         "mark_node_complete on a no-output node must flip is_done"
 
@@ -309,13 +312,13 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
         ],
     )
     wg_id = 2
-    mgr, _runtime, rid = _build(
+    mgr, runtime, rid = _build(
         single_node_graph, wg_id, "prefill", nodes={"prefill"},
     )
     mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
-    mgr.mark_node_complete(rid, wg_id, "prefill")
+    runtime._mark_node_complete(rid, wg_id, "prefill")
 
-    routing = mgr.process_node_outputs(
+    routing = runtime._process_node_outputs(
         rid,
         node_name="prefill",
         outputs=list(mgr.queues[wg_id].per_request_queues[rid].nodes["prefill"].outputs),
@@ -334,7 +337,7 @@ def test_peer_loop_stop_is_applied_only_when_newer():
     _mgr, _wg_id, _walk, runtime, rid = _make_manager()
     mgr, wg_id = _mgr, _wg_id
     mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
-    mgr.mark_node_complete(rid, wg_id, "prefill")
+    runtime._mark_node_complete(rid, wg_id, "prefill")
     wgio = runtime.queues[wg_id].per_request_queues[rid]
 
     newer = NestedLoopIndices(
@@ -366,7 +369,7 @@ def test_pending_loop_stops_are_recorded_and_live_one_iteration():
     _mgr, _wg_id, walk, runtime, rid = _make_manager()
     mgr, wg_id = _mgr, _wg_id
     mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
-    mgr.mark_node_complete(rid, wg_id, "prefill")
+    runtime._mark_node_complete(rid, wg_id, "prefill")
 
     runtime.stop_loops_batched(
         partition="default", graph_walk=walk, last_node_run="ar_decode",
@@ -399,7 +402,7 @@ def test_peer_loop_stop_compares_enclosing_loop_indices():
     _mgr, _wg_id, _walk, runtime, rid = _make_manager()
     mgr, wg_id = _mgr, _wg_id
     mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
-    mgr.mark_node_complete(rid, wg_id, "prefill")
+    runtime._mark_node_complete(rid, wg_id, "prefill")
     wgio = runtime.queues[wg_id].per_request_queues[rid]
 
     def _at(outer_idx):
@@ -421,3 +424,120 @@ def test_peer_loop_stop_compares_enclosing_loop_indices():
     runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": _at(2)})
     assert wgio.loops["ar_loop"]._finish_signal is False, \
         "the same observation twice must not re-stop"
+
+
+# --- complete_and_route_batch -------------------------------------------------
+
+def _store_outputs(store, minter, rid, tensors):
+    """Put tensors + descriptors in the store, as the worker's prologue does,
+    and hand back the uuids. Descriptors are what let the runtime take uuids."""
+    out = {}
+    for name, tensor_list in tensors.items():
+        uuids = []
+        for tensor in tensor_list:
+            uuid = minter.mint()
+            store.put_tensor(rid, uuid, tensor, TensorPointerInfo(
+                dims=tuple(tensor.shape), dtype=tensor.dtype,
+                stride=tensor.stride(), nbytes=tensor.nbytes,
+                address=tensor.data_ptr(), uuid=uuid,
+                source_session_id="s", source_entity="worker_0",
+            ))
+            store.increment_ref(uuid, n=1)  # the safety hold
+            uuids.append(uuid)
+        out[name] = uuids
+    return out
+
+
+def test_route_batch_decodes_the_flat_rid_major_layout():
+    """num_tensors is indexed [rid_i * n_signals + signal_i]. Getting that
+    wrong silently attaches one rid's tensors to another's edges, so drive it
+    with two rids and DIFFERENT tensor counts per signal."""
+    import torch
+
+    mgr, runtime, rid_a = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    rid_b = runtime.add_request(
+        request_id="rid_b", partition="default", graph_walk="decode",
+        partition_worker_graph_ids=[0],
+        worker_graph_to_workers=ParallelList([0], [["worker0"]]),
+    )
+    mgr.add_request(
+        rid=rid_b, partition_worker_graph_ids=[0],
+        worker_graph_to_workers={0: ["worker0"]},
+        current_fwd_info=_fwd_info("decode"),
+    )
+    for rid in (rid_a, rid_b):
+        mgr.process_new_inputs(
+            rid, [GraphEdge(name="prompt", next_node="prefill")]
+        )
+
+    store, minter = TensorStore(), TensorUuidMinter("worker_0")
+    # Two signals with asymmetric counts: with one signal, or with matching
+    # counts, a rid-major and a signal-major read give the SAME answer and the
+    # test proves nothing.
+    a = _store_outputs(store, minter, rid_a, {
+        "token": [torch.ones(2), torch.ones(3)], "kv_cache": [torch.ones(4)],
+    })
+    b = _store_outputs(store, minter, rid_b, {
+        "token": [torch.ones(5)],
+        "kv_cache": [torch.ones(6), torch.ones(7), torch.ones(8)],
+    })
+    signals = ["kv_cache", "token"]  # sorted, as the worker builds it
+    flat = (
+        a["kv_cache"] + a["token"] + b["kv_cache"] + b["token"]
+    )
+    num_tensors = [
+        len(a["kv_cache"]), len(a["token"]),
+        len(b["kv_cache"]), len(b["token"]),
+    ]
+
+    out = runtime.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk="decode", node_name="prefill",
+            output_signals=signals,
+            wg_ids=ParallelList([rid_a, rid_b], [0, 0]),
+            tensors=flat,
+            num_tensors=num_tensors,
+        ),
+        store,
+    )
+    completion = runtime.take_completion(out.completion_id)
+
+    # Each rid's edges carry exactly its own uuids, per signal.
+    for rid, own in ((rid_a, a), (rid_b, b)):
+        by_signal: dict[str, list[int]] = {}
+        for edge in completion.routing[rid].routed_to_this_worker_graph:
+            by_signal.setdefault(edge.name, []).extend(
+                i.uuid for i in edge.tensor_info
+            )
+        assert by_signal == own, f"{rid} got the wrong slice of the flat list"
+
+
+def test_route_batch_parks_routing_under_a_fresh_completion_id():
+    import torch
+
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+    store, minter = TensorStore(), TensorUuidMinter("worker_0")
+    uuids = _store_outputs(store, minter, rid, {"token": [torch.ones(2)]})["token"]
+
+    out = runtime.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk="decode", node_name="prefill",
+            output_signals=["token"],
+            wg_ids=ParallelList([rid], [0]),
+            tensors=uuids, num_tensors=[1],
+        ),
+        store,
+    )
+    assert out.completion_id not in (0,), "ids start above the unset sentinel"
+    state = runtime.take_completion(out.completion_id)
+    assert state.node_name == "prefill" and state.graph_walk == "decode"
+    # Taken once: a second take must not resurrect it.
+    with pytest.raises(KeyError):
+        runtime.take_completion(out.completion_id)
