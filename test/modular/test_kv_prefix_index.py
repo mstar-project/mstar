@@ -10,6 +10,7 @@ still has D.
 from __future__ import annotations
 
 import sys
+from collections import Counter
 
 sys.path.insert(0, ".")
 
@@ -167,4 +168,53 @@ def test_eviction_stops_when_no_leaf_is_left():
     _chain(index, arena)
 
     assert index.evict(99) == 4, "eviction claimed more pages than it held"
+    _assert_pages_partition(arena)
+
+
+# ── how big the heap gets ───────────────────────────────────────────────
+
+
+def _one_entry_per_indexed_page(index: PrefixIndex) -> None:
+    entries = Counter(page for _, page in index._leaves)
+    assert set(entries) <= set(index.pages()), (
+        f"the heap still names pages the index let go of: "
+        f"{sorted(set(entries) - set(index.pages()))}"
+    )
+    assert max(entries.values(), default=0) <= 1, (
+        f"a page holds more than one heap entry: "
+        f"{sorted(page for page, count in entries.items() if count > 1)}"
+    )
+
+
+def test_lookups_of_one_leaf_leave_at_most_one_heap_entry_per_page():
+    arena = _arena()
+    index = PrefixIndex(arena)
+    (page,) = arena.acquire(1)
+    index.insert(b"k", page)
+    arena.release([page])
+
+    for _ in range(10_000):
+        index.lookup([b"k"])
+
+    assert len(index._leaves) <= len(index.pages()), (
+        f"{len(index._leaves)} heap entries for {len(index.pages())} indexed "
+        "page: every hit on a leaf pushed another one"
+    )
+
+
+def test_children_churning_under_a_held_parent_leave_it_one_heap_entry():
+    arena = _arena()
+    index = PrefixIndex(arena)
+    (parent,) = arena.acquire(1)
+    index.insert(b"parent", parent)  # and a request keeps holding it
+
+    for turn in range(200):
+        (child,) = arena.acquire(1)
+        key = f"child {turn}".encode()
+        index.insert(key, child, parent)
+        arena.release([child])
+        index.lookup([b"parent", key])
+
+        assert index.evict(1) == 1, "the one child nobody holds was not given back"
+        _one_entry_per_indexed_page(index)
     _assert_pages_partition(arena)
