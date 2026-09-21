@@ -18,6 +18,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.runtime.base import EdgeSpec, RouteInput, SpeculationPrepInput
 from mstar.graph.runtime.python import PythonGraphRuntime
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
 
@@ -582,3 +583,81 @@ def test_an_unknown_rid_has_no_sharding_config(pair):
     # rather than raising.
     rt, _book, _store = pair
     assert rt.get_sharding_config(9999) is None
+
+
+# --- a worker graph completes many times over one request --------------------
+
+@pytest.fixture(params=["python", "rust"])
+def one_node(request):
+    """A worker graph whose single node finishes it in one completion.
+
+    The main fixture runs each request through exactly one pass, so it cannot
+    see whether a finished worker graph is RESET afterwards.
+    """
+    section = GraphNode(
+        name="only", input_names={"prompt"},
+        outputs=[GraphEdge(name="out", next_node=EMIT_TO_CLIENT)],
+    )
+    wg = WorkerGraph(
+        section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: set()},
+        all_wg_ids_to_nodes={WG_ID: {"only"}},
+        node_to_partition={"only": "default"},
+        sharding_config=_sharding(),
+    )
+    if request.param == "python":
+        book = PythonTensorBookkeeping()
+        tm = _StubTensorManager(book)
+        rt = PythonGraphRuntime(
+            tensor_manager=tm, communicator=None, **common,
+        )
+        return rt, book, tm.tensor_store
+    book = RustTensorBookkeeping()
+    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
+
+
+def _one_pass(rt, book, store, rid, uuid):
+    """Drive the single node through a full pass; return the completed wgs."""
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "only")]))
+    rt.pop_rids("only", WALK, [rid])
+    book.put_tensor(uuid, _info(uuid))
+    book.increment_ref(uuid, 1)  # the safety hold
+    out = rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="only",
+            output_signals=["out"],
+            wg_ids=ParallelList([rid], [WG_ID]),
+            tensors=[uuid], num_tensors=[1],
+        ),
+        store,
+    )
+    return out
+
+
+def test_a_worker_graph_completes_on_every_pass_not_just_the_first(one_node):
+    """``is_done`` latches unless the finished graph is reset.
+
+    A worker graph runs many times over a request. Rust never called
+    RequestState::reset, so after the first completion root_entity_done
+    early-returned on is_done, node flags and loop counters never cleared, and
+    the request reported done once and could never become ready again.
+    """
+    rt, book, store = one_node
+    rid = _admit(rt)
+
+    first = _one_pass(rt, book, store, rid, uuid=1)
+    assert first.completion_id > 0
+    # The pass consumed it: nothing is ready until new input arrives.
+    assert _ready(rt) == []
+
+    # Second pass. Without the reset the node's completed flag and the
+    # worker graph's is_done both latch, so this ingest goes nowhere.
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "only")]))
+    assert _ready(rt) == [("only", WALK, [rid])], "the graph must run again"
+
+    second = _one_pass(rt, book, store, rid, uuid=2)
+    assert second.completion_id != first.completion_id

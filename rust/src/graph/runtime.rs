@@ -1555,6 +1555,14 @@ impl GraphRuntime {
             .map(|(i, &u)| (u, i))
             .collect();
 
+        // The local worker graphs live in this walk; the done-sweep below
+        // intersects each request's registered graphs with these.
+        let walk_wgs: Vec<WgIndex> = self
+            .interner
+            .get(&input.graph_walk)
+            .and_then(|w| self.walk_to_local_wgs.get(&w).cloned())
+            .unwrap_or_default();
+
         let mut out = RouteOut::default();
         let mut routing: FxHashMap<u32, Vec<RoutedEdge>> = FxHashMap::default();
         let mut completed_wgs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -1593,12 +1601,38 @@ impl GraphRuntime {
                 continue;
             };
             let (edges, _filtered, freed_inputs) = state.complete(node, &out_tensors);
-            let done = state.is_done;
-            if done {
+
+            // Sweep EVERY worker graph this request runs in this walk, not
+            // just the one owning the completed node: a wg can become done
+            // without ingesting an edge here, when the completed node's
+            // outputs all go to EMPTY_DESTINATION / EMIT_TO_CLIENT / a
+            // streaming partition (Orpheus prefill, BAGEL vae_decoder,
+            // Code2Wav).
+            //
+            // Each one that is done is RESET. A worker graph completes many
+            // times over a request, and without the reset `is_done` latches:
+            // root_entity_done early-returns on it, node flags and loop
+            // counters never clear, and the request reports done exactly once
+            // and can never become ready again.
+            let sweep: Vec<WgIndex> = match &self.requests[rid as usize] {
+                Some(info) => info
+                    .worker_graphs
+                    .iter()
+                    .copied()
+                    .filter(|w| walk_wgs.contains(w))
+                    .collect(),
+                None => vec![wg],
+            };
+            for w in sweep {
+                let Some(st) = self.state_mut(w, rid) else { continue };
+                if !st.is_done {
+                    continue;
+                }
+                st.reset();
                 completed_wgs
                     .entry(rid)
                     .or_default()
-                    .push(self.wg_ids[wg as usize]);
+                    .push(self.wg_ids[w as usize]);
             }
 
             // Local destinations ingest now, so a consumer on this worker sees
