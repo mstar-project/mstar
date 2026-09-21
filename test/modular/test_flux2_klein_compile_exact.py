@@ -48,6 +48,15 @@ def test_excluded_modules_compute_the_same_values():
         assert torch.equal(after, before[id(m)])
 
 
+def test_vae_norms_and_activations_are_excluded():
+    from mstar.model.components.diffusion.autoencoder_kl import ResnetBlock
+
+    block = ResnetBlock(8, 8, groups=4, eps=1e-6)
+    assert exclude_from_compile(block) == 3  # two GroupNorms + the shared SiLU module
+    x = torch.randn(1, 8, 4, 4)
+    assert torch.equal(block(x), block.conv2(block.act(block.norm2(block.conv1(block.act(block.norm1(x)))))) + x)
+
+
 def test_scaled_rmsnorm_opts_in_by_attribute():
     norm = ScaledRMSNorm(6, 1e-5)
     assert ScaledRMSNorm.compile_exact_op is True
