@@ -2,16 +2,16 @@
 
 Nodes, and the resources each declares (``NemotronDuplexModel.get_node_resources``):
 
-    conformer_encoder  (none)                          16 kHz speech -> per-frame LLM embeds (+ RNN-T)
-    nano_llm           nano_kv, nano_attn, nano_sampler Nemotron-H hybrid Mamba-2 / attention / MLP (9B)
-    eartts_talker      (none yet)                      Gemma3 talker -> 31 RVQ codes per frame
-    audio_codec        (none)                          RVQ codes -> 22.05 kHz PCM, per-request left context
+    conformer_encoder  (none)                    16 kHz speech -> per-frame LLM embeds (+ RNN-T)
+    nano_llm           nano_kv, nano_attn,        Nemotron-H hybrid Mamba-2 / attention / MLP (9B):
+                       mamba_state, mamba,        paged KV for the 4 attention layers, recurrent-pool
+                       nano_sampler               slots for the 27 Mamba-2 layers, the text sampler
+    eartts_talker      (none yet)                Gemma3 talker -> 31 RVQ codes per frame
+    audio_codec        (none)                    RVQ codes -> 22.05 kHz PCM, per-request left context
 
-All four nodes run eager today (``disable_torch_compile``): the Mamba conv/SSM
-state and the talker's KV live in ``PerRequestState`` (a dict keyed by request
-id), which is neither compile- nor capture-safe. Moving that state onto engine
-resources (the recurrent-state pool for Mamba, the KV pool for the talker) is
-what unlocks CUDA graphs.
+The talker's KV still lives in ``PerRequestState`` (a dict keyed by request
+id), which is neither compile- nor capture-safe; moving it onto the KV pool is
+what unlocks its CUDA graph. The nano's state is all in engine resources.
 """
 from __future__ import annotations
 
@@ -26,8 +26,16 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AttentionStep, KVStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.model.nemotron_duplex.components.nemotron_h import MambaStateAccessor
-from mstar.model.nemotron_duplex.config import NANO_ATTN, NANO_KV, NANO_SAMPLER, NemotronDuplexConfig
+from mstar.engine.resources.linear_attn.config import LinearAttnStep
+from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.model.nemotron_duplex.config import (
+    MAMBA,
+    MAMBA_STATE,
+    NANO_ATTN,
+    NANO_KV,
+    NANO_SAMPLER,
+    NemotronDuplexConfig,
+)
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -37,9 +45,6 @@ from mstar.model.submodule_base import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Walks in which the nano LLM (re)starts its recurrent state.
-PREFILL_WALKS = {"prefill_text", "prefill_audio"}
 
 # How ``prepare_inputs`` classified a request's step; ``preprocess`` fuses accordingly.
 _MODE_FRAME = "frame"      # one streamed audio frame + fed-back prev_text / prev_func
@@ -59,8 +64,10 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     samples the agent text (sampler resource) and the tool-call token (greedy).
     """
 
-    # Mamba state is a Python-dict lookup keyed by request id -- not
-    # compile-/capture-safe. Eager until the state moves onto the recurrent pool.
+    # Eager for now: the fusion in ``preprocess`` and the per-layer resource
+    # cursors are compile-disabled anyway; the decode step is captured as a
+    # CUDA graph (see ``get_cuda_graph_configs``) once every resource is fixed
+    # address, which the Mamba pool and the paged KV now are.
     disable_torch_compile = True
 
     def __init__(self, language_model: nn.Module, config: NemotronDuplexConfig):
@@ -72,16 +79,6 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
 
     # -- resources -------------------------------------------------------
 
-    def _mamba_state(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, seq_lens: list[int] | None = None,
-    ) -> MambaStateAccessor:
-        return MambaStateAccessor(
-            request_states=engine_inputs.per_request_states or {},
-            request_ids=list(engine_inputs.request_ids),
-            is_prefill=graph_walk in PREFILL_WALKS,
-            seq_lens=seq_lens,
-        )
-
     def declare_step(
         self,
         graph_walk: str,
@@ -91,7 +88,14 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
-        steps = {NANO_KV: KVStep(), NANO_ATTN: AttentionStep(causal=True)}
+        steps = {
+            NANO_KV: KVStep(),
+            NANO_ATTN: AttentionStep(causal=True),
+            # one slot per request in the recurrent pool; the Mamba-2 resource
+            # picks the single-step kernels when every row spans one token
+            MAMBA_STATE: RecurrentStep(),
+            MAMBA: LinearAttnStep(),
+        }
         if graph_walk == "decode":
             # The prompt region is not sampled (held at PAD), so only decode
             # steps the sampler; the reference's repetition penalty likewise
@@ -190,14 +194,11 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         seq_lens: list[int],
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        """One fused forward over the packed batch. Attention runs over the
-        planned paged KV; Mamba conv/SSM state is stepped per request from the
-        packed rows (``Mamba2Mixer.forward`` / ``MambaStateAccessor``)."""
+        """One fused forward over the packed batch: attention over the planned
+        paged KV, Mamba-2 over each request's slot in the recurrent pool."""
         cfg = self.config
         rids = list(engine_inputs.request_ids)
-        hidden = self.language_model(
-            input_embeds, mamba_state=self._mamba_state(graph_walk, engine_inputs, seq_lens), label="main",
-        )
+        hidden = self.language_model(input_embeds, label="main")
         if graph_walk != "decode":
             # Prompt priming: no sampling, the region is held at PAD (reference
             # ``_prime_prompt``), so the first audio frame follows the last PAD.
