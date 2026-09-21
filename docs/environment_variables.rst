@@ -45,6 +45,13 @@ Communication
        same per call (15 us at one row, 26 against 31 us at 32 rows, 48 against 50 at 64), so
        FlashMLA is an option, not the default. Prefill, verify blocks and context-only reads stay on
        FlashInfer either way.
+   * - ``MSTAR_MOE_CHUNK_TOKENS``
+     - ``8192``
+     - Tokens per slice of a prefill step through the Marlin MoE kernels (Kimi K3's MXFP4 experts).
+       A slice's transient buffers grow with it (``[tokens x top_k, 2 x intermediate]`` bf16: about
+       940 MB at 8192 tokens, 235 MB at 2048), and every slice reads the expert weights again, so
+       a 7168-token prefill in four 2048-token slices spent 5.5 ms a layer in Marlin against 3.4 in
+       one. Lower it where the prefill's memory is short.
    * - ``MSTAR_AUX_STREAM``
      - ``1``
      - ``0`` keeps every captured step on one stream. By default a layer's independent branches
