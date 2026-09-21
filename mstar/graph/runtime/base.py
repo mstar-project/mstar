@@ -1,6 +1,6 @@
 
 from abc import ABC, abstractmethod
-from typing import NamedTuple
+from typing import Generic, NamedTuple, TypeVar
 
 from mstar.communication.tensors import TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -54,6 +54,14 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 # Rust too, or peer edges become Python objects again on arrival.
 #
 
+TK = TypeVar('TK')
+TV = TypeVar('TV')
+class ParallelList(NamedTuple, Generic[TK, TV]):
+    keys: list[TK]
+    values: list[TV]
+
+    # TODO: methods for iterating items, e.g.
+
 
 class SpeculationOutput(NamedTuple):
     node_name: str
@@ -66,6 +74,15 @@ class EdgeSpec(NamedTuple):
 
     # only valid for streaming edges
     is_final_streaming_chunk: bool = False
+
+
+class PopRidsOutput(NamedTuple):
+    wg_ids: ParallelList[int, int]
+    # flat, rid-major over wg_ids.keys(); input_edges_per_rid[i] edges belong
+    # to rid wg_ids.keys()[i] -- same layout as SpeculationPrepOutput, so
+    # _build_executing_batch can walk either the same way.
+    input_edges: list[EdgeSpec]
+    input_edges_per_rid: list[int]
 
 
 class SpeculationPrepInput(NamedTuple):
@@ -96,12 +113,13 @@ class RouteInput(NamedTuple):
     graph_walk: str
     node_name: str
     output_signals: list[str]
-    rid_to_wg: dict[int, int]
-    rids: list[int]
-    # uuid handles minted by TensorStore.store_batch; Rust looks up the rest
+    # rid -> the worker graph it is running this node in
+    wg_ids: ParallelList[int, int]
+    # tensor uuids for every (rid, output signal), flat and rid-major over
+    # wg_ids.keys(); num_tensors[i * len(output_signals) + s] of them belong to
+    # rid i's signal s. Rust looks the metadata up in the bookkeeper.
     tensors: list[int]
-    # (rid, signal idx) -> number of tensors
-    num_tensors_per_rid_signal: dict[(int, int), int]
+    num_tensors: list[int]
 
     # TODO: function to build this object from a node batch
 
@@ -119,16 +137,16 @@ class RouteOutput(NamedTuple):
 
 class SendInput(NamedTuple):
     completion_id: int
-    per_request_info: dict[int, CurrentForwardPassInfo]
-    new_token_counts: dict[int, dict[str, int]]
+    per_request_info: ParallelList[int, CurrentForwardPassInfo]
+    new_token_counts: ParallelList[int, dict[str, int]]
 
     # for WORKER_GRAPHS_DONE; see note (5)
     # rid -> {edge name -> tokens consumed}
-    stream_tokens_consumed: dict[int, dict[str, int]] | None = None
+    stream_tokens_consumed: ParallelList[int, dict[str, int]] | None = None
     # rids whose partition finished on this pass (from final_stream_rids)
     partition_done_rids: list[int] | None = None
     # rid -> msgpack(rx_info, tx_info, graph_timings); None unless enable_prof
-    profiling: dict[int, bytes] | None = None
+    profiling: ParallelList[int, bytes] | None = None
 
     # only for SHM arena tensor management
     # list[(tensor_idx, segment, offset)]
@@ -145,13 +163,75 @@ class GraphRuntime(ABC):
     ):
         pass
 
-    # TODO: add request, remove request
+    @abstractmethod
+    def add_request(
+        self, request_id: str,
+        partition: str,
+        graph_walk: str,
+        partition_worker_graph_ids: list[int],
+        worker_graph_to_worker: ParallelList[int, str]
+    ) -> int:
+        """
+        Returns the integer handle for this request.
+        """
+        pass
+
+    @abstractmethod
+    def remove_request(
+        self, rid: int
+    ):
+        """``rid`` is the handle ``add_request`` returned, not the uuid."""
+        pass
+
+    @abstractmethod
+    def set_walk(self, rid: int, partition: str, walk: str):
+        pass
 
     @abstractmethod
     def set_speculatively_scheduled(
-        self, node: str, wgid: int, rids: list[int],
+        self, node: str, wg_id: int, rids: list[int],
         speculatively_scheduled: bool
     ):
+        pass
+
+    @abstractmethod
+    def get_dynamic_loop_iters(
+        self, request_ids: list[int],
+        partition: str,
+    ) -> ParallelList[int, dict[str,int]]:
+        pass
+
+    @abstractmethod
+    def get_worker_graph_id_for_node(
+        self, node: str, graph_walk: str,
+    ) -> int:
+        """The owning worker graph. Keyed on the walk too: the same node can
+        belong to different worker graphs in different walks (prefill vs
+        decode), which is what walk_node_to_worker_graph_id indexes today."""
+        pass
+
+    # --------- Inputs ----------
+    @abstractmethod
+    def ingest_inputs_batch(
+        self,
+        # rid -> the signal arriving for it
+        signals: ParallelList[int, EdgeSpec],
+        can_buffer: bool=True,
+        is_streaming: bool=False,
+    ) -> list[int]:
+        """
+        Returns a list of signal indices that remain uningested
+        (used in streaming for re-storing uningested edges).
+
+        For streaming, this function must gate on whether all non-streaming
+        inputs have already been ingested. The gate is re-evaluated per signal,
+        since ingesting one can make another node eligible.
+
+        EdgeSpec rather than a signal-only type because
+        ``is_final_streaming_chunk`` has to survive the ingest: the pass that
+        CONSUMES the chunk is the one that reports partition_done, so the flag
+        lives in the node's input slot until then.
+        """
         pass
 
     # --------- Scheduling ----------
@@ -161,34 +241,42 @@ class GraphRuntime(ABC):
         graph_walk: str,
         request_ids: list[int],
         check_ready: bool=False,
-    ) -> list[int]:
+    ) -> PopRidsOutput | None:
         """
-        Returns worker graph ids for the batch. If check_ready is set, then
-        this function checks if the rids are ready and either pops all or none.
-        Otherwise, it is assumed that the rids are already known to be ready.
+        Returns rids and worker graph ids for the batch. If check_ready is set,
+        then this function checks if the rids are ready and either pops all or.
+        nothing (returning None if it is nothing). Otherwise, it is assumed
+        that the rids are already known to be ready.
+
+        For check_ready, engine-level ready-ness is assumed to be a prerequisite.
         """
         pass
 
     @abstractmethod
     def has_ready_excluding(
-        self, exclude_rids: set[str],
-        exclude_target: tuple[str, str] | None = None,
+        self, exclude_rids: set[int],
+        exclude_target: tuple[str, str] | None=None,
     ) -> bool:
         """
         Graph-level check; does not include schedule-level backlog
-        calculation.
+        calculation; e.g., this may return False even when the backlog exists,
+        so the backlog must be checked first.
+
+        exclude_rids includes failed_rids, pending_removes, and held_until.
         """
         pass
 
     @abstractmethod
     def get_ready_nodes(
-        self, exclude_rids: list[int],
-        target: tuple[str, str] | None = None,
-        exclude_target: tuple[str, str] | None = None,
+        self, exclude_rids: set[int],
+        target: tuple[str, str] | None=None,
+        exclude_target: tuple[str, str] | None=None,
     ) -> list[ReadyNodeSpec]:
         """
         Graph-level ready check. The output list must be filtered for engine-
         level ready-ness separately.
+
+        exclude_rids includes failed_rids, pending_removes, and held_until.
         """
         pass
 
@@ -230,7 +318,7 @@ class GraphRuntime(ABC):
     @abstractmethod
     def stop_loops_batched(
         self, partition: str, graph_walk: str,
-        rid_to_loop_names: dict[int, list[str]]
+        loop_names: ParallelList[int, list[str]]
     ):
         """
         (1) Stop loops in the graph
@@ -245,7 +333,7 @@ class GraphRuntime(ABC):
         tensor_store: TensorStore
     ) -> RouteOutput:
         """
-        (1) Mark node complete
+        (1) Mark node complete, do _cleanup_consumed_inputs
         (2) Process node outputs
         (3) Set persist and update ref counts on the tensor store
 
