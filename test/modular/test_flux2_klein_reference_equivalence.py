@@ -46,7 +46,7 @@ from mstar.model.flux2_klein.submodules import (  # noqa: E402
 )
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
 
-MODEL_REPO = "black-forest-labs/FLUX.2-klein-4B"
+MODEL_REPO = os.environ.get("FLUX2_KLEIN_REPO", "black-forest-labs/FLUX.2-klein-4B")
 _ORACLE_ENV = os.environ.get("FLUX2_KLEIN_ORACLE_DIR", "")
 ORACLE_DIR = Path(_ORACLE_ENV) if _ORACLE_ENV else None
 CUDA_AVAILABLE = torch.cuda.is_available()
@@ -81,7 +81,12 @@ DEVICE = torch.device("cuda")
 @pytest.fixture(scope="module")
 def meta() -> dict:
     with open(ORACLE_DIR / "metadata.json") as f:
-        return json.load(f)
+        meta = json.load(f)
+    # The oracle must have been recorded from the checkpoint under test (FLUX2_KLEIN_REPO
+    # selects 4B or 9B); comparing against the other model's trajectory is a setup error.
+    assert meta["repo"] == MODEL_REPO, (
+        f"oracle {ORACLE_DIR} was recorded from {meta['repo']!r} but FLUX2_KLEIN_REPO={MODEL_REPO!r}")
+    return meta
 
 
 @pytest.fixture(scope="module")
