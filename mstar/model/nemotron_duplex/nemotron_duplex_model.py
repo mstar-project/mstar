@@ -625,16 +625,6 @@ class NemotronDuplexModel(Model):
             input_modalities=imod, output_modalities=omod, graph_walk=walk, is_prefill=is_prefill,
         )
 
-    @staticmethod
-    def _stream_exhausted(incoming_connections, edge_name: str) -> bool:
-        """A consumer partition is done once its upstream producer is finished and
-        every streamed token has been consumed."""
-        for c in incoming_connections or []:
-            if getattr(c, "edge_name", None) == edge_name:
-                return bool(getattr(c, "producer_done", False)) and \
-                    getattr(c, "consumed_count", 0) >= getattr(c, "token_count", 0)
-        return False
-
     def get_initial_forward_pass_args(
         self,
         partition_name: str,
@@ -696,11 +686,18 @@ class NemotronDuplexModel(Model):
         if partition_name == "Encoder":                    # runs once, then done producing
             return ForwardPassArgs(full_metadata=m, inputs=[], unpersist_tensors=[], request_done=True)
 
+        # LLM, Talker and Codec are stream-terminated: each ends when its node
+        # consumes the final chunk of its upstream stream, which the worker
+        # reports and the conductor turns into the partition's request_done
+        # (and producer_done for the next partition). Nothing here guesses the
+        # end from the connection counters: ``consumed_count`` counts chunks
+        # popped for execution, so a counter-based end can fire while the last
+        # step is still running and its output would arrive for a finished
+        # request (observed as sessions losing their final audio frame).
         if partition_name == "LLM":
             if m.is_prefill:                               # prefill_text -> decode
                 m.is_prefill = False
                 m.graph_walk = "decode"
-            done = self._stream_exhausted(incoming_connections, "audio_frame")
             edges = []
             for name in ("prev_text", "prev_func"):        # fed-back tokens for AddFusion
                 e = GraphEdge(next_node="nano_llm", name=name)
@@ -709,15 +706,11 @@ class NemotronDuplexModel(Model):
             return ForwardPassArgs(
                 full_metadata=m, inputs=edges,
                 unpersist_tensors=sum([e.tensor_info for e in edges], start=[]),
-                request_done=done, step_metadata={"is_prefill": False},
+                request_done=False, step_metadata={"is_prefill": False},
             )
 
         if partition_name in ("Talker", "Codec"):          # self-triggered by the upstream stream
-            stream = "new_token" if partition_name == "Talker" else "codec_tokens"
-            return ForwardPassArgs(
-                full_metadata=m, inputs=[], unpersist_tensors=[],
-                request_done=self._stream_exhausted(incoming_connections, stream),
-            )
+            return ForwardPassArgs(full_metadata=m, inputs=[], unpersist_tensors=[], request_done=False)
         raise ValueError(f"Unknown partition: {partition_name!r}")
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
