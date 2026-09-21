@@ -255,3 +255,28 @@ def test_bf16_path_matches_marlin_on_long_slices():
     torch.cuda.synchronize()
     assert torch.equal(captured, want)
     be.bf16_min_tokens = type(be).bf16_min_tokens
+
+
+@cuda
+def test_bf16_path_warm_up_prepares_the_shared_buffers():
+    """``warm_bf16_path`` runs the path once at setup (kernels compiled, the weight buffers allocated), so a
+    server's first long prefill does not pay for it; a no-op while the path is off."""
+    if not hasattr(torch, "_grouped_mm"):
+        pytest.skip("torch._grouped_mm missing")
+    from mstar.utils.fused_moe.marlin import _BF16_BUFFERS
+
+    moe, hidden = _small_moe()
+    moe.prepare_experts_backend("marlin", DEV)
+    be = moe._backend
+    be.bf16_min_tokens = 0
+    assert be.warm_bf16_path() == 0.0
+    be.bf16_min_tokens = 64
+    shape = (moe.num_experts, moe.inter_local, moe.latent_size)
+    for key in [k for k in _BF16_BUFFERS if k[:3] == shape]:
+        _BF16_BUFFERS.pop(key)
+    took = be.warm_bf16_path()
+    keys = [k for k in _BF16_BUFFERS if k[:3] == shape]
+    assert took > 0 and len(keys) == 1, (took, keys)
+    w13, w2 = _BF16_BUFFERS[keys[0]]
+    assert w13.shape == (moe.num_experts, 2 * moe.inter_local, moe.latent_size) and w2.shape == (moe.num_experts, moe.latent_size, moe.inter_local)
+    be.bf16_min_tokens = type(be).bf16_min_tokens
