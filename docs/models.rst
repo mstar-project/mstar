@@ -196,7 +196,10 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   checkpoint's demo recordings are two-channel conversations (user left, agent
   right); feed the left channel only. ``test/nemotron_duplex/duplex_request.py``
   prepares such a clip from the bundled ``turn_taking.wav`` and sends it;
-  ``oracle_compare.py`` runs the standalone reference path on the same clip.
+  ``parity_compare.py`` runs the standalone reference path on the same clip
+  and checks the served text against it token for token (bf16, the serving
+  precision, must match exactly; the fp32 oracle can differ where the agent's
+  turn-taking decision is a knife-edge, which its printed logit margins show).
 - Default deployment: ``configs/nemotron_duplex.yaml`` (all four nodes on one
   GPU); ``configs/nemotron_duplex_disagg.yaml`` puts the encoder+LLM, the talker
   and the codec on three ranks. Launch with ``--tensor-comm-protocol SHM`` on a
