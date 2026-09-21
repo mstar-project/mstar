@@ -408,6 +408,20 @@ class KVManager(AttentionResource):
                 return
             self._trim_lease(stream, matched_len)
 
+    def agree_prefix(self, rid: str, label: str, matched: int) -> None:
+        """Cut this stream down to the length the whole group settled on.
+
+        Never grows it: a rank cannot skip pages it does not hold, whatever
+        the others matched.
+        """
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None or stream.stored_len:
+                # already converted, so the retry after a refused admit is
+                # answered what the first attempt skipped
+                return
+            self._trim_lease(stream, matched)
+
     def matched_prefix(self, rid: str) -> dict[str, int]:
         """Tokens the probe at ingest matched for ``rid``, by keyed label.
 
@@ -441,7 +455,7 @@ class KVManager(AttentionResource):
         above it are in no page this stream owns.
         """
         keep = matched_len // self.config.page_size
-        if keep < len(stream.lease):
+        if stream.lease is not None and keep < len(stream.lease):
             self._arena.release(stream.lease[keep:])
             stream.lease = stream.lease[:keep] or None
         stream.agreed = keep * self.config.page_size

@@ -1080,6 +1080,42 @@ class Worker:
                 continue
             self._tp_prefix_waiting[(request_id, node_name)] = _time.monotonic()
 
+    def _agree_prefix(
+        self, node_name: str, request_ids: list[str],
+    ) -> dict[str, dict[str, int]]:
+        """The length every rank of ``node_name`` can skip, per request.
+
+        The minimum, because one span runs on every rank and a rank cannot
+        skip pages it does not hold. Taken once: past this the length lives on
+        each rank's own stream, so a re-scheduled request carries nothing.
+        """
+        agreed: dict[str, dict[str, int]] = {}
+        engine = self.engine_manager.get_engine(node_name)
+        for rid in request_ids:
+            replies = self._tp_prefix_replies.pop(rid, None)
+            if replies is None:
+                continue
+            merged: dict[str, int] = {}
+            for matched in engine.matched_prefixes(node_name, rid):
+                merged.update(matched)
+            for reply in replies.values():
+                for label, tokens in reply.items():
+                    merged[label] = min(merged.get(label, tokens), tokens)
+            if merged:
+                agreed[rid] = merged
+        return agreed
+
+    def _apply_agreed_prefix(
+        self, node_name: str, prefix_matched: dict[str, dict[str, int]],
+    ) -> None:
+        """Cut this rank's leases down to what the group agreed."""
+        if not prefix_matched:
+            return
+        engine = self.engine_manager.get_engine(node_name)
+        for rid, matched in prefix_matched.items():
+            for label, tokens in matched.items():
+                engine.agree_prefix(node_name, rid, label, tokens)
+
     def _record_prefix_match(self, body: TPPrefixMatch) -> None:
         """Keep a follower's matched length, and let the step go once the
         whole group has answered."""
@@ -1129,6 +1165,12 @@ class Worker:
         workers = cfg.sharding_config.get_sharding_group(
             node_batch.node_name, node_batch.graph_walk
         )._workers[1:]
+        # before the leader's own stage, which runs on the GPU thread this
+        # method returns into
+        prefix_matched = self._agree_prefix(
+            node_batch.node_name, node_batch.request_ids,
+        )
+        self._apply_agreed_prefix(node_batch.node_name, prefix_matched)
         for worker in workers:
             self.communicator.send(
                 worker, msg=WorkerMessage(
@@ -1140,6 +1182,7 @@ class Worker:
                         speculative=speculative,
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
+                        prefix_matched=prefix_matched,
                     )
                 )
             )
@@ -2150,6 +2193,10 @@ class Worker:
 
     def _register_tp_follow(self, message: ScheduleTPNode) -> None:
         """Queue a ScheduleTPNode; drop a head for a step this rank closed."""
+        # before the drops below and before the batch is built: the leader
+        # sends the agreed length once, so a head this rank ignores still has
+        # to leave it behind
+        self._apply_agreed_prefix(message.node_name, message.prefix_matched)
         if not message.request_ids:
             logger.warning(
                 "Worker %s: dropped empty ScheduleTPNode for %s/%s (seq %d)",

@@ -107,6 +107,7 @@ def _stub():
     stub._process_messages = _process_messages
     stub._try_follow_speculation = _try_follow
     stub._register_tp_follow = lambda m: Worker._register_tp_follow(stub, m)
+    stub._apply_agreed_prefix = lambda node, matched: None
     stub._register_tp_nospec = lambda m: Worker._register_tp_nospec(stub, m)
     stub._close_tp_follow_step = lambda p: Worker._close_tp_follow_step(stub, p)
     stub._await_tp_follow_step = (

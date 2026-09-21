@@ -107,6 +107,9 @@ class ScheduleTPNode(MessageBody):
     speculative: bool = False
     spec_seq: int = -1
     spec_from_seq: int = -1
+    # rid -> label -> tokens every rank of the group can skip, carried on the
+    # first schedule that names the rid and on no later one
+    prefix_matched: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 @dataclass

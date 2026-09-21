@@ -116,6 +116,11 @@ class Resource(ABC):
         """Take this step's sampled tokens, so what was generated can be keyed."""
         return
 
+    def agree_prefix(self, rid: str, label: str, matched: int) -> None:
+        """Take the length every rank of this node settled on, at most the one
+        this resource matched itself."""
+        return
+
     def matched_prefix(self, rid: str) -> dict[str, int]:
         """Tokens this resource matched of ``rid``'s prefix, by label.
 

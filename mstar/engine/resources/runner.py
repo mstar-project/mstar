@@ -140,6 +140,12 @@ class StepRunner:
                 rid, node_name, graph_walk, outputs,
             )
 
+    def agree_prefix(
+        self, rid: str, node_name: str, label: str, matched: int,
+    ) -> None:
+        for key in self._sweep(self._node_order, self._order, node_name):
+            self._resources[key].agree_prefix(rid, label, matched)
+
     def matched_prefixes(self, rid: str, node_name: str) -> list[dict[str, int]]:
         """One entry a resource, not one merged answer: two caches on a node
         match their own lengths and agree them separately."""

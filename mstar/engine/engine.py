@@ -595,6 +595,11 @@ class Engine:
                     rid, batch.node_name, walk, per_rid,
                 )
 
+    def agree_prefix(
+        self, node_name: str, request_id: str, label: str, matched: int,
+    ) -> None:
+        self._runner.agree_prefix(request_id, node_name, label, matched)
+
     def matched_prefixes(
         self, node_name: str, request_id: str,
     ) -> list[dict[str, int]]:
