@@ -287,8 +287,8 @@ VAE_DECODE_BATCH_SIZES = (1, 2, 4, 8)
 
 
 # Modules whose eager CUDA kernels differ in the last bit from inductor's decompositions:
-# reductions (LayerNorm / RMSNorm mean and variance) and transcendental activations (SiLU).
-EXACT_OP_TYPES = (nn.LayerNorm, nn.RMSNorm, nn.SiLU)
+# reductions (LayerNorm / RMSNorm / GroupNorm mean and variance) and transcendental activations (SiLU).
+EXACT_OP_TYPES = (nn.LayerNorm, nn.RMSNorm, nn.GroupNorm, nn.SiLU)
 
 
 def exclude_from_compile(transformer: nn.Module) -> int:
@@ -328,7 +328,13 @@ def compile_vae_decode(vae: nn.Module):
     engine's runner owns capture). Static, not symbolic: a symbolic batch dimension decoded
     batch 8 in 346 ms against 223 ms for the per-size graph. A fresh max-autotune compile costs
     tens of seconds, so the decoder warms every batch size it will ever call at load and splits
-    larger batches into those sizes (see ``decode_in_chunks``)."""
+    larger batches into those sizes (see ``decode_in_chunks``).
+
+    Numerics (H100, 1024^2, measured 2026-09-21): the compiled decode lands ~56 dB from the eager
+    one (inductor's GroupNorm / SiLU decompositions), and because the autotuner benchmarks
+    candidate conv kernels, two server processes can pick different ones (64 dB apart on the same
+    seeds). An "exact" compile that keeps GroupNorm and SiLU on the eager kernels is bit-exact but
+    slower than eager (111 vs 89 ms), so the exactness knob for the VAE is ``vae_compile: false``."""
     return torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=VAE_COMPILE_MODE)
 
 
