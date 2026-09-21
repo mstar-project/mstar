@@ -12,7 +12,9 @@ import torch
 
 from mstar.engine.resources import (
     AttentionSpec,
+    KVReqConfig,
     KVSpec,
+    PositionSpec,
     SamplerSpec,
     SamplingReqConfig,
     resolve_spec_dependencies,
@@ -25,6 +27,9 @@ from mstar.model.nemotron_duplex.config import (
     NANO_ATTN,
     NANO_KV,
     NANO_SAMPLER,
+    TALKER_ATTN,
+    TALKER_KV,
+    TALKER_POS,
     NemotronDuplexConfig,
 )
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
@@ -56,16 +61,27 @@ def test_duplex_declares_all_walks_and_nodes():
 
 
 def test_duplex_node_resources():
-    """Only the nano declares resources: a paged KV over its 4 attention layers
-    with attention planned on it (NoPE: no position resource), a recurrent pool
-    holding the 27 Mamba-2 layers' conv + SSM state with the Mamba-2 resource
-    planned on it, and one text sampler. The other three nodes own no engine
-    resource."""
+    """The nano declares a paged KV over its 4 attention layers with attention
+    planned on it (NoPE: no position resource), a recurrent pool holding the 27
+    Mamba-2 layers' conv + SSM state with the Mamba-2 resource planned on it,
+    and one text sampler; the talker a paged KV over its 28 layers with attention
+    and RoPE positions. The encoder and the codec own no engine resource."""
     model = _make_model()
     specs = model.get_node_resources()
     by_key = resolve_spec_dependencies(specs)          # unique keys, dependencies satisfied
-    assert set(by_key) == {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER}
-    assert all(spec.nodes == {"nano_llm"} for spec in specs)
+    assert set(by_key) == {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER, TALKER_KV, TALKER_ATTN, TALKER_POS}
+    nano_keys = {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER}
+    assert all(spec.nodes == ({"nano_llm"} if spec.resource_key in nano_keys else {"eartts_talker"}) for spec in specs)
+
+    eartts = model.config.eartts
+    tkv = by_key[TALKER_KV]
+    assert isinstance(tkv, KVSpec)
+    assert (tkv.config.num_layers, tkv.config.num_kv_heads, tkv.config.head_dim) == (28, 16, 72)
+    assert tkv.config.max_seq_len > eartts.sliding_window + 37   # window + speaker warm-up
+    assert isinstance(by_key[TALKER_ATTN], AttentionSpec) and by_key[TALKER_ATTN].config.kv_cache == TALKER_KV
+    tpos = by_key[TALKER_POS]
+    assert isinstance(tpos, PositionSpec) and tpos.config.kv_cache == TALKER_KV
+    assert tpos.config.rotary_dim == eartts.head_dim and tpos.config.interleave is False
 
     nano = model.config.nano
     pool = by_key[MAMBA_STATE]
@@ -97,7 +113,9 @@ def test_duplex_node_resources():
 def test_duplex_request_resource_configs():
     model = _make_model()
     cfg = model.get_request_resource_configs({}, None)
-    assert set(cfg) == {NANO_SAMPLER}
+    assert set(cfg) == {NANO_SAMPLER, TALKER_KV}
+    assert isinstance(cfg[TALKER_KV], KVReqConfig)
+    assert cfg[TALKER_KV].get_labels("eartts_talker", "talker_decode") == ["main", "uncond"]
     text = cfg[NANO_SAMPLER]
     assert isinstance(text, SamplingReqConfig)
     assert text.temperature == model.config.temperature and text.top_p == model.config.top_p
