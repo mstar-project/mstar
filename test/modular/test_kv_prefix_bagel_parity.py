@@ -233,7 +233,9 @@ def test_a_consumed_prefix_lands_within_the_repos_parity_tolerance(capsys):
 
     cold = _Node(device, cached=False)
     cold.ingest("fresh", prompt + tail)
-    assert cold.resolve("fresh") == 0
+    assert cold.resolve("fresh") == 0, (
+        "the fresh node matched something, so it is not the uncached side"
+    )
     whole = cold.prefill("fresh", prompt + tail)
     fresh = whole[matched:]
 

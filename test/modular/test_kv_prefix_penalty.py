@@ -95,7 +95,9 @@ def test_a_miss_keeps_nothing():
         ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), 0,
     )
 
-    assert RID not in resource._cached_prefix
+    assert RID not in resource._cached_prefix, (
+        "a request that matched nothing left tokens for the mask to fold in"
+    )
 
 
 def test_a_walk_without_token_ids_keeps_nothing():
@@ -107,7 +109,9 @@ def test_a_walk_without_token_ids_keeps_nothing():
         MATCHED,
     )
 
-    assert RID not in resource._cached_prefix
+    assert RID not in resource._cached_prefix, (
+        "a walk with no ids to keep kept something anyway"
+    )
 
 
 def test_an_inert_penalty_leaves_the_mask_alone():
@@ -153,4 +157,6 @@ def test_removing_the_request_drops_what_was_kept_for_it():
 
     resource.remove_request(RID)
 
-    assert RID not in resource._cached_prefix
+    assert RID not in resource._cached_prefix, (
+        "the skipped prompt outlived the request it was kept for"
+    )

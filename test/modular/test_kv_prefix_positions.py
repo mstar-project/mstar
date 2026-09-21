@@ -114,7 +114,9 @@ def test_the_step_after_a_hit_is_placed_past_the_matched_prefix():
 def test_a_request_that_matched_nothing_still_starts_at_zero():
     node = _Node()
 
-    assert node.step(4) == [0, 1, 2, 3]
+    assert node.step(4) == [0, 1, 2, 3], (
+        "a request that matched nothing was placed past a prefix it never had"
+    )
 
 
 def test_the_counter_is_seeded_once_and_then_advances_on_its_own():
@@ -124,7 +126,7 @@ def test_the_counter_is_seeded_once_and_then_advances_on_its_own():
     first = node.step(4)
     second = node.step(2)
 
-    assert first == [96, 97, 98, 99]
+    assert first == [96, 97, 98, 99], "the first step did not start at the match"
     assert second == [100, 101], "the seed was re-applied on a later step"
 
 

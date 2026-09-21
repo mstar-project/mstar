@@ -114,7 +114,9 @@ def test_a_match_shortens_the_span_a_step_would_declare():
     assert _Submodule.declare_step(cut) == 4, (
         "the step would still declare the tokens the cache already holds"
     )
-    assert cut.input_ids.tolist() == list(range(96, PROMPT))
+    assert cut.input_ids.tolist() == list(range(96, PROMPT)), (
+        "the ids left to run are not the ones past the match"
+    )
 
 
 def test_the_smallest_answer_wins():
@@ -133,7 +135,9 @@ def test_a_resource_with_no_opinion_is_not_an_answer_of_zero():
         {NODE: ["kv", "quiet"]},
     )
 
-    assert _stage(engine, _inputs()).input_seq_len == PROMPT - 96
+    assert _stage(engine, _inputs()).input_seq_len == PROMPT - 96, (
+        "a resource with no opinion was counted as holding nothing"
+    )
 
 
 def test_a_zero_match_leaves_the_inputs_exactly_as_they_were():
@@ -168,7 +172,7 @@ def test_a_walk_carrying_anything_opaque_never_probes(opaque):
     engine = _engine({"kv": resource}, {NODE: ["kv"]})
     inputs = _inputs(**opaque)
 
-    assert _stage(engine, inputs) is inputs
+    assert _stage(engine, inputs) is inputs, "an opaque walk was cut anyway"
     assert resource.resolved == 0, (
         f"a walk carrying {sorted(opaque)} was probed and would have been cut "
         "to a length only one of its labels agreed to"
@@ -180,8 +184,12 @@ def test_a_walk_whose_inputs_are_not_token_shaped_never_probes():
     engine = _engine({"kv": resource}, {NODE: ["kv"]})
     inputs = NodeInputs(input_seq_len=PROMPT)
 
-    assert _stage(engine, inputs) is inputs
-    assert resource.resolved == 0
+    assert _stage(engine, inputs) is inputs, (
+        "inputs with no ids to slice were rebuilt"
+    )
+    assert resource.resolved == 0, (
+        "a walk with nothing sequence-shaped in it was probed"
+    )
 
 
 def test_a_falsy_step_info_is_not_opaque():
@@ -190,7 +198,9 @@ def test_a_falsy_step_info_is_not_opaque():
 
     cut = _stage(engine, _inputs(resource_step_info=False))
 
-    assert cut.input_seq_len == 4 and resource.resolved == 1
+    assert cut.input_seq_len == 4 and resource.resolved == 1, (
+        "a walk whose step info is merely falsy was taken for an opaque one"
+    )
 
 
 # ── scope ───────────────────────────────────────────────────────────────

@@ -102,7 +102,10 @@ def _root(kv=None, rope=None, model=None) -> bytes:
 
 
 def test_the_same_build_roots_the_same_way_twice():
-    assert _root() == _root()
+    assert _root() == _root(), (
+        "two builds of one deployment rooted differently, so neither could "
+        "match what the other wrote"
+    )
 
 
 def test_the_root_changes_with_the_kv_resources_own_config():
@@ -156,7 +159,9 @@ def test_a_deployment_can_turn_the_cache_off():
 
     _root(kv=kv)
 
-    assert kv._index is None and kv._prefix_root is None
+    assert kv._index is None and kv._prefix_root is None, (
+        "a deployment that turned the cache off opened an index anyway"
+    )
 
 
 def test_the_index_opens_empty():
@@ -164,7 +169,7 @@ def test_the_index_opens_empty():
 
     _root(kv=kv)
 
-    assert kv._index is not None
+    assert kv._index is not None, "the cache was asked to open and did not"
     assert kv._index.lookup([b"anything"]) == [], "the index opened with entries"
 
 
@@ -176,7 +181,9 @@ def test_ingest_puts_the_requests_keys_on_the_stream():
 
     kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0", b"k1"]}))
 
-    assert kv._streams["r0"]["main"].keys == [b"k0", b"k1"]
+    assert kv._streams["r0"]["main"].keys == [b"k0", b"k1"], (
+        "the chain the request brought never reached its stream"
+    )
 
 
 def test_a_label_the_request_did_not_key_carries_none():

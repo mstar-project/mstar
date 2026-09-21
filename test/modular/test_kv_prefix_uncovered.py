@@ -136,7 +136,9 @@ def test_a_read_in_stream_keys_nothing_it_generates():
         seq_len=len(PROMPT), latest_kv_transfer_info="peer",
         page_indices=list(range(3)),
     )})
-    assert kv.admit_retrieve("r0", NODE, WALK, published).ok
+    assert kv.admit_retrieve("r0", NODE, WALK, published).ok, (
+        "the read-in was refused, so this stream never held the prompt"
+    )
     kv.assert_pages_conserved()
 
     # the first token was sampled by the rank that prefilled, so the samples

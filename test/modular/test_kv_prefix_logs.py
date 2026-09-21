@@ -112,11 +112,13 @@ def test_a_miss_is_reported_as_a_miss(caplog):
     with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
         _run(kv, "r0", len(tokens))
 
-    assert len(_lines(caplog)) == 1
+    assert len(_lines(caplog)) == 1, "a declared request was not reported once"
     line = _lines(caplog)[0]
-    assert "matched 0 of its 4 pages" in line
-    assert "whole prompt already cached False" in line
-    assert f"replica {REPLICA}" in line
+    assert "matched 0 of its 4 pages" in line, line
+    assert "whole prompt already cached False" in line, line
+    assert f"replica {REPLICA}" in line, (
+        f"the line names no replica, so nothing says which copy served it: {line}"
+    )
 
 
 def test_a_hit_reports_how_much_of_the_prompt_was_already_here(caplog):
