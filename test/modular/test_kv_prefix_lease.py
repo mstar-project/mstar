@@ -312,6 +312,70 @@ def test_a_refused_admit_retried_trims_the_same_and_commits_once():
     kv.assert_pages_conserved()
 
 
+def _refused_then_cached(kv: KVManager, prompt: list[int]) -> list[int]:
+    """Leave ``r1`` holding reserved pages at ``stored_len`` 0, then index its prompt.
+
+    The first try at a batch of ``r1`` and a much longer ``r2`` reserves r1's pages
+    and refuses r2's; before the batch comes round again, another request fills
+    and indexes the prompt r1 is waiting on.
+    """
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": _keys(prompt)}))
+    kv.ingest_request("r2", KVReqConfig())
+    step = KVStep(segments=(
+        Segment("r1", "main", len(prompt)), Segment("r2", "main", 2 * len(prompt)),
+    ))
+    assert not kv.admit(step, _ctx("r1", "r2")).ok, "the pool fit both, so nothing was refused"
+    reserved = list(kv._streams["r1"]["main"].page_indices)
+    assert reserved and not kv._streams["r1"]["main"].stored_len, (
+        "the refused admit left r1 nothing to trip over"
+    )
+    _seed(kv, prompt)
+    kv.remove_request("seed")
+    return reserved
+
+
+def test_a_lease_taken_after_a_refused_batch_admit_is_still_converted():
+    kv = _manager(max_num_pages=16)
+    prompt = list(range(100))
+    reserved = _refused_then_cached(kv, prompt)
+
+    matched = kv.resolve_cached_prefix("r1", NODE, WALK)
+    leased = list(kv._streams["r1"]["main"].lease)
+    _grow(kv, "r1", len(prompt) - matched)
+
+    stream = kv._streams["r1"]["main"]
+    assert stream.stored_len == len(prompt), (
+        f"the retry wrote the tail of the prompt from position 0 over pages it "
+        f"had reserved, not after the {matched} tokens it was cut by"
+    )
+    assert stream.page_indices[:len(leased)] == leased, (
+        "the retry is not reading the pages it matched"
+    )
+    tail = set(stream.page_indices[len(leased):])
+    assert all(
+        page in tail or kv._arena.num_owners[page] == 0 for page in reserved
+    ), "a page the refused admit reserved is held by a stream that no longer names it"
+    kv.assert_pages_conserved()
+
+
+def test_a_leased_stream_an_offload_has_claimed_keeps_its_pages():
+    kv = _manager(max_num_pages=16)
+    prompt = list(range(100))
+    reserved = _refused_then_cached(kv, prompt)
+    matched = kv.resolve_cached_prefix("r1", NODE, WALK)
+    leased = list(kv._streams["r1"]["main"].lease)
+    # what a claim leaves on a stream while its copy runs with the lock down
+    kv._streams["r1"]["main"].offloaded = True
+
+    kv.admit(KVStep(segments=(Segment("r1", "main", len(prompt) - matched),)), _ctx("r1"))
+
+    stream = kv._streams["r1"]["main"]
+    assert stream.page_indices == reserved, (
+        "the conversion let go of pages an offload was still copying"
+    )
+    assert stream.lease == leased, "the lease was converted under the offload"
+
+
 def test_a_pre_fork_off_a_leased_stream_covers_the_whole_prefix():
     kv = _manager()
     keys = _seed(kv, list(range(100)))
