@@ -489,11 +489,11 @@ class CudaGraphRunner:
                 config_idx=spec.config_idx,
             )
         finally:
-            # pages stay with the dummy streams: replay's padding rows address
-            # the same ids, so their plan finds the storage already resident.
-            # Resources that hand out nothing to padding rows (the recurrent
-            # pool routes them to its sink) have nothing to keep here either.
-            self._dummy_rows.reset(dummy_rids)
+            # Capture ran the dummy rows as real requests, so hand their
+            # storage back now rather than carry it through the rest of the
+            # pass: a replay's padding rows address the sink (page and slot)
+            # and need none of it.
+            self._dummy_rows.reset(dummy_rids, free=True)
 
     def _forward_for(self, spec: CGSlotSpec):
         """The callable this bucket captures, compiled once per config.
@@ -807,15 +807,15 @@ class CudaGraphRunner:
     def release(self, lease: SlotLease, real_bs: int) -> None:
         """Return the padding rows to their at-rest state after a step.
 
-        Their pages stay resident (``free=False``), so the next step's plan for
-        this slot allocates nothing for the tail. Freeing them here instead
-        made every padded decode step allocate and release one KV page per
-        padding row, and on a near-full arena those allocations failed and
-        held the whole batch: a step's padding must never compete with real
-        requests for storage.
+        Padding rows are flagged on the step context (`is_padding_row`) and
+        the resources give them nothing: the KV cache runs them against
+        SINK_PAGE, the recurrent pool against its sink slot. So there is
+        nothing to keep resident here, and nothing that could fail to be
+        re-acquired on the next padded step either — a step's padding must
+        never compete with real requests for storage.
         """
         dummy_rids = self.slot_for(lease).dummy_rids
-        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs])
+        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs], free=True)
 
     def plan_stream(self) -> torch.cuda.Stream | None:
         """Dedicated stream for pre-planning.
