@@ -146,7 +146,8 @@ class MarlinMXFP4Experts:
         self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor, out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``out [m, latent]`` (optional, ``z``'s dtype) receives the result -- the summed expert
-        outputs land there directly, e.g. in the all-reduce buffer."""
+        outputs land there directly, e.g. in the all-reduce buffer; a ``[m, chunks, latent / chunks]``
+        view with its column chunks at their own stride is written as it is (the reduce-scatter layout)."""
         n = self.max_chunk_tokens
         if z.shape[0] <= n:
             return self._forward(z, topk_idx, topk_weight, out)
