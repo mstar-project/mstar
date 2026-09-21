@@ -92,6 +92,20 @@ def prepare_scales(scale: torch.Tensor, size_n: int, size_k: int) -> torch.Tenso
     return torch.stack([mxfp4_process_scales(marlin_permute_scales(s[i].T, size_k, size_n, 32)) for i in range(s.shape[0])])
 
 
+_BF16_BUFFERS: dict = {}
+
+
+def _bf16_weight_buffers(e: int, inter: int, latent: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """The dequantized gate-up ``[E, 2I, K]`` and down ``[E, K, I]`` bf16 buffers, one pair per process for
+    all the layers of a shape (1.85 GB at the pruned75 per-rank shapes), allocated on first use."""
+    key = (e, inter, latent, str(device))
+    bufs = _BF16_BUFFERS.get(key)
+    if bufs is None:
+        bufs = _BF16_BUFFERS[key] = (torch.empty(e, 2 * inter, latent, dtype=torch.bfloat16, device=device),
+                                     torch.empty(e, latent, inter, dtype=torch.bfloat16, device=device))
+    return bufs
+
+
 class MarlinMXFP4Experts:
     """Routed-expert forward on the Marlin MXFP4 MoE kernel (bf16 activations)."""
 
@@ -140,6 +154,13 @@ class MarlinMXFP4Experts:
     # less at 8192 than at 2048 (a run of 512 requests at eight concurrencies had no memory trouble).
     # MSTAR_MOE_CHUNK_TOKENS lowers the slice where the prefill's memory is short (2048: 235 MB).
     max_chunk_tokens = int(os.environ.get("MSTAR_MOE_CHUNK_TOKENS", "8192"))
+    # from this many tokens a slice runs as bf16 grouped GEMMs on weights dequantized from the Marlin tiles
+    # once per layer (marlin/dequant.py): Marlin dequantizes inside its inner loop, once per 64-row block, so a
+    # long prefill dequantizes every expert tens of times and runs at a quarter of the tensor cores' rate. The
+    # bf16 path pays a fixed 1.6 ms a layer of dequantization plus its gathers, which on an H100 at the pruned75
+    # shapes only breaks even with Marlin near 8192 tokens (5.2 against 5.0 to 5.7 ms a layer, plan section 11,
+    # 2026-09-21), so it is off unless MSTAR_MOE_BF16_TOKENS names a threshold.
+    bf16_min_tokens = int(os.environ.get("MSTAR_MOE_BF16_TOKENS", "0"))
 
     @torch.compiler.disable
     def __call__(
@@ -149,14 +170,64 @@ class MarlinMXFP4Experts:
         outputs land there directly, e.g. in the all-reduce buffer; a ``[m, chunks, latent / chunks]``
         view with its column chunks at their own stride is written as it is (the reduce-scatter layout)."""
         n = self.max_chunk_tokens
+        forward = self._forward_bf16 if self._bf16_applies(z) else self._forward
         if z.shape[0] <= n:
-            return self._forward(z, topk_idx, topk_weight, out)
+            return forward(z, topk_idx, topk_weight, out)
         # routing is per token, so slices along the token axis are independent
         if out is None:
-            return torch.cat([self._forward(z[i:i + n], topk_idx[i:i + n], topk_weight[i:i + n])
+            return torch.cat([forward(z[i:i + n], topk_idx[i:i + n], topk_weight[i:i + n])
                               for i in range(0, z.shape[0], n)])
         for i in range(0, z.shape[0], n):
-            self._forward(z[i:i + n], topk_idx[i:i + n], topk_weight[i:i + n], out[i:i + n])
+            forward(z[i:i + n], topk_idx[i:i + n], topk_weight[i:i + n], out[i:i + n])
+        return out
+
+    def _bf16_applies(self, z: torch.Tensor) -> bool:
+        """The bf16 grouped path: long enough (per slice, so the last slice of a longer prefill may stay on
+        Marlin), eager (a captured verify step of 64 rows by 8 tokens would pass a low threshold, and its
+        sorting is not a graph's business), every expert local (an expert-parallel rank's skipped assignments
+        stay with Marlin), the grouped GEMM available."""
+        n = min(z.shape[0], self.max_chunk_tokens)
+        return (self.bf16_min_tokens > 0 and n >= self.bf16_min_tokens and z.dtype == torch.bfloat16
+                and not torch.cuda.is_current_stream_capturing()
+                and not (self.sharding is not None and self.sharding.is_partial) and hasattr(torch, "_grouped_mm"))
+
+    def _forward_bf16(
+        self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor, out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The slice's experts as bf16 grouped GEMMs: the layer's weights dequantized from the Marlin tiles
+        into buffers shared by every layer, the rows gathered in expert order, gate-up, SiTU, down, and the
+        weighted top-k sum back in token order (the routing weights applied in fp32 there, as Marlin applies
+        them in its epilogue; into ``out``, plain or column-chunked, like ``_forward``). Same math up to the
+        GEMMs' accumulation order."""
+        from mstar.utils.fused_moe.kernels import moe_indexed_topk_sum_triton
+        from mstar.utils.fused_moe.marlin.dequant import dequant_marlin_experts
+        from mstar.utils.fused_moe.mxfp4 import situ_and_mul_triton
+
+        m, k = z.shape
+        top_k = topk_idx.shape[1]
+        e, inter = self.num_experts, self.inter
+        w13_buf, w2_buf = _bf16_weight_buffers(e, inter, k, z.device)
+        flat = topk_idx.reshape(-1).to(torch.long)
+        order = torch.argsort(flat)  # the token-expert pairs in expert order
+        # the rows per expert without bincount, which sizes its output on the host (a sync per layer)
+        counts = torch.zeros(e, dtype=torch.int32, device=z.device).scatter_add_(
+            0, flat, torch.ones_like(flat, dtype=torch.int32))
+        offs = counts.cumsum(0).to(torch.int32)
+        w13 = dequant_marlin_experts(self.w13, self.s13, 2 * inter, k, out=w13_buf)
+        a = z.index_select(0, order // top_k)  # [m * top_k, k]
+        c1 = torch._grouped_mm(a, w13.transpose(1, 2), offs=offs)  # [m * top_k, 2 * inter]
+        del a
+        h = torch.empty(m * top_k, inter, dtype=z.dtype, device=z.device)
+        situ_and_mul_triton(c1, h, self.situ_beta, self.situ_linear_beta)
+        del c1
+        w2 = dequant_marlin_experts(self.w2, self.s2, k, inter, out=w2_buf)
+        c3 = torch._grouped_mm(h, w2.transpose(1, 2), offs=offs)  # [m * top_k, k], expert order
+        del h
+        rows = torch.empty_like(order)
+        rows[order] = torch.arange(order.numel(), device=z.device)  # where token t's j-th pair landed
+        if out is None:
+            out = torch.empty(m, k, dtype=z.dtype, device=z.device)
+        moe_indexed_topk_sum_triton(c3, rows.view(m, top_k).to(torch.int32), topk_weight.to(torch.float32).contiguous(), out)
         return out
 
     def _forward(
