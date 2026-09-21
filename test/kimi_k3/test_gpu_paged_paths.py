@@ -358,3 +358,56 @@ def test_flashkda_prefill_matches_fla_kernels():
     o_fk = FlashKDAKernels().run_paged(qkv, g_raw, beta_raw, plan, conv_b, rec_b, p)
     torch.testing.assert_close(o_fk.float(), o_fla.float(), rtol=3e-2, atol=3e-2)
     torch.testing.assert_close(rec_b[slots], rec_a[slots], rtol=3e-2, atol=3e-2)
+
+
+@cuda
+def test_kda_prefill_layers_do_not_sync_with_the_host():
+    """A prefill step's KDA layers run without a host sync: the int64 indices, the state mask and fla's
+    chunk table are built once per plan and every layer reads them (FlashKDA's first layer of a step
+    included; the fla bundle's first layer may still sync inside fla's own chunk bookkeeping). One
+    sync per layer had stalled the eager prefill at all 69 KDA layers of Kimi K3."""
+    from mstar.engine.resources.linear_attn.kda_kernels import FLAKDAKernels, default_kernels
+    from mstar.model.kimi_k3.components.kda import ParallelKDAAttention
+
+    torch.manual_seed(11)
+    hidden, h, d = 256, 4, 128
+    layer = ParallelKDAAttention(hidden_size=hidden, num_heads=h, head_dim=d, gate_lower_bound=-5.0)
+    layer = layer.to(DEV, torch.bfloat16)
+    with torch.no_grad():
+        for prm in layer.parameters():
+            prm.normal_(std=0.05)
+        layer.A_log.data = torch.log(torch.empty(h, device=DEV).uniform_(1, 16))
+        layer.dt_bias.data = torch.randn(h * d, device=DEV) * 0.5
+    p = layer.params()
+    lens = [40, 3, 70]
+    t = sum(lens)
+    x = torch.randn(t, hidden, device=DEV, dtype=torch.bfloat16)
+    qkv, g_raw, beta_raw, _ = layer._project(x)
+    cu = [0, lens[0], lens[0] + lens[1], t]
+
+    def plan():
+        return KDAPlan(
+            slot_ids=torch.tensor([1, 2, 3], dtype=torch.int32, device=DEV),
+            has_state=torch.tensor([True, False, False], device=DEV),
+            cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=DEV), cu_seqlens_cpu=cu, num_rows=3,
+            num_tokens=t, is_decode=False,
+        )
+
+    served = default_kernels(DEV)  # FlashKDA where it is built, fla otherwise
+    bundles = [(FLAKDAKernels(), 1)] + ([(served, 0)] if type(served) is not FLAKDAKernels else [])
+    for kernels, warm_layers in bundles:
+        conv = torch.zeros(4, 3 * h * d, 3, device=DEV, dtype=torch.bfloat16)
+        rec = torch.zeros(4, h, d, d, device=DEV)
+        rec[1].normal_(std=0.1)
+        want = kernels.run_paged(qkv, g_raw, beta_raw, plan(), conv.clone(), rec.clone(), p)  # JIT, autotuning
+        torch.cuda.synchronize()
+        step = plan()
+        for _ in range(warm_layers):
+            kernels.run_paged(qkv, g_raw, beta_raw, step, conv.clone(), rec.clone(), p)
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            got = kernels.run_paged(qkv, g_raw, beta_raw, step, conv, rec, p)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.synchronize()
+        torch.testing.assert_close(got.float(), want.float(), rtol=1e-3, atol=1e-3, msg=type(kernels).__name__)
