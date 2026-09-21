@@ -65,10 +65,7 @@ from mstar.utils.ipc_format import (
 from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.node_manager_utils import (
-    NodeOutputRouting,
-    RequestStateManager,
-)
+from mstar.worker.node_manager_utils import RequestStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -1211,15 +1208,27 @@ class Worker:
             ],
         )
 
-    def _count_new_tokens(self, routing: NodeOutputRouting) -> dict[str, int]:
-        """Token counts for the conductor. Needs numel(), hence the tensors."""
-        counts: dict[str, int] = {}
-        for signal in routing.new_token_outputs:
-            if signal.name in counts:
-                continue  # don't double-count new tokens
-            counts[signal.name] = sum(
-                self.tensor_manager.get_tensor(info.uuid).numel()
-                for info in signal.tensor_info
+    def _count_new_tokens(
+        self,
+        new_token_idxs: list[int],
+        flat_rids: list[int],
+        flat_uuids: list[int],
+        signals: list[str],
+        signal_idxs: list[int],
+    ) -> dict[int, dict[str, int]]:
+        """Token counts for the conductor, per rid. Needs numel(), hence the
+        tensors -- which is why this stays here and not behind the contract.
+
+        The runtime already dropped repeat edges of a signal, so summing is
+        safe: one output routed to two destinations is two edges carrying the
+        same tensors, and counting both would double every token.
+        """
+        counts: dict[int, dict[str, int]] = {}
+        for idx in new_token_idxs:
+            per_rid = counts.setdefault(flat_rids[idx], {})
+            signal = signals[signal_idxs[idx]]
+            per_rid[signal] = per_rid.get(signal, 0) + (
+                self.tensor_manager.get_tensor(flat_uuids[idx]).numel()
             )
         return counts
 
@@ -2246,7 +2255,9 @@ class Worker:
             [batch_N.batch.request_to_worker_graph[r] for r in rids],
         )
         flat_uuids: list[int] = []
+        flat_rids: list[int] = []
         num_tensors: list[int] = []
+        signal_idxs: list[int] = []
         for rid in rids:
             info_by_signal = self.tensor_manager.store_and_return_tensor_info(
                 rid=rid, tensors=outputs.get(rid) or {},
@@ -2254,10 +2265,12 @@ class Worker:
                 graph_walk=batch_N.graph_walk,
                 skip_cuda_sync=True,
             )
-            for signal in signals:
+            for i, signal in enumerate(signals):
                 infos = info_by_signal.get(signal, [])
                 num_tensors.append(len(infos))
                 flat_uuids.extend(info.uuid for info in infos)
+                flat_rids.extend(rid for _ in infos)
+                signal_idxs.extend(i for _ in infos)
         # Safety hold: ref=1 until the real fanout is known, which
         # complete_and_route_batch settles. One call for the batch rather than
         # one per tensor -- with a Rust bookkeeper each is a boundary crossing,
@@ -2281,10 +2294,6 @@ class Worker:
             ),
             self.tensor_manager.tensor_store,
         )
-        completion = self._rid_runtime.peek_completion(
-            route_output.completion_id
-        )
-        routing_per_request = completion.routing
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -2312,15 +2321,23 @@ class Worker:
 
         # Local streaming stays here: a StreamBuffer holds real tensors, so it
         # cannot move behind the runtime's contract.
-        for rid, routing in routing_per_request.items():
+        for idx in route_output.local_streaming_tensor_idxs:
+            rid = flat_rids[idx]
+            uuid = flat_uuids[idx]
             req_info = self.request_state.per_request_info[rid]
-            for edge in routing.streaming_local:
-                stream_buf = req_info.stream_buffers[edge.name]
-                for info in edge.tensor_info:
-                    stream_buf.pre_read_register(info.uuid)
-                self._route_streaming_tensor(rid, edge)
+            signal = signals[signal_idxs[idx]]
+            stream_buf = req_info.stream_buffers[signal]
+            stream_buf.pre_read_register(uuid)
+            tensor = self.tensor_manager.get_tensor(uuid)
+            stream_buf.put(uuid, tensor.clone())
+            self.tensor_manager.dereference(uuid)
 
-        send_rids = list(routing_per_request)
+        send_rids = list(rids)
+        # numel() needs the tensors, so the counting stays on this side.
+        new_token_counts = self._count_new_tokens(
+            route_output.new_token_output_idxs,
+            flat_rids, flat_uuids, signals, signal_idxs,
+        )
         self._rid_runtime.send_outputs(SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
@@ -2331,13 +2348,9 @@ class Worker:
                     ) for rid in send_rids
                 ],
             ),
-            # numel() needs the tensors, so the counting stays on this side.
             new_token_counts=ParallelList(
                 send_rids,
-                [
-                    self._count_new_tokens(routing_per_request[rid])
-                    for rid in send_rids
-                ],
+                [new_token_counts.get(rid, {}) for rid in send_rids],
             ),
             nested_loop_indices=ParallelList(
                 send_rids,
@@ -2353,8 +2366,6 @@ class Worker:
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
-
-        return routing_per_request
 
     def _get_pinned_d2h_buffer(
         self,

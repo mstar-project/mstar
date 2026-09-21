@@ -218,6 +218,11 @@ class RustGraphRuntime(GraphRuntime):
             # reads.
             bookkeeping=bookkeeping._rust,
             me=my_worker_id,
+            # A share of the same transport, so the frames Rust decides on can
+            # be sent from there rather than handed back one at a time. None
+            # under the pyzmq communicator, which has no shareable object --
+            # the worker's flag gate refuses that pairing anyway.
+            communicator=getattr(communicator, "_inner", None),
         )
         self._node_to_partition = node_to_partition
         self._communicator = communicator

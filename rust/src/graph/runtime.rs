@@ -7,6 +7,9 @@ use crate::graph::spec::*;
 use crate::graph::request::{LoopStopTime, RequestInfo, WgIndex, WorkerGraphMeta};
 use crate::graph::state::{RequestState, RoutedEdge, SpecNode, TensorRef};
 use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
+use crate::communicator::RawZmqCommunicator;
+use crate::PyZmqCommunicator;
+use std::sync::Arc;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -167,6 +170,12 @@ pub struct GraphRuntime {
     /// construction. Routing reads descriptors and adjusts refcounts through
     /// it, so a copy would diverge from what the store believes.
     bookkeeping: SharedBookkeeping,
+
+    /// A share of the SAME transport the worker's communicator owns, so the
+    /// frames this runtime decides on can be sent from here rather than
+    /// handed back to Python one at a time. None where the worker built the
+    /// pyzmq communicator, which has no shareable object.
+    communicator: Option<Arc<RawZmqCommunicator>>,
 }
 
  impl GraphRuntime {
@@ -845,7 +854,10 @@ pub struct WorkerGraphArg {
 #[pymethods]
 impl GraphRuntime {
     #[new]
-    #[pyo3(signature = (worker_graphs, remote_worker_graphs, sharding, bookkeeping, me))]
+    #[pyo3(signature = (
+        worker_graphs, remote_worker_graphs, sharding, bookkeeping, me,
+        communicator = None,
+    ))]
     fn new(
         worker_graphs: Vec<WorkerGraphArg>,
         // Owned by other workers; needed to answer "who runs this node" when
@@ -854,6 +866,7 @@ impl GraphRuntime {
         sharding: ShardingArg,
         bookkeeping: PyRef<'_, TensorBookkeeping>,
         me: String,
+        communicator: Option<PyRef<'_, PyZmqCommunicator>>,
     ) -> PyResult<Self> {
         let mut it = StrToId::default();
         let mut graphs = Vec::with_capacity(worker_graphs.len());
@@ -960,6 +973,7 @@ impl GraphRuntime {
             completions: FxHashMap::default(),
             completion_counter: 0,
             bookkeeping: bookkeeping.share(),
+            communicator: communicator.map(|c| c.share()),
         })
     }
 
@@ -1669,13 +1683,18 @@ impl GraphRuntime {
                 }
             }
 
+            let mut new_token_seen: FxHashSet<Sym> = FxHashSet::default();
             for e in &edges {
                 let idxs: Vec<usize> = e
                     .tensors
                     .iter()
                     .filter_map(|t| uuid_to_idx.get(&t.uuid).copied())
                     .collect();
-                if e.new_token {
+                // First edge of a signal name wins, as in Python's
+                // _count_new_tokens ("don't double-count new tokens"). One
+                // output routed to two destinations is two edges carrying the
+                // SAME tensors, so without this the caller sums each twice.
+                if e.new_token && new_token_seen.insert(e.name) {
                     out.new_token_output_idxs.extend(&idxs);
                 }
                 if e.streaming && matches!(e.dest, Dest::Local(_)) {
