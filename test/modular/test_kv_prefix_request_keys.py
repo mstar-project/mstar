@@ -247,6 +247,26 @@ def test_a_declared_model_is_keyed_by_its_own_prompt_not_by_the_client():
     )
 
 
+class _Recording(_Model):
+    """Keeps the keyword arguments its prompt processing was handed."""
+
+    def process_prompt(self, *args, **kwargs):
+        self.handed = kwargs
+        return super().process_prompt(*args, **kwargs)
+
+
+def test_a_clients_prefix_keys_never_reach_process_prompt():
+    model = _Recording()
+    worker = _worker(model, _deployment())
+
+    _run(worker, dict(_PLANTED))
+
+    assert not {"prefix_keys", "prefix_tail", "prefix_decode"} & set(model.handed), (
+        "process_prompt was handed keys the client made up, and a model that "
+        f"reads them would key the prompt by them: {sorted(model.handed)}"
+    )
+
+
 # ── the metadata fold ───────────────────────────────────────────────────
 
 
