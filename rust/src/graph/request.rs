@@ -8,6 +8,7 @@
 //! direction is static, so it lives on `WorkerGraphMeta` and costs nothing per
 //! request.
 
+use crate::graph::shard::ShardMap;
 use crate::graph::spec::Sym;
 use rustc_hash::FxHashMap;
 
@@ -79,6 +80,9 @@ pub struct RequestInfo {
     /// Loop name -> the stop observation this rank has. Worker-only, so it
     /// does not ride CurrentForwardPassInfo across the wire.
     pub loop_stop_times: FxHashMap<Sym, LoopStopTime>,
+    /// This request's resolved sharding, from ShardingTemplate::instantiate.
+    /// None until add_request has seen the worker assignment.
+    pub shard: Option<ShardMap>,
 }
 
 impl RequestInfo {

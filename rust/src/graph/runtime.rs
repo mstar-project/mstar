@@ -2,10 +2,11 @@
 //! walk state; Python calls it once per forward pass, not once per request.
 
 use crate::graph::compile::{EMIT_TO_CLIENT, EMPTY_DESTINATION, LoopArg, NodeArg, compile_one};
-use crate::graph::shard::{Group, ShardMap};
+use crate::graph::shard::{GroupTemplate, ShardMap, ShardingTemplate};
 use crate::graph::spec::*;
 use crate::graph::request::{RequestInfo, WgIndex, WorkerGraphMeta};
 use crate::graph::state::RequestState;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -134,7 +135,7 @@ pub struct GraphRuntime {
     interner: StrToId,
     graphs: Vec<GraphRef>,
     wg_ids: Vec<u32>,
-    shard: ShardMap,
+    shard: ShardingTemplate,
 
     /// `[wg][handle]`; None where the request is not registered with that
     /// worker graph (Python only adds a request to the graphs its partition
@@ -242,14 +243,19 @@ impl GraphRuntime {
         let worker_syms: Vec<Sym> = workers.iter().map(|w| it.intern(w)).collect();
         let me_sym = it.intern(&me);
 
-        // Sharding config
+        // Sharding TEMPLATE. The per-request ShardMap comes from
+        // `instantiate`, because a data-parallel replica puts the same node on
+        // different workers -- the binding is not deployment-wide.
         let tp_rank = worker_syms.iter().position(|&w| w == me_sym).unwrap_or(0) as u32;
-        let group = Group { workers: worker_syms, tp_size: workers.len() as u32, tp_rank };
-        let node_group = graphs.iter()
-            .flat_map(|g| g.nodes.iter().map(|n| (n.name, 0u32)))
-            .collect();
-        let shard = ShardMap {
-            node_group, groups: vec![group], shard_dim: FxHashMap::default(), me: me_sym,
+        let shard = ShardingTemplate {
+            groups: vec![GroupTemplate {
+                nodes: graphs.iter().flat_map(|g| g.nodes.iter().map(|n| n.name)).collect(),
+                tp_size: workers.len() as u32,
+                graph_walks: None,
+                tp_rank: Some(tp_rank),
+            }],
+            shard_dim: FxHashMap::default(),
+            me: me_sym,
         };
 
         let states: Vec<Vec<Option<RequestState>>> =
@@ -382,6 +388,12 @@ impl GraphRuntime {
                     }
                 }
             }
+            // clone_empty() + setup(node_to_workers), per Python.
+            info.shard = Some(
+                self.shard
+                    .instantiate(&info.node_to_workers)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            );
             self.requests[handle as usize] = Some(info);
         }
 

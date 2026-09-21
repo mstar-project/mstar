@@ -10,6 +10,7 @@
 pub mod communicator;
 pub mod graph;
 pub mod shm;
+pub mod tensors;
 
 use std::os::raw::{c_int, c_void};
 use std::time::Duration;
