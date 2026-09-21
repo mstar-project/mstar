@@ -85,14 +85,15 @@ def main() -> None:
     prompts = EDIT_PROMPTS[: args.concurrency]
     solo: dict[int, bytes] = {}
     for i, prompt in enumerate(prompts):
-        png, wall = timed(client.edit_image, prompt, ("ref_a.png", ref_a), seed=10 + i, num_inference_steps=args.steps)
+        png, wall = timed(client.edit_image, prompt, [("ref_a.png", ref_a)], seed=10 + i,
+                          num_inference_steps=args.steps)
         (out / f"edit_solo_{i}.png").write_bytes(png)
         solo[i] = png
         report["solo"][str(i)] = {"wall_s": wall}
         print(f"solo edit {i}: {wall * 1000:.0f} ms")
     for r in range(args.rounds):
         with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
-            futures = {i: pool.submit(timed, client.edit_image, p, ("ref_a.png", ref_a), seed=10 + i,
+            futures = {i: pool.submit(timed, client.edit_image, p, [("ref_a.png", ref_a)], seed=10 + i,
                                       num_inference_steps=args.steps) for i, p in enumerate(prompts)}
         for i, fut in futures.items():
             png, wall = fut.result()
@@ -109,7 +110,7 @@ def main() -> None:
     (out / "multi_solo.png").write_bytes(multi_solo)
     print(f"two-reference edit alone: {wall * 1000:.0f} ms")
     with ThreadPoolExecutor(max_workers=len(prompts) + 1) as pool:
-        futs = [pool.submit(timed, client.edit_image, p, ("ref_a.png", ref_a), seed=10 + i,
+        futs = [pool.submit(timed, client.edit_image, p, [("ref_a.png", ref_a)], seed=10 + i,
                             num_inference_steps=args.steps) for i, p in enumerate(prompts)]
         multi_fut = pool.submit(timed, client.edit_image, MULTI_PROMPT, [("ref_a.png", ref_a), ("ref_b.png", ref_b)],
                                 seed=77, num_inference_steps=args.steps)
@@ -124,9 +125,9 @@ def main() -> None:
           f"{_fmt(value)} dB; the singles vs their solo images: {report['multi']['singles_in_mix']}")
 
     for w, h in SIZES:
-        a, wall1 = timed(client.edit_image, prompts[0], ("ref_a.png", ref_a), seed=5, width=w, height=h,
+        a, wall1 = timed(client.edit_image, prompts[0], [("ref_a.png", ref_a)], seed=5, width=w, height=h,
                          num_inference_steps=args.steps)
-        b, wall2 = timed(client.edit_image, prompts[0], ("ref_a.png", ref_a), seed=5, width=w, height=h,
+        b, wall2 = timed(client.edit_image, prompts[0], [("ref_a.png", ref_a)], seed=5, width=w, height=h,
                          num_inference_steps=args.steps)
         (out / f"size_{w}x{h}.png").write_bytes(a)
         size = Image.open(io.BytesIO(a)).size
