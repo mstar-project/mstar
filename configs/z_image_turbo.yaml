@@ -12,9 +12,11 @@ model_kwargs:
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
   # transformer still lands at a median 34.4 dB from the eager path over the 100 protocol prompts (78 of 100 below 40 dB)
   compile_eager_rounding: true
-  # norms and activations stay on the eager kernels inside the compiled forward: the compiled transformer is
-  # then bit-exact with the eager one; some B=1 latency over plain compile (see the table)
-  compile_exact_ops: true
+  # compile_exact_ops keeps op classes on the eager kernels inside the compiled forward. On Z-Image the cost is the
+  # 180 norm graph breaks per step: [norms] (or true) is >= 55.9 dB from the eager path on all 100 protocol prompts but
+  # runs 1.25 s / 0.80 images/s at B=1 / concurrency 8 against 0.86 s / 1.17 for the plain compile (SGLang 0.86 s), and
+  # [activations] buys nothing (median 34.9 dB). Default: the fast plain compile; set [norms] for reference-faithful output.
+  compile_exact_ops: false
   cuda_graph: true
   capture_sizes: [[1024, 1024]]
   # captions are padded to multiples of 32 tokens; graphs are captured for these lengths
