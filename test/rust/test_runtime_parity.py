@@ -302,3 +302,84 @@ def test_cleanup_agrees(pair):
     assert rt.ingest_inputs_batch(
         ParallelList([rid], [_spec("prompt", "prefill")]), can_buffer=False
     ) == []
+
+
+# --- stale handles -----------------------------------------------------------
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda rt, r: rt.remove_request(r), id="remove_request"),
+    pytest.param(lambda rt, r: rt.get_rid_string(r), id="get_rid_string"),
+    pytest.param(lambda rt, r: rt.set_walk(r, "default", "w"), id="set_walk"),
+    pytest.param(
+        lambda rt, r: rt.mark_stream_partition_done(r, "default"),
+        id="mark_stream_partition_done"),
+    pytest.param(
+        lambda rt, r: rt.get_dynamic_loop_iters([r], "default"),
+        id="get_dynamic_loop_iters"),
+    pytest.param(
+        lambda rt, r: rt.cleanup_consumed_inputs("prefill", [r], [WG_ID]),
+        id="cleanup_consumed_inputs"),
+    pytest.param(
+        lambda rt, r: rt.reset_outputs("prefill", [r], [WG_ID]),
+        id="reset_outputs"),
+    pytest.param(
+        lambda rt, r: rt.push_back_node("prefill", [r], [WG_ID]),
+        id="push_back_node"),
+    pytest.param(
+        lambda rt, r: rt.set_speculatively_scheduled(
+            "prefill", WG_ID, [r], True),
+        id="set_speculatively_scheduled"),
+    pytest.param(
+        lambda rt, r: rt.pop_rids("prefill", WALK, [r]), id="pop_rids"),
+    pytest.param(
+        lambda rt, r: rt.pop_rids("prefill", WALK, [r], check_ready=True),
+        id="pop_rids_checked"),
+    pytest.param(
+        lambda rt, r: rt.speculate_node("prefill", WALK, r),
+        id="speculate_node"),
+    pytest.param(
+        lambda rt, r: rt.get_spec_target("prefill", "ar_decode", WALK, r),
+        id="get_spec_target"),
+    pytest.param(
+        lambda rt, r: rt.has_pending_loop_stop(r, WALK, "ar_loop"),
+        id="has_pending_loop_stop"),
+    pytest.param(
+        lambda rt, r: rt.apply_peer_loop_stops(r, "default", {}),
+        id="apply_peer_loop_stops"),
+    pytest.param(
+        lambda rt, r: rt.stop_loops_batched(
+            partition="default", graph_walk=WALK, last_node_run="ar_decode",
+            loop_names=ParallelList([r], [["ar_loop"]])),
+        id="stop_loops_batched"),
+    pytest.param(
+        lambda rt, r: rt.prep_spec_rids(SpeculationPrepInput(
+            spec_node_name="ar_decode", curr_node_name="prefill",
+            graph_walk=WALK, rids=[r], room_for_continuing=None,
+            streaming_edges=[], streaming_edges_per_rid=[0])),
+        id="prep_spec_rids"),
+    pytest.param(
+        lambda rt, r: rt.prep_follow_spec_rids(SpeculationPrepInput(
+            spec_node_name="ar_decode", curr_node_name="prefill",
+            graph_walk=WALK, rids=[r], room_for_continuing=None,
+            streaming_edges=[], streaming_edges_per_rid=[0])),
+        id="prep_follow_spec_rids"),
+    pytest.param(
+        lambda rt, r: rt.ingest_inputs_batch(
+            ParallelList([r], [_spec("prompt", "prefill")])),
+        id="ingest_inputs_batch"),
+])
+def test_a_stale_handle_never_panics(pair, call):
+    """A handle can outlive its request: a message for a rid this rank already
+    removed is a benign race the Python side has always tolerated.
+
+    On the Rust side an unchecked index panics ACROSS the FFI boundary, which
+    is far worse than an exception -- so every entry point is checked.
+    """
+    rt, _book, _store = pair
+    _admit(rt)  # so the tables are non-empty and a bad index is really out of range
+    try:
+        call(rt, 9999)
+    except Exception as e:  # noqa: BLE001 - the point is what it must NOT be
+        assert "Panic" not in type(e).__name__, (
+            f"panicked across the FFI boundary: {e}"
+        )

@@ -227,7 +227,7 @@ pub struct GraphRuntime {
             else {
                 continue; // the node does not take this input
             };
-            let Some(state) = &mut self.states[wg as usize][rid as usize] else {
+            let Some(state) = self.state_mut(wg, rid) else {
                 continue;
             };
             // The streaming gate is re-checked per signal on purpose:
@@ -267,8 +267,7 @@ pub struct GraphRuntime {
             }
             for part in info.partitions.values() {
                 for &wg in &part.walk_worker_graphs {
-                    let Some(state) = &self.states[wg as usize][rid as usize]
-                    else {
+                    let Some(state) = self.state(wg, rid) else {
                         continue;
                     };
                     let g = &self.graphs[wg as usize];
@@ -325,7 +324,7 @@ pub struct GraphRuntime {
                 persist_for_loop: false,
             })
             .collect();
-        let state = self.states[wg as usize].get_mut(rid as usize)?.as_mut()?;
+        let state = self.state_mut(wg, rid)?;
         let out = state.ingest_for_speculation(source, &edges);
         state.clear_speculative_inputs();
         Some(out)
@@ -445,7 +444,7 @@ pub struct GraphRuntime {
                 return false;
             }
         }
-        let Some(state) = self.states[wg as usize][rid as usize].as_ref() else {
+        let Some(state) = self.state(wg, rid) else {
             return false;
         };
         state.loop_iter(lid) + 1 < g.lp(lid).max_iters && !state.loop_finished(lid)
@@ -480,7 +479,7 @@ pub struct GraphRuntime {
             })
             .collect();
 
-        let state = self.states[wg as usize][rid as usize].as_mut()?;
+        let state = self.state_mut(wg, rid)?;
         // Held True across the ingest so a streaming input cannot re-add the
         // node to the ready queue underneath us.
         state.set_spec_scheduled(spec_node, true);
@@ -520,15 +519,21 @@ pub struct GraphRuntime {
             return None;
         }
 
-        let node_name = self.interner.name(g.node(spec_node).name).to_string();
         let edges_out = state
             .input_tensors(spec_node, same_node)
             .into_iter()
             .map(|(name, tensors, final_chunk)| {
+                (name, tensors.iter().map(|t| t.uuid).collect(), final_chunk)
+            })
+            .collect::<Vec<(Sym, Vec<u64>, bool)>>();
+        let node_name = self.interner.name(g.node(spec_node).name).to_string();
+        let edges_out = edges_out
+            .into_iter()
+            .map(|(name, uuids, final_chunk)| {
                 (
                     self.interner.name(name).to_string(),
                     node_name.clone(),
-                    tensors.iter().map(|t| t.uuid).collect(),
+                    uuids,
                     final_chunk,
                 )
             })
@@ -539,7 +544,7 @@ pub struct GraphRuntime {
     fn undo_spec_ingest(
         &mut self, wg: WgIndex, rid: u32, node: NodeId, slots: &[(u8, bool)],
     ) {
-        if let Some(state) = self.states[wg as usize][rid as usize].as_mut() {
+        if let Some(state) = self.state_mut(wg, rid) {
             for &(slot, from_next) in slots {
                 state.remove_input(node, slot, from_next);
             }
@@ -600,7 +605,7 @@ pub struct GraphRuntime {
             let g = self.graphs[wg as usize].clone();
             for &sym in &syms {
                 let Some(&lid) = g.loop_by_name.get(&sym) else { continue };
-                if let Some(state) = self.states[wg as usize][rid as usize].as_mut() {
+                if let Some(state) = self.state_mut(wg, rid) {
                     state.register_loop_finish(lid);
                 }
             }
@@ -618,8 +623,7 @@ pub struct GraphRuntime {
         let g = self.graphs[owner as usize].clone();
         for &sym in &syms {
             let Some(&lid) = g.loop_by_name.get(&sym) else { continue };
-            let Some(state) = self.states[owner as usize][rid as usize].as_ref()
-            else {
+            let Some(state) = self.state(owner, rid) else {
                 continue;
             };
             let order: Vec<Sym> = g
@@ -651,6 +655,17 @@ pub struct GraphRuntime {
 
     fn live_wgs(&self, walk: Sym) -> Vec<WgIndex> {
         self.walk_to_local_wgs.get(&walk).cloned().unwrap_or_default()
+    }
+
+    /// Bounds-checked. A handle can legitimately outlive its request -- a
+    /// message for a rid this rank already removed is a benign race -- and an
+    /// unchecked index would panic ACROSS the FFI boundary.
+    fn state(&self, wg: WgIndex, rid: u32) -> Option<&RequestState> {
+        self.states.get(wg as usize)?.get(rid as usize)?.as_ref()
+    }
+
+    fn state_mut(&mut self, wg: WgIndex, rid: u32) -> Option<&mut RequestState> {
+        self.states.get_mut(wg as usize)?.get_mut(rid as usize)?.as_mut()
     }
 
     fn info(&self, rid: u32) -> Option<&RequestInfo> {
@@ -1030,6 +1045,8 @@ impl GraphRuntime {
         // per-partition lists just point at it.
         let live = self.live_wgs(walk_sym);
         for &wg in &live {
+            // In range by construction: the vectors were grown for this
+            // handle above.
             if self.states[wg as usize][handle as usize].is_none() {
                 self.states[wg as usize][handle as usize] =
                     Some(RequestState::new(self.graphs[wg as usize].clone()));
@@ -1208,7 +1225,7 @@ impl GraphRuntime {
         for (rid, wg_id) in rids.into_iter().zip(wg_ids) {
             let Some(wg) = self.wg_index(wg_id) else { continue };
             let Some(node_id) = self.nid(wg, &node_name) else { continue };
-            if let Some(state) = &mut self.states[wg as usize][rid as usize] {
+            if let Some(state) = self.state_mut(wg, rid) {
                 state.push_back(node_id);
             }
         }
@@ -1257,8 +1274,7 @@ impl GraphRuntime {
                 let Some(info) = self.info(rid) else { return out };
                 let Some(part) = info.partitions.get(&p) else { return out };
                 for &wg in &part.walk_worker_graphs {
-                    let Some(state) = &self.states[wg as usize][rid as usize]
-                    else {
+                    let Some(state) = self.state(wg, rid) else {
                         continue;
                     };
                     let g = &self.graphs[wg as usize];
@@ -1298,7 +1314,7 @@ impl GraphRuntime {
         for (rid, wg_id) in rids.into_iter().zip(wg_ids) {
             let Some(wg) = self.wg_index(wg_id) else { continue };
             let Some(node) = self.nid(wg, node_name) else { continue };
-            if let Some(state) = &mut self.states[wg as usize][rid as usize] {
+            if let Some(state) = self.state_mut(wg, rid) {
                 freed.extend(state.clear_consumed_inputs(node));
             }
         }
@@ -1380,9 +1396,7 @@ impl GraphRuntime {
 
         if check_ready {
             for &rid in &request_ids {
-                let ready = self.states[wg as usize]
-                    .get(rid as usize)
-                    .and_then(|s| s.as_ref())
+                let ready = self.state(wg, rid)
                     .is_some_and(|s| s.is_ready(node));
                 if !ready {
                     return None; // unknown rid counts as not ready
@@ -1392,10 +1406,7 @@ impl GraphRuntime {
 
         let mut out = PopRidsOut::default();
         for rid in request_ids {
-            let Some(state) = self.states[wg as usize]
-                .get_mut(rid as usize)
-                .and_then(|s| s.as_mut())
-            else {
+            let Some(state) = self.state_mut(wg, rid) else {
                 continue;
             };
             if !state.take_for_schedule(node) {
@@ -1562,10 +1573,7 @@ impl GraphRuntime {
                 .map(|e| by_signal.get(&e.name).cloned().unwrap_or_default())
                 .collect();
 
-            let Some(state) = self.states[wg as usize]
-                .get_mut(rid as usize)
-                .and_then(|s| s.as_mut())
-            else {
+            let Some(state) = self.state_mut(wg, rid) else {
                 continue;
             };
             let (edges, _filtered) = state.complete(node, &out_tensors);
@@ -1588,10 +1596,7 @@ impl GraphRuntime {
                 }
                 if let Dest::Local(d) = e.dest {
                     if let Some(slot) = g.node(d).slot_of(e.name) {
-                        if let Some(st) = self.states[wg as usize]
-                            [rid as usize]
-                            .as_mut()
-                        {
+                        if let Some(st) = self.state_mut(wg, rid) {
                             st.ingest(d, slot, e.tensors.clone(), true, false);
                         }
                     }
@@ -1887,9 +1892,8 @@ impl GraphRuntime {
                 "node {node:?} is not in worker graph {wg_id}"
             ))
         })?;
-        let states = &mut self.states[wg as usize];
         for rid in rids {
-            if let Some(state) = &mut states[rid as usize] {
+            if let Some(state) = self.state_mut(wg, rid) {
                 state.set_spec_scheduled(node_id, speculatively_scheduled);
             }
         }
