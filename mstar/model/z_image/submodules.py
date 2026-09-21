@@ -156,8 +156,8 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
 
     def __init__(
         self, transformer: nn.Module, config: ZImageConfig, *, loop_name: str, attn_resource_key: str | None,
-        compile_transformer: bool = True, compile_eager_rounding: bool = True, max_batch_size: int = 8,
-        capture_shapes=(), capture_batch_sizes=(1, 2, 4, 8),
+        compile_transformer: bool = True, compile_eager_rounding: bool = True, compile_exact_ops: bool = False,
+        max_batch_size: int = 8, capture_shapes=(), capture_batch_sizes=(1, 2, 4, 8),
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
@@ -169,7 +169,9 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
         self.rope = ZImageRoPE(tcfg.rope_theta, tcfg.axes_dims, tcfg.axes_lens)
         self._compile = bool(compile_transformer) and transformer is not None
         if self._compile:
-            compile_transformer_forward(transformer, eager_rounding=compile_eager_rounding)
+            compile_transformer_forward(
+                transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+            )
 
     def shape_key_for(self, fwd_info: CurrentForwardPassInfo) -> ZShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
