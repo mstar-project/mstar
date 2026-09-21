@@ -462,9 +462,19 @@ def test_graph_walks_and_resources():
     align = walks[ALIGN_WALK]
     assert align.name == DECODER_NODE and set(align.input_names) == {"encoder_states", "transcript", "audio_frames"}
     assert [(e.name, e.next_node) for e in align.outputs] == [("word_tokens", EMIT_TO_CLIENT)]
-    loop_node = walks[DECODE_WALK].section
+    loop = walks[DECODE_WALK]
+    loop_node = loop.section
     assert set(loop_node.input_names) == {"text_inputs", "ts_rules"}
-    assert {e.name for e in loop_node.outputs if e.next_node == DECODER_NODE} == {"text_inputs", "ts_rules"}
+    # the token loops back (persisted for the align walk) and reaches the
+    # client once, through the loop's accumulated output
+    assert {e.name for e in loop_node.outputs if e.next_node == DECODER_NODE} == {
+        "new_token", "text_inputs", "ts_rules"
+    }
+    assert not any(e.next_node == EMIT_TO_CLIENT for e in loop_node.outputs)
+    assert [(e.name, e.next_node, e.output_modality, e.persist) for e in loop.accumulated_outputs] == [
+        ("new_token", EMIT_TO_CLIENT, "text", True),
+    ]
+    assert [e.persist for e in loop_node.outputs if e.name == "new_token"] == [False]
     assert model.nodes == [ENCODER_NODE, DECODER_NODE]
     specs = model.get_node_resources()
     kv = {s.resource_key: s for s in specs if isinstance(s, KVSpec)}
