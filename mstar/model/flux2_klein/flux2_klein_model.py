@@ -96,6 +96,7 @@ class Flux2KleinModel(Model):
         capture_sizes: list[list[int]] | None = None,
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 8,
+        max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
         lora: list | None = None,
         **kwargs,
@@ -117,6 +118,9 @@ class Flux2KleinModel(Model):
         self.capture_sizes = [tuple(int(v) for v in s) for s in (capture_sizes or [[1024, 1024]])]
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2, 4, 8])]
         self.max_batch_size = int(max_batch_size)
+        # largest output (pixels) a request may ask for: an unbounded size lets one request occupy the worker for
+        # minutes (8192^2 = 262k tokens of quadratic attention); requests above it are rejected before scheduling
+        self.max_image_area = int(max_image_area)
         self.vae_compile = bool(vae_compile)
         # LoRA adapters folded into the transformer at load time (static merge).
         self.loras = [LoraSpec.parse(item) for item in (lora or [])]
@@ -274,6 +278,11 @@ class Flux2KleinModel(Model):
                     f"FLUX.2 klein {name}={value} must be a positive multiple of {align} "
                     f"(VAE stride {self.config.vae.spatial_compression} x 2x2 latent patch)"
                 )
+        if height * width > self.max_image_area:
+            raise ValueError(
+                f"FLUX.2 klein {width}x{height} exceeds this server's max_image_area of {self.max_image_area} pixels "
+                f"({int(self.max_image_area ** 0.5)}^2)"
+            )
         return height, width
 
     def _resolve_steps(self, model_kwargs: dict) -> int:
