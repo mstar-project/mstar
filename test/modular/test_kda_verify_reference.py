@@ -137,8 +137,9 @@ def spec_step(rid, span):
 
 def test_shorter_and_empty_blocks_follow_the_pool_slots():
     """A block length that changes between steps: a full block, a 2-token block, a 1-token block (a plain
-    decode token that still consumes the pending prefix), a full block again. Every block's outputs must
-    follow the dense reference over the accepted sequence, and the checkpoint must track it."""
+    decode token that still consumes the pending prefix, and is committed in the step since the bonus
+    needs no verdict: nothing pends after it), a full block again. Every block's outputs must follow the
+    dense reference over the accepted sequence, and the checkpoint must track it."""
     gen = torch.Generator().manual_seed(1)
     params = KDAParams(conv_weight=torch.randn(P, W, generator=gen) * 0.3, A_log=torch.randn(H, generator=gen),
                        dt_bias=torch.randn(H * D, generator=gen) * 0.1, lower_bound=-5.0, num_heads=H, head_dim=D,
@@ -163,12 +164,16 @@ def test_shorter_and_empty_blocks_follow_the_pool_slots():
         plan = attn.current_plan()
         assert plan.is_verify and plan.k1 == span and plan.kmax1 == K1 and not plan.is_decode
         o = attn.run(b_qkv, b_g, b_beta, conv, state, params, spec=spec)
-        _, want_state, want_conv = dense(params, acc_qkv, acc_g, acc_beta)
+        # the checkpoint after the step: the accepted sequence, plus the block itself when it is one token
+        committed = (acc_qkv, acc_g, acc_beta) if span > 1 else (
+            torch.cat([acc_qkv, b_qkv]), torch.cat([acc_g, b_g]), torch.cat([acc_beta, b_beta]))
+        _, want_state, want_conv = dense(params, *committed)
         assert torch.allclose(from_v_first(state[slot]), want_state, atol=1e-5, rtol=1e-5)
         assert torch.allclose(conv[slot], want_conv, atol=1e-6)
         want_o, _, _ = dense(params, torch.cat([acc_qkv, b_qkv]), torch.cat([acc_g, b_g]), torch.cat([acc_beta, b_beta]))
         assert o.shape == (span, H, D) and torch.allclose(o.float(), want_o[-span:], atol=1e-5, rtol=1e-5)
         attn.set_prefix_len(spec.length, torch.tensor([accepted], dtype=torch.int32))
+        assert int(spec.length[slot, 0]) == (accepted + 1 if span > 1 else 0)
         runner.commit(s)
         acc_qkv = torch.cat([acc_qkv, b_qkv[: accepted + 1]])
         acc_g = torch.cat([acc_g, b_g[: accepted + 1]])
