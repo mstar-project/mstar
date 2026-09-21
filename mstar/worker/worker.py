@@ -2640,7 +2640,7 @@ class Worker:
         self.engine_manager.warmup_all()
 
         # Sync every worker before the main loop opens. Per-batch-size
-        # captures inside CudaGraphRunner are already barriered on the
+        # captures inside AcceleratorGraphRunner are already barriered on the
         # node-local TP group, but that doesn't bound the time between
         # ``warmup_and_capture`` returning and ``run()`` starting to
         # schedule. Without this fence, a TP leader can finish warmup

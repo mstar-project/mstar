@@ -19,10 +19,10 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    CudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, Segment, SlotLease, SubmoduleStep
@@ -149,13 +149,13 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
             for inp in model_inputs
         )
 
-    def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list:
+    def get_accelerator_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list:
         """CUDA graph capture config for the SigLIP encoder.
 
         Captures the batched encoder forward for bs ∈ [1, 2, 4] during the
         'prefill' walk. Each capture slot holds one request's pixel_values:
         (num_cameras, 3, H, W). preprocess() stacks them to (bs, num_cameras,
-        3, H, W) so shape[0] == bs, satisfying StatelessCudaGraphRunner's
+        3, H, W) so shape[0] == bs, satisfying StatelessAcceleratorGraphRunner's
         leading-dim == bs requirement.
 
         compile=False because warmup() already applies torch.compile to
@@ -164,10 +164,10 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         H = W = self.config.vit_image_size
         num_cameras = self.config.num_cameras
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="prefill",
                 single_request_inputs=ARNodeInputs(
-                    input_seq_len=0,  # not used by StatelessCudaGraphRunner
+                    input_seq_len=0,  # not used by StatelessAcceleratorGraphRunner
                     tensor_inputs={
                         "pixel_values": torch.zeros(
                             num_cameras, 3, H, W,
@@ -198,7 +198,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         inputs: list[NodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         # Stack images across requests: (bs, num_cameras, 3, H, W).
-        # Leading dim == bs satisfies StatelessCudaGraphRunner's shape validation,
+        # Leading dim == bs satisfies StatelessAcceleratorGraphRunner's shape validation,
         # and forward_batched flattens it back before the encoder call.
         all_images = [inp.tensor_inputs["pixel_values"] for inp in inputs]
         pixel_values = torch.stack(all_images, dim=0)
@@ -401,14 +401,14 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         emb = self.embed_tokens(ids)
         return emb * self._text_embed_scale
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         del tp_world_size
         return [
             # Action generation always has latents of the same size, so it is a
             # similar paradigm to AR decode and can use the batched cuda graphs.
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="action_gen",
                 single_request_inputs=ARNodeInputs(
                     input_seq_len=self.config.action_horizon,
@@ -421,7 +421,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
                 ),
                 capture_batch_sizes=self.ACTION_GEN_CAPTURE_BATCH_SIZES
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill",
                 make_node_input=lambda n: ARNodeInputs(
                     input_seq_len=n,

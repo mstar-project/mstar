@@ -29,13 +29,13 @@ import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
+from mstar.engine.accelerator_graph_config import (
+    PiecewiseAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
-    PiecewiseCudaGraphConfig,
 )
-from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
@@ -497,7 +497,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         self.anticipation_seconds = float(anticipation_seconds)
 
     # NOTE: this masked predictor does NOT opt into piecewise CUDA graphs
-    # (``get_piecewise_cuda_graph_configs`` returns the base default of {}).
+    # (``get_piecewise_accelerator_graph_configs`` returns the base default of {}).
     # The non-AC predictor attends over n_ctxt + n_pred ≈ 8448 tokens using
     # plain SDPA (no FlashInfer). At that sequence length the O(N²) attention
     # dominates completely — Python kernel-launch overhead is negligible
@@ -856,8 +856,8 @@ class VJepa2ACPredictorSubmodule(ARNodeSubmodule):
 class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
     """Action-conditioned autoregressive rollout.
 
-    Optionally uses a PiecewiseCudaGraphRunner to accelerate the inner block
-    loop. The submodule opts in via ``get_piecewise_cuda_graph_configs`` (label
+    Optionally uses a PiecewiseAcceleratorGraphRunner to accelerate the inner block
+    loop. The submodule opts in via ``get_piecewise_accelerator_graph_configs`` (label
     ``"block_loop"``); the engine builds the runner at warmup and passes it in
     through ``engine_inputs.piecewise_runners``.
 
@@ -919,10 +919,10 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         fn = self.predictor.make_block_loop_fn("main", inp.static_inputs, cond_tokens)
         return {"x": fn(inp.static_inputs["x"])}
 
-    def get_piecewise_cuda_graph_configs(
+    def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1,
         **kwargs: Any,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """One BATCHED piecewise graph (``"block_loop"``) for the AC predictor.
 
         ``capture_seq_len = cond_tokens + N*N`` is the per-frame token count
@@ -1146,12 +1146,12 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         states: torch.Tensor,                    # [B, 1, action_embed_dim]
         t_0: int,
         extrinsics: torch.Tensor | None = None,  # [B, 1, action_embed_dim - 1] or None
-        request_ids: list[str] | None = None,    # needed by PiecewiseCudaGraphRunner
-        runner: "PiecewiseCudaGraphRunner | None" = None,
+        request_ids: list[str] | None = None,    # needed by PiecewiseAcceleratorGraphRunner
+        runner: "PiecewiseAcceleratorGraphRunner | None" = None,
     ) -> torch.Tensor:
         """One AC rollout step using either the CUDA-graph or eager path.
 
-        The CUDA-graph path (when a ``block_loop`` PiecewiseCudaGraphRunner is
+        The CUDA-graph path (when a ``block_loop`` PiecewiseAcceleratorGraphRunner is
         available on ``engine_inputs``):
           1. Preamble (predictor_embed + action/state concat) runs eagerly.
           2. Position tensors are computed eagerly (hoisted out of the graph).

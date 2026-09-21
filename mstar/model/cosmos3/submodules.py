@@ -34,9 +34,9 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    PackedCudaGraphConfig,
+from mstar.engine.accelerator_graph_config import (
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
 )
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.cosmos3.components.packing import (
@@ -214,7 +214,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         The engine leases the replay slot before the step is declared, so this
         answers from per-request state rather than from prepared inputs. It is
-        the sole gate on capture — the v1 engine has no ``can_use_cuda_graphs``
+        the sole gate on capture — the v1 engine has no ``can_use_accelerator_graphs``
         — so every condition the old gate checked lives here:
 
         * only the two-branch guidance regime is captured (both the prefill's
@@ -1506,7 +1506,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # scheduler step run eagerly afterwards.
     # ------------------------------------------------------------------
 
-    def get_cuda_graph_configs(self, device, tp_world_size: int = 1):
+    def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
         """Declare one fixed-shape capture of the image denoise step per
         resolution. Requests at other resolutions, or without guidance, fall back
         to the eager path. The per-resolution token layout is prompt-independent,
@@ -1590,7 +1590,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     cfg=True, cfg_active=True, capture_key=tuple(latent_shape),
                 ),
             )
-            configs.append(BatchedCudaGraphConfig(
+            configs.append(BatchedAcceleratorGraphConfig(
                 capture_graph_walk=IMAGE_GEN_WALK,
                 single_request_inputs=single,
                 # One bucket per resolution: the token layout is baked into the
@@ -1632,7 +1632,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             mrope_dtype = torch.float32 if self.config.enable_fps_modulation else torch.long
 
-            configs.append(PackedCudaGraphConfig(
+            configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 replay_graph_walks=list(PREFILL_WALKS),
                 capture_token_lengths=prefill_tokens,
