@@ -382,7 +382,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         device = self.get_device()
         start_pos = self.node_resources[THINKER_POS].position(
-            rid=fwd_info.request_id, label="main"
+            rid=fwd_info.rid_handle, label="main"
         )
         if graph_walk == "thinker_decode":
             # Get previous token ID from text_inputs
@@ -1252,7 +1252,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             seq_len = input_embeds.shape[0]
 
         if graph_walk == "talker_last_prefill":
-            rid = fwd_info.request_id
+            rid = fwd_info.rid_handle
             # Last-prefill is the assistant's first token, which is
             # text-only — Thinker postprocess pre-selected layer-0 for it.
             last_hidden = inputs["thinker_states"][0].to(device)
@@ -1267,7 +1267,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             input_embeds = inputs["talker_input_embeds"][0].to(dtype)
 
             thinker_states = inputs.get("thinker_states", [])
-            rid = fwd_info.request_id
+            rid = fwd_info.rid_handle
             if thinker_states:
                 # Decode is always text → text_projection.
                 text_hidden = self.model.text_projection(
@@ -1734,7 +1734,7 @@ class Code2WavSubmodule(NodeSubmodule):
             ),dtype=codec_tokens.dtype,
             device=codec_tokens.device)
             codec_tokens = torch.cat([codec_tokens, pad], dim=0)
-        self._latest_seq_len[fwd_info.request_id] = orig_seq_len
+        self._latest_seq_len[fwd_info.rid_handle] = orig_seq_len
 
         # Transpose to (Q, T)
         codec_tokens = codec_tokens.T  # (Q, T)

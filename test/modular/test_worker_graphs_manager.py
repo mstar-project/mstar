@@ -89,7 +89,7 @@ def _make_ar_walk_graph():
     ])
 
 
-def _make_manager(wg_id="wg0", graph_walk="decode", worker_id="worker0"):
+def _make_manager(wg_id=0, graph_walk="decode", worker_id="worker0"):
     """Build a WorkerGraphsManager with one WorkerGraphQueues + one request."""
     graph = _make_ar_walk_graph()
     worker_graph = WorkerGraph(
@@ -118,7 +118,7 @@ def _make_manager(wg_id="wg0", graph_walk="decode", worker_id="worker0"):
         node_to_partition={"prefill": "default", "ar_decode": "default"},
     )
     mgr.add_request(
-        request_id="rid",
+        rid="rid",
         partition_worker_graph_ids=[wg_id],
         worker_graph_to_workers={wg_id: [worker_id]},
         current_fwd_info=_fwd_info(graph_walk),
@@ -189,7 +189,7 @@ def test_stop_loops_returns_loop_back_signal_set():
     mgr.mark_node_complete("rid", wg_id, "prefill")
 
     stopped = mgr.stop_loops(
-        request_id="rid",
+        rid="rid",
         partition="default",
         loop_names={"ar_loop"},
     )
@@ -207,7 +207,7 @@ def test_stop_loops_snapshots_loop_stop_times_when_req_info_provided():
     fwd_info = mgr.get_fwd_info("rid", "default")
 
     mgr.stop_loops(
-        request_id="rid",
+        rid="rid",
         partition="default",
         loop_names={"ar_loop"},
         req_info=fwd_info,
@@ -263,7 +263,7 @@ def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
         input_names={"text_inputs"},
         outputs=[],  # no declared outputs — KV-cache-only step
     )
-    wg_id = "wg_empty"
+    wg_id = 1
     worker_graph = WorkerGraph(
         section=empty_outputs_graph,
         graph_walks={"prefill_text"},
@@ -287,7 +287,7 @@ def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
         node_to_partition={"prefill_text": "default"},
     )
     mgr.add_request(
-        request_id="rid",
+        rid="rid",
         partition_worker_graph_ids=[wg_id],
         worker_graph_to_workers={wg_id: ["worker0"]},
         current_fwd_info=_fwd_info("prefill_text"),
@@ -319,7 +319,7 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
                       conductor_new_token=True, persist=True),
         ],
     )
-    wg_id = "wg_external"
+    wg_id = 2
     worker_graph = WorkerGraph(
         section=single_node_graph,
         graph_walks={"prefill"},
@@ -343,7 +343,7 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
         node_to_partition={"prefill": "default"},
     )
     mgr.add_request(
-        request_id="rid",
+        rid="rid",
         partition_worker_graph_ids=[wg_id],
         worker_graph_to_workers={wg_id: ["worker0"]},
         current_fwd_info=_fwd_info("prefill"),

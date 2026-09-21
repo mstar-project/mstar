@@ -553,7 +553,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             return seg, off
 
     def register_for_send(
-        self, request_id: str, tensor_infos: list[TensorPointerInfo],
+        self, rid: int, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
         if not skip_cuda_sync and torch.cuda.is_available():
@@ -593,7 +593,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     self._arena_ts[uuid] = time.monotonic()
                     self.tensor_store.set_metadata(uuid, mem_registered=True)
                     if self.enable_prof:
-                        self._record_tx(request_id, uuid, len(data),
+                        self._record_tx(rid, uuid, len(data),
                                         time.perf_counter() - t0)
                     logger.debug("ARENA: spilled %s to %s (%d bytes)",
                                  uuid, path, len(data))
@@ -626,7 +626,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 self.tensor_store.set_metadata(uuid, mem_registered=True)
                 if self.enable_prof:
                     self._record_tx(
-                        request_id, uuid, nbytes, time.perf_counter() - t0)
+                        rid, uuid, nbytes, time.perf_counter() - t0)
                 logger.debug("ARENA: staged %s at %s+%d (%d bytes)",
                              uuid, seg_name, off, nbytes)
         if queued and self._d2h_stream is not None:
@@ -637,19 +637,19 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     # -- consumer ---------------------------------------------------------
 
     def start_read_tensors(
-        self, request_id: str, graph_edges: list[GraphEdge],
+        self, rid: int, graph_edges: list[GraphEdge],
         graph_walk: str | None = None,
     ):
         # Increment races are benign here: a torn count can only make
         # eviction OVER-cautious (skip a sweep), never unsafe.
         self._reads_active += 1
         try:
-            return self._start_read_tensors(request_id, graph_edges,
+            return self._start_read_tensors(rid, graph_edges,
                                             graph_walk)
         finally:
             self._reads_active -= 1
 
-    def _start_read_tensors(self, request_id, graph_edges, graph_walk):
+    def _start_read_tensors(self, rid, graph_edges, graph_walk):
         self._evict_dead_peers()
         h2d_did_work = False
         read_edges: list[tuple[GraphEdge, float]] = []
@@ -666,7 +666,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 for info in graph_edge.tensor_info:
                     if info.source_entity == self.my_entity_id:
                         self._slice_existing_tensor(
-                            request_id=request_id, name=graph_edge.name,
+                            rid=rid, name=graph_edge.name,
                             next_node=graph_edge.next_node,
                             graph_walk=graph_walk, info=info,
                         )
@@ -688,7 +688,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                         tensor = self._read_from_arena(info)
                     h2d_did_work = h2d_did_work or tensor.numel() > 0
                     self.tensor_store.put_tensor(
-                        request_id, info.uuid, tensor)
+                        rid, info.uuid, tensor)
                     self.tensor_store.set_metadata(info.uuid, mem_registered=False)
                     # +1 transit (released by get_ready_tensors), +1 usage
                     # (released by _cleanup_consumed_inputs).
@@ -711,7 +711,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             self.pending.append(
                 FutureAndPointers(
                     future=future, graph_edges=[graph_edge],
-                    request_id=request_id, rx_time=rx_time,
+                    rid=rid, rx_time=rx_time,
                 )
             )
         if future is None:
@@ -784,10 +784,9 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 self._wake_q.put(None)
                 self._wake_q = None
 
-    def _cleanup_by_uuid(self, request_id: str, uuid: str):
+    def _cleanup_by_uuid(self, uuid: int):
         # Grandparent cleanup (refcounts): skip the file manager's unlink.
-        super(SharedMemoryCommunicationManager, self)._cleanup_by_uuid(
-            request_id, uuid)
+        super(SharedMemoryCommunicationManager, self)._cleanup_by_uuid(uuid)
         self._arena_ts.pop(uuid, None)
         if (loc := self._arena_locs.pop(uuid, None)) is not None:
             self._arena.free(*loc)

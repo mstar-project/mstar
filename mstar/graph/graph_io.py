@@ -29,7 +29,7 @@ class WorkerGraphIO:
     """
     def __init__(
         self, graph: GraphSection,
-        wg_id: str | None=None
+        wg_id: int | None=None
     ):
         self.nodes = graph.get_nodes()
         self.loops = graph.get_loops()
@@ -179,14 +179,14 @@ class WorkerGraphIO:
     def clear(self):
         self.wg_state_registry.clear()
 
-    def register_communication_info(self, communication_manager, request_id: str):
+    def register_communication_info(self, communication_manager, rid: int):
         for loop in self.loops.values():
             loop.register_communication_info(
-                communication_manager, request_id
+                communication_manager, rid
             )
         for node in self.nodes.values():
             node.register_communication_info(
-                communication_manager, request_id
+                communication_manager, rid
             )
 
     def get_loop_indices(self):

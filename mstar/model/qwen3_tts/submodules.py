@@ -314,14 +314,14 @@ class TalkerSubmodule(ARNodeSubmodule):
         del kwargs
         if graph_walk == "talker_prefill":
             input_embeds = self._build_prefill(
-                fwd_info.request_id,
+                fwd_info.rid_handle,
                 inputs["text_inputs"][0],
                 int(inputs["speaker_id"][0].item()),
                 int(inputs["language_id"][0].item()),
             )
-            state = self.request_state(fwd_info.request_id)
+            state = self.request_state(fwd_info.rid_handle)
         elif graph_walk == "talker_decode":
-            state = self.request_state(fwd_info.request_id)
+            state = self.request_state(fwd_info.rid_handle)
             step = int(state["generation_step"])
             trailing = state["trailing_text_hidden"]
             text_condition = (
@@ -862,7 +862,7 @@ class CodecSubmodule(ARNodeSubmodule):
                 codes,
                 (0, 0, 0, self.full_seq_len - original_frames),
             )
-        self.request_state(fwd_info.request_id).add(
+        self.request_state(fwd_info.rid_handle).add(
             "latest_codec_frames", original_frames
         )
         return ARNodeInputs(

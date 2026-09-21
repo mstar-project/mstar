@@ -158,8 +158,12 @@ class TensorStore:
     def __init__(self, bookkeeping: TensorBookkeeping | None = None):
         # {UUID -> tensor}
         self._tensors: dict[int, torch.Tensor] = {}
-        # Only for teardown: which uuids a request is responsible for.
+        # Only for teardown: which uuids a request is responsible for, and the
+        # reverse so a single removal does not scan every request. A sliced
+        # tensor can outlive its producer's entry (_slice_existing_tensor mints
+        # a new uuid), so ownership is not derivable from the uuid alone.
         self._rid_to_uuids: dict[int, set[int]] = {}
+        self._uuid_to_rid: dict[int, int] = {}
         self.bookkeeping = bookkeeping or PythonTensorBookkeeping()
 
     # -- tensors ------------------------------------------------------------
@@ -167,18 +171,20 @@ class TensorStore:
     def get_tensor(self, uuid: int) -> torch.Tensor:
         return self._tensors[uuid]
 
-    def put_tensor(self, request_id: int, uuid: int, tensor: torch.Tensor):
+    def put_tensor(self, rid: int, uuid: int, tensor: torch.Tensor):
         self._tensors[uuid] = tensor
-        self._rid_to_uuids.setdefault(request_id, set()).add(uuid)
+        self._rid_to_uuids.setdefault(rid, set()).add(uuid)
+        self._uuid_to_rid[uuid] = rid
         self.bookkeeping.put_tensor(uuid)
 
     def put_tensor_batch(
-        self, request_id: int, tensors: ParallelList[int, torch.Tensor],
+        self, rid: int, tensors: ParallelList[int, torch.Tensor],
     ):
-        owned = self._rid_to_uuids.setdefault(request_id, set())
+        owned = self._rid_to_uuids.setdefault(rid, set())
         for uuid, tensor in tensors:
             self._tensors[uuid] = tensor
             owned.add(uuid)
+            self._uuid_to_rid[uuid] = rid
         self.bookkeeping.put_tensor_batch(tensors.keys)
 
     def check_uuid_presence(self, uuid: int) -> bool:
@@ -188,22 +194,24 @@ class TensorStore:
         if self._tensors.pop(uuid, None) is None:
             return
         self.bookkeeping.forget_tensor(uuid)
-        # The owning request is usually known by the caller, but a slice can
-        # outlive its producer's entry, so find it rather than require it.
-        for owned in self._rid_to_uuids.values():
-            if uuid in owned:
+        rid = self._uuid_to_rid.pop(uuid, None)
+        if rid is not None:
+            owned = self._rid_to_uuids.get(rid)
+            if owned is not None:
                 owned.discard(uuid)
-                break
+                if not owned:
+                    del self._rid_to_uuids[rid]
 
-    def get_all_uuids(self, request_id: int) -> list[int]:
-        return list(self._rid_to_uuids.get(request_id, ()))
+    def get_all_uuids(self, rid: int) -> list[int]:
+        return list(self._rid_to_uuids.get(rid, ()))
 
-    def remove_request(self, request_id: int) -> list[int]:
+    def remove_request(self, rid: int) -> list[int]:
         """Forget the request and return the uuids it owned, so the caller can
         run its own per-uuid cleanup (shm files, arena slots) before they go."""
-        uuids = list(self._rid_to_uuids.pop(request_id, ()))
+        uuids = list(self._rid_to_uuids.pop(rid, ()))
         for uuid in uuids:
             self._tensors.pop(uuid, None)
+            self._uuid_to_rid.pop(uuid, None)
             self.bookkeeping.forget_tensor(uuid)
         return uuids
 

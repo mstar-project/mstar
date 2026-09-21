@@ -72,7 +72,7 @@ def test_reclaim_frees_arena_slots(tmp_path):
     (info,) = infos["x"]
     prod.register_for_send("r2", [info])
     assert prod._arena_locs
-    prod._cleanup_by_uuid("r2", info.uuid)
+    prod._cleanup_by_uuid(info.uuid)
     assert not prod._arena_locs
 
 
@@ -114,7 +114,7 @@ def test_arena_grows_then_spills(tmp_path):
         # Reclaim unlinks the spilled files.
         for info in spilled:
             path = prod._shm_files[info.uuid]
-            prod._cleanup_by_uuid("r3", info.uuid)
+            prod._cleanup_by_uuid(info.uuid)
             assert not os.path.exists(path)
     finally:
         del os.environ["MSTAR_SHM_ARENA_SPILL_AFTER_S"]
@@ -138,7 +138,7 @@ def test_mixed_edge_and_fragmentation_signature(tmp_path, caplog):
         # ...then free ALTERNATE allocations: ~1.2 MB total free, but no
         # contiguous block larger than ~300 KB.
         for info in fill["fill"][::2]:
-            prod._cleanup_by_uuid("r6", info.uuid)
+            prod._cleanup_by_uuid(info.uuid)
         st = prod.stats_summary()
         assert st["free_bytes"] > 500_000 > st["largest_free_block"]
 
@@ -294,7 +294,7 @@ def test_dead_peer_segments_evicted(tmp_path):
     assert seg in cons._peer_segments
     cons.pending.clear()               # no in-flight reads
     # Producer goes away gracefully: Drop unlinks its segments.
-    prod._cleanup_by_uuid("re", infos["x"][0].uuid)
+    prod._cleanup_by_uuid(infos["x"][0].uuid)
     del prod
     import gc
 

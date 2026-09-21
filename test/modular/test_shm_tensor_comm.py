@@ -153,7 +153,7 @@ def test_full_sender_receiver_cycle():
         assert len(ready["req1"]) == 1
 
         # Verify tensor equality
-        received_tensor = receiver.get_tensor("req1", uuids[0])
+        received_tensor = receiver.get_tensor(uuids[0])
         assert torch.equal(received_tensor, original)
 
 
@@ -172,7 +172,7 @@ def test_full_cycle_bfloat16():
 
         receiver.start_read_tensors("req1", edges, graph_walk="decode")
         receiver.get_ready_tensors(graph_walk="decode")
-        received = receiver.get_tensor("req1", uuids[0])
+        received = receiver.get_tensor(uuids[0])
         assert torch.equal(received, original)
 
 
@@ -189,7 +189,7 @@ def test_cleanup_unlinks_file():
         assert os.path.isfile(path)
 
         # Dereference to 0 triggers cleanup
-        mgr.dereference("req1", uuid, n=0)  # ref is already 0
+        mgr.dereference(uuid, n=0)  # ref is already 0
         mgr.cleanup_request("req1")
         assert not os.path.isfile(path)
 
@@ -210,7 +210,7 @@ def test_local_tensor_skips_shm():
         ready = mgr.get_ready_tensors(graph_walk="decode")
         assert "req1" in ready
 
-        retrieved = mgr.get_tensor("req1", uuids[0])
+        retrieved = mgr.get_tensor(uuids[0])
         assert torch.equal(retrieved, tensor)
 
 
@@ -292,7 +292,7 @@ def test_ack_unread_tensors_lets_producer_reclaim_buffer():
         # Producer applies the ack (mirrors worker._handle_tensor_received) and
         # reclaims the buffer.
         for u, n in msg.body.successful_tensors.items():
-            producer.dereference("req1", u, n=n)
+            producer.dereference(u, n=n)
         assert not os.path.isfile(shm_path)  # reclaimed -> no leak
 
 
@@ -306,7 +306,7 @@ def _store_persisted_input(mgr, request_id, name="in"):
     info = mgr.store_and_return_tensor_info(request_id, {name: [torch.randn(4, 8)]})
     tensor_info = info[name][0]
     mgr.register_for_send(request_id, [tensor_info])
-    mgr.set_persist(request_id, tensor_info.uuid, persist=True)
+    mgr.set_persist(tensor_info.uuid, persist=True)
     return tensor_info.uuid
 
 
@@ -369,7 +369,7 @@ def test_has_inflight_reads_tracks_pending_futures():
 
         # Completed synchronous read (future=None) does not count.
         mgr.pending.append(
-            FutureAndPointers(future=None, graph_edges=[], request_id="req1")
+            FutureAndPointers(future=None, graph_edges=[], rid="req1")
         )
         assert not mgr.has_inflight_reads("req1")
 
@@ -379,7 +379,7 @@ def test_has_inflight_reads_tracks_pending_futures():
                 return False
 
         mgr.pending.append(
-            FutureAndPointers(future=_Fut(), graph_edges=[], request_id="req1")
+            FutureAndPointers(future=_Fut(), graph_edges=[], rid="req1")
         )
         assert mgr.has_inflight_reads("req1")
         assert not mgr.has_inflight_reads("other-req")

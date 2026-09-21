@@ -49,6 +49,11 @@ def _worker(known_rids=("r1", "r2")):
     w.worker_graphs_manager = SimpleNamespace(
         per_request_info={rid: object() for rid in known_rids}
     )
+    # Identity interning: the rid string doubles as its own handle here.
+    w._rid_runtime = SimpleNamespace(
+        get_rid_handle=lambda r: r if r in known_rids else None,
+        get_rid_string=lambda h: h,
+    )
     w.scheduler = MicroScheduler.__new__(MicroScheduler)
     w.scheduler.failed_rids = set()
     w.scheduler.held_until = {}
@@ -271,8 +276,8 @@ def test_output_postprocess_failure_becomes_an_error_chunk():
     )
     wt.tensor_manager = SimpleNamespace(
         get_ready_tensors=lambda: {"r1": [edge]},
-        get_tensor=lambda request_id, uuid: object(),
-        dereference=lambda request_id, uuid: dereferenced.append(uuid),
+        get_tensor=lambda uuid: object(),
+        dereference=dereferenced.append,
     )
 
     assert wt._process_read_tensors() is True

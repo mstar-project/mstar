@@ -164,11 +164,11 @@ class ReadySignals:
 
     def __post_init__(self):
         self._tensor_manager = None
-        self._request_id = None
+        self._rid = None
 
-    def register_communication_info(self, communication_manager, request_id: str):
+    def register_communication_info(self, communication_manager, rid: int):
         self._tensor_manager = communication_manager
-        self._request_id =  request_id
+        self._rid =  rid
 
     def update(self, edge: GraphEdge):
         assert edge.name in self.input_names, \
@@ -193,7 +193,7 @@ class ReadySignals:
                 if edge._persist_for_loop:
                     continue
                 for info in edge.tensor_info:
-                    self._tensor_manager.dereference(self._request_id, info.uuid)
+                    self._tensor_manager.dereference(info.uuid)
         self.ready_inputs.clear()
         self.ready_names.clear()
         self.is_ready = False
@@ -262,14 +262,14 @@ class GraphNode(GraphSection):
             streaming_inputs=self._streaming_inputs
         )
         self._tensor_manager = None
-        self._request_id = None
+        self._rid = None
 
-    def register_communication_info(self, communication_manager, request_id: str):
+    def register_communication_info(self, communication_manager, rid: int):
         self.ready_signals.register_communication_info(
-            communication_manager, request_id
+            communication_manager, rid
         )
         self.ready_next_iter.register_communication_info(
-            communication_manager, request_id
+            communication_manager, rid
         )
 
     def _register_streaming(self, streaming_inputs: set[str]):
@@ -553,9 +553,9 @@ class Loop(GraphSection):
                 output_edges=self._ingested_external_inputs
             )
 
-    def register_communication_info(self, communication_manager, request_id: str):
+    def register_communication_info(self, communication_manager, rid: int):
         self._tensor_manager = communication_manager
-        self._request_id = request_id
+        self._rid = rid
 
     def maybe_cache_output(self, edges: list[GraphEdge]):
         """Snapshot tensor_info for any edge that matches a declared loop output.
@@ -576,19 +576,19 @@ class Loop(GraphSection):
                 ).extend(edge.tensor_info)
                 if self._tensor_manager is not None:
                     for info in edge.tensor_info:
-                        self._tensor_manager.increment_ref(self._request_id, info.uuid)
+                        self._tensor_manager.increment_ref(info.uuid)
 
             elif edge.name in self._accumulated_output_names:
                 self._accumulated_cache.setdefault(edge.name, []).extend(edge.tensor_info)
                 if self._tensor_manager is not None:
                     for info in edge.tensor_info:
-                        self._tensor_manager.increment_ref(self._request_id, info.uuid)
+                        self._tensor_manager.increment_ref(info.uuid)
 
 
     def __post_init__(self):
         # Will be set later
         self._tensor_manager = None
-        self._request_id = None
+        self._rid = None
 
         io = self.section.get_inputs_outputs()
         if self._external_inputs is None:
@@ -620,17 +620,17 @@ class Loop(GraphSection):
         self.is_done = False
 
     def _uncache_outputs(self):
-        if self._tensor_manager is not None and self._request_id is not None:
+        if self._tensor_manager is not None and self._rid is not None:
             for tensor_infos in self._cached_outputs.values():
                 for info in tensor_infos:
-                    self._tensor_manager.dereference(self._request_id, info.uuid)
+                    self._tensor_manager.dereference(info.uuid)
         self._cached_outputs.clear()
 
     def _uncache_accumulated_outputs(self):
-        if self._tensor_manager is not None and self._request_id is not None:
+        if self._tensor_manager is not None and self._rid is not None:
             for tensor_infos in self._accumulated_cache.values():
                 for info in tensor_infos:
-                    self._tensor_manager.dereference(self._request_id, info.uuid)
+                    self._tensor_manager.dereference(info.uuid)
         self._accumulated_cache.clear()
 
     def reset_for_outer_iter(self):

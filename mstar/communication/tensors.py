@@ -3,6 +3,7 @@ import os
 import platform
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 class FutureAndPointers:
     future: Future | None
     graph_edges: list[GraphEdge]
-    request_id: str = ""
+    rid: int = -1
     rx_time: float | None = None # seconds
 
 
@@ -278,6 +279,11 @@ class TensorCommunicationManager(ABC):
     Holds common attributes and shared method implementations. Subclasses
     only need to override ``__init__``, ``register_for_send``,
     ``start_read_tensors``, and ``_cleanup_by_uuid``.
+
+    ``rid`` is the worker's integer rid handle. The api-server data worker
+    drives this same class with string request ids, which behaves identically
+    because nothing here does more than use the rid as an opaque key -- only
+    ``rid_to_str`` cares, and its default (``str``) is the identity on strings.
     """
 
     def __init__(
@@ -296,21 +302,25 @@ class TensorCommunicationManager(ABC):
         self.communicator = communicator
         self.transfer_engine = transfer_engine
         self.tensor_store = TensorStore()
+        # Everything here keys off the integer rid handle; the TENSOR_RECEIVED
+        # ack is the only thing that leaves the process, so it is the only
+        # place the string is needed. The worker installs the real de-interner.
+        self.rid_to_str: Callable[[int], str] = str
         self._uuid_minter = TensorUuidMinter(my_entity_id)
         self.pending: list[FutureAndPointers] = []
-        self.read_finished: dict[str, set[int]] = {}
+        self.read_finished: dict[int, set[int]] = {}
 
-        self.req_rx_info: dict[str, SourceAndEdgeToRxInfo] = {}
-        self.req_tx_info: dict[str, EdgeNameToTxInfo] = {}
+        self.req_rx_info: dict[int, SourceAndEdgeToRxInfo] = {}
+        self.req_tx_info: dict[int, EdgeNameToTxInfo] = {}
         # uuid -> edge/signal name, so register_for_send (which doesn't see
         # edge names) can attribute TX bytes/time to the right edge. Only tracked under
         # ``enable_prof``.
         self.uuid_to_edge_name: dict[int, str] = {}
 
         # req_id -> cfg
-        self.sharding_configs: dict[str, ShardingConfig] = {}
+        self.sharding_configs: dict[int, ShardingConfig] = {}
         # req_id -> {name -> shards}
-        self.buffered_shards: dict[str, dict[str, BufferedShards]] = {}
+        self.buffered_shards: dict[int, dict[str, BufferedShards]] = {}
         self.uuid_to_shard_dim: dict[int, int | None] = {}
 
     # ---- shared: store ----
@@ -333,7 +343,7 @@ class TensorCommunicationManager(ABC):
         return tensor.permute(*inverse_perm).contiguous()
 
     def store_and_return_tensor_info(
-        self, request_id: str, tensors: NameToTensorList,
+        self, rid: int, tensors: NameToTensorList,
         node_name: str | None=None,
         graph_walk: str | None=None,
         skip_cuda_sync: bool = False,
@@ -353,7 +363,7 @@ class TensorCommunicationManager(ABC):
         # register_request is a hard prereq on the worker side, but the API
         # server calls this without registering. Default to "no group" / TP=1
         # when no sharding_config is present.
-        cfg = self.sharding_configs.get(request_id)
+        cfg = self.sharding_configs.get(rid)
         if cfg is not None:
             source_group = cfg.get_sharding_group(node_name, graph_walk)
         else:
@@ -376,7 +386,7 @@ class TensorCommunicationManager(ABC):
                 # match what receivers will read.
                 canonical = self._ensure_leading_shard_dim(shard_dim, tensor)
                 self.tensor_store.put_tensor(
-                    request_id=request_id, uuid=tensor_uuid, tensor=canonical,
+                    rid=rid, uuid=tensor_uuid, tensor=canonical,
                 )
                 if cfg is not None:
                     self.uuid_to_shard_dim[tensor_uuid] = shard_dim
@@ -401,7 +411,7 @@ class TensorCommunicationManager(ABC):
         return tensor_info
 
     def store_and_populate_graph_edges(
-        self, request_id: str, tensors: NameToTensorList,
+        self, rid: int, tensors: NameToTensorList,
         graph_edges: list[GraphEdge],
         node_name: str | None=None,
         graph_walk: str | None=None,
@@ -413,7 +423,7 @@ class TensorCommunicationManager(ABC):
             name_to_graph_edges.setdefault(edge.name, []).append(edge)
 
         graph_node_info = self.store_and_return_tensor_info(
-            request_id=request_id, tensors=tensors,
+            rid=rid, tensors=tensors,
             node_name=node_name, graph_walk=graph_walk,
             skip_cuda_sync=skip_cuda_sync,
         )
@@ -444,7 +454,7 @@ class TensorCommunicationManager(ABC):
 
     def set_output_ref_counts(
         self,
-        request_id: str,
+        rid: int,
         safety_hold_uuids: set[int],
         routed_edges: list[GraphEdge],
     ):
@@ -467,13 +477,13 @@ class TensorCommunicationManager(ABC):
             if delta > 0:
                 self.tensor_store.increment_ref(uuid, n=delta)
             elif delta < 0:
-                self.dereference(request_id, uuid, n=-delta)
+                self.dereference(uuid, n=-delta)
 
     # ---- abstract: transport-specific ----
 
     @abstractmethod
     def register_for_send(
-        self, request_id: str, tensor_infos: list[TensorPointerInfo],
+        self, rid: int, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
         """Mark these tensors ready for remote consumers to RDMA-read.
@@ -489,11 +499,11 @@ class TensorCommunicationManager(ABC):
         ...
 
     def _slice_existing_tensor(
-        self, request_id: str, name: str, next_node: str,
+        self, rid: int, name: str, next_node: str,
         graph_walk: str | None, info: TensorPointerInfo
     ):
-        shard_dim = self.sharding_configs[request_id].shard_dim.get(name)
-        dest_group = self.sharding_configs[request_id].group_mapping.get(
+        shard_dim = self.sharding_configs[rid].shard_dim.get(name)
+        dest_group = self.sharding_configs[rid].group_mapping.get(
             NodeAndGraphWalk(next_node, graph_walk)
         )
         dest_tp_size = dest_group.tp_size if dest_group is not None else 1
@@ -511,31 +521,31 @@ class TensorCommunicationManager(ABC):
             end = start + info.nbytes // bytes_per_row
             slice_view = canonical_tensor[start:end]
             new_uuid = self._uuid_minter.mint()
-            self.tensor_store.put_tensor(request_id, new_uuid, slice_view)
+            self.tensor_store.put_tensor(rid, new_uuid, slice_view)
             self.uuid_to_shard_dim[new_uuid] = shard_dim
             # Release this edge's stake on the producer's UUID — the slice now
             # owns it. The slice view keeps the underlying storage alive even
             # if the producer's UUID GCs.
-            self.dereference(request_id, info.uuid, 1)
+            self.dereference(info.uuid, 1)
             info.uuid = new_uuid
 
     @abstractmethod
     def start_read_tensors(
-        self, request_id: str, graph_edges: list[GraphEdge],
+        self, rid: int, graph_edges: list[GraphEdge],
         graph_walk: str | None = None
     ) -> list[Future]:
         ...
 
-    def _cleanup_by_uuid(self, request_id: str, uuid: int):
+    def _cleanup_by_uuid(self, uuid: int):
         self.uuid_to_shard_dim.pop(uuid, None)
         self.uuid_to_edge_name.pop(uuid, None)
 
     # ---- shared: polling & ACKs ----
 
     def _collect_and_send_acks(
-        self, request_id: str, graph_edges: list[GraphEdge],
+        self, rid: int, graph_edges: list[GraphEdge],
     ):
-        acks: dict[str, dict[str, int]] = {}
+        acks: dict[str, dict[int, int]] = {}
         for edge in graph_edges:
             for info in edge.tensor_info:
                 if info.source_entity not in acks:
@@ -550,7 +560,7 @@ class TensorCommunicationManager(ABC):
                 WorkerMessage(
                     message_type=WorkerMessageType.TENSOR_RECEIVED,
                     body=TensorReceived(
-                        request_id=request_id,
+                        request_id=self.rid_to_str(rid),
                         successful_tensors=tensors,
                         failed_tensor_ids=[],
                     ),
@@ -558,17 +568,17 @@ class TensorCommunicationManager(ABC):
             )
 
     def ack_unread_tensors(
-        self, request_id: str, graph_edges: list[GraphEdge],
+        self, rid: int, graph_edges: list[GraphEdge],
     ):
         """Ack result tensors for an already-removed request without reading them.
 
         The producer holds these output buffers until it gets the
         TENSOR_RECEIVED ack; emit it here so it can reclaim them.
         """
-        self._collect_and_send_acks(request_id, graph_edges)
+        self._collect_and_send_acks(rid, graph_edges)
 
-    def get_ready_tensors(self, graph_walk: str | None=None) -> dict[str, list[GraphEdge]]:
-        ready: dict[str, list[GraphEdge]] = {}
+    def get_ready_tensors(self, graph_walk: str | None=None) -> dict[int, list[GraphEdge]]:
+        ready: dict[int, list[GraphEdge]] = {}
         still_pending = []
         uuid_to_time = {}
         for ep in self.pending:
@@ -576,7 +586,7 @@ class TensorCommunicationManager(ABC):
                 if ep.future is not None:
                     ep.future.result()
                 for edge in ep.graph_edges:
-                    ready.setdefault(ep.request_id, []).append(edge)
+                    ready.setdefault(ep.rid, []).append(edge)
                     logger.debug(
                         "Finished reading in %d tensors %s for graph node %s",
                         len(edge.tensor_info), edge.name, edge.next_node
@@ -588,7 +598,7 @@ class TensorCommunicationManager(ABC):
                 still_pending.append(ep)
         self.pending = still_pending
 
-        final_ready: dict[str, list[GraphEdge]] = {}
+        final_ready: dict[int, list[GraphEdge]] = {}
         for req_id, edges in ready.items():
             self._collect_and_send_acks(req_id, edges)
             seen_uuids = self.read_finished.setdefault(req_id, set())
@@ -642,7 +652,7 @@ class TensorCommunicationManager(ABC):
                     self.tensor_store.dereference(info.uuid, 1)
                     seen_uuids.add(info.uuid)
                     self.uuid_to_shard_dim[info.uuid] = shard_dim
-                    tensors.append(self.get_tensor(req_id, info.uuid))
+                    tensors.append(self.get_tensor(info.uuid))
 
                 if edge.name in self.buffered_shards.get(req_id, {}):
                     buf = self.buffered_shards[req_id][edge.name]
@@ -653,7 +663,7 @@ class TensorCommunicationManager(ABC):
                     # tensor data has been copied into the buffer; the standard
                     # GC path drops the registered memory when refcount hits 0.
                     for info in edge.tensor_info:
-                        self.dereference(req_id, info.uuid, 1)
+                        self.dereference(info.uuid, 1)
 
                     if buf.is_done():
                         consolidated = buf.consolidate()
@@ -685,15 +695,15 @@ class TensorCommunicationManager(ABC):
         return final_ready
 
     def register_request(
-        self, request_id: str, sharding_config: ShardingConfig
+        self, rid: int, sharding_config: ShardingConfig
     ):
-        self.sharding_configs[request_id] = sharding_config
-        self.buffered_shards[request_id] = {}
+        self.sharding_configs[rid] = sharding_config
+        self.buffered_shards[rid] = {}
 
     # ---- shared: profiling (tx/rx) ----
 
     def _record_tx(
-        self, request_id: str, uuid: int, num_bytes: int, elapsed: float
+        self, rid: int, uuid: int, num_bytes: int, elapsed: float
     ):
         """Record bytes/time spent making ``uuid`` available to remote consumers.
 
@@ -702,54 +712,54 @@ class TensorCommunicationManager(ABC):
         that is never read — so TX carries no dest and is not per-connection.
         """
         edge_name = self.uuid_to_edge_name.get(uuid, "?")
-        tx = self.req_tx_info.setdefault(request_id, {})
+        tx = self.req_tx_info.setdefault(rid, {})
         if edge_name not in tx:
             tx[edge_name] = TxInfo(
                 edge_name=edge_name, source_entity=self.my_entity_id
             )
         tx[edge_name].update(num_bytes=num_bytes, time=elapsed)
 
-    def get_tx_info(self, request_id: str) -> list[TxInfo]:
-        return list(self.req_tx_info.get(request_id, {}).values())
+    def get_tx_info(self, rid: int) -> list[TxInfo]:
+        return list(self.req_tx_info.get(rid, {}).values())
 
-    def get_rx_info(self, request_id: str) -> list[RxInfo]:
-        return list(self.req_rx_info.get(request_id, {}).values())
+    def get_rx_info(self, rid: int) -> list[RxInfo]:
+        return list(self.req_rx_info.get(rid, {}).values())
 
     # ---- shared: TensorStore delegation ----
 
-    def get_tensor(self, request_id: str, uuid: int) -> torch.Tensor:
+    def get_tensor(self, uuid: int) -> torch.Tensor:
         tensor = self.tensor_store.get_tensor(uuid)
         shard_dim = self.uuid_to_shard_dim.get(uuid)
         if shard_dim is None:
             return tensor
         return self._undo_leading_shard_dim(shard_dim, tensor)
 
-    def set_persist(self, request_id: str, uuid: int, persist: bool):
+    def set_persist(self, uuid: int, persist: bool):
         self.tensor_store.set_metadata(uuid, persist=persist)
         if self.tensor_store.can_gc(uuid):
-            self._cleanup_by_uuid(request_id, uuid)
+            self._cleanup_by_uuid(uuid)
 
-    def dereference(self, request_id: str, uuid: int, n: int = 1):
+    def dereference(self, uuid: int, n: int = 1):
         self.tensor_store.dereference(uuid, n=n)
         if self.tensor_store.can_gc(uuid):
-            self._cleanup_by_uuid(request_id, uuid)
+            self._cleanup_by_uuid(uuid)
 
-    def increment_ref(self, request_id: str, uuid: int, n: int = 1):
+    def increment_ref(self, uuid: int, n: int = 1):
         self.tensor_store.increment_ref(uuid, n=n)
 
-    def has_inflight_reads(self, request_id: str) -> bool:
+    def has_inflight_reads(self, rid: int) -> bool:
         """Whether any async read for this request is still touching a remote
         segment. Synchronous (SHM) reads complete inside ``start_read_tensors``
         with ``future=None``, so they never count here; only outstanding
         async (RDMA) futures do. Gates the READS_DONE ACK during a drain.
         """
         return any(
-            ep.request_id == request_id
+            ep.rid == rid
             and ep.future is not None and not ep.future.done()
             for ep in self.pending
         )
 
-    def cleanup_request(self, request_id: str, force: bool = False):
+    def cleanup_request(self, rid: int, force: bool = False):
         """Teardown for a request's tensor state.
 
         Default (soft): drop tensors that are safe to GC, defer any still
@@ -757,12 +767,12 @@ class TensorCommunicationManager(ABC):
         is the conductor-coordinated hard cleanup, see
         :meth:`force_cleanup_request`.
         """
-        self.read_finished.pop(request_id, None)
-        self.buffered_shards.pop(request_id, None)
-        self.sharding_configs.pop(request_id, None)
-        self.req_rx_info.pop(request_id, None)
-        self.req_tx_info.pop(request_id, None)
-        for uuid in self.tensor_store.get_all_uuids(request_id):
+        self.read_finished.pop(rid, None)
+        self.buffered_shards.pop(rid, None)
+        self.sharding_configs.pop(rid, None)
+        self.req_rx_info.pop(rid, None)
+        self.req_tx_info.pop(rid, None)
+        for uuid in self.tensor_store.get_all_uuids(rid):
             self.uuid_to_shard_dim.pop(uuid, None)
             if not self.tensor_store.can_gc(uuid) and not force:
                 logger.warning(
@@ -770,22 +780,22 @@ class TensorCommunicationManager(ABC):
                     "(awaiting TENSOR_RECEIVED ACK or unpersist)", uuid
                 )
                 continue
-            self._cleanup_by_uuid(request_id, uuid)
+            self._cleanup_by_uuid(uuid)
 
         self._collect_and_send_acks(
-            request_id,
-            sum([ep.graph_edges for ep in self.pending if ep.request_id == request_id], start=[]),
+            rid,
+            sum([ep.graph_edges for ep in self.pending if ep.rid == rid], start=[]),
         )
-        self.pending = [ep for ep in self.pending if ep.request_id != request_id]
+        self.pending = [ep for ep in self.pending if ep.rid != rid]
 
-    def force_cleanup_request(self, request_id: str):
+    def force_cleanup_request(self, rid: int):
         """Unconditional teardown: drop every tensor for the request and unlink
         its SHM, ignoring ref counts and persist markers. Safe only after every
         reader has confirmed (READS_DONE) it has no in-flight reads for the
         request. Also reclaims non-persisted buffers whose readers drained
         before ACKing (which the soft path would otherwise defer forever).
         """
-        self.cleanup_request(request_id, force=True)
+        self.cleanup_request(rid, force=True)
 
 
 # ---------------------------------------------------------------------------
@@ -824,7 +834,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             enable_prof=enable_prof
         )
 
-    def register_for_send(self, request_id, tensor_infos, skip_cuda_sync=False):
+    def register_for_send(self, rid, tensor_infos, skip_cuda_sync=False):
         if not skip_cuda_sync:
             torch.cuda.default_stream().synchronize()
         for info in tensor_infos:
@@ -842,22 +852,22 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 )
                 if ret_value != 0:
                     raise RuntimeError(
-                        f"Mooncake memory registration failed for request id {request_id}, uuid {uuid}."
+                        f"Mooncake memory registration failed for request id {rid}, uuid {uuid}."
                     )
                 if self.enable_prof:
                     # RDMA: the receiver does the actual read, so the sender-side
                     # cost is the memory-pinning (register) time.
                     self._record_tx(
-                        request_id, uuid, tensor.nbytes, time.perf_counter() - t0
+                        rid, uuid, tensor.nbytes, time.perf_counter() - t0
                     )
             elif self.enable_prof and not already_registered:
                 tensor = self.tensor_store.get_tensor(uuid)
-                self._record_tx(request_id, uuid, tensor.nbytes, 0.0)
+                self._record_tx(rid, uuid, tensor.nbytes, 0.0)
             self.tensor_store.set_metadata(uuid, mem_registered=True
             )
 
-    def _cleanup_by_uuid(self, request_id: str, uuid: int):
-        super()._cleanup_by_uuid(request_id, uuid)
+    def _cleanup_by_uuid(self, uuid: int):
+        super()._cleanup_by_uuid(uuid)
         logger.debug("Deleting tensor uuid %s", uuid)
         if not self.tensor_store.check_uuid_presence(uuid):
             logger.warning("Trying to cleanup tensor %s, but uuid not found", uuid)
@@ -872,7 +882,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         self.tensor_store.remove_tensor(uuid)
 
     def start_read_tensors(
-        self, request_id: str, graph_edges: list[GraphEdge],
+        self, rid: int, graph_edges: list[GraphEdge],
         graph_walk: str | None=None
     ) -> list[Future]:
         futures = []
@@ -889,7 +899,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             for info in graph_edge.tensor_info:
                 if info.source_entity == self.my_entity_id:
                     self._slice_existing_tensor(
-                        request_id=request_id, name=graph_edge.name,
+                        rid=rid, name=graph_edge.name,
                         next_node=graph_edge.next_node,
                         graph_walk=graph_walk, info=info
                     )
@@ -902,7 +912,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     info.dims, dtype=info.dtype, device=self.device
                 ).as_strided(info.dims, stride=info.stride)
                 self.tensor_store.put_tensor(
-                    request_id=request_id, uuid=info.uuid, tensor=buffer
+                    rid=rid, uuid=info.uuid, tensor=buffer
                 )
                 self.tensor_store.set_metadata(info.uuid, mem_registered=True
                 )
@@ -926,7 +936,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             # completes (the reader runs on another thread; the object identity
             # is stable, only ``.future`` is filled in after submit).
             fp = FutureAndPointers(
-                future=None, graph_edges=[graph_edge], request_id=request_id
+                future=None, graph_edges=[graph_edge], rid=rid
             )
             if self.enable_prof:
                 for ri in read_info:
@@ -1020,7 +1030,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         return os.path.join(self.shm_dir, f"mstar_{entity_id}_{uuid}")
 
     def register_for_send(
-        self, request_id: str, tensor_infos: list[TensorPointerInfo],
+        self, rid: int, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
         if not skip_cuda_sync and torch.cuda.is_available():
@@ -1050,12 +1060,12 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                 if self.enable_prof:
                     # SHM: the serialize + file write IS the send work.
                     self._record_tx(
-                        request_id, uuid, len(data), time.perf_counter() - t0
+                        rid, uuid, len(data), time.perf_counter() - t0
                     )
                 logger.debug("SHM: wrote tensor %s to %s (%d bytes)", uuid, path, len(data))
 
     def start_read_tensors(
-        self, request_id: str, graph_edges: list[GraphEdge],
+        self, rid: int, graph_edges: list[GraphEdge],
         graph_walk: str | None = None
     ):
         # Run H2D copies on a dedicated stream so they overlap with the
@@ -1079,7 +1089,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                 for info in graph_edge.tensor_info:
                     if info.source_entity == self.my_entity_id:
                         self._slice_existing_tensor(
-                            request_id=request_id, name=graph_edge.name,
+                            rid=rid, name=graph_edge.name,
                             next_node=graph_edge.next_node,
                             graph_walk=graph_walk, info=info
                         )
@@ -1100,7 +1110,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                         data = f.read(info.nbytes)
                     tensor = _deserialize_tensor(data, self.device, tensor_info=info)
                     h2d_did_work = True
-                    self.tensor_store.put_tensor(request_id, info.uuid, tensor)
+                    self.tensor_store.put_tensor(rid, info.uuid, tensor)
                     self.tensor_store.set_metadata(info.uuid, mem_registered=False)
                     # +1 for transit (released by get_ready_tensors)
                     # +1 for graph-node usage (released by _cleanup_consumed_inputs)
@@ -1109,7 +1119,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                 self.pending.append(
                     FutureAndPointers(
                         future=None, graph_edges=[graph_edge],
-                        request_id=request_id,
+                        rid=rid,
                         rx_time=time.perf_counter() - rx_t0,
                     )
                 )
@@ -1117,8 +1127,8 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
             torch.cuda.default_stream(self.device).wait_stream(self._h2d_stream)
         return []
 
-    def _cleanup_by_uuid(self, request_id: str, uuid: int):
-        super()._cleanup_by_uuid(request_id, uuid)
+    def _cleanup_by_uuid(self, uuid: int):
+        super()._cleanup_by_uuid(uuid)
         logger.debug("SHM: cleaning up tensor uuid %s", uuid)
         if not self.tensor_store.check_uuid_presence(uuid):
             logger.warning("SHM: cleanup tensor %s, uuid not found", uuid)

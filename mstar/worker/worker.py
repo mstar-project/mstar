@@ -28,10 +28,11 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, SpeculativeNodeInfo
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
-from mstar.utils.containers import RecentSet
+from mstar.utils.containers import ParallelList, RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -103,15 +104,15 @@ class Speculation:
     # Consumed in ``_thread_outputs_to_speculative`` to splice batch_N's
     # outputs into the spec batch's per-rid input tensors.
     consumed_edges: set[tuple[str, str]]
-    continuing_rids: set[str]
+    continuing_rids: set[int]
     partition: str
     is_new_iter: bool
     is_same_node: bool
     # rid -> edges
-    consumed_streaming_edges: dict[str, list[GraphEdge]] = field(default_factory=dict)
+    consumed_streaming_edges: dict[int, list[GraphEdge]] = field(default_factory=dict)
     is_yield_away: bool = False
     loop_name: str | None = None
-    dropped: set[str] = field(default_factory=set)
+    dropped: set[int] = field(default_factory=set)
 
     plan_future: Future | None = None
     # TP async scheduling: the broadcast seq of this speculation (leader:
@@ -121,7 +122,7 @@ class Speculation:
 
 @dataclass(frozen=True)
 class PendingLoopStop:
-    rid: str
+    rid: int
     graph_walk: str
     loop_name: str
 
@@ -149,9 +150,9 @@ class Worker:
         model: Model,
         my_worker_graphs: list[WorkerGraph],
         model_config: dict,
-        all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-        all_worker_graph_ids_to_nodes: dict[str, set[str]],
-        all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
+        all_worker_graph_ids_to_graph_walks: dict[int, set[str]],
+        all_worker_graph_ids_to_nodes: dict[int, set[str]],
+        all_worker_graph_ids_to_dyn_loops: dict[int, set[str]],
         sharding_config: ShardingConfig,
         parallel_groups: WorkerParallelGroups,
         hostname: str = "localhost",
@@ -324,10 +325,15 @@ class Worker:
             parallel_leader_nodes=self.parallel_leader_nodes
         )
 
+        # Both take wire rid strings and hand back handles; everything else in
+        # these two is already handle-keyed.
+        self.scheduler.rid_of = self._rid
+        self.tensor_manager.rid_to_str = self._rid_str
+
         self._unprocessed_messages = {} # req_id -> messages for requests that are not in the queue
 
         # CPU offloading: LRU tracking and eviction policy
-        self._last_active: dict[tuple[str, str], float] = {}  # (request_id, node_name) -> monotonic timestamp
+        self._last_active: dict[tuple[int, str], float] = {}  # (rid handle, node_name) -> monotonic timestamp
         self.eviction_policy = EvictionPolicy.LRU
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
@@ -340,15 +346,23 @@ class Worker:
         #   postprocess, consumed by next iter's speculation to drop rids whose
         #   loop has ended. Keyed by (rid, graph_walk, loop_name) — see
         #   PendingLoopStop.
-        self._in_flight_rids: set[str] = set()
-        self._pending_removes: set[str] = set()
+        # handle-keyed: both are compared against batch rids
+        self._in_flight_rids: set[int] = set()
+        self._pending_removes: set[int] = set()
         # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
         # behind an in-flight GPU step; _draining_rids have stopped reading and
         # persist until REMOVE_REQUEST (so no read can restart after READS_DONE);
         # _reads_done_sent tracks which have already ACKed.
+        # string-keyed: a DRAIN can precede the NEW that mints the handle
         self._pending_drains: set[str] = set()
         self._draining_rids: set[str] = set()
         self._reads_done_sent: set[str] = set()
+
+        # rid string <-> worker-local integer handle. Everything inside a
+        # request's ADMITTED lifetime keys on the handle; the lifecycle sets
+        # below stay strings because DRAIN can arrive before NEW, so no handle
+        # exists yet. Messages always carry the string.
+        self._rid_runtime = PythonGraphRuntime()
 
         self._pending_loop_stops: set[PendingLoopStop] = set()
         # Let the scheduler see deferred removes so it stops initiating new work
@@ -367,9 +381,9 @@ class Worker:
             tuple[str, torch.dtype, tuple[int, ...]], list[torch.Tensor]
         ] = defaultdict(list)
 
-        # Streaming buffers: request_id -> edge_name -> list of tensors
+        # Streaming buffers: rid -> edge_name -> list of tensors
         # (Legacy path — kept for models without PartitionTopology)
-        self.streaming_buffers: dict[str, dict[str, list[torch.Tensor]]] = {}
+        self.streaming_buffers: dict[int, dict[str, list[torch.Tensor]]] = {}
 
         # New streaming path: PartitionTopology + StreamBuffer on consumer worker
         self.partition_topology = model.get_partition_topology() if model else None
@@ -421,34 +435,60 @@ class Worker:
     # Message handling
     # ------------------------------------------------------------------
 
+    # -- rid string <-> handle ------------------------------------------
+    # The only two translation points: a handle is minted on NEW_REQUEST and
+    # looked up on every other inbound message; the string goes back on the
+    # wire at each send site.
+
+    def _rid(self, request_id: str) -> int | None:
+        """Handle for an inbound message's rid, or None if this rank does not
+        know it (removed already -- a benign race, not an error)."""
+        return self._rid_runtime.get_rid_handle(request_id)
+
+    def _rid_str(self, handle: int) -> str:
+        """The wire identity, for a message about to leave this process."""
+        return self._rid_runtime.get_rid_string(handle)
+
     def _add_new_request(self, body: NewRequest) -> None:
         if body.request_id in self._draining_rids:
             # Being torn down (out-of-order NEW after DRAIN); don't start reads.
+            # Checked on the string: no handle exists for a rid that never
+            # completed admission.
             return
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
+        # The one place a handle is minted. Everything below keys on it.
+        rid = self._rid_runtime.add_request(
+            rid=body.request_id,
+            partition=body.request_info.partition_name,
+            graph_walk=body.request_info.graph_walk,
+            partition_worker_graph_ids=body.partition_worker_graph_ids,
+            worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
+        )
+        body.request_info.rid_handle = rid
+
         now = _time.monotonic()
         for node_name in self.engine_manager.evictable_nodes():
-            self._last_active[(body.request_id, node_name)] = now
+            self._last_active[(rid, node_name)] = now
 
         self.worker_graphs_manager.add_request(
-            request_id=body.request_id,
+            rid=rid,
             partition_worker_graph_ids=body.partition_worker_graph_ids,
             worker_graph_to_workers=body.worker_graph_to_workers,
             current_fwd_info=body.request_info
         )
         self.engine_manager.add_request(
-            body.request_id, body.request_info.resource_configs,
+            rid, body.request_info.resource_configs,
         )
         self.tensor_manager.register_request(
-            body.request_id,
-            self.worker_graphs_manager.per_request_info[body.request_id].sharding_config
+            rid,
+            self.worker_graphs_manager.per_request_info[rid].sharding_config
         )
 
         # Create StreamBuffers for consumer connections on this worker
         for conn in self._my_consumer_connections:
-            req_info = self.worker_graphs_manager.per_request_info[body.request_id]
+            req_info = self.worker_graphs_manager.per_request_info[rid]
             req_info.stream_buffers[conn.edge_name] = StreamBuffer(
-                request_id=body.request_id,
+                rid=rid,
                 edge_name=conn.edge_name,
                 from_partition=conn.from_partition,
                 policy=conn.chunk_policy_factory(),
@@ -456,7 +496,7 @@ class Worker:
 
         # Start RDMA reads for tensors that have tensor_info
         futures = self.tensor_manager.start_read_tensors(
-            body.request_id, body.initial_inputs,
+            rid, body.initial_inputs,
             graph_walk=body.request_info.graph_walk
         )
         self.wakeup_event.register_futures(futures)
@@ -467,7 +507,7 @@ class Worker:
         ]
         if signal_only:
             self.worker_graphs_manager.process_new_inputs(
-                request_id=body.request_id, inputs=signal_only,
+                rid=rid, inputs=signal_only,
                 can_buffer=True
             )
         # process messages that may have came in out-of-order
@@ -486,15 +526,18 @@ class Worker:
         # / KV pages. Queue the remove and apply it once no in-flight step
         # references the rid (see _apply_pending_removes_safe_to_drop in
         # the run loop).
-        if body.request_id in self._in_flight_rids:
-            self._pending_removes.add(body.request_id)
+        rid = self._rid(body.request_id)
+        if rid is None:
+            return  # never admitted here, or already removed
+        if rid in self._in_flight_rids:
+            self._pending_removes.add(rid)
             return
 
         # If we are the TP leader for this request, signal the followers to
         # remove it too. Followers defer removal until they get this message
         # (see the guard at the top of this method) so they can't tear down
         # state we're still reading from an in-flight step/speculation.
-        cfg = self.worker_graphs_manager.per_request_info.get(body.request_id)
+        cfg = self.worker_graphs_manager.per_request_info.get(rid)
         if cfg is not None:
             followers: set[str] = set()
             for group in cfg.sharding_config.groups:
@@ -507,7 +550,7 @@ class Worker:
                     worker, msg=WorkerMessage(
                         message_type=WorkerMessageType.REMOVE_REQUEST,
                         body=RemoveRequest(
-                            request_id=body.request_id,
+                            rid=body.request_id,
                             source=MessageSource.TP_RANK_0,
                         )
                     )
@@ -518,18 +561,23 @@ class Worker:
         # REMOVE_REQUEST once every reader has confirmed drained (READS_DONE) —
         # on the abort/fail path via a prior DrainRequest, on the happy path
         # once the api server finished reading the outputs.
+        # Lifecycle sets are string-keyed (a DRAIN can precede the NEW that
+        # mints the handle); everything else keys on the handle.
         self._draining_rids.discard(body.request_id)
         self._pending_drains.discard(body.request_id)
         self._reads_done_sent.discard(body.request_id)
-        self.engine_manager.remove_request(body.request_id)
-        self.worker_graphs_manager.remove_request(body.request_id)
-        self.tensor_manager.force_cleanup_request(body.request_id)
-        self.profile_info.pop_request(body.request_id)
-        self.streaming_buffers.pop(body.request_id, None)
-        self.scheduler.clear_rid(body.request_id)
+        self.engine_manager.remove_request(rid)
+        self.worker_graphs_manager.remove_request(rid)
+        self.tensor_manager.force_cleanup_request(rid)
+        self.profile_info.pop_request(rid)
+        self.streaming_buffers.pop(rid, None)
+        self.scheduler.clear_rid(rid)
 
         for node_name in self.engine_manager.evictable_nodes():
-            self._last_active.pop((body.request_id, node_name), None)
+            self._last_active.pop((rid, node_name), None)
+
+        # Last: frees the handle for reuse, so nothing above may run after it.
+        self._rid_runtime.remove_request(rid)
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
@@ -543,16 +591,24 @@ class Worker:
 
         # Defer behind an in-flight GPU step, same as REMOVE_REQUEST: clearing
         # the scheduler while a step references the rid would race the GPU thread.
-        if body.request_id in self._in_flight_rids:
+        rid = self._rid(body.request_id)
+        if rid is not None and rid in self._in_flight_rids:
             self._pending_drains.add(body.request_id)
             return
 
         self._begin_drain(body.request_id)
 
     def _begin_drain(self, request_id: str) -> None:
+        """Takes the string: a drain can arrive for a rid this rank never
+        admitted, and it still has to go into ``_draining_rids`` so a late
+        NEW_REQUEST is refused."""
+        rid = self._rid(request_id)
         # Fan the drain to TP followers so each rank drains and ACKs its own
         # READS_DONE (the conductor waits on every rank).
-        cfg = self.worker_graphs_manager.per_request_info.get(request_id)
+        cfg = (
+            None if rid is None
+            else self.worker_graphs_manager.per_request_info.get(rid)
+        )
         if cfg is not None:
             followers: set[str] = set()
             for group in cfg.sharding_config.groups:
@@ -571,7 +627,8 @@ class Worker:
 
         # Stop new leader work but keep draining committed TP batches (failed_rids
         # is exactly this gate); keep engine/tensor/queue state until REMOVE.
-        self.scheduler.fail_rids({request_id})
+        if rid is not None:
+            self.scheduler.fail_rids({rid})
         self._draining_rids.add(request_id)
         self._complete_drain_if_ready(request_id)
 
@@ -582,10 +639,14 @@ class Worker:
             return
         if request_id in self._reads_done_sent:
             return
-        if self.tensor_manager.has_inflight_reads(request_id):
-            return  # let get_ready_tensors resolve the futures; retry next iter
-        if self.scheduler.pending_tp_follow_count.get(request_id, 0) > 0:
-            return  # wait for committed TP-follow batches to drain first
+        rid = self._rid(request_id)
+        # A rid this rank never admitted has nothing in flight, so it can ACK
+        # straight away.
+        if rid is not None:
+            if self.tensor_manager.has_inflight_reads(rid):
+                return  # let get_ready_tensors resolve the futures; retry next iter
+            if self.scheduler.pending_tp_follow_count.get(rid, 0) > 0:
+                return  # wait for committed TP-follow batches to drain first
         self._reads_done_sent.add(request_id)
         self.communicator.send(
             "conductor",
@@ -597,10 +658,18 @@ class Worker:
             ),
         )
 
-    def _apply_pending_drains(self, in_flight_rids: set[str]) -> None:
+    def _apply_pending_drains(self, in_flight_rids: set[int]) -> None:
         """Begin drains that were deferred behind an in-flight GPU step, and
-        re-check draining rids whose reads may now have finished."""
-        for rid in [r for r in self._pending_drains if r not in in_flight_rids]:
+        re-check draining rids whose reads may now have finished.
+
+        ``_pending_drains`` holds strings and ``in_flight_rids`` holds handles,
+        so the comparison goes through the interner.
+        """
+        deferred = [
+            r for r in self._pending_drains
+            if self._rid(r) not in in_flight_rids
+        ]
+        for rid in deferred:
             self._pending_drains.discard(rid)
             self._begin_drain(rid)
         for rid in list(self._draining_rids):
@@ -608,10 +677,10 @@ class Worker:
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
+        # Uuids are global, so a late ack needs no rid lookup and works even
+        # after the request is gone.
         for (uuid, ref_cnt) in body.successful_tensors.items():
-            self.tensor_manager.dereference(
-                body.request_id, uuid, n=ref_cnt
-            )
+            self.tensor_manager.dereference(uuid, n=ref_cnt)
 
     def _process_new_inputs(self, body: InputSignals) -> None:
         # Draining for teardown: don't start new reads for this rid. The
@@ -622,7 +691,17 @@ class Worker:
             "Received new signals %s at worker %s for request %s",
             format_graph_edge_list(body.inputs), self.worker_id, body.request_id
         )
-        req_info = self.worker_graphs_manager.per_request_info.get(body.request_id)
+        rid = self._rid(body.request_id)
+        if rid is None:
+            # Signals for a rid this rank never admitted or has already torn
+            # down. Nothing to route them into; dropping matches the drain
+            # early-return above.
+            logger.warning(
+                "Worker %s: dropping input signals for unknown request %s",
+                self.worker_id, body.request_id,
+            )
+            return
+        req_info = self.worker_graphs_manager.per_request_info.get(rid)
 
         if self.enable_nvtx:
             range_push("process_new_inputs.routing_update")
@@ -645,8 +724,11 @@ class Worker:
         # partition). Streaming-only InputSignals must not overwrite the current
         # partition's fwd_info.
         if non_streaming:
+            # A fwd_info off the wire carries only the string; stamp the handle
+            # so submodules keying per-request state can use it directly.
+            body.request_info.rid_handle = rid
             self.worker_graphs_manager.update_request_info(
-                body.request_id, current_fwd_info=body.request_info,
+                rid, current_fwd_info=body.request_info,
                 partition_name=body.partition_name
             )
 
@@ -655,14 +737,14 @@ class Worker:
             range_push("process_new_inputs.start_read")
         # Start RDMA reads for non-streaming edges with tensor_info
         futures = self.tensor_manager.start_read_tensors(
-            body.request_id, non_streaming,
+            rid, non_streaming,
             graph_walk=body.request_info.graph_walk
         )
         self.wakeup_event.register_futures(futures)
         # Start RDMA reads for streaming edges with tensor_info (will be routed to buffer in _check_ready_tensors)
         if streaming_with_tensors:
             futures = self.tensor_manager.start_read_tensors(
-                body.request_id, streaming_with_tensors,
+                rid, streaming_with_tensors,
             )
             self.wakeup_event.register_futures(futures)
             for edge in streaming_with_tensors:
@@ -680,7 +762,7 @@ class Worker:
         signal_only = [edge for edge in non_streaming if len(edge.tensor_info) == 0]
         if signal_only:
             self.worker_graphs_manager.process_new_inputs(
-                request_id=body.request_id, inputs=signal_only,
+                rid=rid, inputs=signal_only,
                 can_buffer=True
             )
         if self.enable_nvtx:
@@ -688,20 +770,17 @@ class Worker:
 
     def _unpersist_tensors(self, body: UnpersistTensors):
         for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
-            self.tensor_manager.increment_ref(
-                body.request_id, uuid, n=ref_cnt
-            )
-            self.tensor_manager.set_persist(
-                body.request_id, uuid, persist=False
-            )
+            self.tensor_manager.increment_ref(uuid, n=ref_cnt)
+            self.tensor_manager.set_persist(uuid, persist=False)
 
     def _stop_loops(self, body: StopLoops):
-        if not self.worker_graphs_manager.has_partition(
-            body.request_id, body.partition_name
+        rid = self._rid(body.request_id)
+        if rid is None or not self.worker_graphs_manager.has_partition(
+            rid, body.partition_name
         ):
             return
         fwd_info = self.worker_graphs_manager.get_fwd_info(
-            body.request_id, body.partition_name
+            rid, body.partition_name
         )
         loop_names = set()
         for name, stop_time in body.loop_stop_times.items():
@@ -712,7 +791,7 @@ class Worker:
             fwd_info.loop_stop_times[name] = stop_time
         if loop_names:
             self.worker_graphs_manager.stop_loops(
-                body.request_id, body.partition_name, loop_names
+                rid, body.partition_name, loop_names
             )
 
     def _process_message_list(self, messages: list[WorkerMessage]):
@@ -760,21 +839,19 @@ class Worker:
     # Tensor readiness
     # ------------------------------------------------------------------
 
-    def _route_streaming_tensor(self, request_id: str, edge: GraphEdge) -> None:
+    def _route_streaming_tensor(self, rid: int, edge: GraphEdge) -> None:
         """Route a streaming tensor to its request's StreamBuffer for this edge."""
-        req_info = self.worker_graphs_manager.per_request_info.get(request_id)
+        req_info = self.worker_graphs_manager.per_request_info.get(rid)
         stream_buf = req_info.stream_buffers[edge.name]
 
         for info in edge.tensor_info:
-            tensor = self.tensor_manager.get_tensor(
-                request_id=request_id, uuid=info.uuid,
-            )
+            tensor = self.tensor_manager.get_tensor(info.uuid)
 
             stream_buf.put(info.uuid, tensor.clone())
-            self.tensor_manager.dereference(request_id, info.uuid)
+            self.tensor_manager.dereference(info.uuid)
 
     def _pop_streaming_edge(
-        self, sbuf: StreamBuffer, edge_name: str, request_id: str
+        self, sbuf: StreamBuffer, edge_name: str, rid: str
     ) -> GraphEdge | None:
         consumer_node = self._consumer_node_cache.get(edge_name, "")
         synthetic_edge = sbuf.pop_waiting_edge()
@@ -799,7 +876,7 @@ class Worker:
                 # carry producer events and this call site should wait on
                 # those events before storing with skip_cuda_sync=True.
                 tensor_infos = self.tensor_manager.store_and_return_tensor_info(
-                    request_id, {edge_name: [chunk_tensor]},
+                    rid, {edge_name: [chunk_tensor]},
                     skip_cuda_sync=True,
                 )
                 synthetic_edge = GraphEdge(
@@ -811,25 +888,25 @@ class Worker:
         return synthetic_edge
 
     def _poll_stream_buffers_for_speculation(
-        self, request_id: str, node_name: str
+        self, rid: str, node_name: str
     ) -> list[GraphEdge]:
         result = []
-        req_info = self.worker_graphs_manager.per_request_info.get(request_id)
+        req_info = self.worker_graphs_manager.per_request_info.get(rid)
         if req_info is None:
             return []
         for edge_name, sbuf in req_info.stream_buffers.items():
             consumer_node = self._consumer_node_cache.get(edge_name, "")
             if consumer_node != node_name:
                 continue
-            edge = self._pop_streaming_edge(sbuf, edge_name, request_id)
+            edge = self._pop_streaming_edge(sbuf, edge_name, rid)
             if edge is not None:
                 result.append(edge)
         return result
 
     def _return_speculative_streaming_edge(
-        self, request_id: str, edge: GraphEdge
+        self, rid: str, edge: GraphEdge
     ):
-        req_info = self.worker_graphs_manager.per_request_info.get(request_id)
+        req_info = self.worker_graphs_manager.per_request_info.get(rid)
         if req_info is None:
             return
         sbuf = req_info.stream_buffers.get(edge.name)
@@ -838,9 +915,9 @@ class Worker:
 
     def _poll_stream_buffers(self) -> None:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
-        for request_id, req_info in list(self.worker_graphs_manager.per_request_info.items()):
+        for rid, req_info in list(self.worker_graphs_manager.per_request_info.items()):
             for edge_name, sbuf in req_info.stream_buffers.items():
-                synthetic_edge = self._pop_streaming_edge(sbuf, edge_name, request_id)
+                synthetic_edge = self._pop_streaming_edge(sbuf, edge_name, rid)
 
                 if synthetic_edge is not None:
                     # Streaming edges go through the same path as regular ones —
@@ -852,7 +929,7 @@ class Worker:
                     # NOT here, where an earlier in-flight pass's WGD could read
                     # it before the final output chunk is emitted.
                     leftovers = self.worker_graphs_manager.process_new_streaming_inputs(
-                        request_id=request_id, inputs=[synthetic_edge],
+                        rid=rid, inputs=[synthetic_edge],
                         can_buffer=False # important: only ingest for this loop iter only!
                     )
                     if leftovers:
@@ -863,7 +940,7 @@ class Worker:
         """Poll for completed RDMA transfers, feed ready graph edges to worker graph queues."""
         self.wakeup_event.drain()
         ready = self.tensor_manager.get_ready_tensors()
-        for request_id, edges in ready.items():
+        for rid, edges in ready.items():
             # Separate streaming edges from normal edges
             streaming = [e for e in edges if e.is_streaming]
             normal = [e for e in edges if not e.is_streaming]
@@ -871,7 +948,7 @@ class Worker:
             if self.enable_nvtx:
                 range_push("check_ready-tensors.route_streaming")
             for edge in streaming:
-                self._route_streaming_tensor(request_id, edge)
+                self._route_streaming_tensor(rid, edge)
 
             if self.enable_nvtx:
                 range_pop(synchronize=False)
@@ -879,7 +956,7 @@ class Worker:
 
             if normal:
                 self.worker_graphs_manager.process_new_inputs(
-                    request_id=request_id, inputs=normal,
+                    rid=rid, inputs=normal,
                     can_buffer=True
                 )
             if self.enable_nvtx:
@@ -951,24 +1028,22 @@ class Worker:
 
     def _build_executing_batch(self, batch: ScheduledBatch) -> ExecutingBatch:
         """Gather input tensors from tensor_manager for all requests in the batch."""
-        per_request_inputs: dict[str, NameToTensorList] = {}
-        per_request_info: dict[str, CurrentForwardPassInfo] = {}
-        final_stream_rids: set[str] = set()
+        per_request_inputs: dict[int, NameToTensorList] = {}
+        per_request_info: dict[int, CurrentForwardPassInfo] = {}
+        final_stream_rids: set[int] = set()
         batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
-        for request_id, node in batch.node_objects.items():
+        for rid, node in batch.node_objects.items():
             tensors = {}
             ready_inputs = node.ready_signals.ready_inputs
             for input_name, edge in ready_inputs.items():
                 tensors[input_name] = [
-                    self.tensor_manager.get_tensor(
-                        request_id=request_id, uuid=info.uuid
-                    ) for info in edge.tensor_info
+                    self.tensor_manager.get_tensor(info.uuid) for info in edge.tensor_info
                 ]
                 if edge._final_stream_chunk:
-                    final_stream_rids.add(request_id)
-            per_request_inputs[request_id] = tensors
-            per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+                    final_stream_rids.add(rid)
+            per_request_inputs[rid] = tensors
+            per_request_info[rid] = self.worker_graphs_manager.get_fwd_info(rid, batch_partition)
 
         return self._make_executing_batch(
             node_name=batch.node_name,
@@ -983,9 +1058,9 @@ class Worker:
         self,
         node_name: str,
         graph_walk: str,
-        request_ids: list[str],
-        per_request_input_tensors: dict[str, NameToTensorList],
-        per_request_info: dict[str, CurrentForwardPassInfo],
+        request_ids: list[int],
+        per_request_input_tensors: dict[int, NameToTensorList],
+        per_request_info: dict[int, CurrentForwardPassInfo],
         final_stream_rids: set[str] | None = None,
     ) -> ExecutingBatch:
         """One step's batch, with the step context the engine drives it through.
@@ -1032,7 +1107,9 @@ class Worker:
                     body=ScheduleTPNode(
                         node_name=node_batch.node_name,
                         graph_walk=node_batch.graph_walk,
-                        request_ids=list(node_batch.request_ids),  # tuple -> wire list
+                        request_ids=[
+                            self._rid_str(r) for r in node_batch.request_ids
+                        ],
                         speculative=speculative,
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
@@ -1077,8 +1154,8 @@ class Worker:
         For outputs staying local: store tensors in tensor_manager.
         Returns the output edges per request (with tensor_info filled in).
         """
-        for request_id, _node in batch.node_objects.items():
-            routing = routing_per_request[request_id]
+        for rid, _node in batch.node_objects.items():
+            routing = routing_per_request[rid]
             infos_by_uuid = {}
             for edge in (
                 routing.persist +
@@ -1089,13 +1166,13 @@ class Worker:
                 for info in edge.tensor_info:
                     infos_by_uuid[info.uuid] = info
             self.tensor_manager.register_for_send(
-                request_id=request_id, tensor_infos=list(infos_by_uuid.values()),
+                rid=rid, tensor_infos=list(infos_by_uuid.values()),
                 skip_cuda_sync=True,
             )
 
 
     def _send_outputs(
-        self, request_id: str, outputs: NodeOutputRouting,
+        self, rid: str, outputs: NodeOutputRouting,
         nested_loop_indices: NestedLoopIndices,
         graph_walk: str | None = None,
         partition_name: str | None = None,
@@ -1107,14 +1184,14 @@ class Worker:
         with the WORKER_GRAPHS_DONE message to avoid race conditions.
         """
         if graph_walk is None:
-            graph_walk = self.worker_graphs_manager.get_graph_walk(request_id, partition_name)
+            graph_walk = self.worker_graphs_manager.get_graph_walk(rid, partition_name)
         for worker_id, edges in outputs.to_workers.items():
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
-                    request_id=request_id,
+                    rid=self._rid_str(rid),
                     inputs=edges,
-                    request_info=self.worker_graphs_manager.get_fwd_info(request_id, partition_name),
+                    request_info=self.worker_graphs_manager.get_fwd_info(rid, partition_name),
                     partition_name=partition_name
                 ),
             )
@@ -1123,7 +1200,7 @@ class Worker:
         # Buffer persist signals for this request
         if outputs.persist:
             self.worker_graphs_manager.buffer_persist_signals(
-                request_id, outputs.persist
+                rid, outputs.persist
             )
 
         if outputs.new_token_outputs:
@@ -1133,29 +1210,26 @@ class Worker:
                     continue  # don't double-count new tokens
                 count = 0
                 for tensor_info in signal.tensor_info:
-                    tensor = self.tensor_manager.get_tensor(
-                        request_id=request_id,
-                        uuid=tensor_info.uuid,
-                    )
+                    tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
                     count += tensor.numel()
                 name_to_count[signal.name] = count
             self.worker_graphs_manager.buffer_new_token_counts(
-                request_id, name_to_count
+                rid, name_to_count
             )
 
         if outputs.emit_to_client:
             self.worker_graphs_manager.buffer_output_signals(
-                request_id, outputs.emit_to_client
+                rid, outputs.emit_to_client
             )
             for graph_edge in outputs.emit_to_client:
                 self.worker_graphs_manager.register_output_loop_indices(
-                    request_id=request_id, loop_indices=nested_loop_indices,
+                    rid=rid, loop_indices=nested_loop_indices,
                     output_name=graph_edge.name
                 )
                 message = APIServerMessage(
                     message_type="result_tensors",
                     body=ResultTensors(
-                        request_id=request_id,
+                        rid=self._rid_str(rid),
                         modality=graph_edge.output_modality,
                         graph_edge=graph_edge,
                         loop_indices=nested_loop_indices,
@@ -1166,30 +1240,30 @@ class Worker:
 
         # Handle streaming edges
         # Local streaming: route to StreamBuffer
-        req_info = self.worker_graphs_manager.per_request_info[request_id]
+        req_info = self.worker_graphs_manager.per_request_info[rid]
         for edge in outputs.streaming_local:
             stream_buf = req_info.stream_buffers[edge.name]
             for info in edge.tensor_info:
                 stream_buf.pre_read_register(info.uuid)
-            self._route_streaming_tensor(request_id, edge)
+            self._route_streaming_tensor(rid, edge)
 
         # Remote streaming: send to destination workers
         for worker_id, edges in outputs.streaming_to_workers.items():
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
-                    request_id=request_id,
+                    rid=self._rid_str(rid),
                     inputs=edges,
-                    request_info=self.worker_graphs_manager.get_fwd_info(request_id, partition_name),
+                    request_info=self.worker_graphs_manager.get_fwd_info(rid, partition_name),
                     partition_name=partition_name
                 ),
             )
             self.communicator.send(worker_id, message)
         if outputs.completed_worker_graph_ids:
-            fwd_info = self.worker_graphs_manager.get_fwd_info(request_id, partition_name)
+            fwd_info = self.worker_graphs_manager.get_fwd_info(rid, partition_name)
             if partition_name is None:
                 partition_name = getattr(fwd_info, 'partition_name', 'default')
-            req_info = self.worker_graphs_manager.per_request_info.get(request_id)
+            req_info = self.worker_graphs_manager.per_request_info.get(rid)
             p_done = (
                 req_info.per_partition_info[partition_name].stream_partition_done \
                     and not node_speculatively_scheduled
@@ -1204,20 +1278,20 @@ class Worker:
             message = ConductorMessage(
                 message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
                 body=WorkerGraphsDone(
-                    request_id=request_id,
+                    rid=self._rid_str(rid),
                     worker_graph_ids=outputs.completed_worker_graph_ids,
                     is_first_tp_rank=outputs.is_first_tp_rank,
-                    persist_signals=self.worker_graphs_manager.flush_persist_signals(request_id),
-                    new_token_counts=self.worker_graphs_manager.flush_new_token_counts(request_id),
-                    output_signal_names=self.worker_graphs_manager.flush_output_signals(request_id),
-                    resource_publish_info=self.worker_graphs_manager.get_publish_info(request_id, partition_name),
+                    persist_signals=self.worker_graphs_manager.flush_persist_signals(rid),
+                    new_token_counts=self.worker_graphs_manager.flush_new_token_counts(rid),
+                    output_signal_names=self.worker_graphs_manager.flush_output_signals(rid),
+                    resource_publish_info=self.worker_graphs_manager.get_publish_info(rid, partition_name),
                     partition_name=partition_name,
                     partition_done=p_done,
                     stream_tokens_consumed=stream_consumed,
-                    output_loop_indices=self.worker_graphs_manager.get_output_loop_indices(request_id),
-                    graph_timings=self.profile_info.per_rid_graph_timings.get(request_id, {}),
-                    rx_info=self.tensor_manager.get_rx_info(request_id),
-                    tx_info=self.tensor_manager.get_tx_info(request_id),
+                    output_loop_indices=self.worker_graphs_manager.get_output_loop_indices(rid),
+                    graph_timings=self.profile_info.per_rid_graph_timings.get(rid, {}),
+                    rx_info=self.tensor_manager.get_rx_info(rid),
+                    tx_info=self.tensor_manager.get_tx_info(rid),
                 ),
             )
             self.communicator.send("conductor", message)
@@ -1417,10 +1491,10 @@ class Worker:
             self._handle_allocation_failure(batch, node_batch)
             return
 
-        for request_id, node in batch.node_objects.items():
-            wg_id = batch.request_to_worker_graph[request_id]
+        for rid, node in batch.node_objects.items():
+            wg_id = batch.request_to_worker_graph[rid]
             self.worker_graphs_manager.queues[wg_id].push_back_node(
-                request_id, node
+                rid, node
             )
         logger.info(
             "Admit refused node=%s walk=%s (%s): re-queued %d requests",
@@ -1463,10 +1537,10 @@ class Worker:
         )
 
         # Push all batch nodes back to their queues
-        for request_id, node in batch.node_objects.items():
-            wg_id = batch.request_to_worker_graph[request_id]
+        for rid, node in batch.node_objects.items():
+            wg_id = batch.request_to_worker_graph[rid]
             self.worker_graphs_manager.queues[wg_id].push_back_node(
-                request_id, node
+                rid, node
             )
 
         if victim_id is not None:
@@ -1574,9 +1648,7 @@ class Worker:
         tensors = {}
         for input_name, edge in inputs.items():
             tensors[input_name] = [
-                self.tensor_manager.get_tensor(
-                    request_id=rid, uuid=info.uuid,
-                )
+                self.tensor_manager.get_tensor(info.uuid)
                 for info in edge.tensor_info
             ]
         return tensors
@@ -1794,7 +1866,7 @@ class Worker:
         continuing = []
         new_node_objects: dict[str, GraphNode] = {}
         new_request_to_worker_graph: dict[str, str] = {}
-        per_request_inputs: dict[str, NameToTensorList] = {}
+        per_request_inputs: dict[int, NameToTensorList] = {}
         consumed_streaming_edges: dict[str, GraphEdge] = {}
         # Backlogged rids for this target get first claim on the batch: they
         # have already waited a step, and the chain only ever continues its own
@@ -1975,8 +2047,11 @@ class Worker:
             return None
         spec_node_info = infos[0]
 
-        continuing = [r for r in head.request_ids if r in batch_N.node_objects]
-        fresh = [r for r in head.request_ids if r not in batch_N.node_objects]
+        # ``head`` came off the wire, so its rids are strings; the rest of this
+        # path is handle-keyed.
+        head_rids = self.scheduler.tp_rids(head)
+        continuing = [r for r in head_rids if r in batch_N.node_objects]
+        fresh = [r for r in head_rids if r not in batch_N.node_objects]
 
         # The leader's list is the composition every rank runs: no local
         # finished-rid skipping, no ``room_for_continuing`` cap here.
@@ -2006,9 +2081,9 @@ class Worker:
 
         new_node_objects: dict[str, GraphNode] = {}
         new_request_to_worker_graph: dict[str, str] = {}
-        per_request_inputs: dict[str, NameToTensorList] = {}
+        per_request_inputs: dict[int, NameToTensorList] = {}
         consumed_streaming_edges: dict[str, list[GraphEdge]] = {}
-        for rid in head.request_ids:  # wire order == the leader's batch order
+        for rid in head_rids:  # wire order == the leader's batch order
             if rid in prepped:
                 node, wg_id, inputs, into_sig, into_next = prepped[rid]
                 consumed_streaming_edges[rid] = into_next + into_sig
@@ -2024,10 +2099,10 @@ class Worker:
         self.scheduler.pop_tp_follow_head()
         # Its rids count as in flight now, so a remove landing before submit is
         # deferred like any other; ``_set_pending`` re-derives the set on submit.
-        self._in_flight_rids |= set(head.request_ids)
+        self._in_flight_rids |= set(head_rids)
         logger.debug(
             "Follow-speculating: %s %s (seq %d from %d)",
-            head.node_name, head.request_ids, head.spec_seq, head.spec_from_seq,
+            head.node_name, head_rids, head.spec_seq, head.spec_from_seq,
         )
         return self._assemble_speculation(
             pending, sample_node, spec_node_info,
@@ -2298,7 +2373,7 @@ class Worker:
                     msg=WorkerMessage(
                         message_type=WorkerMessageType.STOP_LOOPS,
                         body=StopLoops(
-                            request_id=rid,
+                            rid=self._rid_str(rid),
                             loop_names=loop_names,
                             loop_stop_times=batch_N.node_batch.per_request_info[rid].loop_stop_times,
                             partition_name=batch_N.partition
@@ -2320,7 +2395,7 @@ class Worker:
             node.reset_outputs() # reset stale outputs
             if req_output_tensors:
                 graph_node_info = self.tensor_manager.store_and_populate_graph_edges(
-                    request_id=rid,
+                    rid=rid,
                     tensors=req_output_tensors,
                     graph_edges=node.outputs,
                     node_name=node.name,
@@ -2347,9 +2422,7 @@ class Worker:
 
                 for edge in routing.persist:
                     for info in edge.tensor_info:
-                        self.tensor_manager.set_persist(
-                            request_id=rid, uuid=info.uuid, persist=True
-                        )
+                        self.tensor_manager.set_persist(info.uuid, persist=True)
 
                 # NOTE: routing.persist is not included here because the tensors are
                 # (1) kept alive by the persist marker, and (2) would otherwise be
@@ -2490,7 +2563,9 @@ class Worker:
         to_apply = [r for r in self._pending_removes if r not in in_flight_rids]
         for rid in to_apply:
             self._pending_removes.discard(rid)
-            self._remove_request(RemoveRequest(request_id=rid, source=MessageSource.SELF))
+            self._remove_request(RemoveRequest(
+                rid=self._rid_str(rid), source=MessageSource.SELF,
+            ))
 
     def _drop_failed_rids(
         self, pending: PendingBatch,
@@ -2575,10 +2650,10 @@ class Worker:
 
         self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
 
-    def _fail_requests(self, errors: dict[str, str]) -> None:
+    def _fail_requests(self, errors: dict[int, str]) -> None:
         """Report requests this worker can no longer serve to the conductor.
 
-        ``errors`` maps request_id -> message. Rids the worker has already
+        ``errors`` maps rid handle -> message. Rids the worker has already
         torn down are dropped: reporting them would leave a permanent entry
         in ``scheduler.failed_rids`` (the conductor answers a failure with a
         REMOVE_REQUEST, and it won't send one for a request it no longer
@@ -2599,7 +2674,9 @@ class Worker:
             "conductor",
             ConductorMessage(
                 message_type=ConductorMessageType.FAIL_REQUESTS,
-                body=FailRequests(errors=errors),
+                body=FailRequests(errors={
+                    self._rid_str(rid): msg for rid, msg in errors.items()
+                }),
             ),
         )
         # Note: we do not cleanup the request right now; we wait for the conductor
@@ -3094,10 +3171,10 @@ class Worker:
                 node_batch = self._build_executing_batch(batch)
                 batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
-                for request_id, req_info in node_batch.per_request_info.items():
+                for rid, req_info in node_batch.per_request_info.items():
                     req_info.dynamic_loop_iter_counts.update(
                         self.worker_graphs_manager.get_dynamic_loop_iters(
-                            request_id, partition=batch_partition,
+                            rid, partition=batch_partition,
                         )
                     )
                 if self.enable_nvtx:
