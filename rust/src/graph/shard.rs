@@ -27,7 +27,14 @@ pub struct GroupTemplate {
 /// The deployment-wide config. Cloned per request by `instantiate`.
 pub struct ShardingTemplate {
     pub groups: Vec<GroupTemplate>,
+    /// signal -> shard dim. Python's value type is `int | None`, but an entry
+    /// whose value is None reads exactly like an absent one (`.get(sig) is
+    /// None` == replicated), so the Nones are dropped on the way in.
     pub shard_dim: FxHashMap<Sym, u32>,
+    /// Gate config validation only -- they add no shard_dim entries and do not
+    /// affect routing. Carried so this type is the whole ShardingConfig.
+    pub tp_enabled_nodes: FxHashSet<Sym>,
+    pub sp_enabled_nodes: FxHashSet<Sym>,
     pub me: Sym,
 }
 
@@ -289,7 +296,13 @@ mod tests {
     }
 
     fn template(groups: Vec<GroupTemplate>) -> ShardingTemplate {
-        ShardingTemplate { groups, shard_dim: FxHashMap::default(), me: 100 }
+        ShardingTemplate {
+            groups,
+            shard_dim: FxHashMap::default(),
+            tp_enabled_nodes: FxHashSet::default(),
+            sp_enabled_nodes: FxHashSet::default(),
+            me: 100,
+        }
     }
 
     #[test]
@@ -387,6 +400,41 @@ mod tests {
             result.err(),
             Some(ShardError::WorkerCount { got: 2, tp_size: 4 })
         ));
+    }
+
+    #[test]
+    fn shard_dim_reaches_the_instance_and_selects_the_sharded_fanout() {
+        // A dropped shard_dim does not fail: it silently takes the replicated
+        // branch, sending whole tensors where slices were meant.
+        const SIGNAL: Sym = 50;
+        let mut t = template(vec![GroupTemplate {
+            nodes: vec![NODE_A, NODE_B],
+            tp_size: 2,
+            graph_walks: Some(vec![WALK_X]),
+            tp_rank: Some(0),
+        }]);
+        t.shard_dim.insert(SIGNAL, 0);
+
+        let m = t
+            .instantiate(&n2w(&[
+                ((NODE_A, WALK_X), &[100, 101]),
+                ((NODE_B, WALK_X), &[100, 101]),
+            ]))
+            .unwrap();
+        assert_eq!(m.shard_dim.get(&SIGNAL), Some(&0));
+
+        let tensors = [TensorRef { uuid: 1, dim0: 4, nbytes: 0, offset: 0 }];
+        let mut out = Vec::new();
+        m.fanout(SIGNAL, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out);
+        assert!(
+            out.iter().all(|d| !d.full),
+            "a sharded signal must fan out as slices, not whole tensors"
+        );
+
+        // The same edge without a shard dim is replicated.
+        let mut out2 = Vec::new();
+        m.fanout(999, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out2);
+        assert!(out2.iter().all(|d| d.full));
     }
 
     #[test]

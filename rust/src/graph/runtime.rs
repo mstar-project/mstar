@@ -2,7 +2,7 @@
 //! walk state; Python calls it once per forward pass, not once per request.
 
 use crate::graph::compile::{EMIT_TO_CLIENT, EMPTY_DESTINATION, LoopArg, NodeArg, compile_one};
-use crate::graph::shard::{GroupTemplate, ShardMap, ShardingTemplate};
+use crate::graph::shard::{GroupTemplate, ShardingTemplate};
 use crate::graph::spec::*;
 use crate::graph::request::{RequestInfo, WgIndex, WorkerGraphMeta};
 use crate::graph::state::RequestState;
@@ -183,6 +183,27 @@ pub struct GraphRuntime {
     }
 }
 
+/// One `ShardingGroup` as configured.
+#[derive(FromPyObject)]
+pub struct ShardingGroupArg {
+    #[pyo3(item)] nodes: Vec<String>,
+    #[pyo3(item)] tp_size: u32,
+    /// None = every graph walk.
+    #[pyo3(item)] graph_walks: Option<Vec<String>>,
+    /// This worker's rank in the group; the conductor sets it per worker.
+    #[pyo3(item)] tp_rank: Option<u32>,
+}
+
+/// Everything `ShardingConfig` carries.
+#[derive(FromPyObject)]
+pub struct ShardingArg {
+    #[pyo3(item)] groups: Vec<ShardingGroupArg>,
+    /// signal -> shard dim; None means replicated, same as absent.
+    #[pyo3(item)] shard_dim: Vec<(String, Option<u32>)>,
+    #[pyo3(item)] tp_enabled_nodes: Vec<String>,
+    #[pyo3(item)] sp_enabled_nodes: Vec<String>,
+}
+
 /// A worker graph owned by another worker: enough to route to it, no spec.
 #[derive(FromPyObject)]
 pub struct RemoteWorkerGraphArg {
@@ -207,10 +228,13 @@ pub struct WorkerGraphArg {
 #[pymethods]
 impl GraphRuntime {
     #[new]
-    #[pyo3(signature = (worker_graphs, workers, me))]
+    #[pyo3(signature = (worker_graphs, remote_worker_graphs, sharding, me))]
     fn new(
         worker_graphs: Vec<WorkerGraphArg>,
-        workers: Vec<String>,
+        // Owned by other workers; needed to answer "who runs this node" when
+        // an output leaves this worker.
+        remote_worker_graphs: Vec<RemoteWorkerGraphArg>,
+        sharding: ShardingArg,
         me: String,
     ) -> PyResult<Self> {
         let mut it = StrToId::default();
@@ -239,22 +263,29 @@ impl GraphRuntime {
             graphs.push(graph);
         }
 
-        // Intern worker names
-        let worker_syms: Vec<Sym> = workers.iter().map(|w| it.intern(w)).collect();
         let me_sym = it.intern(&me);
 
         // Sharding TEMPLATE. The per-request ShardMap comes from
         // `instantiate`, because a data-parallel replica puts the same node on
         // different workers -- the binding is not deployment-wide.
-        let tp_rank = worker_syms.iter().position(|&w| w == me_sym).unwrap_or(0) as u32;
         let shard = ShardingTemplate {
-            groups: vec![GroupTemplate {
-                nodes: graphs.iter().flat_map(|g| g.nodes.iter().map(|n| n.name)).collect(),
-                tp_size: workers.len() as u32,
-                graph_walks: None,
-                tp_rank: Some(tp_rank),
-            }],
-            shard_dim: FxHashMap::default(),
+            groups: sharding.groups.iter().map(|g| GroupTemplate {
+                nodes: g.nodes.iter().map(|n| it.intern(n)).collect(),
+                tp_size: g.tp_size,
+                graph_walks: g.graph_walks.as_ref().map(
+                    |ws| ws.iter().map(|w| it.intern(w)).collect()
+                ),
+                tp_rank: g.tp_rank,
+            }).collect(),
+            // A None dim reads exactly like an absent key, so drop it here
+            // rather than carrying an Option nothing distinguishes.
+            shard_dim: sharding.shard_dim.iter()
+                .filter_map(|(sig, dim)| dim.map(|d| (it.intern(sig), d)))
+                .collect(),
+            tp_enabled_nodes: sharding.tp_enabled_nodes.iter()
+                .map(|n| it.intern(n)).collect(),
+            sp_enabled_nodes: sharding.sp_enabled_nodes.iter()
+                .map(|n| it.intern(n)).collect(),
             me: me_sym,
         };
 
@@ -280,6 +311,21 @@ impl GraphRuntime {
             });
         }
 
+        let known: FxHashSet<u32> =
+            all_worker_graphs.iter().map(|m| m.wg_id).collect();
+        for wga in &remote_worker_graphs {
+            if known.contains(&wga.wg_id) {
+                continue; // ours; already compiled above
+            }
+            all_worker_graphs.push(WorkerGraphMeta {
+                wg_id: wga.wg_id,
+                graph_walks: wga.graph_walks.iter().map(|w| it.intern(w)).collect(),
+                nodes: wga.nodes.iter().map(|n| it.intern(n)).collect(),
+                dyn_loops: wga.dyn_loops.iter().map(|l| it.intern(l)).collect(),
+                local: None,
+            });
+        }
+
         Ok(Self{
             interner: it,
             graphs,
@@ -292,28 +338,6 @@ impl GraphRuntime {
             all_worker_graphs,
             walk_to_local_wgs,
         })
-    }
-
-    /// Worker graphs owned by OTHER workers, from the conductor's global maps.
-    /// Needed only to route an output off this worker.
-    fn set_remote_worker_graphs(
-        &mut self,
-        worker_graphs: Vec<RemoteWorkerGraphArg>,
-    ) {
-        let known: FxHashSet<u32> =
-            self.all_worker_graphs.iter().map(|m| m.wg_id).collect();
-        for wga in worker_graphs {
-            if known.contains(&wga.wg_id) {
-                continue; // ours; already compiled
-            }
-            self.all_worker_graphs.push(WorkerGraphMeta {
-                wg_id: wga.wg_id,
-                graph_walks: wga.graph_walks.iter().map(|w| self.interner.intern(w)).collect(),
-                nodes: wga.nodes.iter().map(|n| self.interner.intern(n)).collect(),
-                dyn_loops: wga.dyn_loops.iter().map(|l| self.interner.intern(l)).collect(),
-                local: None,
-            });
-        }
     }
 
     /// The three sets are node NAMES. A name this worker does not host is
