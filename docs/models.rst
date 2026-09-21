@@ -82,11 +82,14 @@ text anywhere in the prompt, and prefill follows the order they were written::
 
 Most layers are gated DeltaNet rather than full attention, so a request holds a
 recurrent-state slot as well as a KV allocation. The slot pool is sized
-explicitly in ``configs/qwen3_5_*.yaml``: at ~25 MiB a slot the 256-slot default
-would reserve far too much, and the floor is set by CUDA-graph capture (every
-captured row holds a slot for the whole pass), not by the concurrency you want.
-Raising any ``*_CAPTURE_BATCH_SIZES`` raises it, and capture fails outright if
-the pool cannot fit — the config comment carries the arithmetic.
+explicitly in ``configs/qwen3_5_*.yaml`` (``gdn_state.max_slots``): one slot per
+concurrent request plus the sink, so set it to the concurrency you want to
+serve. A slot is ~10 MiB for the 0.8B and ~25 MiB for the 27B at TP4, which is
+why the 256-slot default is not used. CUDA-graph capture and padded replays
+address the sink and take no slots, so the capture batch sizes do not enter
+into it. ``gdn_state.state_dtype: float32`` keeps the recurrent state in fp32
+(the checkpoint's ``mamba_ssm_dtype``) at twice the state traffic; the default
+is bf16 wherever FlashInfer's fused bf16 decode kernel applies (K = V = 128).
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
