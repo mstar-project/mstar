@@ -1,11 +1,12 @@
 """NemotronDuplexModel — NVIDIA NemotronLabs VoiceChat-11B in M*.
 
-A full-duplex speech-to-speech model with three stages:
+A full-duplex speech-to-speech model with four nodes:
 
-    conformer_encoder (STATELESS) — 16 kHz speech → fused embeds + RNN-T transcript
-    nano_llm          (KV_CACHE)  — Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B)
-    eartts_talker     (KV_CACHE)  — Gemma3 talker → 31-codebook RVQ codes
-    audio_codec       (STATELESS) — RVQ codes → 22.05 kHz PCM
+    conformer_encoder — 16 kHz speech → per-frame LLM embeds (+ RNN-T transcript)
+    nano_llm          — Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B);
+                        resources nano_kv / nano_attn / nano_sampler
+    eartts_talker     — Gemma3 talker → 31-codebook RVQ codes
+    audio_codec       — RVQ codes → 22.05 kHz PCM
 
 Full-duplex: the model consumes user speech continuously and emits agent text +
 agent speech as it generates, frame-synchronously in one backbone, so it handles
@@ -22,10 +23,11 @@ INFERENCE PATHS (all live, verified vs the NeMo reference):
       matches the offline text path and vocalizes with CFG + noise sampling.
     * ``realtime_api`` — OpenAI Realtime-API WebSocket server over ``DuplexStream``.
 
-The M*-serving-engine graph path (``prefill_text`` → ``decode`` walk graphs, async
-partitions with ``StreamingGraphEdge`` fan-out of transcript / text / audio) is
-sketched in ``_duplex_design`` below and is the remaining engine-integration work;
-the standalone paths above are what run today.
+The M* serving path is the walk graphs below: four async partitions
+(Encoder → LLM → Talker → Codec) joined by ``StreamingGraphEdge``s, with the nano
+decode loop consuming one encoder frame per step. ``get_node_resources`` declares
+the nano's paged KV cache, attention and sampler; the Mamba conv/SSM state and the
+talker KV still live in per-request submodule state (eager).
 
 Contract methods crib from ``mstar/model/orpheus/orpheus_model.py`` (single
 streaming LLM+codec) and ``mstar/model/qwen3_omni/qwen3_omni_model.py`` (omni,
@@ -41,16 +43,24 @@ import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
-from mstar.engine.base import EngineType
-from mstar.engine.kv_cache_engine import KVCacheConfig
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVSpec,
+    NodeResourceSpec,
+    ResourceReqConfig,
+    SamplerSpec,
+    SamplingReqConfig,
+)
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.nemotron_duplex.config import NemotronDuplexConfig
+from mstar.model.multimodal import PromptPart
+from mstar.model.nemotron_duplex.config import NANO_ATTN, NANO_KV, NANO_SAMPLER, NemotronDuplexConfig
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
-from mstar.utils.sampling import SamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -347,42 +357,49 @@ class NemotronDuplexModel(Model):
         return types.SimpleNamespace(tokenizer=types.SimpleNamespace(vocab=v), vocab=v)
 
     # -------------------------------------------------------------------
-    # KV cache config — nano_llm (attention layers only) + eartts_talker
+    # Resources: the nano's paged KV (attention layers only), its attention
+    # plan and the agent-text sampler. NoPE: no position resource. The other
+    # three nodes declare nothing (encoder/codec are stateless; the talker
+    # keeps its own KV in per-request state for now).
     # -------------------------------------------------------------------
 
-    def get_kv_cache_config(self) -> list[KVCacheConfig]:
+    def get_node_resources(self) -> list[NodeResourceSpec]:
         nano = self.config.nano
-        eartts = self.config.eartts
+        kv_config = KVConfig(
+            # Only the ``*`` (attention) layers hold a KV cache; the Mamba and
+            # MLP layers do not. The backbone maps global layer -> dense
+            # attention index (``NemotronHLLM._attn_cache_idx``).
+            num_layers=nano.num_attention_layers,
+            num_kv_heads=nano.num_key_value_heads,
+            head_dim=nano.head_dim,
+            max_seq_len=nano.max_position_embeddings,
+            num_qo_heads=nano.num_attention_heads,
+        )
         return [
-            KVCacheConfig(
-                # Only the ``*`` (attention) layers hold a KV cache; the Mamba
-                # and MLP layers do not. The submodule maps global layer -> this
-                # dense attention index.
-                num_layers=nano.num_attention_layers,
-                num_kv_heads=nano.num_key_value_heads,
-                head_dim=nano.head_dim,
-                max_seq_len=nano.max_position_embeddings,
-                num_qo_heads=nano.num_attention_heads,
-                nodes=["nano_llm"],
+            KVSpec(resource_key=NANO_KV, nodes={"nano_llm"}, config=kv_config),
+            AttentionSpec(
+                resource_key=NANO_ATTN, nodes={"nano_llm"},
+                config=AttentionConfig(kv_cache=NANO_KV),
             ),
-            # Phase 5 — declared now so layout is stable; only used once the
-            # talker submodule is implemented.
-            KVCacheConfig(
-                num_layers=eartts.num_hidden_layers,
-                num_kv_heads=eartts.num_key_value_heads,
-                head_dim=eartts.head_dim,
-                max_seq_len=nano.max_position_embeddings,
-                num_qo_heads=eartts.num_attention_heads,
-                nodes=["eartts_talker"],
+            SamplerSpec(
+                resource_key=NANO_SAMPLER, nodes={"nano_llm"},
+                vocab_size=self.config.vocab_size,
+                enable_repetion_penalty=True,
             ),
         ]
 
-    def get_node_engine_types(self) -> dict[str, EngineType]:
+    def get_request_resource_configs(
+        self,
+        partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        del partition_fwd_args
+        model_kwargs = model_kwargs or {}
+        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         return {
-            "conformer_encoder": EngineType.STATELESS,  # Phase 4
-            "nano_llm": EngineType.KV_CACHE,            # implemented (text path)
-            "eartts_talker": EngineType.KV_CACHE,        # Phase 5
-            "audio_codec": EngineType.STATELESS,        # Phase 5
+            NANO_SAMPLER: SamplingReqConfig(
+                **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys}
+            ),
         }
 
     # -------------------------------------------------------------------
@@ -408,8 +425,9 @@ class NemotronDuplexModel(Model):
             input_names=["audio_features"],
             outputs=[StreamingGraphEdge(next_node="nano_llm", name="audio_frame", target_partition="LLM")],
         )
-        # LLM: optional bulk system-prompt prefill (primes cache; persists the carry-in
-        # prev_text / prev_func), then the frame-synchronous decode loop.
+        # LLM: optional system-prompt prefill (primes the cache like the reference;
+        # persists the carry-in prev_text / prev_func, both PAD after a prompt),
+        # then the frame-synchronous decode loop.
         prefill_text = GraphNode(
             name="nano_llm",
             input_names=["text_inputs"],
@@ -506,13 +524,6 @@ class NemotronDuplexModel(Model):
                        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=eartts.codec_chunk_frames)),
         ])
 
-    def get_aux_sampling_configs(self, node_name: str, model_kwargs: dict | None = None) -> dict:
-        # The nano samples a second (function) token per frame alongside agent text;
-        # it is fed back into the next frame's AddFusion. Greedy (like the reference).
-        if node_name == "nano_llm":
-            return {"function": SamplingConfig(temperature=0.0)}
-        return {}
-
     # -------------------------------------------------------------------
     # Prompt processing
     # -------------------------------------------------------------------
@@ -523,6 +534,7 @@ class NemotronDuplexModel(Model):
         input_modalities: list[str],
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
+        prompt_parts: list[PromptPart] | None = None,
         **kwargs,
     ) -> NameToTensorList:
         # Duplex request: raw user audio (-> Encoder partition) plus an optional
@@ -667,18 +679,6 @@ class NemotronDuplexModel(Model):
                 request_done=self._stream_exhausted(incoming_connections, stream),
             )
         raise ValueError(f"Unknown partition: {partition_name!r}")
-
-    # -------------------------------------------------------------------
-    # Sampling
-    # -------------------------------------------------------------------
-
-    def get_sampling_config(self, node_name: str, model_kwargs: dict | None = None) -> SamplingConfig | None:
-        if node_name != "nano_llm":
-            return None  # eartts_talker sampling: Phase 5 (+ get_aux_sampling_configs)
-        model_kwargs = model_kwargs or {}
-        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
-        params = {k: model_kwargs.get(k, getattr(self.config, k)) for k in keys}
-        return SamplingConfig(vocab_size=self.config.vocab_size, **params)
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.eartts.sample_rate
