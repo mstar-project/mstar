@@ -25,6 +25,10 @@ NANO_ATTN = "nano_attn"             # attention planned over NANO_KV (NoPE: no p
 NANO_SAMPLER = "nano_sampler"       # agent-text channel sampler
 MAMBA_STATE = "mamba_state"         # recurrent-state pool: conv + SSM state of the 27 Mamba-2 layers
 MAMBA = "mamba"                     # the Mamba-2 (SSD) resource planned against MAMBA_STATE
+TALKER_KV = "talker_kv"             # paged KV of the talker's 28 Gemma3 layers (labels: main, uncond)
+TALKER_ATTN = "talker_attn"         # attention planned over TALKER_KV
+TALKER_POS = "talker_pos"           # positions / RoPE for the talker (per-layer theta at call time)
+TALKER_CFG_LABEL = "_cfg"           # the two talker streams combined into one plan (cond rows, then uncond)
 
 
 @dataclass
