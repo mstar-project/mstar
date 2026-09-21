@@ -369,11 +369,7 @@ class KVManager(AttentionResource):
     def enable_prefix_cache(
         self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
     ) -> None:
-        """Open the index under ``root``, the identity every key hangs from.
-
-        ``walks`` names, per label, the walk that writes the keyed span and the
-        one that decodes after it.
-        """
+        """Open the index under ``root``, the identity every key hangs from."""
         self._keyed_walks = {
             label: frozenset(walk for walk in named if walk is not None)
             for label, named in (walks or {}).items()

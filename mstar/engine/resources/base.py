@@ -90,6 +90,16 @@ class Resource(ABC):
     # A node is declared for prefix reuse only if all of its resources do
     prefix_skip_safe: bool = False
 
+    def enable_prefix_cache(
+        self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
+    ) -> None:
+        """Open whatever this resource keeps across requests, under ``root``.
+
+        ``walks`` names, per label, the walk that writes the keyed span and the
+        one that decodes after it.
+        """
+        return
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
     ) -> int | None:

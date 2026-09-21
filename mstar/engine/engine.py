@@ -32,7 +32,6 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.keys import fingerprint
-from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
@@ -522,7 +521,7 @@ class Engine:
         return runners
 
     def _open_prefix_caches(self, specs_by_key, model) -> None:
-        """Root each KV resource's index in everything its pages depend on.
+        """Root each resource's cache in everything its pages depend on.
 
         A page's contents depend on the weights, the preprocessing that built
         the prompt, and the configuration of the resources that wrote it — its
@@ -546,8 +545,6 @@ class Engine:
                     stream.walk for stream in by_label.values()
                 )
         for key, resource in self._resources.items():
-            if not isinstance(resource, KVManager):
-                continue
             # its own, then its dependents' in key order, so the root does not
             # move with the order the engine happened to build them in
             parts = [resource.fingerprint()]
