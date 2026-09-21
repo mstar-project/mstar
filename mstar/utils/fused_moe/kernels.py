@@ -432,3 +432,52 @@ def get_default_config(M: int, E: int, N: int, K: int, top_k: int) -> Dict[str, 
         "BLOCK_SIZE_K": 32,
         "GROUP_SIZE_M": 8,
     }
+
+
+# ---------------------------------------------------------------------------
+# Top-k sum over rows given by index (the expert-order outputs of a grouped GEMM)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def moe_indexed_topk_sum_kernel(
+    src_ptr, rows_ptr, weight_ptr, output_ptr,
+    output_stride_0, output_stride_chunk, chunk_dim: int,
+    hidden_dim: int,
+    TOPK: tl.constexpr, BLOCK_DIM: tl.constexpr,
+):
+    """``output[t, :] = sum_j weight[t, j] * src[rows[t, j], :]`` in fp32, rounded once to the output dtype.
+    ``src`` holds the token-expert rows in any order (a grouped GEMM's, by expert), ``rows [T, TOPK]`` says
+    where each token's are, ``weight [T, TOPK]`` fp32 are the routing weights (applied here, in fp32, as
+    Marlin applies them in its epilogue); the output's column chunks follow ``moe_sum_reduce_kernel``."""
+    t = tl.program_id(0).to(tl.int64)
+    db = tl.program_id(1)
+    offs = db * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+    mask = offs < hidden_dim
+    acc = tl.zeros((BLOCK_DIM,), dtype=tl.float32)
+    for j in tl.static_range(TOPK):
+        r = tl.load(rows_ptr + t * TOPK + j).to(tl.int64)
+        wj = tl.load(weight_ptr + t * TOPK + j).to(tl.float32)
+        acc += wj * tl.load(src_ptr + r * hidden_dim + offs, mask=mask, other=0.0).to(tl.float32)
+    out_cols = (offs // chunk_dim) * tl.cast(output_stride_chunk, tl.int64) + offs % chunk_dim
+    tl.store(output_ptr + t * tl.cast(output_stride_0, tl.int64) + out_cols, acc.to(output_ptr.dtype.element_ty), mask=mask)
+
+
+def moe_indexed_topk_sum_triton(src: torch.Tensor, rows: torch.Tensor, weight: torch.Tensor, output: torch.Tensor) -> None:
+    """``src [T * top_k, D]`` contiguous, ``rows [T, top_k]`` int32, ``weight [T, top_k]`` fp32; ``output`` as
+    for :func:`moe_sum_reduce_triton` (``[T, D]`` or a column-chunked ``[T, chunks, D / chunks]`` view)."""
+    assert src.is_contiguous() and rows.is_contiguous() and weight.is_contiguous()
+    token_num, top_k = rows.shape
+    assert weight.shape == (token_num, top_k) and weight.dtype == torch.float32
+    hidden_dim = src.shape[1]
+    if output.dim() == 3:
+        assert output.shape[0] == token_num and output.shape[1] * output.shape[2] == hidden_dim and output.stride(2) == 1
+        chunk_dim, stride_chunk = output.shape[2], output.stride(1)
+    else:
+        assert output.shape == (token_num, hidden_dim) and output.stride(1) == 1
+        chunk_dim, stride_chunk = hidden_dim, 0
+    block = 1024
+    moe_indexed_topk_sum_kernel[(token_num, triton.cdiv(hidden_dim, block))](
+        src, rows, weight, output, output.stride(0), stride_chunk, chunk_dim=chunk_dim, hidden_dim=hidden_dim,
+        TOPK=top_k, BLOCK_DIM=block, num_warps=4,
+    )
