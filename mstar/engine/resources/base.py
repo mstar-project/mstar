@@ -86,6 +86,10 @@ class Resource(ABC):
     def depends_on(self) -> set[str]:
         return set()
 
+    # whether this kind of resource survives a step it never saw the front of.
+    # A node is declared for prefix reuse only if all of its resources do
+    prefix_skip_safe: bool = False
+
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
     ) -> int | None:

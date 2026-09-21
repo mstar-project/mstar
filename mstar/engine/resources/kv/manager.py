@@ -255,6 +255,8 @@ class KVPlanState:
 
 
 class KVManager(AttentionResource):
+    prefix_skip_safe = True
+
     def __init__(
         self,
         cfg: KVConfig,

@@ -34,6 +34,9 @@ class PublishedPositionInfo(PublishedInfo):
 
 
 class PositionManager(Resource):
+    # the scheme is the other half of this, checked per declared node at load
+    prefix_skip_safe = True
+
     # NOTE: not an `AttentionResource`, so no label/layer cursors — this is
     # called once per step, not per layer. Layers reach `apply_qk` with the
     # label off `AttentionCallable.label`; make this one if that stops holding.

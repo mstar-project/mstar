@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 class AttentionManager(AttentionResource):
+    prefix_skip_safe = True
+
     # Remains abstract except for build; will build based
     # on the attention backend
 
