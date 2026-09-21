@@ -6,11 +6,14 @@ KV resource and of every resource planned against it. Anything left out of that
 fold is a way for one deployment to match pages another one wrote.
 
 The other half is where the cache stays shut: above one rank, because the ranks
-walk their indexes independently and would match different lengths.
+walk their indexes independently and would match different lengths; and for a
+model that names no checkpoint, until the deployment sets a salt, because two
+builds that differ only in their weights would share every key.
 """
 
 from __future__ import annotations
 
+import logging
 import sys
 
 sys.path.insert(0, ".")
@@ -25,6 +28,7 @@ from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.model.base import PrefixStream
 
 KV = "kv"
 ROPE = "rope"
@@ -66,6 +70,20 @@ class _Model:
 
     def prefix_key_streams(self):
         return {}
+
+
+class _Declaring(_Model):
+    """Keys ``main`` on the KV resource from its text walk."""
+
+    def prefix_key_streams(self):
+        return {KV: {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}}
+
+
+def _checkpoint(root, config: bytes) -> str:
+    root.mkdir()
+    (root / "config.json").write_bytes(config)
+    (root / "model-00001.safetensors").write_bytes(b"x" * 100)
+    return str(root)
 
 
 def _kv(dtype=torch.float32, **overrides) -> KVManager:
@@ -168,6 +186,48 @@ def test_a_deployment_can_turn_the_cache_off():
     )
 
 
+def test_a_model_naming_no_checkpoint_keeps_its_cache_shut(caplog):
+    kv = _kv()
+
+    with caplog.at_level(logging.INFO, logger=Engine.__module__):
+        _root(kv=kv, model=_Declaring())
+
+    assert kv._index is None and kv._prefix_root is None, (
+        "the cache opened under a root without the weights, so two builds that "
+        "differ only in their weights would share every key"
+    )
+    lines = [r.getMessage() for r in caplog.records if "prefix cache off" in r.getMessage()]
+    assert len(lines) == 1 and KV in lines[0] and "prefix_cache_salt" in lines[0], (
+        "the cache stayed shut without naming the resource or what opens it"
+    )
+
+
+def test_a_salt_opens_the_cache_of_a_model_naming_no_checkpoint():
+    kv = _kv(prefix_cache_salt="deployment")
+
+    _root(kv=kv, model=_Declaring())
+
+    assert kv._index is not None, "a deployment that set a salt still had its cache shut"
+
+
+def test_a_model_naming_a_checkpoint_opens_its_cache(tmp_path):
+    kv = _kv()
+
+    _root(kv=kv, model=_Declaring(checkpoint=_checkpoint(tmp_path / "a", b"{}")))
+
+    assert kv._index is not None, "a model that named its weights had its cache shut"
+
+
+def test_two_checkpoints_root_the_cache_apart(tmp_path):
+    a = _checkpoint(tmp_path / "a", b'{"hidden_size": 8}')
+    b = _checkpoint(tmp_path / "b", b'{"hidden_size": 16}')
+
+    assert _root(model=_Declaring(checkpoint=a)) != _root(model=_Declaring(checkpoint=b)), (
+        "two checkpoints rooted the cache the same way, so each would match "
+        "pages the other wrote"
+    )
+
+
 def test_the_index_opens_empty():
     kv = _kv()
 
@@ -212,12 +272,6 @@ def test_a_request_can_opt_out_of_the_cache():
 
 
 def test_the_engine_hands_each_cache_the_walks_its_streams_name():
-    from mstar.model.base import PrefixStream
-
-    class _Declaring(_Model):
-        def prefix_key_streams(self):
-            return {KV: {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}}
-
     kv = _kv(prefix_cache_salt="deployment")
     _root(kv=kv, model=_Declaring())
 
