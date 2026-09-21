@@ -9,16 +9,20 @@ model_kwargs:
   # reference kernel; flashinfer stays available
   attention_backend: sdpa
   compile: true
-  # inductor rounds intermediates like eager PyTorch: keeps the compiled transformer at the
-  # reference's numerics (without it the served images drift to 35-39 dB on a 4-step sampler)
+  # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
+  # transformer still lands at a median 34.4 dB from the eager path over the 100 protocol prompts (78 of 100 below 40 dB)
   compile_eager_rounding: true
+  # norms and activations stay on the eager kernels inside the compiled forward: the compiled transformer is
+  # then bit-exact with the eager one; some B=1 latency over plain compile (see the table)
+  compile_exact_ops: true
   cuda_graph: true
   capture_sizes: [[1024, 1024]]
   # captions are padded to multiples of 32 tokens; graphs are captured for these lengths
   capture_caption_lengths: [32, 64]
   capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
   max_batch_size: 8
-  # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode
+  # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
+  # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
 
 node_groups:
