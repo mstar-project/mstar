@@ -248,3 +248,37 @@ def test_api_resolves_from_main_module(monkeypatch):
     stub = _StubAPI("bagel")
     monkeypatch.setattr(sys.modules["__main__"], "api_server", stub, raising=False)
     assert router_mod._api() is stub
+
+
+def test_images_edits_forwards_size(client_and_stub):
+    """``size`` is a known field of the multipart route but still has to reach the adapter: an edit at
+    768x1024 used to come back at the reference's size because the field was dropped."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("image", b"\x89PNGedited")]
+    resp = client.post(
+        "/v1/images/edits",
+        files={"image": ("in.png", b"\x89PNGinput", "image/png")},
+        data={"prompt": "make it neon", "size": "768x1024"},
+    )
+    assert resp.status_code == 200
+    assert stub.last_submit["model_kwargs"].get("size") == "768x1024"
+
+
+def test_image_routes_report_validation_errors_as_400(client_and_stub):
+    """A ValueError raised while building or validating the request is the client's fault (400, not 500)."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+
+    def reject(**kw):
+        raise ValueError("size must be 'WxH'")
+
+    stub.submit_request = reject
+    resp = client.post("/v1/images/generations", json={"model": "bagel", "prompt": "a cat", "size": "big"})
+    assert resp.status_code == 400 and "WxH" in resp.json()["error"]["message"]
+    resp = client.post(
+        "/v1/images/edits",
+        files={"image": ("in.png", b"\x89PNGinput", "image/png")},
+        data={"prompt": "make it neon", "size": "big"},
+    )
+    assert resp.status_code == 400
