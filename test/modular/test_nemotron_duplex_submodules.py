@@ -169,25 +169,61 @@ def test_nano_postprocess_feeds_tokens_back():
 
 
 class _FakeCodec(nn.Module):
-    """Stand-in vocoder: emits SPF samples per code frame (value = frame index),
-    so a chunk's emitted length and content are checkable."""
+    """Stand-in vocoder: emits SPF samples per code frame, valued by the frame's
+    first code (so a chunk's emitted length AND content are checkable), and
+    counts its calls."""
 
     SPF = 16
 
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
     def decode(self, codes, code_len):
-        tf = codes.shape[1]
-        wav = torch.repeat_interleave(torch.arange(tf, dtype=torch.float32) / 1000.0, self.SPF)
-        return wav.view(1, 1, -1), torch.tensor([tf * self.SPF])
+        self.calls += 1
+        b, tf = codes.shape[0], codes.shape[1]
+        per_frame = codes[:, :, 0].float() / 1000.0                     # (B, Tf)
+        wav = torch.repeat_interleave(per_frame, self.SPF, dim=1)       # (B, Tf * SPF)
+        return wav.view(b, 1, -1), torch.full((b,), tf * self.SPF)
 
 
 def _make_codec() -> AudioCodecDecoderSubmodule:
     return AudioCodecDecoderSubmodule(codec=_FakeCodec(), config=NemotronDuplexConfig())
 
 
-def _run_codec(codec, rid, n_frames):
-    codes = torch.zeros(n_frames, 4, dtype=torch.long)
+def _codes(n_frames, value=0):
+    return torch.full((n_frames, 4), value, dtype=torch.long)
+
+
+def _run_codec(codec, rid, n_frames, value=0):
     eng = SimpleNamespace(request_ids=[rid])
-    return codec.forward("codec_chunk", eng, codes=codes)["audio_chunk"][0]
+    return codec.forward("codec_chunk", eng, codes=_codes(n_frames, value))["audio_chunk"][0]
+
+
+def _run_codec_batch(codec, rids, frames):
+    eng = SimpleNamespace(request_ids=list(rids))
+    inputs = [codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [_codes(n, v)]})
+              for n, v in frames]
+    pre = codec.preprocess("codec_chunk", eng, inputs)
+    return codec.forward_batched("codec_chunk", eng, **pre)
+
+
+def test_codec_batches_requests_with_equal_windows():
+    """Requests at the same window length share one decode; a newcomer with a
+    shorter window gets its own; every request emits only its new frames with
+    its own content."""
+    codec = _make_codec()
+    _run_codec(codec, "a", 5, 1)
+    _run_codec(codec, "b", 5, 2)
+    codec.codec.calls = 0
+    out = _run_codec_batch(codec, ["a", "b", "c"], [(5, 3), (5, 4), (5, 5)])
+    assert codec.codec.calls == 2                      # {a, b} at 10 frames, c at 5
+    spf = _FakeCodec.SPF
+    for rid, value in (("a", 3), ("b", 4), ("c", 5)):
+        wav = out[rid]["audio_chunk"][0]
+        assert wav.shape[0] == 5 * spf
+        assert torch.all(wav == int(value / 1000.0 * 32767))    # the new frames' own content
+    assert _ctx(codec, "c").shape[0] == 5 and _ctx(codec, "a").shape[0] == 10
 
 
 def _ctx(codec, rid):
