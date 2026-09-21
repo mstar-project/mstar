@@ -360,18 +360,14 @@ class KVManager(AttentionResource):
         return state
 
     def enable_prefix_cache(self, root: bytes) -> None:
-        """Open the index under ``root``, the identity every key hangs from.
-
-        Refused above one rank: the ranks index independently, so they would
-        match different lengths and diverge mid-prefill. Lifting that needs the
-        ranks to agree on one length before the step is declared.
-        """
+        """Open the index under ``root``, the identity every key hangs from."""
         if not self.config.prefix_cache:
             return
         if self._world_size > 1:
             logger.info(
-                "KV %s: prefix cache off at world size %d; it needs the "
-                "cross-rank match exchange", self.name, self._world_size,
+                "KV %s: prefix cache off at world size %d: the ranks index "
+                "independently and would match different lengths",
+                self.name, self._world_size,
             )
             return
         self._prefix_root = root
@@ -382,9 +378,9 @@ class KVManager(AttentionResource):
     ) -> int | None:
         """Match this request's prefix against the index and hold what matched.
 
-        Answers the same length every time it is asked while the lease is held,
-        without taking a second reference: an allocation failure sends the batch
-        back through `prepare_inputs`, which probes again on untrimmed inputs.
+        Answers the same length every time it is asked, and takes one reference
+        however often that is: a probe is repeated whenever a step is prepared
+        again.
         """
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
@@ -556,9 +552,9 @@ class KVManager(AttentionResource):
     ) -> None:
         """Key what this request generated, once a page of it exists.
 
-        The tokens arrive one step after they were written, off the host copy
-        the stop check already takes, so the page they finish is keyed on the
-        step after it filled and `commit` offers it to the index then.
+        The ids are the host copy the stop check takes, which can arrive after
+        the step that wrote them has committed; the page is offered to the index
+        by the first commit that finds it both filled and keyed.
         """
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)

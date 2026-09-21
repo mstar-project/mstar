@@ -1,25 +1,16 @@
 """How far a real forward moves when its prefix comes from the cache.
 
-`test_kv_prefix_correctness.py` compares exactly, because it puts a value in
-each KV slot that depends only on that slot's position and never runs a kernel.
-This one runs the kernels. It builds Bagel's language model at a small random
-initialisation, gives it the real KV, attention and position resources, and
-computes the same tokens twice: once attending a prefix it inherited from an
-earlier request, once attending a prefix it computed itself a moment ago.
+`test_kv_prefix_correctness.py` never runs a kernel, so it can compare exactly.
+This one builds Bagel's language model over the real KV, attention and position
+resources and computes the same tokens twice: once attending a prefix inherited
+from an earlier request, once attending one it computed itself. Attention is
+planned over a different number of pages in the two runs, so what is asked of
+them is the repo's parity standard rather than equality.
 
-The two are not required to be identical. Attention is planned over a different
-number of pages in the two runs, and reductions outside attention depend on the
-shape of the step, so what is asked of them is the repo's parity standard rather
-than equality.
-
-Which of the repo's two tolerances applies is decided by the dtype, not by
-preference. FlashInfer's paged attention takes bf16 or fp16 and refuses fp32, so
-this runs in bf16 — the dtype a deployment runs in. The repo's tolerance for a
-bf16 comparison is `test_pi05_reference_equivalence.py:589`, atol=rtol=5e-2,
-whose own comment records ~1.1% relative as "within bf16". The 1e-5 in
-`vjepa2/test_ac_kv_cache_parity.py` belongs to an fp32 comparison on CPU and
-cannot be met by a bf16 kernel by either path. The measured deviation is printed
-so the margin is on the record rather than implied.
+The dtype decides which standard applies: FlashInfer's paged attention refuses
+fp32, so this runs in bf16, where the repo's tolerance is atol=rtol=5e-2 from
+`test_pi05_reference_equivalence.py`. The 1e-5 in
+`vjepa2/test_ac_kv_cache_parity.py` belongs to an fp32 comparison on CPU.
 """
 
 from __future__ import annotations
@@ -250,11 +241,8 @@ def test_a_consumed_prefix_lands_within_the_repos_parity_tolerance(capsys):
         )
     deviation = (from_cache - fresh).abs().max().item()
     with capsys.disabled():
-        print(
-            f"\n  matched {matched} of {len(prompt + tail)} tokens; "
-            f"max |hidden_cached - hidden_fresh| = {deviation:.3e} "
-            f"against atol {ATOL:.0e}"
-        )
+        # printed, not just asserted: the margin is the number this test is for
+        print(f"\n  matched {matched} tokens; deviation {deviation:.3e}")
     torch.testing.assert_close(
         from_cache, fresh, atol=ATOL, rtol=RTOL,
         msg=lambda default: (

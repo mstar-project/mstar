@@ -209,7 +209,8 @@ no longer read. It raises an error with a message describing the migration.
 
 ``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
 ``prefix_cache_salt`` keeps two otherwise identical deployments off each other's
-cached pages; one request opts out with ``prefix_cache=False``.
+cached pages. A single request opts out by sending ``prefix_cache=False``, which
+travels with its other ``model_kwargs``.
 
 **Single GPU.** Everything on rank 0:
 

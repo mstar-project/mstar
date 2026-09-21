@@ -151,7 +151,7 @@ class RopeManager(PositionManager):
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
     ) -> None:
-        """Hold the matched length for the `admit` that is about to seed it."""
+        """Hold what the cache matched, until an admit seeds a counter with it."""
         del node_name, graph_walk, inputs
         if matched_len:
             self._matched[rid] = matched_len
