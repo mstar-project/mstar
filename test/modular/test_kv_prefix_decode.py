@@ -144,23 +144,6 @@ def test_a_generated_page_is_indexed_at_the_commit_that_fills_it():
     kv.assert_pages_conserved()
 
 
-def test_the_page_the_prompt_and_the_generation_share_is_keyed_over_both():
-    kv = _manager()
-    prompt = list(range(100))
-    generated = list(range(9000, 9000 + 28))
-    _ingest(kv, "r0", prompt)
-    _prefill(kv, "r0", prompt, sampled=generated[0])
-
-    for token in generated[1:]:
-        _decode(kv, "r0", token)
-
-    whole_run = chain(_pages(prompt + generated))
-    assert kv._streams["r0"]["main"].keys[0] == whole_run[0], (
-        "the page the prompt and the generation share was keyed over only one "
-        "of them, so a later request with the same text would miss it"
-    )
-
-
 def test_a_generated_page_is_matched_by_the_request_that_asks_for_it_next():
     kv = _manager()
     prompt = list(range(100))

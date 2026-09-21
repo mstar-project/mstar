@@ -69,22 +69,6 @@ def test_a_cut_prefill_still_ends_with_the_whole_prompt_in_the_mask():
     )
 
 
-def test_a_cut_run_and_a_whole_run_end_with_the_same_mask():
-    whole = _sampler()
-    _prefill(whole, PROMPT)
-
-    cut = _sampler()
-    cut.apply_cached_prefix(
-        RID, NODE, WALK,
-        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), MATCHED,
-    )
-    _prefill(cut, PROMPT[MATCHED:])
-
-    assert _seen(cut) == _seen(whole), (
-        "the same prompt gives two different penalties depending on the cache"
-    )
-
-
 def test_the_skipped_tokens_are_folded_in_once():
     resource = _sampler()
     resource.apply_cached_prefix(

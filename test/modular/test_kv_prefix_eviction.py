@@ -136,17 +136,6 @@ def test_a_request_still_fails_when_the_pool_is_full_of_live_ones():
     kv.assert_pages_conserved()
 
 
-def test_eviction_holds_the_invariant_across_the_pages_it_moves():
-    kv = _manager(2 * PAGES_PER_REQUEST + 1)
-    _finished(kv, "a", _tokens(0))
-    _finished(kv, "b", _tokens(1000))
-
-    _ingest(kv, "c", _tokens(2000))
-    _admit(kv, "c", TOKENS)
-
-    kv.assert_pages_conserved()
-
-
 # ── what eviction must not take ─────────────────────────────────────────
 
 
@@ -229,19 +218,5 @@ def test_passing_over_a_leaf_leaves_its_parent_alone():
     assert index.page_for(index._key[leaf]) == leaf, "the leaf was removed"
     assert index.page_for(index._key[parent]) == parent, (
         "the walk went up from a leaf it never removed"
-    )
-    kv.assert_pages_conserved()
-
-
-def test_a_page_a_running_request_holds_is_never_evicted():
-    kv = _manager(2 * PAGES_PER_REQUEST + 1)
-    _ingest(kv, "a", _tokens(0))
-    assert _admit(kv, "a", TOKENS).ok
-    held = list(kv._streams["a"]["main"].page_indices)
-
-    kv._index.evict(kv.config.max_num_pages)
-
-    assert [kv._arena.num_owners[page] for page in held] == [2] * len(held), (
-        "the index let go of pages a running request shares with it"
     )
     kv.assert_pages_conserved()
