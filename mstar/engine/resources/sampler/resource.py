@@ -16,6 +16,8 @@ from mstar.engine.resources.step import SlotLease, StepContext
 
 
 class SamplerResource(Resource):
+    prefix_skip_safe = True
+
     # TODO: this is  a light wrapper around mstar/engine/resources/sampler/utils.py. In the future,
     # we should rip out the parts we need from sampling.py and discard the rest.
     def __init__(

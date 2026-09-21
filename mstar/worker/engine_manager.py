@@ -44,6 +44,34 @@ def _refuse_uncacheable_positions(
             )
 
 
+def _refuse_unskippable_resources(
+    specs: list[NodeResourceSpec], model: Model,
+) -> None:
+    """Refuse a declared node carrying a resource that cannot skip a prefix.
+
+    A hit takes the front of a request away from every resource on the node,
+    not just the ones that answered the probe, so one that cannot account for
+    tokens it never saw would plan its step against a sequence that never ran.
+    """
+    declared = set(model.prefix_key_streams())
+    if not declared:
+        return
+    cached_nodes = {
+        node for spec in specs if spec.resource_key in declared
+        for node in spec.nodes
+    }
+    for spec in specs:
+        shared = spec.nodes & cached_nodes
+        if not shared or spec.resource_class.prefix_skip_safe:
+            continue
+        raise ValueError(
+            f"resource {spec.resource_key!r} cannot serve a request whose "
+            f"prefix came from the cache, but it sits on {sorted(shared)}, "
+            "which the model keyed for prefix reuse; either drop the stream "
+            "or give the resource the prefix hooks"
+        )
+
+
 @dataclass
 class EngineManager:
     """Owns the worker's engine.
@@ -75,6 +103,7 @@ class EngineManager:
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, model_config)
         _refuse_uncacheable_positions(specs, model)
+        _refuse_unskippable_resources(specs, model)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to
