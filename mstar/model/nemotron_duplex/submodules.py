@@ -25,6 +25,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
 from mstar.engine.resources import AttentionStep, KVStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent import RecurrentStep
@@ -64,11 +65,14 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     samples the agent text (sampler resource) and the tool-call token (greedy).
     """
 
-    # Eager for now: the fusion in ``preprocess`` and the per-layer resource
-    # cursors are compile-disabled anyway; the decode step is captured as a
-    # CUDA graph (see ``get_cuda_graph_configs``) once every resource is fixed
-    # address, which the Mamba pool and the paged KV now are.
+    # No torch.compile: the per-layer resource cursors are compile-disabled
+    # and the decode step is a CUDA graph replay, which is where the time goes.
     disable_torch_compile = True
+
+    # Decode batch sizes captured as CUDA graphs: one row per live session per
+    # 80 ms tick. The recurrent pool holds a slot per row (padding rows take
+    # one transiently), so the model's pool sizing covers the largest bucket.
+    DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
     def __init__(self, language_model: nn.Module, config: NemotronDuplexConfig):
         super().__init__()
@@ -76,6 +80,36 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         self.embeddings = language_model.embeddings
         self.lm_head = language_model.lm_head
         self.config = config
+
+    def get_cuda_graph_configs(
+        self, device: torch.device, tp_world_size: int = 1,
+    ) -> list[CudaGraphConfig]:
+        """Capture the frame-synchronous decode step.
+
+        ``prepare_inputs`` is host-only and ``preprocess`` (embedding + AddFusion)
+        runs eagerly before the graph on both capture and replay; the captured
+        region is ``forward_batched``: the 56-layer backbone over the paged KV
+        and the recurrent pool, the two heads and the sampler. The dummy row is
+        one fused frame: a zero audio frame plus the BOS / PAD carry-ins.
+        """
+        cfg = self.config
+        frame = ARNodeInputs(
+            input_seq_len=1,
+            tensor_inputs={
+                "prev_text": torch.tensor([cfg.text_bos_id], dtype=torch.long),
+                "prev_func": torch.tensor([cfg.text_pad_id], dtype=torch.long),
+                "audio_frame": torch.zeros(1, cfg.nano.hidden_size, device=device),
+            },
+            kwargs={"mode": _MODE_FRAME},
+        )
+        return [
+            BatchedCudaGraphConfig(
+                capture_graph_walk="decode",
+                single_request_inputs=frame,
+                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+                compile=False,
+            ),
+        ]
 
     # -- resources -------------------------------------------------------
 
@@ -205,8 +239,11 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             pad = torch.full((1,), cfg.text_pad_id, dtype=torch.long, device=hidden.device)
             return {rid: {"prev_text": [pad], "prev_func": [pad]} for rid in rids}
 
-        ends = list(itertools.accumulate(seq_lens))
-        last = hidden.index_select(0, torch.tensor([e - 1 for e in ends], device=hidden.device))  # (B, H)
+        if all(n == 1 for n in seq_lens):
+            last = hidden                                   # decode: one row per request (captured shape)
+        else:
+            ends = list(itertools.accumulate(seq_lens))
+            last = hidden.index_select(0, torch.tensor([e - 1 for e in ends], device=hidden.device))
         new_token = engine_inputs.resources[NANO_SAMPLER].sample(rids, logits=self.lm_head(last))
         new_func = None
         if cfg.use_function_head:
