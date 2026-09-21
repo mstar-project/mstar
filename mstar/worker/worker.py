@@ -313,7 +313,7 @@ class Worker:
         # Leader: what each follower's own index matched, by rank, for requests
         # whose length the group has not settled yet. Dropped at remove.
         self._tp_prefix_replies: dict[str, dict[int, dict[str, int]]] = {}
-        self._tp_prefix_logged: RecentSet[str] = RecentSet(self._TP_NOSPEC_KEEP)
+        self._tp_prefix_logged: set[str] = set()
         # Leader: (rid, node) -> when the wait started, for requests whose
         # group has not all answered. Read by the scheduler, by reference.
         self._tp_prefix_waiting: dict[tuple[str, str], float] = {}
@@ -538,6 +538,7 @@ class Worker:
         self._pending_drains.discard(body.request_id)
         self._reads_done_sent.discard(body.request_id)
         self._tp_prefix_replies.pop(body.request_id, None)
+        self._tp_prefix_logged.discard(body.request_id)
         for node_name in self.parallel_nodes:
             self._tp_prefix_waiting.pop((body.request_id, node_name), None)
         self.engine_manager.remove_request(body.request_id)

@@ -36,6 +36,7 @@ def _worker(
     w._reads_done_sent = set(reads_done)
     w._pending_removes = set()
     w._tp_prefix_replies = {}
+    w._tp_prefix_logged = set()
     w._tp_prefix_waiting = {}
     w.parallel_nodes = set()
     w._last_active = {}
@@ -155,6 +156,18 @@ def test_remove_forgets_the_tp_prefix_replies():
     assert w._tp_prefix_replies == {}, (
         "a removed request's replies outlive it, and the next request to "
         "reuse its id is scheduled on a length no rank matched"
+    )
+
+
+def test_remove_forgets_that_the_prefix_gap_was_logged():
+    w = _worker()
+    w._tp_prefix_logged = {"X"}
+
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+
+    assert w._tp_prefix_logged == set(), (
+        "a removed request stays in the logged set for the life of the worker, "
+        "so the set grows with every request a follower's match ever differed on"
     )
 
 
