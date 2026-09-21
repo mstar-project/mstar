@@ -25,7 +25,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
-from mstar.engine.resources import ResourceReqConfig
+from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
@@ -372,10 +372,18 @@ class Conductor:
         Resolved once, here, and carried on the request: the worker hands each
         config to its resource at ingest. KV shape is not part of this — that
         is a deployment-wide property the model declares in its resource specs.
+
+        A declared stream is given a config whether the model asked for one or
+        not: the chain below is handed to the config named for the resource
+        that declared it, so a resource with no config would never see its keys
+        and would never match anything.
         """
-        return self.model.get_request_resource_configs(
+        configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
+        for key, streams in self.model.prefix_key_streams().items():
+            configs.setdefault(key, KVReqConfig(needed_labels=list(streams)))
+        return configs
 
     def _derive_worker_info(self):
         """Derive per-rank worker info from the worker graphs."""
