@@ -398,15 +398,22 @@ def test_first_decode_without_the_prefill_bundle_matches(monkeypatch):
 # ── (c) padded batch ─────────────────────────────────────────────────────
 
 
-def _drive_batch(driver: _Driver, prompts: dict[str, torch.Tensor], max_tokens: int):
-    """Prefill each request alone, then decode them as one batch."""
+def _drive_batch(
+    driver: _Driver, prompts: dict[str, torch.Tensor], max_tokens: int,
+    prefill_together: bool = False,
+):
+    """Prefill each request alone (or all of them in one packed step), then
+    decode them as one batch."""
     infos = {rid: _fwd_info(rid, max_tokens) for rid in prompts}
     emitted = {rid: [] for rid in prompts}
     texts = {}
-    for rid, prompt in prompts.items():
-        out = driver.step("prefill", {rid: (infos[rid], prompt)})[rid]
-        emitted[rid].append(out["new_token"][0])
-        texts[rid] = out[MTP_DRAFT_BUNDLE][0] if MTP_DRAFT_BUNDLE in out else out["text_inputs"][0]
+    prefills = [dict(prompts)] if prefill_together else [{rid: p} for rid, p in prompts.items()]
+    for batch in prefills:
+        outs = driver.step("prefill", {rid: (infos[rid], p) for rid, p in batch.items()})
+        for rid in batch:
+            out = outs[rid]
+            emitted[rid].append(out["new_token"][0])
+            texts[rid] = out[MTP_DRAFT_BUNDLE][0] if MTP_DRAFT_BUNDLE in out else out["text_inputs"][0]
     live = set(prompts)
     for _ in range(32):
         if not live:
@@ -458,6 +465,47 @@ def test_batch_of_two_padded_to_four_matches_single_streams(monkeypatch, k):
         # M=4(k+1); same near-tie caveat as the plain-decode comparison.
         assert batched[rid] == singles_eager[rid], (
             f"{rid}: padded replay diverged from the eager regions:\n"
+            f" eager   {singles_eager[rid]}\n batched {batched[rid]}")
+
+
+@pytest.mark.parametrize("k", [2, 3])
+def test_packed_prefill_of_three_padded_to_four_matches_single_streams(monkeypatch, k):
+    """Three prompts prefilled in ONE packed step through the prefill region
+    captured only at bs=4: the plan carries a zero-length padding row whose
+    qo_indptr tail repeats the last real offset, so ``_last_rows`` must hand
+    the sampler three rows, not four. Each stream must equal the request
+    prefilled alone (padded 1 -> 4) and the request on the eager regions.
+    """
+    monkeypatch.setattr(Glm52LLMSubmodule, "MTP_CAPTURE_BATCH_SIZES", [4])
+    cfg = _cfg(k)
+    cfg.prefill_capture_batch_sizes = [4]
+    model = _model(cfg)
+    prompts = {"a": _prompt(PROMPT_A, 3), "b": _prompt(PROMPT_B, 9), "c": _prompt(4, 17)}
+    singles = {
+        rid: _stream(model, cfg, k, regions=True, prompt=p, max_tokens=14, rid=rid)[0]
+        for rid, p in prompts.items()
+    }
+    singles_eager = {
+        rid: _stream(model, cfg, k, regions=False, prompt=p, max_tokens=14, rid=rid)[0]
+        for rid, p in prompts.items()
+    }
+
+    sub = Glm52LLMSubmodule(model, cfg)
+    driver = _Driver(sub, cfg, list(prompts), regions=True)
+    try:
+        assert set(driver.piecewise) == _expected_labels(k)
+        total = sum(p.shape[0] for p in prompts.values())
+        assert driver.piecewise[MTP_PREFILL_LABEL].can_run(len(prompts), total)
+        batched = _drive_batch(driver, prompts, max_tokens=14, prefill_together=True)
+        assert not any(driver.ran_eager().values()), driver.ran_eager()
+    finally:
+        driver.close()
+    for rid in prompts:
+        assert batched[rid] == singles[rid], (
+            f"{rid}: packed prefill (bs=3 -> 4) diverged from the request alone:\n"
+            f" alone   {singles[rid]}\n batched {batched[rid]}")
+        assert batched[rid] == singles_eager[rid], (
+            f"{rid}: packed prefill diverged from the eager regions:\n"
             f" eager   {singles_eager[rid]}\n batched {batched[rid]}")
 
 

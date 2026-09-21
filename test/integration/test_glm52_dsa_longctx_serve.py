@@ -120,6 +120,7 @@ def _write_checkpoint(tmp_path, seed=0):
 
     torch.manual_seed(seed)
     cfg = Glm52ModelConfig.reduced()
+    cfg.dsa_long_context = True  # the reference must carry the indexer the served model loads
     ref = Glm52ForCausalLM(cfg).to(device=DEVICE, dtype=DTYPE)
     ref.model.embed_tokens.weight.data.normal_(0, 0.05)
     ref.model.norm.weight.data.normal_(1.0, 0.02)

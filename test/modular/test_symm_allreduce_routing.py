@@ -52,15 +52,16 @@ class _CudaTensor:
     nbytes: int
     contiguous: bool = True
     is_cuda: bool = True
+    esize: int = 1
 
     def is_contiguous(self):
         return self.contiguous
 
     def numel(self):
-        return self.nbytes
+        return self.nbytes // self.esize
 
     def element_size(self):
-        return 1
+        return self.esize
 
 
 @pytest.fixture(autouse=True)
@@ -202,6 +203,38 @@ def test_over_cutoff_goes_nccl(nccl_calls):
 def test_non_contiguous_goes_nccl(nccl_calls):
     g, symm = _symm_group()
     t = _CudaTensor(nbytes=16, contiguous=False)
+    g.all_reduce(t)
+    assert symm.calls == []
+    assert nccl_calls == [(t, g.device_group)]
+
+
+@pytest.mark.parametrize("nbytes", [8186, 20, 1000, 4])
+def test_misaligned_byte_size_goes_nccl(nccl_calls, nbytes):
+    """multimem_all_reduce_ / one_shot_all_reduce reject a message whose
+    byte size is not aligned (a (1, 4093) bf16 is 8186 bytes) and raise
+    inside the op, past the setup-time fallback; route those to NCCL."""
+    from mstar.distributed.communication import TP_SYMM_AR_ALIGN_BYTES
+
+    assert nbytes % TP_SYMM_AR_ALIGN_BYTES != 0
+    g, symm = _symm_group(max_bytes=16 * 1024)
+    t = _CudaTensor(nbytes=nbytes, esize=2)
+    g.all_reduce(t)
+    assert symm.calls == []
+    assert nccl_calls == [(t, g.device_group)]
+
+
+@pytest.mark.parametrize("nbytes", [16, 8192, 6144 * 2])
+def test_aligned_byte_size_goes_symm(nccl_calls, nbytes):
+    g, symm = _symm_group(max_bytes=16 * 1024)
+    t = _CudaTensor(nbytes=nbytes, esize=2)
+    g.all_reduce(t)
+    assert symm.calls == [t]
+    assert nccl_calls == []
+
+
+def test_empty_message_goes_nccl(nccl_calls):
+    g, symm = _symm_group()
+    t = _CudaTensor(nbytes=0)
     g.all_reduce(t)
     assert symm.calls == []
     assert nccl_calls == [(t, g.device_group)]

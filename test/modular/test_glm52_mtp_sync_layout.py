@@ -90,3 +90,29 @@ def test_out_of_range_row_count_is_loud():
 def test_mismatched_lengths_are_loud():
     with pytest.raises(ValueError):
         mtp_sync_padded_layout([1, 2], [10], 2)
+
+
+def test_pack_padded_rows_matches_slice_assign():
+    """The padded sync inputs (rows slots per request, real rows first,
+    zeros after) built in two cats equal the per-request slice-assign."""
+    import torch
+
+    from mstar.model.glm52.submodules import mtp_pack_padded_rows
+
+    torch.manual_seed(0)
+    k = 3
+    rows = k + 1
+    for e_list in ([1], [4], [2, 4, 1], [3, 3, 3, 3], [1, 2, 3, 4, 2]):
+        tokens = [torch.randint(0, 256, (e,)) for e in e_list]
+        hiddens = [torch.randn(e, 6) for e in e_list]
+        num = len(e_list)
+        ref_ids = torch.zeros(num * rows, dtype=torch.long)
+        ref_h = torch.zeros(num * rows, 6)
+        for i, (t, h) in enumerate(zip(tokens, hiddens, strict=True)):
+            ref_ids[i * rows:i * rows + t.shape[0]] = t
+            ref_h[i * rows:i * rows + h.shape[0]] = h
+        ids, h = mtp_pack_padded_rows(tokens, hiddens, rows)
+        assert ids.dtype == torch.long and ids.shape == (num * rows,)
+        assert h.shape == (num * rows, 6)
+        assert torch.equal(ids, ref_ids), e_list
+        assert torch.equal(h, ref_h), e_list

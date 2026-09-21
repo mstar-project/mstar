@@ -408,3 +408,112 @@ def test_mtp_draft_phase_hoist_matches_baseline(monkeypatch, k):
     # the first decode step (the emitted token alone, no bundle) is not k+1
     # rows and takes the un-hoisted path
     assert phase.calls - 1 <= phase.staged <= phase.calls and phase.staged > 0
+
+
+# ── the context limit ────────────────────────────────────────────────────
+
+
+def _window_cfg(k: int, limit: int) -> Glm52ModelConfig:
+    """Reduced config whose context limit (index_topk, DSA off) is ``limit``
+    rows: two CPU pages of 8, so a row past the limit needs a third page."""
+    cfg = _cfg(k, mla_absorb=True)
+    cfg.index_topk = limit
+    return cfg
+
+
+def _window_stream(model, cfg, mode_k: int, regions: bool, prompt_len: int):
+    """One arm at the window: the stream, the capped budget, and the KV
+    stream's final length and page high-water mark."""
+    k = cfg.mtp_num_draft_tokens
+    cfg.mtp_num_draft_tokens = mode_k
+    try:
+        sub = Glm52LLMSubmodule(model, cfg)
+        driver = _Driver(sub, cfg, ["r0"], regions=regions and mode_k > 0)
+        prompt = torch.arange(prompt_len, dtype=torch.long) + 3
+        stream = _drive(driver, prompt, _fwd_info("r0", 40, True), carry_prefill_drafts=True)
+        kv = driver.resources[KV_RESOURCE]
+        pages = len(kv._streams["r0"]["main"].page_indices)
+        return stream, sub._token_budget["r0"], kv.stored_len("r0"), pages
+    finally:
+        cfg.mtp_num_draft_tokens = k
+
+
+@pytest.mark.parametrize("prepare", ["0", "1"])
+@pytest.mark.parametrize("k", [2, 3])
+def test_stream_stops_cleanly_at_the_context_limit(monkeypatch, k, prepare):
+    """A request whose max_tokens outruns the context limit stops there, with
+    the same stream for every k and every path: the prefill's preprocess
+    caps its budget at limit - prompt + 1, and under MTP a request within
+    k+1 rows of the limit stops drafting, so neither the trunk guard fires
+    nor the draft chain writes past the limit (no third KV page). Before,
+    the guard raised inside the batch k rows early and the chain could
+    reserve rows beyond the window."""
+    monkeypatch.setenv("MSTAR_GLM52_MTP_PHASE_PREPARE", prepare)
+    limit, prompt_len = 16, 5
+    cfg = _window_cfg(k, limit)
+    model = _model(cfg)
+    expect_tokens = limit - prompt_len + 1
+    baseline, budget, stored, pages = _window_stream(model, cfg, 0, False, prompt_len)
+    assert budget == expect_tokens
+    assert baseline.numel() == expect_tokens
+    assert stored == limit and pages == limit // 8
+    for regions in (False, True):
+        stream, budget, stored, pages = _window_stream(model, cfg, k, regions, prompt_len)
+        assert budget == expect_tokens
+        assert torch.equal(stream, baseline), (regions, stream.tolist(), baseline.tolist())
+        assert stored <= limit, (regions, stored)
+        assert pages <= limit // 8, (regions, pages)
+
+
+def test_budget_within_the_window_is_untouched():
+    cfg = _window_cfg(2, 64)
+    model = _model(cfg)
+    sub = Glm52LLMSubmodule(model, cfg)
+    driver = _Driver(sub, cfg, ["r0"])
+    prompt = torch.arange(5, dtype=torch.long) + 3
+    stream = _drive(driver, prompt, _fwd_info("r0", 9, True), carry_prefill_drafts=True)
+    assert sub._token_budget["r0"] == 9
+    assert stream.numel() == 9
+
+
+def test_mtp_drafting_gate_is_stored_plus_k_plus_one():
+    """A request drafts while its next trunk step (k+1 rows) still fits the
+    limit; the draft chain's k-1 transient rows lie inside those."""
+    cfg = _window_cfg(3, 16)
+    sub = Glm52LLMSubmodule(_model(cfg), cfg)
+    stored = {"a": 11, "b": 12, "c": 13}
+    kv = SimpleNamespace(stored_len=lambda rid: stored[rid])
+    assert sub._mtp_drafting(kv, ["a", "b", "c"]) == [True, True, False]
+
+
+def test_hoisted_stage_leaves_no_in_flight_marks(monkeypatch):
+    """MSTAR_GLM52_MTP_PHASE_PREPARE=1: every decode step admits the draft
+    phase's first half through stage() before the verify readback and the
+    second through run() after it. The first admit reserves no rows and the
+    second's commit clears the in-flight mark both set, so across a stream
+    no stage goes unpaired, no stream stays marked, and the reserved pages
+    never exceed the verified rows plus the transient chain."""
+    from mstar.model.glm52.submodules import MTP_DRAFT_PHASE_LABEL
+
+    monkeypatch.setenv("MSTAR_GLM52_MTP_PHASE_PREPARE", "1")
+    cfg = _cfg(2, True)
+    model = _model(cfg)
+    sub = Glm52LLMSubmodule(model, cfg)
+    assert sub._mtp_phase_prepare
+    driver = _Driver(sub, cfg, ["r0"], regions=True)
+    phase = driver.piecewise[MTP_DRAFT_PHASE_LABEL]
+    kv = driver.resources[KV_RESOURCE]
+    info = _fwd_info("r0", 30, True)
+    prompt = torch.arange(5, dtype=torch.long) + 3
+    out = driver.step("prefill", {"r0": (info, prompt)})["r0"]
+    text = out[MTP_DRAFT_BUNDLE][0]
+    total = prompt.numel()
+    for step in range(6):
+        out = driver.step("decode", {"r0": (info, text)})["r0"]
+        total += out["new_token"][0].numel()
+        stream = kv._streams["r0"]["main"]
+        assert stream.step_in_flight is False
+        assert kv.stored_len("r0") == total
+        assert phase.staged == phase.calls == step + 1
+        assert len(stream.page_indices) <= -(-(total + cfg.mtp_num_draft_tokens + 1) // 8)
+        text = out["text_inputs"][0]

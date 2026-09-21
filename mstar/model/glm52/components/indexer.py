@@ -18,6 +18,31 @@ def is_full_indexer_layer(config: Glm52ModelConfig, layer_idx: int) -> bool:
     return not skip
 
 
+def select_topk_causal(
+    scores: torch.Tensor, positions: torch.Tensor, topk: int
+) -> torch.Tensor:
+    """Per-row top-``topk`` key positions of causally masked ``scores``.
+
+    ``scores`` is ``(T, num_keys)`` with every key past a row's position
+    already ``-inf``; the result is ``(T, topk)`` int32, -1 padded where a
+    row sees fewer than ``topk`` keys. One stable sort for the whole batch:
+    no per-token topk launch, no host sync. Ties break toward the earlier
+    key position, so a row's selection does not depend on how the batch
+    is packed or on which device ran it (torch.topk's tie order is neither).
+    """
+    num_tokens, num_keys = scores.shape
+    k_eff = min(topk, num_keys)
+    order = scores.sort(dim=1, descending=True, stable=True).indices[:, :k_eff]
+    # the -inf tail sorts last (stable: by ascending index), so rank >= p_t+1
+    # is exactly the invisible remainder
+    rank = torch.arange(k_eff, device=scores.device)
+    invisible = rank.unsqueeze(0) >= positions.unsqueeze(1) + 1
+    selection = torch.full(
+        (num_tokens, topk), -1, dtype=torch.int32, device=scores.device)
+    selection[:, :k_eff] = order.to(torch.int32).masked_fill(invisible, -1)
+    return selection
+
+
 class Glm52Indexer(nn.Module):
     """DSA indexer for one FULL layer: k projection/cache side + selection side."""
 
@@ -88,9 +113,4 @@ class Glm52Indexer(nn.Module):
         scores = scores.masked_fill(
             key_pos.unsqueeze(0) > positions.unsqueeze(1), float("-inf"))
 
-        selection = torch.full(
-            (num_tokens, self.topk), -1, dtype=torch.int32, device=scores.device)
-        for t in range(num_tokens):
-            n = min(self.topk, int(positions[t]) + 1)
-            selection[t, :n] = scores[t].topk(n).indices.to(torch.int32)
-        return selection
+        return select_topk_causal(scores, positions, self.topk)

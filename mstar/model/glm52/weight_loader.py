@@ -134,12 +134,18 @@ def build_glm52_read_plan(
     config,
     tp_rank: int,
     tp_size: int,
-    load_indexer: bool = True,
+    load_indexer: bool | None = None,
     load_mtp: bool = False,
 ) -> tuple[set[str], "dict[str, tuple[int, int, int]]"]:
-    """Keys-to-read + per-key slice specs for the TP fast read path."""
+    """Keys-to-read + per-key slice specs for the TP fast read path.
+
+    ``load_indexer`` defaults to ``config.dsa_long_context``: flag-off the
+    model builds no indexer to fill, so its keys are never read.
+    """
     from mstar.model.glm52.components.indexer import is_full_indexer_layer
 
+    if load_indexer is None:
+        load_indexer = bool(config.dsa_long_context)
     fp8_experts = config.quantization_config is not None and config.moe_fp8_resident
     shard_inter = config.moe_intermediate_size // tp_size
     keys: set[str] = set()

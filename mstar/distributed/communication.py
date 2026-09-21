@@ -18,6 +18,10 @@ DIST_TIMEOUT_ENV = "MSTAR_DIST_TIMEOUT_S"
 TP_ALLREDUCE_ENV = "MSTAR_TP_ALLREDUCE"
 TP_SYMM_AR_MAX_KB_ENV = "MSTAR_TP_SYMM_AR_MAX_KB"
 TP_SYMM_AR_MODES = ("symm_oneshot", "symm_multimem")
+# The symm_mem ops check the message byte size is aligned (at least
+# max(4, element_size)) and vectorize at 16; anything else raises inside
+# the op, so only 16-byte-multiple messages are routed there.
+TP_SYMM_AR_ALIGN_BYTES = 16
 
 
 class _SymmAllReduce:
@@ -157,15 +161,13 @@ class CommGroup:
         if self.world_size == 1:
             return input_
         # Small contiguous CUDA messages go through symmetric memory when
-        # enabled; everything else (prefill-sized, strided, host) stays on NCCL.
+        # enabled; everything else (prefill-sized, strided, host, or a byte
+        # size the op would reject as misaligned) stays on NCCL.
         symm = self._symm_ar
-        if (
-            symm is not None
-            and input_.is_cuda
-            and input_.is_contiguous()
-            and input_.numel() * input_.element_size() <= symm.max_bytes
-        ):
-            return symm.all_reduce_(input_)
+        if symm is not None and input_.is_cuda and input_.is_contiguous():
+            nbytes = input_.numel() * input_.element_size()
+            if 0 < nbytes <= symm.max_bytes and nbytes % TP_SYMM_AR_ALIGN_BYTES == 0:
+                return symm.all_reduce_(input_)
         dist.all_reduce(input_, group=self.device_group)
         return input_
 

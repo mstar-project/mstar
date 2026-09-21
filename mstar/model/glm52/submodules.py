@@ -85,6 +85,20 @@ def mtp_sync_padded_layout(
     return positions, last_rows, [rows - e for e in e_list]
 
 
+def mtp_pack_padded_rows(
+    tokens: list[torch.Tensor], hiddens: list[torch.Tensor], rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The PADDED sync layout's device inputs: ``rows`` slots per request,
+    the ``e_i`` real rows first and zeros after. Two zero buffers and two
+    cats, whatever the batch size — the per-request slice-assign this
+    replaces cost two small kernels per request on the decode hot path."""
+    zero_ids = torch.zeros(rows, dtype=tokens[0].dtype, device=tokens[0].device)
+    zero_h = torch.zeros((rows, hiddens[0].shape[-1]), dtype=hiddens[0].dtype, device=hiddens[0].device)
+    sync_ids = torch.cat([piece for t in tokens for piece in (t, zero_ids[:rows - t.shape[0]])])
+    pair_h = torch.cat([piece for h in hiddens for piece in (h, zero_h[:rows - h.shape[0]])])
+    return sync_ids, pair_h
+
+
 @dataclass(kw_only=True)
 class Glm52MtpTrunkGraphConfig(PiecewiseCudaGraphConfig):
     """PACKED piecewise config with exactly one (bs, [rows]*bs) bucket per
@@ -194,6 +208,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_emitted: dict[str, int] = {}
         self._mtp_max_tokens: dict[str, int] = {}
         self._mtp_ignore_eos: dict[str, bool] = {}
+        # per request: max_tokens capped at the context limit (prompt-aware,
+        # set by the prefill's preprocess); read by check_stop for every k
+        self._token_budget: dict[str, int] = {}
         # Which trunk stream the MTP plane pairs drafts against (see
         # _mtp_pair_rows): the post-final-norm one by default.
         self._mtp_pair_postnorm = (
@@ -247,6 +264,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self._mtp_emitted.pop(request_id, None)
         self._mtp_max_tokens.pop(request_id, None)
         self._mtp_ignore_eos.pop(request_id, None)
+        self._token_budget.pop(request_id, None)
         super().cleanup_request(request_id)
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
@@ -745,7 +763,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                     f"repetition_penalty={sampling.repetition_penalty}. Send "
                     "temperature=0 without a penalty, or serve a k=0 config."
                 )
-            self._mtp_max_tokens[rid] = fwd_info.max_tokens
+            # capped by the prefill's context-limit clamp once that has run
+            self._mtp_max_tokens[rid] = min(
+                fwd_info.max_tokens, self._token_budget.get(rid, fwd_info.max_tokens))
             self._mtp_ignore_eos[rid] = sampling.ignore_eos
         return ARNodeInputs(
             input_ids=text_inputs,
@@ -757,6 +777,62 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if runner is not None and runner.can_run(bs, tokens):
             return runner
         return None
+
+    def _context_limit(self) -> int:
+        """Rows a request may hold: the serving window on the DSA engine
+        path, else index_topk, where dense MLA is exactly GLM-5.2's DSA."""
+        return self.config.max_seq_len if self.config.dsa_long_context else self.config.index_topk
+
+    def _clamp_token_budget(self, engine_inputs: ModelInputsFromEngine, rid: str, room: int) -> None:
+        """Cap the request's max_tokens at what fits before the context
+        limit, so decode stops there (check_stop, the MTP verify truncation)
+        instead of tripping preprocess's guard mid-batch. ``room`` is the
+        prompt-aware count, known only once the prefill rows are declared."""
+        info = (getattr(engine_inputs, "per_request_info", None) or {}).get(rid)
+        asked = getattr(info, "max_tokens", None)
+        if asked is None:
+            return
+        budget = min(int(asked), room)
+        if budget < asked:
+            logger.info(
+                "request %s: max_tokens %d capped to %d by the context limit %d",
+                rid, asked, budget, self._context_limit(),
+            )
+        self._token_budget[rid] = budget
+        if rid in self._mtp_max_tokens:
+            self._mtp_max_tokens[rid] = min(self._mtp_max_tokens[rid], budget)
+
+    def _mtp_drafting(self, kv, request_ids: list[str]) -> list[bool]:
+        """Which requests still draft. The next trunk step verifies k+1 rows
+        from the stream as it stands and the draft chain writes up to k-1
+        transient rows past the verified length, so both stay inside the
+        context limit only while stored + k + 1 <= limit. A request past
+        that mark finishes as plain decode (one row per step, no drafts);
+        its MTP plane goes unsynced, which is fine since it never drafts
+        again. Decided on the committed trunk length, before any rewind, so
+        every consumer in the step sees the same set."""
+        room = self._context_limit() - (self.config.mtp_num_draft_tokens + 1)
+        return [kv.stored_len(rid) <= room for rid in request_ids]
+
+    def _mtp_draft_subset(
+        self, engine_inputs: ModelInputsFromEngine, request_ids: list[str],
+        drafting: list[bool], sync_tokens: list[torch.Tensor],
+        pair_hiddens: list[torch.Tensor], **runners,
+    ) -> list[torch.Tensor]:
+        """``_mtp_sync_and_draft`` over the drafting requests; a (0,) draft
+        for the rest, so their next step carries the emitted token alone."""
+        if all(drafting):
+            return self._mtp_sync_and_draft(
+                engine_inputs, sync_tokens, pair_hiddens, request_ids=request_ids, **runners)
+        drafts = [t[:0] for t in sync_tokens]
+        idx = [i for i, d in enumerate(drafting) if d]
+        if idx:
+            sub = self._mtp_sync_and_draft(
+                engine_inputs, [sync_tokens[i] for i in idx], [pair_hiddens[i] for i in idx],
+                request_ids=[request_ids[i] for i in idx], **runners)
+            for j, i in enumerate(idx):
+                drafts[i] = sub[j]
+        return drafts
 
     def preprocess(
         self,
@@ -793,7 +869,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # context fits the top-k window; refuse beyond it unless the DSA
         # engine path is on, where the cap is the serving window.
         long_context = self.config.dsa_long_context
-        limit = self.config.max_seq_len if long_context else self.config.index_topk
+        limit = self._context_limit()
         topk = self.config.index_topk
         pos_ids_list: list[int] = []
         spans: list[Glm52DsaRequestSpan] = []
@@ -812,6 +888,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                         "DSA computation. Long context needs dsa_long_context=True."
                     )
                 )
+            if graph_walk == "prefill":
+                # a prompt of P rows can emit limit - P + 1 tokens: the
+                # prefill's, then one per row up to the limit
+                self._clamp_token_budget(engine_inputs, rid, limit - (start + sl) + 1)
             if long_context:
                 if start + sl > topk:
                     if sl > 1:
@@ -971,8 +1051,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 self._mtp_emitted[rid] = 1
                 sync_tokens.append(torch.cat([input_ids[r][1:], new_tokens[i:i + 1]]))
                 pair_hiddens.append(pair_rows[r])
-            drafts = self._mtp_sync_and_draft(
-                engine_inputs, sync_tokens, pair_hiddens, draft_runner=runners.get("draft"))
+            drafts = self._mtp_draft_subset(
+                engine_inputs, request_ids, self._mtp_drafting(kv, request_ids),
+                sync_tokens, pair_hiddens, draft_runner=runners.get("draft"))
             return {
                 rid: {
                     "new_token": [new_tokens[i:i + 1]],
@@ -1016,9 +1097,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         rows = self.config.mtp_num_draft_tokens + 1
         prepared = False
         pair_rows = self._mtp_pair_rows(hidden, prenorm)
+        drafting = self._mtp_drafting(kv, request_ids)
         if (
             phase_runner is not None and self._mtp_phase_prepare
-            and all(sl == rows for sl in seq_lens)
+            and all(sl == rows for sl in seq_lens) and all(drafting)
         ):
             # the e-independent half of the draft phase, while the GPU is
             # still running the trunk (see _mtp_phase_prepare)
@@ -1072,8 +1154,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         sync_runner = runners.get("sync")
         if sync_runner is None and self._mtp_capture_sync:
             self._warn_mtp_sync_eager_once(num)
-        drafts = self._mtp_sync_and_draft(
-            engine_inputs, sync_tokens, pair_hiddens,
+        drafts = self._mtp_draft_subset(
+            engine_inputs, request_ids, drafting, sync_tokens, pair_hiddens,
             draft_runner=runners.get("draft"), sync_runner=sync_runner,
             phase_runner=phase_runner, prepared=prepared,
         )
@@ -1093,20 +1175,26 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         sync_runner=None,
         phase_runner=None,
         prepared: bool = False,
+        request_ids: list[str] | None = None,
     ) -> list[torch.Tensor]:
         """Extend the MTP plane over the newly committed tokens, then draft
         k tokens autoregressively. Returns per-request (k,) draft tensors.
+        ``request_ids`` is the subset still drafting (``_mtp_drafting``),
+        default the whole batch.
         """
         k = self.config.mtp_num_draft_tokens
         kv = self._kv(engine_inputs)
         mtp = self.language_model.mtp
         embed = self.language_model.model.embed_tokens
-        request_ids = list(engine_inputs.request_ids)
+        request_ids = list(engine_inputs.request_ids if request_ids is None else request_ids)
         num = len(request_ids)
         device = pair_hiddens[0].device
         e_list = [t.shape[0] for t in sync_tokens]
         starts = [kv.stored_len(rid) for rid in request_ids]
         rows = k + 1
+        limit = self._context_limit()
+        assert all(st + rows <= limit for st in starts), (
+            f"draft phase would write past the context limit {limit}: stored {starts}, k={k}")
 
         assert not prepared or phase_runner is not None
         if phase_runner is not None:
@@ -1121,13 +1209,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 phase_inputs = {"last_rows": pinned(last_l, torch.long)}
                 step_kwargs = {"e_list": list(e_list), "phase": "finish"}
             else:
-                sync_ids = torch.zeros(num * rows, dtype=torch.long, device=device)
-                pair_h = torch.zeros(
-                    (num * rows, pair_hiddens[0].shape[-1]),
-                    dtype=pair_hiddens[0].dtype, device=device)
-                for i, (t, h) in enumerate(zip(sync_tokens, pair_hiddens, strict=True)):
-                    sync_ids[i * rows:i * rows + t.shape[0]] = t
-                    pair_h[i * rows:i * rows + h.shape[0]] = h
+                sync_ids, pair_h = mtp_pack_padded_rows(sync_tokens, pair_hiddens, rows)
                 phase_inputs = {
                     "sync_ids": sync_ids,
                     "pair_hidden": pair_h,
@@ -1154,13 +1236,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             assert all(e <= rows for e in e_list), (
                 f"padded sync got rows {e_list} outside [1, {rows}]")
             pos_l, last_l, over_advance = mtp_sync_padded_layout(e_list, starts, k)
-            sync_ids = torch.zeros(num * rows, dtype=torch.long, device=device)
-            pair_h = torch.zeros(
-                (num * rows, pair_hiddens[0].shape[-1]),
-                dtype=pair_hiddens[0].dtype, device=device)
-            for i, (t, h) in enumerate(zip(sync_tokens, pair_hiddens, strict=True)):
-                sync_ids[i * rows:i * rows + t.shape[0]] = t
-                pair_h[i * rows:i * rows + h.shape[0]] = h
+            sync_ids, pair_h = mtp_pack_padded_rows(sync_tokens, pair_hiddens, rows)
             out = sync_runner.run(
                 static_inputs={
                     "sync_ids": sync_ids,
@@ -1310,6 +1386,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return set()
         ignore_eos = request_info.resource_configs[SAMPLER_RESOURCE].ignore_eos
+        # the prompt-aware cap from the prefill's preprocess, else the request's own
+        budget = self._token_budget.get(request_id, request_info.max_tokens)
         if self.config.mtp_num_draft_tokens > 0:
             # multi-token emission: in-step truncation guarantees a stop id
             # can only be the LAST element; totals live in the per-request
@@ -1318,7 +1396,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             last = int(tokens[-1])
             is_eos = last in self.config.eos_token_ids
             generated = self._mtp_emitted.get(request_id, 0)
-            if (not ignore_eos and is_eos) or generated >= request_info.max_tokens:
+            if (not ignore_eos and is_eos) or generated >= budget:
                 return {"decode_loop"}
             return set()
         token = outputs["new_token"][0].item()
@@ -1326,6 +1404,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         # max_tokens counts the token the prefill emits, so the total is
         # 1 + (iters + 1) decode tokens
         generated = request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 2
-        if (not ignore_eos and is_eos) or generated >= request_info.max_tokens:
+        if (not ignore_eos and is_eos) or generated >= budget:
             return {"decode_loop"}
         return set()

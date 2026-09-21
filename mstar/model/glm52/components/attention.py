@@ -88,10 +88,17 @@ class Glm52MLAAttention(nn.Module):
         # DSA indexer only on FULL layers — SHARED layers carry no indexer
         # weights in the checkpoint (they reuse the last FULL selection),
         # and a dormant module would sit uninitialized after ``to_empty``.
+        # And only on the DSA engine path: with dsa_long_context off no
+        # forward ever hands the layer a dsa_ctx, so a FULL layer's indexer
+        # (replicated, not TP-sharded) would be read and held for nothing;
+        # the loader skips its keys to match (Glm52ForCausalLM.load_weights).
         self.layer_idx = layer_idx  # k-store key + selection provenance
+        self.dsa_long_context = config.dsa_long_context
         self.indexer = (
             Glm52Indexer(config)
-            if layer_idx is not None and is_full_indexer_layer(config, layer_idx)
+            if self.dsa_long_context
+            and layer_idx is not None
+            and is_full_indexer_layer(config, layer_idx)
             else None
         )
         # run_attention uses 1/sqrt(padded_head_dim); fold the intended
@@ -137,6 +144,13 @@ class Glm52MLAAttention(nn.Module):
                 "dsa_long_context requires mla_absorb: the sparse gather path "
                 "consumes the paged MLA latent cache, which only the absorbed "
                 "backend maintains"
+            )
+        if dsa_ctx is not None and not self.dsa_long_context:
+            # built flag-off: no indexer was constructed and its weights were
+            # never loaded, so a FULL layer here would pass for SHARED
+            raise RuntimeError(
+                "dsa_ctx handed to an attention layer built with dsa_long_context "
+                "off — its indexer does not exist"
             )
         if self.mla_absorb:
             if dsa_selection is not None:
@@ -347,18 +361,44 @@ class Glm52MLAAttention(nn.Module):
                 "hk,kd->hd", attn, gathered[:, :latent_dim]).to(out.dtype)
         return out
 
+    # The absorbed forward reads only w_kc / w_vc / fused_qkv_a_proj_weight;
+    # these source projections would otherwise stay resident for the process
+    # lifetime (~2.8 GB per rank on the TP8 full model — KV pages lost).
+    _ABSORBED_SOURCE_PROJS = ("q_a_proj", "kv_a_proj_with_mqa", "kv_b_proj")
+
     def process_weights_after_loading(self, device: torch.device | str | None = None) -> None:
-        """Build absorbed Q/O projections from the local-head ``kv_b_proj`` shard."""
+        """Build absorbed Q/O projections from the local-head ``kv_b_proj`` shard,
+        then release the source weights the absorbed forward never reads."""
         if not self.mla_absorb:
             return
         del device  # protocol arg; kv_b_proj.weight already carries the right device
+        if self.absorbed_sources_released:
+            return  # fused and freed already: nothing left to fold from
         w = self.kv_b_proj.weight  # (H_local*(Dnope+Dv), L)
         h, d_nope, d_v, latent = (
             self.num_heads, self.qk_nope_head_dim, self.v_head_dim, self.kv_lora_rank)
         w = w.view(h, d_nope + d_v, latent)
         w_kc, w_vc = w.split([d_nope, d_v], dim=1)
-        self.w_kc = w_kc.contiguous()  # (H_local, Dnope, L)
-        self.w_vc = w_vc.contiguous()  # (H_local, Dv,    L)
+        # clone, not contiguous(): with one local head the split slices are
+        # already contiguous views, and a view would pin the storage we free
+        self.w_kc = w_kc.clone(memory_format=torch.contiguous_format)  # (H_local, Dnope, L)
+        self.w_vc = w_vc.clone(memory_format=torch.contiguous_format)  # (H_local, Dv,    L)
 
         self.fused_qkv_a_proj_weight = torch.cat(
             [self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight], dim=0).contiguous()
+        self._release_absorbed_sources()
+
+    @property
+    def absorbed_sources_released(self) -> bool:
+        return (
+            self.mla_absorb and self.w_kc is not None
+            and self.kv_b_proj.weight.numel() == 0
+        )
+
+    def _release_absorbed_sources(self) -> None:
+        for name in self._ABSORBED_SOURCE_PROJS:
+            param = getattr(self, name).weight
+            # keep the Parameter (its weight_loader, dtype, device) and the
+            # Linear's in/out_features the forward still reads; drop only the
+            # storage — the same ``.data`` rebinding restore_fp32_params uses
+            param.data = param.data.new_empty(0)

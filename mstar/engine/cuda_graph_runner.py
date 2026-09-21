@@ -54,9 +54,18 @@ def _validate_compile_mode(mode: str, source: str) -> str:
     return mode
 
 
-_COMPILE_MODE_OVERRIDE = os.environ.get(_COMPILE_MODE_ENV)
-if _COMPILE_MODE_OVERRIDE is not None:
-    _validate_compile_mode(_COMPILE_MODE_OVERRIDE, _COMPILE_MODE_ENV)
+def _read_compile_mode_override(environ: Mapping[str, str] | None = None) -> str | None:
+    """The env override, validated here so a bad value fails the process at
+    import rather than every capture. Takes the mapping so a test can drive
+    it without reloading this module (which re-creates every class in it)."""
+    env = os.environ if environ is None else environ
+    mode = env.get(_COMPILE_MODE_ENV)
+    if mode is not None:
+        _validate_compile_mode(mode, _COMPILE_MODE_ENV)
+    return mode
+
+
+_COMPILE_MODE_OVERRIDE = _read_compile_mode_override()
 # Restrict what max-autotune considers (e.g. "ATEN" = cuBLAS only), for
 # attributing an autotune pick without leaving autotune.
 _GEMM_BACKENDS = os.environ.get("MSTAR_INDUCTOR_GEMM_BACKENDS", "")
@@ -1404,8 +1413,11 @@ class PiecewiseCudaGraphRunner:
         passes in two steps must land the second next to the first, not over
         it (``MlaAttentionStep.first_sub_plan``).
 
-        Host work only; nothing is replayed and nothing commits here, and a
-        ``run`` that never follows leaves no state behind but the plans.
+        Host work only; nothing is replayed and nothing commits here. The
+        first step's admit reserves no rows (its spans are zero) but marks
+        its streams in flight; the paired ``run``'s commit of the second
+        step clears that mark. A ``run`` that never follows leaves the mark
+        set until the request's next committed step.
         """
         data, real_bs, _, _ = self._resolve_call(request_ids, seq_lens, real_bs)
         self._copy_inputs(data, static_inputs)

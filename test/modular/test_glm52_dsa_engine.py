@@ -105,6 +105,7 @@ def test_cleanup_request_evicts_kstore():
     sub._mtp_emitted = {"r0": 7}
     sub._mtp_max_tokens = {"r0": 32}
     sub._mtp_ignore_eos = {"r0": False}
+    sub._token_budget = {"r0": 20}
 
     sub._dsa_k_store.append("r0", 0, torch.randn(5, 16), start_pos=0)
     sub.request_state("r0")  # base per-request state exists too
@@ -114,6 +115,7 @@ def test_cleanup_request_evicts_kstore():
     assert sub._mtp_emitted == {}
     assert sub._mtp_max_tokens == {}
     assert sub._mtp_ignore_eos == {}
+    assert sub._token_budget == {}
     sub.cleanup_request("r0")  # idempotent, like the base hook
 
 

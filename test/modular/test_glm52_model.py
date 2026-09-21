@@ -47,6 +47,7 @@ from mstar.engine.resources import (  # noqa: E402
     SamplingReqConfig,
 )
 from mstar.graph.base import Loop  # noqa: E402
+from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
     ATTN_RESOURCE,
     KV_RESOURCE,
@@ -388,6 +389,7 @@ def _make_submodule(config) -> Glm52LLMSubmodule:
     sub = object.__new__(Glm52LLMSubmodule)
     sub.config = config
     sub._dsa_k_store = Glm52DsaKStore()
+    sub._token_budget = {}  # no prefill ran: check_stop falls back to the request's max_tokens
     return sub
 
 
@@ -544,3 +546,75 @@ def test_glm52_postprocess_byte_mode_never_touches_tokenizer():
     assert m._tokenizer is None  # no lazy HF download triggered
     with pytest.raises(ValueError, match="Unsupported modality"):
         m.postprocess(torch.tensor([1]), "audio")
+
+
+
+# ---------------------------------------------------------------------------
+# DSA indexer residency follows dsa_long_context
+# ---------------------------------------------------------------------------
+
+def _indexer_params(model):
+    return {n for n, _ in model.named_parameters() if ".self_attn.indexer." in n}
+
+
+def test_indexer_exists_only_on_the_dsa_path():
+    """Flag-off no forward ever hands a layer a dsa_ctx, so a FULL layer's
+    indexer would be replicated (not TP-sharded) dead weight — ~370 MB per
+    rank on the full model. Flag-on FULL layers carry it, SHARED ones never."""
+    off = Glm52ForCausalLM(Glm52ModelConfig.reduced())
+    assert _indexer_params(off) == set()
+    assert all(layer.self_attn.indexer is None for layer in off.model.layers)
+
+    cfg = Glm52ModelConfig.reduced()
+    cfg.dsa_long_context = True
+    on = Glm52ForCausalLM(cfg)
+    assert on.model.layers[0].self_attn.indexer is not None  # FULL
+    assert on.model.layers[1].self_attn.indexer is None      # SHARED
+    assert all(n.startswith("model.layers.0.") for n in _indexer_params(on))
+
+    # the MTP layer's indexer follows the same flag (drafting is flag-off
+    # only in v1, so it never carries one in practice)
+    cfg = Glm52ModelConfig.reduced()
+    cfg.num_hidden_layers = 4  # MTP position lands FULL
+    cfg.mtp_num_draft_tokens = 2
+    assert Glm52ForCausalLM(cfg).mtp.transformer_layer.self_attn.indexer is None
+
+
+def test_flag_off_layer_refuses_a_dsa_ctx():
+    from mstar.model.glm52.components.attention import Glm52MLAAttention
+    from mstar.model.glm52.dsa import Glm52DsaForwardContext
+
+    cfg = Glm52ModelConfig.reduced()
+    cfg.mla_absorb = True
+    attn = Glm52MLAAttention(cfg, layer_idx=0)  # FULL slot, built flag-off
+    ctx = Glm52DsaForwardContext(spans=[], k_store=Glm52DsaKStore(), needs_selection=True)
+    with pytest.raises(RuntimeError, match="dsa_long_context"):
+        attn(torch.randn(1, cfg.hidden_size), torch.tensor([0]), dsa_ctx=ctx)
+
+
+def test_load_weights_skips_indexer_keys_flag_off_and_demands_them_flag_on():
+    from test_glm52_moe import BLOCK, _fabricate_checkpoint
+
+    torch.manual_seed(3)
+    cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+    state, _ = _fabricate_checkpoint(cfg)  # carries layer 0's indexer keys
+    assert any(".self_attn.indexer." in name for name, _ in state)
+
+    # flag-off: the keys are dropped before the dequant stream, the load is
+    # complete both ways without them
+    off = Glm52ForCausalLM(cfg)
+    loaded = off.load_weights(iter(state))
+    assert loaded == set(dict(off.named_parameters()))
+    assert not any(".indexer." in n for n in loaded)
+
+    # flag-on: the FULL layer's indexer loads, and a stream without those
+    # keys is refused rather than served from uninitialized memory
+    cfg.dsa_long_context = True
+    on = Glm52ForCausalLM(cfg)
+    loaded = on.load_weights(iter(state))
+    assert loaded == set(dict(on.named_parameters()))
+    assert _indexer_params(on) <= loaded and _indexer_params(on)
+
+    stripped = [(n, t) for n, t in state if ".self_attn.indexer." not in n]
+    with pytest.raises(RuntimeError, match="indexer parameters received no checkpoint"):
+        Glm52ForCausalLM(cfg).load_weights(iter(stripped))

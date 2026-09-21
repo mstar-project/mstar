@@ -133,6 +133,7 @@ def _reduced_mtp_config() -> Glm52ModelConfig:
     the real geometry where 78 = 2 + 19·4."""
     cfg = Glm52ModelConfig.reduced()
     cfg.num_hidden_layers = 4
+    cfg.dsa_long_context = True  # the indexer (and its checkpoint keys) exist only on the DSA path
     return cfg
 
 
@@ -332,6 +333,7 @@ def test_mtp_load_end_to_end_reduced_fp8():
     cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
     cfg.num_hidden_layers = 4  # MTP position lands FULL (4 = offset-1 + freq)
     cfg.mtp_num_draft_tokens = 2
+    cfg.dsa_long_context = True  # indexer keys ride the stream only on the DSA path
     model = Glm52ForCausalLM(cfg)
     assert model.mtp is not None
     assert model.mtp.transformer_layer.self_attn.indexer is not None

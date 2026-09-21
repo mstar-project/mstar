@@ -21,6 +21,7 @@ BLOCK = (16, 16)
 
 def test_read_plan_excludes_and_slices():
     cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)  # moe_inter 64, 2 layers
+    cfg.dsa_long_context = True  # the indexer is read only on the DSA path
     keys = [
         "model.embed_tokens.weight",
         "model.layers.0.self_attn.q_a_proj.weight",
@@ -66,6 +67,33 @@ def test_read_plan_flag_off_indexer_and_bf16_experts():
     plan_keys, specs = build_glm52_read_plan(keys, cfg, tp_rank=0, tp_size=2, load_indexer=False)
     assert plan_keys == {"model.layers.1.mlp.experts.2.gate_proj.weight"}
     assert specs == {}
+
+
+def test_read_plan_indexer_default_follows_dsa_long_context():
+    """Flag-off the model builds no indexer (Glm52MLAAttention), so the plan
+    must not read the keys — ~370 MB per rank of replicated weights on the
+    full model, transferred to every rank for nothing. Flag-on the FULL
+    layers' keys come back; an explicit ``load_indexer`` still wins."""
+    keys = [
+        "model.layers.0.self_attn.indexer.wk.weight",       # layer 0 FULL
+        "model.layers.1.self_attn.indexer.wk.weight",       # layer 1 SHARED
+        "model.layers.0.self_attn.q_a_proj.weight",
+    ]
+    cfg = Glm52ModelConfig.reduced()
+    assert cfg.dsa_long_context is False
+    plan_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=0, tp_size=1)
+    assert plan_keys == {"model.layers.0.self_attn.q_a_proj.weight"}
+
+    cfg.dsa_long_context = True
+    plan_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=0, tp_size=1)
+    assert plan_keys == {
+        "model.layers.0.self_attn.q_a_proj.weight",
+        "model.layers.0.self_attn.indexer.wk.weight",
+    }
+
+    cfg.dsa_long_context = False
+    plan_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=0, tp_size=1, load_indexer=True)
+    assert "model.layers.0.self_attn.indexer.wk.weight" in plan_keys
 
 
 def test_expert_loaders_accept_full_and_presliced():
@@ -131,7 +159,12 @@ def test_read_plan_includes_mtp_when_enabled():
         keys, cfg, tp_rank=1, tp_size=2, load_mtp=True)
     assert "model.layers.4.enorm.weight" in plan_keys
     assert "model.layers.4.eh_proj.weight" in plan_keys
-    assert "model.layers.4.self_attn.indexer.wk.weight" in plan_keys
+    # the MTP layer's own indexer follows the DSA flag like the trunk's
+    assert "model.layers.4.self_attn.indexer.wk.weight" not in plan_keys
+    cfg.dsa_long_context = True
+    on_keys, _ = build_glm52_read_plan(keys, cfg, tp_rank=1, tp_size=2, load_mtp=True)
+    assert "model.layers.4.self_attn.indexer.wk.weight" in on_keys
+    cfg.dsa_long_context = False
     shard = cfg.moe_intermediate_size // 2
     assert specs["model.layers.4.mlp.experts.0.up_proj.weight"] == (
         0, shard, 2 * shard)

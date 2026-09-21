@@ -23,6 +23,8 @@ from mstar.model.glm52.quantization import FP8_DTYPE, dequantize_fp8_block_weigh
 logger = logging.getLogger(__name__)
 
 _BACKEND_LOGGED = False
+# accepted moe_quant_kernel values; see Glm52ModelConfig.moe_quant_kernel
+MOE_QUANT_KERNELS = ("reference", "triton", "auto")
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -153,6 +155,13 @@ class Glm52SparseMoeBlock(nn.Module):
             config.quantization_config is not None and config.moe_fp8_resident
         )
         self.quant_kernel = getattr(config, "moe_quant_kernel", "reference")
+        if self.quant_kernel not in MOE_QUANT_KERNELS:
+            # an unknown value would otherwise resolve to the uncapturable
+            # reference loop and serve eager behind a healthy /health
+            raise ValueError(
+                f"moe_quant_kernel={self.quant_kernel!r} is not one of "
+                f"{MOE_QUANT_KERNELS}"
+            )
         # Resolved on the real device by process_weights_after_loading;
         # blocks used without the load hook (CPU tests) stay on reference.
         self._use_fused = False

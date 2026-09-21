@@ -1,7 +1,6 @@
 """``compile_mode`` on a capture config, and the MSTAR_GRAPH_COMPILE_MODE
 override — resolved once in ``cuda_graph_runner.compile_kwargs``."""
 
-import importlib
 import sys
 
 import pytest
@@ -17,21 +16,32 @@ from mstar.engine.cuda_graph_config import (
 from mstar.engine.cuda_graph_runner import compile_kwargs, resolve_compile_mode
 from mstar.model.submodule_base import NodeInputs
 
+ENV = "MSTAR_GRAPH_COMPILE_MODE"
 
-def test_config_mode_defaults_to_the_historical_autotune():
-    assert runner_mod._COMPILE_MODE_OVERRIDE is None, "run without the env var set"
+
+@pytest.fixture
+def no_env_override(monkeypatch):
+    # The import-time read lands in a module attribute: patch that, never
+    # importlib.reload the module — a reload re-creates every class in it
+    # for the rest of the session, so isinstance against a runner imported
+    # elsewhere fails. Also keeps these tests green in a shell that exports
+    # the variable.
+    monkeypatch.setattr(runner_mod, "_COMPILE_MODE_OVERRIDE", None)
+
+
+def test_config_mode_defaults_to_the_historical_autotune(no_env_override):
     assert resolve_compile_mode(None) == "max-autotune-no-cudagraphs"
     assert compile_kwargs(None) == {
         "fullgraph": False, "dynamic": False, "mode": "max-autotune-no-cudagraphs",
     }
 
 
-def test_config_names_its_own_mode():
+def test_config_names_its_own_mode(no_env_override):
     assert compile_kwargs("default") == {"fullgraph": False, "dynamic": False}
     assert compile_kwargs("reduce-overhead")["mode"] == "reduce-overhead"
 
 
-def test_invalid_config_mode_is_refused():
+def test_invalid_config_mode_is_refused(no_env_override):
     with pytest.raises(ValueError, match="compile_mode='no-such-mode'"):
         compile_kwargs("no-such-mode")
 
@@ -57,17 +67,25 @@ def test_configs_carry_the_field():
     assert pw.compile_mode == "default"
 
 
-def test_env_override_wins_and_invalid_env_fails_at_import(monkeypatch):
-    monkeypatch.setenv("MSTAR_GRAPH_COMPILE_MODE", "default")
-    mod = importlib.reload(runner_mod)
-    try:
-        assert mod.resolve_compile_mode("max-autotune-no-cudagraphs") == "default"
-        assert mod.compile_kwargs("max-autotune-no-cudagraphs") == {
-            "fullgraph": False, "dynamic": False,
-        }
-        monkeypatch.setenv("MSTAR_GRAPH_COMPILE_MODE", "no-such-mode")
-        with pytest.raises(ValueError, match="MSTAR_GRAPH_COMPILE_MODE='no-such-mode'"):
-            importlib.reload(runner_mod)
-    finally:
-        monkeypatch.delenv("MSTAR_GRAPH_COMPILE_MODE")
-        importlib.reload(runner_mod)
+def test_env_override_wins_over_the_config(monkeypatch):
+    monkeypatch.setattr(runner_mod, "_COMPILE_MODE_OVERRIDE", "default")
+    assert resolve_compile_mode("max-autotune-no-cudagraphs") == "default"
+    assert compile_kwargs("max-autotune-no-cudagraphs") == {"fullgraph": False, "dynamic": False}
+
+
+def test_env_override_is_read_and_validated_at_import():
+    # the import-time statement is `_read_compile_mode_override()` over
+    # os.environ; drive the same function over an explicit mapping
+    read = runner_mod._read_compile_mode_override
+    assert read({}) is None
+    assert read({ENV: "default"}) == "default"
+    assert read({ENV: "reduce-overhead"}) == "reduce-overhead"
+    with pytest.raises(ValueError, match=f"{ENV}='no-such-mode'"):
+        read({ENV: "no-such-mode"})
+
+
+def test_module_reads_the_process_environment(monkeypatch):
+    monkeypatch.setenv(ENV, "default")
+    assert runner_mod._read_compile_mode_override() == "default"
+    monkeypatch.delenv(ENV)
+    assert runner_mod._read_compile_mode_override() is None

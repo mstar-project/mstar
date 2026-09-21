@@ -273,9 +273,12 @@ class Glm52Model(Model):
                     ),
                 ],
             ),
-            # Runaway guard. The per-request budget lives in check_stop,
-            # which sees the request's real max_tokens.
-            max_iters=self.get_max_output_tokens(),
+            # Runaway guard only: the per-request budget lives in check_stop,
+            # which sees the request's real max_tokens. Sized to the most
+            # decode steps any prompt can take before the context guard, not
+            # to the default budget: at the default, every request asking for
+            # more was cut short at 1025 tokens with no error.
+            max_iters=self.max_decode_steps(),
             outputs=[],
         )
 
@@ -434,8 +437,25 @@ class Glm52Model(Model):
             params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
 
+    def context_limit(self) -> int:
+        """The bound the submodule's preprocess holds every context to:
+        index_topk with DSA off (dense MLA is exact there), the serving
+        window with it on."""
+        return self.config.max_seq_len if self.config.dsa_long_context else self.config.index_topk
+
+    def max_decode_steps(self) -> int:
+        """Decode iterations a one-token prompt can run before the context
+        guard; every longer prompt stops sooner, via check_stop or the guard.
+        Under MTP each iteration emits at least one token, so it bounds those
+        loops too."""
+        return self.context_limit() - 1
+
     def get_max_output_tokens(self, **model_kwargs):
-        return model_kwargs.get("max_output_tokens", self.config.max_output_tokens)
+        # the request's budget, held to the window: a one-token prompt emits at
+        # most ``context_limit`` tokens (the last is never stored), so a larger
+        # budget is unreachable and check_stop could never fire on it
+        budget = model_kwargs.get("max_output_tokens", self.config.max_output_tokens)
+        return min(budget, self.context_limit())
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

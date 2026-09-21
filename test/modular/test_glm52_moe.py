@@ -198,6 +198,27 @@ def test_moe_quant_kernel_resolution():
         pass
 
 
+def test_unknown_moe_quant_kernel_is_refused_at_construction():
+    """A typo ("Triton", "fused") used to resolve to the reference loop and
+    serve eager behind a warning; the block refuses it up front."""
+    from mstar.model.glm52.components.moe import MOE_QUANT_KERNELS
+
+    assert MOE_QUANT_KERNELS == ("reference", "triton", "auto")
+    for bad in ("Triton", "fused", ""):
+        cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+        cfg.moe_quant_kernel = bad
+        try:
+            Glm52SparseMoeBlock(cfg)
+            raise AssertionError(f"moe_quant_kernel={bad!r} must be refused")
+        except ValueError as exc:
+            assert repr(bad) in str(exc) and "reference" in str(exc)
+    # the accepted spellings still construct (resolution is tested above)
+    for ok in MOE_QUANT_KERNELS:
+        cfg = Glm52ModelConfig.reduced_fp8(block=BLOCK)
+        cfg.moe_quant_kernel = ok
+        Glm52SparseMoeBlock(cfg)
+
+
 def test_cuda_graphs_return_with_fused_dispatch():
     """Graph configs are gated on the RESOLVED dispatch: reference -> none
     (uncapturable host loops), fused -> registered."""

@@ -82,7 +82,8 @@ class PromptsJsonDataset(BaseDataset):
     Dataset loader for text-to-text prompts from a JSON file in the M1
     harness format: ``{"prompts": [{"id", "text", "max_tokens"}, ...]}``
     (top-level keys other than ``prompts`` — e.g. ``_comment`` — are
-    ignored), or a bare list of the same row objects.
+    ignored), or a bare list of the same row objects. A row may also be a
+    bare prompt string, read as ``{"text": row}``.
 
     ``max_tokens`` is optional per row; when present it is stamped onto the
     request as both ``max_tokens`` and ``max_output_tokens`` (the OpenAI and
@@ -110,7 +111,15 @@ class PromptsJsonDataset(BaseDataset):
 
         self.items: list[RequestInput] = []
         self._num_requests = num_requests
-        for row in rows:
+        for i, row in enumerate(rows):
+            if isinstance(row, str):
+                # a bare prompt string is the natural shorthand for a row
+                row = {"text": row}
+            elif not isinstance(row, dict):
+                raise ValueError(
+                    f"{filename}: prompt row {i} is {type(row).__name__}; expected "
+                    'a {"id", "text", "max_tokens"} object or a prompt string'
+                )
             text = row.get("text")
             if not text:
                 continue
