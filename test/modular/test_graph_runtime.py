@@ -1,4 +1,4 @@
-"""Tests for ``WorkerGraphsManager``.
+"""Tests for ``RequestStateManager``.
 
 Covers:
 - Inverted ``walk_node_to_worker_graph_id`` index built in __post_init__
@@ -31,7 +31,7 @@ from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ConductorMessageType
 from mstar.worker.node_manager_utils import (
-    WorkerGraphsManager,
+    RequestStateManager,
 )
 
 # --- minimal stubs for tensor manager + fwd info -----------------------------
@@ -131,16 +131,7 @@ def _build(section, wg_id, walk, nodes, loops=frozenset(), worker_id="worker0"):
         sharding_config=_sharding_config(),
         tensor_manager=StubTensorManager(),
     )
-    mgr = WorkerGraphsManager(
-        queues=runtime.queues,
-        per_request_info={},
-        base_sharding_config=_sharding_config(),
-        worker_id=worker_id,
-        all_worker_graph_ids_to_graph_walks=all_walks,
-        all_worker_graph_ids_to_nodes=all_nodes,
-        all_worker_graph_ids_to_dyn_loops=all_loops,
-        node_to_partition=node_to_partition,
-    )
+    mgr = RequestStateManager(node_to_partition=node_to_partition)
     fwd_info = _fwd_info(walk)
     rid = runtime.add_request(
         request_id=fwd_info.request_id,
@@ -149,12 +140,7 @@ def _build(section, wg_id, walk, nodes, loops=frozenset(), worker_id="worker0"):
         partition_worker_graph_ids=[wg_id],
         worker_graph_to_workers=ParallelList([wg_id], [[worker_id]]),
     )
-    mgr.add_request(
-        rid=rid,
-        partition_worker_graph_ids=[wg_id],
-        worker_graph_to_workers={wg_id: [worker_id]},
-        current_fwd_info=fwd_info,
-    )
+    mgr.add_request(rid, fwd_info)
     return mgr, runtime, rid
 
 
@@ -231,7 +217,7 @@ def test_stop_loops_returns_loop_back_signal_set():
     # ar_loop has two loop-back inputs: (token, ar_decode) and (kv_cache, ar_decode).
     assert stopped == {("token", "ar_decode"), ("kv_cache", "ar_decode")}
     # _finish_signal should be set on the live loop.
-    wgio = mgr.queues[wg_id].per_request_queues[rid]
+    wgio = runtime.queues[wg_id].per_request_queues[rid]
     assert wgio.loops["ar_loop"]._finish_signal is True
 
 
@@ -299,9 +285,9 @@ def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
         empty_outputs_graph, wg_id, "prefill_text", nodes={"prefill_text"},
     )
     _ingest(runtime, rid, [GraphEdge(name="text_inputs", next_node="prefill_text")])
-    assert not mgr.queues[wg_id].is_done(rid)  # not done before complete
+    assert not runtime.queues[wg_id].is_done(rid)  # not done before complete
     runtime._mark_node_complete(rid, wg_id, "prefill_text")
-    assert mgr.queues[wg_id].is_done(rid), \
+    assert runtime.queues[wg_id].is_done(rid), \
         "mark_node_complete on a no-output node must flip is_done"
 
 
@@ -334,7 +320,7 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
     routing = runtime._process_node_outputs(
         rid,
         node_name="prefill",
-        outputs=list(mgr.queues[wg_id].per_request_queues[rid].nodes["prefill"].outputs),
+        outputs=list(runtime.queues[wg_id].per_request_queues[rid].nodes["prefill"].outputs),
         graph_walk="prefill",
     )
     assert wg_id in routing.completed_worker_graph_ids, \
@@ -492,11 +478,7 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
         partition_worker_graph_ids=[0],
         worker_graph_to_workers=ParallelList([0], [["worker0"]]),
     )
-    mgr.add_request(
-        rid=rid_b, partition_worker_graph_ids=[0],
-        worker_graph_to_workers={0: ["worker0"]},
-        current_fwd_info=_fwd_info("decode"),
-    )
+    mgr.add_request(rid_b, _fwd_info("decode"))
     for rid in (rid_a, rid_b):
         _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")]
         )

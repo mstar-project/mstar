@@ -67,7 +67,7 @@ from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import (
     NodeOutputRouting,
-    WorkerGraphsManager,
+    RequestStateManager,
 )
 
 logger = logging.getLogger(__name__)
@@ -139,7 +139,7 @@ class EvictionPolicy(Enum):
 
 class Worker:
     """
-    Real worker that integrates WorkerGraphsManager, EngineManager,
+    Real worker that integrates RequestStateManager, EngineManager,
     MicroScheduler, and MooncakeCommunicationManager to execute
     computation via engines.
     """
@@ -259,15 +259,8 @@ class Worker:
             communicator=self.communicator,
         )
 
-        self.worker_graphs_manager = WorkerGraphsManager(
-            queues=self._rid_runtime.queues,
-            per_request_info={},
-            all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
-            all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
-            all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
+        self.request_state = RequestStateManager(
             node_to_partition=node_to_partition,
-            base_sharding_config=sharding_config,
-            worker_id=self.worker_id
         )
 
         # The lockstep unit for a node is its whole instance: the tensor-parallel
@@ -482,12 +475,7 @@ class Worker:
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active[(rid, node_name)] = now
 
-        self.worker_graphs_manager.add_request(
-            rid=rid,
-            partition_worker_graph_ids=body.partition_worker_graph_ids,
-            worker_graph_to_workers=body.worker_graph_to_workers,
-            current_fwd_info=body.request_info
-        )
+        self.request_state.add_request(rid, body.request_info)
         self.engine_manager.add_request(
             rid, body.request_info.resource_configs,
         )
@@ -497,7 +485,7 @@ class Worker:
 
         # Create StreamBuffers for consumer connections on this worker
         for conn in self._my_consumer_connections:
-            req_info = self.worker_graphs_manager.per_request_info[rid]
+            req_info = self.request_state.per_request_info[rid]
             req_info.stream_buffers[conn.edge_name] = StreamBuffer(
                 rid=rid,
                 edge_name=conn.edge_name,
@@ -547,10 +535,10 @@ class Worker:
         # remove it too. Followers defer removal until they get this message
         # (see the guard at the top of this method) so they can't tear down
         # state we're still reading from an in-flight step/speculation.
-        cfg = self.worker_graphs_manager.per_request_info.get(rid)
-        if cfg is not None:
+        sharding = self._rid_runtime.get_sharding_config(rid)
+        if sharding is not None:
             followers: set[str] = set()
-            for group in cfg.sharding_config.groups:
+            for group in sharding.groups:
                 # _workers is rank-ordered; index 0 is this worker when we are
                 # rank 0. Only real TP groups (tp_size > 1) have followers.
                 if group.tp_size > 1 and group._tp_rank == 0:
@@ -577,7 +565,7 @@ class Worker:
         self._pending_drains.discard(body.request_id)
         self._reads_done_sent.discard(body.request_id)
         self.engine_manager.remove_request(rid)
-        self.worker_graphs_manager.remove_request(rid)
+        self.request_state.remove_request(rid)
         self.tensor_manager.force_cleanup_request(rid)
         self.profile_info.pop_request(rid)
         self.streaming_buffers.pop(rid, None)
@@ -615,13 +603,12 @@ class Worker:
         rid = self._rid(request_id)
         # Fan the drain to TP followers so each rank drains and ACKs its own
         # READS_DONE (the conductor waits on every rank).
-        cfg = (
-            None if rid is None
-            else self.worker_graphs_manager.per_request_info.get(rid)
+        sharding = (
+            None if rid is None else self._rid_runtime.get_sharding_config(rid)
         )
-        if cfg is not None:
+        if sharding is not None:
             followers: set[str] = set()
-            for group in cfg.sharding_config.groups:
+            for group in sharding.groups:
                 if group.tp_size > 1 and group._tp_rank == 0:
                     followers.update(group._workers[1:])
             for worker in followers:
@@ -711,7 +698,7 @@ class Worker:
                 self.worker_id, body.request_id,
             )
             return
-        req_info = self.worker_graphs_manager.per_request_info.get(rid)
+        req_info = self.request_state.per_request_info.get(rid)
 
         if self.enable_nvtx:
             range_push("process_new_inputs.routing_update")
@@ -740,7 +727,7 @@ class Worker:
             self._rid_runtime.set_walk(
                 rid, body.partition_name, body.request_info.graph_walk,
             )
-            self.worker_graphs_manager.update_request_info(
+            self.request_state.update_request_info(
                 rid, current_fwd_info=body.request_info,
                 partition_name=body.partition_name
             )
@@ -805,7 +792,7 @@ class Worker:
         for message in list(messages):
             if (
                 message.message_type in msg_types_needing_active_request and \
-                message.body.request_id not in self.worker_graphs_manager.per_request_info
+                message.body.request_id not in self.request_state.per_request_info
             ):
                 # got an out-of-order request
                 self._unprocessed_messages.setdefault(
@@ -840,7 +827,7 @@ class Worker:
 
     def _route_streaming_tensor(self, rid: int, edge: GraphEdge) -> None:
         """Route a streaming tensor to its request's StreamBuffer for this edge."""
-        req_info = self.worker_graphs_manager.per_request_info.get(rid)
+        req_info = self.request_state.per_request_info.get(rid)
         stream_buf = req_info.stream_buffers[edge.name]
 
         for info in edge.tensor_info:
@@ -890,7 +877,7 @@ class Worker:
         self, rid: str, node_name: str
     ) -> list[GraphEdge]:
         result = []
-        req_info = self.worker_graphs_manager.per_request_info.get(rid)
+        req_info = self.request_state.per_request_info.get(rid)
         if req_info is None:
             return []
         for edge_name, sbuf in req_info.stream_buffers.items():
@@ -905,7 +892,7 @@ class Worker:
     def _return_speculative_streaming_edge(
         self, rid: str, edge: GraphEdge
     ):
-        req_info = self.worker_graphs_manager.per_request_info.get(rid)
+        req_info = self.request_state.per_request_info.get(rid)
         if req_info is None:
             return
         sbuf = req_info.stream_buffers.get(edge.name)
@@ -914,7 +901,7 @@ class Worker:
 
     def _poll_stream_buffers(self) -> None:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
-        for rid, req_info in list(self.worker_graphs_manager.per_request_info.items()):
+        for rid, req_info in list(self.request_state.per_request_info.items()):
             for edge_name, sbuf in req_info.stream_buffers.items():
                 synthetic_edge = self._pop_streaming_edge(sbuf, edge_name, rid)
 
@@ -1040,13 +1027,13 @@ class Worker:
         per_request_inputs: dict[int, NameToTensorList] = {}
         per_request_info: dict[int, CurrentForwardPassInfo] = {}
         final_stream_rids: set[int] = set()
-        batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
+        batch_partition = self.request_state.get_partition_for_node(batch.node_name)
 
         for rid, edges in batch.input_edges.items():
             per_request_inputs[rid] = self._tensors_for(edges)
             if any(spec.is_final_streaming_chunk for spec in edges):
                 final_stream_rids.add(rid)
-            per_request_info[rid] = self.worker_graphs_manager.get_fwd_info(rid, batch_partition)
+            per_request_info[rid] = self.request_state.get_fwd_info(rid, batch_partition)
 
         return self._make_executing_batch(
             node_name=batch.node_name,
@@ -1099,8 +1086,7 @@ class Worker:
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
         sample_rid = node_batch.request_ids[0]
-        cfg = self.worker_graphs_manager.per_request_info[sample_rid]
-        workers = cfg.sharding_config.get_sharding_group(
+        workers = self._rid_runtime.get_sharding_config(sample_rid).get_sharding_group(
             node_batch.node_name, node_batch.graph_walk
         )._workers[1:]
         for worker in workers:
@@ -1127,8 +1113,7 @@ class Worker:
         # Not ``pending.node_batch.request_ids``: the GPU thread may be
         # ``drop_rids``-ing that list right now (empty at B=1 on a veto).
         sample_rid = next(iter(pending.batch.request_to_worker_graph))
-        cfg = self.worker_graphs_manager.per_request_info[sample_rid]
-        workers = cfg.sharding_config.get_sharding_group(
+        workers = self._rid_runtime.get_sharding_config(sample_rid).get_sharding_group(
             pending.node_name, pending.graph_walk
         )._workers[1:]
         for worker in workers:
@@ -1186,7 +1171,7 @@ class Worker:
         return counts
 
     def _stream_consumption(self, rid: int) -> dict[str, int]:
-        req_info = self.worker_graphs_manager.per_request_info.get(rid)
+        req_info = self.request_state.per_request_info.get(rid)
         if req_info is None:
             return {}
         return {
@@ -1590,7 +1575,7 @@ class Worker:
             request_ids=request_ids,
             per_request_input_tensors=per_request_inputs,
             per_request_info={
-                rid: self.worker_graphs_manager.get_fwd_info(rid, pending.partition)
+                rid: self.request_state.get_fwd_info(rid, pending.partition)
                 for rid in request_ids
             },
             final_stream_rids={
@@ -1721,7 +1706,7 @@ class Worker:
         # partitioned models, unrelated ready work stays queued for
         # the normal scheduler path.
         fresh_batch = self.scheduler.get_next_batch(
-            self.worker_graphs_manager,
+            self.request_state,
             target=spec_target,
             pre_existing_batch_size=len(continuing)
         )
@@ -1864,7 +1849,7 @@ class Worker:
         # a failure needs is push_back_node. The reverse order leaves a
         # successful all-or-nothing prep to unwind, with no API for it.
         popped = self.scheduler.pop_ready_rids(
-            self.worker_graphs_manager, head.node_name, head.graph_walk, fresh,
+            self.request_state, head.node_name, head.graph_walk, fresh,
         )
 
         def _return_all_polled() -> None:
@@ -2272,7 +2257,7 @@ class Worker:
         # Local streaming stays here: a StreamBuffer holds real tensors, so it
         # cannot move behind the runtime's contract.
         for rid, routing in routing_per_request.items():
-            req_info = self.worker_graphs_manager.per_request_info[rid]
+            req_info = self.request_state.per_request_info[rid]
             for edge in routing.streaming_local:
                 stream_buf = req_info.stream_buffers[edge.name]
                 for info in edge.tensor_info:
@@ -2285,7 +2270,7 @@ class Worker:
             per_request_info=ParallelList(
                 send_rids,
                 [
-                    self.worker_graphs_manager.get_fwd_info(
+                    self.request_state.get_fwd_info(
                         rid, batch_N.partition
                     ) for rid in send_rids
                 ],
@@ -2494,7 +2479,7 @@ class Worker:
         """
         errors = {
             rid: msg for rid, msg in errors.items()
-            if rid in self.worker_graphs_manager.per_request_info
+            if rid in self.request_state.per_request_info
         }
         if not errors:
             return
@@ -2736,7 +2721,7 @@ class Worker:
                         spec_peek_for_fairness
                         and consecutive_spec_steps >= 1
                         and self.scheduler.has_ready_excluding(
-                            self.worker_graphs_manager,
+                            self.request_state,
                             (pending.node_name, pending.graph_walk),
                         )
                     )
@@ -2769,12 +2754,12 @@ class Worker:
                         ) if must_yield_away else None
                         with self._span("worker.schedule_yield_away"):
                             batch = self.scheduler.get_next_batch(
-                                self.worker_graphs_manager,
+                                self.request_state,
                                 exclude_target=yield_away_from_target,
                             )
                         if batch is not None:
                             node_batch = self._build_executing_batch(batch)
-                            batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
+                            batch_partition = self.request_state.get_partition_for_node(batch.node_name)
                             logger.debug("Yield away: %s %s", batch.node_name, node_batch.request_ids)
                             speculation = Speculation(
                                 scheduled_batch=batch,
@@ -2991,11 +2976,11 @@ class Worker:
                     batch = None
                     if yield_away_from_target is not None:
                         batch = self.scheduler.get_next_batch(
-                            self.worker_graphs_manager,
+                            self.request_state,
                             exclude_target=yield_away_from_target,
                         )
                     if batch is None:
-                        batch = self.scheduler.get_next_batch(self.worker_graphs_manager)
+                        batch = self.scheduler.get_next_batch(self.request_state)
                 if batch is None:
                     self.communicator.wait_for_work(10)
                     continue
@@ -3003,7 +2988,7 @@ class Worker:
                 if self.enable_nvtx:
                     range_push("worker.build_node_batch", synchronize=False)
                 node_batch = self._build_executing_batch(batch)
-                batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
+                batch_partition = self.request_state.get_partition_for_node(batch.node_name)
 
                 for rid, new_iters in self._rid_runtime.get_dynamic_loop_iters(
                     list(node_batch.per_request_info), partition=batch_partition,

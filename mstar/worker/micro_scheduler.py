@@ -10,7 +10,7 @@ from mstar.engine.resources import AdmitRuntimeError
 from mstar.graph.runtime.base import EdgeSpec, GraphRuntime
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.engine_manager import EngineManager
-from mstar.worker.node_manager_utils import WorkerGraphsManager
+from mstar.worker.node_manager_utils import RequestStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +235,7 @@ class MicroScheduler:
         return by_rid
 
     def pop_ready_rids(
-        self, worker_graphs_manager: WorkerGraphsManager,
+        self, request_state: RequestStateManager,
         node_name: str, graph_walk: str, rids: list[int],
     ) -> tuple[dict[int, int], dict[int, list[EdgeSpec]]] | None:
         """Pop ``node_name`` for exactly ``rids``, all or none.
@@ -245,9 +245,9 @@ class MicroScheduler:
             return {}, {}
         # Engine readiness first: pop_rids treats it as a prerequisite, and it
         # is all-or-nothing too, so one not-ready rid leaves the set intact.
-        node_partition = worker_graphs_manager.get_partition_for_node(node_name)
+        node_partition = request_state.get_partition_for_node(node_name)
         for rid in rids:
-            fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
+            fwd_info = request_state.get_fwd_info(rid, node_partition)
             if not self._check_ready(node_name, rid, fwd_info):
                 return None
 
@@ -266,7 +266,7 @@ class MicroScheduler:
         )
 
     def _try_schedule_tp_follow(
-        self, worker_graphs_manager: WorkerGraphsManager,
+        self, request_state: RequestStateManager,
         exclude_target: tuple[str, str] | None = None,
     ) -> ScheduledBatch | None:
         if len(self.tp_batches_pending_schedule) == 0:
@@ -277,14 +277,14 @@ class MicroScheduler:
             return
         if self.num_consec_tp_follower_batches >= self.max_consec_tp_follower_batches and \
                 self.has_ready_excluding(
-                    worker_graphs_manager,
+                    request_state,
                     (first_tp_node.node_name, first_tp_node.graph_walk)
                 ):
             return
         # Check readiness for every rid to pop all-or-none. Use the
         # leader's graph walk.
         popped = self.pop_ready_rids(
-            worker_graphs_manager, first_tp_node.node_name,
+            request_state, first_tp_node.node_name,
             first_tp_node.graph_walk, self.tp_rids(first_tp_node),
         )
         if popped is None:
@@ -304,7 +304,7 @@ class MicroScheduler:
 
     def get_next_batch(
         self,
-        worker_graphs_manager: WorkerGraphsManager,
+        request_state: RequestStateManager,
         max_batch_size: int | None = None,
         target: tuple[str, str] | None = None,
         exclude_target: tuple[str, str] | None = None,
@@ -333,7 +333,7 @@ class MicroScheduler:
         }
 
         sched_from_backlog = self._schedule_from_backlogged(
-            worker_graphs_manager, target=target,
+            request_state, target=target,
             max_batch_size=max_batch_size,
             pre_existing_batch_size=pre_existing_batch_size
         )
@@ -353,7 +353,7 @@ class MicroScheduler:
         # (the speculation fresh-rid merge, which may reject what it is
         # handed) is never served from the FIFO.
         tp_follow_batch = None if target is not None else self._try_schedule_tp_follow(
-            worker_graphs_manager, exclude_target=exclude_target,
+            request_state, exclude_target=exclude_target,
         )
         if tp_follow_batch is None:
             self.num_consec_tp_follower_batches = 0
@@ -370,14 +370,14 @@ class MicroScheduler:
         ):
             if spec.node_name not in self.parallel_leader_nodes:
                 continue  # only rank 0 can initiate scheduling!
-            node_partition = worker_graphs_manager.get_partition_for_node(
+            node_partition = request_state.get_partition_for_node(
                 spec.node_name
             )
             wg_id = self.runtime.get_worker_graph_id_for_node(
                 spec.node_name, spec.graph_walk,
             )
             for rid in spec.rids:
-                fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
+                fwd_info = request_state.get_fwd_info(rid, node_partition)
                 # check if the node is ready on the engine level
                 # (e.g., for AR, whether the kv cache is read in)
                 if not self._check_ready(spec.node_name, rid, fwd_info):
@@ -410,7 +410,7 @@ class MicroScheduler:
             return None
 
         full_batch = self._assemble_batch(
-            worker_graphs_manager, best_node_name, graph_walk, entries
+            request_state, best_node_name, graph_walk, entries
         )
         if not full_batch:
             return None
@@ -429,13 +429,13 @@ class MicroScheduler:
 
     def _filter_cap_and_schedule(
         self, batch: ScheduledBatch, max_bs: int,
-        worker_graphs_manager: WorkerGraphsManager,
+        request_state: RequestStateManager,
     ):
-        node_partition = worker_graphs_manager.get_partition_for_node(batch.node_name)
+        node_partition = request_state.get_partition_for_node(batch.node_name)
         not_ready_rids = {
             rid for rid in batch.request_to_worker_graph if not self._check_ready(
                 batch.node_name, rid,
-                worker_graphs_manager.get_fwd_info(rid, node_partition),
+                request_state.get_fwd_info(rid, node_partition),
             )
         }
         # A failed rid is not "not ready yet": excluding it would put it
@@ -498,7 +498,7 @@ class MicroScheduler:
         self.node_and_walk_to_last_batch_num[(node_name, graph_walk)] = self.batch_number
 
     def _schedule_from_backlogged(
-        self, worker_graphs_manager: WorkerGraphsManager,
+        self, request_state: RequestStateManager,
         target: tuple[str, str] | None = None,
         max_batch_size: int | None=None,
         pre_existing_batch_size: int = 0
@@ -529,7 +529,7 @@ class MicroScheduler:
             scheduled = self._filter_cap_and_schedule(
                 batch=backlogged,
                 max_bs=self._remaining_capacity(curr_max_bs, pre_existing_batch_size),
-                worker_graphs_manager=worker_graphs_manager
+                request_state=request_state
             )
             if scheduled is not None:
                 return scheduled
@@ -556,12 +556,12 @@ class MicroScheduler:
 
     def _assemble_batch(
         self,
-        worker_graphs_manager: WorkerGraphsManager,
+        request_state: RequestStateManager,
         node_name: str,
         graph_walk: str,
         entries: list[ReadyNodeEntry],
     ) -> ScheduledBatch | None:
-        del worker_graphs_manager  # readiness was already established upstream
+        del request_state  # readiness was already established upstream
         popped = self.runtime.pop_rids(
             node_name, graph_walk, [entry.rid for entry in entries],
         )
@@ -614,7 +614,7 @@ class MicroScheduler:
 
     def has_ready_excluding(
         self,
-        worker_graphs_manager: WorkerGraphsManager,
+        request_state: RequestStateManager,
         exclude_target: tuple[str, str] | None,
     ) -> bool:
         """Cheap peek: any worker-graph queue ready with a (node, walk) other
@@ -660,11 +660,11 @@ class MicroScheduler:
         for spec in self.runtime.get_ready_nodes(
             exclude, exclude_target=exclude_target,
         ):
-            node_partition = worker_graphs_manager.get_partition_for_node(
+            node_partition = request_state.get_partition_for_node(
                 spec.node_name
             )
             for rid in spec.rids:
-                fwd_info = worker_graphs_manager.get_fwd_info(
+                fwd_info = request_state.get_fwd_info(
                     rid, node_partition
                 )
                 if self._check_ready(spec.node_name, rid, fwd_info):

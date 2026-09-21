@@ -52,7 +52,7 @@ class _Queue:
 class _Runtime:
     """Graph-level ready scan, over the manager's queues.
 
-    The real PythonGraphRuntime owns the queues and WorkerGraphsManager shares
+    The real PythonGraphRuntime owns the queues and RequestStateManager shares
     the same dict; this mirrors that by reading the manager's.
     """
 
@@ -127,7 +127,7 @@ class _Runtime:
 
 
 class _Manager:
-    """Stands in for WorkerGraphsManager: one worker graph, one node."""
+    """Stands in for RequestStateManager: one worker graph, one node."""
 
     def __init__(self, rids, node=NODE, walk=WALK):
         self.queues = {"wg0": _Queue(rids, node)}

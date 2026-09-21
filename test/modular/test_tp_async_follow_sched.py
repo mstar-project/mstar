@@ -114,7 +114,7 @@ class _FakeRuntime:
         return []
 
 
-class _FakeWorkerGraphsManager:
+class _FakeRequestStateManager:
     def __init__(self, queue):
         self.queues = {"wg0": queue}
         # The real runtime owns the queues and the manager shares them; bind
@@ -149,7 +149,7 @@ def _head(rids, seq=5, from_seq=4):
 def test_pop_ready_rids_pops_exactly_the_named_set():
     sched = _sched()
     queue = _FakeQueue(["r0", "r1", "r2"])
-    manager = _FakeWorkerGraphsManager(queue)
+    manager = _FakeRequestStateManager(queue)
     sched.runtime = manager.runtime
 
     popped = sched.pop_ready_rids(manager, NODE, WALK, ["r1", "r2"])
@@ -167,7 +167,7 @@ def test_pop_ready_rids_pops_exactly_the_named_set():
 def test_pop_ready_rids_is_all_or_nothing_on_graph_readiness():
     sched = _sched()
     queue = _FakeQueue(["r0"], not_ready_rids=["r1"])
-    manager = _FakeWorkerGraphsManager(queue)
+    manager = _FakeRequestStateManager(queue)
     sched.runtime = manager.runtime
 
     assert sched.pop_ready_rids(manager, NODE, WALK, ["r0", "r1"]) is None
@@ -179,7 +179,7 @@ def test_pop_ready_rids_is_all_or_nothing_on_graph_readiness():
 def test_pop_ready_rids_is_all_or_nothing_on_engine_readiness():
     sched = _sched(_FakeEngine(not_ready=["r1"]))
     queue = _FakeQueue(["r0", "r1"])
-    manager = _FakeWorkerGraphsManager(queue)
+    manager = _FakeRequestStateManager(queue)
     sched.runtime = manager.runtime
 
     assert sched.pop_ready_rids(manager, NODE, WALK, ["r0", "r1"]) is None
@@ -189,7 +189,7 @@ def test_pop_ready_rids_is_all_or_nothing_on_engine_readiness():
 
 def test_pop_ready_rids_empty_set_is_a_valid_no_op():
     sched = _sched()
-    manager = _FakeWorkerGraphsManager(_FakeQueue(["r0"]))
+    manager = _FakeRequestStateManager(_FakeQueue(["r0"]))
     sched.runtime = manager.runtime
     assert sched.pop_ready_rids(manager, NODE, WALK, []) == ({}, {})
     assert sched.batch_number == 0
@@ -200,7 +200,7 @@ def test_serial_tp_follow_path_still_serves_via_shared_pop():
     ``pop_ready_rids``; the observable serial behaviour is unchanged, and the
     batch carries the head's seq."""
     sched = _sched()
-    manager = _FakeWorkerGraphsManager(_FakeQueue(["r0", "r1"]))
+    manager = _FakeRequestStateManager(_FakeQueue(["r0", "r1"]))
     sched.runtime = manager.runtime
     sched.register_tp_follow(_head(["r0", "r1"], seq=9))
     batch = sched.get_next_batch(manager)
@@ -213,7 +213,7 @@ def test_serial_tp_follow_path_still_serves_via_shared_pop():
 def test_serial_tp_follow_waits_when_a_rid_is_not_ready_and_pops_nothing():
     sched = _sched()
     queue = _FakeQueue(["r0"], not_ready_rids=["r1"])
-    manager = _FakeWorkerGraphsManager(queue)
+    manager = _FakeRequestStateManager(queue)
     sched.runtime = manager.runtime
     sched.register_tp_follow(_head(["r0", "r1"]))
     assert sched.get_next_batch(manager) is None
@@ -248,7 +248,7 @@ def test_fifo_accessors_touch_only_the_head_and_keep_order():
 
 def test_drain_refcount_discharged_by_the_serial_path():
     sched = _sched()
-    manager = _FakeWorkerGraphsManager(_FakeQueue(["r0"]))
+    manager = _FakeRequestStateManager(_FakeQueue(["r0"]))
     sched.runtime = manager.runtime
     sched.register_tp_follow(_head(["r0"]))
     assert sched.pending_tp_follow_count["r0"] == 1

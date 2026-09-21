@@ -108,7 +108,7 @@ class _FakeRuntime:
         return []
 
 
-class _FakeWorkerGraphsManager:
+class _FakeRequestStateManager:
     def __init__(self, queue):
         self.queues = {"wg0": queue}
         # The real runtime owns the queues and the manager shares them; bind
@@ -134,7 +134,7 @@ def _setup(rids=("r0", "r1")):
         parallel_leader_nodes=set(),
     )
     queue = _FakeQueue(rids, NODE)
-    manager = _FakeWorkerGraphsManager(queue)
+    manager = _FakeRequestStateManager(queue)
     sched.runtime = manager.runtime
     return sched, manager
 

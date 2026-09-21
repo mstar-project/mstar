@@ -65,7 +65,7 @@ def _worker(known_rids=("r1", "r2")):
     w.communicator = SimpleNamespace(
         send=lambda entity_id, msg: w.sent.append((entity_id, msg))
     )
-    w.worker_graphs_manager = SimpleNamespace(
+    w.request_state = SimpleNamespace(
         per_request_info={rid: object() for rid in known_rids}
     )
     # Identity interning: the rid string doubles as its own handle here.

@@ -180,7 +180,7 @@ class PythonGraphRuntime(GraphRuntime):
 
     @property
     def queues(self) -> dict[int, WorkerGraphQueues]:
-        """Shared with WorkerGraphsManager while the port is in flight; the
+        """Shared with RequestStateManager while the port is in flight; the
         runtime owns the per-request lifecycle (add_request / remove_request)."""
         return self._queues
 
@@ -353,8 +353,11 @@ class PythonGraphRuntime(GraphRuntime):
         )
         return self._request_info[rid].dyn_loop_to_workers[ngw]
 
-    def get_sharding_config(self, rid: int) -> ShardingConfig:
-        return self._request_info[rid].sharding_config
+    def get_sharding_config(self, rid: int) -> ShardingConfig | None:
+        """None for a rid this rank does not know: callers on the teardown and
+        TP-fanout paths can legitimately race a removal."""
+        info = self._request_info.get(rid)
+        return None if info is None else info.sharding_config
 
     def _section_node(self, node_name: str, graph_walk: str):
         wg_id = self.get_worker_graph_id_for_node(node_name, graph_walk)

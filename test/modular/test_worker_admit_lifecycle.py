@@ -6,7 +6,7 @@ from the rid refactor stayed invisible behind a green suite.
 
 It also pins the ownership split the graph-runtime port introduced: the
 runtime mints the handle and owns the per-request QUEUE lifecycle, while
-WorkerGraphsManager owns per_request_info and shares the same queues dict.
+RequestStateManager owns per_request_info and shares the same queues dict.
 """
 import sys
 from types import SimpleNamespace
@@ -22,7 +22,7 @@ from mstar.graph.base import GraphNode
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
 from mstar.utils.ipc_format import NewRequest, RemoveRequest
-from mstar.worker.node_manager_utils import WorkerGraphsManager
+from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.worker import Worker
 
 WG_ID = 0
@@ -77,16 +77,7 @@ def _worker():
         sharding_config=_sharding_config(),
         tensor_manager=w.tensor_manager,
     )
-    w.worker_graphs_manager = WorkerGraphsManager(
-        queues=w._rid_runtime.queues,
-        per_request_info={},
-        base_sharding_config=_sharding_config(),
-        worker_id=WORKER,
-        all_worker_graph_ids_to_graph_walks=all_walks,
-        all_worker_graph_ids_to_nodes=all_nodes,
-        all_worker_graph_ids_to_dyn_loops=all_loops,
-        node_to_partition=node_to_partition,
-    )
+    w.request_state = RequestStateManager(node_to_partition=node_to_partition)
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: [NODE],
         add_request=lambda rid, cfgs: None,
@@ -133,11 +124,14 @@ def test_admit_mints_a_handle_and_sets_up_both_sides():
     # The handle is stamped onto the fwd_info so submodules can key on it.
     assert body.request_info.rid_handle == rid
 
-    # The runtime owns the queue lifecycle...
+    # The split: the runtime owns the graph state...
     assert rid in w._rid_runtime.queues[WG_ID].per_request_queues
-    # ...and the manager, sharing that same dict, sees the same request.
-    assert w.worker_graphs_manager.queues is w._rid_runtime.queues
-    assert rid in w.worker_graphs_manager.per_request_info
+    assert w._rid_runtime.get_sharding_config(rid) is not None
+    # ...and RequestStateManager owns only what cannot live behind the
+    # contract: the wire fwd_info and the tensor-holding stream buffers.
+    assert rid in w.request_state.per_request_info
+    assert w.request_state.get_fwd_info(rid, "default") is body.request_info
+    assert not hasattr(w.request_state, "queues")
     assert w.tensor_manager.registered == [rid]
 
 
@@ -151,7 +145,8 @@ def test_remove_tears_down_both_sides_and_frees_the_handle():
     assert w._rid("r1") is None
     assert rid not in w._rid_runtime.queues[WG_ID].per_request_queues, \
         "the runtime must drop the per-request queue on removal"
-    assert rid not in w.worker_graphs_manager.per_request_info
+    assert w._rid_runtime.get_sharding_config(rid) is None
+    assert rid not in w.request_state.per_request_info
     assert w.tensor_manager.cleaned == [rid]
 
     # Freed handles are reused, which is why teardown has to be complete: the
