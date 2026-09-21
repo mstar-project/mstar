@@ -271,6 +271,11 @@ def prepare_moe_kernels(model: nn.Module, device, backend: str = "auto") -> str:
         if mode != "marlin":
             # one layer's shapes stand for all: tune the CUTLASS tactics per decode bucket
             moes[0]._backend.autotune(top_k=moes[0].top_k)
+        elif moes[0]._backend.bf16_min_tokens > 0:
+            # the opt-in bf16 path for long prefill slices: compile and allocate now, not in a request
+            took = moes[0]._backend.warm_bf16_path()
+            logger.info("Kimi K3 bf16 expert path warmed for slices of %d tokens or more in %.1f s",
+                        moes[0]._backend.bf16_min_tokens, took)
         return mode
     return "triton"
 
