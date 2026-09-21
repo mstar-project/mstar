@@ -1165,6 +1165,21 @@ class Conductor:
         done_partitions = []
         if pstate.current_worker_graph_ids.issubset(pstate.completed_worker_graph_ids):
             done_partitions.append(partition_name)
+        else:
+            # The partition cannot advance to its next walk until every worker
+            # graph of the CURRENT one has reported from every rank. Stuck
+            # here, the request simply stops: the walk never changes, no new
+            # inputs go out, and nothing raises.
+            missing = pstate.current_worker_graph_ids - pstate.completed_worker_graph_ids
+            logger.warning(
+                "Request %s partition %s walk %s: not advancing -- worker "
+                "graphs %s have not completed. reported=%s expected=%s",
+                body.request_id, partition_name,
+                pstate.metadata.graph_walk, sorted(missing),
+                {w: pstate.wg_rank_completions.get(w, 0) for w in sorted(missing)},
+                {w: len(request_data.worker_graph_to_workers.get(w, ()))
+                 for w in sorted(missing)},
+            )
 
         return done_partitions
 
