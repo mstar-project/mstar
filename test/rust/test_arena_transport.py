@@ -410,3 +410,37 @@ def test_register_for_send_batch_matches_the_per_request_loop(tmp_path):
         cons.tensor_store.get_tensor(batch_out[10][0].uuid),
         batched.tensor_store.get_tensor(batch_out[10][0].uuid),
     )
+
+
+# --- the stamp has to reach the STORE, not just the caller's object ---------
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("batched", [False, True])
+def test_the_arena_location_is_readable_back_out_of_the_store(
+    tmp_path, monkeypatch, backend, batched
+):
+    """Staging stamps ``shm_segment`` in place; the store has to see it.
+
+    The wire descriptor is rebuilt from the store by uuid (RouteOutput carries
+    indices, not objects), so a stamp that only lands on the caller's object
+    ships ``shm_segment=None`` -- which a consumer reads as "spilled to a file"
+    and goes looking for a file nobody wrote. The Python bookkeeper hides this
+    by keeping the caller's object; the Rust one copies it in.
+    """
+    monkeypatch.setenv("MSTAR_RUST_GRAPH", "1" if backend == "rust" else "0")
+    prod = _manager(f"wb_{backend}_{int(batched)}", tmp_path)
+    assert (type(prod.tensor_store.bookkeeping).__name__
+            == ("RustTensorBookkeeping" if backend == "rust"
+                else "PythonTensorBookkeeping"))
+
+    infos = prod.store_and_return_tensor_info(7, {"h": [torch.randn(4, 8)]})
+    flat = [i for il in infos.values() for i in il]
+    if batched:
+        prod.register_for_send_batch(ParallelList([7], [flat]))
+    else:
+        prod.register_for_send(7, flat)
+
+    stored = prod.tensor_store.get_info(flat[0].uuid)
+    assert stored.shm_segment == flat[0].shm_segment
+    assert stored.shm_offset == flat[0].shm_offset
+    assert stored.shm_segment is not None, "staged, so it must carry a segment"

@@ -26,6 +26,12 @@ from mstar.utils.containers import ParallelList
 
 NameToTensorList = dict[str, list[torch.Tensor]]
 
+# The worker interns request ids to integer handles; the api-server data and
+# preprocess workers never did and still pass the string id. Both work: rid is
+# an opaque dict key here, never arithmetic, and it reaches the bookkeeper --
+# the half that is actually typed -- not at all.
+Rid = int | str
+
 
 @dataclass
 class ReferenceInfo:
@@ -361,8 +367,8 @@ class TensorStore:
         # reverse so a single removal does not scan every request. A sliced
         # tensor can outlive its producer's entry (_slice_existing_tensor mints
         # a new uuid), so ownership is not derivable from the uuid alone.
-        self._rid_to_uuids: dict[int, set[int]] = {}
-        self._uuid_to_rid: dict[int, int] = {}
+        self._rid_to_uuids: dict[Rid, set[int]] = {}
+        self._uuid_to_rid: dict[int, Rid] = {}
         self.bookkeeping = bookkeeping or _build_tensor_bookkeeping()
 
     # -- tensors ------------------------------------------------------------
@@ -371,7 +377,7 @@ class TensorStore:
         return self._tensors[uuid]
 
     def put_tensor(
-        self, rid: int, uuid: int,
+        self, rid: Rid, uuid: int,
         tensor: torch.Tensor,
         info: TensorPointerInfo
     ):
@@ -381,7 +387,7 @@ class TensorStore:
         self.bookkeeping.put_tensor(uuid, info)
 
     def put_tensor_batch(
-        self, rid: int, tensors: ParallelList[int, torch.Tensor],
+        self, rid: Rid, tensors: ParallelList[int, torch.Tensor],
         info: list[TensorPointerInfo],
     ):
         owned = self._rid_to_uuids.setdefault(rid, set())
@@ -406,10 +412,10 @@ class TensorStore:
                 if not owned:
                     del self._rid_to_uuids[rid]
 
-    def get_all_uuids(self, rid: int) -> list[int]:
+    def get_all_uuids(self, rid: Rid) -> list[int]:
         return list(self._rid_to_uuids.get(rid, ()))
 
-    def remove_request(self, rid: int) -> list[int]:
+    def remove_request(self, rid: Rid) -> list[int]:
         """Forget the request and return the uuids it owned, so the caller can
         run its own per-uuid cleanup (shm files, arena slots) before they go."""
         uuids = list(self._rid_to_uuids.pop(rid, ()))
@@ -432,6 +438,11 @@ class TensorStore:
 
     def update_info(self, uuid: int, info: TensorPointerInfo):
         self.bookkeeping.update_info(uuid, info)
+
+    def update_info_batch(
+        self, uuids: list[int], infos: list[TensorPointerInfo]
+    ):
+        self.bookkeeping.update_info_batch(uuids, infos)
 
     def increment_ref(self, uuid: int, n: int = 1):
         self.bookkeeping.increment_ref(uuid, n)
