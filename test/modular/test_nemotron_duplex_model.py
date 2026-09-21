@@ -1,5 +1,6 @@
-"""Structural tests for the Nemotron-Duplex M* engine integration: the four-partition
-full-duplex walk graphs, topology, aux sampling, and forward-pass-args routing.
+"""Structural tests for the Nemotron-Duplex M* integration: the four-partition
+full-duplex walk graphs, topology, declared resources, per-request configs and
+forward-pass-args routing.
 
 These validate everything the engine needs to *wire* the model (no weights / GPU):
 ``get_worker_graphs`` resolves every edge route + cross-partition streaming connection,
@@ -9,14 +10,22 @@ from pathlib import Path
 
 import torch
 
-from mstar.engine.base import EngineType
-from mstar.model.nemotron_duplex.config import NemotronDuplexConfig
+from mstar.engine.resources import (
+    AttentionSpec,
+    KVSpec,
+    SamplerSpec,
+    SamplingReqConfig,
+    resolve_spec_dependencies,
+)
+from mstar.model.nemotron_duplex.config import NANO_ATTN, NANO_KV, NANO_SAMPLER, NemotronDuplexConfig
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
+from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "nemotron_duplex.yaml"
 
 WALKS = {"encode", "prefill_text", "decode", "talker_decode", "codec_chunk"}
+NODES = {"conformer_encoder", "nano_llm", "eartts_talker", "audio_codec"}
 
 
 def _make_model() -> NemotronDuplexModel:
@@ -26,17 +35,51 @@ def _make_model() -> NemotronDuplexModel:
     return model
 
 
-def test_duplex_declares_all_walks():
-    assert set(_make_model().get_graph_walk_graphs()) == WALKS
+def test_duplex_is_registered():
+    assert get_model_class("nemotron_duplex") is NemotronDuplexModel
+    assert HF_MODELS["nemotron_duplex"]["model_path_hf"] == "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B"
 
 
-def test_duplex_engine_types():
-    assert _make_model().get_node_engine_types() == {
-        "conformer_encoder": EngineType.STATELESS,
-        "nano_llm": EngineType.KV_CACHE,
-        "eartts_talker": EngineType.KV_CACHE,
-        "audio_codec": EngineType.STATELESS,
-    }
+def test_duplex_declares_all_walks_and_nodes():
+    model = _make_model()
+    assert set(model.get_graph_walk_graphs()) == WALKS
+    assert set(model.nodes) == NODES
+
+
+def test_duplex_node_resources():
+    """Only the nano declares resources: a paged KV over its 4 attention layers,
+    attention planned on it (NoPE: no position resource) and one text sampler.
+    The other three nodes own no engine resource."""
+    model = _make_model()
+    specs = model.get_node_resources()
+    by_key = resolve_spec_dependencies(specs)          # unique keys, dependencies satisfied
+    assert set(by_key) == {NANO_KV, NANO_ATTN, NANO_SAMPLER}
+    assert all(spec.nodes == {"nano_llm"} for spec in specs)
+
+    kv = by_key[NANO_KV]
+    assert isinstance(kv, KVSpec)
+    nano = model.config.nano
+    assert kv.config.num_layers == nano.num_attention_layers == 4
+    assert kv.config.num_kv_heads == nano.num_key_value_heads
+    assert kv.config.num_qo_heads == nano.num_attention_heads
+    assert kv.config.head_dim == nano.head_dim
+
+    attn = by_key[NANO_ATTN]
+    assert isinstance(attn, AttentionSpec) and attn.config.kv_cache == NANO_KV
+    sampler = by_key[NANO_SAMPLER]
+    assert isinstance(sampler, SamplerSpec) and sampler.vocab_size == model.config.vocab_size
+
+
+def test_duplex_request_resource_configs():
+    model = _make_model()
+    cfg = model.get_request_resource_configs({}, None)
+    assert set(cfg) == {NANO_SAMPLER}
+    text = cfg[NANO_SAMPLER]
+    assert isinstance(text, SamplingReqConfig)
+    assert text.temperature == model.config.temperature and text.top_p == model.config.top_p
+    # request knobs override the config defaults
+    greedy = model.get_request_resource_configs({}, {"temperature": 0.0, "ignore_eos": True})[NANO_SAMPLER]
+    assert greedy.temperature == 0.0 and greedy.ignore_eos is True
 
 
 def test_duplex_partition_producer_chain():
@@ -56,11 +99,6 @@ def test_duplex_topology_routes():
         ("LLM", "Talker", "new_token"),
         ("Talker", "Codec", "codec_tokens"),
     }
-
-
-def test_duplex_nano_has_function_aux_channel():
-    assert "function" in _make_model().get_aux_sampling_configs("nano_llm")
-    assert _make_model().get_aux_sampling_configs("audio_codec") == {}
 
 
 def test_duplex_worker_graphs_derive_all_walks():
@@ -90,12 +128,11 @@ def test_duplex_initial_partition_routing():
 def test_duplex_llm_prefill_to_decode_transition():
     model = _make_model()
     meta = model._meta(["audio"], ["audio"], "prefill_text", True)
-    fpa = model.get_partition_forward_pass_args("LLM", meta, {})
+    fpa = model.get_partition_forward_pass_args("LLM", meta, {"prev_text": ["pt"], "prev_func": ["pf"]})
     assert fpa.full_metadata.graph_walk == "decode"
     assert fpa.full_metadata.is_prefill is False
-
-
-# --- regression tests for the E5 full-duplex serving fixes ------------------
+    # the primed carry-in tokens persisted by prefill_text feed decode iteration 0
+    assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func"}
 
 
 def test_duplex_stream_connection_policies():
