@@ -173,13 +173,15 @@ class _Attn(nn.Module):
         self.attend = AttentionCallable(kv=kv, attn=attn) if kv is not None and attn is not None else None
         self.pos = pos
 
-    def forward_pooled(self, x: torch.Tensor, rope_theta: float) -> torch.Tensor:
+    def forward_pooled(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """Self-attention over this step's packed tokens ``[total_tokens, H]``
-        through the engine's paged KV: Gemma3 QK-norm, RoPE at the positions
-        the position resource planned (this layer's ``rope_theta``, over the
-        full head dim), the KV write and the planned attention. The kernel
-        scales by ``head_dim ** -0.5``; Gemma wants ``query_pre_attn_scalar
-        ** -0.5``, so the query is pre-scaled by the ratio.
+        through the engine's paged KV: Gemma3 QK-norm, RoPE from ``cos``/``sin``
+        ``[total_tokens, hd]`` (built by the caller from the positions the
+        position resource planned, with this layer's theta; in torch, because
+        FlashInfer's RoPE kernel takes no head dim of 72), the KV write and the
+        planned attention. The kernel scales by ``head_dim ** -0.5``; Gemma
+        wants ``query_pre_attn_scalar ** -0.5``, so the query is pre-scaled by
+        the ratio.
         """
         n = x.shape[0]
         nh, hd = self.num_heads, self.head_dim
@@ -189,9 +191,9 @@ class _Attn(nn.Module):
         if hasattr(self, "q_norm"):
             q = _gemma_rmsnorm(q, self.q_norm.weight, self.eps)
             k = _gemma_rmsnorm(k, self.k_norm.weight, self.eps)
-        q, k = self.pos.apply_qk(
-            q, k, label=self.attend.label, rope_theta=rope_theta, rotary_dim=hd, interleave=False,
-        )
+        cos_b, sin_b = cos[:, None, :].to(q.dtype), sin[:, None, :].to(q.dtype)      # over heads
+        q = q * cos_b + _rotate_half(q) * sin_b
+        k = k * cos_b + _rotate_half(k) * sin_b
         q = q * (self.scaling * hd ** 0.5)
         out = self.attend(q, k, v).reshape(n, nh * hd)
         return F.linear(out, self.o_proj.weight)
@@ -303,11 +305,11 @@ class TalkerLayer(nn.Module):
         return x
 
 
-    def forward_pooled(self, x: torch.Tensor, rope_theta: float) -> torch.Tensor:
+    def forward_pooled(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """``forward`` over packed tokens with the attention through the engine's KV pool."""
         residual = x
         h = _gemma_rmsnorm(x, self.input_layernorm.weight, self.eps)
-        h = self.self_attn.forward_pooled(h, rope_theta)
+        h = self.self_attn.forward_pooled(h, cos, sin)
         h = _gemma_rmsnorm(h, self.post_attention_layernorm.weight, self.eps)
         x = residual + h
         residual = x
@@ -757,22 +759,25 @@ class EarTTSTalker(nn.Module):
             cnt += k
         return code
 
-    def layer_rope_theta(self, layer_idx: int) -> float:
-        cfg = self.config
-        return cfg.rope_theta_full if (layer_idx + 1) % cfg.sliding_window_pattern == 0 else cfg.rope_theta_local
-
     def backbone_pooled(self, x: torch.Tensor, label: str) -> torch.Tensor:
         """Gemma3 stack over this step's packed tokens ``[total_tokens, H]`` with
         the attention through the engine's paged KV under ``label`` (the label
         and layer index are cursors on the shared resources, as in
         ``Attention.forward``). Returns the normed hidden ``[total_tokens, H]``.
         """
+        cfg = self.config
         layers = self.backbone.layers
         layers[0].self_attn.attend.bind_step(label)
+        # the planned absolute positions of this step's tokens, one RoPE table
+        # per theta (full-attention layers vs sliding-window layers)
+        pos_ids = layers[0].self_attn.pos.pos_ids(label)[: x.shape[0]]
+        cos_g, sin_g = _rope_cos_sin(pos_ids, cfg.rope_theta_full, cfg.head_dim)
+        cos_l, sin_l = _rope_cos_sin(pos_ids, cfg.rope_theta_local, cfg.head_dim)
         for i, layer in enumerate(layers):
             layer.self_attn.attend.set_layer_idx(i)
-            x = layer.forward_pooled(x, self.layer_rope_theta(i))
-        return _gemma_rmsnorm(x, self.backbone.norm.weight, self.config.rms_norm_eps)
+            full = (i + 1) % cfg.sliding_window_pattern == 0
+            x = layer.forward_pooled(x, cos_g if full else cos_l, sin_g if full else sin_l)
+        return _gemma_rmsnorm(x, self.backbone.norm.weight, cfg.rms_norm_eps)
 
     @torch.no_grad()
     def warmup_inputs(
