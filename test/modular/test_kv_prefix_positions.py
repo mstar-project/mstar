@@ -12,20 +12,31 @@ just wrong — so these tests read the position ids the plan actually produces.
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 
 sys.path.insert(0, ".")
 
 import pytest
 import torch
 
-from mstar.engine.resources import KVConfig, PositionConfig, StepContext, StepRunner
+from mstar.engine.resources import (
+    KVConfig,
+    PositionConfig,
+    Resource,
+    StepContext,
+    StepRunner,
+)
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionSpec, PositionStep, PosScheme
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import Segment, SubmoduleStep
-from mstar.worker.engine_manager import _refuse_uncacheable_positions
+from mstar.worker.engine_manager import (
+    _refuse_uncacheable_positions,
+    _refuse_unskippable_resources,
+)
 
 KV = "kv"
 ROPE = "rope"
@@ -231,3 +242,50 @@ def test_only_the_cache_that_was_declared_is_checked():
         "a position resource over a cache nobody keyed was held to the "
         "sequential rule"
     )
+
+
+# ── what else the node carries ──────────────────────────────────────────
+
+
+class _Unskippable(Resource):
+    """A resource that keeps state of its own and never learned the hooks."""
+
+    @classmethod
+    def build(cls, spec, info):
+        raise NotImplementedError
+
+
+@dataclass
+class _StubSpec(NodeResourceSpec):
+    """Declares `_Unskippable` on whichever nodes the test puts it on."""
+
+    @property
+    def resource_class(self):
+        return _Unskippable
+
+
+def _with_stub(*nodes: str) -> list:
+    return _specs(PosScheme.SEQUENTIAL) + [
+        _StubSpec(resource_key="recurrent_state", nodes=set(nodes)),
+    ]
+
+
+def test_a_declared_node_carrying_a_resource_that_cannot_skip_is_refused():
+    with pytest.raises(ValueError, match="recurrent_state") as refusal:
+        _refuse_unskippable_resources(_with_stub(NODE), _Model(KV))
+
+    assert NODE in str(refusal.value), (
+        "the refusal does not say which node the resource sits on"
+    )
+
+
+def test_the_same_node_without_the_declaration_loads():
+    _refuse_unskippable_resources(_with_stub(NODE), _Model())
+
+
+def test_a_resource_that_cannot_skip_loads_beside_a_declared_node():
+    _refuse_unskippable_resources(_with_stub("Talker"), _Model(KV))
+
+
+def test_a_declared_node_of_caches_positions_attention_and_sampling_loads():
+    _refuse_unskippable_resources(_specs(PosScheme.SEQUENTIAL), _Model(KV))
