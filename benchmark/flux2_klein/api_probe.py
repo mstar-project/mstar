@@ -43,6 +43,8 @@ def post_json(url: str, body: dict, timeout: float = 600) -> tuple[int, dict | N
         except Exception:  # noqa: BLE001
             payload = None
         return e.code, payload, time.perf_counter() - t0
+    except (urllib.error.URLError, TimeoutError, OSError) as e:  # no answer at all: reported as status 0
+        return 0, {"error": f"{type(e).__name__}: {e}"}, time.perf_counter() - t0
 
 
 def post_multipart(url: str, fields: dict[str, str], files: list[tuple[str, str, bytes]],
@@ -69,6 +71,8 @@ def post_multipart(url: str, fields: dict[str, str], files: list[tuple[str, str,
         except Exception:  # noqa: BLE001
             payload = None
         return e.code, payload, time.perf_counter() - t0
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return 0, {"error": f"{type(e).__name__}: {e}"}, time.perf_counter() - t0
 
 
 def images_of(payload: dict | None) -> list[bytes]:
@@ -140,9 +144,10 @@ def main() -> None:
     for name, bad in (("size 1000x1000", {"size": "1000x1000"}), ("size 8192x8192", {"size": "8192x8192"}),
                       ("empty prompt", {"prompt": ""}), ("zero steps", {"num_inference_steps": 0}),
                       ("size garbage", {"size": "big"})):
-        status, payload, wall = post_json(gen_url, {**base, **bad}, timeout=120)
+        status, payload, wall = post_json(gen_url, {**base, **bad}, timeout=60)
         msg = (payload or {}).get("error", payload)
-        check(f"error path: {name}", 400 <= status < 500, f"status {status}: {str(msg)[:120]}", status=status)
+        check(f"error path: {name}", 400 <= status < 500,
+              f"status {status} after {wall:.1f} s: {str(msg)[:120]}", status=status)
 
     long_prompt = " ".join(["a very detailed painting of a cat"] * 400)
     status, payload, wall = post_json(gen_url, {**base, "prompt": long_prompt})
