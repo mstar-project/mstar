@@ -22,8 +22,8 @@ rust_runtime = pytest.importorskip(
     reason="mstar_rust not built (maturin develop --release in rust/)",
 )
 from mstar.communication.rust_tensor_store import RustTensorBookkeeping
-from mstar.graph.runtime import base as rust_runtime_base
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.runtime import base as rust_runtime_base
 from mstar.graph.runtime.base import RouteInput, SpeculationPrepInput
 
 WG_ID = 0
@@ -79,6 +79,16 @@ def runtime():
     # Tests seed descriptors through the same bookkeeper the runtime holds.
     rt._bookkeeping_for_test = book
     return rt
+
+
+def _send_input(rid, completion_id):
+    from mstar.graph.runtime.base import SendInput
+    return SendInput(
+        completion_id=completion_id,
+        per_request_info=ParallelList([rid], [None]),
+        new_token_counts=ParallelList([rid], [{}]),
+        nested_loop_indices=ParallelList([rid], [None]),
+    )
 
 
 def _tensor_info(uuid):
@@ -191,13 +201,25 @@ def test_speculative_flag_rejects_an_unknown_node(runtime):
         runtime.set_speculatively_scheduled("nope", WG_ID, [rid], True)
 
 
-# --- the unported half -------------------------------------------------------
+# --- coverage of the ABC -----------------------------------------------------
 
-def test_an_unported_method_says_so(runtime):
-    # A silent AttributeError would surface as "NoneType has no attribute"
-    # three frames away.
-    with pytest.raises(NotImplementedError, match="not ported yet"):
-        runtime.send_outputs(None)
+def test_every_abstract_method_is_implemented():
+    """The whole contract is ported. A method left abstract would fail at
+    construction; one left as a raising stub would fail mid-pass, which is
+    worse -- so check the class carries no stubs either."""
+    from mstar.graph.runtime.base import GraphRuntime
+
+    abstract = {
+        name for name, attr in vars(GraphRuntime).items()
+        if getattr(attr, "__isabstractmethod__", False)
+    }
+    assert abstract, "sanity: the ABC should declare abstract methods"
+    for name in sorted(abstract):
+        impl = getattr(rust_runtime.RustGraphRuntime, name, None)
+        assert impl is not None, f"{name} is missing"
+        assert impl.__qualname__.split(".")[0] != "_unported", (
+            f"{name} is still a stub"
+        )
 
 
 # --- the compile seam's loop handling ----------------------------------------
@@ -821,3 +843,47 @@ def test_a_peer_stop_for_an_unknown_partition_is_dropped(runtime):
         )},
     )
     assert runtime._loop_stop_times(rid) == {}
+
+
+# --- send --------------------------------------------------------------------
+
+class _Recorder:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, entity_id, msg=None, **kw):
+        self.sent.append((entity_id, msg if msg is not None else kw.get("msg")))
+
+
+def test_send_consumes_the_completion(runtime):
+    """complete_and_route parks the routing; send_outputs is what frees it.
+    A double-take would raise on the second pass of a live request."""
+    rid = _admit(runtime)
+    runtime._communicator = _Recorder()
+    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.pop_rids("prefill", WALK, [rid])
+    bk = runtime._bookkeeping_for_test
+    for u in (30, 31):
+        bk.put_tensor(u, _tensor_info(u))
+    out = _route(runtime, [rid], "prefill", ["kv_cache", "token"], [[[30], [31]]])
+
+    runtime.send_outputs(_send_input(rid, out.completion_id))
+    with pytest.raises((ValueError, RuntimeError)):
+        runtime.send_outputs(_send_input(rid, out.completion_id))
+
+
+def test_a_local_only_batch_sends_nothing_to_peers(runtime):
+    # prefill -> ar_decode is local, so there is no peer frame to build.
+    rid = _admit(runtime)
+    rec = _Recorder()
+    runtime._communicator = rec
+    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.pop_rids("prefill", WALK, [rid])
+    bk = runtime._bookkeeping_for_test
+    for u in (40, 41):
+        bk.put_tensor(u, _tensor_info(u))
+    out = _route(runtime, [rid], "prefill", ["kv_cache", "token"], [[[40], [41]]])
+    runtime.send_outputs(_send_input(rid, out.completion_id))
+
+    peers = [e for e, _ in rec.sent if e not in ("conductor", "api_server")]
+    assert peers == []

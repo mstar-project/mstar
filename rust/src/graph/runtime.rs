@@ -687,6 +687,22 @@ fn e_persist(edges: &[RoutedEdge], uuid: u64) -> bool {
         .any(|e| e.persist && e.tensors.iter().any(|t| t.uuid == uuid))
 }
 
+/// What a completion has to send. Grouped by kind rather than by message so
+/// the caller builds one frame per (worker, rid) instead of per edge.
+#[pyclass]
+#[derive(Default)]
+pub struct SendPlan {
+    #[pyo3(get)] pub partition: String,
+    /// (rid, worker, signal, next_node, uuids, is_streaming)
+    #[pyo3(get)] pub to_workers: Vec<(u32, String, String, String, Vec<u64>, bool)>,
+    /// (rid, signal, uuids)
+    #[pyo3(get)] pub persist: Vec<(u32, String, Vec<u64>)>,
+    /// (rid, signal, modality, uuids)
+    #[pyo3(get)] pub emit: Vec<(u32, String, String, Vec<u64>)>,
+    /// (rid, finished worker graph ids)
+    #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>)>,
+}
+
 /// One `NestedLoopIndices` as Python hands it over.
 #[derive(FromPyObject)]
 pub struct LoopStopArg {
@@ -1785,6 +1801,70 @@ impl GraphRuntime {
                 )
             })
             .collect()
+    }
+
+    /// Consume a completion and report what to send.
+    ///
+    /// Returns per rid: the peer edges (grouped by worker), the persist
+    /// signals, the emit-to-client edges, and whether a worker graph finished.
+    /// Frames are built by the caller -- see stop_loops_batched.
+    fn take_send_plan(&mut self, completion_id: u64) -> PyResult<SendPlan> {
+        let c = self.completions.remove(&completion_id).ok_or_else(|| {
+            PyValueError::new_err(format!("unknown completion {completion_id}"))
+        })?;
+        let g = self.graphs[c.wg as usize].clone();
+        let mut plan = SendPlan {
+            partition: c.partition.clone(),
+            ..Default::default()
+        };
+
+        for (rid, edges) in c.routing {
+            let walk = self.interner.get(&c.graph_walk);
+            for e in edges {
+                let uuids: Vec<u64> = e.tensors.iter().map(|t| t.uuid).collect();
+                let name = self.interner.name(e.name).to_string();
+                if e.persist {
+                    plan.persist.push((rid, name.clone(), uuids.clone()));
+                }
+                match e.dest {
+                    Dest::EmitToClient => plan.emit.push((
+                        rid,
+                        name.clone(),
+                        self.interner.name(e.modality).to_string(),
+                        uuids.clone(),
+                    )),
+                    Dest::External(dest) => {
+                        // Who runs that node for THIS request.
+                        let workers = walk
+                            .and_then(|w| {
+                                self.info(rid)?.node_to_workers.get(&(dest, w)).cloned()
+                            })
+                            .unwrap_or_default();
+                        for worker in workers {
+                            plan.to_workers.push((
+                                rid,
+                                self.interner.name(worker).to_string(),
+                                name.clone(),
+                                self.interner.name(dest).to_string(),
+                                uuids.clone(),
+                                e.streaming,
+                            ));
+                        }
+                    }
+                    Dest::Local(_) | Dest::Empty => {}
+                }
+            }
+            if let Some(wgs) = c.completed_wgs.get(&rid) {
+                let _ = &g;
+                plan.completed.push((rid, wgs.clone()));
+            }
+        }
+        Ok(plan)
+    }
+
+    fn stream_partition_done(&self, rid: u32, partition: &str) -> bool {
+        let Some(p) = self.interner.get(partition) else { return false };
+        self.info(rid).is_some_and(|i| i.stream_done(p))
     }
 
     fn num_handles(&self) -> usize {

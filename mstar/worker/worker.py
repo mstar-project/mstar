@@ -76,10 +76,9 @@ logger = logging.getLogger(__name__)
 def _make_graph_runtime(**kwargs) -> PythonGraphRuntime:
     """``MSTAR_RUST_GRAPH``: ``0`` (default) Python, ``1`` Rust.
 
-    No ``AUTO``. The Rust runtime is incomplete -- ingest, scheduling, routing
-    and sending still raise -- so falling back silently would hide that, and
-    picking it up silently would break a worker that merely happens to have
-    the extension installed.
+    No ``AUTO``: picking the Rust runtime up silently would change how a
+    worker behaves merely because the extension happened to be installed, and
+    falling back silently would hide a build that did not take.
 
     It requires the Rust communicator. The runtime sends WORKER_GRAPHS_DONE
     and INPUT_SIGNALS itself, holding an Arc to the same transport rather than

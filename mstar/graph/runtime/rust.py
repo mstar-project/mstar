@@ -1,11 +1,13 @@
 """``GraphRuntime`` over the Rust implementation in ``rust/``
 (``mstar_rust.GraphRuntime``).
 
-INCOMPLETE. The Rust side implements the bookkeeping and the structural
-lookups; ingest, scheduling, routing, sending and speculation still raise. The
-class exists so those land one method at a time behind a flag rather than as
-one switchover, and so the seam that converts Python graph objects into the
-Rust spec (:func:`worker_graph_args`) has a home.
+The whole ``GraphRuntime`` contract is implemented. Graph state, scheduling,
+routing and speculation run in Rust; the outbound FRAMES are still built here,
+because a Rust encoder has to reproduce ``wire.py``'s typed msgpack byte for
+byte -- Rust decides what to send and to whom, Python serialises it.
+
+:func:`worker_graph_args` is the compile seam: Python owns graph
+construction, Rust owns the compiled form.
 
 Rust never sees a tensor. It holds a share of the same ``TensorBookkeeping``
 Python gave ``TensorStore``, so descriptors and refcounts stay in one place.
@@ -18,9 +20,11 @@ from copy import deepcopy
 
 from mstar_rust import GraphRuntime as _RustGraphRuntime
 
+from mstar.api_server.request_types import APIServerMessage, ResultTensors
+from mstar.communication import wire
 from mstar.communication.tensor_store import TensorBookkeeping
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphSection, Loop
+from mstar.graph.base import GraphEdge, GraphSection, Loop
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import (
@@ -31,30 +35,22 @@ from mstar.graph.runtime.base import (
     ReadyNodeSpec,
     RouteInput,
     RouteOutput,
+    SendInput,
     SpeculationOutput,
     SpeculationPrepInput,
     SpeculationPrepOutput,
 )
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
-from mstar.utils.ipc_format import StopLoops, WorkerMessage, WorkerMessageType
-
-
-def _unported(name: str):
-    """A method still on the Python side.
-
-    Bound in the class body, not setattr'd afterwards: ABCMeta freezes
-    __abstractmethods__ at class creation, so a later assignment leaves the
-    class abstract and unusable. Raising by name beats an AttributeError three
-    frames away.
-    """
-    def raise_unported(self, *args, **kwargs):
-        del args, kwargs
-        raise NotImplementedError(
-            f"RustGraphRuntime.{name} is not ported yet; MSTAR_RUST_GRAPH "
-            "cannot drive a full forward pass. See mstar/graph/runtime/rust.py."
-        )
-    raise_unported.__name__ = name
-    return raise_unported
+from mstar.utils.ipc_format import (
+    ConductorMessage,
+    ConductorMessageType,
+    InputSignals,
+    StopLoops,
+    WorkerGraphsDone,
+    WorkerMessage,
+    WorkerMessageType,
+)
 
 
 def _edge_args(section: GraphSection, edge) -> dict:
@@ -224,6 +220,13 @@ class RustGraphRuntime(GraphRuntime):
         )
         self._node_to_partition = node_to_partition
         self._communicator = communicator
+        self._bookkeeping = bookkeeping
+        # Buffered until the worker graph finishes, so a persist signal cannot
+        # race the WORKER_GRAPHS_DONE announcing it.
+        self._pending_persist: dict[int, dict] = {}
+        self._pending_new_tokens: dict[int, dict[str, int]] = {}
+        self._buffered_outputs: dict[int, list[str]] = {}
+        self._output_loop_indices: dict[int, dict] = {}
 
     # --------- Bookkeeping ----------
 
@@ -554,9 +557,94 @@ class RustGraphRuntime(GraphRuntime):
             for name, order, indices, fwd in self._rust.get_loop_stop_times(rid)
         }
 
-    # --------- not ported yet ----------
-    #
-    # Everything a forward pass needs. Until these land, MSTAR_RUST_GRAPH=1
-    # admits requests and answers the structural queries but cannot run a step.
+    def send_outputs(self, input: SendInput):
+        """Rust decides what goes where; the frames are built here.
 
-    send_outputs = _unported("send_outputs")
+        Same split as stop_loops_batched: a Rust encoder would have to
+        reproduce wire.py's typed msgpack byte for byte.
+        """
+        plan = self._rust.take_send_plan(input.completion_id)
+        partition = plan.partition
+        fwd_infos = dict(iter(input.per_request_info))
+        counts = dict(iter(input.new_token_counts))
+        nested = dict(iter(input.nested_loop_indices))
+        consumed = (
+            {} if input.stream_tokens_consumed is None
+            else dict(iter(input.stream_tokens_consumed))
+        )
+        profiling = (
+            {} if input.profiling is None else dict(iter(input.profiling))
+        )
+
+        # One frame per (rid, worker): the plan is per edge, and a worker
+        # taking several of a request's signals should see one message.
+        grouped: dict[tuple[int, str], list[GraphEdge]] = {}
+        for rid, worker, signal, next_node, uuids, streaming in plan.to_workers:
+            grouped.setdefault((rid, worker), []).append(GraphEdge(
+                name=signal, next_node=next_node, is_streaming=streaming,
+                tensor_info=self._infos(uuids),
+            ))
+        for (rid, worker), edges in grouped.items():
+            self._communicator.send(worker, WorkerMessage(
+                message_type=WorkerMessageType.INPUT_SIGNALS,
+                body=InputSignals(
+                    request_id=self.get_rid_string(rid), inputs=edges,
+                    request_info=fwd_infos.get(rid), partition_name=partition,
+                ),
+            ))
+
+        for rid, signal, modality, uuids in plan.emit:
+            self._buffered_outputs.setdefault(rid, []).append(signal)
+            self._output_loop_indices.setdefault(rid, {})[signal] = nested.get(rid)
+            self._communicator.send("api_server", APIServerMessage(
+                message_type="result_tensors",
+                body=ResultTensors(
+                    request_id=self.get_rid_string(rid), modality=modality,
+                    graph_edge=GraphEdge(
+                        name=signal, next_node=EMIT_TO_CLIENT,
+                        output_modality=modality,
+                        tensor_info=self._infos(uuids),
+                    ),
+                    loop_indices=nested.get(rid), metadata={},
+                ),
+            ))
+
+        for rid, signal, uuids in plan.persist:
+            self._pending_persist.setdefault(rid, {})[signal] = self._infos(uuids)
+        for rid, cnts in counts.items():
+            pending = self._pending_new_tokens.setdefault(rid, {})
+            for name, n in (cnts or {}).items():
+                pending[name] = pending.get(name, 0) + n
+
+        for rid, wg_ids in plan.completed:
+            rx, tx, timings = [], [], {}
+            if profiling.get(rid) is not None:
+                rx, tx, timings = wire.decode(profiling[rid])
+            fwd_info = fwd_infos.get(rid)
+            self._communicator.send("conductor", ConductorMessage(
+                message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
+                body=WorkerGraphsDone(
+                    request_id=self.get_rid_string(rid),
+                    worker_graph_ids=wg_ids,
+                    is_first_tp_rank=True,
+                    persist_signals=self._pending_persist.pop(rid, {}),
+                    new_token_counts=self._pending_new_tokens.pop(rid, {}),
+                    output_signal_names=self._buffered_outputs.pop(rid, []),
+                    resource_publish_info=(
+                        {} if fwd_info is None else fwd_info.resource_publish_info
+                    ),
+                    partition_name=partition,
+                    partition_done=self._rust.stream_partition_done(rid, partition),
+                    stream_tokens_consumed=consumed.get(rid, {}),
+                    output_loop_indices=self._output_loop_indices.get(rid, {}),
+                    graph_timings=timings, rx_info=rx, tx_info=tx,
+                ),
+            ))
+
+    def _infos(self, uuids: list[int]) -> list:
+        """Descriptors for the wire, from the bookkeeper Rust shares."""
+        return [
+            i for i in (self._bookkeeping.get_info(u) for u in uuids)
+            if i is not None
+        ]
+
