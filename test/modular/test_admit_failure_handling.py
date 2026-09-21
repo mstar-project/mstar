@@ -90,32 +90,39 @@ def test_postprocess_runs_on_a_step_that_admitted():
 # --- worker: every admit failure is re-queued ------------------------------
 
 
-class _Queue:
+class _Runtime:
+    """The runtime owns the ready queues, so the push-back lands here."""
+
     def __init__(self):
         self.pushed_back: list[str] = []
 
-    def push_back_node(self, request_id, node):
-        del node
-        self.pushed_back.append(request_id)
+    def push_back_node(self, node_name, rids, wg_ids):
+        del node_name, wg_ids
+        self.pushed_back.extend(rids)
 
 
 class _FakeWorker:
     """Binds the two handlers onto stubs for their collaborators."""
 
     _handle_admit_failure = Worker._handle_admit_failure
+    _push_back_batch = Worker._push_back_batch
 
     def __init__(self):
-        self.queue = _Queue()
-        self.worker_graphs_manager = SimpleNamespace(queues={"wg": self.queue})
+        self._rid_runtime = _Runtime()
         self.held: list[str] = []
         self.scheduler = SimpleNamespace(hold_requests=self.held.extend)
         self.offload_calls: list[str] = []
 
+    @property
+    def queue(self):
+        # The assertions read .pushed_back; keep that name pointing at
+        # whoever owns the ready queues now.
+        return self._rid_runtime
+
     def _handle_allocation_failure(self, batch, node_batch):
         self.offload_calls.append(node_batch.node_name)
         # the real one push-backs and holds; stand in for both
-        for rid in batch.node_objects:
-            self.queue.push_back_node(rid, None)
+        self._push_back_batch(batch)
         self.scheduler.hold_requests(list(batch.node_objects))
 
 

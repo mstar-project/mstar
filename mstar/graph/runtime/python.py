@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import TensorCommunicationManager, TensorStore
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import NameAndDest, NodeAndGraphWalk
+from mstar.graph.base import GraphNode, NameAndDest, NodeAndGraphWalk
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import (
     EdgeSpec,
@@ -325,7 +325,59 @@ class PythonGraphRuntime(GraphRuntime):
         request_ids: list[int],
         check_ready: bool = False,
     ) -> PopRidsOutput | None:
-        raise NotImplementedError
+        wg_id = self.get_worker_graph_id_for_node(node_name, graph_walk)
+        queue = self._queues.get(wg_id)
+        if queue is None:
+            return None
+        if check_ready:
+            # All or nothing: verified for every rid before anything is popped,
+            # so a partially ready set is retried intact later.
+            for rid in request_ids:
+                wgio = queue.per_request_queues.get(rid)
+                if wgio is None or node_name not in wgio.ready_node_names:
+                    return None  # unknown rid (removed here) counts as not ready
+
+        rids: list[int] = []
+        wg_ids: list[int] = []
+        input_edges: list[EdgeSpec] = []
+        input_edges_per_rid: list[int] = []
+        for rid in request_ids:
+            popped = queue.pop_ready_nodes(rid, [node_name])
+            if not popped:
+                continue
+            assert len(popped) == 1
+            node = popped[0]
+            ready = node.ready_signals.ready_inputs
+            rids.append(rid)
+            wg_ids.append(wg_id)
+            input_edges_per_rid.append(len(ready))
+            for signal, edge in ready.items():
+                input_edges.append(EdgeSpec(
+                    signal=signal,
+                    next_node=edge.next_node,
+                    uuids=[info.uuid for info in edge.tensor_info],
+                    is_final_streaming_chunk=edge._final_stream_chunk,
+                ))
+        return PopRidsOutput(
+            wg_ids=ParallelList(rids, wg_ids),
+            input_edges=input_edges,
+            input_edges_per_rid=input_edges_per_rid,
+        )
+
+    def get_nodes(
+        self, node_name: str, rids: list[int], wg_ids: list[int],
+    ) -> list[GraphNode]:
+        """TRANSITIONAL: hands out the live graph objects.
+
+        The worker still carries GraphNodes through its batch for postprocess
+        (reset_outputs, outputs, _speculatively_scheduled). Those uses move
+        into complete_and_route_batch, and this goes away with them -- a Rust
+        backend cannot implement it.
+        """
+        return [
+            self._queues[wg_id].per_request_queues[rid].get_node(node_name)
+            for rid, wg_id in zip(rids, wg_ids, strict=True)
+        ]
 
     def _scan_ready(
         self, exclude_rids: set[int],
@@ -388,7 +440,14 @@ class PythonGraphRuntime(GraphRuntime):
         rids: list[int],
         wg_ids: list[int]
     ):
-        raise NotImplementedError
+        """Return a popped node to the ready set, e.g. after an OOM hold."""
+        for rid, wg_id in zip(rids, wg_ids, strict=True):
+            queue = self._queues.get(wg_id)
+            if queue is None:
+                continue
+            wgio = queue.per_request_queues.get(rid)
+            if wgio is not None:
+                wgio.ready_node_names.add(node_name)
 
     # --------- Speculation ----------
 

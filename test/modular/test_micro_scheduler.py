@@ -27,7 +27,8 @@ from mstar.engine.resources.step import (
     AdmitRuntimeError,
     FullAdmitOutcome,
 )
-from mstar.graph.runtime.base import ReadyNodeSpec
+from mstar.graph.runtime.base import PopRidsOutput, ReadyNodeSpec
+from mstar.utils.containers import ParallelList
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 
 NODE = "LLM"
@@ -95,6 +96,34 @@ class _Runtime:
     def get_worker_graph_id_for_node(self, node_name, graph_walk):
         del node_name, graph_walk
         return "wg0"
+
+    def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):
+        del graph_walk
+        queue = self._manager.queues["wg0"]
+        if check_ready:
+            ready = queue.get_ready_node_names()
+            for rid in request_ids:
+                if node_name not in ready.get(rid, ()):
+                    return None
+        rids, wg_ids = [], []
+        for rid in request_ids:
+            if queue.pop_ready_nodes(rid, [node_name]):
+                rids.append(rid)
+                wg_ids.append("wg0")
+        return PopRidsOutput(
+            wg_ids=ParallelList(rids, wg_ids),
+            input_edges=[], input_edges_per_rid=[0] * len(rids),
+        )
+
+    def get_nodes(self, node_name, rids, wg_ids):
+        del wg_ids
+        return [SimpleNamespace(name=node_name) for _ in rids]
+
+    def push_back_node(self, node_name, rids, wg_ids):
+        del wg_ids
+        queue = self._manager.queues["wg0"]
+        for rid in rids:
+            queue._ready.setdefault(rid, set()).add(node_name)
 
 
 class _Manager:

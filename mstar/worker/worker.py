@@ -1129,6 +1129,14 @@ class Worker:
     # ------------------------------------------------------------------
     # Output handling
     # ------------------------------------------------------------------
+    def _push_back_batch(self, batch: ScheduledBatch) -> None:
+        """Return a whole batch's nodes to the ready set (admit refusal, OOM)."""
+        rids = list(batch.node_objects)
+        self._rid_runtime.push_back_node(
+            batch.node_name, rids,
+            [batch.request_to_worker_graph[rid] for rid in rids],
+        )
+
     def _register_outputs(
         self,
         batch: ScheduledBatch,
@@ -1482,11 +1490,7 @@ class Worker:
             self._handle_allocation_failure(batch, node_batch)
             return
 
-        for rid, node in batch.node_objects.items():
-            wg_id = batch.request_to_worker_graph[rid]
-            self.worker_graphs_manager.queues[wg_id].push_back_node(
-                rid, node
-            )
+        self._push_back_batch(batch)
         logger.info(
             "Admit refused node=%s walk=%s (%s): re-queued %d requests",
             batch.node_name, batch.graph_walk,
@@ -1528,11 +1532,7 @@ class Worker:
         )
 
         # Push all batch nodes back to their queues
-        for rid, node in batch.node_objects.items():
-            wg_id = batch.request_to_worker_graph[rid]
-            self.worker_graphs_manager.queues[wg_id].push_back_node(
-                rid, node
-            )
+        self._push_back_batch(batch)
 
         if victim_id is not None:
             self.scheduler.hold_requests([victim_id])
@@ -1932,8 +1932,10 @@ class Worker:
                     #
                     # Never a TP-follow batch: targeted calls don't pop the
                     # TP-follow FIFO (a rejected ScheduleTPNode can't re-queue).
-                    wg_id = fresh_batch.request_to_worker_graph[rid]
-                    self.worker_graphs_manager.queues[wg_id].push_back_node(rid, node)
+                    self._rid_runtime.push_back_node(
+                        fresh_batch.node_name, [rid],
+                        [fresh_batch.request_to_worker_graph[rid]],
+                    )
                     continue
 
                 per_request_inputs[rid] = self._get_input_tensors(
@@ -2991,12 +2993,16 @@ class Worker:
                                 # Fresh rids are not re-readied by N's routing
                                 # the way continuing rids are: give them back.
                                 sb = speculation.scheduled_batch
-                                for rid, node in sb.node_objects.items():
-                                    if rid in speculation.continuing_rids:
-                                        continue
-                                    wg_id = sb.request_to_worker_graph.get(rid)
-                                    if wg_id is not None:
-                                        self.worker_graphs_manager.queues[wg_id].push_back_node(rid, node)
+                                fresh = [
+                                    rid for rid in sb.node_objects
+                                    if rid not in speculation.continuing_rids
+                                    and sb.request_to_worker_graph.get(rid)
+                                    is not None
+                                ]
+                                self._rid_runtime.push_back_node(
+                                    sb.node_name, fresh,
+                                    [sb.request_to_worker_graph[r] for r in fresh],
+                                )
                                 speculation = None
 
                     if pending.node_batch.admit_error is not None:

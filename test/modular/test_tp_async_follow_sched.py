@@ -19,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_OK  # noqa: E402
 from mstar.graph.base import GraphNode  # noqa: E402
+from mstar.graph.runtime.base import PopRidsOutput
+from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 
@@ -71,11 +73,38 @@ class _FakeQueue:
 
 
 class _FakeRuntime:
-    """The runtime owns the (walk, node) -> worker graph index and the
-    graph-level ready scan now."""
+    """The runtime owns the (walk, node) -> worker graph index, the
+    graph-level ready scan and the pop now."""
+
+    def __init__(self, queue=None):
+        self._queue = queue
 
     def get_worker_graph_id_for_node(self, node_name, graph_walk):
         return "wg0"
+    def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):
+        del graph_walk
+        queue = self._queue
+        if check_ready:
+            for rid in request_ids:
+                wg = queue.per_request_queues.get(rid)
+                if wg is None or node_name not in wg.ready_node_names:
+                    return None
+        rids = [
+            rid for rid in request_ids
+            if queue.pop_ready_nodes(rid, [node_name])
+        ]
+        return PopRidsOutput(
+            wg_ids=ParallelList(rids, ["wg0"] * len(rids)),
+            input_edges=[], input_edges_per_rid=[0] * len(rids),
+        )
+
+    def get_nodes(self, node_name, rids, wg_ids):
+        del wg_ids
+        return [
+            GraphNode(name=node_name, input_names=set(), outputs=[])
+            for _ in rids
+        ]
+
 
     def has_ready_excluding(self, exclude_rids, exclude_target=None):
         # Pure TP follower: no locally-initiated work, matching _FakeQueue.
@@ -88,6 +117,9 @@ class _FakeRuntime:
 class _FakeWorkerGraphsManager:
     def __init__(self, queue):
         self.queues = {"wg0": queue}
+        # The real runtime owns the queues and the manager shares them; bind
+        # the fake pair the same way.
+        self.runtime = _FakeRuntime(queue)
         self.per_request_info = {}
 
     def get_partition_for_node(self, node_name):
@@ -102,7 +134,6 @@ def _sched(engine=None):
         engine_manager=_FakeEngineManager(engine or _FakeEngine()),
         parallel_leader_nodes=set(),  # follower role
     )
-    sched.runtime = _FakeRuntime()
     return sched
 
 
@@ -119,6 +150,7 @@ def test_pop_ready_rids_pops_exactly_the_named_set():
     sched = _sched()
     queue = _FakeQueue(["r0", "r1", "r2"])
     manager = _FakeWorkerGraphsManager(queue)
+    sched.runtime = manager.runtime
 
     popped = sched.pop_ready_rids(manager, NODE, WALK, ["r1", "r2"])
     assert popped is not None
@@ -135,6 +167,7 @@ def test_pop_ready_rids_is_all_or_nothing_on_graph_readiness():
     sched = _sched()
     queue = _FakeQueue(["r0"], not_ready_rids=["r1"])
     manager = _FakeWorkerGraphsManager(queue)
+    sched.runtime = manager.runtime
 
     assert sched.pop_ready_rids(manager, NODE, WALK, ["r0", "r1"]) is None
     # NOTHING was consumed: r0 is still ready for a later attempt.
@@ -146,6 +179,7 @@ def test_pop_ready_rids_is_all_or_nothing_on_engine_readiness():
     sched = _sched(_FakeEngine(not_ready=["r1"]))
     queue = _FakeQueue(["r0", "r1"])
     manager = _FakeWorkerGraphsManager(queue)
+    sched.runtime = manager.runtime
 
     assert sched.pop_ready_rids(manager, NODE, WALK, ["r0", "r1"]) is None
     assert NODE in queue.per_request_queues["r0"].ready_node_names
@@ -155,6 +189,7 @@ def test_pop_ready_rids_is_all_or_nothing_on_engine_readiness():
 def test_pop_ready_rids_empty_set_is_a_valid_no_op():
     sched = _sched()
     manager = _FakeWorkerGraphsManager(_FakeQueue(["r0"]))
+    sched.runtime = manager.runtime
     assert sched.pop_ready_rids(manager, NODE, WALK, []) == ({}, {})
     assert sched.batch_number == 0
 
@@ -165,6 +200,7 @@ def test_serial_tp_follow_path_still_serves_via_shared_pop():
     batch carries the head's seq."""
     sched = _sched()
     manager = _FakeWorkerGraphsManager(_FakeQueue(["r0", "r1"]))
+    sched.runtime = manager.runtime
     sched.register_tp_follow(_head(["r0", "r1"], seq=9))
     batch = sched.get_next_batch(manager)
     assert batch is not None
@@ -177,6 +213,7 @@ def test_serial_tp_follow_waits_when_a_rid_is_not_ready_and_pops_nothing():
     sched = _sched()
     queue = _FakeQueue(["r0"], not_ready_rids=["r1"])
     manager = _FakeWorkerGraphsManager(queue)
+    sched.runtime = manager.runtime
     sched.register_tp_follow(_head(["r0", "r1"]))
     assert sched.get_next_batch(manager) is None
     assert NODE in queue.per_request_queues["r0"].ready_node_names
@@ -211,6 +248,7 @@ def test_fifo_accessors_touch_only_the_head_and_keep_order():
 def test_drain_refcount_discharged_by_the_serial_path():
     sched = _sched()
     manager = _FakeWorkerGraphsManager(_FakeQueue(["r0"]))
+    sched.runtime = manager.runtime
     sched.register_tp_follow(_head(["r0"]))
     assert sched.pending_tp_follow_count["r0"] == 1
 

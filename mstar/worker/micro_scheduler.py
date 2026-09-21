@@ -228,31 +228,31 @@ class MicroScheduler:
         retries later for a partially ready set."""
         if not rids:
             return {}, {}
+        # Engine readiness first: pop_rids treats it as a prerequisite, and it
+        # is all-or-nothing too, so one not-ready rid leaves the set intact.
         node_partition = worker_graphs_manager.get_partition_for_node(node_name)
-        wgid = self.runtime.get_worker_graph_id_for_node(node_name, graph_walk)
-        queue = worker_graphs_manager.queues[wgid]
         for rid in rids:
-            # An unknown rid (removed on this rank) counts as not ready.
-            wg = queue.per_request_queues.get(rid)
-            if wg is None or node_name not in wg.ready_node_names:
-                return None
             fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
-            # Engine-level readiness
             if not self._check_ready(node_name, rid, fwd_info):
                 return None
 
-        node_objects: dict[int, GraphNode] = {}
-        request_to_worker_graph: dict[int, int] = {}
-        for rid in rids:
-            popped = queue.pop_ready_nodes(rid, [node_name])
-            if popped:
-                assert len(popped) == 1
-                node_objects[rid] = popped[0]
-                request_to_worker_graph[rid] = wgid
+        popped = self.runtime.pop_rids(
+            node_name, graph_walk, rids, check_ready=True,
+        )
+        if popped is None:
+            return None
+        batch_rids, wg_ids = popped.wg_ids.keys, popped.wg_ids.values
+        # TODO: popped.input_edges is the batch's ready inputs as EdgeSpecs;
+        # _build_executing_batch should take them from here instead of walking
+        # node.ready_signals again.
+        nodes = self.runtime.get_nodes(node_name, batch_rids, wg_ids)
 
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[(node_name, graph_walk)] = self.batch_number
-        return node_objects, request_to_worker_graph
+        return (
+            dict(zip(batch_rids, nodes, strict=True)),
+            dict(zip(batch_rids, wg_ids, strict=True)),
+        )
 
     def _try_schedule_tp_follow(
         self, worker_graphs_manager: WorkerGraphsManager,
@@ -550,18 +550,21 @@ class MicroScheduler:
         graph_walk: str,
         entries: list[ReadyNodeEntry],
     ) -> ScheduledBatch | None:
-        node_objects = {}
-        request_to_worker_graph = {}
-        for entry in entries:
-            queue = worker_graphs_manager.queues[entry.worker_graph_id]
-            popped = queue.pop_ready_nodes(entry.rid, [node_name])
-            if popped:
-                assert len(popped) == 1
-                node_objects[entry.rid] = popped[0]
-                request_to_worker_graph[entry.rid] = entry.worker_graph_id
-
-        if not node_objects:
+        del worker_graphs_manager  # readiness was already established upstream
+        popped = self.runtime.pop_rids(
+            node_name, graph_walk, [entry.rid for entry in entries],
+        )
+        if popped is None:
             return
+        batch_rids, wg_ids = popped.wg_ids.keys, popped.wg_ids.values
+        if not batch_rids:
+            return
+        node_objects = dict(zip(
+            batch_rids,
+            self.runtime.get_nodes(node_name, batch_rids, wg_ids),
+            strict=True,
+        ))
+        request_to_worker_graph = dict(zip(batch_rids, wg_ids, strict=True))
 
         return ScheduledBatch(
             node_name=node_name,

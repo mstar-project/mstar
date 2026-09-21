@@ -55,8 +55,15 @@ class ParallelList(NamedTuple, Generic[TK, TV]):
         return len(self.keys)
 
     def __iter__(self) -> Iterator[tuple[TK, TV]]:
-        # strict: the two lists being the same length is the invariant of the
-        # whole type; a silent truncation here would drop requests.
+        """Yields (key, value) pairs.
+
+        NOTE: this overrides NamedTuple's field iteration, so ``k, v = pl``
+        does NOT give you the two lists -- it unpacks pairs, and silently
+        succeeds with exactly two entries. Use ``pl.keys`` / ``pl.values``.
+
+        strict: the two lists being the same length is the invariant of the
+        whole type; a silent truncation here would drop requests.
+        """
         return zip(self.keys, self.values, strict=True)
 
     @classmethod

@@ -139,13 +139,6 @@ class WorkerGraphQueues:
                 nodes.append(q.nodes[name])
         return nodes
 
-    def push_back_node(
-        self, rid: int, node: GraphNode
-    ) -> None:
-        """Push a previously popped node back onto the ready queue (e.g., after OOM hold)."""
-        if rid in self.per_request_queues:
-            self.per_request_queues[rid].ready_node_names.add(node.name)
-
     def reset(self, rid):
         """
         At the end of a worker graph, reset the queues for a request so it can
