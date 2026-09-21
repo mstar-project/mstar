@@ -182,3 +182,22 @@ def test_forward_pooled_pads_qkv_to_the_kv_head_dim_exactly(kv_head_dim):
         assert torch.equal(t[..., cfg.head_dim:], torch.zeros_like(t[..., cfg.head_dim:]))
     ref = attn.forward(x[None], cos, sin, causal=True)[0]
     torch.testing.assert_close(pooled, ref, atol=1e-4, rtol=1e-4)
+
+
+def test_warmup_steps_run_eager_and_steady_state_steps_hit_the_decode_capture():
+    """The decode capture has a fixed shape (two tokens per session); a session's
+    first step prefills its 38-token warm-up, so any batch containing one runs
+    eager. cg_key_info() (asked before prepare_inputs) and declare_step() must
+    agree, and both must name the key the capture config was captured under."""
+    sub = make_sub()
+    sub.request_state("b").add(sub.PREV_CODES_KEY, torch.zeros(TINY.num_quantizers, dtype=torch.long))
+    infos = {"a": SimpleNamespace(request_id="a"), "b": SimpleNamespace(request_id="b")}
+    first = sub.prepare_inputs("talker_decode", infos["a"], {"new_token": [torch.tensor([5])]})
+    later = sub.prepare_inputs("talker_decode", infos["b"], {"new_token": [torch.tensor([7])]})
+
+    assert sub.cg_key_info("talker_decode", infos) is None                      # "a" is on its warm-up step
+    assert sub.declare_step("talker_decode", ["a", "b"], [first, later]).cg_key_info is None
+    assert sub.cg_key_info("talker_decode", {"b": infos["b"]}) == sub.DECODE_KEY
+    assert sub.declare_step("talker_decode", ["b"], [later]).cg_key_info == sub.DECODE_KEY
+    (cfg,) = sub.get_cuda_graph_configs(torch.device("cpu"))
+    assert cfg.additional_key_info == sub.DECODE_KEY
