@@ -28,6 +28,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``cosmos3_super``
      - ``nvidia/Cosmos3-Super``
      - Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.
+   * - ``nemotron_duplex`` *(Beta)*
+     - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
+     - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
+       encoder + Nemotron-H hybrid Mamba-2/attention backbone + EarTTS talker +
+       RVQ codec; user speech in, agent text and 22.05 kHz speech out.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
@@ -162,6 +167,41 @@ The benchmark stops on the model's natural codec EOS by default. Use
 fixed-length decode throughput rather than end-user latency.
 The first process-local request can include eager FlashInfer kernel JIT, so
 keep the warmup requests enabled when reporting steady-state latency.
+
+Nemotron VoiceChat (``nemotron_duplex``) notes
+----------------------------------------------
+
+- Four nodes in four async partitions, joined by streaming edges:
+  ``conformer_encoder`` (16 kHz audio → one LLM-space embedding per 80 ms frame)
+  → ``nano_llm`` (frame-synchronous decode loop: each step fuses one audio frame
+  with the previous agent-text and tool-call tokens, emits one agent-text token)
+  → ``eartts_talker`` (one text token → 31 RVQ codes) → ``audio_codec`` (codes →
+  PCM, decoded with a per-request left context and emitted as new frames only).
+  The decode loops are stream-terminated: they end when the upstream stream
+  closes, not on EOS, which is an ordinary per-frame token in duplex speech.
+- ``nano_llm`` declares a paged KV cache over its four attention layers, the
+  attention plan on it and the agent-text sampler (``resources: nano_kv`` /
+  ``nano_attn`` / ``nano_sampler`` in the YAML). The attention layers use no
+  positional encoding, so there is no position resource. The Mamba-2 conv/SSM
+  state and the talker KV are still held in per-request submodule state, so all
+  four nodes run eager for now.
+- The nano text tokenizer is read from the ``nano/`` folder of
+  ``pipecat-ai/NVIDIA-NemotronLabs-VoiceChat-11B-Spark`` (the base checkpoint
+  ships only the RNN-T tokenizer); prefetch both repositories on machines
+  without egress.
+- Inputs are a single user-only 16 kHz mono clip (the request's ``audio``) plus
+  an optional system prompt (the request's text, primed before the first frame
+  exactly as the reference does). The model answers in the frames *after* the
+  user stops, so append a few seconds of trailing silence to the clip. The
+  checkpoint's demo recordings are two-channel conversations (user left, agent
+  right); feed the left channel only. ``test/nemotron_duplex/duplex_request.py``
+  prepares such a clip from the bundled ``turn_taking.wav`` and sends it;
+  ``oracle_compare.py`` runs the standalone reference path on the same clip.
+- Default deployment: ``configs/nemotron_duplex.yaml`` (all four nodes on one
+  GPU); ``configs/nemotron_duplex_disagg.yaml`` puts the encoder+LLM, the talker
+  and the codec on three ranks. Launch with ``--tensor-comm-protocol SHM`` on a
+  single node. Text is greedy at ``temperature: 0``; the talker's
+  mixture-of-Gaussians sampling is stochastic by design and seeded per request.
 
 Cosmos3 environment requirements
 --------------------------------
