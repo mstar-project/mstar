@@ -5,6 +5,7 @@ of the (captured) forward and reproduces the generator-driven sampling, and the
 MaskGIT schedule is computed on the host. Tiny random weights, CPU."""
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep
@@ -137,3 +138,47 @@ def test_postprocess_carries_the_codes_into_the_next_frame():
     codes = torch.arange(TINY.num_quantizers)
     sub.postprocess("a", None, {"codec_tokens": [codes]})
     torch.testing.assert_close(sub.request_state("a")[sub.PREV_CODES_KEY], codes)
+
+
+class _DenseAttend:
+    """Stands in for the engine's planned attention over this step's packed
+    tokens: one causal sequence, FlashInfer's default scale (the declared head
+    dim ** -0.5). Records what the layer handed it."""
+
+    def __init__(self):
+        self.seen = None
+
+    def __call__(self, q, k, v):
+        self.seen = (q, k, v)
+        n, d = q.shape[0], q.shape[-1]
+        s = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * d ** -0.5
+        s = s.masked_fill(torch.triu(torch.ones(n, n, dtype=torch.bool), 1), float("-inf"))
+        return torch.einsum("hqk,khd->qhd", s.softmax(-1), v.float()).to(q.dtype)
+
+
+@pytest.mark.parametrize("kv_head_dim", [128, TINY.head_dim])
+def test_forward_pooled_pads_qkv_to_the_kv_head_dim_exactly(kv_head_dim):
+    """The pool's head dim is FlashInfer's 128 (the talker's 72 zero-padded);
+    the padded attention must equal the plain per-sequence attention."""
+    import dataclasses
+
+    from mstar.model.nemotron_duplex.components.eartts_talker import _Attn, _rope_cos_sin
+
+    torch.manual_seed(0)
+    cfg = dataclasses.replace(TINY, kv_head_dim=kv_head_dim)
+    attn = _Attn(cfg, qk_norm=True)
+    for p in attn.parameters():
+        p.data.normal_(0, 0.3)
+    attn.attend = _DenseAttend()
+    n = 5
+    x = torch.randn(n, cfg.hidden_size)
+    cos, sin = _rope_cos_sin(torch.arange(n), cfg.rope_theta_local, cfg.head_dim)
+
+    pooled = attn.forward_pooled(x, cos, sin)
+
+    q, k, v = attn.attend.seen
+    assert q.shape == k.shape == v.shape == (n, cfg.num_attention_heads, kv_head_dim)
+    for t in (q, k, v):
+        assert torch.equal(t[..., cfg.head_dim:], torch.zeros_like(t[..., cfg.head_dim:]))
+    ref = attn.forward(x[None], cos, sin, causal=True)[0]
+    torch.testing.assert_close(pooled, ref, atol=1e-4, rtol=1e-4)
