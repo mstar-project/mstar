@@ -71,10 +71,18 @@ class _FakeQueue:
 
 
 class _FakeRuntime:
-    """The runtime owns the (walk, node) -> worker graph index now."""
+    """The runtime owns the (walk, node) -> worker graph index and the
+    graph-level ready scan now."""
 
     def get_worker_graph_id_for_node(self, node_name, graph_walk):
         return "wg0"
+
+    def has_ready_excluding(self, exclude_rids, exclude_target=None):
+        # Pure TP follower: no locally-initiated work, matching _FakeQueue.
+        return False
+
+    def get_ready_nodes(self, exclude_rids, target=None, exclude_target=None):
+        return []
 
 
 class _FakeWorkerGraphsManager:

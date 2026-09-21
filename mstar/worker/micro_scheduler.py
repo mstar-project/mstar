@@ -329,11 +329,6 @@ class MicroScheduler:
         if sched_from_backlog is not None:
             return sched_from_backlog
 
-        if target is not None:
-            target_node_name, target_graph_walk = target
-        else:
-            target_node_name, target_graph_walk = None, None
-
         # Collect all ready (node_name, rid, graph_walk) tuples
         # grouped by node name
         node_name_to_requests: dict[str, list[ReadyNodeEntry]] = {}
@@ -355,37 +350,30 @@ class MicroScheduler:
             self.num_consec_tp_follower_batches += 1
             return tp_follow_batch
 
-        for worker_graph_id, queue in worker_graphs_manager.queues.items():
-            ready_map = queue.get_ready_node_names()
-            for rid, node_names in ready_map.items():
-                if (
-                    rid not in worker_graphs_manager.per_request_info
-                ) or rid in self.pending_removes or (
-                    rid in self.held_until
-                ) or rid in self.failed_rids:
-                    # Do not want to schedule if: request was removed between
-                    # scheduling cycles, remove deferred for in-flight safety,
-                    # request in OOM backoff, or request recently failed
+        # Do not schedule a request that was removed between scheduling
+        # cycles, has its remove deferred for in-flight safety, is in OOM
+        # backoff, or recently failed.
+        exclude = self.pending_removes | set(self.held_until) | self.failed_rids
+        for spec in self.runtime.get_ready_nodes(
+            exclude, target=target, exclude_target=exclude_target,
+        ):
+            if spec.node_name not in self.parallel_leader_nodes:
+                continue  # only rank 0 can initiate scheduling!
+            node_partition = worker_graphs_manager.get_partition_for_node(
+                spec.node_name
+            )
+            wg_id = self.runtime.get_worker_graph_id_for_node(
+                spec.node_name, spec.graph_walk,
+            )
+            for rid in spec.rids:
+                fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
+                # check if the node is ready on the engine level
+                # (e.g., for AR, whether the kv cache is read in)
+                if not self._check_ready(spec.node_name, rid, fwd_info):
                     continue
-                for sname in node_names:
-                    if sname not in self.parallel_leader_nodes:
-                        continue # only rank 0 can initiate scheduling!
-                    if target_node_name is not None and sname != target_node_name:
-                        continue
-                    node_partition = worker_graphs_manager.get_partition_for_node(sname)
-                    graph_walk = worker_graphs_manager.get_graph_walk(rid, node_partition)
-                    if target_graph_walk is not None and graph_walk != target_graph_walk:
-                        continue
-                    if exclude_target is not None and (sname, graph_walk) == exclude_target:
-                        continue
-                    fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
-                    # check if the node is ready on the engine level
-                    # (e.g., for AR, whether the kv cache is read in)
-                    if not self._check_ready(sname, rid, fwd_info):
-                        continue
-                    node_name_to_requests.setdefault(sname, []).append(
-                        ReadyNodeEntry(rid, worker_graph_id, graph_walk)
-                    )
+                node_name_to_requests.setdefault(spec.node_name, []).append(
+                    ReadyNodeEntry(rid, wg_id, spec.graph_walk)
+                )
 
         if not node_name_to_requests:
             return None
@@ -649,29 +637,30 @@ class MicroScheduler:
             pend: ScheduleTPNode = self.tp_batches_pending_schedule[0]
             if (pend.node_name, pend.graph_walk) != exclude_target:
                 tp_pend_rids = set(self.tp_rids(pend))
-        now = time.monotonic()
         # Don't bother expiring held_until here — we only read it; the next
         # get_next_batch call will refresh.
-        for _worker_graph_id, queue in worker_graphs_manager.queues.items():
-            ready_map = queue.get_ready_node_names()
-            for rid, node_names in ready_map.items():
-                if rid not in worker_graphs_manager.per_request_info:
-                    continue
-                if rid in self.held_until and self.held_until[rid] > now:
-                    continue
-                if rid in self.failed_rids and rid not in tp_pend_rids:
-                    continue
+        now = time.monotonic()
+        exclude = {
+            rid for rid in self.failed_rids if rid not in tp_pend_rids
+        } | {
+            rid for rid, t in self.held_until.items() if t > now
+        }
 
-                for sname in node_names:
-                    node_partition = worker_graphs_manager.get_partition_for_node(sname)
-                    graph_walk = worker_graphs_manager.get_graph_walk(
-                        rid, node_partition,
-                    )
-                    if exclude_target is not None and (sname, graph_walk) == exclude_target:
-                        continue
-                    fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
-                    if not self._check_ready(sname, rid, fwd_info):
-                        continue
+        # Graph readiness is necessary but not sufficient, so a False here is
+        # final and skips the engine pass.
+        if not self.runtime.has_ready_excluding(exclude, exclude_target):
+            return False
+        for spec in self.runtime.get_ready_nodes(
+            exclude, exclude_target=exclude_target,
+        ):
+            node_partition = worker_graphs_manager.get_partition_for_node(
+                spec.node_name
+            )
+            for rid in spec.rids:
+                fwd_info = worker_graphs_manager.get_fwd_info(
+                    rid, node_partition
+                )
+                if self._check_ready(spec.node_name, rid, fwd_info):
                     return True
         return False
 

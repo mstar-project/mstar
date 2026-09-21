@@ -399,11 +399,6 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
-    def get_loop_stop_times(self, rid: int) -> dict[str, NestedLoopIndices]:
-        """The snapshot this rank has, for putting on the wire."""
-        pass
-
-    @abstractmethod
     def has_pending_loop_stop(
         self, rid: int, graph_walk: str, loop_name: str,
     ) -> bool:

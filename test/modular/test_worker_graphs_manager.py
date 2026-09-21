@@ -228,7 +228,7 @@ def test_stop_loops_snapshots_loop_stop_times_for_the_last_node_run():
         rid, "default", {"ar_loop"}, last_node_run="ar_decode",
     )
     # The snapshot lives on the runtime now, not on the wire-forwarded fwd_info.
-    snapshot = runtime.get_loop_stop_times(rid).get("ar_loop")
+    snapshot = runtime._loop_stop_times(rid).get("ar_loop")
     assert snapshot is not None
     assert snapshot.wg_fwd_pass_idx == fwd_info.fwd_index
     assert snapshot.loop_name_order == ["ar_loop"]
@@ -343,7 +343,7 @@ def test_peer_loop_stop_is_applied_only_when_newer():
     )
     runtime.apply_peer_loop_stops(rid, "default", {"ar_loop": newer})
     assert wgio.loops["ar_loop"]._finish_signal is True
-    assert runtime.get_loop_stop_times(rid)["ar_loop"] is newer
+    assert runtime._loop_stop_times(rid)["ar_loop"] is newer
 
     # An older observation for the same loop is recorded but stops nothing new.
     wgio.loops["ar_loop"]._finish_signal = False
@@ -359,7 +359,7 @@ def test_peer_loop_stop_is_applied_only_when_newer():
 def test_peer_loop_stop_for_an_unknown_partition_is_dropped():
     _mgr, _wg_id, _walk, runtime, rid = _make_manager()
     runtime.apply_peer_loop_stops(rid, "no_such_partition", {"ar_loop": None})
-    assert runtime.get_loop_stop_times(rid) == {}
+    assert runtime._loop_stop_times(rid) == {}
 
 
 def test_pending_loop_stops_are_recorded_and_live_one_iteration():

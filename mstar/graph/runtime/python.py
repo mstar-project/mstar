@@ -327,18 +327,61 @@ class PythonGraphRuntime(GraphRuntime):
     ) -> PopRidsOutput | None:
         raise NotImplementedError
 
+    def _scan_ready(
+        self, exclude_rids: set[int],
+        target: tuple[str, str] | None,
+        exclude_target: tuple[str, str] | None,
+    ):
+        """Every (node, walk, rid) whose graph inputs are satisfied.
+
+        Graph level only -- engine readiness (is the KV cache read in?) is the
+        caller's to apply, because it can fail a request, which is a scheduling
+        decision rather than a graph one.
+        """
+        target_node, target_walk = target if target is not None else (None, None)
+        for queue in self._queues.values():
+            for rid, node_names in queue.get_ready_node_names().items():
+                if rid in exclude_rids or rid not in self._request_info:
+                    continue
+                for node_name in node_names:
+                    if target_node is not None and node_name != target_node:
+                        continue
+                    partition = self._node_to_partition.get(node_name)
+                    if partition is None:
+                        continue
+                    walk = self.get_walk(rid, partition)
+                    if target_walk is not None and walk != target_walk:
+                        continue
+                    if exclude_target is not None \
+                            and (node_name, walk) == exclude_target:
+                        continue
+                    yield node_name, walk, rid
+
     def has_ready_excluding(
         self, exclude_rids: set[int],
         exclude_target: tuple[str, str] | None = None,
     ) -> bool:
-        raise NotImplementedError
+        # Stops at the first match instead of building the full list. Graph
+        # readiness is a necessary condition for schedulability, so a False
+        # here lets the caller skip its engine-level pass entirely.
+        for _ in self._scan_ready(exclude_rids, None, exclude_target):
+            return True
+        return False
 
     def get_ready_nodes(
         self, exclude_rids: set[int],
         target: tuple[str, str] | None = None,
         exclude_target: tuple[str, str] | None = None,
     ) -> list[ReadyNodeSpec]:
-        raise NotImplementedError
+        grouped: dict[tuple[str, str], list[int]] = {}
+        for node_name, walk, rid in self._scan_ready(
+            exclude_rids, target, exclude_target,
+        ):
+            grouped.setdefault((node_name, walk), []).append(rid)
+        return [
+            ReadyNodeSpec(node_name, walk, rids)
+            for (node_name, walk), rids in grouped.items()
+        ]
 
     def push_back_node(
         self, node_name: str,
@@ -436,7 +479,7 @@ class PythonGraphRuntime(GraphRuntime):
                     body=StopLoops(
                         request_id=self.get_rid_string(rid),
                         loop_names=names,
-                        loop_stop_times=self.get_loop_stop_times(rid),
+                        loop_stop_times=self._loop_stop_times(rid),
                         partition_name=partition,
                     ),
                 ),
@@ -460,7 +503,9 @@ class PythonGraphRuntime(GraphRuntime):
             # took the snapshot and told everyone.
             self._stop_loops_for_rid(rid, partition, newer, None)
 
-    def get_loop_stop_times(self, rid: int) -> dict[str, NestedLoopIndices]:
+    def _loop_stop_times(self, rid: int) -> dict[str, NestedLoopIndices]:
+        """Only ever read to build the STOP_LOOPS this runtime sends, so it
+        stays off the contract."""
         return self._request_info[rid].loop_stop_times
 
     def has_pending_loop_stop(
