@@ -218,7 +218,7 @@ def test_the_engine_hands_each_cache_the_walks_its_streams_name():
         def prefix_key_streams(self):
             return {KV: {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}}
 
-    kv = _kv()
+    kv = _kv(prefix_cache_salt="deployment")
     _root(kv=kv, model=_Declaring())
 
     assert kv._keyed_walks == {"main": {"prefill_text", "decode"}}, (

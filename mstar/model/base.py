@@ -399,9 +399,10 @@ class Model(ABC):
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.
 
-        The prefix cache hashes the checkpoint's manifest into its root, so a
-        model that does not name one is never matched against pages another
-        build of it wrote. Not every model resolves a local snapshot.
+        The prefix cache hashes the checkpoint's manifest into its root. The
+        default leaves the weights out of the root, so two builds that differ
+        only in weights would share keys, which is why the cache stays shut
+        until the model names a checkpoint or the deployment sets a salt.
         """
         return None
 

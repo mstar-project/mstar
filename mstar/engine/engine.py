@@ -545,6 +545,16 @@ class Engine:
                     stream.walk for stream in by_label.values()
                 )
         for key, resource in self._resources.items():
+            if checkpoint is None and declared.get(key):
+                config = specs_by_key[key].config
+                if config.prefix_cache and not config.prefix_cache_salt:
+                    logger.info(
+                        "KV %s: prefix cache off: %s names no checkpoint, so "
+                        "builds that differ only in their weights cannot be "
+                        "told apart; set prefix_cache_salt to enable it",
+                        key, self._prefix_model,
+                    )
+                    continue
             # its own, then its dependents' in key order, so the root does not
             # move with the order the engine happened to build them in
             parts = [resource.fingerprint()]
