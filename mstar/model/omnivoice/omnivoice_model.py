@@ -219,7 +219,13 @@ class OmniVoiceModel(Model):
         )
 
     def _ensure_data_worker_assets(self):
-        """Load the tokenizer and duration estimator on first use."""
+        """Load the tokenizer and duration estimator on first use.
+
+        The checkpoint's config is read here too. The data worker never builds
+        a submodule, so it would otherwise keep this file's generation
+        defaults while the compute workers run the checkpoint's, and
+        ``process_prompt`` reads ``denoise`` from them.
+        """
         if self.tokenizer is not None:
             return
         from transformers import AutoTokenizer
@@ -230,6 +236,28 @@ class OmniVoiceModel(Model):
         from omnivoice.utils.duration import RuleDurationEstimator
 
         self._duration_estimator = RuleDurationEstimator()
+        self._refresh_from_checkpoint_config()
+
+    def _refresh_from_checkpoint_config(self) -> None:
+        """Pull the checkpoint's config without loading any weights."""
+        from transformers import AutoConfig
+
+        try:
+            config = AutoConfig.from_pretrained(
+                self.model_path_hf, cache_dir=self.cache_dir,
+                trust_remote_code=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A config this loader cannot parse is not fatal on the data
+            # worker: the defaults in config.py still produce valid requests,
+            # and the compute worker reads the real thing when it loads the
+            # weights.
+            logger.warning(
+                "OmniVoice: could not read the checkpoint config on the data "
+                "worker (%s); using the defaults in config.py.", exc,
+            )
+            return
+        self._refresh_checkpoint_defaults(config)
 
     def _estimate_target_tokens(
         self,

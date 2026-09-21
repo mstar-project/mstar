@@ -401,14 +401,14 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
     def _step_generator(
         request_info: CurrentForwardPassInfo, k: int, device: torch.device
     ) -> torch.Generator | None:
-        """The request's RNG for iteration ``k``, or ``None`` when unseeded.
+        """The request's RNG for iteration ``k``.
 
-        Seed 0 is the conductor's default and means "nobody asked", so it is
-        left on the global RNG rather than pinned to one fixed stream for
-        every request.
+        The conductor derives a seed per request, so this is normally always
+        set and the fallback is only for a caller that drives the submodule
+        without one.
         """
-        seed = getattr(request_info, "random_seed", 0) or 0
-        if not seed:
+        seed = getattr(request_info, "random_seed", None)
+        if seed is None:
             return None
         generator = torch.Generator(device=device)
         generator.manual_seed((int(seed) + k) & 0x7FFF_FFFF_FFFF_FFFF)
