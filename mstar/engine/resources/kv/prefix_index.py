@@ -23,8 +23,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import PageArena
 
-_NO_PARENT = -1
-
 
 class PrefixIndex:
     def __init__(self, arena: "PageArena") -> None:
@@ -32,7 +30,7 @@ class PrefixIndex:
         self._arena = arena
         self._by_key: dict[bytes, int] = {}
         self._key: list[bytes | None] = [None] * num_pages
-        self._parent: list[int] = [_NO_PARENT] * num_pages
+        self._parent: list[int | None] = [None] * num_pages
         self._children: list[int] = [0] * num_pages
         self._stamp: list[int] = [0] * num_pages
         self._leaves: list[tuple[int, int]] = []
@@ -57,9 +55,7 @@ class PrefixIndex:
 
     def insert(self, key: bytes, page: int, parent: int | None = None) -> bool:
         """Name ``page`` by ``key`` under ``parent``; the first writer wins."""
-        if parent is None:
-            parent = _NO_PARENT
-        assert parent == _NO_PARENT or self._key[parent] is not None, (
+        assert parent is None or self._key[parent] is not None, (
             f"page {page} indexed under parent page {parent}, which the index "
             "does not hold; a parent must outlive its children"
         )
@@ -73,7 +69,7 @@ class PrefixIndex:
         self._stamp[page] = self._clock
         self._arena.seal([page])
         self._arena.retain([page])
-        if parent != _NO_PARENT:
+        if parent is not None:
             self._children[parent] += 1
         heapq.heappush(self._leaves, (self._clock, page))
         return True
@@ -124,9 +120,9 @@ class PrefixIndex:
         del self._by_key[self._key[page]]
         self._key[page] = None
         parent = self._parent[page]
-        self._parent[page] = _NO_PARENT
+        self._parent[page] = None
         self._arena.release([page])
-        if parent != _NO_PARENT:
+        if parent is not None:
             self._children[parent] -= 1
             if self._children[parent] == 0 and self._key[parent] is not None:
                 heapq.heappush(self._leaves, (self._stamp[parent], parent))
