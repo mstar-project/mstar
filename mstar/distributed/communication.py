@@ -301,6 +301,40 @@ class CommGroup:
             return torch.ops.symm_mem.one_shot_all_reduce(buf, "sum", name)
         return torch.ops.symm_mem.two_shot_all_reduce_(buf, "sum", name)
 
+    def all_reduce_is_nccl(self, shape, dtype: torch.dtype, device: torch.device) -> bool:
+        """Whether :meth:`all_reduce` of this shape would run NCCL's kernel (no Lamport channel, too
+        large for the symmetric-memory buffers): the sizes at which a producer that needs only its own
+        columns of the sum is better off with :meth:`reduce_scatter_stacked`."""
+        if self.world_size == 1:
+            return False
+        if device.type != "cuda" or not self._symm_available():
+            return True
+        if self.lamport_applies(shape, dtype, device):
+            return False
+        numel = 1
+        for d in shape:
+            numel *= int(d)
+        return numel * torch.empty((), dtype=dtype).element_size() > self._symm_max_bytes
+
+    def reduce_scatter_stacked(self, stacked: torch.Tensor) -> torch.Tensor:
+        """``stacked [world_size, ...]`` (contiguous): the sum over the group of every rank's
+        ``stacked``, this rank receiving chunk ``self.rank`` of it, ``[...]``. Half of an all-reduce
+        whose result is then sliced (each byte moves once); the caller lays its chunks out along the
+        leading dim, so nothing is copied here."""
+        if self.world_size == 1:
+            return stacked[0]
+        assert stacked.shape[0] == self.world_size and stacked.is_contiguous(), stacked.shape
+        out = torch.empty(stacked.shape[1:], dtype=stacked.dtype, device=stacked.device)
+        dist.reduce_scatter_tensor(out, stacked, group=self.device_group)
+        return out
+
+    def all_reduce_plain(self, input_: torch.Tensor) -> torch.Tensor:
+        """Sum ``input_`` in place over NCCL, whatever its shape or dtype: for small statistics (fp32 row
+        sums) whose shapes change from step to step, which must not each get a symmetric-memory ring."""
+        if self.world_size > 1:
+            dist.all_reduce(input_, group=self.device_group)
+        return input_
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """Sum ``input_`` across the group. Use the returned tensor: NCCL reduces in place,
         the symmetric-memory path returns a reduced tensor of its own."""
