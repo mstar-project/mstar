@@ -17,7 +17,16 @@ from mstar.engine.resources import (
     SamplingReqConfig,
     resolve_spec_dependencies,
 )
-from mstar.model.nemotron_duplex.config import NANO_ATTN, NANO_KV, NANO_SAMPLER, NemotronDuplexConfig
+from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttnVariant
+from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateSpec
+from mstar.model.nemotron_duplex.config import (
+    MAMBA,
+    MAMBA_STATE,
+    NANO_ATTN,
+    NANO_KV,
+    NANO_SAMPLER,
+    NemotronDuplexConfig,
+)
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.streaming.chunk_policy import FixedChunkPolicy
@@ -47,14 +56,29 @@ def test_duplex_declares_all_walks_and_nodes():
 
 
 def test_duplex_node_resources():
-    """Only the nano declares resources: a paged KV over its 4 attention layers,
-    attention planned on it (NoPE: no position resource) and one text sampler.
-    The other three nodes own no engine resource."""
+    """Only the nano declares resources: a paged KV over its 4 attention layers
+    with attention planned on it (NoPE: no position resource), a recurrent pool
+    holding the 27 Mamba-2 layers' conv + SSM state with the Mamba-2 resource
+    planned on it, and one text sampler. The other three nodes own no engine
+    resource."""
     model = _make_model()
     specs = model.get_node_resources()
     by_key = resolve_spec_dependencies(specs)          # unique keys, dependencies satisfied
-    assert set(by_key) == {NANO_KV, NANO_ATTN, NANO_SAMPLER}
+    assert set(by_key) == {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER}
     assert all(spec.nodes == {"nano_llm"} for spec in specs)
+
+    nano = model.config.nano
+    pool = by_key[MAMBA_STATE]
+    assert isinstance(pool, RecurrentStateSpec)
+    assert pool.config.num_layers == nano.num_mamba_layers == 27
+    geom = Mamba2Geometry.from_blocks(pool.config.blocks)
+    dims = (geom.num_heads, geom.head_dim, geom.state_size, geom.n_groups, geom.conv_kernel_size)
+    assert dims == (128, 80, 128, 8, 4)
+    assert pool.config.blocks["ssm"].dtype is torch.float32 and pool.config.blocks["conv"].shape == (12288, 3)
+    assert pool.config.usable_slots == model.DEFAULT_MAMBA_SLOTS
+    mamba = by_key[MAMBA]
+    assert isinstance(mamba, LinearAttnSpec) and mamba.config.variant is LinearAttnVariant.MAMBA2
+    assert mamba.config.recurrent_state == MAMBA_STATE and mamba.depends_on() == {MAMBA_STATE}
 
     kv = by_key[NANO_KV]
     assert isinstance(kv, KVSpec)
