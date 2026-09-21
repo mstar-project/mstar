@@ -248,5 +248,6 @@ Worker scheduling
      - ``0``
      - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
        ``remove_request``, check the KV page bookkeeping (free list, owner
-       counts, seals) against the streams holding the pages. Walks every
-       live stream; tests and debugging only.
+       counts, seals) against the streams holding the pages, and log once a
+       request where a TP follower's prefix match differs from rank 0's.
+       Walks every live stream; tests and debugging only.

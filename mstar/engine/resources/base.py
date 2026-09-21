@@ -116,6 +116,14 @@ class Resource(ABC):
         """Take this step's sampled tokens, so what was generated can be keyed."""
         return
 
+    def matched_prefix(self, rid: str) -> dict[str, int]:
+        """Tokens this resource matched of ``rid``'s prefix, by label.
+
+        Empty where nothing is held across requests, which is what says the
+        ranks of a node have no length to agree on.
+        """
+        return {}
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 

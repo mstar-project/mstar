@@ -595,6 +595,11 @@ class Engine:
                     rid, batch.node_name, walk, per_rid,
                 )
 
+    def matched_prefixes(
+        self, node_name: str, request_id: str,
+    ) -> list[dict[str, int]]:
+        return self._runner.matched_prefixes(request_id, node_name)
+
     def _skip_cached_prefix(
         self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,
     ) -> NodeInputs:

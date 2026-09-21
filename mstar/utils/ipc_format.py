@@ -39,6 +39,7 @@ class WorkerMessageType(Enum):
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
     TP_NO_SPEC = "tp_no_spec"
+    TP_PREFIX_MATCH = "tp_prefix_match"
 
 
 @dataclass
@@ -113,6 +114,16 @@ class TPNoSpeculation(MessageBody):
     node_name: str
     graph_walk: str
     spec_from_seq: int
+
+
+@dataclass
+class TPPrefixMatch(MessageBody):
+    # a follower's reply to rank 0, and the only message a worker sends upward,
+    # so it names the rank that sent it
+    request_id: str
+    node_name: str
+    tp_rank: int
+    matched: dict[str, int]
 
 @dataclass
 class WorkerMessage:

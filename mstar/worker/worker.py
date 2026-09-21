@@ -47,6 +47,7 @@ from mstar.utils.ipc_format import (
     StopLoops,
     TensorReceived,
     TPNoSpeculation,
+    TPPrefixMatch,
     UnpersistTensors,
     WorkerGraphsDone,
     WorkerMessage,
@@ -62,6 +63,11 @@ from mstar.worker.node_manager_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Log how far a follower's prefix match is from the leader's own. Off by
+# default: it re-reads the local resources on every reply, and a gap is what
+# independent indexes are expected to produce.
+_KV_DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
 
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
@@ -304,6 +310,10 @@ class Worker:
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
         self._tp_leader_gap_warned = False
+        # Leader: what each follower's own index matched, by rank, for requests
+        # whose length the group has not settled yet. Dropped at remove.
+        self._tp_prefix_replies: dict[str, dict[int, dict[str, int]]] = {}
+        self._tp_prefix_logged: RecentSet[str] = RecentSet(self._TP_NOSPEC_KEEP)
         tp_async_on = sorted(n for n in self.parallel_nodes if self._tp_async_for(n))
         if tp_async_on:
             logger.info(
@@ -439,6 +449,7 @@ class Worker:
         self.engine_manager.add_request(
             body.request_id, body.request_info.resource_configs,
         )
+        self._report_prefix_match(body.request_id)
         self.tensor_manager.register_request(
             body.request_id,
             self.worker_graphs_manager.per_request_info[body.request_id].sharding_config
@@ -521,6 +532,7 @@ class Worker:
         self._draining_rids.discard(body.request_id)
         self._pending_drains.discard(body.request_id)
         self._reads_done_sent.discard(body.request_id)
+        self._tp_prefix_replies.pop(body.request_id, None)
         self.engine_manager.remove_request(body.request_id)
         self.worker_graphs_manager.remove_request(body.request_id)
         self.tensor_manager.force_cleanup_request(body.request_id)
@@ -719,7 +731,10 @@ class Worker:
         msg_types_needing_active_request = [
             WorkerMessageType.REMOVE_REQUEST,
             WorkerMessageType.INPUT_SIGNALS,
-            WorkerMessageType.STOP_LOOPS
+            WorkerMessageType.STOP_LOOPS,
+            # a follower ingests on its own NewRequest, so its reply can beat
+            # rank 0's
+            WorkerMessageType.TP_PREFIX_MATCH,
         ]
         # Snapshot: a REMOVE handled mid-iteration can re-buffer trailing
         # signals onto this same list, and mutating it while iterating it would
@@ -752,6 +767,8 @@ class Worker:
                 self._register_tp_follow(message.body)
             elif message.message_type == WorkerMessageType.TP_NO_SPEC:
                 self._register_tp_nospec(message.body)
+            elif message.message_type == WorkerMessageType.TP_PREFIX_MATCH:
+                self._record_prefix_match(message.body)
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())
@@ -1004,6 +1021,62 @@ class Worker:
                 slot=0,
                 capture=False,
             ),
+        )
+
+    def _report_prefix_match(self, request_id: str) -> None:
+        """Tell rank 0 what this rank's index matched for ``request_id``.
+
+        A page is keyed on each rank's own postprocess path, so at any instant
+        one rank holds a page another has not keyed yet, and only a length
+        rank 0 works out from all of them is one every rank can skip.
+        """
+        cfg = self.worker_graphs_manager.per_request_info.get(request_id)
+        if cfg is None:
+            return
+        for node_name in self.parallel_nodes - self.parallel_leader_nodes:
+            partition = self.worker_graphs_manager.get_partition_for_node(node_name)
+            walk = self.worker_graphs_manager.get_graph_walk(request_id, partition)
+            group = cfg.sharding_config.get_sharding_group(node_name, walk)
+            if group is None:
+                continue
+            engine = self.engine_manager.get_engine(node_name)
+            for matched in engine.matched_prefixes(node_name, request_id):
+                self.communicator.send(
+                    group._workers[0], msg=WorkerMessage(
+                        message_type=WorkerMessageType.TP_PREFIX_MATCH,
+                        body=TPPrefixMatch(
+                            request_id=request_id,
+                            node_name=node_name,
+                            tp_rank=group._tp_rank,
+                            matched=matched,
+                        )
+                    )
+                )
+
+    def _record_prefix_match(self, body: TPPrefixMatch) -> None:
+        """Keep a follower's matched length until the group settles on one."""
+        self._tp_prefix_replies.setdefault(body.request_id, {})[
+            body.tp_rank
+        ] = body.matched
+        if _KV_DEBUG_ASSERTS:
+            self._log_prefix_match_gap(body)
+
+    def _log_prefix_match_gap(self, body: TPPrefixMatch) -> None:
+        """Say how far this rank's match is from the one that replied, which
+        is the number that says how far the indexes drift apart."""
+        if body.request_id in self._tp_prefix_logged:
+            return
+        engine = self.engine_manager.get_engine(body.node_name)
+        mine: dict[str, int] = {}
+        for matched in engine.matched_prefixes(body.node_name, body.request_id):
+            mine.update(matched)
+        if mine == body.matched:
+            return
+        self._tp_prefix_logged.add(body.request_id)
+        logger.info(
+            "Worker %s: request %s on %s matched %s here and %s on rank %d",
+            self.worker_id, body.request_id, body.node_name,
+            mine, body.matched, body.tp_rank,
         )
 
     def maybe_send_zmq_to_tp_followers(

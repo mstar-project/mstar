@@ -408,6 +408,21 @@ class KVManager(AttentionResource):
                 return
             self._trim_lease(stream, matched_len)
 
+    def matched_prefix(self, rid: str) -> dict[str, int]:
+        """Tokens the probe at ingest matched for ``rid``, by keyed label.
+
+        The lease, not the agreed length: this is what this rank brings to the
+        agreement rather than what came out of it.
+        """
+        if self._index is None:
+            return {}
+        with self._lock:
+            return {
+                label: len(stream.lease or ()) * self.config.page_size
+                for label, stream in self._streams.get(rid, {}).items()
+                if stream.keys
+            }
+
     def _take_lease(self, stream: CacheStream, rooted: list[bytes]) -> int:
         # the chain has ceil(seq_len / page_size) keys and only a full page
         # is ever indexed, so stopping one key short leaves the request at

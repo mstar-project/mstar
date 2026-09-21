@@ -140,6 +140,15 @@ class StepRunner:
                 rid, node_name, graph_walk, outputs,
             )
 
+    def matched_prefixes(self, rid: str, node_name: str) -> list[dict[str, int]]:
+        """One entry a resource, not one merged answer: two caches on a node
+        match their own lengths and agree them separately."""
+        return [
+            matched
+            for key in self._sweep(self._node_order, self._order, node_name)
+            if (matched := self._resources[key].matched_prefix(rid))
+        ]
+
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
 
