@@ -372,7 +372,7 @@ class PreprocessWorkerThread:
                 tensors=tensors,
                 input_metadata=input_metadata,
                 prompt_parts=input.prompt_parts,
-                **(input.model_kwargs or {}),
+                **model_kwargs,
             )
             if isinstance(prompt_tensors, ProcessPromptOutput):
                 model_kwargs.update(prompt_tensors.metadata)
