@@ -1458,8 +1458,14 @@ impl GraphRuntime {
         spec_nodes
             .into_iter()
             .filter(|sn| {
-                self.async_checker
-                    .can_speculate(g.node(source).name, g.node(sn.node).name)
+                // The DESTINATION opts out of async scheduling. Mirrors the
+                // source-side check the caller already made; without it a
+                // structurally ineligible destination is picked here and then
+                // dropped per rid.
+                g.node(sn.node).async_enabled
+                    && self.async_checker.can_speculate(
+                        g.node(source).name, g.node(sn.node).name,
+                    )
             })
             .map(|sn| self.spec_output(&g, graph_walk, &sn))
             .collect()

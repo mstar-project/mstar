@@ -489,3 +489,70 @@ def test_removal_purges_routing_parked_for_a_send_that_never_ran(pair):
         else rt._rust.num_parked_completions()
     )
     assert parked == 0, f"{parked} completions left parked"
+
+
+def _graph_target_opts_out():
+    """Same shape, but the speculation TARGET refuses async scheduling.
+
+    The main fixture has every node async-enabled, so it cannot tell the
+    source-side check from the destination-side one -- they agree on every
+    input it produces.
+    """
+    return Sequential(sections=[
+        GraphNode(
+            name="prefill", input_names={"prompt"},
+            outputs=[
+                GraphEdge(name="token", next_node="ar_decode"),
+                GraphEdge(name="kv_cache", next_node="ar_decode"),
+            ],
+        ),
+        Loop(
+            name="ar_loop",
+            section=GraphNode(
+                name="ar_decode", input_names={"token", "kv_cache"},
+                enable_async_scheduling=False,
+                outputs=[
+                    GraphEdge(name="token", next_node="ar_decode"),
+                    GraphEdge(name="kv_cache", next_node="ar_decode"),
+                ],
+            ),
+            outputs=[GraphEdge(name="token", next_node="post_processor")],
+            max_iters=4,
+        ),
+    ])
+
+
+@pytest.fixture(params=["python", "rust"])
+def opted_out(request):
+    wg = WorkerGraph(
+        section=_graph_target_opts_out(), graph_walks={WALK}, ranks=[0],
+        worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: {"ar_loop"}},
+        all_wg_ids_to_nodes={WG_ID: NODES},
+        node_to_partition=dict.fromkeys(NODES, "default"),
+        sharding_config=_sharding(),
+    )
+    if request.param == "python":
+        book = PythonTensorBookkeeping()
+        return PythonGraphRuntime(
+            tensor_manager=_StubTensorManager(book), communicator=None,
+            **common,
+        )
+    return rust_runtime.RustGraphRuntime(
+        bookkeeping=RustTensorBookkeeping(), **common,
+    )
+
+
+def test_a_target_that_refuses_async_is_never_speculated(opted_out):
+    """``enable_async_scheduling=False`` on the DESTINATION.
+
+    Rust only consulted the source's flag, and the source is already filtered
+    by the caller -- so the real check was missing and a node that opted out
+    got speculated into, to be dropped again per rid.
+    """
+    rid = _admit(opted_out)
+    assert opted_out.speculate_node("prefill", WALK, rid) == []

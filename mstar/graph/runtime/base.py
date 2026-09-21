@@ -5,6 +5,7 @@ from typing import NamedTuple
 
 from mstar.communication.tensors import TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.distributed.base import ShardingConfig
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.utils.containers import ParallelList
 
@@ -220,6 +221,10 @@ class GraphRuntime(ABC):
         clear_rid), Worker.{_last_active, _pending_removes,
         _pending_loop_stops}, and the tensor manager's per-request maps.
         """
+        pass
+
+    @abstractmethod
+    def get_sharding_config(self, rid: int) -> ShardingConfig | None:
         pass
 
     # --------- rid <-> handle, at the process boundary ----------

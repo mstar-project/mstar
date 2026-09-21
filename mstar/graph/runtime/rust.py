@@ -256,7 +256,19 @@ class RustGraphRuntime(GraphRuntime):
         )
 
     def remove_request(self, rid: int):
+        # Handles are recycled, so anything left keyed by this one attaches to
+        # a DIFFERENT request later. These four are only drained when a worker
+        # graph completes; a request aborted between the route and that
+        # completion would otherwise leak its persist signals and token counts
+        # onto some future request's first WORKER_GRAPHS_DONE.
+        self._pending_persist.pop(rid, None)
+        self._pending_new_tokens.pop(rid, None)
+        self._buffered_outputs.pop(rid, None)
+        self._output_loop_indices.pop(rid, None)
         self._rust.remove_request(rid)
+
+    def get_sharding_config(self, rid: int) -> ShardingConfig | None:
+        pass # TODO
 
     def get_rid_string(self, handle: int) -> str:
         return self._rust.get_rid_string(handle)
