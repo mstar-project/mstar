@@ -4,9 +4,15 @@ The served path batches concurrent requests at the same shape in every node: the
 stacks prompts into ``[B, 512]``, the denoise loop steps ``[B, L, C]``, the VAE decodes
 ``[B, C, H, W]``. A request's row inside such a batch must equal the same request alone, or a
 row-mixing bug / padding leak would silently change images under load. Rows here carry different
-prompts and seeds. The SDPA/eager path is used, so the comparison is between kernels that see
-each row independently; the printed numbers (max abs per stage, PSNR per image) are the
-measurement, the assertions are the contract (embeddings within bf16 rounding, images >= 40 dB).
+prompts and seeds; the SDPA/eager path is used.
+
+Two contracts. (1) Row independence: the same rows in another order, at the same batch size,
+must reproduce every row bit for bit — the same kernels run, so any difference is a cross-row
+leak (padding rows, spans, stacked scalars). (2) Batch size: a row inside a batch of four vs the
+row alone is reported per stage and per image; cuBLAS / cuDNN may pick other algorithms for
+another M (klein-4B measured bit-exact; Z-Image's dit differs from step 0 and lands near 39 dB
+after 8 steps with no leak), so this one is asserted only as a gross-error bound (>= 30 dB) and
+the printed numbers are the measurement.
 
 Skips without CUDA or without the checkpoint (``FLUX2_KLEIN_REPO``, default 4B) in the HF cache.
 Run with ``NVIDIA_TF32_OVERRIDE=0 CUBLAS_WORKSPACE_CONFIG=:4096:8`` for repeatable kernels.
@@ -38,7 +44,8 @@ PROMPTS = (
 SEEDS = (0, 1, 2, 3)
 HEIGHT = WIDTH = 1024
 STEPS = 4
-MIN_PSNR_DB = 40.0
+MIN_PSNR_DB = 40.0        # exactness contracts (row independence, VAE)
+MIN_BATCH_PSNR_DB = 30.0  # gross-error bound for the batch-size comparison (see the docstring)
 
 
 def _hf_cache_has_checkpoint() -> bool:
@@ -107,7 +114,7 @@ def _encode(model, subs, batched: bool) -> list[torch.Tensor]:
                 [TEXT_EMBEDS][0] for i, (i_ids, i_mask) in enumerate(zip(ids, masks, strict=True))]
 
 
-def _trajectory(subs, embeds: list[torch.Tensor], prefix: str, batched: bool) -> list[list[torch.Tensor]]:
+def _trajectory(subs, embeds: list[torch.Tensor], prefix: str, batched: bool, seeds=SEEDS) -> list[list[torch.Tensor]]:
     """Latents after every step for each row: ``[step][row]``; one stacked forward per step or one per row."""
     dit = subs["dit"]
     rids = [f"{prefix}{i}" for i in range(len(embeds))]
@@ -120,7 +127,7 @@ def _trajectory(subs, embeds: list[torch.Tensor], prefix: str, batched: bool) ->
                 inputs = {TEXT_EMBEDS: [embeds[i]]}
                 if latents[i] is not None:
                     inputs[LATENTS] = [latents[i]]
-                rows.append(dit.prepare_inputs(IMAGE_GEN_WALK, _info(rid, k, SEEDS[i]), inputs))
+                rows.append(dit.prepare_inputs(IMAGE_GEN_WALK, _info(rid, k, seeds[i]), inputs))
             if batched:
                 kwargs = dit.preprocess(IMAGE_GEN_WALK, _eng(rids), rows)
                 out = dit.forward_batched(IMAGE_GEN_WALK, _eng(rids), **kwargs)
@@ -169,16 +176,29 @@ def test_text_encoder_rows_match_single_requests(model, subs, single):
         torch.testing.assert_close(b, s, rtol=1e-2, atol=1e-2)
 
 
+def test_denoise_rows_are_independent_of_their_neighbours(subs, single):
+    """Same batch size, rows in another order: every row must come back bit for bit."""
+    perm = [3, 1, 0, 2]
+    embeds = single["embeds"]
+    straight = _trajectory(subs, embeds, "o", batched=True)
+    shuffled = _trajectory(subs, [embeds[j] for j in perm], "p", batched=True, seeds=[SEEDS[j] for j in perm])
+    for k, (a, b) in enumerate(zip(straight, shuffled, strict=True)):
+        worst = max(_max_abs(a[j], b[perm.index(j)]) for j in range(len(perm)))
+        print(f"dit step {k}, permuted batch vs batch: max_abs={worst:.3e}")
+        for j in range(len(perm)):
+            assert torch.equal(a[j], b[perm.index(j)]), f"step {k}: row {j} depends on its neighbours"
+
+
 def test_denoise_rows_match_single_requests(model, subs, single):
     steps = _trajectory(subs, single["embeds"], "b", batched=True)
     for k, (batched_rows, single_rows) in enumerate(zip(steps, single["steps"], strict=True)):
-        worst = max(_max_abs(b, s) for b, s in zip(batched_rows, single_rows, strict=True))
-        print(f"dit step {k}, batch of {len(PROMPTS)} vs alone: max_abs={worst:.3e}")
+        per_row = [f"{_max_abs(b, s):.1e}" for b, s in zip(batched_rows, single_rows, strict=True)]
+        print(f"dit step {k}, batch of {len(PROMPTS)} vs alone, max_abs per row: {per_row}")
     images = _decode(model, subs, steps[-1], batched=False)
-    for i, (img, ref) in enumerate(zip(images, single["images"], strict=True)):
-        psnr = _psnr(img, ref)
+    psnrs = [_psnr(img, ref) for img, ref in zip(images, single["images"], strict=True)]
+    for i, psnr in enumerate(psnrs):
         print(f"row {i} (seed {SEEDS[i]}): image PSNR batched-trajectory vs alone = {psnr:.2f} dB")
-        assert psnr >= MIN_PSNR_DB, f"row {i}: {psnr:.2f} dB < {MIN_PSNR_DB}"
+    assert min(psnrs) >= MIN_BATCH_PSNR_DB, f"batch-size numerics beyond a kernel-selection effect: {psnrs}"
 
 
 def test_vae_decode_rows_match_single_requests(model, subs, single):
