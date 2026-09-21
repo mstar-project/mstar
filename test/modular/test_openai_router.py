@@ -248,3 +248,40 @@ def test_api_resolves_from_main_module(monkeypatch):
     stub = _StubAPI("bagel")
     monkeypatch.setattr(sys.modules["__main__"], "api_server", stub, raising=False)
     assert router_mod._api() is stub
+
+
+def test_audio_voices_lists_model_voices(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.model.get_voices = lambda: ["tara", "zoe"]
+    stub.model.get_default_voice = lambda: "tara"
+    body = client.get("/v1/audio/voices").json()
+    assert body["object"] == "list" and body["default_voice"] == "tara"
+    assert body["voices"] == [{"id": "tara", "name": "tara"}, {"id": "zoe", "name": "zoe"}]
+
+
+def test_audio_voices_404_without_a_voice_list(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.model.get_voices = lambda: None
+    stub.model.get_default_voice = lambda: None
+    r = client.get("/v1/audio/voices")
+    assert r.status_code == 404 and "voice list" in r.json()["error"]["message"]
+
+
+def test_audio_voices_404_for_non_speech_model(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    assert client.get("/v1/audio/voices").status_code == 404
+
+
+def test_speech_stream_pcm_has_no_wav_header(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2, 3]))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True, "response_format": "pcm"})
+    assert r.status_code == 200 and r.headers["content-type"].startswith("audio/pcm")
+    assert r.content == _pcm([1, 2, 3])
+    r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True})
+    assert r.headers["content-type"].startswith("audio/wav") and r.content[:4] == b"RIFF"
+    assert r.content[44:] == _pcm([1, 2, 3])

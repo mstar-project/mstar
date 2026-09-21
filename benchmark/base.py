@@ -89,6 +89,11 @@ class Model(ABC):
     def get_supported_modalities(self):
         pass
 
+    def get_served_model_name(self) -> str:
+        """The ``model`` field sent to an OpenAI-compatible server. Defaults to
+        the HF id; a server that only knows a short alias overrides it."""
+        return self.get_hf_url()
+
     def get_tokenizer(self):
         """Lazy-load the model's HF tokenizer for per-chunk re-tokenization in
         ITL aggregation (matches sglang.bench_serving --accept-length path).
@@ -157,6 +162,27 @@ class Orpheus(Model):
 
     def get_supported_modalities(self):
         return {RequestType.T2S}
+
+
+class Kokoro(Model):
+    """Kokoro-82M TTS via ``/v1/audio/speech`` (M* or Kokoro-FastAPI)."""
+
+    def get_hf_url(self):
+        return "hexgrad/Kokoro-82M"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2S}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {"voice": self.config.get("voice", "af_heart")}
+
+    def get_tokenizer(self):
+        # Audio-only output: nothing to re-tokenize, and the checkpoint has no HF tokenizer.
+        return None
+
+    def get_served_model_name(self) -> str:
+        # M* ignores the field; Kokoro-FastAPI accepts only "kokoro" (or OpenAI voice-model aliases).
+        return "kokoro"
 
 
 class Qwen3Omni(Model):
@@ -326,6 +352,7 @@ class HiggsAudio(Model):
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
+    KOKORO = "kokoro"
     QWEN3OMNI = "qwen3omni"
     QWEN3TTS = "qwen3_tts"
     PI05 = "pi05"
@@ -338,6 +365,8 @@ class ModelType(Enum):
             return Bagel(**kwargs)
         if self == ModelType.ORPHEUS:
             return Orpheus(**kwargs)
+        if self == ModelType.KOKORO:
+            return Kokoro(**kwargs)
         if self == ModelType.QWEN3OMNI:
             return Qwen3Omni(**kwargs)
         if self == ModelType.QWEN3TTS:

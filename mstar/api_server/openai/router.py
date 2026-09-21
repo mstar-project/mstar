@@ -108,6 +108,17 @@ async def audio_speech(request: SpeechRequest, raw_request: Request):
         return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
 
 
+@router.get("/v1/audio/voices")
+async def audio_voices():
+    api, model_name, adapter, err = _resolve("supports_speech")
+    if err is not None:
+        return err
+    voices = serving_speech.list_voices(api)
+    if voices is None:
+        return _error(404, f"Model {model_name!r} does not publish a voice list")
+    return JSONResponse(voices.model_dump())
+
+
 @router.post("/v1/images/generations")
 async def images_generations(request: ImageGenerationRequest, raw_request: Request):
     api, model_name, adapter, err = _resolve("supports_images")

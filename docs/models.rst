@@ -28,6 +28,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``cosmos3_super``
      - ``nvidia/Cosmos3-Super``
      - Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.
+   * - ``kokoro``
+     - ``hexgrad/Kokoro-82M``
+     - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
+       decoder, 54 bundled voices and voice blends, sentence-chunked streaming,
+       batched across requests.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
@@ -65,6 +70,49 @@ Notes
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
 - To add a new family, see :doc:`adding_models`.
+
+Kokoro notes
+------------
+
+- Install the G2P dependencies with ``pip install -e '.[kokoro]'`` and fetch the
+  spaCy tagger once with ``python -m spacy download en_core_web_sm`` (misaki does
+  this itself on first use when it has network access). ``pip install 'misaki[en]'``
+  additionally bundles espeak-ng (GPL), which Kokoro uses only as the fallback for
+  out-of-dictionary English words and as the G2P for Spanish, French, Hindi,
+  Italian and Portuguese voices; without it those words are skipped and those
+  languages are unavailable. Japanese and Mandarin voices need ``misaki[ja]`` /
+  ``misaki[zh]``.
+- Serve with ``mstar serve kokoro``. Request knobs: ``voice`` (a bundled voice such
+  as ``af_heart``, or a blend ``af_bella+af_sky`` / ``af_bella(2)+af_sky(1)``),
+  ``speed`` (0.25-4.0), ``lang_code`` (defaults to the voice prefix: ``a`` American
+  English, ``b`` British, ``e`` Spanish, ``f`` French, ``h`` Hindi, ``i`` Italian,
+  ``p`` Portuguese, ``j`` Japanese, ``z`` Mandarin) and ``phonemes`` (skip G2P and
+  synthesize a phoneme string directly).
+- Deployment-wide options go in the YAML's ``model_kwargs`` (see ``configs/kokoro.yaml``):
+  ``lang_code`` fixes the G2P language, ``espeak_fallback: false`` disables the espeak-ng
+  fallback even when it is installed, ``chunk_target_phonemes`` and
+  ``first_chunk_target_phonemes`` set the sentence packing, ``text_buckets``,
+  ``frame_buckets``, ``capture_batch_sizes`` and ``max_batch_frames`` shape the CUDA
+  graphs captured at start-up (fewer buckets on a smaller GPU), ``compile_decoder: false``
+  skips the ``torch.compile`` of the vocoder (start-up in seconds instead of minutes, about
+  half the throughput on an H100) and ``decoder_dtype: bfloat16`` runs the vocoder trunk
+  in bf16 (about 13% more throughput at concurrency 32 in our runs, with the harmonic
+  source and the iSTFT kept in fp32; the parity test covers fp32 only).
+- Text is cut at sentence boundaries into chunks of at most 510 phonemes (the
+  PL-BERT window); each chunk is emitted to the client as soon as it is
+  synthesized, so ``stream=True`` on ``/v1/audio/speech`` returns audio sentence by
+  sentence. The first chunk is kept short so time to first audio is one short
+  synthesis.
+- Output is 24 kHz mono PCM16. The model runs in fp32 by default: its vocoder is
+  phase-sensitive, so reduced precision is opt-in. On CUDA the text half and the
+  frame half of the forward are captured as CUDA graphs per length bucket and the
+  frame half is compiled with dynamic shapes, so the first start-up on a GPU takes
+  about two minutes; rows of one step are grouped by frame bucket
+  (``frame_grouping: single`` pads them into one group instead, kept for comparison).
+- ``examples/livekit_kokoro.py`` and ``examples/pipecat_kokoro.py`` plug the server
+  into LiveKit Agents and Pipecat through their OpenAI TTS plugins (``base_url``
+  pointed at M*, ``response_format="pcm"``); ``GET /v1/audio/voices`` lists the
+  voices for a picker.
 
 Qwen3-TTS notes
 ---------------

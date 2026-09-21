@@ -146,6 +146,12 @@ class MStarClient:
             raise RuntimeError("Server returned no audio output")
         return res.audio
 
+    def voices(self) -> list[str]:
+        """The ``voice`` ids the served speech model accepts (``GET /v1/audio/voices``)."""
+        r = self._session.get(f"{self.base_url}/v1/audio/voices", timeout=self.timeout)
+        r.raise_for_status()
+        return [v["id"] for v in r.json().get("voices", [])]
+
     def health(self) -> bool:
         try:
             r = self._session.get(f"{self.base_url}/health", timeout=10)

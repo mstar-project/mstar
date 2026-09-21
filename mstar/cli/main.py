@@ -28,6 +28,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "cosmos3": "cosmos3_nano.yaml",
     "cosmos3_droid": "cosmos3_droid.yaml",
     "cosmos3_super": "cosmos3_super_tp2.yaml",
+    "kokoro": "kokoro.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
@@ -108,8 +109,9 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("                           raw_action_dim=10, action_chunk_size=16)")
     if model == "qwen3_omni":
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
-    if model in ("orpheus", "qwen3_omni", "qwen3_tts"):
+    if model in ("kokoro", "orpheus", "qwen3_omni", "qwen3_tts"):
         voice = {
+            "kokoro": "af_heart",
             "orpheus": "tara",
             "qwen3_omni": "Ethan",
             "qwen3_tts": "Vivian",
@@ -124,15 +126,15 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    print(res.text)  # transcript")
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
-    if model in ("bagel", "qwen3_omni", "orpheus", "cosmos3", "cosmos3_super"):
+    if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")"]
         if model in ("bagel", "qwen3_omni"):
             lines.append(f"    oai.chat.completions.create(model=\"{model}\", "
                          "messages=[{\"role\":\"user\",\"content\":\"hi\"}])")
-        if model in ("orpheus", "qwen3_omni"):
-            voice = "tara" if model == "orpheus" else "Ethan"
+        if model in ("orpheus", "qwen3_omni", "kokoro"):
+            voice = {"orpheus": "tara", "qwen3_omni": "Ethan", "kokoro": "af_heart"}[model]
             lines.append(f"    oai.audio.speech.create(model=\"{model}\", input=\"hi\", voice=\"{voice}\")")
         if model == "bagel":
             lines.append("    oai.images.generate(model=\"bagel\", prompt=\"a cat\")")

@@ -244,6 +244,18 @@ class PreprocessWorker:
             self.thread.join()
 
 
+def warm_up_model(model) -> None:
+    """Run the model's ``warmup_preprocess`` once; a failure is logged, not
+    fatal, because the same work happens again on the first request."""
+    warm = getattr(model, "warmup_preprocess", None)
+    if model is None or not callable(warm):
+        return
+    try:
+        warm()
+    except Exception:  # noqa: BLE001 — warm-up is best effort
+        logger.exception("model.warmup_preprocess failed; the first request will do the work")
+
+
 class PreprocessWorkerThread:
     def __init__(
         self,
@@ -599,6 +611,7 @@ class PreprocessWorkerThread:
         self.request_model_kwargs.pop(request_id, None)
 
     def run(self):
+        warm_up_model(self.model)
         while not self.stop_event.is_set():
             did_work = False
             try:
