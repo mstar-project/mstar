@@ -50,6 +50,9 @@ def main() -> None:
     ap.add_argument("--warm", type=int, nargs="+", default=[1, 2],
                     help="batch sizes (in order) the serving-path callable is warmed with before timing")
     ap.add_argument("--serving-only", action="store_true", help="time only the serving-path callable")
+    ap.add_argument("--exact", action="store_true",
+                    help="also time the default-mode compile and an exact-ops compile (norms / activations eager) "
+                         "and report whether each is bit-exact")
     args = ap.parse_args()
 
     device = torch.device("cuda")
@@ -79,6 +82,22 @@ def main() -> None:
                 for mode in ("reduce-overhead", "max-autotune-no-cudagraphs"):
                     fn = torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=mode)
                     variants[f"compiled {mode}"] = functools.partial(fn, latents)
+            if args.exact:
+                # default mode without cudnn.benchmark (deterministic kernel choice, no autotuning) and the
+                # exact-ops compile: GroupNorm / SiLU on the eager kernels, conv layout optimisation off
+                import torch._inductor.config as inductor_config
+
+                from mstar.model.flux2_klein.submodules import exclude_from_compile
+
+                torch.backends.cudnn.benchmark = False
+                plain = torch.compile(vae.decode, fullgraph=False, dynamic=False)
+                variants["compiled default, no cudnn.benchmark"] = functools.partial(plain, latents)
+                exact_vae = build_vae(config, snapshot, device).eval()
+                exclude_from_compile(exact_vae)
+                inductor_config.emulate_precision_casts = True
+                inductor_config.layout_optimization = False
+                exact = torch.compile(exact_vae.decode, fullgraph=False, dynamic=False)
+                variants["compiled exact_ops (norms/act eager)"] = functools.partial(exact, latents)
             variants[f"serving: dynamic batch, warmed at {args.warm}"] = functools.partial(dynamic, latents)
             print(f"== batch {batch}")
             ref_u8 = pixels_to_uint8(reference)
@@ -87,7 +106,8 @@ def main() -> None:
                 out = fn()
                 diff = (out.float() - reference.float()).abs().max().item()
                 psnr = _psnr(pixels_to_uint8(out), ref_u8)
-                print(f"  {name:36s} {ms:8.2f} ms   max_abs vs eager {diff:.3e}   uint8 PSNR {psnr:6.2f} dB")
+                exact = "bit-exact" if torch.equal(out, reference) else ""
+                print(f"  {name:36s} {ms:8.2f} ms   max_abs vs eager {diff:.3e}   uint8 PSNR {psnr:6.2f} dB {exact}")
             torch.backends.cudnn.benchmark = False
         print(f"  peak alloc {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
 
