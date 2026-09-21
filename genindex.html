@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 19, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 21, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -678,8 +678,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 </ul>
 </details></li>
@@ -1986,6 +1988,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorStore.dereference">(mstar.communication.tensors.TensorStore method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.utils.exitcode.html#mstar.utils.exitcode.describe_exitcode">describe_exitcode() (in module mstar.utils.exitcode)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.EngineResourceInfo.device">device (mstar.engine.resources.base.EngineResourceInfo attribute)</a>
 
       <ul>
@@ -2165,6 +2169,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch.exec_timings">exec_timings (mstar.engine.engine.ExecutingBatch attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch">ExecutingBatch (class in mstar.engine.engine)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.orphan.html#mstar.utils.orphan.exit_when_orphaned">exit_when_orphaned() (in module mstar.utils.orphan)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.EXPECTED_MSTAR_RUST_VERSION">EXPECTED_MSTAR_RUST_VERSION (in module mstar.communication.communicator)</a>
 </li>
@@ -4006,9 +4012,13 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.utils.containers.html#module-mstar.utils.containers">mstar.utils.containers</a>
 </li>
+        <li><a href="_autosummary/mstar.utils.exitcode.html#module-mstar.utils.exitcode">mstar.utils.exitcode</a>
+</li>
         <li><a href="_autosummary/mstar.utils.ipc_format.html#module-mstar.utils.ipc_format">mstar.utils.ipc_format</a>
 </li>
         <li><a href="_autosummary/mstar.utils.logging_config.html#module-mstar.utils.logging_config">mstar.utils.logging_config</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.orphan.html#module-mstar.utils.orphan">mstar.utils.orphan</a>
 </li>
         <li><a href="_autosummary/mstar.utils.profiler.html#module-mstar.utils.profiler">mstar.utils.profiler</a>
 </li>
@@ -4087,8 +4097,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.api_server.openai.serving_images.html#module-mstar.api_server.openai.serving_images">module</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     mstar.api_server.openai.serving_speech
 
@@ -4096,6 +4104,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.api_server.openai.serving_speech.html#module-mstar.api_server.openai.serving_speech">module</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     mstar.api_server.openai.serving_videos
 
@@ -4958,6 +4968,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    mstar.utils.exitcode
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.exitcode.html#module-mstar.utils.exitcode">module</a>
+</li>
+      </ul></li>
+      <li>
     mstar.utils.ipc_format
 
       <ul>
@@ -4969,6 +4986,13 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.utils.logging_config.html#module-mstar.utils.logging_config">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.utils.orphan
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.orphan.html#module-mstar.utils.orphan">module</a>
 </li>
       </ul></li>
       <li>
@@ -7823,6 +7847,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.warmup_and_capture">(mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.utils.orphan.html#mstar.utils.orphan.watch_parent">watch_parent() (in module mstar.utils.orphan)</a>
+</li>
       <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.wav_stream_header">wav_stream_header() (in module mstar.api_server.media_io)</a>
 </li>
       <li><a href="_autosummary/mstar.model.components.distributed.html#mstar.model.components.distributed.ColumnParallelLinear.weight_loader">weight_loader() (mstar.model.components.distributed.ColumnParallelLinear method)</a>
@@ -7991,7 +8017,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 19, 2026.
+  Last updated on Sep 21, 2026.
   <br/>
 </p>
   </div>

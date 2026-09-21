@@ -30,8 +30,10 @@
    adarms_norm
    attention
    containers
+   exitcode
    fused_moe
    ipc_format
    logging_config
+   orphan
    profiler
 
