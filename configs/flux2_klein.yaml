@@ -16,9 +16,10 @@ model_kwargs:
   # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
   # transformer still lands at a median 37.6 dB from the eager path over the 100 protocol prompts (67 of 100 below 40 dB)
   compile_eager_rounding: true
-  # norms and activations stay on the eager kernels inside the compiled forward: the compiled transformer is
-  # then bit-exact with the eager one; +8% B=1 latency over plain compile (0.386 vs 0.356 s), -16% vs no compile
-  compile_exact_ops: true
+  # op classes kept on the eager kernels inside the compiled forward: with the norms eager the compiled transformer
+  # is bit-exact with the eager one (the activations add nothing but graph breaks); every served image is then
+  # >= 53 dB from the eager path on all 100 protocol prompts (the compiled VAE) — [norms] 0.371 s at B=1 vs 0.356 plain and 0.383 with the activations too; 0.461 without compile
+  compile_exact_ops: [norms]
   cuda_graph: true
   capture_sizes: [[1024, 1024]]
   # every batch size up to max_batch_size: a lockstep group of 5-7 requests would otherwise be padded into the 8-graph
