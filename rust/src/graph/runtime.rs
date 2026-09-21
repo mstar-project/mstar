@@ -6,6 +6,7 @@ use crate::graph::shard::{GroupTemplate, ShardingTemplate};
 use crate::graph::spec::*;
 use crate::graph::request::{RequestInfo, WgIndex, WorkerGraphMeta};
 use crate::graph::state::RequestState;
+use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -152,6 +153,17 @@ pub struct GraphRuntime {
     /// walk -> the LOCAL worker graphs active in it. Static, so a request only
     /// stores the slice its partition selected.
     walk_to_local_wgs: FxHashMap<Sym, Vec<WgIndex>>,
+
+    /// (walk, node) -> local worker graph. Built once; last write wins, as in
+    /// the Python inverted index.
+    node_owner: FxHashMap<(Sym, Sym), WgIndex>,
+    /// Loop stops from this iteration's check_stop; cleared every iteration.
+    pending_loop_stops: FxHashSet<(u32, Sym, Sym)>,
+
+    /// A share of the SAME bookkeeper Python handed TensorStore, taken at
+    /// construction. Routing reads descriptors and adjusts refcounts through
+    /// it, so a copy would diverge from what the store believes.
+    bookkeeping: SharedBookkeeping,
 }
 
  impl GraphRuntime {
@@ -168,6 +180,12 @@ pub struct GraphRuntime {
     /// `graphs` are indexed by this worker's local position.
     fn wg_index(&self, wg_id: u32) -> Option<WgIndex> {
         self.wg_ids.iter().position(|&id| id == wg_id).map(|i| i as WgIndex)
+    }
+
+    fn owner_of(&self, node: &str, walk: &str) -> Option<WgIndex> {
+        let n = self.interner.get(node)?;
+        let w = self.interner.get(walk)?;
+        self.node_owner.get(&(w, n)).copied()
     }
 
     fn live_wgs(&self, walk: Sym) -> Vec<WgIndex> {
@@ -234,13 +252,14 @@ pub struct WorkerGraphArg {
 #[pymethods]
 impl GraphRuntime {
     #[new]
-    #[pyo3(signature = (worker_graphs, remote_worker_graphs, sharding, me))]
+    #[pyo3(signature = (worker_graphs, remote_worker_graphs, sharding, bookkeeping, me))]
     fn new(
         worker_graphs: Vec<WorkerGraphArg>,
         // Owned by other workers; needed to answer "who runs this node" when
         // an output leaves this worker.
         remote_worker_graphs: Vec<RemoteWorkerGraphArg>,
         sharding: ShardingArg,
+        bookkeeping: PyRef<'_, TensorBookkeeping>,
         me: String,
     ) -> PyResult<Self> {
         let mut it = StrToId::default();
@@ -343,6 +362,9 @@ impl GraphRuntime {
             async_checker: AsyncEnabledChecker::new(async_enabled),
             all_worker_graphs,
             walk_to_local_wgs,
+            node_owner,
+            pending_loop_stops: FxHashSet::default(),
+            bookkeeping: bookkeeping.share(),
         })
     }
 
@@ -494,6 +516,127 @@ impl GraphRuntime {
         if let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut()) {
             info.mark_stream_done(p);
         }
+    }
+
+    /// Structural: which local worker graph runs this node in this walk.
+    fn get_worker_graph_id_for_node(
+        &self, node: &str, graph_walk: &str,
+    ) -> PyResult<u32> {
+        self.owner_of(node, graph_walk)
+            .map(|wg| self.wg_ids[wg as usize])
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "Could not find worker graph for node {node:?}, \
+                     graph_walk {graph_walk:?}"
+                ))
+            })
+    }
+
+    /// Structural, so no rid: whether the node opts into async scheduling.
+    fn is_async_schedulable(&self, node_name: &str, graph_walk: &str) -> bool {
+        match self.owner_of(node_name, graph_walk) {
+            Some(wg) => self
+                .nid(wg, node_name)
+                .is_some_and(|n| self.graphs[wg as usize].node(n).async_enabled),
+            None => false,
+        }
+    }
+
+    /// The node's output signal names. Structural: a request's edge objects
+    /// are its own, but their names are not.
+    fn get_output_signals(&self, node_name: &str, graph_walk: &str) -> Vec<String> {
+        let Some(wg) = self.owner_of(node_name, graph_walk) else {
+            return vec![];
+        };
+        let Some(n) = self.nid(wg, node_name) else {
+            return vec![];
+        };
+        let mut names: Vec<String> = self.graphs[wg as usize]
+            .node(n)
+            .outputs
+            .iter()
+            .map(|e| self.interner.name(e.name).to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The (signal, dest) pairs `source_node` emits into `dest_node`. Used by
+    /// a speculative batch to know which of the in-flight outputs it consumes.
+    fn get_consumed_edges(
+        &self, source_node: &str, dest_node: &str, graph_walk: &str,
+    ) -> Vec<(String, String)> {
+        let Some(wg) = self.owner_of(source_node, graph_walk) else {
+            return vec![];
+        };
+        let Some(n) = self.nid(wg, source_node) else {
+            return vec![];
+        };
+        self.graphs[wg as usize]
+            .node(n)
+            .outputs
+            .iter()
+            .filter(|e| self.dest_name(wg, e.dest) == dest_node)
+            .map(|e| {
+                (
+                    self.interner.name(e.name).to_string(),
+                    self.dest_name(wg, e.dest),
+                )
+            })
+            .collect()
+    }
+
+    // -- pending loop stops: good for exactly one iteration ----------------
+
+    fn has_pending_loop_stop(
+        &self, rid: u32, graph_walk: &str, loop_name: &str,
+    ) -> bool {
+        let (Some(w), Some(l)) = (
+            self.interner.get(graph_walk),
+            self.interner.get(loop_name),
+        ) else {
+            return false;
+        };
+        self.pending_loop_stops.contains(&(rid, w, l))
+    }
+
+    fn pending_loop_stop_rids(
+        &self, graph_walk: &str, loop_name: &str,
+    ) -> Vec<u32> {
+        let (Some(w), Some(l)) = (
+            self.interner.get(graph_walk),
+            self.interner.get(loop_name),
+        ) else {
+            return vec![];
+        };
+        self.pending_loop_stops
+            .iter()
+            .filter(|(_, gw, ln)| *gw == w && *ln == l)
+            .map(|(rid, _, _)| *rid)
+            .collect()
+    }
+
+    fn clear_pending_loop_stops(&mut self) {
+        self.pending_loop_stops.clear();
+    }
+
+    fn push_back_node(
+        &mut self, node_name: String, rids: Vec<u32>, wg_ids: Vec<u32>,
+    ) -> PyResult<()> {
+        if rids.len() != wg_ids.len() {
+            return Err(PyValueError::new_err(
+                "push_back_node: rids and wg_ids must be the same length",
+            ));
+        }
+        for (rid, wg_id) in rids.into_iter().zip(wg_ids) {
+            let Some(wg) = self.wg_index(wg_id) else { continue };
+            let Some(node_id) = self.nid(wg, &node_name) else { continue };
+            if let Some(state) = &mut self.states[wg as usize][rid as usize] {
+                state.push_back(node_id);
+            }
+        }
+        Ok(())
     }
 
     fn num_handles(&self) -> usize {

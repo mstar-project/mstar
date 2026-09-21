@@ -73,6 +73,61 @@ from mstar.worker.node_manager_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _make_graph_runtime(**kwargs) -> PythonGraphRuntime:
+    """``MSTAR_RUST_GRAPH``: ``0`` (default) Python, ``1`` Rust.
+
+    No ``AUTO``. The Rust runtime is incomplete -- ingest, scheduling, routing
+    and sending still raise -- so falling back silently would hide that, and
+    picking it up silently would break a worker that merely happens to have
+    the extension installed.
+
+    It requires the Rust communicator. The runtime sends WORKER_GRAPHS_DONE
+    and INPUT_SIGNALS itself, holding an Arc to the same transport rather than
+    hopping back into Python for every message; with the pyzmq communicator
+    there is no such object to share.
+    """
+    choice = os.getenv("MSTAR_RUST_GRAPH", "0")
+    if choice not in ("0", "1"):
+        raise ValueError(f"MSTAR_RUST_GRAPH must be 0 or 1; got {choice!r}")
+    if choice == "0":
+        return PythonGraphRuntime(**kwargs)
+
+    if os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper() == "0":
+        raise ValueError(
+            "MSTAR_RUST_GRAPH=1 needs the Rust communicator, but "
+            "MSTAR_RUST_ZMQ=0 forces pyzmq. The graph runtime sends from "
+            "Rust and has to share the transport."
+        )
+    from mstar.communication.rust_communicator import RustZMQCommunicator
+    from mstar.graph.runtime.rust import RustGraphRuntime
+
+    communicator = kwargs.get("communicator")
+    if not isinstance(communicator, RustZMQCommunicator):
+        raise ValueError(
+            "MSTAR_RUST_GRAPH=1 needs the Rust communicator, but this worker "
+            f"built a {type(communicator).__name__}. Set MSTAR_RUST_ZMQ=1."
+        )
+    tensor_manager = kwargs["tensor_manager"]
+    bookkeeping = tensor_manager.tensor_store.bookkeeping
+    if not hasattr(bookkeeping, "_rust"):
+        raise ValueError(
+            "MSTAR_RUST_GRAPH=1 needs the Rust TensorBookkeeping: the runtime "
+            "holds a share of it, so a Python one cannot be handed over. "
+            f"Got {type(bookkeeping).__name__}."
+        )
+    logger.info("graph runtime: rust (MSTAR_RUST_GRAPH=1)")
+    return RustGraphRuntime(
+        my_worker_id=kwargs["my_worker_id"],
+        my_worker_graphs=kwargs["my_worker_graphs"],
+        all_wg_ids_to_graph_walks=kwargs["all_wg_ids_to_graph_walks"],
+        all_wg_ids_to_dyn_loops=kwargs["all_wg_ids_to_dyn_loops"],
+        all_wg_ids_to_nodes=kwargs["all_wg_ids_to_nodes"],
+        node_to_partition=kwargs["node_to_partition"],
+        sharding_config=kwargs["sharding_config"],
+        bookkeeping=bookkeeping,
+    )
+
+
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
     """``MSTAR_TP_ASYNC_SCHED``: ``0``/empty off, ``1`` every parallel node,
     or a comma-separated node list. Returns ``(enabled, nodes_or_None)``."""
@@ -244,10 +299,8 @@ class Worker:
             enable_prof=self.enable_prof
         )
 
-        # The graph runtime is taking this over method by method. It owns the
-        # per-request queues; the manager is handed the SAME dict so the two
-        # read one copy of the state while the port is in flight.
-        self._rid_runtime = PythonGraphRuntime(
+        # The graph runtime owns the per-request queues and the graph state.
+        self._rid_runtime = _make_graph_runtime(
             my_worker_id=self.worker_id,
             my_worker_graphs=my_worker_graphs,
             all_wg_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,

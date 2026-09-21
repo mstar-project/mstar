@@ -13,6 +13,7 @@ use crate::graph::spec::{StrToId, Sym};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct ReferenceInfo {
@@ -89,14 +90,24 @@ pub struct TensorInfoOut {
     #[pyo3(get)] pub source_graph_walk: Option<String>,
 }
 
-#[pyclass]
-pub struct TensorBookkeeping {
+/// The state itself, held apart from the `#[pyclass]` wrapper so Rust-side
+/// holders can share it. `GraphRuntime` needs the SAME bookkeeper Python
+/// handed to `TensorStore` -- a copy would diverge the moment either side
+/// adjusted a refcount.
+#[derive(Default)]
+pub struct Bookkeeping {
     ref_info: FxHashMap<u64, ReferenceInfo>,
     tensor_info: FxHashMap<u64, TensorPointerInfo>,
     strings: StrToId,
 }
 
-impl TensorBookkeeping {
+/// Uncontended in practice -- everything runs under the GIL today -- but a
+/// Mutex is what makes the pyclass Send + Sync, which pyo3 requires. Hold it
+/// for the shortest span possible: a lock held across a call back into Python
+/// would deadlock against a Python-side method on the same object.
+pub type SharedBookkeeping = Arc<Mutex<Bookkeeping>>;
+
+impl Bookkeeping {
     fn intern_info(&mut self, arg: &TensorInfoArg) -> TensorPointerInfo {
         TensorPointerInfo {
             dims: arg.dims.clone(),
@@ -150,18 +161,8 @@ impl TensorBookkeeping {
     fn entry(&mut self, uuid: u64) -> Option<&mut ReferenceInfo> {
         self.ref_info.get_mut(&uuid)
     }
-}
 
-#[pymethods]
-impl TensorBookkeeping {
-    #[new]
-    fn new() -> Self {
-        Self {
-            ref_info: FxHashMap::default(),
-            tensor_info: FxHashMap::default(),
-            strings: StrToId::default(),
-        }
-    }
+    // -- the operations, callable from either side ------------------------
 
     /// Start tracking a uuid. Reference state resets: `put_tensor` on a live
     /// uuid means a NEW tensor, not an update (that is `update_info`).
@@ -230,7 +231,6 @@ impl TensorBookkeeping {
         self.ref_info.contains_key(&uuid)
     }
 
-    #[pyo3(signature = (uuid, n = 1))]
     fn increment_ref(&mut self, uuid: u64, n: i64) -> PyResult<()> {
         if n < 0 {
             return Err(PyValueError::new_err(format!(
@@ -261,7 +261,6 @@ impl TensorBookkeeping {
 
     /// A negative `n` is legal here: `set_output_ref_counts` corrects downward
     /// from the safety hold by dereferencing a negative delta.
-    #[pyo3(signature = (uuid, n = 1))]
     fn dereference(&mut self, uuid: u64, n: i64) {
         if let Some(e) = self.entry(uuid) {
             e.ref_count -= n;
@@ -319,8 +318,119 @@ impl TensorBookkeeping {
         uuids.into_iter().filter(|&u| self.can_gc(u)).collect()
     }
 
-    fn __len__(&self) -> usize {
+    fn len(&self) -> usize {
         self.ref_info.len()
+    }
+}
+
+/// The Python handle. Holds only a share of the state, so
+/// `GraphRuntime::new` can take the same one.
+#[pyclass]
+pub struct TensorBookkeeping {
+    inner: SharedBookkeeping,
+}
+
+impl TensorBookkeeping {
+    /// A second handle on the same state, for a Rust-side holder.
+    pub fn share(&self) -> SharedBookkeeping {
+        Arc::clone(&self.inner)
+    }
+}
+
+#[pymethods]
+impl TensorBookkeeping {
+    #[new]
+    fn new() -> Self {
+        Self { inner: Arc::new(Mutex::new(Bookkeeping::default())) }
+    }
+
+    // Each of these locks, delegates and drops. Nothing below calls back into
+    // Python, so the lock is never held across a re-entry.
+
+    fn put_tensor(&self, uuid: u64, info: TensorInfoArg) {
+        self.inner.lock().unwrap().put_tensor(uuid, info)
+    }
+
+    fn put_tensor_batch(
+        &self, uuids: Vec<u64>, infos: Vec<TensorInfoArg>,
+    ) -> PyResult<()> {
+        self.inner.lock().unwrap().put_tensor_batch(uuids, infos)
+    }
+
+    fn update_info(&self, uuid: u64, info: TensorInfoArg) {
+        self.inner.lock().unwrap().update_info(uuid, info)
+    }
+
+    fn update_info_batch(
+        &self, uuids: Vec<u64>, infos: Vec<TensorInfoArg>,
+    ) -> PyResult<()> {
+        self.inner.lock().unwrap().update_info_batch(uuids, infos)
+    }
+
+    fn get_info(&self, uuid: u64) -> Option<TensorInfoOut> {
+        self.inner.lock().unwrap().get_info(uuid)
+    }
+
+    fn get_info_batch(&self, uuids: Vec<u64>) -> Vec<Option<TensorInfoOut>> {
+        self.inner.lock().unwrap().get_info_batch(uuids)
+    }
+
+    fn forget_tensor(&self, uuid: u64) {
+        self.inner.lock().unwrap().forget_tensor(uuid)
+    }
+
+    fn is_tracked(&self, uuid: u64) -> bool {
+        self.inner.lock().unwrap().is_tracked(uuid)
+    }
+
+    #[pyo3(signature = (uuid, n = 1))]
+    fn increment_ref(&self, uuid: u64, n: i64) -> PyResult<()> {
+        self.inner.lock().unwrap().increment_ref(uuid, n)
+    }
+
+    fn increment_ref_batch(
+        &self, uuids: Vec<u64>, counts: Vec<i64>,
+    ) -> PyResult<()> {
+        self.inner.lock().unwrap().increment_ref_batch(uuids, counts)
+    }
+
+    #[pyo3(signature = (uuid, n = 1))]
+    fn dereference(&self, uuid: u64, n: i64) {
+        self.inner.lock().unwrap().dereference(uuid, n)
+    }
+
+    fn dereference_batch(
+        &self, uuids: Vec<u64>, counts: Vec<i64>,
+    ) -> PyResult<()> {
+        self.inner.lock().unwrap().dereference_batch(uuids, counts)
+    }
+
+    fn set_persist(&self, uuid: u64, persist: bool) {
+        self.inner.lock().unwrap().set_persist(uuid, persist)
+    }
+
+    fn set_persist_batch(&self, uuids: Vec<u64>, persist: bool) {
+        self.inner.lock().unwrap().set_persist_batch(uuids, persist)
+    }
+
+    fn set_mem_registered(&self, uuid: u64, mem_registered: bool) {
+        self.inner.lock().unwrap().set_mem_registered(uuid, mem_registered)
+    }
+
+    fn is_registered(&self, uuid: u64) -> bool {
+        self.inner.lock().unwrap().is_registered(uuid)
+    }
+
+    fn can_gc(&self, uuid: u64) -> bool {
+        self.inner.lock().unwrap().can_gc(uuid)
+    }
+
+    fn collectable(&self, uuids: Vec<u64>) -> Vec<u64> {
+        self.inner.lock().unwrap().collectable(uuids)
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.lock().unwrap().len()
     }
 }
 
@@ -328,11 +438,28 @@ impl TensorBookkeeping {
 mod tests {
     use super::*;
 
-    fn bk() -> TensorBookkeeping {
-        TensorBookkeeping::new()
+    #[test]
+    fn a_share_sees_the_same_state() {
+        // The point of the split: GraphRuntime holds a share of the very
+        // bookkeeper Python gave TensorStore, so a refcount either side
+        // adjusts is visible to the other.
+        let py_handle = TensorBookkeeping::new();
+        let shared = py_handle.share();
+        shared.lock().unwrap().ref_info.insert(1, ReferenceInfo::default());
+
+        assert!(py_handle.is_tracked(1), "the Python handle sees it");
+        py_handle.increment_ref(1, 1).unwrap();
+        assert!(
+            !shared.lock().unwrap().can_gc(1),
+            "and the Rust share sees the Python handle's change"
+        );
     }
 
-    fn track(b: &mut TensorBookkeeping, uuid: u64) {
+    fn bk() -> Bookkeeping {
+        Bookkeeping::default()
+    }
+
+    fn track(b: &mut Bookkeeping, uuid: u64) {
         b.ref_info.insert(uuid, ReferenceInfo::default());
     }
 
@@ -363,7 +490,7 @@ mod tests {
         b.set_persist(42, true);
         b.set_mem_registered(42, true);
         assert!(!b.is_tracked(42));
-        assert_eq!(b.__len__(), 0);
+        assert_eq!(b.len(), 0);
     }
 
     #[test]

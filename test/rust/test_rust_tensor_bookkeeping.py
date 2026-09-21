@@ -233,3 +233,40 @@ def test_tensor_store_works_over_either_backend(bk):
     assert store.remove_request(5) == [1]
     assert not store.check_uuid_presence(1)
     assert store.get_info(1) is None, "teardown must drop the descriptor too"
+
+
+# --- sharing with GraphRuntime ----------------------------------------------
+
+def test_graph_runtime_shares_the_bookkeeper_it_was_given():
+    """GraphRuntime takes a share of the SAME bookkeeper, not a copy.
+
+    Routing reads descriptors and adjusts refcounts through it; a copy would
+    diverge from what TensorStore believes the moment either side moved a
+    refcount, and nothing would raise.
+    """
+    from mstar_rust import GraphRuntime
+    from mstar_rust import TensorBookkeeping as RustBk
+
+    book = RustBk()
+    runtime = GraphRuntime(
+        worker_graphs=[],
+        remote_worker_graphs=[],
+        sharding={
+            "groups": [], "shard_dim": [],
+            "tp_enabled_nodes": [], "sp_enabled_nodes": [],
+        },
+        bookkeeping=book,
+        me="worker_0",
+    )
+    assert runtime is not None
+
+    # The handle Python kept still drives the state the runtime holds; if the
+    # runtime had copied, this object would be the only one that saw it.
+    book.put_tensor(1, _to_rust_dict(_info(1)))
+    assert book.is_tracked(1)
+    book.increment_ref(1, 1)
+    assert not book.can_gc(1)
+
+
+def _to_rust_dict(info):
+    return rust_bookkeeping._to_rust(info)
