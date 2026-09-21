@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 import torch
 
+from mstar.graph.base import TensorPointerInfo
 from mstar.utils.containers import ParallelList
 
 NameToTensorList = dict[str, list[torch.Tensor]]
@@ -38,12 +39,44 @@ class TensorBookkeeping(ABC):
     """
 
     @abstractmethod
-    def put_tensor(self, uuid: int):
+    def put_tensor(self, uuid: int, info: TensorPointerInfo):
         pass
 
-    def put_tensor_batch(self, uuids: list[int]):
-        for uuid in uuids:
-            self.put_tensor(uuid)
+    def put_tensor_batch(
+        self, tensor_info: ParallelList[int, TensorPointerInfo]
+    ):
+        for uuid, info in tensor_info:
+            self.put_tensor(uuid, info)
+
+    @abstractmethod
+    def update_info(self, uuid: int, info: TensorPointerInfo):
+        """Rebind the descriptor for an existing uuid.
+
+        Needed where the tensor lands before its final descriptor exists: a
+        slice re-points an arriving info at a freshly minted uuid, and a fan-in
+        consolidation mints one for a tensor it has just concatenated.
+        """
+        pass
+
+    def update_info_batch(
+        self, tensor_info: ParallelList[int, TensorPointerInfo]
+    ):
+        for uuid, info in tensor_info:
+            self.update_info(uuid, info)
+
+    @abstractmethod
+    def get_info(self, uuid: int) -> TensorPointerInfo | None:
+        """The descriptor a peer needs to read this tensor.
+
+        This is what lets an edge be rebuilt from uuids alone: ingestion and
+        routing carry uuids, and anything that has to put a descriptor back on
+        the wire (a disaggregated loop re-emitting its external inputs, say)
+        looks it up here.
+        """
+        pass
+
+    def get_info_batch(self, uuids: list[int]) -> list[TensorPointerInfo | None]:
+        return [self.get_info(uuid) for uuid in uuids]
 
     @abstractmethod
     def forget_tensor(self, uuid: int):
@@ -106,12 +139,21 @@ class TensorBookkeeping(ABC):
 class PythonTensorBookkeeping(TensorBookkeeping):
     def __init__(self):
         self._ref_info: dict[int, ReferenceInfo] = {}
+        self._tensor_info: dict[int, TensorPointerInfo] = {}
 
-    def put_tensor(self, uuid: int):
+    def put_tensor(self, uuid: int, info: TensorPointerInfo):
         self._ref_info[uuid] = ReferenceInfo()
+        self._tensor_info[uuid] = info
+
+    def update_info(self, uuid: int, info: TensorPointerInfo):
+        self._tensor_info[uuid] = info
+
+    def get_info(self, uuid: int) -> TensorPointerInfo | None:
+        return self._tensor_info.get(uuid)
 
     def forget_tensor(self, uuid: int):
         self._ref_info.pop(uuid, None)
+        self._tensor_info.pop(uuid, None)
 
     def is_tracked(self, uuid: int) -> bool:
         return uuid in self._ref_info
@@ -171,21 +213,28 @@ class TensorStore:
     def get_tensor(self, uuid: int) -> torch.Tensor:
         return self._tensors[uuid]
 
-    def put_tensor(self, rid: int, uuid: int, tensor: torch.Tensor):
+    def put_tensor(
+        self, rid: int, uuid: int,
+        tensor: torch.Tensor,
+        info: TensorPointerInfo
+    ):
         self._tensors[uuid] = tensor
         self._rid_to_uuids.setdefault(rid, set()).add(uuid)
         self._uuid_to_rid[uuid] = rid
-        self.bookkeeping.put_tensor(uuid)
+        self.bookkeeping.put_tensor(uuid, info)
 
     def put_tensor_batch(
         self, rid: int, tensors: ParallelList[int, torch.Tensor],
+        info: list[TensorPointerInfo],
     ):
         owned = self._rid_to_uuids.setdefault(rid, set())
         for uuid, tensor in tensors:
             self._tensors[uuid] = tensor
             owned.add(uuid)
             self._uuid_to_rid[uuid] = rid
-        self.bookkeeping.put_tensor_batch(tensors.keys)
+        self.bookkeeping.put_tensor_batch(
+            ParallelList(tensors.keys, info)
+        )
 
     def check_uuid_presence(self, uuid: int) -> bool:
         return uuid in self._tensors
@@ -222,6 +271,12 @@ class TensorStore:
 
     def is_registered(self, uuid: int) -> bool:
         return self.bookkeeping.is_registered(uuid)
+
+    def get_info(self, uuid: int) -> TensorPointerInfo | None:
+        return self.bookkeeping.get_info(uuid)
+
+    def update_info(self, uuid: int, info: TensorPointerInfo):
+        self.bookkeeping.update_info(uuid, info)
 
     def increment_ref(self, uuid: int, n: int = 1):
         self.bookkeeping.increment_ref(uuid, n)

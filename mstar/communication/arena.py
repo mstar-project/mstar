@@ -720,7 +720,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                         tensor = self._read_from_arena(info)
                     h2d_did_work = h2d_did_work or tensor.numel() > 0
                     self.tensor_store.put_tensor(
-                        rid, info.uuid, tensor)
+                        rid, info.uuid, tensor, info)
                     self.tensor_store.set_metadata(info.uuid, mem_registered=False)
                     # +1 transit (released by get_ready_tensors), +1 usage
                     # (released by _cleanup_consumed_inputs).

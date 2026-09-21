@@ -386,16 +386,11 @@ class TensorCommunicationManager(ABC):
                 # it here unconditionally so TensorPointerInfo dims/strides
                 # match what receivers will read.
                 canonical = self._ensure_leading_shard_dim(shard_dim, tensor)
-                self.tensor_store.put_tensor(
-                    rid=rid, uuid=tensor_uuid, tensor=canonical,
-                )
-                if cfg is not None:
-                    self.uuid_to_shard_dim[tensor_uuid] = shard_dim
-                if self.enable_prof:
-                    self.uuid_to_edge_name[tensor_uuid] = name
-
-                logger.debug("Storing tensor name %s uuid %s", name, tensor_uuid)
-                tensor_info[name].append(TensorPointerInfo(
+                # Built before the put: the store keeps the descriptor so an
+                # edge can be rebuilt from its uuid alone. This is the same
+                # object the edge carries, so later in-place edits (the
+                # shm_segment register_for_send stamps on) are visible to both.
+                info = TensorPointerInfo(
                     dims=canonical.shape,
                     dtype=canonical.dtype,
                     stride=canonical.stride(),
@@ -408,7 +403,17 @@ class TensorCommunicationManager(ABC):
                     source_tp_rank=source_tp_rank,
                     _source_node_name=node_name,
                     _source_graph_walk=graph_walk,
-                ))
+                )
+                self.tensor_store.put_tensor(
+                    rid=rid, uuid=tensor_uuid, tensor=canonical, info=info,
+                )
+                if cfg is not None:
+                    self.uuid_to_shard_dim[tensor_uuid] = shard_dim
+                if self.enable_prof:
+                    self.uuid_to_edge_name[tensor_uuid] = name
+
+                logger.debug("Storing tensor name %s uuid %s", name, tensor_uuid)
+                tensor_info[name].append(info)
         return tensor_info
 
     def store_and_populate_graph_edges(
@@ -583,13 +588,15 @@ class TensorCommunicationManager(ABC):
             end = start + info.nbytes // bytes_per_row
             slice_view = canonical_tensor[start:end]
             new_uuid = self._uuid_minter.mint()
-            self.tensor_store.put_tensor(rid, new_uuid, slice_view)
             self.uuid_to_shard_dim[new_uuid] = shard_dim
             # Release this edge's stake on the producer's UUID — the slice now
             # owns it. The slice view keeps the underlying storage alive even
             # if the producer's UUID GCs.
             self.dereference(info.uuid, 1)
             info.uuid = new_uuid
+            # After the re-point, so the descriptor the store keeps already
+            # names the slice rather than the producer's tensor.
+            self.tensor_store.put_tensor(rid, new_uuid, slice_view, info)
 
     @abstractmethod
     def start_read_tensors(
@@ -733,7 +740,16 @@ class TensorCommunicationManager(ABC):
                         for uuid_, tensor in (
                             (self._uuid_minter.mint(), t) for t in consolidated
                         ):
-                            self.tensor_store.put_tensor(req_id, uuid_, tensor)
+                            info = TensorPointerInfo(
+                                dims=tensor.shape, dtype=tensor.dtype,
+                                nbytes=tensor.nbytes, address=tensor.data_ptr(),
+                                stride=tensor.stride(), uuid=uuid_,
+                                source_session_id=self.my_session_id,
+                                source_entity=self.my_entity_id,
+                            )
+                            self.tensor_store.put_tensor(
+                                req_id, uuid_, tensor, info,
+                            )
                             # +1 for graph-node usage (released by the
                             # downstream consumer via _cleanup_consumed_inputs)
                             self.tensor_store.increment_ref(uuid_, 1)
@@ -741,13 +757,7 @@ class TensorCommunicationManager(ABC):
                             # (cat happened along the real shard_dim); record
                             # None so get_tensor doesn't try to un-rearrange.
                             self.uuid_to_shard_dim[uuid_] = None
-                            new_infos.append(TensorPointerInfo(
-                                dims=tensor.shape, dtype=tensor.dtype,
-                                nbytes=tensor.nbytes, address=tensor.data_ptr(),
-                                stride=tensor.stride(), uuid=uuid_,
-                                source_session_id=self.my_session_id,
-                                source_entity=self.my_entity_id,
-                            ))
+                            new_infos.append(info)
                         edge.tensor_info = new_infos
                         del self.buffered_shards[req_id][edge.name]
                         final_ready.setdefault(req_id, []).append(edge)
@@ -974,7 +984,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                     info.dims, dtype=info.dtype, device=self.device
                 ).as_strided(info.dims, stride=info.stride)
                 self.tensor_store.put_tensor(
-                    rid=rid, uuid=info.uuid, tensor=buffer
+                    rid=rid, uuid=info.uuid, tensor=buffer, info=info,
                 )
                 self.tensor_store.set_metadata(info.uuid, mem_registered=True
                 )
@@ -1172,7 +1182,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                         data = f.read(info.nbytes)
                     tensor = _deserialize_tensor(data, self.device, tensor_info=info)
                     h2d_did_work = True
-                    self.tensor_store.put_tensor(rid, info.uuid, tensor)
+                    self.tensor_store.put_tensor(rid, info.uuid, tensor, info)
                     self.tensor_store.set_metadata(info.uuid, mem_registered=False)
                     # +1 for transit (released by get_ready_tensors)
                     # +1 for graph-node usage (released by _cleanup_consumed_inputs)

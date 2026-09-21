@@ -422,3 +422,79 @@ def test_factory_returns_mooncake_for_rdma():
     except RuntimeError:
         # Mooncake not installed — expected in CI/dev environments
         pytest.skip("mooncake not installed")
+
+
+# ---------------------------------------------------------------------------
+# descriptor bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def test_store_keeps_a_descriptor_for_every_uuid_it_holds(tmp_path):
+    """Ingestion and routing carry uuids, so anything that has to put a
+    descriptor back on the wire — a disaggregated loop re-emitting its
+    external inputs — has to be able to recover it from the uuid alone."""
+    mgr = _make_manager(str(tmp_path), request_id="r1")
+    infos = mgr.store_and_return_tensor_info(
+        "r1", {"h": [torch.randn(4, 8)], "e": [torch.empty(0, 3)]},
+    )
+    for name, info_list in infos.items():
+        for info in info_list:
+            got = mgr.tensor_store.get_info(info.uuid)
+            assert got is not None, f"no descriptor kept for {name}"
+            # Same object, so the shm_segment register_for_send stamps on later
+            # is visible through both the edge and the store.
+            assert got is info
+
+
+def test_descriptor_survives_register_for_send(tmp_path):
+    """register_for_send edits the descriptor in place (shm_segment/offset);
+    the stored one must show those edits, not a stale snapshot."""
+    mgr = _make_manager(str(tmp_path), request_id="r1")
+    infos = mgr.store_and_return_tensor_info("r1", {"h": [torch.randn(4, 8)]})
+    info = infos["h"][0]
+    mgr.register_for_send("r1", [info])
+
+    stored = mgr.tensor_store.get_info(info.uuid)
+    assert stored.address == info.address
+    assert stored.nbytes == info.nbytes
+    assert stored.dims == info.dims
+
+
+def test_descriptor_is_dropped_with_the_tensor(tmp_path):
+    """Descriptors are keyed by uuid, and uuids are never reused, but a leak
+    here would grow without bound over a long-lived worker."""
+    mgr = _make_manager(str(tmp_path), request_id="r1")
+    infos = mgr.store_and_return_tensor_info("r1", {"h": [torch.randn(4, 8)]})
+    uuid = infos["h"][0].uuid
+    assert mgr.tensor_store.get_info(uuid) is not None
+
+    mgr.tensor_store.remove_tensor(uuid)
+    assert mgr.tensor_store.get_info(uuid) is None
+
+
+def test_an_edge_rebuilt_from_uuids_alone_is_readable_by_a_peer(tmp_path):
+    """The premise the graph-runtime port rests on.
+
+    ingest_inputs_batch / complete_and_route_batch carry uuids, not
+    descriptors. A disaggregated loop re-emits its ingested external inputs
+    as outputs, which can be routed to another worker -- and there the
+    descriptor IS the payload the peer RDMA-reads from. So reconstructing an
+    edge from uuids has to produce something a peer can actually read; a
+    stub carrying only the uuid would send a structurally valid but
+    unreadable message.
+    """
+    producer = _make_manager(str(tmp_path), "worker_0", request_id="r1")
+    consumer = _make_manager(str(tmp_path), "worker_1", request_id="r1")
+
+    original = torch.randn(4, 8)
+    infos = producer.store_and_return_tensor_info("r1", {"h": [original]})
+    uuid = infos["h"][0].uuid
+    producer.register_for_send("r1", [infos["h"][0]])
+
+    # Nothing kept but the uuid.
+    rebuilt = GraphEdge(
+        name="h", next_node="consumer_node",
+        tensor_info=[producer.tensor_store.get_info(uuid)],
+    )
+    consumer.start_read_tensors("r1", [rebuilt])
+    assert torch.equal(consumer.tensor_store.get_tensor(uuid), original)
