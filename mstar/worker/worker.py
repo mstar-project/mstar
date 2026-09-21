@@ -40,6 +40,7 @@ from mstar.graph.runtime.base import (
 )
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import Model, WorkerGraph
+from mstar.profile.format import GraphTiming, RxInfo, TxInfo
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.containers import ParallelList, RecentSet
@@ -1242,13 +1243,19 @@ class Worker:
         }
 
     def _profiling_payloads(self, rids: list[int]) -> ParallelList:
-        """rx/tx/timings, msgpacked so the runtime need not own the types."""
+        """rx/tx/timings, msgpacked so the runtime need not own the types.
+
+        encode_fields, not encode: a bare list has no wire tag, so encode
+        would pickle the whole payload -- which a Rust peer cannot decode and
+        the Rust frame builder cannot splice.
+        """
+        hints = (list[RxInfo], list[TxInfo], dict[tuple[str, str], GraphTiming])
         return ParallelList(rids, [
-            wire.encode([
+            wire.encode_fields([
                 self.tensor_manager.get_rx_info(rid),
                 self.tensor_manager.get_tx_info(rid),
                 self.profile_info.per_rid_graph_timings.get(rid, {}),
-            ]) for rid in rids
+            ], hints) for rid in rids
         ])
 
     def _register_outputs(

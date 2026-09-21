@@ -364,6 +364,20 @@ def encode_field(value, hint) -> bytes:
     return msgpack.packb(_encoder(hint)(value), use_bin_type=True)
 
 
+def encode_fields(values, hints) -> bytes:
+    """Several field values as one msgpack array, each by its declared type.
+
+    For a payload that is a bare tuple of values rather than a message.
+    ``encode`` would reach the pickle fallback on one of those -- a list has
+    no wire tag -- and a pickled payload cannot be decoded by a Rust peer, nor
+    spliced into a frame it builds.
+    """
+    return msgpack.packb(
+        [_encoder(h)(v) for v, h in zip(values, hints, strict=True)],
+        use_bin_type=True,
+    )
+
+
 def decode(data: bytes):
     tag, payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
     if tag == OPAQUE:

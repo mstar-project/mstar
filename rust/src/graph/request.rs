@@ -83,6 +83,61 @@ pub struct RequestInfo {
     /// This request's resolved sharding, from ShardingTemplate::instantiate.
     /// None until add_request has seen the worker assignment.
     pub shard: Option<ShardMap>,
+
+    /// Buffered between send_outputs calls and flushed onto the next
+    /// WORKER_GRAPHS_DONE, so a persist signal cannot race the message that
+    /// announces it.
+    ///
+    /// On RequestInfo rather than in a side map keyed by handle: handles are
+    /// recycled, and a side map outliving its request hands one request's
+    /// persist signals and token counts to whichever request draws that
+    /// integer next. Here, remove_request frees them with everything else.
+    pub pending: PendingOutputs,
+}
+
+/// What a request has accumulated since its last WORKER_GRAPHS_DONE.
+#[derive(Default)]
+pub struct PendingOutputs {
+    /// signal -> uuids. Uuids, not descriptors: the bookkeeper is shared, so
+    /// resolving at send time cannot go stale against it.
+    pub persist: Vec<(Sym, Vec<u64>)>,
+    pub new_tokens: Vec<(String, i64)>,
+    /// Emitted signal names, in emission order.
+    pub output_signals: Vec<Sym>,
+    /// signal -> the loop context it was emitted at.
+    pub output_loop_indices: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
+}
+
+impl PendingOutputs {
+    /// Everything but `output_loop_indices`, which the conductor keeps for the
+    /// life of the request -- Python re-sends it on every WGD.
+    pub fn take_for_send(&mut self) -> (Vec<(Sym, Vec<u64>)>, Vec<(String, i64)>, Vec<Sym>) {
+        (
+            std::mem::take(&mut self.persist),
+            std::mem::take(&mut self.new_tokens),
+            std::mem::take(&mut self.output_signals),
+        )
+    }
+
+    /// Accumulate, matching Python: a repeated signal's count adds up, and a
+    /// repeated loop index overwrites.
+    pub fn add_new_tokens(&mut self, counts: &[(String, i64)]) {
+        for (name, n) in counts {
+            match self.new_tokens.iter_mut().find(|(k, _)| k == name) {
+                Some((_, v)) => *v += n,
+                None => self.new_tokens.push((name.clone(), *n)),
+            }
+        }
+    }
+
+    pub fn set_loop_indices(
+        &mut self, signal: Sym, idx: (Vec<Sym>, Vec<(Sym, u32)>, u32),
+    ) {
+        match self.output_loop_indices.iter_mut().find(|(s, _)| *s == signal) {
+            Some(slot) => slot.1 = idx,
+            None => self.output_loop_indices.push((signal, idx)),
+        }
+    }
 }
 
 impl RequestInfo {

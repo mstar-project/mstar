@@ -20,11 +20,11 @@ from copy import deepcopy
 
 from mstar_rust import GraphRuntime as _RustGraphRuntime
 
-from mstar.api_server.request_types import APIServerMessage, ResultTensors
 from mstar.communication import wire
 from mstar.communication.tensor_store import TensorBookkeeping
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphEdge, GraphSection, Loop
+from mstar.graph.base import GraphSection, Loop
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime import sharding
@@ -41,14 +41,9 @@ from mstar.graph.runtime.base import (
     SpeculationPrepInput,
     SpeculationPrepOutput,
 )
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
 from mstar.utils.ipc_format import (
-    ConductorMessage,
-    ConductorMessageType,
-    InputSignals,
     StopLoops,
-    WorkerGraphsDone,
     WorkerMessage,
     WorkerMessageType,
 )
@@ -235,12 +230,9 @@ class RustGraphRuntime(GraphRuntime):
         self._all_wg_ids_to_graph_walks = all_wg_ids_to_graph_walks
         self._all_wg_ids_to_nodes = all_wg_ids_to_nodes
         self._sharding: dict[int, ShardingConfig] = {}
-        # Buffered until the worker graph finishes, so a persist signal cannot
-        # race the WORKER_GRAPHS_DONE announcing it.
-        self._pending_persist: dict[int, dict] = {}
-        self._pending_new_tokens: dict[int, dict[str, int]] = {}
-        self._buffered_outputs: dict[int, list[str]] = {}
-        self._output_loop_indices: dict[int, dict] = {}
+        # rid -> (the object, its wire bytes). Keyed by handle, so it is
+        # dropped on removal: handles are recycled.
+        self._fwd_info_bytes: dict[int, tuple[object, bytes]] = {}
 
     # --------- Bookkeeping ----------
 
@@ -279,15 +271,9 @@ class RustGraphRuntime(GraphRuntime):
 
     def remove_request(self, rid: int):
         # Handles are recycled, so anything left keyed by this one attaches to
-        # a DIFFERENT request later. These four are only drained when a worker
-        # graph completes; a request aborted between the route and that
-        # completion would otherwise leak its persist signals and token counts
-        # onto some future request's first WORKER_GRAPHS_DONE.
-        self._pending_persist.pop(rid, None)
-        self._pending_new_tokens.pop(rid, None)
-        self._buffered_outputs.pop(rid, None)
-        self._output_loop_indices.pop(rid, None)
+        # a DIFFERENT request later.
         self._sharding.pop(rid, None)
+        self._fwd_info_bytes.pop(rid, None)
         self._rust.remove_request(rid)
 
     def get_sharding_config(self, rid: int) -> ShardingConfig | None:
@@ -607,93 +593,51 @@ class RustGraphRuntime(GraphRuntime):
         }
 
     def send_outputs(self, input: SendInput):
-        """Rust decides what goes where; the frames are built here.
+        """A thin wrapper: Rust decides what goes where AND builds the frames.
 
-        Same split as stop_loops_batched: a Rust encoder would have to
-        reproduce wire.py's typed msgpack byte for byte.
+        Only the Python-owned payloads are prepared here.
+        ``CurrentForwardPassInfo`` is encoded rather than handed over, so Rust
+        never owns the type -- and with it ``resource_publish_info``, whose
+        ``PublishedInfo`` is abstract and would otherwise mean a Rust change
+        for every new resource. Both splice in untouched.
         """
-        plan = self._rust.take_send_plan(input.completion_id)
-        partition = plan.partition
-        fwd_infos = dict(iter(input.per_request_info))
-        counts = dict(iter(input.new_token_counts))
-        nested = dict(iter(input.nested_loop_indices))
-        consumed = (
-            {} if input.stream_tokens_consumed is None
-            else dict(iter(input.stream_tokens_consumed))
+        self._rust.send_outputs(
+            completion_id=input.completion_id,
+            request_infos=[
+                (rid, self._encoded_fwd_info(rid, info))
+                for rid, info in input.per_request_info
+            ],
+            new_token_counts=[
+                (rid, list((counts or {}).items()))
+                for rid, counts in input.new_token_counts
+            ],
+            nested=[
+                (rid, None if idx is None else (
+                    list(idx.loop_name_order),
+                    list(idx.loop_indices.items()),
+                    idx.wg_fwd_pass_idx,
+                ))
+                for rid, idx in input.nested_loop_indices
+            ],
+            stream_tokens_consumed=[
+                (rid, list((counts or {}).items()))
+                for rid, counts in (input.stream_tokens_consumed or [])
+            ],
+            profiling=list(input.profiling or []),
         )
-        profiling = (
-            {} if input.profiling is None else dict(iter(input.profiling))
-        )
 
-        # One frame per (rid, worker): the plan is per edge, and a worker
-        # taking several of a request's signals should see one message.
-        grouped: dict[tuple[int, str], list[GraphEdge]] = {}
-        for rid, worker, signal, next_node, uuids, streaming in plan.to_workers:
-            grouped.setdefault((rid, worker), []).append(GraphEdge(
-                name=signal, next_node=next_node, is_streaming=streaming,
-                tensor_info=self._infos(uuids),
-            ))
-        for (rid, worker), edges in grouped.items():
-            self._communicator.send(worker, WorkerMessage(
-                message_type=WorkerMessageType.INPUT_SIGNALS,
-                body=InputSignals(
-                    request_id=self.get_rid_string(rid), inputs=edges,
-                    request_info=fwd_infos.get(rid), partition_name=partition,
-                ),
-            ))
+    def _encoded_fwd_info(self, rid: int, info) -> bytes | None:
+        """``CurrentForwardPassInfo`` as wire bytes, encoded once per request.
 
-        for rid, signal, modality, uuids in plan.emit:
-            self._buffered_outputs.setdefault(rid, []).append(signal)
-            self._output_loop_indices.setdefault(rid, {})[signal] = nested.get(rid)
-            self._communicator.send("api_server", APIServerMessage(
-                message_type="result_tensors",
-                body=ResultTensors(
-                    request_id=self.get_rid_string(rid), modality=modality,
-                    graph_edge=GraphEdge(
-                        name=signal, next_node=EMIT_TO_CLIENT,
-                        output_modality=modality,
-                        tensor_info=self._infos(uuids),
-                    ),
-                    loop_indices=nested.get(rid), metadata={},
-                ),
-            ))
-
-        for rid, signal, uuids in plan.persist:
-            self._pending_persist.setdefault(rid, {})[signal] = self._infos(uuids)
-        for rid, cnts in counts.items():
-            pending = self._pending_new_tokens.setdefault(rid, {})
-            for name, n in (cnts or {}).items():
-                pending[name] = pending.get(name, 0) + n
-
-        for rid, wg_ids, is_first_tp_rank in plan.completed:
-            rx, tx, timings = [], [], {}
-            if profiling.get(rid) is not None:
-                rx, tx, timings = wire.decode(profiling[rid])
-            fwd_info = fwd_infos.get(rid)
-            self._communicator.send("conductor", ConductorMessage(
-                message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
-                body=WorkerGraphsDone(
-                    request_id=self.get_rid_string(rid),
-                    worker_graph_ids=wg_ids,
-                    is_first_tp_rank=is_first_tp_rank,
-                    persist_signals=self._pending_persist.pop(rid, {}),
-                    new_token_counts=self._pending_new_tokens.pop(rid, {}),
-                    output_signal_names=self._buffered_outputs.pop(rid, []),
-                    resource_publish_info=(
-                        {} if fwd_info is None else fwd_info.resource_publish_info
-                    ),
-                    partition_name=partition,
-                    partition_done=self._rust.stream_partition_done(rid, partition),
-                    stream_tokens_consumed=consumed.get(rid, {}),
-                    output_loop_indices=self._output_loop_indices.get(rid, {}),
-                    graph_timings=timings, rx_info=rx, tx_info=tx,
-                ),
-            ))
-
-    def _infos(self, uuids: list[int]) -> list:
-        """Descriptors for the wire, from the bookkeeper Rust shares."""
-        return [
-            i for i in (self._bookkeeping.get_info(u) for u in uuids)
-            if i is not None
-        ]
+        The worker mutates it exactly once, at admit (``rid_handle``), and
+        re-sends the same object every pass -- so re-encoding per pass would
+        be pure waste.
+        """
+        if info is None:
+            return None
+        cached = self._fwd_info_bytes.get(rid)
+        if cached is None or cached[0] is not info:
+            cached = (info, wire.encode_field(info, CurrentForwardPassInfo))
+            self._fwd_info_bytes[rid] = cached
+        return cached[1]
 

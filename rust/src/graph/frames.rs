@@ -18,6 +18,7 @@
 
 use rmpv::Value;
 
+use crate::graph::compile::EMIT_TO_CLIENT;
 use crate::graph::spec::{StrToId, Sym};
 use crate::tensors::TensorPointerInfo;
 
@@ -29,6 +30,37 @@ fn s(v: &str) -> Value {
 /// nested; re-serialising a generic value is what makes splicing exact.
 fn spliced(bytes: &[u8]) -> Value {
     rmpv::decode::read_value(&mut &bytes[..]).unwrap_or(Value::Nil)
+}
+
+/// One key out of an already-encoded map.
+///
+/// `resource_publish_info` is a FIELD of CurrentForwardPassInfo, and Python
+/// sends that whole object anyway -- so it is read back out of the same blob
+/// rather than encoded a second time. Absent yields None, which omits the
+/// field and leaves the decoder's default.
+pub fn spliced_field(bytes: Option<&[u8]>, key: &str) -> Option<Value> {
+    match spliced(bytes?) {
+        Value::Map(m) => m
+            .into_iter()
+            .find(|(k, _)| k.as_str() == Some(key))
+            .map(|(_, v)| v),
+        _ => None,
+    }
+}
+
+/// The profiling payload is one blob holding `[rx_info, tx_info,
+/// graph_timings]` (see `wire.encode_fields`). Split so each rides its own
+/// field. A blob of the wrong shape yields nothing rather than a wrong
+/// frame -- profiling is diagnostic, and must not take the send down.
+pub fn split_profiling(bytes: Option<&[u8]>) -> [Option<Value>; 3] {
+    let Some(b) = bytes else { return [None, None, None] };
+    match spliced(b) {
+        Value::Array(v) if v.len() == 3 => {
+            let mut it = v.into_iter();
+            [it.next(), it.next(), it.next()]
+        }
+        _ => [None, None, None],
+    }
 }
 
 /// One `TensorPointerInfo`. `shm_segment` and the two `_source_*` fields have
@@ -96,13 +128,12 @@ pub struct WorkerGraphsDone<'a> {
     pub partition_done: bool,
     pub stream_tokens_consumed: &'a [(String, i64)],
     pub output_loop_indices: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
-    /// `dict[str, PublishedInfo]` -- abstract, so it stays Python's.
-    pub resource_publish_info_encoded: Option<&'a [u8]>,
-    /// `graph_timings`, `rx_info`, `tx_info`: only populated under
-    /// enable_prof, and they reach us as bytes already.
-    pub graph_timings_encoded: Option<&'a [u8]>,
-    pub rx_info_encoded: Option<&'a [u8]>,
-    pub tx_info_encoded: Option<&'a [u8]>,
+    /// `dict[str, PublishedInfo]` -- abstract, so it stays Python's. Read
+    /// out of the CurrentForwardPassInfo blob by `spliced_field`.
+    pub resource_publish_info: Option<Value>,
+    /// `rx_info`, `tx_info`, `graph_timings`, in that order: only populated
+    /// under enable_prof, and already encoded when they reach us.
+    pub profiling: [Option<Value>; 3],
 }
 
 fn str_counts(pairs: &[(String, i64)]) -> Value {
@@ -162,14 +193,14 @@ impl WorkerGraphsDone<'_> {
                 ),
             ),
         ];
-        for (key, bytes) in [
-            ("resource_publish_info", self.resource_publish_info_encoded),
-            ("graph_timings", self.graph_timings_encoded),
-            ("rx_info", self.rx_info_encoded),
-            ("tx_info", self.tx_info_encoded),
-        ] {
-            if let Some(b) = bytes {
-                m.push((s(key), spliced(b)));
+        if let Some(v) = &self.resource_publish_info {
+            m.push((s("resource_publish_info"), v.clone()));
+        }
+        for (key, value) in
+            ["rx_info", "tx_info", "graph_timings"].iter().zip(&self.profiling)
+        {
+            if let Some(v) = value {
+                m.push((s(key), v.clone()));
             }
         }
         Value::Map(m)
@@ -178,19 +209,148 @@ impl WorkerGraphsDone<'_> {
     /// The full frame: a ConductorMessage wrapping this body. `body` is
     /// declared `MessageBody`, which is abstract, hence the `[tag, payload]`.
     pub fn encode(&self, it: &StrToId, bk: &StrToId) -> Vec<u8> {
-        let frame = Value::Array(vec![
-            s("conductor_msg"),
-            Value::Map(vec![
-                (s("message_type"), s("worker_graphs_done")),
-                (
-                    s("body"),
-                    Value::Array(vec![s("wgs_done"), self.body(it, bk)]),
-                ),
-            ]),
-        ]);
-        let mut out = Vec::new();
-        // Infallible for a Value tree with no unrepresentable node.
-        rmpv::encode::write_value(&mut out, &frame).expect("msgpack encode");
-        out
+        encode_frame(
+            "conductor_msg", "worker_graphs_done", Some("wgs_done"),
+            self.body(it, bk),
+        )
     }
+}
+
+/// One `GraphEdge`. Every field has a non-None default, so none is omitted --
+/// including `output_modality`, which defaults to `""` rather than nil.
+fn graph_edge(
+    bk: &StrToId,
+    name: &str,
+    next_node: &str,
+    modality: &str,
+    is_streaming: bool,
+    infos: &[TensorPointerInfo],
+) -> Value {
+    Value::Map(vec![
+        (s("next_node"), s(next_node)),
+        (s("name"), s(name)),
+        (
+            s("tensor_info"),
+            Value::Array(infos.iter().map(|i| tensor_info(bk, i)).collect()),
+        ),
+        (s("persist"), false.into()),
+        (s("conductor_new_token"), false.into()),
+        (s("is_streaming"), is_streaming.into()),
+        (s("output_modality"), s(modality)),
+        (s("_persist_for_loop"), false.into()),
+        (s("_final_stream_chunk"), false.into()),
+        (s("_total_fanin"), 1.into()),
+    ])
+}
+
+/// One edge on an INPUT_SIGNALS frame.
+pub struct OutEdge {
+    pub name: String,
+    pub next_node: String,
+    pub is_streaming: bool,
+    pub infos: Vec<TensorPointerInfo>,
+}
+
+/// INPUT_SIGNALS to a peer worker. One frame per (request, worker): the plan
+/// is per edge, and a worker taking several of a request's signals should see
+/// one message.
+pub struct InputSignals<'a> {
+    pub request_id: &'a str,
+    pub partition_name: &'a str,
+    pub edges: &'a [OutEdge],
+    /// `CurrentForwardPassInfo`, encoded by Python. Required with no default,
+    /// so when absent it goes as an explicit nil rather than being omitted.
+    pub request_info_encoded: Option<&'a [u8]>,
+}
+
+impl InputSignals<'_> {
+    pub fn encode(&self, bk: &StrToId) -> Vec<u8> {
+        let body = Value::Map(vec![
+            (s("request_id"), s(self.request_id)),
+            (
+                s("inputs"),
+                Value::Array(
+                    self.edges
+                        .iter()
+                        .map(|e| {
+                            graph_edge(
+                                bk, &e.name, &e.next_node, "", e.is_streaming,
+                                &e.infos,
+                            )
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                s("request_info"),
+                match self.request_info_encoded {
+                    Some(b) => spliced(b),
+                    None => Value::Nil,
+                },
+            ),
+            (s("partition_name"), s(self.partition_name)),
+            // A set, which msgpack cannot express; the codec sends a list.
+            (s("producer_done"), Value::Array(vec![])),
+        ]);
+        encode_frame("worker_msg", "input_signals", Some("input_signals"), body)
+    }
+}
+
+/// One emitted output to the api server.
+pub struct ResultTensors<'a> {
+    pub request_id: &'a str,
+    pub modality: &'a str,
+    pub signal: &'a str,
+    pub infos: Vec<TensorPointerInfo>,
+    pub loop_indices: Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)>,
+}
+
+impl ResultTensors<'_> {
+    pub fn encode(&self, it: &StrToId, bk: &StrToId) -> Vec<u8> {
+        let body = Value::Map(vec![
+            (s("request_id"), s(self.request_id)),
+            (s("modality"), s(self.modality)),
+            (
+                s("graph_edge"),
+                graph_edge(
+                    bk, self.signal, EMIT_TO_CLIENT, self.modality, false,
+                    &self.infos,
+                ),
+            ),
+            (
+                s("loop_indices"),
+                match &self.loop_indices {
+                    Some((order, idxs, fwd)) => {
+                        nested_loop_indices(it, order, idxs, *fwd)
+                    }
+                    None => Value::Nil,
+                },
+            ),
+            (s("metadata"), Value::Map(vec![])),
+        ]);
+        // ResultTensors is APIServerMessage.body's DECLARED type, not an
+        // abstract one, so the body rides untagged.
+        encode_frame("api_msg", "result_tensors", None, body)
+    }
+}
+
+/// `[outer_tag, {message_type, body}]`, with `body` tagged only where its
+/// declared type is abstract.
+fn encode_frame(
+    outer_tag: &str, message_type: &str, body_tag: Option<&str>, body: Value,
+) -> Vec<u8> {
+    let body = match body_tag {
+        Some(t) => Value::Array(vec![s(t), body]),
+        None => body,
+    };
+    let frame = Value::Array(vec![
+        s(outer_tag),
+        Value::Map(vec![
+            (s("message_type"), s(message_type)),
+            (s("body"), body),
+        ]),
+    ]);
+    let mut out = Vec::new();
+    rmpv::encode::write_value(&mut out, &frame).expect("msgpack encode");
+    out
 }
