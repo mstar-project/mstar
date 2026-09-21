@@ -2329,8 +2329,33 @@ class Worker:
         num_tensors: list[int] = []
         signal_idxs: list[int] = []
         for rid in rids:
+            produced = outputs.get(rid) or {}
+            if not produced:
+                # Every edge out of this node will carry no tensors, so nothing
+                # downstream becomes ready and the pipeline stalls silently.
+                # Distinguish the two ways to get here: the rid is absent from
+                # the engine's dict (a KEY-TYPE mismatch -- these are integer
+                # handles), or it is present and genuinely empty.
+                logger.warning(
+                    "%s/%s: no outputs for rid %r (%s). outputs has %r; "
+                    "expected signals %r",
+                    batch_N.node_name, batch_N.graph_walk, rid,
+                    "rid not in the dict" if rid not in outputs
+                    else "present but empty",
+                    list(outputs)[:4], signals,
+                )
+            elif not set(produced) & set(signals):
+                # The node emitted tensors under names no edge carries, so
+                # store_and_return_tensor_info files them and the lookup below
+                # finds nothing.
+                logger.warning(
+                    "%s/%s: rid %r emitted %r but the graph's edges are %r -- "
+                    "no overlap, so every edge carries no tensors.",
+                    batch_N.node_name, batch_N.graph_walk, rid,
+                    list(produced), signals,
+                )
             info_by_signal = self.tensor_manager.store_and_return_tensor_info(
-                rid=rid, tensors=outputs.get(rid) or {},
+                rid=rid, tensors=produced,
                 node_name=batch_N.node_name,
                 graph_walk=batch_N.graph_walk,
                 skip_cuda_sync=True,
