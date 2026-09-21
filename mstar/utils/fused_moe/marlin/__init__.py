@@ -98,7 +98,10 @@ _BF16_BUFFERS: dict = {}
 def _bf16_weight_buffers(e: int, inter: int, latent: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     """The dequantized gate-up ``[E, 2I, K]`` and down ``[E, K, I]`` bf16 buffers, one pair per process for
     all the layers of a shape (1.85 GB at the pruned75 per-rank shapes), allocated on first use."""
-    key = (e, inter, latent, str(device))
+    dev = torch.device(device)
+    if dev.index is None:  # one key per GPU, however the device was spelled
+        dev = torch.device(dev.type, torch.cuda.current_device())
+    key = (e, inter, latent, str(dev))
     bufs = _BF16_BUFFERS.get(key)
     if bufs is None:
         bufs = _BF16_BUFFERS[key] = (torch.empty(e, 2 * inter, latent, dtype=torch.bfloat16, device=device),
@@ -157,10 +160,12 @@ class MarlinMXFP4Experts:
     # from this many tokens a slice runs as bf16 grouped GEMMs on weights dequantized from the Marlin tiles
     # once per layer (marlin/dequant.py): Marlin dequantizes inside its inner loop, once per 64-row block, so a
     # long prefill dequantizes every expert tens of times and runs at a quarter of the tensor cores' rate. The
-    # bf16 path pays a fixed 1.6 ms a layer of dequantization plus its gathers, which on an H100 at the pruned75
-    # shapes only breaks even with Marlin near 8192 tokens (5.2 against 5.0 to 5.7 ms a layer, plan section 11,
-    # 2026-09-21), so it is off unless MSTAR_MOE_BF16_TOKENS names a threshold.
-    bf16_min_tokens = int(os.environ.get("MSTAR_MOE_BF16_TOKENS", "0"))
+    # bf16 path pays a fixed 1.6 ms a layer of dequantization plus its gathers, so it only pays for the longest
+    # slices: at 6144 tokens and up it took 100 to 550 ms off the TTFT of Kimi K3 pruned75's 8-prompt prefills
+    # on 8 H100s and added 1 to 1.4 % of throughput from 16 concurrent requests (plan section 11, 2026-09-21);
+    # with uniform routing it is about even with Marlin at 8192 tokens. MSTAR_MOE_BF16_TOKENS moves the threshold,
+    # 0 turns the path off. Its first use compiles and allocates: prepare_moe_kernels warms it at setup.
+    bf16_min_tokens = int(os.environ.get("MSTAR_MOE_BF16_TOKENS", "6144"))
 
     @torch.compiler.disable
     def __call__(
@@ -190,6 +195,25 @@ class MarlinMXFP4Experts:
         return (self.bf16_min_tokens > 0 and n >= self.bf16_min_tokens and z.dtype == torch.bfloat16
                 and not torch.cuda.is_current_stream_capturing()
                 and not (self.sharding is not None and self.sharding.is_partial) and hasattr(torch, "_grouped_mm"))
+
+    def warm_bf16_path(self) -> float:
+        """Run the bf16 path once on a slice of ``bf16_min_tokens`` random rows, so its first real prefill does not
+        pay the kernels' compilation, the shared weight buffers' allocation and the grouped GEMM's setup (some
+        seconds at a request's expense otherwise). Returns the seconds it took; nothing when the path is off."""
+        import time
+
+        if not (self.bf16_min_tokens > 0 and self.w13 is not None and hasattr(torch, "_grouped_mm")):
+            return 0.0
+        t0 = time.perf_counter()
+        m, e, k = self.bf16_min_tokens, self.num_experts, self.latent
+        top_k = min(16, e)
+        z = torch.zeros(m, k, dtype=torch.bfloat16, device=self.device)
+        idx = torch.arange(m * top_k, device=self.device).remainder(e).view(m, top_k).to(torch.int32)
+        w = torch.full((m, top_k), 1.0 / top_k, dtype=torch.float32, device=self.device)
+        if self._bf16_applies(z):
+            self._forward_bf16(z, idx, w)
+        torch.cuda.synchronize(self.device)
+        return time.perf_counter() - t0
 
     def _forward_bf16(
         self, z: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor, out: torch.Tensor | None = None,
