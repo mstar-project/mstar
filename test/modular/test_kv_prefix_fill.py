@@ -169,6 +169,23 @@ def test_the_first_request_to_fill_a_page_is_the_one_the_index_names():
     kv.assert_pages_conserved()
 
 
+def test_a_rewound_stream_indexes_its_rerun_from_page_zero():
+    kv = _manager()
+    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": _keys(512)}))
+    _step(kv, "r0", 512)
+    kv.reset_request("r0")
+    # nothing left from the first run, so the rerun is the only thing to index
+    kv._index.evict(kv.config.max_num_pages)
+
+    _step(kv, "r0", 512)
+
+    assert set(kv._index.pages()) == set(kv._streams["r0"]["main"].page_indices), (
+        "the rerun picked the chain up where the first run left it and filed "
+        "none of the pages it wrote"
+    )
+    kv.assert_pages_conserved()
+
+
 # ── who may not offer anything ──────────────────────────────────────────
 
 
