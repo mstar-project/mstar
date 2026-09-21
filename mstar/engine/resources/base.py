@@ -91,9 +91,7 @@ class Resource(ABC):
     ) -> int | None:
         """How many of this request's leading tokens this resource already holds.
 
-        None means the resource has no opinion, which is not the same as zero:
-        the engine takes the smallest answer any resource gives, so one that
-        cannot serve a prefix must not be counted as offering none.
+        None is no opinion; zero is an opinion that nothing can be skipped.
         """
         return None
 
@@ -103,19 +101,15 @@ class Resource(ABC):
     ) -> None:
         """Take on the length every resource agreed to skip.
 
-        Called with the untrimmed inputs, so a resource that needs the tokens
-        being skipped can still read them; the engine trims afterwards.
+        The inputs are untrimmed, so a resource that needs the tokens being
+        skipped can still read them.
         """
         return
 
     def extend_prefix_chain(
         self, rid: str, node_name: str, graph_walk: str, outputs: Any,
     ) -> None:
-        """Take this step's sampled tokens, so what was generated can be keyed.
-
-        Handed the host copy the stop check already takes, one step after the
-        tokens were written.
-        """
+        """Take this step's sampled tokens, so what was generated can be keyed."""
         return
 
     def fingerprint(self) -> bytes | None:

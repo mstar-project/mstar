@@ -64,11 +64,9 @@ _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 def checkpoint_identity(path: str | Path) -> bytes:
     """Name the weights a cached page was produced under, without reading them.
 
-    The safetensors index already names every shard and its tensors, so hashing
-    it plus ``config.json`` costs a few kilobytes where hashing the weights
-    would cost the whole checkpoint. A checkpoint shipped without an index falls
-    back to its shard names and sizes, which catches a replaced shard but not
-    one edited in place at the same length.
+    A checkpoint with no safetensors index falls back to its shard names and
+    sizes, which catches a replaced shard but not one edited in place at the
+    same length.
     """
     root = Path(path)
     index = root / "model.safetensors.index.json"
@@ -534,8 +532,9 @@ class Engine:
             for other in sorted(specs_by_key):
                 if key in specs_by_key[other].depends_on():
                     built = self._resources.get(other)
-                    if built is not None and built.fingerprint() is not None:
-                        parts.append(built.fingerprint())
+                    mark = built.fingerprint() if built is not None else None
+                    if mark is not None:
+                        parts.append(mark)
             resource.enable_prefix_cache(fingerprint(*shared, *parts))
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:

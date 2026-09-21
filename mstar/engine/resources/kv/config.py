@@ -32,8 +32,7 @@ class KVConfig:
     layout: KVLayout = KVLayout.NHD
     # pages of pinned host memory to keep for offloading; 0 disables it
     cpu_offload_pages: int = 0
-    # keeps deployments that should not read each other's cached pages apart,
-    # by changing the root rather than by checking anything at match time
+    # folded into the root, not checked at match time
     prefix_cache_salt: str = ""
     prefix_cache: bool = True
 

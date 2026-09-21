@@ -1,19 +1,12 @@
 """The prefix index: which cached page holds which key, and which to drop first.
 
-Inserting makes the index a page's second owner — it seals the page and retains
-it through the arena — so evicting releases that one reference and the page
-reaches the free list only once no live request holds it too.
+Inserting makes the index a page's second owner, so evicting releases that one
+reference and the page reaches the free list only once no live request holds it
+too. Leaves are ordered by a clock that ticks on every insert and every matching
+lookup; a page that is re-stamped or gains a child leaves a stale heap entry
+behind, which is why an entry's stamp is checked against the page's own.
 
-A page is removed only as a leaf, because a parent link is a physical page id: a
-page removed from the middle of a chain could be reused under a descendant that
-still names it. The child counts are what make "is this a leaf" a read rather
-than a walk.
-
-Leaves are ordered by a clock that ticks on every insert and every matching
-lookup. A page that is re-stamped or gains a child leaves a stale heap entry
-behind rather than being hunted down, so an entry's stamp is checked against the
-page's own before it is used. Every caller holds the manager's lock, so none of
-this takes one of its own.
+Every caller holds the manager's lock, so none of this takes one of its own.
 """
 
 import heapq
@@ -75,7 +68,7 @@ class PrefixIndex:
         return True
 
     def page_for(self, key: bytes) -> int | None:
-        """The page under ``key``, without counting it as a hit."""
+        # not `lookup`: this is not a hit, and must not re-stamp the page
         return self._by_key.get(key)
 
     def pages(self) -> list[int]:

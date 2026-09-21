@@ -136,15 +136,14 @@ class SamplerResource(Resource):
     ) -> None:
         """Keep the tokens the cache is about to skip, for `plan` to fold in.
 
-        A step declares its tracked tokens from the inputs it is given, and by
-        then the matched prefix has been cut out of them; without these the
-        mask would hold the tail of the prompt and the penalty would let the
-        model repeat everything before it.
+        A step declares its tracked tokens from inputs the prefix has already
+        been cut out of, so without these the mask would hold the prompt's tail
+        alone and the penalty would let the model repeat the rest.
         """
         del node_name, graph_walk
-        ids = getattr(inputs, "input_ids", None)
-        if matched_len > 0 and ids is not None:
-            self._cached_prefix[rid] = ids[:matched_len]
+        # a walk that prefills from embeddings has no ids to keep
+        if matched_len > 0 and inputs.input_ids is not None:
+            self._cached_prefix[rid] = inputs.input_ids[:matched_len]
 
     def remove_request(self, rid: str):
         self._sampler.remove_request(rid)
