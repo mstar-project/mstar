@@ -11,7 +11,16 @@ import torch
 from torch import nn
 
 from mstar.engine.resources import AttentionStep, KVStep, SamplerStep
-from mstar.model.nemotron_duplex.config import NANO_ATTN, NANO_KV, NANO_SAMPLER, NemotronDuplexConfig
+from mstar.engine.resources.linear_attn.config import LinearAttnStep
+from mstar.engine.resources.recurrent import RecurrentStep
+from mstar.model.nemotron_duplex.config import (
+    MAMBA,
+    MAMBA_STATE,
+    NANO_ATTN,
+    NANO_KV,
+    NANO_SAMPLER,
+    NemotronDuplexConfig,
+)
 from mstar.model.nemotron_duplex.submodules import (
     AudioCodecDecoderSubmodule,
     NemotronHLLMSubmodule,
@@ -101,21 +110,26 @@ def test_nano_prompt_priming_matches_reference():
     assert torch.allclose(pre["input_embeds"], expected)
 
 
+STATE_KEYS = {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA}
+
+
 def test_nano_declare_step_per_walk():
-    """Prefill steps the KV + attention only (the prompt region is never sampled);
-    decode also steps the text sampler. One 'main' segment per request, spanning
-    its token count — padding rows included (strict zip)."""
+    """Every walk steps the KV + attention and the Mamba pool + resource; only
+    decode steps the text sampler (the prompt region is never sampled). One
+    'main' segment per request, spanning its token count — padding rows
+    included (strict zip)."""
     nano = _make_nano()
     p_inp = nano.prepare_inputs("prefill_text", None, {"text_inputs": [torch.arange(5)]})
     step = nano.declare_step("prefill_text", ["a"], [p_inp])
-    assert set(step.keys()) == {NANO_KV, NANO_ATTN}
+    assert set(step.keys()) == STATE_KEYS
     assert isinstance(step.get(NANO_KV), KVStep) and isinstance(step.get(NANO_ATTN), AttentionStep)
+    assert isinstance(step.get(MAMBA_STATE), RecurrentStep) and isinstance(step.get(MAMBA), LinearAttnStep)
     assert step.get(NANO_ATTN).causal is True
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("a", "main", 5)]
 
     d_inp = nano.prepare_inputs("decode", None, {"audio_frame": [torch.ones(H)]})
     step = nano.declare_step("decode", ["a", "b"], [d_inp, d_inp])
-    assert set(step.keys()) == {NANO_KV, NANO_ATTN, NANO_SAMPLER}
+    assert set(step.keys()) == STATE_KEYS | {NANO_SAMPLER}
     assert isinstance(step.get(NANO_SAMPLER), SamplerStep)
     assert [(s.request_id, s.span) for s in step.segments] == [("a", 1), ("b", 1)]
 
