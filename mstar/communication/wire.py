@@ -349,6 +349,21 @@ def encode(msg) -> bytes:
     return msgpack.packb([tag, _encode_dataclass(msg)], use_bin_type=True)
 
 
+def encode_field(value, hint) -> bytes:
+    """One field's value, encoded as its DECLARED type, on its own.
+
+    For a sender that builds the rest of the frame elsewhere: the Rust graph
+    runtime encodes what it owns and splices these in as opaque values, so it
+    never has to know ``CurrentForwardPassInfo`` or grow a case for every new
+    ``PublishedInfo`` subclass.
+
+    Passing the declared type is what makes the result safe to splice -- it
+    selects the same encoder ``_plan`` would have chosen for that field, so
+    the frame decodes identically to having built the whole message here.
+    """
+    return msgpack.packb(_encoder(hint)(value), use_bin_type=True)
+
+
 def decode(data: bytes):
     tag, payload = msgpack.unpackb(data, raw=False, strict_map_key=False)
     if tag == OPAQUE:
