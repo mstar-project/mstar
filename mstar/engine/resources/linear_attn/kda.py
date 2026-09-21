@@ -47,14 +47,38 @@ class KDAPlan:
     _cpu: dict = field(default_factory=dict, repr=False)
     _dev: dict = field(default_factory=dict, repr=False)
 
+    # Values every layer of the step reads, built on the first request and kept for the plan's lifetime:
+    # one launch (or one copy) a step instead of one a layer, and one object, which matters to kernels that
+    # cache their own bookkeeping by the identity of the tensor they are handed (fla's chunk table)
+    def cached(self, key, build):
+        """``build()`` once under ``key``, the stored result after."""
+        if key not in self._dev:
+            self._dev[key] = build()
+        return self._dev[key]
+
     def verify_cu_seqlens(self) -> torch.Tensor:
         """Token boundaries of the rows' prefix + block sequences (``kmax1 + k1`` each, the prefix
-        padded to the pool's slots), the packing ``kda_recurrent_checkpoint`` reads; built once per
-        plan (one launch a step, not one a layer)."""
-        if "verify_cu" not in self._dev:
-            self._dev["verify_cu"] = torch.arange(
-                self.num_rows + 1, dtype=torch.int32, device=self.cu_seqlens.device) * (self.kmax1 + self.k1)
-        return self._dev["verify_cu"]
+        padded to the pool's slots), the packing ``kda_recurrent_checkpoint`` reads."""
+        return self.cached("verify_cu", lambda: torch.arange(
+            self.num_rows + 1, dtype=torch.int32, device=self.cu_seqlens.device) * (self.kmax1 + self.k1))
+
+    def cu_seqlens_long(self) -> torch.Tensor:
+        """The rows' token boundaries as int64, which fla's varlen kernels index with."""
+        return self.cached("cu_long", lambda: self.cu_seqlens[: self.num_rows + 1].to(torch.long))
+
+    def cu_seqlens_host(self) -> torch.Tensor:
+        """The same boundaries as a CPU int64 tensor, for kernels that keep their chunk bookkeeping on the host."""
+        if "cu_host" not in self._cpu:
+            self._cpu["cu_host"] = torch.tensor(self.cu_seqlens_cpu[: self.num_rows + 1], dtype=torch.long)
+        return self._cpu["cu_host"]
+
+    def slot_ids_long(self) -> torch.Tensor:
+        """The rows' slots as int64 (``index_copy_`` takes no other index dtype)."""
+        return self.cached("slots_long", lambda: self.slot_ids[: self.num_rows].to(torch.long))
+
+    def state_mask(self, dtype: torch.dtype) -> torch.Tensor:
+        """``has_state`` as a ``[rows]`` factor in ``dtype``: 1 where the slot's state is read, 0 where it reads as zeros."""
+        return self.cached(("mask", dtype), lambda: self.has_state[: self.num_rows].to(dtype))
 
     # host copies for reference kernels that loop over rows (a sync on CUDA; the fla kernels never ask)
     @property
