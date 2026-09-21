@@ -53,6 +53,11 @@ class PrefixIndex:
         )
         if key in self._by_key:
             return False
+        assert self._key[page] is None, (
+            f"page {page} indexed under {key.hex()[:16]} while it is still "
+            f"indexed under {self._key[page].hex()[:16]}; evicting one entry "
+            "would free a page the other still names"
+        )
         self._clock += 1
         self._by_key[key] = page
         self._key[page] = key
