@@ -300,8 +300,23 @@ class APIServer:
                     req.error = message
                     req.error_status = 503
                 req.event.set()
-        if self.on_fatal is not None:
-            self.on_fatal()
+            on_fatal = self.on_fatal
+        if on_fatal is not None:
+            on_fatal()
+
+    def set_on_fatal(self, callback: Callable[[], None]) -> None:
+        """Register what stops the HTTP server once the conductor is gone.
+
+        The message thread runs the callback when it finds the conductor
+        dead, which can be any time after finalize_setup started it, so a
+        callback registered later than that runs right away. Registration
+        and the thread's read share request_lock, so it runs once.
+        """
+        with self.request_lock:
+            self.on_fatal = callback
+            fatal = self.fatal_error is not None
+        if fatal:
+            callback()
 
     # ----------------------------------------------------------
     # Submitting a request
@@ -1086,7 +1101,7 @@ def main(argv: list[str] | None = None):
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)
-            api_server.on_fatal = bridge.stop
+            api_server.set_on_fatal(bridge.stop)
             bridge.run()
         else:
             logger.info("Starting mstar API server on %s:%s", args.host, args.port)
@@ -1099,7 +1114,7 @@ def main(argv: list[str] | None = None):
             def _stop_server():
                 server.should_exit = True
 
-            api_server.on_fatal = _stop_server
+            api_server.set_on_fatal(_stop_server)
             server.run()
             if not server.started:
                 exit_code = 3  # uvicorn.run()'s own code for a server that never came up

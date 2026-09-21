@@ -167,7 +167,7 @@ def serve(server: APIServer, model_name: str, args) -> None:
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(signal.SIGTERM, runtime.shutdown)
         # Conductor death is detected on the message thread, so hop to the loop.
-        server.on_fatal = lambda: loop.call_soon_threadsafe(runtime.shutdown)
+        server.set_on_fatal(lambda: loop.call_soon_threadsafe(runtime.shutdown))
         surfaces = []
         for surface in specs:
             endpoint = runtime.endpoint(

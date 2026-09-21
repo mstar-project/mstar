@@ -379,6 +379,26 @@ def test_dead_conductor_releases_pending_requests_and_stops_the_server():
     assert exc.value.status_code == 503
 
 
+def test_stop_callback_registered_after_the_conductor_died_still_runs():
+    """main() registers what stops the HTTP server after finalize_setup has
+    started the message thread, so the thread can find the conductor dead
+    before anything is registered. The late registration has to stop the
+    server itself, or the process would keep answering 503 forever."""
+    stopped = []
+    server = _api_server(_Proc(5, alive=False, exitcode=1))
+    server._process_messages()  # found dead, nothing to call yet
+    assert server.fatal_error is not None
+    server.set_on_fatal(lambda: stopped.append("late"))
+    assert stopped == ["late"]
+
+    # Registered first, the message thread runs it, once.
+    server = _api_server(_Proc(5, alive=False, exitcode=1))
+    server.set_on_fatal(lambda: stopped.append("early"))
+    assert stopped == ["late"]
+    server._process_messages()
+    assert stopped == ["late", "early"]
+
+
 def test_health_reports_unhealthy_once_fatal():
     """A load balancer must stop routing here: /health has to fail as soon as
     the deployment is going down, not stay 200 until the process exits."""
