@@ -268,13 +268,14 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
-    manager.ingest_request("request", KVReqConfig(needed_labels=["main"]))
+    manager.ingest_request("broken", KVReqConfig(needed_labels=["main"]))
+    manager.ingest_request("healthy", KVReqConfig(needed_labels=["main"]))
     missing = ShmKVTransferInfo(
         path=str(tmp_path / "missing.pt"),
         page_indices=(0,),
         layout=manager.kv_cache.layout,
     )
-    published = PublishedKVInfo.build_for_rank(
+    broken_publish = PublishedKVInfo.build_for_rank(
         rank=0,
         world_size=1,
         seq_info={
@@ -285,13 +286,46 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
             ),
         },
     )
-
-    outcome = manager.admit_retrieve(
-        "request", "LLM_cfg_text", "image_gen_cfg", published,
+    healthy_path = tmp_path / "healthy.pt"
+    healthy_kv = torch.ones((1, 1, 2, 4, 1, 1), dtype=torch.float32)
+    torch.save(healthy_kv, healthy_path)
+    healthy_publish = PublishedKVInfo.build_for_rank(
+        rank=0,
+        world_size=1,
+        seq_info={
+            "main": KVSequenceInfo(
+                seq_len=1,
+                latest_kv_transfer_info=ShmKVTransferInfo(
+                    path=str(healthy_path),
+                    page_indices=(0,),
+                    layout=manager.kv_cache.layout,
+                ),
+                page_indices=[0],
+            ),
+        },
     )
 
-    assert not outcome.ok
-    assert "FileNotFoundError" in outcome.reason.message
+    broken = manager.admit_retrieve(
+        "broken", "LLM_cfg_text", "image_gen_cfg", broken_publish,
+    )
+    broken_again = manager.admit_retrieve(
+        "broken", "LLM_cfg_text", "image_gen_cfg", broken_publish,
+    )
+    healthy = manager.admit_retrieve(
+        "healthy", "LLM_cfg_text", "image_gen_cfg", healthy_publish,
+    )
+
+    healthy_page = manager._streams["healthy"]["main"].page_indices[0]
+
+    assert not broken.ok
+    assert "FileNotFoundError" in broken.reason.message
+    assert not broken_again.ok
+    assert "FileNotFoundError" in broken_again.reason.message
+    assert healthy.ok and healthy.ready
+    torch.testing.assert_close(
+        manager.kv_cache.tensor[:, healthy_page, :, :1],
+        healthy_kv[:, 0, :, :1],
+    )
 
 
 def test_kv_shm_directory_is_private_to_the_deployment(
