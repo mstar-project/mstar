@@ -154,6 +154,8 @@ class _Attn(nn.Module):
         h = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
+        self.kv_head_dim = config.kv_head_dim       # the engine KV's head dim (>= head_dim)
+        assert self.kv_head_dim >= self.head_dim, (self.kv_head_dim, self.head_dim)
         self.scaling = config.query_pre_attn_scalar ** -0.5
         self.eps = config.rms_norm_eps
         self.q_proj = nn.Linear(h, self.num_heads * self.head_dim, bias=False)
@@ -179,12 +181,16 @@ class _Attn(nn.Module):
         ``[total_tokens, hd]`` (built by the caller from the positions the
         position resource planned, with this layer's theta; in torch, because
         FlashInfer's RoPE kernel takes no head dim of 72), the KV write and the
-        planned attention. The kernel scales by ``head_dim ** -0.5``; Gemma
-        wants ``query_pre_attn_scalar ** -0.5``, so the query is pre-scaled by
-        the ratio.
+        planned attention. The pool's head dim is ``kv_head_dim`` (FlashInfer
+        computes 64/128/256 exactly and returns wrong values for 72, see
+        ``EarTTSConfig.kv_head_dim``): q/k/v are zero-padded to it and the
+        output sliced back, which is exact since the padded dims add nothing to
+        the scores and come back as zeros. The kernel scales by
+        ``kv_head_dim ** -0.5``; Gemma wants ``query_pre_attn_scalar ** -0.5``,
+        so the query is pre-scaled by the ratio.
         """
         n = x.shape[0]
-        nh, hd = self.num_heads, self.head_dim
+        nh, hd, kd = self.num_heads, self.head_dim, self.kv_head_dim
         q = F.linear(x, self.q_proj.weight).view(n, nh, hd)
         k = F.linear(x, self.k_proj.weight).view(n, nh, hd)
         v = F.linear(x, self.v_proj.weight).view(n, nh, hd)
@@ -194,8 +200,10 @@ class _Attn(nn.Module):
         cos_b, sin_b = cos[:, None, :].to(q.dtype), sin[:, None, :].to(q.dtype)      # over heads
         q = q * cos_b + _rotate_half(q) * sin_b
         k = k * cos_b + _rotate_half(k) * sin_b
-        q = q * (self.scaling * hd ** 0.5)
-        out = self.attend(q, k, v).reshape(n, nh * hd)
+        q = q * (self.scaling * kd ** 0.5)
+        if kd != hd:
+            q, k, v = (F.pad(t, (0, kd - hd)) for t in (q, k, v))
+        out = self.attend(q, k, v)[..., :hd].reshape(n, nh * hd)
         return F.linear(out, self.o_proj.weight)
 
     def forward(
