@@ -1,0 +1,31 @@
+# BAGEL with the encoders paged in on demand rather than held resident.
+#
+# A validation deployment for `residency: on_demand`: the ViT and the two VAE
+# nodes only run on the image walks, so holding their weights for the whole
+# process is pure floor. Paging them in costs a host->device transfer per
+# execution and forfeits CUDA-graph capture for those nodes; the LLM, which
+# runs every decode step and benefits most from capture, stays resident.
+#
+# Compare peak device memory against configs/bagel_single_gpu.yaml.
+model: "bagel"
+max_seq_len: 32768
+
+node_groups:
+  - node_names:
+      - vit_encoder
+    ranks:
+      - 0
+    residency: on_demand
+
+  - node_names:
+      - vae_encoder
+      - vae_decoder
+    ranks:
+      - 0
+    residency: on_demand
+
+  - node_names:
+      - LLM
+    ranks:
+      - 0
+    residency: resident
