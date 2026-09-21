@@ -12,6 +12,7 @@ request's logits, so the parity test can drive it directly.
 """
 
 import math
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
@@ -34,17 +35,23 @@ def get_time_steps(
     return t_shift * timesteps / (1 + (t_shift - 1) * timesteps)
 
 
+@lru_cache(maxsize=256)
 def build_reveal_schedule(
     target_len: int,
     num_codebook: int,
     num_step: int,
     t_shift: float,
-) -> list[int]:
+) -> tuple[int, ...]:
     """How many of the ``target_len * num_codebook`` cells to reveal per step.
 
     The per-step count follows the gap between consecutive timesteps, rounded
     up and clamped by what is left; the final step takes the entire remainder so
     the canvas is always fully revealed regardless of rounding drift.
+
+    Cached, and returning a tuple so it stays immutable: the schedule depends
+    only on these four numbers, but ``postprocess`` needs it on every step of
+    every request, and recomputing it there means a linspace and a Python loop
+    per step for a list that never changes within a request.
     """
     timesteps = get_time_steps(num_step=num_step, t_shift=t_shift).tolist()
     total = target_len * num_codebook
@@ -61,7 +68,7 @@ def build_reveal_schedule(
         count = int(count)
         schedule.append(count)
         remaining -= count
-    return schedule
+    return tuple(schedule)
 
 
 def filter_top_k(logits: torch.Tensor, ratio: float = 0.1) -> torch.Tensor:

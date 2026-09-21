@@ -279,8 +279,12 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         Cost per step is ``sum(doc_lens)`` through a bidirectional attention
         plus a head GEMM over ``2 * sum(target_len)``; eight 30-second requests
         and eight 2-second ones are two very different steps. Row count alone
-        would let the first case allocate a float32 logits tensor several
-        hundred MB wide.
+        would let the first case allocate a logits tensor several hundred MB
+        wide.
+
+        The cap is deliberately conservative and has room now that the
+        float32 upcast is per request rather than over the whole batch, but
+        raising it is a measurement, not a guess, so it stays where it was.
         """
         packed = sum(inp.input_seq_len for inp in model_inputs)
         if packed > self.config.max_packed_tokens:
@@ -307,18 +311,31 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         Nothing request-shaped happens here: the canvas arrives built from
         ``preprocess`` and the CFG branches leave as a per-request pair of
         logit blocks, so the body is a single backbone call.
+
+        The float32 upcast happens per slice rather than on the whole packed
+        tensor. Scoring needs float32, but casting first materialises a
+        float32 copy of every request's logits at once, and that peak is what
+        ``max_packed_tokens`` has to be set low enough to survive. Casting
+        after the slice keeps the peak at one batch in the backbone's dtype
+        plus one request in float32.
         """
         assert items is not None and canvas is not None, (
             "OmniVoice backbone requires preprocess output"
         )
-        logits = self.backbone(canvas).to(torch.float32)
+        logits = self.backbone(canvas)
         outputs: dict[str, NameToTensorList] = {}
         for item in items:
             c_logits, u_logits = canvas.slice_logits(logits, item)
-            outputs[item.request_id] = {
-                "c_logits": [c_logits[0]],
-                "u_logits": [u_logits[0]],
-            }
+            row: NameToTensorList = {"c_logits": [c_logits[0].to(torch.float32)]}
+            # An item with CFG off has no unconditional document. Echo the
+            # conditional block so the edge keeps one shape for every request;
+            # scoring ignores it at guidance_scale 0.
+            row["u_logits"] = (
+                [u_logits[0].to(torch.float32)]
+                if u_logits is not None
+                else row["c_logits"]
+            )
+            outputs[item.request_id] = row
         return outputs
 
     def postprocess(

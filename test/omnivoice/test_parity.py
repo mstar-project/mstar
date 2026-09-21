@@ -108,6 +108,44 @@ def test_packed_layout_doc_boundaries():
     assert canvas.tgt_index.numel() == 240
 
 
+def test_cfg_off_drops_the_unconditional_document():
+    """guidance_scale 0 should not pay for logits scoring throws away."""
+    with_cfg = _item("a", prefix_len=40, target_len=100, guidance_scale=2.0)
+    without = _item("b", prefix_len=40, target_len=100, guidance_scale=0.0)
+
+    c_on = build_packed_canvas([with_cfg], MASK_ID, torch.device("cpu"))
+    c_off = build_packed_canvas([without], MASK_ID, torch.device("cpu"))
+
+    assert c_on.doc_lens == [140, 100]
+    assert c_off.doc_lens == [140]
+    assert c_off.packed_ids.shape[-1] == 140, "no unconditional document"
+    assert c_off.tgt_index.numel() == 100, "only the conditional block is gathered"
+    assert c_off.flat_uncond_total == 0
+
+    # Mixed batch: the layout is per item, not per step.
+    mixed = build_packed_canvas(
+        [
+            _item("x", prefix_len=10, target_len=20, guidance_scale=2.0),
+            _item("y", prefix_len=12, target_len=30, guidance_scale=0.0),
+        ],
+        MASK_ID, torch.device("cpu"),
+    )
+    assert mixed.doc_lens == [30, 20, 42]
+    assert mixed.flat_target_total == 50
+    assert mixed.flat_uncond_total == 20
+    logits = torch.randn(
+        1, NUM_CODEBOOK, mixed.flat_target_total + mixed.flat_uncond_total, 1025
+    )
+    c_x, u_x = mixed.slice_logits(logits, mixed.items[0])
+    c_y, u_y = mixed.slice_logits(logits, mixed.items[1])
+    assert c_x.shape[2] == 20 and u_x is not None and u_x.shape[2] == 20
+    assert c_y.shape[2] == 30 and u_y is None
+
+    # The conditional blocks must still be the ones the canvas gathered.
+    gathered = mixed.audio_mask[0][mixed.tgt_index]
+    assert gathered.all()
+
+
 def test_packed_layout_positions_restart_per_document():
     """RoPE must not read document n+1 as a continuation of document n."""
     items = [

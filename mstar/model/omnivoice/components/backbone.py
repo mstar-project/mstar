@@ -1,10 +1,10 @@
 """The OmniVoice backbone, run as one packed bidirectional forward per step.
 
-Every request in a step becomes two documents — the conditional canvas and its
-CFG counterpart — packed end to end into a single row and separated by
-flashinfer's ragged attention rather than by a mask.  Nothing is padded, so a
-batch mixing a 2-second and a 25-second utterance wastes nothing, and the head
-GEMM runs only at the positions whose logits are actually read.
+A request in a step becomes two documents — the conditional canvas and its CFG
+counterpart — packed end to end into a single row and separated by flashinfer's
+ragged attention rather than by a mask, or one document when it turned CFG off.
+Nothing is padded, so a batch mixing a 2-second and a 25-second utterance wastes
+nothing, and the head GEMM runs only at the positions whose logits are read.
 
 The per-step kernel path is the reference's own fastest mode, reused rather than
 re-derived: ``apply_flashinfer`` fuses QKV, swaps in flashinfer RoPE, RMSNorm
@@ -72,10 +72,10 @@ class CanvasItem:
     reference audio tokens when cloning.  ``tokens`` is ``[1, C, T]``, the live
     target canvas: all MASK at step 0, fully revealed when the loop ends.
 
-    Both CFG documents are always built, even when ``guidance_scale`` is 0.
-    The unconditional document is only the target region, so the waste is
-    small, and a uniform two-documents-per-item layout keeps the packing and
-    the gather index simple enough to be obviously correct.
+    An item at ``guidance_scale == 0`` contributes one document instead of
+    two. Scoring throws the unconditional logits away in that case, and the
+    unconditional document is the whole target region plus its share of the
+    head GEMM, so building it would be close to twice the work for nothing.
     """
 
     request_id: str
@@ -84,7 +84,9 @@ class CanvasItem:
     tokens: torch.Tensor
     guidance_scale: float
     # Filled in by build_packed_canvas; scoring reads them back.
+    # flat_u_start stays -1 for an item with no unconditional document.
     flat_start: int = field(default=-1)
+    flat_u_start: int = field(default=-1)
 
     @property
     def target_len(self) -> int:
@@ -106,23 +108,30 @@ class PackedCanvas:
     packed_ids: torch.Tensor       # [1, C, total]
     audio_mask: torch.Tensor       # [1, total]
     position_ids: torch.Tensor     # [1, total]
-    doc_lens: list[int]            # [c_0, u_0, c_1, u_1, ...]
-    tgt_index: torch.Tensor        # [2 * sum(target_len)]
+    doc_lens: list[int]            # [c_0, u_0, c_1, ...], u only where CFG is on
+    tgt_index: torch.Tensor        # [flat_target_total + flat_uncond_total]
     flat_target_total: int
+    flat_uncond_total: int
     items: list[CanvasItem]
 
     def slice_logits(
         self, logits: torch.Tensor, item: CanvasItem
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Conditional and unconditional target logits for one item.
 
-        ``logits`` is ``[1, C, 2 * flat_target_total, V]``, laid out as every
-        item's conditional target block followed by every item's unconditional
-        block — the gather order ``tgt_index`` was built in.
+        Laid out as every item's conditional target block followed by the
+        unconditional blocks of the items that asked for CFG, which is the
+        gather order ``tgt_index`` was built in.
+
+        The unconditional half is ``None`` for an item at
+        ``guidance_scale == 0``: it has no unconditional document, because
+        scoring would discard those logits anyway.
         """
         start, length = item.flat_start, item.target_len
         c_logits = logits[:, :, start : start + length, :]
-        u_start = self.flat_target_total + start
+        if item.flat_u_start < 0:
+            return c_logits, None
+        u_start = self.flat_target_total + item.flat_u_start
         u_logits = logits[:, :, u_start : u_start + length, :]
         return c_logits, u_logits
 
@@ -139,6 +148,11 @@ def build_packed_canvas(
     are no pad positions at all, and therefore none of the fully-masked-row
     hazard a dense padded batch has to guard against.
 
+    An item at ``guidance_scale == 0`` contributes only its conditional
+    document, so a batch of those is close to half the packed length and half
+    the head GEMM.  Mixing the two kinds in one step is fine: the layout is
+    driven per item.
+
     ``position_ids`` restart at 0 in every document.  Without that, RoPE would
     read a later document's canvas as a continuation of the previous request's.
     """
@@ -148,13 +162,20 @@ def build_packed_canvas(
     num_codebook = items[0].prefix_ids.shape[0]
 
     doc_lens: list[int] = []
+    offsets: list[tuple[int, int]] = []   # (cond_offset, uncond_offset or -1)
+    cursor = 0
     for item in items:
-        doc_lens.extend([item.cond_len, item.target_len])
-
-    offsets = [0]
-    for length in doc_lens[:-1]:
-        offsets.append(offsets[-1] + length)
-    total = sum(doc_lens)
+        c_off = cursor
+        cursor += item.cond_len
+        doc_lens.append(item.cond_len)
+        if item.does_cfg:
+            u_off = cursor
+            cursor += item.target_len
+            doc_lens.append(item.target_len)
+        else:
+            u_off = -1
+        offsets.append((c_off, u_off))
+    total = cursor
 
     packed_ids = torch.full(
         (1, num_codebook, total), audio_mask_id, dtype=torch.long, device=device
@@ -165,9 +186,9 @@ def build_packed_canvas(
     cond_ranges: list[torch.Tensor] = []
     uncond_ranges: list[torch.Tensor] = []
     flat_cursor = 0
+    flat_u_cursor = 0
 
-    for i, item in enumerate(items):
-        c_off, u_off = offsets[2 * i], offsets[2 * i + 1]
+    for item, (c_off, u_off) in zip(items, offsets, strict=True):
         c_len, t_len = item.cond_len, item.target_len
 
         prefix_ids = item.prefix_ids.to(device)
@@ -184,17 +205,24 @@ def build_packed_canvas(
         )
         position_ids[0, c_off : c_off + c_len] = torch.arange(c_len, device=device)
 
+        item.flat_start = flat_cursor
+        flat_cursor += t_len
+        cond_ranges.append(
+            torch.arange(c_off + c_len - t_len, c_off + c_len, device=device)
+        )
+
+        if u_off < 0:
+            item.flat_u_start = -1
+            continue
+
         # Unconditional document: the target canvas alone. Dropping the
         # conditioning entirely *is* the null prompt here.
         packed_ids[0, :, u_off : u_off + t_len] = tokens
         audio_mask[0, u_off : u_off + t_len] = True
         position_ids[0, u_off : u_off + t_len] = torch.arange(t_len, device=device)
 
-        item.flat_start = flat_cursor
-        flat_cursor += t_len
-        cond_ranges.append(
-            torch.arange(c_off + c_len - t_len, c_off + c_len, device=device)
-        )
+        item.flat_u_start = flat_u_cursor
+        flat_u_cursor += t_len
         uncond_ranges.append(torch.arange(u_off, u_off + t_len, device=device))
 
     return PackedCanvas(
@@ -204,6 +232,7 @@ def build_packed_canvas(
         doc_lens=doc_lens,
         tgt_index=torch.cat(cond_ranges + uncond_ranges),
         flat_target_total=flat_cursor,
+        flat_uncond_total=flat_u_cursor,
         items=items,
     )
 
