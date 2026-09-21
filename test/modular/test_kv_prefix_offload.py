@@ -14,6 +14,7 @@ reload allocates fresh pages and copies into them.
 from __future__ import annotations
 
 import sys
+import threading
 
 sys.path.insert(0, ".")
 
@@ -131,6 +132,38 @@ def test_a_read_in_only_moves_what_this_cache_does_not_already_hold():
         "the read moved pages this cache already held"
     )
     assert _StubTransfer.started[0]["end_len"] == 96
+    kv.assert_pages_conserved()
+
+
+def test_a_read_in_hashes_the_prompt_with_the_lock_down(monkeypatch):
+    kv = _manager()
+    tokens = list(range(64))
+    _ingest(kv, "a", tokens)
+    _run(kv, "a", tokens)
+    kv.remove_request("a")
+    _ingest(kv, "b", tokens)
+    real = manager_mod.fingerprint
+
+    def _fingerprint(*fields):
+        free = []
+
+        def _try():
+            if kv._lock.acquire(blocking=False):
+                kv._lock.release()
+                free.append(True)
+
+        attempt = threading.Thread(target=_try)
+        attempt.start()
+        attempt.join()
+        assert free, "a key was hashed with the manager's lock held"
+        return real(*fields)
+
+    monkeypatch.setattr(manager_mod, "fingerprint", _fingerprint)
+
+    assert kv.admit_retrieve(
+        "b", NODE, WALK, _published(kv, "b", 64, list(range(4))),
+    ).ok
+    assert kv._streams["b"]["main"].stored_len == 64, "the read-in matched nothing"
     kv.assert_pages_conserved()
 
 
