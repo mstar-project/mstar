@@ -56,14 +56,20 @@ class _StubTensorManager:
 class _Model:
     """A model that declares one id-keyed stream, or none when asked not to."""
 
-    def __init__(self, declares: bool = True, metadata: dict | None = None):
+    def __init__(
+        self, declares: bool = True, metadata: dict | None = None,
+        chains_decode: bool = False,
+    ):
         self._declares = declares
         self._metadata = metadata
+        self._chains_decode = chains_decode
 
     def prefix_key_streams(self):
         if not self._declares:
             return {}
-        return {"kv": {"main": PrefixStream("text_inputs", "ids")}}
+        return {"kv": {"main": PrefixStream(
+            "text_inputs", "ids", self._chains_decode,
+        )}}
 
     def get_node_resources(self):
         return [KVSpec(
@@ -158,6 +164,39 @@ def test_a_worker_without_a_deployment_config_keys_no_stream():
 
     assert "prefix_keys" not in _run(worker), (
         "a stream was keyed without a page size to page it by"
+    )
+
+
+def test_the_tail_the_manager_cannot_see_travels_with_the_keys():
+    worker = _worker(_Model(), _deployment())
+
+    cfg = _handed_over(_run(worker))
+
+    whole = len(PROMPT) // PAGE_SIZE
+    assert cfg.prefix_tail == {"main": PROMPT[whole * PAGE_SIZE:]}, (
+        "the page the generation finishes is keyed over the prompt's last "
+        "tokens, and the manager has no other way to see them"
+    )
+
+
+def test_a_node_that_chains_its_decode_says_where_the_token_arrives():
+    worker = _worker(_Model(chains_decode=True), _deployment())
+
+    cfg = _handed_over(_run(worker))
+
+    assert cfg.prefix_decode == {"main": "text_inputs"}, (
+        "the manager was not told which output carries the sampled token"
+    )
+
+
+def test_a_node_that_does_not_chain_its_decode_sends_no_name():
+    worker = _worker(_Model(chains_decode=False), _deployment())
+
+    cfg = _handed_over(_run(worker))
+
+    assert cfg.prefix_decode is None, (
+        "a node that never said its decode ids are the token it sampled would "
+        "have its generation keyed anyway"
     )
 
 
