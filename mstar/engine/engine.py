@@ -1151,13 +1151,28 @@ class Engine:
                     merged[key] = [value.clone()]
                 else:
                     merged[key] = value
-        if missed and missed == len(out_ids):
+        # Against the number of pairs ZIPPED, not len(out_ids): out_ids is the
+        # PADDED list, so comparing to it can never be true once padding is in
+        # play -- which is how this stayed silent through a real stall.
+        paired = min(len(request_ids), len(out_ids))
+        if missed and missed == paired:
             logger.warning(
                 "%s: none of the %d rid(s) matched a key in the forward's "
                 "outputs (looked up %r, the dict has %r). Every edge will "
                 "carry no tensors.",
                 submodule.__class__.__name__, missed,
-                out_ids[:3], list(raw_outputs)[:3],
+                list(out_ids)[:3], list(raw_outputs)[:3],
+            )
+        elif outputs and not any(outputs.values()):
+            # Matched, but every entry is empty -- the forward returned a dict
+            # per rid with nothing in it.
+            logger.warning(
+                "%s: every rid matched but emitted nothing. raw keys=%r, "
+                "first raw value=%r",
+                submodule.__class__.__name__, list(raw_outputs)[:4],
+                next(iter(raw_outputs.values()), None)
+                if not isinstance(next(iter(raw_outputs.values()), None), dict)
+                else list(next(iter(raw_outputs.values()))),
             )
 
     def _merge_unpacked(
