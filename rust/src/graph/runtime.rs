@@ -263,6 +263,27 @@ pub struct GraphRuntime {
         Ok(frame.encode(&self.interner, bk.strings()))
     }
 
+    /// This request's loop stop observations, interned. What STOP_LOOPS
+    /// carries so a peer can tell a newer stop from a duplicate.
+    fn loop_stop_times_of(
+        &self, rid: u32,
+    ) -> Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))> {
+        let Some(info) = self.info(rid) else { return vec![] };
+        info.loop_stop_times
+            .iter()
+            .map(|(&name, t)| {
+                (
+                    name,
+                    (
+                        t.loop_name_order.clone(),
+                        t.loop_indices.iter().map(|(&n, &i)| (n, i)).collect(),
+                        t.wg_fwd_pass_idx,
+                    ),
+                )
+            })
+            .collect()
+    }
+
     fn g(&self, wg: u32) -> &GraphRef {
         &self.graphs[wg as usize]
     }
@@ -1895,16 +1916,15 @@ impl GraphRuntime {
         last_node_run: &str,
         rids: Vec<u32>,
         loop_names: Vec<Vec<String>>,
-    ) -> PyResult<Vec<(u32, String, Vec<String>)>> {
+    ) -> PyResult<()> {
         if rids.len() != loop_names.len() {
             return Err(PyValueError::new_err(
                 "stop_loops_batched: rids and loop_names must be the same length",
             ));
         }
         let Some(walk) = self.interner.get(graph_walk) else {
-            return Ok(vec![]);
+            return Ok(());
         };
-        let mut fanout = Vec::new();
         for (rid, names) in rids.into_iter().zip(loop_names) {
             let wanted: Vec<String> = names
                 .into_iter()
@@ -1925,19 +1945,29 @@ impl GraphRuntime {
                     per_worker.entry(w).or_default().push(name.clone());
                 }
             }
+            // Never to ourselves: this rank originated the stop and has
+            // already applied it. A self-send would land in apply_peer_loop_stops
+            // and stop the loops a second time.
             let me = self.shard.me;
+            let request_id = self.rid_name(rid)?;
+            // Snapshotted BEFORE the sends: stop_loops_for_rid above already
+            // recorded this stop, and every peer must see the same context.
+            let stop_times = self.loop_stop_times_of(rid);
             for (worker, names) in per_worker {
                 if worker == me {
                     continue;
                 }
-                fanout.push((
-                    rid,
-                    self.interner.name(worker).to_string(),
-                    names,
-                ));
+                let bytes = frames::StopLoops {
+                    request_id: &request_id,
+                    partition_name: partition,
+                    loop_names: &names,
+                    loop_stop_times: stop_times.clone(),
+                }
+                .encode(&self.interner);
+                self.dispatch(self.interner.name(worker), &bytes)?;
             }
         }
-        Ok(fanout)
+        Ok(())
     }
 
     /// A peer's STOP_LOOPS landing here.

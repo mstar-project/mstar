@@ -42,11 +42,6 @@ from mstar.graph.runtime.base import (
     SpeculationPrepOutput,
 )
 from mstar.model.base import WorkerGraph
-from mstar.utils.ipc_format import (
-    StopLoops,
-    WorkerMessage,
-    WorkerMessageType,
-)
 
 
 def _edge_args(section: GraphSection, edge) -> dict:
@@ -533,26 +528,11 @@ class RustGraphRuntime(GraphRuntime):
         self, partition: str, graph_walk: str, last_node_run: str,
         loop_names: ParallelList[int, list[str]],
     ):
-        # Rust stops the loops and reports who to tell; the frames are built
-        # here because a Rust encoder has to reproduce wire.py's typed msgpack
-        # byte for byte. See the module docstring.
-        fanout = self._rust.stop_loops_batched(
+        """Rust stops the loops, decides who to tell, and sends."""
+        self._rust.stop_loops_batched(
             partition, graph_walk, last_node_run,
             list(loop_names.keys), [list(v) for v in loop_names.values],
         )
-        for rid, worker, names in fanout:
-            self._communicator.send(
-                entity_id=worker,
-                msg=WorkerMessage(
-                    message_type=WorkerMessageType.STOP_LOOPS,
-                    body=StopLoops(
-                        request_id=self.get_rid_string(rid),
-                        loop_names=set(names),
-                        loop_stop_times=self._loop_stop_times(rid),
-                        partition_name=partition,
-                    ),
-                ),
-            )
 
     def apply_peer_loop_stops(
         self, rid: int, partition: str,
@@ -583,6 +563,8 @@ class RustGraphRuntime(GraphRuntime):
         )
 
     def _loop_stop_times(self, rid: int) -> dict[str, NestedLoopIndices]:
+        """Only used for testing.
+        """
         return {
             name: NestedLoopIndices(
                 loop_name_order=order,

@@ -354,3 +354,39 @@ fn encode_frame(
     rmpv::encode::write_value(&mut out, &frame).expect("msgpack encode");
     out
 }
+
+/// STOP_LOOPS to a peer worker: which loops ended, and the loop context each
+/// was observed to end at.
+pub struct StopLoops<'a> {
+    pub request_id: &'a str,
+    pub partition_name: &'a str,
+    pub loop_names: &'a [String],
+    pub loop_stop_times: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
+}
+
+impl StopLoops<'_> {
+    pub fn encode(&self, it: &StrToId) -> Vec<u8> {
+        let body = Value::Map(vec![
+            (s("request_id"), s(self.request_id)),
+            // A set, which msgpack cannot express; the codec sends a list and
+            // rebuilds it.
+            (
+                s("loop_names"),
+                Value::Array(self.loop_names.iter().map(|n| s(n)).collect()),
+            ),
+            (s("partition_name"), s(self.partition_name)),
+            (
+                s("loop_stop_times"),
+                Value::Map(
+                    self.loop_stop_times
+                        .iter()
+                        .map(|(name, (order, idxs, fwd))| {
+                            (s(it.name(*name)), nested_loop_indices(it, order, idxs, *fwd))
+                        })
+                        .collect(),
+                ),
+            ),
+        ]);
+        encode_frame("worker_msg", "stop_loops", Some("stop_loops"), body)
+    }
+}

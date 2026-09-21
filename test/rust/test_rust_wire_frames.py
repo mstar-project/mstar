@@ -330,3 +330,62 @@ def test_a_uuid_whose_descriptor_is_gone_is_skipped(tmp_path):
     mesh.book.put_tensor(2, info)
     got = mesh.run(rid, uuids=[1])
     assert got["conductor"][0].body.persist_signals == {"out": []}
+
+
+# --- stop loops ---------------------------------------------------------------
+
+def _loop_mesh(tmp_path):
+    """A dynamic loop owned by this rank and a peer."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    inboxes = {p: ZmqCommunicator(p, str(tmp_path))
+               for p in ("conductor", "api_server", PEER)}
+    wg = {
+        "wg_id": WG_ID, "graph_walks": [WALK],
+        "nodes": [_node("ar_decode", ["token"], [("token", "ar_decode", False)])],
+        "loops": [{
+            "name": "ar_loop", "max_iters": 4, "parent": None,
+            "member_nodes": ["ar_decode"],
+            "outputs": [{"name": "token", "dest": "post", "persist": False,
+                         "new_token": False, "streaming": False,
+                         "modality": ""}],
+            "accumulated": [], "loop_back": [("token", "ar_decode")],
+            "external_inputs": [("token", "ar_decode")],
+        }],
+    }
+    rt = GraphRuntime(
+        worker_graphs=[wg],
+        remote_worker_graphs=[{"wg_id": 1, "graph_walks": [WALK],
+                               "nodes": ["ar_decode"],
+                               "dyn_loops": ["ar_loop"]}],
+        sharding={"groups": [], "shard_dim": [],
+                  "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [ME, PEER], [1, 1])
+    return rt, rid, inboxes
+
+
+def test_stopping_a_loop_tells_the_peers_that_run_it(tmp_path):
+    rt, rid, inboxes = _loop_mesh(tmp_path)
+    rt.stop_loops_batched("default", WALK, "ar_decode", [rid], [["ar_loop"]])
+
+    got = _collect(inboxes[PEER])
+    assert len(got) == 1
+    msg = got[0]
+    assert msg.message_type is WorkerMessageType.STOP_LOOPS
+    assert msg.body.request_id == "r1"
+    assert msg.body.loop_names == {"ar_loop"}
+    assert msg.body.partition_name == "default"
+    # The observation the peer needs to tell a newer stop from a duplicate.
+    assert msg.body.loop_stop_times["ar_loop"].wg_fwd_pass_idx == 0
+
+    # Never to ourselves: this rank already applied the stop, and a self-send
+    # would land in apply_peer_loop_stops and stop it a second time.
+    assert _collect(inboxes["conductor"], first_wait_ms=100) == []
+
+
+def test_a_loop_nobody_else_runs_sends_nothing(tmp_path):
+    rt, rid, inboxes = _loop_mesh(tmp_path)
+    rt.stop_loops_batched("default", WALK, "ar_decode", [rid], [["nope"]])
+    assert _collect(inboxes[PEER], first_wait_ms=100) == []
