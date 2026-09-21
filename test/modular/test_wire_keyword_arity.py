@@ -25,10 +25,16 @@ def _known_dataclasses() -> dict[str, set[str]]:
         if not name.startswith("mstar") or module is None:
             continue
         for attr in vars(module).values():
-            if dataclasses.is_dataclass(attr) and isinstance(attr, type):
-                fields.setdefault(
-                    attr.__name__, {f.name for f in dataclasses.fields(attr)}
-                )
+            if not (dataclasses.is_dataclass(attr) and isinstance(attr, type)):
+                continue
+            # Only our own types: third-party configs (HF PretrainedConfig and
+            # friends) take **kwargs, so their fields do not describe what
+            # __init__ accepts and every extra kwarg would read as an error.
+            if not getattr(attr, "__module__", "").startswith("mstar"):
+                continue
+            fields.setdefault(
+                attr.__name__, {f.name for f in dataclasses.fields(attr)}
+            )
     return fields
 
 
