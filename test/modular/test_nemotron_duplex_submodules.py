@@ -134,6 +134,33 @@ def test_nano_declare_step_per_walk():
     assert [(s.request_id, s.span) for s in step.segments] == [("a", 1), ("b", 1)]
 
 
+def test_nano_captures_the_decode_step():
+    """The frame-synchronous decode step is a CUDA graph: one config, decode
+    only, whose dummy row is a fused frame (host-only prepare_inputs shape)
+    and whose largest bucket fits the model's default recurrent-pool sizing
+    (padding rows take a slot each during the step)."""
+    from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig
+    from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
+
+    nano = _make_nano()
+    configs = nano.get_cuda_graph_configs(torch.device("cpu"))
+    assert len(configs) == 1
+    cfg = configs[0]
+    assert isinstance(cfg, BatchedCudaGraphConfig)
+    assert cfg.capture_graph_walk == "decode" and cfg.replay_graph_walks == ["decode"]
+    assert cfg.compile is False
+    assert max(cfg.capture_batch_sizes) <= NemotronDuplexModel.DEFAULT_MAMBA_SLOTS
+    row = cfg.single_request_inputs
+    assert row.input_seq_len == 1 and row.kwargs["mode"] == "frame"
+    assert row.tensor_inputs["audio_frame"].shape == (1, nano.config.nano.hidden_size)
+    assert int(row.tensor_inputs["prev_text"]) == nano.config.text_bos_id
+    # the dummy rows fuse like real frames: preprocess yields one embedding per row
+    rows = cfg.get_node_inputs(3, 3)
+    nano.embeddings = nn.Embedding(64, nano.config.nano.hidden_size)  # match the frame width
+    pre = nano.preprocess("decode", _ENGINE, rows)
+    assert pre["input_embeds"].shape == (3, nano.config.nano.hidden_size) and pre["seq_lens"] == [1, 1, 1]
+
+
 def test_nano_postprocess_feeds_tokens_back():
     nano = _make_nano()
     out = {"new_token": [torch.tensor([7])], "new_func": [torch.tensor([12])]}
