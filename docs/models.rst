@@ -203,6 +203,12 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (its 38-token speaker warm-up) runs eager. The talker KV pool is 512 pages
   of 128 positions (14 GiB): 64 sessions x 2 streams x 512 positions, about
   38 s of speech per session, with no sliding-window eviction yet.
+- Measured on one H100 80GB (2026-09-20, ``benchmark/nemotron_duplex/sessions.py``
+  on the 106-frame demo clip): 23.6 ms per 80 ms tick with one session, 57 ms
+  with 32 concurrent sessions, 74-80 ms with 64 (at the budget); every session
+  received all its frames. Served audio is checked for intelligibility by
+  transcribing it (Whisper large-v3-turbo): MaskGIT sampling is knife-edge, so
+  attention-backend numerics change the waveform but not the words.
 - The nano text tokenizer is read from the ``nano/`` folder of
   ``pipecat-ai/NVIDIA-NemotronLabs-VoiceChat-11B-Spark`` (the base checkpoint
   ships only the RNN-T tokenizer); prefetch both repositories on machines
