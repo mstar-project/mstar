@@ -196,13 +196,20 @@ class PythonGraphRuntime(GraphRuntime):
         partition_worker_graph_ids: list[int],
         worker_graph_to_workers: ParallelList[int, list[str]]
     ) -> int:
-        if not self._available_handles:
-            handle = len(self._rids)
-            self._rids.append(request_id)
-        else:
-            handle = self._available_handles.pop()
-            self._rids[handle] = request_id
-        self._rid_to_handle[request_id] = handle
+        # The conductor sends one NewRequest PER PARTITION, so this runs
+        # several times for one request. Minting a fresh handle each time
+        # would orphan the previous one's queues -- a deepcopy of the whole
+        # graph section per extra partition, never freed, because
+        # remove_request only ever sees the last handle.
+        handle = self._rid_to_handle.get(request_id)
+        if handle is None:
+            if not self._available_handles:
+                handle = len(self._rids)
+                self._rids.append(request_id)
+            else:
+                handle = self._available_handles.pop()
+                self._rids[handle] = request_id
+            self._rid_to_handle[request_id] = handle
 
         if self._my_worker_id is None:
             return handle # TODO: remove this once rest is updated

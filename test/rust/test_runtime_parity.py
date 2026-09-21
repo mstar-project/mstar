@@ -201,6 +201,38 @@ def test_refusals_agree(pair):
     ) == [0]
 
 
+def test_one_handle_per_request_across_partitions(pair):
+    """The conductor sends one NewRequest PER PARTITION, so add_request runs
+    several times for one request and must return the same handle.
+
+    Minting a fresh one each time orphans the previous handle's queues -- a
+    deepcopy of the whole graph section per extra partition, never freed,
+    because remove_request only ever sees the last handle. On a three-
+    partition model that is two leaked graphs per request, forever.
+    """
+    rt, _book, _store = pair
+    handles = [
+        rt.add_request(
+            request_id="r", partition=p, graph_walk=WALK,
+            partition_worker_graph_ids=[WG_ID],
+            worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+        )
+        for p in ("Thinker", "Talker", "Code2Wav")
+    ]
+    assert len(set(handles)) == 1, f"one request, {len(set(handles))} handles"
+    assert rt.get_rid_handle("r") == handles[0]
+
+    # And teardown is complete: the handle is reusable, so nothing may be left
+    # keyed by it.
+    rt.remove_request(handles[0])
+    assert rt.get_rid_handle("r") is None
+    assert rt.add_request(
+        request_id="r2", partition="Thinker", graph_walk=WALK,
+        partition_worker_graph_ids=[WG_ID],
+        worker_graph_to_workers=ParallelList([WG_ID], [[WORKER]]),
+    ) == handles[0]
+
+
 def test_handle_recycling_agrees(pair):
     rt, _book, _store = pair
     rid = _admit(rt, "r1")
