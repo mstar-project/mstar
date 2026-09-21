@@ -490,8 +490,10 @@ class CudaGraphRunner:
             )
         finally:
             # pages stay with the dummy streams: replay's padding rows address
-            # the same ids, so their plan finds the storage already resident
-            self._dummy_rows.reset(dummy_rids, free=True)
+            # the same ids, so their plan finds the storage already resident.
+            # Resources that hand out nothing to padding rows (the recurrent
+            # pool routes them to its sink) have nothing to keep here either.
+            self._dummy_rows.reset(dummy_rids)
 
     def _forward_for(self, spec: CGSlotSpec):
         """The callable this bucket captures, compiled once per config.
@@ -804,9 +806,16 @@ class CudaGraphRunner:
 
     def release(self, lease: SlotLease, real_bs: int) -> None:
         """Return the padding rows to their at-rest state after a step.
+
+        Their pages stay resident (``free=False``), so the next step's plan for
+        this slot allocates nothing for the tail. Freeing them here instead
+        made every padded decode step allocate and release one KV page per
+        padding row, and on a near-full arena those allocations failed and
+        held the whole batch: a step's padding must never compete with real
+        requests for storage.
         """
         dummy_rids = self.slot_for(lease).dummy_rids
-        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs], free=True)
+        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs])
 
     def plan_stream(self) -> torch.cuda.Stream | None:
         """Dedicated stream for pre-planning.
