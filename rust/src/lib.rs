@@ -306,5 +306,7 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyShmArena>()?;
     m.add_class::<PyShmSegment>()?;
     m.add_class::<PySegmentedShmArena>()?;
+    m.add_class::<crate::tensors::TensorBookkeeping>()?;
+    m.add_class::<crate::tensors::TensorInfoOut>()?;
     Ok(())
 }

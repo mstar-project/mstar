@@ -217,7 +217,7 @@ def test_stop_loops_returns_loop_back_signal_set():
     # ar_loop has two loop-back inputs: (token, ar_decode) and (kv_cache, ar_decode).
     assert stopped == {("token", "ar_decode"), ("kv_cache", "ar_decode")}
     # _finish_signal should be set on the live loop.
-    wgio = runtime.queues[wg_id].per_request_queues[rid]
+    wgio = runtime._queues[wg_id].per_request_queues[rid]
     assert wgio.loops["ar_loop"]._finish_signal is True
 
 
@@ -285,9 +285,9 @@ def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
         empty_outputs_graph, wg_id, "prefill_text", nodes={"prefill_text"},
     )
     _ingest(runtime, rid, [GraphEdge(name="text_inputs", next_node="prefill_text")])
-    assert not runtime.queues[wg_id].is_done(rid)  # not done before complete
+    assert not runtime._queues[wg_id].is_done(rid)  # not done before complete
     runtime._mark_node_complete(rid, wg_id, "prefill_text")
-    assert runtime.queues[wg_id].is_done(rid), \
+    assert runtime._queues[wg_id].is_done(rid), \
         "mark_node_complete on a no-output node must flip is_done"
 
 
@@ -320,7 +320,7 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
     routing = runtime._process_node_outputs(
         rid,
         node_name="prefill",
-        outputs=list(runtime.queues[wg_id].per_request_queues[rid].nodes["prefill"].outputs),
+        outputs=list(runtime._queues[wg_id].per_request_queues[rid].nodes["prefill"].outputs),
         graph_walk="prefill",
     )
     assert wg_id in routing.completed_worker_graph_ids, \
@@ -337,7 +337,7 @@ def test_peer_loop_stop_is_applied_only_when_newer():
     mgr, wg_id = _mgr, _wg_id
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
     runtime._mark_node_complete(rid, wg_id, "prefill")
-    wgio = runtime.queues[wg_id].per_request_queues[rid]
+    wgio = runtime._queues[wg_id].per_request_queues[rid]
 
     newer = NestedLoopIndices(
         loop_name_order=["ar_loop"], loop_indices={"ar_loop": 5},
@@ -402,7 +402,7 @@ def test_peer_loop_stop_compares_enclosing_loop_indices():
     mgr, wg_id = _mgr, _wg_id
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
     runtime._mark_node_complete(rid, wg_id, "prefill")
-    wgio = runtime.queues[wg_id].per_request_queues[rid]
+    wgio = runtime._queues[wg_id].per_request_queues[rid]
 
     def _at(outer_idx):
         return NestedLoopIndices(
@@ -660,7 +660,7 @@ def test_speculate_node_skips_a_target_that_opted_out_of_async():
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    wgio = runtime.queues[0].per_request_queues[rid]
+    wgio = runtime._queues[0].per_request_queues[rid]
     wgio.nodes["ar_decode"].enable_async_scheduling = False
 
     assert runtime.speculate_node("prefill", "decode", rid) == []
@@ -781,7 +781,7 @@ def test_prep_skips_a_rid_on_its_loops_final_iteration():
         runtime, [rid], curr="ar_decode", spec="ar_decode"
     ).ready_rids == [rid]
 
-    runtime.queues[0].per_request_queues[rid].loops[
+    runtime._queues[0].per_request_queues[rid].loops[
         "ar_loop"
     ]._finish_signal = True
     assert _prep(
@@ -802,7 +802,7 @@ def test_prep_rolls_back_the_streaming_ingest_when_the_node_is_not_ready():
     If the ingest were left in place, the chunk would be stranded in a slot
     of a node that never ran."""
     _mgr, runtime, rid = _spec_ready_runtime()
-    wgio = runtime.queues[0].per_request_queues[rid]
+    wgio = runtime._queues[0].per_request_queues[rid]
     node = wgio.nodes["ar_decode"]
 
     # Force not-ready: ar_decode needs token AND kv_cache, so offer only a

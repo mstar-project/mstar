@@ -178,12 +178,6 @@ class PythonGraphRuntime(GraphRuntime):
         self._sharding_config = sharding_config
 
 
-    @property
-    def queues(self) -> dict[int, WorkerGraphQueues]:
-        """Shared with RequestStateManager while the port is in flight; the
-        runtime owns the per-request lifecycle (add_request / remove_request)."""
-        return self._queues
-
     # --------- Bookkeeping ----------
 
     def set_node_metadata(

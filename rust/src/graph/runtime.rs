@@ -493,6 +493,23 @@ impl GraphRuntime {
     fn num_handles(&self) -> usize {
         self.rids.len()
     }
+
+    fn set_speculatively_scheduled(
+        &mut self, node: String,
+        wg_id: u32, rids: Vec<u32>,
+        specultively_scheduled: bool,
+    ) -> PyResult<()>{
+        let node_id = self.interner.get(&node).unwrap();
+        let mut states = &mut self.states[wg_id as usize];
+        for rid in rids {
+            if let Some(state) = &mut states[rid as usize] {
+                state.set_spec_scheduled(node, on);
+            }
+        }
+        // TODO
+
+        Ok(())
+    }
 }
 #[cfg(test)]
 mod tests {
