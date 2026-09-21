@@ -134,3 +134,22 @@ def test_text_node_pads_prompts_to_the_reference_length():
     assert batch["lengths"] == [40, 7]
     assert batch["text_mask"].sum(dim=1).tolist() == [40, 7]
     assert (batch[TEXT_INPUTS][1, 7:] == config.text_encoder.pad_token_id).all()
+
+
+def test_requests_above_max_image_area_are_rejected():
+    """An unbounded size let one request occupy the worker for minutes; the default cap is 2048^2 pixels."""
+    import pytest
+
+    from mstar.model.z_image.z_image_model import ZImageModel
+
+    model = ZImageModel(model_path_hf="x")
+    model.set_config(ZImageConfig())
+    assert model.max_image_area == 2048 * 2048
+    kwargs = dict(height=2048, width=2048)
+    assert model._resolve_size(kwargs) == (2048, 2048)
+    with pytest.raises(ValueError, match="max_image_area"):
+        model._resolve_size(dict(height=2048, width=2064))
+    small = ZImageModel(model_path_hf="x", max_image_area=1024 * 1024)
+    small.set_config(ZImageConfig())
+    with pytest.raises(ValueError, match="max_image_area"):
+        small._resolve_size(dict(height=1024, width=1040))
