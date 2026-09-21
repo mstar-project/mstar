@@ -116,7 +116,9 @@ async def images_generations(request: ImageGenerationRequest, raw_request: Reque
     try:
         result = await serving_images.create_images(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
-        return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+        # a malformed request (adapter / model validation) is the client's error, not the server's
+        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
+        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
     return JSONResponse(result)
 
 
@@ -156,6 +158,8 @@ async def images_edits(request: Request):
                 extra[key] = json.loads(value)
             except (json.JSONDecodeError, TypeError):
                 extra[key] = value
+        if form.get("size"):
+            extra["size"] = form.get("size")  # the adapter maps "WxH" to the model's width / height
         result = await serving_images.create_image_edit(
             api,
             model_name,
@@ -167,5 +171,6 @@ async def images_edits(request: Request):
             raw_request=request,
         )
     except Exception as e:  # noqa: BLE001
-        return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
+        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
     return JSONResponse(result)
