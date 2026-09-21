@@ -114,8 +114,8 @@ def test_preprocess_packs_rows_label_major_and_draws_noise_per_row():
     total = (P + 1) + 1
     assert pre["x"].shape == (2 * total, e.hidden_size)     # [a cond (38), b cond (1), a uncond (38), b uncond (1)]
     assert pre["spans"] == [P + 1, 1]
-    assert pre["noise_u"].shape == (e.inference_num_iter, 2, 1, e.mog_num_predictions)
-    assert pre["noise_eps"].shape == (e.inference_num_iter, 2, 1, e.code_dim)
+    assert pre["noise_u"].shape == (2, e.inference_num_iter, 1, e.mog_num_predictions)   # rows first
+    assert pre["noise_eps"].shape == (2, e.inference_num_iter, 1, e.code_dim)
     # a steady-state batch is exactly two rows per session
     inputs2 = [sub.prepare_inputs("talker_decode", SimpleNamespace(request_id="b"), {"new_token": [torch.tensor([7])]})]
     pre2 = sub.preprocess("talker_decode", SimpleNamespace(request_ids=["b"], resources={}, per_request_states=None),
