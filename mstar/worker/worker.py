@@ -314,6 +314,9 @@ class Worker:
         # whose length the group has not settled yet. Dropped at remove.
         self._tp_prefix_replies: dict[str, dict[int, dict[str, int]]] = {}
         self._tp_prefix_logged: RecentSet[str] = RecentSet(self._TP_NOSPEC_KEEP)
+        # Leader: (rid, node) -> when the wait started, for requests whose
+        # group has not all answered. Read by the scheduler, by reference.
+        self._tp_prefix_waiting: dict[tuple[str, str], float] = {}
         tp_async_on = sorted(n for n in self.parallel_nodes if self._tp_async_for(n))
         if tp_async_on:
             logger.info(
@@ -364,6 +367,7 @@ class Worker:
         # Let the scheduler see deferred removes so it stops initiating new work
         # for those rids (shared by reference — mutations are visible to both).
         self.scheduler.pending_removes = self._pending_removes
+        self.scheduler.tp_prefix_waiting = self._tp_prefix_waiting
 
         # Side stream for D→H copies in postprocess (check_stop pre-materialize).
         # The default stream has GPU(N+1) queued behind GPU(N)'s outputs after
@@ -450,6 +454,7 @@ class Worker:
             body.request_id, body.request_info.resource_configs,
         )
         self._report_prefix_match(body.request_id)
+        self._await_prefix_match(body.request_id)
         self.tensor_manager.register_request(
             body.request_id,
             self.worker_graphs_manager.per_request_info[body.request_id].sharding_config
@@ -533,6 +538,8 @@ class Worker:
         self._pending_drains.discard(body.request_id)
         self._reads_done_sent.discard(body.request_id)
         self._tp_prefix_replies.pop(body.request_id, None)
+        for node_name in self.parallel_nodes:
+            self._tp_prefix_waiting.pop((body.request_id, node_name), None)
         self.engine_manager.remove_request(body.request_id)
         self.worker_graphs_manager.remove_request(body.request_id)
         self.tensor_manager.force_cleanup_request(body.request_id)
@@ -1023,6 +1030,16 @@ class Worker:
             ),
         )
 
+    def _sharding_group(self, request_id: str, node_name: str):
+        """The lockstep group running ``node_name`` for this request, or None
+        once the request is gone."""
+        cfg = self.worker_graphs_manager.per_request_info.get(request_id)
+        if cfg is None:
+            return None
+        partition = self.worker_graphs_manager.get_partition_for_node(node_name)
+        walk = self.worker_graphs_manager.get_graph_walk(request_id, partition)
+        return cfg.sharding_config.get_sharding_group(node_name, walk)
+
     def _report_prefix_match(self, request_id: str) -> None:
         """Tell rank 0 what this rank's index matched for ``request_id``.
 
@@ -1030,13 +1047,8 @@ class Worker:
         one rank holds a page another has not keyed yet, and only a length
         rank 0 works out from all of them is one every rank can skip.
         """
-        cfg = self.worker_graphs_manager.per_request_info.get(request_id)
-        if cfg is None:
-            return
         for node_name in self.parallel_nodes - self.parallel_leader_nodes:
-            partition = self.worker_graphs_manager.get_partition_for_node(node_name)
-            walk = self.worker_graphs_manager.get_graph_walk(request_id, partition)
-            group = cfg.sharding_config.get_sharding_group(node_name, walk)
+            group = self._sharding_group(request_id, node_name)
             if group is None:
                 continue
             engine = self.engine_manager.get_engine(node_name)
@@ -1053,11 +1065,30 @@ class Worker:
                     )
                 )
 
+    def _await_prefix_match(self, request_id: str) -> None:
+        """Hold this request's first step until every rank has answered.
+
+        A step that ran first would skip what this rank alone matched, leaving
+        the ranks a different number of tokens into one request.
+        """
+        for node_name in self.parallel_nodes & self.parallel_leader_nodes:
+            group = self._sharding_group(request_id, node_name)
+            if group is None or group.tp_size == 1:
+                continue
+            engine = self.engine_manager.get_engine(node_name)
+            if not engine.matched_prefixes(node_name, request_id):
+                continue
+            self._tp_prefix_waiting[(request_id, node_name)] = _time.monotonic()
+
     def _record_prefix_match(self, body: TPPrefixMatch) -> None:
-        """Keep a follower's matched length until the group settles on one."""
-        self._tp_prefix_replies.setdefault(body.request_id, {})[
-            body.tp_rank
-        ] = body.matched
+        """Keep a follower's matched length, and let the step go once the
+        whole group has answered."""
+        replies = self._tp_prefix_replies.setdefault(body.request_id, {})
+        # merged: a node with two caches answers once for each, from one rank
+        replies.setdefault(body.tp_rank, {}).update(body.matched)
+        group = self._sharding_group(body.request_id, body.node_name)
+        if group is not None and len(replies) >= group.tp_size - 1:
+            self._tp_prefix_waiting.pop((body.request_id, body.node_name), None)
         if _KV_DEBUG_ASSERTS:
             self._log_prefix_match_gap(body)
 

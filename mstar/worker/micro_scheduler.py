@@ -108,6 +108,11 @@ class MicroScheduler:
     # Seconds to wait before retrying a held request after OOM
     HOLD_BACKOFF_SECONDS = 0.05
 
+    # Seconds a first step waits on its TP group's prefix replies before the
+    # wait is worth a line. Not a timeout: a reply that never comes is a dead
+    # rank, which every other lockstep path hangs on too.
+    PREFIX_WAIT_WARN_SECONDS = 5.0
+
     def __init__(
         self, engine_manager: EngineManager,
         sched_type=SchedulingType.ROUND_ROBIN,
@@ -144,6 +149,10 @@ class MicroScheduler:
         # Rids with a deferred remove; stop initiating new work for them.
         # Shared by reference with Worker._pending_removes.
         self.pending_removes: set[str] = set()
+
+        # (rid, node) -> when the wait started, for first steps whose TP group
+        # has not all answered. Shared by reference with the worker's copy.
+        self.tp_prefix_waiting: dict[tuple[str, str], float] = {}
 
         # rid -> number of committed (ZMQ received) tp follow batches still
         # queued. On the fail/abort path we drain these before ACKing READS_DONE
@@ -305,6 +314,7 @@ class MicroScheduler:
         self.held_until = {
             rid: t for rid, t in self.held_until.items() if t > now
         }
+        self._warn_on_stalled_prefix_waits(now)
 
         sched_from_backlog = self._schedule_from_backlogged(
             worker_graphs_manager, target=target,
@@ -355,6 +365,8 @@ class MicroScheduler:
                 for sname in node_names:
                     if sname not in self.parallel_leader_nodes:
                         continue # only rank 0 can initiate scheduling!
+                    if (request_id, sname) in self.tp_prefix_waiting:
+                        continue # the length to skip is not settled yet
                     if target_node_name is not None and sname != target_node_name:
                         continue
                     node_partition = worker_graphs_manager.get_partition_for_node(sname)
@@ -648,6 +660,8 @@ class MicroScheduler:
                     continue
 
                 for sname in node_names:
+                    if (request_id, sname) in self.tp_prefix_waiting:
+                        continue # get_next_batch will refuse it too
                     node_partition = worker_graphs_manager.get_partition_for_node(sname)
                     graph_walk = worker_graphs_manager.get_graph_walk(
                         request_id, node_partition,
@@ -659,6 +673,20 @@ class MicroScheduler:
                         continue
                     return True
         return False
+
+    def _warn_on_stalled_prefix_waits(self, now: float) -> None:
+        """Say once when a first step has waited a long time on its group."""
+        for key, started in list(self.tp_prefix_waiting.items()):
+            if not started or now - started <= self.PREFIX_WAIT_WARN_SECONDS:
+                continue
+            # zero marks it said; the request keeps waiting either way
+            self.tp_prefix_waiting[key] = 0.0
+            rid, node_name = key
+            logger.warning(
+                "Request %s has waited %.1fs for the rest of %s's TP group to "
+                "report what their prefix index matched; is every rank up?",
+                rid, now - started, node_name,
+            )
 
     def _check_ready(
         self, node_name: str, rid: str, fwd_info: CurrentForwardPassInfo,

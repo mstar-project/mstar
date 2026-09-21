@@ -36,6 +36,8 @@ def _worker(
     w._reads_done_sent = set(reads_done)
     w._pending_removes = set()
     w._tp_prefix_replies = {}
+    w._tp_prefix_waiting = {}
+    w.parallel_nodes = set()
     w._last_active = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(

@@ -45,6 +45,7 @@ def _worker(tp_rank: int, matched: list[dict[str, int]]) -> Worker:
     w.parallel_nodes = {NODE}
     w.parallel_leader_nodes = {NODE} if tp_rank == 0 else set()
     w._tp_prefix_replies = {}
+    w._tp_prefix_waiting = {}
     group = _group(tp_rank)
     w.worker_graphs_manager = SimpleNamespace(
         per_request_info={"r1": SimpleNamespace(
