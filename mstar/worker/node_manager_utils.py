@@ -1,5 +1,5 @@
 import logging
-from copy import deepcopy
+import pickle
 from dataclasses import dataclass, field
 
 from mstar.communication.tensors import TensorCommunicationManager
@@ -97,7 +97,15 @@ class WorkerGraphQueues:
         """
         Initialize queues for a new request
         """
-        section_copy = deepcopy(self.worker_graph.section)
+        # Every request gets its own copy of the graph. Unpickling a cached
+        # dump is several times cheaper than deepcopy for these small trees
+        # and preserves shared references the same way.
+        blob = getattr(self, "_section_blob", None)
+        if blob is None:
+            blob = self._section_blob = pickle.dumps(
+                self.worker_graph.section, protocol=pickle.HIGHEST_PROTOCOL
+            )
+        section_copy = pickle.loads(blob)
         queue = WorkerGraphIO(section_copy, wg_id=self.worker_graph_id)
         queue.register_communication_info(
             self.tensor_manager, request_id
