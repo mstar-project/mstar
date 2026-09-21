@@ -32,7 +32,12 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.graph_io import format_graph_edge_list
-from mstar.graph.runtime.base import RouteInput, RouteOutput, SendInput
+from mstar.graph.runtime.base import (
+    EdgeSpec,
+    RouteInput,
+    RouteOutput,
+    SendInput,
+)
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
@@ -501,9 +506,8 @@ class Worker:
             edge for edge in body.initial_inputs if len(edge.tensor_info) == 0
         ]
         if signal_only:
-            self.worker_graphs_manager.process_new_inputs(
-                rid=rid, inputs=signal_only,
-                can_buffer=True
+            self._rid_runtime.ingest_inputs_batch(
+                self._edge_specs(rid, signal_only), can_buffer=True,
             )
         # process messages that may have came in out-of-order
         if body.request_id in self._unprocessed_messages:
@@ -759,9 +763,8 @@ class Worker:
         # Signal-only non-streaming edges can be processed immediately
         signal_only = [edge for edge in non_streaming if len(edge.tensor_info) == 0]
         if signal_only:
-            self.worker_graphs_manager.process_new_inputs(
-                rid=rid, inputs=signal_only,
-                can_buffer=True
+            self._rid_runtime.ingest_inputs_batch(
+                self._edge_specs(rid, signal_only), can_buffer=True,
             )
         if self.enable_nvtx:
             range_pop()
@@ -913,11 +916,13 @@ class Worker:
                     # which reports the partition done in _postprocess_batch —
                     # NOT here, where an earlier in-flight pass's WGD could read
                     # it before the final output chunk is emitted.
-                    leftovers = self.worker_graphs_manager.process_new_streaming_inputs(
-                        rid=rid, inputs=[synthetic_edge],
-                        can_buffer=False # important: only ingest for this loop iter only!
+                    uningested = self._rid_runtime.ingest_inputs_batch(
+                        self._edge_specs(rid, [synthetic_edge]),
+                        # important: only ingest for this loop iter!
+                        can_buffer=False,
+                        is_streaming=True,
                     )
-                    if leftovers:
+                    if uningested:
                         sbuf.store_uningested_edge(synthetic_edge)
 
 
@@ -940,9 +945,8 @@ class Worker:
                 range_push("process_new_inputs.process_inputs")
 
             if normal:
-                self.worker_graphs_manager.process_new_inputs(
-                    rid=rid, inputs=normal,
-                    can_buffer=True
+                self._rid_runtime.ingest_inputs_batch(
+                    self._edge_specs(rid, normal), can_buffer=True,
                 )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
@@ -1134,6 +1138,25 @@ class Worker:
         self._rid_runtime.push_back_node(
             batch.node_name, rids,
             [batch.request_to_worker_graph[rid] for rid in rids],
+        )
+
+    @staticmethod
+    def _edge_specs(rid: int, edges: list[GraphEdge]) -> ParallelList:
+        """Flatten edges into (rid, EdgeSpec) pairs for the runtime.
+
+        Only uuids cross: the runtime rebuilds the descriptors from the tensor
+        store, which is why they are kept there.
+        """
+        return ParallelList(
+            [rid] * len(edges),
+            [
+                EdgeSpec(
+                    signal=edge.name,
+                    next_node=edge.next_node,
+                    uuids=[info.uuid for info in edge.tensor_info],
+                    is_final_streaming_chunk=edge._final_stream_chunk,
+                ) for edge in edges
+            ],
         )
 
     def _count_new_tokens(self, routing: NodeOutputRouting) -> dict[str, int]:

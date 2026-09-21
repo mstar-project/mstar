@@ -15,6 +15,7 @@ sys.path.insert(0, ".")
 
 import torch  # noqa: F401  (import order: torch before mstar internals)
 
+from mstar.communication.tensor_store import TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphNode
@@ -34,6 +35,8 @@ class _StubTensorManager:
     def __init__(self):
         self.registered = []
         self.cleaned = []
+        # The runtime resolves uuids to descriptors through this.
+        self.tensor_store = TensorStore()
 
     def register_request(self, rid, sharding_config):
         self.registered.append(rid)

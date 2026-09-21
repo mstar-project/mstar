@@ -109,6 +109,12 @@ class PythonGraphRuntime(GraphRuntime):
     ):
         self._my_worker_id = my_worker_id
         self._communicator = communicator
+        # Descriptors for rebuilding an edge from its uuids. complete_and_route
+        # takes the store as an argument; ingest has no such parameter, so it
+        # reads the one the queues were built against.
+        self._tensor_store = (
+            None if tensor_manager is None else tensor_manager.tensor_store
+        )
 
         # rid interning
         self._rids: list[str | None] = []
@@ -352,13 +358,57 @@ class PythonGraphRuntime(GraphRuntime):
 
     # --------- Inputs ----------
 
+    def _edge_from_spec(
+        self, spec: EdgeSpec, is_streaming: bool,
+    ) -> GraphEdge:
+        return GraphEdge(
+            name=spec.signal,
+            next_node=spec.next_node,
+            tensor_info=[
+                self._tensor_store.get_info(uuid) for uuid in spec.uuids
+            ],
+            is_streaming=is_streaming,
+            _final_stream_chunk=spec.is_final_streaming_chunk,
+        )
+
     def ingest_inputs_batch(
         self,
         signals: ParallelList[int, EdgeSpec],
         can_buffer: bool = True,
         is_streaming: bool = False,
     ) -> list[int]:
-        raise NotImplementedError
+        uningested: list[int] = []
+        for i, (rid, spec) in enumerate(signals):
+            info = self._request_info.get(rid)
+            if info is None:
+                uningested.append(i)  # never admitted here, or already removed
+                continue
+            edge = self._edge_from_spec(spec, is_streaming)
+            # The streaming gate is re-evaluated per signal on purpose:
+            # ingesting one can be what makes the next node eligible.
+            if not self._ingest_one(rid, info, edge, can_buffer, is_streaming):
+                uningested.append(i)
+        return uningested
+
+    def _ingest_one(
+        self, rid: int, info: GraphRuntimeRequestInfo, edge: GraphEdge,
+        can_buffer: bool, is_streaming: bool,
+    ) -> bool:
+        """Offer the edge to each live worker graph until one claims it.
+
+        A node can refuse an edge it owns (name mismatch, or both ready slots
+        already full), which is why this is a claim loop and not a lookup.
+        """
+        for part_info in info.partition_info.values():
+            for wg_id in part_info.graph_walk_worker_graph_ids:
+                wgio = self._queues[wg_id].per_request_queues.get(rid)
+                if wgio is None:
+                    continue
+                if is_streaming and edge.next_node not in wgio.ready_for_streaming:
+                    continue
+                if wgio.ingest_input(edge, can_buffer):
+                    return True
+        return False
 
     # --------- Scheduling ----------
 

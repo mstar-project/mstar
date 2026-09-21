@@ -71,19 +71,6 @@ class WorkerGraphQueues:
                 not_ingested.append(inp)
         return not_ingested
 
-    def process_new_streaming_inputs(
-        self, rid: int, inputs: list[GraphEdge],
-        can_buffer: bool=True
-    ) -> list[GraphEdge]:
-        assert rid in self.per_request_queues, \
-            f"Tried to process new inputs for unknown request ID {rid}"
-        queue = self.per_request_queues[rid]
-        not_ingested: list[GraphEdge] = []
-        for inp in inputs:
-            if (inp.next_node not in queue.ready_for_streaming) or (not queue.ingest_input(inp, can_buffer)):
-                not_ingested.append(inp)
-        return not_ingested
-
     def is_done(self, rid) -> bool:
         assert rid in self.per_request_queues, \
             f"Tried to check queue done state for unknown request ID {rid}"
@@ -290,41 +277,6 @@ class WorkerGraphsManager:
     def get_partition_for_node(self, node_name: str) -> str | None:
         """Look up which partition a node belongs to."""
         return self.node_to_partition.get(node_name)
-
-    def process_new_inputs(
-        self,
-        rid: int,
-        inputs: list[GraphEdge],
-        can_buffer: bool=True
-    ) -> list[GraphEdge]:
-        """Route arriving inputs to the per-request io of every active worker
-        graph for this request.
-
-        Returns the leftover edges that no worker graph claimed (their
-        ``next_node`` lives on a different worker). Caller uses these for
-        cross-worker routing.
-        """
-        for part_info in self.per_request_info[rid].per_partition_info.values():
-            worker_graph_ids = part_info.graph_walk_worker_graph_ids
-            for worker_graph_id in worker_graph_ids:
-                inputs = self.queues[worker_graph_id].process_new_inputs(
-                    rid, inputs, can_buffer=can_buffer
-                )
-        return inputs
-
-    def process_new_streaming_inputs(
-        self,
-        rid: int,
-        inputs: list[GraphEdge],
-        can_buffer: bool=True
-    ) -> list[GraphEdge]:
-        for part_info in self.per_request_info[rid].per_partition_info.values():
-            worker_graph_ids = part_info.graph_walk_worker_graph_ids
-            for worker_graph_id in worker_graph_ids:
-                inputs = self.queues[worker_graph_id].process_new_streaming_inputs(
-                    rid, inputs, can_buffer=can_buffer
-                )
-        return inputs
 
     def add_request(
         self, rid: int,
