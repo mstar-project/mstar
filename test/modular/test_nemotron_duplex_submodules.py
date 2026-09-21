@@ -277,8 +277,11 @@ def test_nano_frame_batch_fuses_rows_exactly_like_the_per_request_path():
         })
         for i in range(3)
     ]
-    eng = SimpleNamespace(request_ids=["a", "b", "c"], resources={}, per_request_states=None)
+    # a session past the end of its audio has no frame in the same batch
+    inputs.append(ARNodeInputs(input_seq_len=1, kwargs={"mode": _MODE_FRAME},
+                               tensor_inputs={"prev_text": torch.tensor([7]), "prev_func": torch.tensor([2])}))
+    eng = SimpleNamespace(request_ids=["a", "b", "c", "d"], resources={}, per_request_states=None)
     pre = nano.preprocess("decode", eng, inputs)
     per_request = torch.cat([nano._fuse(inp, torch.device("cpu")) for inp in inputs])
-    assert pre["seq_lens"] == [1, 1, 1]
+    assert pre["seq_lens"] == [1, 1, 1, 1]
     torch.testing.assert_close(pre["input_embeds"], per_request)
