@@ -308,6 +308,9 @@ the plain compile (``compile_exact_ops: false``: 0.86 s at B=1, a median 34 dB f
 because keeping its 180 norms per step eager costs 45% (1.25 s); ``compile_exact_ops: [norms]``
 turns it into the reference-faithful mode (at least 55.9 dB on every prompt). For scale, the served
 images of the other engines are 10 to 16 dB from the diffusers reference for the same seeds.
+``max_image_area`` (pixels, default 2048²) bounds the output size a request may ask for:
+larger requests are rejected with a 400 before scheduling instead of occupying the worker
+for minutes (an 8192² request means 262k tokens of quadratic attention).
 Requests at the same output size batch across users in every node, including the
 text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the
 transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or
