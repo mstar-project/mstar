@@ -15,11 +15,14 @@ import torch
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
 from mstar.graph.base import TensorPointerInfo
 
-rust_bookkeeping = pytest.importorskip(
-    "mstar.communication.rust_tensor_store",
+# Probe the EXTENSION, not the module that wraps it: the wrapper imports
+# fine either way now (the mstar_rust import inside it is lazy), so probing
+# the wrapper would fail rather than skip where the extension is not built.
+pytest.importorskip(
+    "mstar_rust",
     reason="mstar_rust not built (maturin develop --release in rust/)",
 )
-RustTensorBookkeeping = rust_bookkeeping.RustTensorBookkeeping
+from mstar.communication.tensor_store import RustTensorBookkeeping
 
 
 @pytest.fixture(params=["python", "rust"])
@@ -269,4 +272,5 @@ def test_graph_runtime_shares_the_bookkeeper_it_was_given():
 
 
 def _to_rust_dict(info):
-    return rust_bookkeeping._to_rust(info)
+    from mstar.communication.tensor_store import _to_rust
+    return _to_rust(info)

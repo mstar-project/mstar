@@ -21,11 +21,12 @@ from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
 
-rust_runtime = pytest.importorskip(
-    "mstar.graph.runtime.rust",
+pytest.importorskip(
+    "mstar_rust",
     reason="mstar_rust not built (maturin develop --release in rust/)",
 )
-from mstar.communication.rust_tensor_store import RustTensorBookkeeping
+from mstar.communication.tensor_store import RustTensorBookkeeping
+from mstar.graph.runtime import rust as rust_runtime
 
 WG_ID = 0
 WALK = "decode"

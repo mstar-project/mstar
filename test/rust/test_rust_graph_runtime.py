@@ -17,13 +17,14 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
 
-rust_runtime = pytest.importorskip(
-    "mstar.graph.runtime.rust",
+pytest.importorskip(
+    "mstar_rust",
     reason="mstar_rust not built (maturin develop --release in rust/)",
 )
-from mstar.communication.rust_tensor_store import RustTensorBookkeeping
+from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime import base as rust_runtime_base
+from mstar.graph.runtime import rust as rust_runtime
 from mstar.graph.runtime.base import RouteInput, SpeculationPrepInput
 
 WG_ID = 0

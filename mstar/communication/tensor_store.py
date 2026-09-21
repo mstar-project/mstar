@@ -13,6 +13,9 @@ Uuids are globally unique now (see ``tensor_uuid``), so nothing here is keyed by
 request. The one exception is ``_rid_to_uuids``, which exists only so a request
 teardown can find what to free.
 """
+from __future__ import annotations
+
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -193,6 +196,157 @@ class PythonTensorBookkeeping(TensorBookkeeping):
         return info is not None and info.ref_cnt <= 0 and not info.persist
 
 
+def _dtype_name(dtype: torch.dtype) -> str:
+    """Same short name the wire codec uses, so there is one mapping."""
+    return str(dtype).removeprefix("torch.")
+
+
+def _dtype_from_name(name: str) -> torch.dtype:
+    return getattr(torch, name)
+
+
+def _to_rust(info: TensorPointerInfo) -> dict:
+    return {
+        "dims": list(info.dims),
+        "dtype": _dtype_name(info.dtype),
+        "nbytes": info.nbytes,
+        "address": info.address,
+        "stride": list(info.stride),
+        "uuid": info.uuid,
+        "source_session_id": info.source_session_id,
+        "source_entity": info.source_entity,
+        "offset": info.offset,
+        "source_tp_size": info.source_tp_size,
+        "source_tp_rank": info.source_tp_rank,
+        "shm_segment": info.shm_segment,
+        "shm_offset": info.shm_offset,
+        "source_node_name": info._source_node_name,
+        "source_graph_walk": info._source_graph_walk,
+    }
+
+
+def _from_rust(out) -> TensorPointerInfo:
+    return TensorPointerInfo(
+        dims=out.dims,
+        dtype=_dtype_from_name(out.dtype),
+        nbytes=out.nbytes,
+        address=out.address,
+        stride=tuple(out.stride),
+        uuid=out.uuid,
+        source_session_id=out.source_session_id,
+        source_entity=out.source_entity,
+        offset=out.offset,
+        source_tp_size=out.source_tp_size,
+        source_tp_rank=out.source_tp_rank,
+        shm_segment=out.shm_segment,
+        shm_offset=out.shm_offset,
+        _source_node_name=out.source_node_name,
+        _source_graph_walk=out.source_graph_walk,
+    )
+
+
+class RustTensorBookkeeping(TensorBookkeeping):
+    """Every method forwards; the batched ones go over in one call.
+
+    A descriptor handed in is COPIED into Rust, unlike the Python backend which
+    keeps the caller's object. Anything relying on seeing a later in-place edit
+    (``register_for_send`` stamping ``shm_segment``) has to re-``update_info``.
+    """
+
+    def __init__(self):
+        # Imported here, not at module scope: tensor_store is imported by
+        # effectively everything, and a top-level import would make the whole
+        # package unimportable wherever the extension is not built. Same
+        # pattern as arena.py.
+        from mstar_rust import TensorBookkeeping as _RustBookkeeping
+
+        self._rust = _RustBookkeeping()
+
+    # -- descriptors --------------------------------------------------------
+
+    def put_tensor(self, uuid: int, info: TensorPointerInfo):
+        self._rust.put_tensor(uuid, _to_rust(info))
+
+    def put_tensor_batch(
+        self, uuids: list[int], infos: list[TensorPointerInfo]
+    ):
+        self._rust.put_tensor_batch(uuids, [_to_rust(i) for i in infos])
+
+    def update_info(self, uuid: int, info: TensorPointerInfo):
+        self._rust.update_info(uuid, _to_rust(info))
+
+    def update_info_batch(
+        self, uuids: list[int], infos: list[TensorPointerInfo]
+    ):
+        self._rust.update_info_batch(uuids, [_to_rust(i) for i in infos])
+
+    def get_info(self, uuid: int) -> TensorPointerInfo | None:
+        out = self._rust.get_info(uuid)
+        return None if out is None else _from_rust(out)
+
+    def get_info_batch(self, uuids: list[int]) -> list[TensorPointerInfo | None]:
+        return [
+            None if out is None else _from_rust(out)
+            for out in self._rust.get_info_batch(uuids)
+        ]
+
+    def forget_tensor(self, uuid: int):
+        self._rust.forget_tensor(uuid)
+
+    def is_tracked(self, uuid: int) -> bool:
+        return self._rust.is_tracked(uuid)
+
+    # -- refcounts ----------------------------------------------------------
+
+    def increment_ref(self, uuid: int, n: int = 1):
+        self._rust.increment_ref(uuid, n)
+
+    def increment_ref_batch(self, uuids: list[int], counts: list[int]):
+        self._rust.increment_ref_batch(uuids, counts)
+
+    def dereference(self, uuid: int, n: int = 1):
+        self._rust.dereference(uuid, n)
+
+    def dereference_batch(self, uuids: list[int], counts: list[int]):
+        self._rust.dereference_batch(uuids, counts)
+
+    # -- flags --------------------------------------------------------------
+
+    def set_persist(self, uuid: int, persist: bool):
+        self._rust.set_persist(uuid, persist)
+
+    def set_persist_batch(self, uuids: list[int], persist: bool):
+        self._rust.set_persist_batch(uuids, persist)
+
+    def set_mem_registered(self, uuid: int, mem_registered: bool):
+        self._rust.set_mem_registered(uuid, mem_registered)
+
+    def is_registered(self, uuid: int) -> bool:
+        return self._rust.is_registered(uuid)
+
+    # -- gc -----------------------------------------------------------------
+
+    def can_gc(self, uuid: int) -> bool:
+        return self._rust.can_gc(uuid)
+
+    def collectable(self, uuids: list[int]) -> list[int]:
+        return self._rust.collectable(uuids)
+
+
+def _build_tensor_bookkeeping() -> TensorBookkeeping:
+    """Gated on ``MSTAR_RUST_GRAPH``, which is what actually needs it: the
+    Rust graph runtime holds a SHARE of this object, so the two have to be the
+    same implementation.
+
+    Not worth taking on its own. A descriptor is copied into Rust on the way
+    in and rebuilt on the way out, which the Python runtime pays for and gets
+    nothing back -- the saving is in the crossings the Rust runtime avoids.
+    """
+    if os.environ.get("MSTAR_RUST_GRAPH", "0") == "1":
+        return RustTensorBookkeeping()
+    return PythonTensorBookkeeping()
+
+
 class TensorStore:
     """The tensors themselves, plus which request owns each one.
 
@@ -209,7 +363,7 @@ class TensorStore:
         # a new uuid), so ownership is not derivable from the uuid alone.
         self._rid_to_uuids: dict[int, set[int]] = {}
         self._uuid_to_rid: dict[int, int] = {}
-        self.bookkeeping = bookkeeping or PythonTensorBookkeeping()
+        self.bookkeeping = bookkeeping or _build_tensor_bookkeeping()
 
     # -- tensors ------------------------------------------------------------
 
