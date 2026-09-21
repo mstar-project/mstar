@@ -75,6 +75,10 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    # A server started as a background job of a non-interactive shell inherits
+    # SIGINT ignored, and Python keeps an inherited ignore, so the graceful stop
+    # below (and _shutdown_conductor_process's) would be a no-op. Make it real.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     # Started before the model load so an API server that dies during it is
     # still caught. SIGINT is the conductor's graceful stop (run() unwinds into
     # shutdown(), terminating the workers), matching _shutdown_conductor_process.
