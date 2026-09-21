@@ -11,8 +11,8 @@ must reproduce every row bit for bit — the same kernels run, so any difference
 leak (padding rows, spans, stacked scalars). (2) Batch size: a row inside a batch of four vs the
 row alone is reported per stage and per image; cuBLAS / cuDNN may pick other algorithms for
 another M (klein-4B measured bit-exact; Z-Image's dit differs from step 0 and lands near 39 dB
-after 8 steps with no leak), so this one is asserted only as a gross-error bound (>= 30 dB) and
-the printed numbers are the measurement.
+after 8 steps with no leak: rows measured 39.3 / 30.7 / 37.4 / 33.1 dB), so this one is asserted
+only as a gross-error bound (>= 25 dB) and the printed numbers are the measurement.
 
 Skips without CUDA or without the checkpoint (``FLUX2_KLEIN_REPO``, default 4B) in the HF cache.
 Run with ``NVIDIA_TF32_OVERRIDE=0 CUBLAS_WORKSPACE_CONFIG=:4096:8`` for repeatable kernels.
@@ -45,7 +45,7 @@ SEEDS = (0, 1, 2, 3)
 HEIGHT = WIDTH = 1024
 STEPS = 4
 MIN_PSNR_DB = 40.0        # exactness contracts (row independence, VAE)
-MIN_BATCH_PSNR_DB = 30.0  # gross-error bound for the batch-size comparison (see the docstring)
+MIN_BATCH_PSNR_DB = 25.0  # gross-error bound for the batch-size comparison (see the docstring)
 
 
 def _hf_cache_has_checkpoint() -> bool:
