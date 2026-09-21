@@ -28,10 +28,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.components import RMSNorm
 from mstar.model.components.mlp import GatedMLP
 from mstar.model.nemotron_duplex.components._util import RawWeight, param
-from mstar.model.nemotron_duplex.config import EarTTSConfig
+from mstar.model.nemotron_duplex.config import TALKER_ATTN, TALKER_KV, TALKER_POS, EarTTSConfig
 
 # Fixed table cardinalities that are NOT model hyperparameters in EarTTSConfig
 # (tokenizer / vocabulary sizes baked into the checkpoint's flag tables).
@@ -99,6 +100,24 @@ def _masking_rate(rate: torch.Tensor, exponent: float) -> torch.Tensor:
     return (1.0 - rate.pow(exponent)).pow(1.0 / exponent)
 
 
+_SCHEDULES: dict[tuple[int, float, int], tuple[int, ...]] = {}
+
+
+def maskgit_schedule(num_iter: int, exponent: float, num_quantizers: int) -> tuple[int, ...]:
+    """How many codebooks each MaskGIT iteration fills (sum == ``num_quantizers``).
+
+    The reference forms it from ``ceil(masking_rate(linspace) * d)`` on the
+    device and reads it back per iteration; the same float32 arithmetic on the
+    host, once per config, so the sampling loop has no host sync."""
+    key = (num_iter, exponent, num_quantizers)
+    if key not in _SCHEDULES:
+        rates = torch.linspace(0.0, 1.0, num_iter + 1)[:-1]
+        num_maskings = torch.ceil(_masking_rate(rates, exponent) * num_quantizers).long()
+        ks = num_maskings - F.pad(num_maskings[1:], [0, 1])
+        _SCHEDULES[key] = tuple(int(k) for k in ks.tolist())
+    return _SCHEDULES[key]
+
+
 def build_char_vocab(tokenizer) -> dict[str, int]:
     """Character vocabulary derived from the subword tokenizer (port of NeMo
     ``build_vocabs._build_char_vocab``): every single-character token in
@@ -144,6 +163,38 @@ class _Attn(nn.Module):
         if qk_norm:
             self.q_norm = RMSNorm(self.head_dim)
             self.k_norm = RMSNorm(self.head_dim)
+        # Engine resources (paged KV, planned attention, positions), resolved
+        # at load by ``NodeSubmodule.bind_node_resources``; None standalone.
+        self.attend: AttentionCallable | None = None
+        self.pos = None
+
+    def bind_resources(self, resources: dict) -> None:
+        kv, attn, pos = resources.get(TALKER_KV), resources.get(TALKER_ATTN), resources.get(TALKER_POS)
+        self.attend = AttentionCallable(kv=kv, attn=attn) if kv is not None and attn is not None else None
+        self.pos = pos
+
+    def forward_pooled(self, x: torch.Tensor, rope_theta: float) -> torch.Tensor:
+        """Self-attention over this step's packed tokens ``[total_tokens, H]``
+        through the engine's paged KV: Gemma3 QK-norm, RoPE at the positions
+        the position resource planned (this layer's ``rope_theta``, over the
+        full head dim), the KV write and the planned attention. The kernel
+        scales by ``head_dim ** -0.5``; Gemma wants ``query_pre_attn_scalar
+        ** -0.5``, so the query is pre-scaled by the ratio.
+        """
+        n = x.shape[0]
+        nh, hd = self.num_heads, self.head_dim
+        q = F.linear(x, self.q_proj.weight).view(n, nh, hd)
+        k = F.linear(x, self.k_proj.weight).view(n, nh, hd)
+        v = F.linear(x, self.v_proj.weight).view(n, nh, hd)
+        if hasattr(self, "q_norm"):
+            q = _gemma_rmsnorm(q, self.q_norm.weight, self.eps)
+            k = _gemma_rmsnorm(k, self.k_norm.weight, self.eps)
+        q, k = self.pos.apply_qk(
+            q, k, label=self.attend.label, rope_theta=rope_theta, rotary_dim=hd, interleave=False,
+        )
+        q = q * (self.scaling * hd ** 0.5)
+        out = self.attend(q, k, v).reshape(n, nh * hd)
+        return F.linear(out, self.o_proj.weight)
 
     def forward(
         self,
@@ -250,6 +301,20 @@ class TalkerLayer(nn.Module):
         if return_kv:
             return x, new_kv
         return x
+
+
+    def forward_pooled(self, x: torch.Tensor, rope_theta: float) -> torch.Tensor:
+        """``forward`` over packed tokens with the attention through the engine's KV pool."""
+        residual = x
+        h = _gemma_rmsnorm(x, self.input_layernorm.weight, self.eps)
+        h = self.self_attn.forward_pooled(h, rope_theta)
+        h = _gemma_rmsnorm(h, self.post_attention_layernorm.weight, self.eps)
+        x = residual + h
+        residual = x
+        h = _gemma_rmsnorm(x, self.pre_feedforward_layernorm.weight, self.eps)
+        h = self.mlp(h)
+        h = _gemma_rmsnorm(h, self.post_feedforward_layernorm.weight, self.eps)
+        return residual + h
 
 
 class _EncoderLayer(nn.Module):
@@ -484,6 +549,7 @@ class MogHead(nn.Module):
         guidance_scale: float = 0.0,
         top_p: float | None = None,
         generator: torch.Generator | None = None,
+        u: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample a mixture component and return its target latent mean + log-std.
 
@@ -506,7 +572,8 @@ class MogHead(nn.Module):
         if (top_p is not None and top_p < 1.0) or (temperature and temperature > 0.0):
             temp = temperature if (temperature and temperature > 0.0) else 1.0
             logp = F.log_softmax(logits, dim=-1) / temp
-            u = _rand_rows(logp.shape, logp.device, logp.dtype, generator, torch.rand)
+            if u is None:   # else pre-drawn by the caller (a captured step draws outside the graph)
+                u = _rand_rows(logp.shape, logp.device, logp.dtype, generator, torch.rand)
             gumbel = -torch.log(-torch.log(u + 1e-8) + 1e-8)
             idx = (logp + gumbel).argmax(-1)                                # [b, t]
         else:
@@ -639,6 +706,7 @@ class EarTTSTalker(nn.Module):
         noise_scale: float = 0.0,
         top_p: float | None = None,
         generator: torch.Generator | None = None,
+        noise: list[tuple[torch.Tensor | None, torch.Tensor | None]] | None = None,
     ) -> torch.Tensor:
         """Iterative MoG-conditioned RVQ decode of one (or more) frame(s) — port
         of the reference ``generate_step``.
@@ -651,6 +719,11 @@ class EarTTSTalker(nn.Module):
         component drawn by Gumbel-top-p; guidance applied inside ``mog_head.infer``
         on the stacked ``[cond; uncond]`` batch), then residual-quantizes the next
         block of codebooks. Returns ``[b, t, num_quantizers]`` in ``[0, codebook_size)``.
+
+        ``noise`` (one ``(u, eps)`` pair per iteration, either entry None) lets the
+        caller draw the sampling noise ahead of the call, which is what a CUDA-graph
+        capture of this loop needs; the schedule itself is fixed by the config and
+        computed on the host (``maskgit_schedule``), so nothing here syncs.
         """
         cfg = self.config
         b, t, _ = hidden_states.shape
@@ -659,33 +732,96 @@ class EarTTSTalker(nn.Module):
         code = torch.full((b, t, d), cfg.codebook_size, dtype=torch.long, device=device)
         guided = guidance_scale and guidance_scale > 0.0 and hidden_uncond is not None
 
-        rates = torch.linspace(0.0, 1.0, num_iter + 1, device=device)[:-1].unsqueeze(-1)
-        num_maskings = torch.ceil(_masking_rate(rates, exponent) * d).long()
-        ks = num_maskings - F.pad(num_maskings[1:], [0, 0, 0, 1])           # per-iter codebook counts, sum == d
         cnt = 0
-        for i in range(num_iter):
-            k = int(ks[i, 0].item())
+        for i, k in enumerate(maskgit_schedule(num_iter, exponent, d)):
             if k == 0:
                 continue
+            u_i, eps_i = noise[i] if noise is not None else (None, None)
             code_embed = self.embed_code(self.depthsum_embedding(code))
             if guided:
                 mog_input = torch.cat([code_embed + hidden_states, code_embed + hidden_uncond], dim=0)
                 mu, logs = self.mog_head.infer(
                     mog_input, temperature=temperature, guidance_scale=guidance_scale,
-                    top_p=top_p, generator=generator,
+                    top_p=top_p, generator=generator, u=u_i,
                 )
             else:
                 mog_input = code_embed + hidden_states
                 mu, logs = self.mog_head.infer(
-                    mog_input, temperature=temperature, top_p=top_p, generator=generator,
+                    mog_input, temperature=temperature, top_p=top_p, generator=generator, u=u_i,
                 )
             z = mu
             if noise_scale:
-                eps = _rand_rows(mu.shape, device, mu.dtype, generator, torch.randn)
+                eps = eps_i if eps_i is not None else _rand_rows(mu.shape, device, mu.dtype, generator, torch.randn)
                 z = z + torch.exp(logs) * eps * noise_scale
             code = self._rvq_quantize(z, code, cnt, k)
             cnt += k
         return code
+
+    def layer_rope_theta(self, layer_idx: int) -> float:
+        cfg = self.config
+        return cfg.rope_theta_full if (layer_idx + 1) % cfg.sliding_window_pattern == 0 else cfg.rope_theta_local
+
+    def backbone_pooled(self, x: torch.Tensor, label: str) -> torch.Tensor:
+        """Gemma3 stack over this step's packed tokens ``[total_tokens, H]`` with
+        the attention through the engine's paged KV under ``label`` (the label
+        and layer index are cursors on the shared resources, as in
+        ``Attention.forward``). Returns the normed hidden ``[total_tokens, H]``.
+        """
+        layers = self.backbone.layers
+        layers[0].self_attn.attend.bind_step(label)
+        for i, layer in enumerate(layers):
+            layer.self_attn.attend.set_layer_idx(i)
+            x = layer.forward_pooled(x, self.layer_rope_theta(i))
+        return _gemma_rmsnorm(x, self.backbone.norm.weight, self.config.rms_norm_eps)
+
+    @torch.no_grad()
+    def warmup_inputs(
+        self,
+        speaker: str,
+        subword_id_to_char_ids: dict,
+        char_pad_idx: int,
+        text_pad_id: int,
+        text_eos_id: int,
+        speech_pad_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The speaker warm-up as backbone inputs: ``(cond [P, H], uncond [P, H],
+        prev_codes [Q])`` — the ``P`` fused positions ``init_state`` runs through
+        the backbone for the text-conditioned and the null-conditioned stream,
+        and the speech-pad frame carried into frame 0. Constant per speaker, so
+        a session's first step can prefill them together with its first frame.
+        """
+        latent = self.audio_prompt_latents[speaker]
+        dev, p, h = latent.device, latent.shape[1], self.config.hidden_size
+        silence = self.codec_silence_tokens.to(dev).view(1, 1, -1)
+        bos_frame = self.embed_code(self.depthsum_embedding(silence)) + self.bos_emb.to(latent)
+        code_embeds = torch.cat([latent[:, : p - 1], bos_frame], dim=1)              # [1, P, H]
+        subword_ids = torch.full((1, p), int(text_pad_id), dtype=torch.long, device=dev)
+        subword_ids[:, p - 1] = int(text_eos_id)
+        subword_mask = torch.zeros((1, p), dtype=torch.bool, device=dev)
+        subword_mask[:, p - 2:] = True
+        cond = self.text_conditioning(subword_ids, subword_mask, subword_id_to_char_ids, char_pad_idx)
+        null_cond = self.null_emb.to(code_embeds).view(1, 1, h).expand(1, p, h)
+        prev_codes = torch.full((self.config.num_quantizers,), int(speech_pad_id), dtype=torch.long, device=dev)
+        return (
+            self.gated_fusion_audio_text(code_embeds, cond)[0],
+            self.gated_fusion_audio_text(code_embeds, null_cond)[0],
+            prev_codes,
+        )
+
+    def frame_inputs(self, prev_codes: torch.Tensor, conds: torch.Tensor, current_ids: torch.Tensor,
+                     text_eos_id: int | None) -> tuple[torch.Tensor, torch.Tensor]:
+        """One frame's fused backbone inputs for N rows: ``prev_codes`` ``[N, Q]``
+        (silenced where the text token is EOS), ``conds`` ``[N, 1, H]`` ->
+        ``(cond [N, H], uncond [N, H])``."""
+        if text_eos_id is not None:
+            silence = self.codec_silence_tokens.to(prev_codes.device).view(1, -1).expand_as(prev_codes)
+            prev_codes = torch.where(current_ids.view(-1, 1) == text_eos_id, silence, prev_codes)
+        code_embeds = self.embed_code(self.depthsum_embedding(prev_codes.unsqueeze(1)))       # [N, 1, H]
+        null_cond = self.null_emb.to(code_embeds).view(1, 1, -1).expand_as(code_embeds)
+        return (
+            self.gated_fusion_audio_text(code_embeds, conds)[:, 0],
+            self.gated_fusion_audio_text(code_embeds, null_cond)[:, 0],
+        )
 
     @torch.no_grad()
     def init_state(
