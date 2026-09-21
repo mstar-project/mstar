@@ -160,6 +160,18 @@ class CacheStream:
         if freed:
             self.page_indices.clear()
 
+    def forget_chain(self):
+        """Drop what the chain knows of this stream, for a run that starts over.
+
+        Not part of `reset`, which an offload calls too: a reload brings the
+        same tokens back, so the chain that describes them has to survive it.
+        """
+        self.keys = None
+        self.pending = None
+        self.cursor = 0
+        self.keyed_pages = 0
+        self.covered_len = 0
+
 
 @dataclass
 class ClaimedStream:
@@ -1260,6 +1272,10 @@ class KVManager(AttentionResource):
                 if drop:
                     self._arena.release(stream.page_indices)
                 stream.reset(freed=drop)
+                # a stale cursor or generated key would misfile what the rerun writes
+                stream.forget_chain()
+            for label, stream in self._streams.get(rid, {}).items():
+                self._seed_keys(rid, label, stream)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
