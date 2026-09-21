@@ -350,14 +350,14 @@ class PreprocessWorkerThread:
             )]
 
         initial_signals = self.tensor_manager.store_and_return_tensor_info(
-            request_id=input.request_id,
+            rid=input.request_id,
             tensors=tensors # dict(modality_input: list[tensors])
         )
         all_infos = sum(
             [infos for infos in initial_signals.values()], start=[]
         )
         self.tensor_manager.register_for_send(
-            request_id=input.request_id,
+            rid=input.request_id,
             tensor_infos=all_infos,
         )
         # also persist all of the input signals
@@ -445,7 +445,7 @@ class PreprocessWorkerThread:
     ):
         result.graph_edge.name = f"{result.modality}_output"
         self.tensor_manager.start_read_tensors(
-            request_id=result.request_id,
+            rid=result.request_id,
             graph_edges=[result.graph_edge],
         )
         if result.request_id not in self.tensor_uuid_to_metadata_per_request:
@@ -460,7 +460,7 @@ class PreprocessWorkerThread:
         # The request is gone, so don't start a read — just ack the tensors back
         # to the producing worker so it can free the source buffers.
         self.tensor_manager.ack_unread_tensors(
-            request_id=result.request_id,
+            rid=result.request_id,
             graph_edges=[result.graph_edge],
         )
 
