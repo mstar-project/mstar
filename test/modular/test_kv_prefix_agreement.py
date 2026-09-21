@@ -74,6 +74,7 @@ def _rank(indexed: int) -> KVManager:
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
     )
+    kv._world_size = 2
     kv.enable_prefix_cache(ROOT)
     seen = TOKENS[:indexed * PAGE_SIZE]
     kv.ingest_request("seed", KVReqConfig(prefix_keys={"main": _keys(seen)}))
@@ -235,3 +236,20 @@ def test_a_follower_keeps_its_lease_for_a_rid_the_message_leaves_out():
         "away, so an undeclared node would lose what it holds"
     )
     short_rank.assert_pages_conserved()
+
+
+# ── before the group has answered ───────────────────────────────────────
+
+
+def test_a_rank_above_one_offers_a_length_without_settling_it():
+    rank = _rank(5)
+
+    _ingest(rank)
+
+    assert rank.matched_prefix("r1") == {"main": 5 * PAGE_SIZE}, (
+        "the rank brought nothing to the agreement it is part of"
+    )
+    assert rank.resolve_cached_prefix("r1", NODE, WALK) is None, (
+        "a step run now would skip what this rank alone matched, which is the "
+        "one length the group has not agreed to"
+    )
