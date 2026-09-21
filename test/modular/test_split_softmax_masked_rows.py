@@ -42,7 +42,7 @@ def test_split_matches_fused_and_torch_with_masked_regions(masked):
     temperature = torch.tensor([1.0, 0.7, 0.0], device="cuda")  # last row greedy
     split = _run(logits, temperature, force_fused=False)
     fused = _run(logits, temperature, force_fused=True)
-    ref = torch.softmax(logits.float() / temperature[:2, None], dim=-1)
+    ref = torch.softmax(logits[:2].float() / temperature[:2, None], dim=-1)
     assert torch.isfinite(split).all()
     assert torch.allclose(split.sum(-1), torch.ones(B, device="cuda"), atol=1e-3)
     assert torch.allclose(split[:2], ref, atol=1e-6, rtol=1e-3)
