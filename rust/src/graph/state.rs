@@ -352,14 +352,22 @@ impl RequestState {
 
     /// Python's `WorkerGraphIO.mark_node_complete`. Returns the edges to route,
     /// with loop-back edges of any finishing loop already filtered out.
+    /// Third return: uuids this cleared and the caller must dereference.
+    ///
+    /// Python's `mark_entity_complete` clears a top-level entity's ready
+    /// signals THROUGH the tensor manager, so the dereference happens whether
+    /// or not the caller already cleaned up. Clearing here without reporting
+    /// them would leak a reference on any path where completion precedes the
+    /// explicit cleanup.
     pub fn complete(
         &mut self, node: NodeId, out_tensors: &[Vec<TensorRef>],
-    ) -> (Vec<RoutedEdge>, Vec<(Sym, NodeId)>) {
+    ) -> (Vec<RoutedEdge>, Vec<(Sym, NodeId)>, Vec<u64>) {
         let graph = self.graph.clone();
         let spec = graph.node(node);
         let prev_done = self.is_done;
         let mut out: Vec<RoutedEdge> = Vec::with_capacity(spec.outputs.len() + 2);
 
+        let mut freed: Vec<u64> = Vec::new();
         {
             let st = &mut self.nodes[node as usize];
             st.completed = true;
@@ -368,6 +376,9 @@ impl RequestState {
             // loop-back arrivals land in `next` — Python only clears
             // ready_signals for top-level entities (base.py:758-767).
             if spec.loop_id.is_none() {
+                for t in st.cur.tensors.iter().flatten() {
+                    freed.extend(t.iter().map(|x| x.uuid));
+                }
                 st.cur.clear();
             }
         }
@@ -386,7 +397,7 @@ impl RequestState {
         if self.is_done && !prev_done {
             self.num_times_run += 1;
         }
-        (out, filtered)
+        (out, filtered, freed)
     }
 
     fn root_entity_done(&mut self) {

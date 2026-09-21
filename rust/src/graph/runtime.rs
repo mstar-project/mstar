@@ -1576,7 +1576,7 @@ impl GraphRuntime {
             let Some(state) = self.state_mut(wg, rid) else {
                 continue;
             };
-            let (edges, _filtered) = state.complete(node, &out_tensors);
+            let (edges, _filtered, freed_inputs) = state.complete(node, &out_tensors);
             let done = state.is_done;
             if done {
                 completed_wgs
@@ -1627,6 +1627,15 @@ impl GraphRuntime {
                             out.register_rids.push(rid);
                         }
                     }
+                }
+            }
+
+            // Inputs the completion cleared. Dereferenced here so the result
+            // does not depend on whether cleanup_consumed_inputs ran first.
+            if !freed_inputs.is_empty() {
+                let mut bk = self.bookkeeping.lock().unwrap();
+                for uuid in &freed_inputs {
+                    bk.dereference(*uuid, 1);
                 }
             }
 

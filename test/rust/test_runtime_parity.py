@@ -415,3 +415,44 @@ def test_a_stale_handle_never_panics(pair, call):
         assert "Panic" not in type(e).__name__, (
             f"panicked across the FFI boundary: {e}"
         )
+
+
+@pytest.mark.parametrize("cleanup_first", [True, False])
+def test_an_input_is_released_whichever_order_runs(pair, cleanup_first):
+    """The worker cleans up before routing, but the release must not DEPEND on
+    that order: completion also clears a top-level node's inputs, and clearing
+    without dereferencing leaks the reference silently."""
+    rt, book, store = pair
+    rid = _admit(rt)
+    book.put_tensor(100, _info(100))
+    book.increment_ref(100, 1)
+    rt.ingest_inputs_batch(
+        ParallelList([rid], [_spec("prompt", "prefill", uuids=[100])])
+    )
+    rt.pop_rids("prefill", WALK, [rid])
+
+    def cleanup():
+        rt.cleanup_consumed_inputs("prefill", [rid], [WG_ID])
+
+    def route():
+        for u in (200, 201):
+            book.put_tensor(u, _info(u))
+            book.increment_ref(u, 1)
+        rt.complete_and_route_batch(
+            RouteInput(
+                partition="default", graph_walk=WALK, node_name="prefill",
+                output_signals=["kv_cache", "token"],
+                wg_ids=ParallelList([rid], [WG_ID]),
+                tensors=[200, 201], num_tensors=[1, 1],
+            ),
+            store,
+        )
+
+    if cleanup_first:
+        cleanup()
+        route()
+    else:
+        route()
+        cleanup()
+
+    assert book.can_gc(100), "the consumed input leaked a reference"
