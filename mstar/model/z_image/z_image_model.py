@@ -61,7 +61,7 @@ class ZImageModel(Model):
         attention_backend: str = "flashinfer",
         compile: bool = True,
         compile_eager_rounding: bool = True,
-        compile_exact_ops: bool = False,
+        compile_exact_ops: bool | list[str] = False,
         cuda_graph: bool = True,
         capture_sizes: list[list[int]] | None = None,
         capture_caption_lengths: list[int] | None = None,
@@ -78,7 +78,8 @@ class ZImageModel(Model):
         self.attention_backend = attention_backend
         self.compile_transformer = bool(compile)
         self.compile_eager_rounding = bool(compile_eager_rounding)
-        self.compile_exact_ops = bool(compile_exact_ops)
+        # True: every norm / activation class stays eager inside the compiled forward; a list picks classes
+        self.compile_exact_ops = compile_exact_ops if isinstance(compile_exact_ops, list) else bool(compile_exact_ops)
         self.cuda_graph = bool(cuda_graph)
         self.capture_sizes = [tuple(int(v) for v in s) for s in (capture_sizes or [[1024, 1024]])]
         # Captions round up to a multiple of 32 tokens; short prompts land in the first two buckets.
