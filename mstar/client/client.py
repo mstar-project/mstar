@@ -174,8 +174,10 @@ class MStarClient:
         for kind, items in (("images", images), ("audio", audio), ("video", video)):
             if not items:
                 continue
-            if isinstance(items, (str, bytes, bytearray, Path)):
-                items = [items]
+            if isinstance(items, (str, bytes, bytearray, Path)) or (
+                isinstance(items, tuple) and len(items) == 2 and isinstance(items[0], str)
+            ):
+                items = [items]  # one path, one blob, or one (filename, bytes) pair
             for i, item in enumerate(items):
                 fname, blob = self._coerce_file(kind, i, item)
                 files.append(("files", (fname, blob)))
