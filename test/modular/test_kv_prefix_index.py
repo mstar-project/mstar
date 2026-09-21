@@ -101,9 +101,11 @@ def test_two_inserts_of_one_key_keep_one_entry_and_one_count():
     arena = _arena()
     index = PrefixIndex(arena)
     first, second = arena.acquire(2)
-    assert index.insert(b"k", first)
+    assert index.insert(b"k", first), "the first writer of a key was refused"
 
-    assert index.insert(b"k", second) is False
+    assert index.insert(b"k", second) is False, (
+        "a second page took a key the index already holds"
+    )
 
     assert index.lookup([b"k"]) == [first], "the second writer took the key"
     assert arena.num_owners[second] == 1, "a refused insert still retained"
@@ -118,7 +120,9 @@ def test_a_lookup_stops_at_the_first_key_the_index_does_not_hold():
     index = PrefixIndex(arena)
     pages = _chain(index, arena)
 
-    assert index.lookup([b"A", b"B", b"nope", b"D"]) == [pages["A"], pages["B"]]
+    assert index.lookup([b"A", b"B", b"nope", b"D"]) == [pages["A"], pages["B"]], (
+        "the walk carried on past a key the index does not hold"
+    )
     _assert_pages_partition(arena)
 
 
@@ -129,11 +133,13 @@ def test_eviction_after_a_hit_takes_the_cold_branch_and_stops_at_the_fork():
     arena = _arena()
     index = PrefixIndex(arena)
     pages = _chain(index, arena)
-    assert index.lookup([b"A", b"B", b"D"]) == [pages["A"], pages["B"], pages["D"]]
+    assert index.lookup([b"A", b"B", b"D"]) == [pages["A"], pages["B"], pages["D"]], (
+        "the branch this test warms was not the one the index walked"
+    )
 
     freed = index.evict(1)
 
-    assert freed == 1
+    assert freed == 1, "the eviction stopped before it had given a page back"
     assert index.lookup([b"A", b"B", b"D"]) == [pages["A"], pages["B"], pages["D"]], (
         "evicting the cold branch disturbed the branch that was hit"
     )

@@ -125,7 +125,7 @@ def test_a_live_request_never_fails_while_cache_only_pages_exist():
 def test_a_request_still_fails_when_the_pool_is_full_of_live_ones():
     kv = _manager(PAGES_PER_REQUEST + 1)
     _ingest(kv, "a", _tokens(0))
-    assert _admit(kv, "a", TOKENS).ok
+    assert _admit(kv, "a", TOKENS).ok, "the request under test never ran"
 
     _ingest(kv, "b", _tokens(1000))
     outcome = _admit(kv, "b", TOKENS)
@@ -151,7 +151,9 @@ def test_a_leased_page_is_never_evicted():
     # somebody else asks for everything the pool can give
     kv._index.evict(kv.config.max_num_pages)
 
-    assert kv._streams["b"]["main"].lease == leased
+    assert kv._streams["b"]["main"].lease == leased, (
+        "the lease lost pages to an eviction it was supposed to hold them from"
+    )
     assert all(page not in kv._arena.allocator.free_pages.queue for page in leased), (
         "a page a request was about to be admitted on was handed to someone else"
     )
@@ -161,7 +163,7 @@ def test_a_leased_page_is_never_evicted():
 def test_a_pool_of_live_leaves_gives_up_after_one_look_at_each():
     kv = _manager(2 * PAGES_PER_REQUEST + 1)
     _ingest(kv, "a", _tokens(0))
-    assert _admit(kv, "a", TOKENS).ok
+    assert _admit(kv, "a", TOKENS).ok, "the request under test never ran"
     index = kv._index
     popped: list[int] = []
     real_pop = index._pop_leaf
@@ -180,7 +182,9 @@ def test_a_pool_of_live_leaves_gives_up_after_one_look_at_each():
         f"a leaf that was passed over was looked at again in the same pass: "
         f"{popped}"
     )
-    assert set(popped) <= set(kv._streams["a"]["main"].page_indices)
+    assert set(popped) <= set(kv._streams["a"]["main"].page_indices), (
+        "a leaf no running request holds was passed over"
+    )
     kv.assert_pages_conserved()
 
 
@@ -188,10 +192,12 @@ def test_a_leaf_that_was_passed_over_is_still_there_for_the_next_shortfall():
     kv = _manager(2 * PAGES_PER_REQUEST + 1)
     tokens = _tokens(0)
     _ingest(kv, "a", tokens)
-    assert _admit(kv, "a", TOKENS).ok
+    assert _admit(kv, "a", TOKENS).ok, "the request under test never ran"
     indexed = sorted(kv._index.pages())
 
-    assert kv._index.evict(PAGES_PER_REQUEST) == 0
+    assert kv._index.evict(PAGES_PER_REQUEST) == 0, (
+        "a pool whose every leaf is live gave something back"
+    )
     kv.remove_request("a")
 
     assert kv._index.evict(PAGES_PER_REQUEST) == PAGES_PER_REQUEST, (
@@ -204,7 +210,7 @@ def test_a_leaf_that_was_passed_over_is_still_there_for_the_next_shortfall():
 def test_passing_over_a_leaf_leaves_its_parent_alone():
     kv = _manager(2 * PAGES_PER_REQUEST + 1)
     _ingest(kv, "a", _tokens(0))
-    assert _admit(kv, "a", TOKENS).ok
+    assert _admit(kv, "a", TOKENS).ok, "the request under test never ran"
     index = kv._index
     chain_pages = kv._streams["a"]["main"].page_indices[:PAGES_PER_REQUEST]
     parent, leaf = chain_pages[-2], chain_pages[-1]

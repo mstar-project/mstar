@@ -154,8 +154,12 @@ def test_a_request_that_matches_nothing_gets_no_lease():
     _seed(kv, list(range(100)))
     kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": _keys([7] * 100)}))
 
-    assert kv.resolve_cached_prefix("r1", NODE, WALK) is None
-    assert kv._streams["r1"]["main"].lease is None
+    assert kv.resolve_cached_prefix("r1", NODE, WALK) is None, (
+        "a prompt sharing no page with anything indexed was answered a length"
+    )
+    assert kv._streams["r1"]["main"].lease is None, (
+        "a request that matched nothing is holding pages"
+    )
     kv.assert_pages_conserved()
 
 
@@ -181,7 +185,9 @@ def test_a_refused_admit_answers_the_same_and_holds_one_lease():
     assert kv.resolve_cached_prefix("r1", NODE, WALK) == first, (
         "the second probe answered a different length"
     )
-    assert kv._streams["r1"]["main"].page_indices[:len(held)] == held
+    assert kv._streams["r1"]["main"].page_indices[:len(held)] == held, (
+        "the refused admit gave up the pages it had converted"
+    )
     assert [kv._arena.num_owners[page] for page in held] == owners, (
         "the second probe took a second reference"
     )
@@ -211,7 +217,9 @@ def test_a_reset_gives_back_a_lease_admit_never_took():
 
     kv.reset_request("r1")
 
-    assert kv._streams["r1"]["main"].lease is None
+    assert kv._streams["r1"]["main"].lease is None, (
+        "a reset request is still holding a lease nobody will convert"
+    )
     kv.assert_pages_conserved()
 
 
@@ -231,7 +239,9 @@ def test_admit_takes_the_lease_over_and_commit_clears_it():
     assert stream.page_indices[:len(leased)] == leased, (
         "admit allocated fresh pages instead of taking the matched ones"
     )
-    assert stream.stored_len == 100
+    assert stream.stored_len == 100, (
+        "the matched pages were not counted as tokens this stream holds"
+    )
     assert stream.lease is None, "commit left the lease on the stream"
     kv.assert_pages_conserved()
 
@@ -314,7 +324,9 @@ def test_a_pre_fork_off_a_leased_stream_covers_the_whole_prefix():
     assert forked.stored_len == matched, (
         "the fork target was sized off a stream whose lease had not converted"
     )
-    assert len(forked.page_indices) >= matched // PAGE_SIZE
+    assert len(forked.page_indices) >= matched // PAGE_SIZE, (
+        "the fork target has fewer pages than the prefix it must cover"
+    )
     assert not set(forked.page_indices) & set(kv._streams["r1"]["main"].page_indices), (
         "the fork target aliased the pages it was supposed to be a copy of"
     )

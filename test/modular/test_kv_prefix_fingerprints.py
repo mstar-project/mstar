@@ -77,7 +77,10 @@ def _checkpoint(tmp_path: pathlib.Path, shard: bytes = b"x" * 100) -> pathlib.Pa
 
 
 def test_a_kv_fingerprint_is_the_same_twice():
-    assert _kv().fingerprint() == _kv().fingerprint()
+    assert _kv().fingerprint() == _kv().fingerprint(), (
+        "one cache configuration fingerprinted two ways, so a restart could "
+        "never match what it wrote"
+    )
 
 
 @pytest.mark.parametrize("overrides", [
@@ -115,7 +118,9 @@ def test_a_kv_fingerprint_ignores_how_many_pages_the_pool_has():
 
 
 def test_a_position_fingerprint_is_the_same_twice():
-    assert _rope().fingerprint() == _rope().fingerprint()
+    assert _rope().fingerprint() == _rope().fingerprint(), (
+        "one rope configuration fingerprinted two ways"
+    )
 
 
 @pytest.mark.parametrize("overrides", [
@@ -156,7 +161,9 @@ def test_preprocessing_fingerprints_separate_two_models():
     class _Two:
         pass
 
-    assert Model.preprocess_fingerprint(_One()) == "_One"
+    assert Model.preprocess_fingerprint(_One()) == "_One", (
+        "the default fingerprint is not the class that preprocessed the prompt"
+    )
     assert (
         Model.preprocess_fingerprint(_One())
         != Model.preprocess_fingerprint(_Two())
@@ -169,7 +176,9 @@ def test_preprocessing_fingerprints_separate_two_models():
 def test_a_checkpoint_identity_is_the_same_twice(tmp_path):
     root = _checkpoint(tmp_path)
 
-    assert checkpoint_identity(root) == checkpoint_identity(root)
+    assert checkpoint_identity(root) == checkpoint_identity(root), (
+        "one checkpoint identified two ways"
+    )
 
 
 def test_a_checkpoint_identity_changes_when_a_shard_changes_size(tmp_path):

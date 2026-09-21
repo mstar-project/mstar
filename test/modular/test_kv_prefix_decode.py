@@ -134,7 +134,10 @@ def test_a_generated_page_is_indexed_at_the_commit_that_fills_it():
         seen.append((kv._streams["r0"]["main"].stored_len, _indexed(kv)))
 
     filled = [step for step, (stored, _) in enumerate(seen) if stored == 2 * PAGE_SIZE]
-    assert len(filled) == 1
+    assert len(filled) == 1, (
+        "the stream passed two pages of tokens, so the step that filled the "
+        "second one is not the step under test"
+    )
     at = filled[0]
     assert seen[at - 1][1] == 1, "a page was indexed before its last slot was written"
     assert seen[at][1] == 2, (
@@ -200,7 +203,10 @@ def test_a_node_whose_decode_ids_are_not_the_sampled_token_stops_at_its_prompt()
     for token in range(1, PAGE_SIZE + 2):
         _decode(kv, "r0", 9000 + token)
 
-    assert after_prompt == 1
+    assert after_prompt == 1, (
+        "a node whose decode ids are not the token it sampled keyed a page of "
+        "them anyway"
+    )
     assert _indexed(kv) == 1, (
         "a node whose decode ids are not the token it sampled indexed pages "
         "it cannot name"
@@ -222,5 +228,7 @@ def test_a_request_that_opted_out_chains_nothing():
     for token in range(1, PAGE_SIZE + 2):
         _decode(kv, "r0", 9000 + token)
 
-    assert _indexed(kv) == 0
+    assert _indexed(kv) == 0, (
+        "a request that turned the cache off left its generated pages behind"
+    )
     kv.assert_pages_conserved()

@@ -126,12 +126,16 @@ def test_a_read_in_only_moves_what_this_cache_does_not_already_hold():
     _ingest(kv, "b", tokens + list(range(1000, 1032)))
     out = kv.admit_retrieve("b", NODE, WALK, _published(kv, "b", 96, list(range(6))))
 
-    assert out.ok
-    assert len(_StubTransfer.started) == 1
+    assert out.ok, "the read-in was refused"
+    assert len(_StubTransfer.started) == 1, (
+        "the read this request needed was never started"
+    )
     assert _StubTransfer.started[0]["start_len"] == 64, (
         "the read moved pages this cache already held"
     )
-    assert _StubTransfer.started[0]["end_len"] == 96
+    assert _StubTransfer.started[0]["end_len"] == 96, (
+        "the read stopped short of what the other side published"
+    )
     kv.assert_pages_conserved()
 
 
@@ -162,7 +166,7 @@ def test_a_read_in_hashes_the_prompt_with_the_lock_down(monkeypatch):
 
     assert kv.admit_retrieve(
         "b", NODE, WALK, _published(kv, "b", 64, list(range(4))),
-    ).ok
+    ).ok, "the read-in was refused"
     assert kv._streams["b"]["main"].stored_len == 64, "the read-in matched nothing"
     kv.assert_pages_conserved()
 
@@ -177,11 +181,13 @@ def test_a_read_in_that_matches_everything_published_moves_nothing():
     _ingest(kv, "b", tokens)
     out = kv.admit_retrieve("b", NODE, WALK, _published(kv, "b", 64, list(range(4))))
 
-    assert out.ok
+    assert out.ok, "the read-in was refused"
     assert _StubTransfer.started == [], (
         "a transfer was started for bytes that were already here"
     )
-    assert kv._streams["b"]["main"].stored_len == 64
+    assert kv._streams["b"]["main"].stored_len == 64, (
+        "the local match was not counted as tokens the stream holds"
+    )
     kv.assert_pages_conserved()
 
 
@@ -191,8 +197,10 @@ def test_a_read_in_with_nothing_local_moves_all_of_it():
 
     out = kv.admit_retrieve("b", NODE, WALK, _published(kv, "b", 64, list(range(4))))
 
-    assert out.ok
-    assert _StubTransfer.started[0]["start_len"] == 0
+    assert out.ok, "the read-in was refused"
+    assert _StubTransfer.started[0]["start_len"] == 0, (
+        "a cache holding none of this prompt still skipped part of the read"
+    )
     kv.assert_pages_conserved()
 
 
@@ -217,7 +225,9 @@ def test_a_shared_page_can_be_evicted_while_its_request_is_away():
     )
     assert kv.reload("a"), "the request could not come back"
     stream = kv._streams["a"]["main"]
-    assert stream.stored_len == len(tokens)
+    assert stream.stored_len == len(tokens), (
+        "the reload brought back fewer tokens than the request had written"
+    )
     assert not set(stream.page_indices) & set(shared), (
         "reload took back pages that had been handed to someone else"
     )

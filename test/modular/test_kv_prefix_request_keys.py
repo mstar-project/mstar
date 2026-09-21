@@ -253,7 +253,7 @@ def test_a_model_returning_only_tensors_still_carries_its_keys():
 
     kwargs = _run(worker, {"voice": "tara"})
 
-    assert kwargs["voice"] == "tara"
+    assert kwargs["voice"] == "tara", "the request's own kwargs were dropped"
     assert "prefix_keys" in kwargs, "the plain-dict return lost the keys"
 
 
@@ -269,7 +269,9 @@ def test_each_resource_config_is_handed_only_its_own_chain():
     for key, cfg in configs.items():
         cfg.apply_conductor_config(seed=1, prefix_keys=prefix_keys.get(key))
 
-    assert configs["kv"].prefix_keys == prefix_keys["kv"]
+    assert configs["kv"].prefix_keys == prefix_keys["kv"], (
+        "the resource that keyed this stream was not handed its chain"
+    )
     assert configs["other_kv"].prefix_keys is None, (
         "a resource was handed another resource's chain"
     )
@@ -285,7 +287,9 @@ def test_a_request_can_turn_the_cache_off_for_itself():
     for cfg in configs.values():
         cfg.apply_conductor_config(seed=1, prefix_cache=False)
 
-    assert configs["kv"].prefix_cache is False
+    assert configs["kv"].prefix_cache is False, (
+        "a request that asked for no cache would still be matched"
+    )
 
 
 def test_a_request_that_says_nothing_is_still_cached():
