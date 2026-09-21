@@ -84,6 +84,7 @@ def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]
 def _batch(node_name: str = NODE):
     return SimpleNamespace(
         node_name=node_name,
+        request_ids=(RID,),
         step_context=StepContext(
             request_ids=(RID,), graph_walk=WALK, slot=0, capture=False,
         ),
@@ -209,6 +210,47 @@ def test_another_nodes_resource_is_never_swept():
     assert theirs.resolved == 0 and theirs.applied == [], (
         "another node's resource was asked about this request"
     )
+
+
+# ── what the postprocess hands back ─────────────────────────────────────
+
+
+class _Chaining(_Answering):
+    """Records the outputs it was handed to key a generation from."""
+
+    def __init__(self):
+        super().__init__(None)
+        self.extended: list[dict] = []
+
+    def extend_prefix_chain(self, rid, node_name, graph_walk, outputs):
+        self.extended.append(outputs)
+
+
+def test_a_declared_nodes_resource_is_handed_the_step_it_sampled_from():
+    mine = _Chaining()
+    theirs = _Chaining()
+    engine = _engine(
+        {"kv": mine, "talker_kv": theirs},
+        {NODE: ["kv"], OTHER: ["talker_kv"]},
+    )
+    sampled = {"text_inputs": [torch.tensor([7])]}
+
+    engine.extend_prefix_chains(_batch(), {RID: sampled})
+
+    assert mine.extended == [sampled], (
+        "the node's own resource never saw what the step sampled, so nothing "
+        "it generates is ever keyed"
+    )
+    assert theirs.extended == [], "another node's resource was handed the step"
+
+
+def test_a_step_that_sampled_nothing_for_a_request_hands_back_nothing():
+    mine = _Chaining()
+    engine = _engine({"kv": mine}, {NODE: ["kv"]})
+
+    engine.extend_prefix_chains(_batch(), {})
+
+    assert mine.extended == [], "a request with no outputs was chained anyway"
 
 
 # ── one request's failure ───────────────────────────────────────────────
