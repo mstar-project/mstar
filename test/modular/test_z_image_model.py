@@ -194,3 +194,17 @@ def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
     assert [s[0] for s in vae.compiled] == [2] and vae.eager == []
     node._decode_fn(torch.zeros(1, c, h * p // 2, w * p))
     assert len(vae.eager) == 1 and [s[0] for s in vae.compiled] == [2]
+
+
+def test_blank_prompts_are_rejected():
+    """An empty or whitespace prompt used to generate an image from an empty caption; it is a 400 now."""
+    import pytest
+
+    from mstar.model.z_image.config import ZImageConfig
+    from mstar.model.z_image.z_image_model import ZImageModel
+
+    model = ZImageModel(model_path_hf="x")
+    model.set_config(ZImageConfig())
+    for bad in (None, "", "   "):
+        with pytest.raises(ValueError, match="text prompt"):
+            model.process_prompt(bad, ["text"], ["image"])
