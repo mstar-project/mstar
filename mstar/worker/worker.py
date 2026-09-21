@@ -415,6 +415,9 @@ class Worker:
         # string-keyed: a DRAIN can precede the NEW that mints the handle
         self._pending_drains: set[str] = set()
         self._draining_rids: set[str] = set()
+        # MSTAR_STALL_PROBE=<seconds>: periodic "why is nothing scheduled".
+        self._stall_probe_every = float(os.getenv("MSTAR_STALL_PROBE", "0"))
+        self._stall_probe_last = 0.0
         self._reads_done_sent: set[str] = set()
 
         # rid string <-> worker-local integer handle. Everything inside a
@@ -1241,6 +1244,66 @@ class Worker:
             edge_name: sbuf._consumed
             for edge_name, sbuf in req_info.stream_buffers.items()
         }
+
+    def _stall_probe(self) -> None:
+        """``MSTAR_STALL_PROBE=<seconds>``: why is nothing being scheduled?
+
+        A stalled pipeline looks identical from outside whether the graph
+        never became ready, the scheduler filtered the node out, or the engine
+        keeps saying not-ready. This walks the same gates in order and reports
+        the first one that drops everything.
+        """
+        if not self._stall_probe_every:
+            return
+        now = _time.monotonic()
+        if now - self._stall_probe_last < self._stall_probe_every:
+            return
+        self._stall_probe_last = now
+        live = list(self.request_state.per_request_info)
+        if not live:
+            logger.warning("STALL: no live requests on %s", self.worker_id)
+            return
+
+        ready = self._rid_runtime.get_ready_nodes(set())
+        if not ready:
+            logger.warning(
+                "STALL: %d live rid(s) %s but NO graph-ready nodes -- inputs "
+                "never arrived or were never ingested. in-flight=%s "
+                "pending_removes=%s",
+                len(live), live[:8], sorted(self._in_flight_rids)[:8],
+                sorted(self._pending_removes)[:8],
+            )
+            return
+
+        for spec in ready:
+            if spec.node_name not in self.parallel_leader_nodes:
+                logger.warning(
+                    "STALL: %s/%s is graph-ready for %s but this rank is not "
+                    "its leader (leaders=%s) -- only rank 0 initiates.",
+                    spec.node_name, spec.graph_walk, spec.rids[:8],
+                    sorted(self.parallel_leader_nodes),
+                )
+                continue
+            partition = self.request_state.get_partition_for_node(spec.node_name)
+            for rid in spec.rids[:4]:
+                try:
+                    fwd = self.request_state.get_fwd_info(rid, partition)
+                except KeyError:
+                    logger.warning(
+                        "STALL: %s/%s ready for rid %s but partition %r has no "
+                        "fwd info -- the conductor never admitted that "
+                        "partition here.", spec.node_name, spec.graph_walk,
+                        rid, partition,
+                    )
+                    continue
+                engine = self.engine_manager.get_engine(spec.node_name)
+                outcome = engine.check_ready(spec.node_name, rid, fwd)
+                logger.warning(
+                    "STALL: %s/%s rid=%s graph-ready, engine ok=%s ready=%s "
+                    "failed_resource=%s reason=%s",
+                    spec.node_name, spec.graph_walk, rid, outcome.ok,
+                    outcome.ready, outcome.failed_resource, outcome.reason,
+                )
 
     def _profiling_payloads(self, rids: list[int]) -> ParallelList:
         """rx/tx/timings, msgpacked so the runtime need not own the types.
@@ -2777,6 +2840,8 @@ class Worker:
                 self._poll_stream_buffers()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
+
+                self._stall_probe()
 
                 # 2. Speculatively schedule + build N+1 — overlaps with GPU(N).
                 # Only when (a) there's a pending step and (b) it's AR-engine.
