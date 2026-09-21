@@ -16,6 +16,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
     "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
+    "zonos2": ("mstar.model.zonos2.zonos2_model", "Zonos2Model"),
 }
 
 HF_MODELS: dict[str, dict] = {
@@ -57,6 +58,11 @@ HF_MODELS: dict[str, dict] = {
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
+    # Zonos2 multi-codebook TTS. The checkpoint is the reference layout — a
+    # directory with ``params.json`` and ``model.pth``, not HF safetensors — so
+    # ``mstar/model/zonos2/weight_loader.py`` snapshots and reads it directly.
+    # The DAC vocoder also needs ``descript-audio-codec`` installed.
+    "zonos2": {"model_path_hf": "Zyphra/ZONOS2"},
 }
 
 

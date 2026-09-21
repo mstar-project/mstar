@@ -761,7 +761,7 @@ Two places need access to resources, and each has its own mechanism.
            hidden = attn.select_last_hidden(hidden)
        return sampler.sample(engine_inputs.request_ids, logits=self.lm_head(hidden))
 
-``ModelInputsFromEngine`` carries four other useful fields:
+``ModelInputsFromEngine`` carries five other useful fields:
 
 - ``step`` is this step's ``SubmoduleStep``. A forward that must match its own declaration
   reads it here instead of computing the same information again.
@@ -770,6 +770,9 @@ Two places need access to resources, and each has its own mechanism.
   packs its inputs differently for the fixed capture shape.
 - ``per_request_states`` is a ``Mapping`` that is resolved on first read.
 - ``piecewise_runners`` holds the piecewise CUDA-graph runners, keyed by region name.
+- ``final_stream_rids`` names the requests whose consumed streaming input was the final
+  chunk, so a streaming-codec node can flush its per-request tail on the last call (the
+  Zonos2 DAC vocoder's withheld crossfade tail). It is empty on non-streaming paths.
 
 **In a layer**, resources are resolved once at load time. The engine calls
 ``submodule.bind_node_resources(resources)``. That method stores the resources, then

@@ -46,6 +46,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``vjepa2_ac``
      - ``vjepa2-ac-vitg``
      - V-JEPA 2-AC encoder + action-conditioned predictor.
+   * - ``zonos2``
+     - ``Zyphra/ZONOS2``
+     - Multi-codebook TTS: autoregressive LLM emitting audio codes + DAC 44.1 kHz decoder.
+       No named voices — it clones from a reference clip with a separate Qwen speech encoder.
+       See `Zonos2 environment requirements`_.
    * - ``whisper_large`` *(Beta)*
      - ``openai/whisper-large-v3``
      - Encoder-decoder ASR (audio in, transcript out). Beta / un-optimized.
@@ -238,3 +243,16 @@ Requests are therefore independent and the loop is resumable across ranks.
 ``torch.compile``, no CUDA-graph capture, no continuous batching, no component
 offload, and the VAE decode is always tiled (which bounds its workspace so the
 untiled conv3d cannot OOM a 32 GiB card).
+Zonos2 environment requirements
+-------------------------------
+
+- The **DAC vocoder** (``pip install descript-audio-codec``) is required and is kept out of
+  every extra — see :doc:`installation`.
+- **Voice cloning** embeds the reference clip with a Qwen speech encoder that is not part of
+  the checkpoint, downloaded from the hub at server start. It needs ``transformers`` and
+  ``torchcodec`` (neither is in ``.[zonos2]``) and a writable ``HF_MODULES_CACHE`` — see
+  :doc:`installation`. Drop the ``speaker_encoder`` node group from the config YAML to serve
+  text-only; clone requests then fail instead of ignoring the reference audio.
+- Clone requests send reference audio (``audio=...`` with ``"audio"`` in
+  ``input_modalities``). A client that caches the returned embedding can pass it back as the
+  ``speaker_embedding`` model kwarg to skip the encoder.

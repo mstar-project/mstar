@@ -885,6 +885,7 @@ class Engine:
             per_request_states=LazyRequestStates(submodule, rids),
             captured=lease is not None,
             step=step,
+            final_stream_rids=batch.final_stream_rids,
         )
         if nvtx:
             range_push("engine.preprocess")
