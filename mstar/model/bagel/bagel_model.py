@@ -736,7 +736,7 @@ class BagelModel(Model):
         )
 
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
-        """The text walk's prompt is its token ids, and so is every step after it.
+        """The text walk's prompt is its token ids, and so is every step it takes.
 
         The image walks share this cache but carry position ids of their own,
         which is what keeps the engine from offering them a prefix.
