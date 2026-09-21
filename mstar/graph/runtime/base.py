@@ -67,6 +67,13 @@ from mstar.utils.containers import ParallelList
 class SpeculationOutput(NamedTuple):
     node_name: str
     graph_walk: str
+    # Loop context for the TARGET. Not used for filtering -- prep_spec_rids
+    # owns that -- but the speculative batch carries it, and the postprocess
+    # that follows needs it to match its pending loop stops. The selection
+    # step already computes both, so reporting them avoids a second
+    # ingest_for_speculation (which mutates speculative slot state).
+    is_new_loop_iter: bool = False
+    loop_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +119,8 @@ class SpeculationPrepInput(NamedTuple):
 class SpeculationPrepOutput(NamedTuple):
     consumed_streaming_edge_idxs: list[int]
     ready_rids: list[int]
+    # parallel to ready_rids: the worker graph each is speculating in
+    wg_ids: list[int]
     input_edges: list[EdgeSpec]
     input_edges_per_rid: list[int]
 

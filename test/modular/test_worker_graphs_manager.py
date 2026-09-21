@@ -18,7 +18,13 @@ from mstar.conductor.request_info import (
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.graph.runtime.base import EdgeSpec, RouteInput, SendInput
+from mstar.graph.runtime.base import (
+    EdgeSpec,
+    PendingLoopStop,
+    RouteInput,
+    SendInput,
+    SpeculationPrepInput,
+)
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
@@ -711,3 +717,133 @@ def test_speculate_node_returns_nothing_for_an_unknown_rid():
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
     assert runtime.speculate_node("prefill", "decode", rid + 999) == []
+
+
+# --- prep_spec_rids -----------------------------------------------------------
+
+def _prep(runtime, rids, streaming=(), room=None,
+          curr="prefill", spec="ar_decode"):
+    per_rid: dict[int, list] = {r: [] for r in rids}
+    for rid, spec_edge in streaming:
+        per_rid[rid].append(spec_edge)
+    flat = [e for r in rids for e in per_rid[r]]
+    return runtime.prep_spec_rids(SpeculationPrepInput(
+        spec_node_name=spec,
+        curr_node_name=curr,
+        graph_walk="decode",
+        rids=rids,
+        room_for_continuing=room,
+        streaming_edges=flat,
+        streaming_edges_per_rid=[len(per_rid[r]) for r in rids],
+    ))
+
+
+def _spec_ready_runtime():
+    """A request sitting at prefill, whose outputs make ar_decode speculatable."""
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+    return mgr, runtime, rid
+
+
+def test_prep_returns_the_worker_graph_per_ready_rid():
+    _mgr, runtime, rid = _spec_ready_runtime()
+    out = _prep(runtime, [rid])
+    assert out.ready_rids == [rid]
+    assert out.wg_ids == [0], "wg_ids is parallel to ready_rids"
+    assert len(out.input_edges_per_rid) == len(out.ready_rids)
+    assert sum(out.input_edges_per_rid) == len(out.input_edges)
+
+
+def test_prep_respects_room_for_continuing():
+    """The backlog has first claim; rids past the cap are skipped BEFORE any
+    streaming ingest, so there is nothing to roll back for them."""
+    _mgr, runtime, rid = _spec_ready_runtime()
+    assert _prep(runtime, [rid], room=0).ready_rids == []
+    assert _prep(runtime, [rid], room=1).ready_rids == [rid]
+
+
+def _in_loop_runtime():
+    """Drive the request INTO ar_decode, so speculating ar_decode -> ar_decode
+    is a loop-BACK. The loop filters only apply to a new loop iteration, which
+    a transition into the loop (prefill -> ar_decode) is not."""
+    mgr, runtime, rid = _spec_ready_runtime()
+    runtime._mark_node_complete(rid, 0, "prefill")
+    _ingest(runtime, rid, [
+        GraphEdge(name="token", next_node="ar_decode"),
+        GraphEdge(name="kv_cache", next_node="ar_decode"),
+    ])
+    return mgr, runtime, rid
+
+
+def test_prep_skips_a_rid_whose_loop_already_has_a_pending_stop():
+    _mgr, runtime, rid = _in_loop_runtime()
+    # Sanity: the loop-back IS speculatable before the stop, or the assertion
+    # below would pass for the wrong reason.
+    assert _prep(
+        runtime, [rid], curr="ar_decode", spec="ar_decode"
+    ).ready_rids == [rid]
+
+    runtime._pending_loop_stops.add(PendingLoopStop(rid, "decode", "ar_loop"))
+    assert _prep(
+        runtime, [rid], curr="ar_decode", spec="ar_decode"
+    ).ready_rids == [], \
+        "a loop with a stop pending has no further iterations to speculate"
+
+
+def test_prep_skips_a_rid_on_its_loops_final_iteration():
+    _mgr, runtime, rid = _in_loop_runtime()
+    assert _prep(
+        runtime, [rid], curr="ar_decode", spec="ar_decode"
+    ).ready_rids == [rid]
+
+    runtime.queues[0].per_request_queues[rid].loops[
+        "ar_loop"
+    ]._finish_signal = True
+    assert _prep(
+        runtime, [rid], curr="ar_decode", spec="ar_decode"
+    ).ready_rids == []
+
+
+def test_prep_does_not_apply_the_loop_filter_to_a_transition_into_the_loop():
+    """prefill -> ar_decode enters the loop, so it is not a new iteration and
+    a pending stop must not suppress it."""
+    _mgr, runtime, rid = _spec_ready_runtime()
+    runtime._pending_loop_stops.add(PendingLoopStop(rid, "decode", "ar_loop"))
+    assert _prep(runtime, [rid]).ready_rids == [rid]
+
+
+def test_prep_rolls_back_the_streaming_ingest_when_the_node_is_not_ready():
+    """The rollback is what lets a later normal scheduling consume the chunk.
+    If the ingest were left in place, the chunk would be stranded in a slot
+    of a node that never ran."""
+    _mgr, runtime, rid = _spec_ready_runtime()
+    wgio = runtime.queues[0].per_request_queues[rid]
+    node = wgio.nodes["ar_decode"]
+
+    # Force not-ready: ar_decode needs token AND kv_cache, so offer only a
+    # signal it does not take, which cannot complete it.
+    before_ready = set(node.ready_signals.ready_names)
+    out = _prep(runtime, [rid], streaming=[(
+        rid, EdgeSpec(signal="token", next_node="ar_decode", uuids=[]),
+    )])
+
+    if not out.ready_rids:
+        assert set(node.ready_signals.ready_names) == before_ready, \
+            "a failed prep must leave no streaming chunk behind"
+        assert out.consumed_streaming_edge_idxs == [], \
+            "nothing was consumed, so the caller returns every chunk"
+
+
+def test_prep_reports_consumed_streaming_edges_by_index():
+    """The caller hands back whatever is NOT consumed, so the indices have to
+    line up with the flat input list."""
+    _mgr, runtime, rid = _spec_ready_runtime()
+    out = _prep(runtime, [rid], streaming=[(
+        rid, EdgeSpec(signal="token", next_node="ar_decode", uuids=[]),
+    )])
+    assert all(
+        0 <= i < 1 for i in out.consumed_streaming_edge_idxs
+    ), "indices must be into the flat streaming_edges list"

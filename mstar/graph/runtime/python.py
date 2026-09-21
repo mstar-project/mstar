@@ -580,13 +580,174 @@ class PythonGraphRuntime(GraphRuntime):
                     continue
             out.append(SpeculationOutput(
                 node_name=info.node_name, graph_walk=graph_walk,
+                is_new_loop_iter=info.is_new_loop_iter,
+                loop_name=info.loop_name,
             ))
         return out
+
+    def _spec_target_info(
+        self, rid: int, wgio, curr_node_name: str, spec_node_name: str,
+    ):
+        """The spec target's loop context, as ingest_for_speculation reports it.
+
+        Taken from ONE rid and applied to the whole batch, matching today's
+        sample-based behaviour: the loop a node belongs to and whether the
+        target is a loop-back are structural, so they do not vary by request.
+        """
+        node = wgio.nodes[curr_node_name]
+        ready = wgio.ingest_for_speculation(node.outputs, curr_node_name)
+        wgio.clear_speculative_inputs()
+        for info in ready:
+            if info.node_name == spec_node_name:
+                return info
+        return None
 
     def prep_spec_rids(
         self, input: SpeculationPrepInput
     ) -> SpeculationPrepOutput:
-        raise NotImplementedError
+        wg_id = self.get_worker_graph_id_for_node(
+            input.spec_node_name, input.graph_walk
+        )
+        queue = self._queues[wg_id]
+        same_node = input.spec_node_name == input.curr_node_name
+
+        # Slice the flat streaming edges back out, per rid.
+        per_rid_edges: list[tuple[int, list[tuple[int, EdgeSpec]]]] = []
+        cursor = 0
+        for i, rid in enumerate(input.rids):
+            count = input.streaming_edges_per_rid[i]
+            per_rid_edges.append((rid, [
+                (cursor + k, input.streaming_edges[cursor + k])
+                for k in range(count)
+            ]))
+            cursor += count
+
+        sample_wgio = queue.per_request_queues.get(input.rids[0]) \
+            if input.rids else None
+        spec_info = None if sample_wgio is None else self._spec_target_info(
+            input.rids[0], sample_wgio, input.curr_node_name,
+            input.spec_node_name,
+        )
+
+        consumed_idxs: list[int] = []
+        ready_rids: list[int] = []
+        wg_ids: list[int] = []
+        input_edges: list[EdgeSpec] = []
+        input_edges_per_rid: list[int] = []
+
+        for rid, indexed_edges in per_rid_edges:
+            wgio = queue.per_request_queues.get(rid)
+            if wgio is None:
+                continue
+            if spec_info is not None and not self._can_continue_loop(
+                rid, wgio, spec_info, input.graph_walk
+            ):
+                continue  # loop already finished; no further work to speculate
+            if (
+                input.room_for_continuing is not None
+                and len(ready_rids) >= input.room_for_continuing
+            ):
+                # Room is spoken for by the backlog. Skipped BEFORE any
+                # streaming ingest, so there is nothing to roll back.
+                continue
+
+            prepped = self._prep_one_spec_rid(
+                rid, wgio, indexed_edges, input.curr_node_name,
+                input.spec_node_name, same_node,
+            )
+            if prepped is None:
+                continue
+            kept_idxs, edges = prepped
+            consumed_idxs.extend(kept_idxs)
+            ready_rids.append(rid)
+            wg_ids.append(wg_id)
+            input_edges.extend(edges)
+            input_edges_per_rid.append(len(edges))
+
+        return SpeculationPrepOutput(
+            consumed_streaming_edge_idxs=consumed_idxs,
+            ready_rids=ready_rids,
+            wg_ids=wg_ids,
+            input_edges=input_edges,
+            input_edges_per_rid=input_edges_per_rid,
+        )
+
+    def _can_continue_loop(
+        self, rid: int, wgio, spec_info, graph_walk: str,
+    ) -> bool:
+        """False once this rid's loop has ended: a stop is already pending for
+        it, or the next iteration would be past the last one."""
+        if not spec_info.is_new_loop_iter:
+            return True
+        if self.has_pending_loop_stop(rid, graph_walk, spec_info.loop_name):
+            return False
+        loop = wgio.loops.get(spec_info.loop_name)
+        if loop is not None and (
+            loop.curr_iter + 1 >= loop.max_iters or loop._finish_signal
+        ):
+            return False
+        return True
+
+    def _prep_one_spec_rid(
+        self, rid: int, wgio, indexed_edges: list[tuple[int, EdgeSpec]],
+        curr_node_name: str, spec_node_name: str, same_node: bool,
+    ) -> tuple[list[int], list[EdgeSpec]] | None:
+        """Ingest this rid's stream chunks, check readiness, gather inputs.
+
+        Returns (consumed streaming edge indices, input edges), or None after
+        rolling the ingests back.
+        """
+        node = wgio.nodes[spec_node_name]
+        # Held True across the ingest so a streaming input cannot re-add the
+        # node to the ready queue underneath us.
+        node._speculatively_scheduled = True
+
+        # ingest_input reports success without saying WHICH slot it used, so
+        # the slot is inferred by peeking before the call. The rollback below
+        # needs that: the two slots are removed from separately.
+        # (index, signal name): the index is what the caller needs back, the
+        # name is what the rollback removes by.
+        into_signals: list[tuple[int, str]] = []
+        into_next_iter: list[tuple[int, str]] = []
+        for idx, spec in indexed_edges:
+            edge = self._edge_from_spec(spec, is_streaming=True)
+            already_ready = edge.name in node.ready_signals.ready_names
+            if node.ingest_input(edge, can_buffer=same_node):
+                target = into_next_iter if already_ready else into_signals
+                target.append((idx, edge.name))
+
+        wgio.ingest_for_speculation(
+            wgio.nodes[curr_node_name].outputs, curr_node_name
+        )
+        fully_ready = node.is_ready_for_speculation(
+            check_next_iter=same_node, allow_streaming=False,
+        )
+        wgio.clear_speculative_inputs()
+        node._speculatively_scheduled = False  # reset in case the rid is dropped
+
+        if not fully_ready:
+            # Pull the chunks back out so a later scheduling of this node
+            # consumes them normally. The caller returns them to their
+            # StreamBuffers; registry state was never touched, because
+            # _speculatively_scheduled was held True above.
+            for _idx, name in into_signals:
+                node.ready_signals.remove(name)
+            for _idx, name in into_next_iter:
+                node.ready_next_iter.remove(name)
+            return None
+
+        slots = node.ready_next_iter if same_node else node.ready_signals
+        return (
+            [idx for idx, _name in into_next_iter + into_signals],
+            [
+                EdgeSpec(
+                    signal=name,
+                    next_node=edge.next_node,
+                    uuids=[info.uuid for info in edge.tensor_info],
+                    is_final_streaming_chunk=edge._final_stream_chunk,
+                ) for name, edge in slots.ready_inputs.items()
+            ],
+        )
 
     def _process_node_outputs(
         self, rid: int,

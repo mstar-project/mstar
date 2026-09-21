@@ -28,7 +28,6 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
-    SpeculativeNodeInfo,
     TensorPointerInfo,
 )
 from mstar.graph.graph_io import format_graph_edge_list
@@ -37,6 +36,8 @@ from mstar.graph.runtime.base import (
     RouteInput,
     RouteOutput,
     SendInput,
+    SpeculationOutput,
+    SpeculationPrepInput,
 )
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import Model, WorkerGraph
@@ -1682,7 +1683,7 @@ class Worker:
         self,
         pending: PendingBatch,
         sample_node: GraphNode,
-        spec_node_info: SpeculativeNodeInfo,
+        spec_target: SpeculationOutput,
         node_objects: dict[str, GraphNode],
         request_to_worker_graph: dict[str, str],
         per_request_inputs: dict[str, NameToTensorList],
@@ -1694,7 +1695,7 @@ class Worker:
     ) -> Speculation:
         """Package prepared rids (batch order) into the ``Speculation`` the main
         loop runs. Leader and follower differ only in how they pick the rids."""
-        spec_node = spec_node_info.node_name
+        spec_node = spec_target.node_name
         request_ids = list(node_objects)
         spec_batch = ScheduledBatch(
             node_name=spec_node,
@@ -1729,9 +1730,9 @@ class Worker:
             },
             continuing_rids=set(continuing),
             partition=pending.partition,
-            is_new_iter=spec_node_info.is_new_loop_iter,
+            is_new_iter=spec_target.is_new_loop_iter,
             is_same_node=is_same_node,
-            loop_name=spec_node_info.loop_name,
+            loop_name=spec_target.loop_name,
             consumed_streaming_edges=consumed_streaming_edges,
             tp_seq=tp_seq,
         )
@@ -1761,97 +1762,84 @@ class Worker:
         # sample node and RID to see which node we will be speculating
         # (TODO: refine this to be, e.g., a majority vote)
         rid, sample_node = next(iter(batch_N.node_objects.items()))
-        wgio = self._get_wgio_for_rid(batch_N, rid)
 
-        # If sample_node has no outputs at all, it can't feed any spec target.
-        if not sample_node.outputs:
-            return
-        ready_for_spec = wgio.ingest_for_speculation(
-            sample_node.outputs, sample_node.name
+        # The runtime applies the async/TP-async eligibility filter; the
+        # loop-completion filter is per rid and lives in prep_spec_rids.
+        ready_for_spec = self._rid_runtime.speculate_node(
+            batch_N.node_name, graph_walk, rid,
         )
-        wgio.clear_speculative_inputs()
-
-        # Filter out destinations that aren't speculation candidates.
-        #
-        # * ``info.node_name in self.parallel_nodes`` — parallel nodes are
-        #   targets only under TP async, from the leader, as a same-node
-        #   loop-back (a follower rebuilds a head from its in-flight batch of
-        #   that node; for a transition into it there is none).
-        # * ``not wgio.nodes[info.node_name].enable_async_scheduling`` — the
-        #   destination node opts out of async scheduling. Mirrors the
-        #   source-side check in ``_can_speculate``; without this, a
-        #   destination that's structurally ineligible (e.g. a node whose
-        #   downstream graph isn't speculation-safe) could still be picked,
-        #   then dropped per-rid further down.
-        ready_for_spec = [
-            info for info in ready_for_spec
-            if (
-                info.node_name not in self.parallel_nodes
-                or (
-                    self._tp_async_for(info.node_name)
-                    and info.node_name in self.parallel_leader_nodes
-                    and info.node_name == batch_N.node_name
-                )
-            )
-            and wgio.nodes[info.node_name].enable_async_scheduling
-        ]
-
         if not ready_for_spec:
-            return # no nodes can be speculated
+            return  # no nodes can be speculated
 
         # TODO: use the microscheduler to break ties when ready_for_spec
         # contains multiple ready nodes
-        spec_node_info = ready_for_spec[0]
-        speculating_same_node = spec_node_info.node_name == batch_N.node_name
+        spec_target_info = ready_for_spec[0]
+        spec_node_name = spec_target_info.node_name
+        speculating_same_node = spec_node_name == batch_N.node_name
 
-        continuing = []
-        new_node_objects: dict[str, GraphNode] = {}
-        new_request_to_worker_graph: dict[str, str] = {}
+        new_node_objects: dict[int, GraphNode] = {}
+        new_request_to_worker_graph: dict[int, int] = {}
         per_request_inputs: dict[int, NameToTensorList] = {}
-        consumed_streaming_edges: dict[str, GraphEdge] = {}
+        consumed_streaming_edges: dict[int, list[GraphEdge]] = {}
         # Backlogged rids for this target get first claim on the batch: they
         # have already waited a step, and the chain only ever continues its own
         # rids, so at the cap they would never be reached. None => uncapped.
-        spec_target = (spec_node_info.node_name, batch_N.graph_walk)
+        spec_target = (spec_node_name, batch_N.graph_walk)
         max_continuing = self.scheduler.room_for_continuing(spec_target)
-        for rid, batch_N_node in batch_N.node_objects.items():
-            wgio = self._get_wgio_for_rid(batch_N, rid)
-            loop = wgio.loops.get(spec_node_info.loop_name)
 
-            # check conditions where the rid cannot be furtuer speculated
-            already_removed = rid in self._pending_removes
-            already_stopped = spec_node_info.is_new_loop_iter \
-                and self._rid_runtime.has_pending_loop_stop(
-                    rid, graph_walk, spec_node_info.loop_name
-                )
-            is_stopping = spec_node_info.is_new_loop_iter and loop is not None and (
-                loop.curr_iter + 1 >= loop.max_iters or loop._finish_signal
-            )
-            if already_removed or already_stopped or is_stopping:
-                # Loop/request has already finished, don't speculate further work
-                continue
+        # Removes are filtered here; prep_spec_rids assumes that.
+        candidates = [
+            r for r in batch_N.node_objects if r not in self._pending_removes
+        ]
+        # Polling the StreamBuffers stays on this side: they hold real tensors.
+        polled: list[tuple[int, GraphEdge]] = []
+        per_rid_counts: list[int] = []
+        for r in candidates:
+            edges = self._poll_stream_buffers_for_speculation(r, spec_node_name)
+            polled.extend((r, e) for e in edges)
+            per_rid_counts.append(len(edges))
 
-            if max_continuing is not None and len(continuing) >= max_continuing:
-                # Room is spoken for by the backlog. Skipped before any
-                # streaming ingest, so there is nothing to roll back; this rid
-                # goes ready again the moment the in-flight batch lands.
-                # (Leader-only: followers run the composition they were sent.)
-                continue
+        prep = self._rid_runtime.prep_spec_rids(SpeculationPrepInput(
+            spec_node_name=spec_node_name,
+            curr_node_name=batch_N.node_name,
+            graph_walk=graph_walk,
+            rids=candidates,
+            room_for_continuing=max_continuing,
+            streaming_edges=[
+                EdgeSpec(
+                    signal=e.name, next_node=e.next_node,
+                    uuids=[i.uuid for i in e.tensor_info],
+                    is_final_streaming_chunk=e._final_stream_chunk,
+                ) for _r, e in polled
+            ],
+            streaming_edges_per_rid=per_rid_counts,
+        ))
 
-            prep = self._prep_continuing_rid_for_spec(
-                batch_N, batch_N_node, rid, spec_node_info.node_name,
-                speculating_same_node,
-            )
-            if prep is None:
-                continue
-            node, wg_id, inputs, into_signals, into_next_iter = prep
+        # Anything not consumed goes back to its StreamBuffer, so a later
+        # scheduling of this node picks it up normally.
+        consumed = set(prep.consumed_streaming_edge_idxs)
+        for i, (r, edge) in enumerate(polled):
+            if i not in consumed:
+                self._return_speculative_streaming_edge(r, edge)
+            else:
+                consumed_streaming_edges.setdefault(r, []).append(edge)
 
-            # prepare speculative batch
-            continuing.append(rid)
-            new_node_objects[rid] = node
-            new_request_to_worker_graph[rid] = wg_id
-            per_request_inputs[rid] = inputs
-            consumed_streaming_edges[rid] = into_next_iter + into_signals
+        continuing = list(prep.ready_rids)
+        cursor = 0
+        nodes = self._rid_runtime.get_nodes(
+            spec_node_name, prep.ready_rids, prep.wg_ids,
+        )
+        for i, r in enumerate(prep.ready_rids):
+            count = prep.input_edges_per_rid[i]
+            per_request_inputs[r] = {
+                spec.signal: [
+                    self.tensor_manager.get_tensor(u) for u in spec.uuids
+                ]
+                for spec in prep.input_edges[cursor:cursor + count]
+            }
+            cursor += count
+            new_node_objects[r] = nodes[i]
+            new_request_to_worker_graph[r] = prep.wg_ids[i]
 
         if not continuing:
             return None
@@ -1870,8 +1858,8 @@ class Worker:
             # The merge below relabels these node objects with the spec
             # target's name/walk, so a batch for any other node must not be
             # merged in.
-            assert fresh_batch.node_name == spec_node_info.node_name, (
-                f"Speculation asked for {spec_node_info.node_name!r} but the "
+            assert fresh_batch.node_name == spec_node_name, (
+                f"Speculation asked for {spec_node_name!r} but the "
                 f"scheduler returned {fresh_batch.node_name!r}"
             )
             for rid, node in fresh_batch.node_objects.items():
@@ -1896,9 +1884,9 @@ class Worker:
                     fresh_batch.request_to_worker_graph[rid]
                 )
 
-        logger.debug("Speculating: %s %s", spec_node_info.node_name, new_node_objects.keys())
+        logger.debug("Speculating: %s %s", spec_node_name, new_node_objects.keys())
         return self._assemble_speculation(
-            pending, sample_node, spec_node_info,
+            pending, sample_node, spec_target_info,
             new_node_objects, new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, continuing,
             is_same_node=speculating_same_node,
@@ -1989,7 +1977,17 @@ class Worker:
         infos = [i for i in ready_for_spec if i.node_name == head.node_name]
         if not infos:
             return None
-        spec_node_info = infos[0]
+        # NOTE: this path still preps rids through the worker-side helper
+        # rather than prep_spec_rids, because a follower is all-or-nothing:
+        # rank 0 committed to this exact composition and sits on the
+        # collective until every follower joins it, so one rid failing has to
+        # roll the whole batch back. prep_spec_rids is per-rid best-effort.
+        spec_target_info = SpeculationOutput(
+            node_name=infos[0].node_name,
+            graph_walk=head.graph_walk,
+            is_new_loop_iter=infos[0].is_new_loop_iter,
+            loop_name=infos[0].loop_name,
+        )
 
         # ``head`` came off the wire, so its rids are strings; the rest of this
         # path is handle-keyed.
@@ -2049,7 +2047,7 @@ class Worker:
             head.node_name, head_rids, head.spec_seq, head.spec_from_seq,
         )
         return self._assemble_speculation(
-            pending, sample_node, spec_node_info,
+            pending, sample_node, spec_target_info,
             new_node_objects, new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, continuing,
             is_same_node=True, tp_seq=head.spec_seq,
