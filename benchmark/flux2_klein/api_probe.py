@@ -137,9 +137,12 @@ def main() -> None:
 
     status, payload, wall = post_json(gen_url, {**base, "n": 2})
     imgs = images_of(payload)
-    same0 = bool(imgs) and bool(ref) and imgs[0] == ref[0]
-    check("n=2 seeded", status == 200 and len(imgs) == 2 and same0 and imgs[1] != imgs[0],
-          f"status {status}, {len(imgs)} images, image 0 identical to n=1: {same0}, {wall * 1000:.0f} ms")
+    # image 0 is the n=1 image bit for bit with an eager VAE; the autotuned VAE decodes the pair as a batch of 2
+    # and lands ~58 dB from the single decode, so the contract checked here is >= 50 dB
+    v0 = psnr(ref[0], imgs[0]) if (imgs and ref) else float("nan")
+    check("n=2 seeded", status == 200 and len(imgs) == 2 and v0 >= 50 and imgs[1] != imgs[0],
+          f"status {status}, {len(imgs)} images, image 0 vs n=1 {'inf' if math.isinf(v0) else f'{v0:.2f}'} dB, "
+          f"{wall * 1000:.0f} ms")
 
     for name, bad in (("size 1000x1000", {"size": "1000x1000"}), ("size 8192x8192", {"size": "8192x8192"}),
                       ("empty prompt", {"prompt": ""}), ("zero steps", {"num_inference_steps": 0}),
