@@ -69,7 +69,7 @@ def _worker(known_rids=("r1", "r2")):
         per_request_info={rid: object() for rid in known_rids}
     )
     # Identity interning: the rid string doubles as its own handle here.
-    w._rid_runtime = _Runtime(known_rids)
+    w._graph_runtime = _Runtime(known_rids)
     w.scheduler = MicroScheduler.__new__(MicroScheduler)
     w.scheduler.failed_rids = set()
     w.scheduler.held_until = {}
@@ -131,7 +131,7 @@ def test_crashed_forward_fails_the_whole_batch():
         assert "ZeroDivisionError" in errors["r1"]
         # The node must not stay flagged as speculatively scheduled, or it can
         # never be re-queued. The runtime owns that flag now.
-        assert w._rid_runtime.cleared == [("node", ["r1"])]
+        assert w._graph_runtime.cleared == [("node", ["r1"])]
     finally:
         executor.shutdown(wait=True)
 

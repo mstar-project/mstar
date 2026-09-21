@@ -67,7 +67,7 @@ def _worker():
     w.worker_id = WORKER
     w.is_tp_follower = False
     w.tensor_manager = _StubTensorManager()
-    w._rid_runtime = PythonGraphRuntime(
+    w._graph_runtime = PythonGraphRuntime(
         my_worker_id=WORKER,
         my_worker_graphs=[worker_graph],
         all_wg_ids_to_graph_walks=all_walks,
@@ -125,8 +125,8 @@ def test_admit_mints_a_handle_and_sets_up_both_sides():
     assert body.request_info.rid_handle == rid
 
     # The split: the runtime owns the graph state...
-    assert rid in w._rid_runtime._queues[WG_ID].per_request_queues
-    assert w._rid_runtime.get_sharding_config(rid) is not None
+    assert rid in w._graph_runtime._queues[WG_ID].per_request_queues
+    assert w._graph_runtime.get_sharding_config(rid) is not None
     # ...and RequestStateManager owns only what cannot live behind the
     # contract: the wire fwd_info and the tensor-holding stream buffers.
     assert rid in w.request_state.per_request_info
@@ -143,9 +143,9 @@ def test_remove_tears_down_both_sides_and_frees_the_handle():
     w._remove_request(RemoveRequest(request_id="r1"))
 
     assert w._rid("r1") is None
-    assert rid not in w._rid_runtime._queues[WG_ID].per_request_queues, \
+    assert rid not in w._graph_runtime._queues[WG_ID].per_request_queues, \
         "the runtime must drop the per-request queue on removal"
-    assert w._rid_runtime.get_sharding_config(rid) is None
+    assert w._graph_runtime.get_sharding_config(rid) is None
     assert rid not in w.request_state.per_request_info
     assert w.tensor_manager.cleaned == [rid]
 

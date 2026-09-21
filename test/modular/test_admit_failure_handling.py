@@ -109,7 +109,7 @@ class _FakeWorker:
     _push_back_batch = Worker._push_back_batch
 
     def __init__(self):
-        self._rid_runtime = _Runtime()
+        self._graph_runtime = _Runtime()
         self.held: list[str] = []
         self.scheduler = SimpleNamespace(hold_requests=self.held.extend)
         self.offload_calls: list[str] = []
@@ -118,7 +118,7 @@ class _FakeWorker:
     def queue(self):
         # The assertions read .pushed_back; keep that name pointing at
         # whoever owns the ready queues now.
-        return self._rid_runtime
+        return self._graph_runtime
 
     def _handle_allocation_failure(self, batch, node_batch):
         self.offload_calls.append(node_batch.node_name)

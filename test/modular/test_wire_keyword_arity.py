@@ -81,7 +81,7 @@ _SEAMS = {
     "self.tensor_manager": "mstar.communication.tensors:TensorCommunicationManager",
     "self.tensor_store": "mstar.communication.tensor_store:TensorStore",
     "self.bookkeeping": "mstar.communication.tensor_store:TensorBookkeeping",
-    "self._rid_runtime": "mstar.graph.runtime.base:GraphRuntime",
+    "self._graph_runtime": "mstar.graph.runtime.base:GraphRuntime",
 }
 
 

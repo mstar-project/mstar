@@ -740,3 +740,282 @@ def test_a_tensor_read_by_two_workers_holds_two_references(two_consumers):
     assert not book.can_gc(1), "still being read by the second worker"
     book.dereference(1, 1)
     assert book.can_gc(1)
+
+
+# --- several requests in one batch --------------------------------------------
+
+def test_a_batch_of_three_routes_and_stays_schedulable(pair):
+    """Every other case admits one rid, so nothing exercises a real batch.
+
+    Drives three requests through prefill together, then checks both runtimes
+    agree on what became ready and that each request can run again.
+    """
+    rt, book, store = pair
+    rids = [_admit(rt, f"r{i}") for i in range(3)]
+    assert len(set(rids)) == 3, "handles must be distinct"
+
+    rt.ingest_inputs_batch(ParallelList(
+        rids, [_spec("prompt", "prefill") for _ in rids],
+    ))
+    assert _ready(rt) == [("prefill", WALK, sorted(rids))]
+    rt.pop_rids("prefill", WALK, rids)
+    assert _ready(rt) == [], "popped nodes must leave the ready set"
+
+    # One tensor per rid per signal, flat and rid-major.
+    signals = ["kv_cache", "token"]
+    uuids, num = [], []
+    for i, _rid in enumerate(rids):
+        for s_i, _sig in enumerate(signals):
+            u = 1 + i * len(signals) + s_i
+            book.put_tensor(u, _info(u))
+            book.increment_ref(u, 1)  # the safety hold
+            uuids.append(u)
+            num.append(1)
+
+    out = rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="prefill",
+            output_signals=signals,
+            wg_ids=ParallelList(rids, [WG_ID] * len(rids)),
+            tensors=uuids, num_tensors=num,
+        ),
+        store,
+    )
+    assert out.completion_id > 0
+    # Each rid's outputs went to its OWN ar_decode, so all three are ready.
+    assert _ready(rt) == [("ar_decode", WALK, sorted(rids))]
+    # Every tensor has exactly its one local consumer -- a rid-major decoding
+    # slip would pile references on one rid and free another's early.
+    for u in uuids:
+        assert not book.can_gc(u), f"uuid {u} lost its reference"
+
+
+def test_a_batch_completes_every_request_not_just_the_first(pair):
+    """The completion has to name all three requests.
+
+    A batch that reports only the first rid leaves the others' worker graphs
+    un-reset, so they never become ready again -- the request simply stops.
+    """
+    rt, book, store = pair
+    rids = [_admit(rt, f"r{i}") for i in range(3)]
+    rt.ingest_inputs_batch(ParallelList(
+        rids, [_spec("prompt", "prefill") for _ in rids],
+    ))
+    rt.pop_rids("prefill", WALK, rids)
+    signals = ["kv_cache", "token"]
+    uuids, num = [], []
+    for i in range(len(rids)):
+        for s_i in range(len(signals)):
+            u = 100 + i * len(signals) + s_i
+            book.put_tensor(u, _info(u))
+            book.increment_ref(u, 1)
+            uuids.append(u)
+            num.append(1)
+    rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="prefill",
+            output_signals=signals,
+            wg_ids=ParallelList(rids, [WG_ID] * len(rids)),
+            tensors=uuids, num_tensors=num,
+        ),
+        store,
+    )
+    # Now run the loop body for all three at once and do it again.
+    rt.pop_rids("ar_decode", WALK, rids)
+    assert _ready(rt) == []
+
+
+# --- a walk transition, which is the whole of a text-to-text request ----------
+
+@pytest.fixture(params=["python", "rust"])
+def two_walks(request):
+    """Two worker graphs, one per walk, both holding the same node.
+
+    This is the t2t shape: prefill runs, the conductor advances the partition
+    to decode, and the SAME node has to become ready again in the other walk.
+    Every other fixture has a single walk, so nothing exercises the handover.
+    """
+    def wg(wg_id, walk):
+        return WorkerGraph(
+            section=GraphNode(
+                name="LLM", input_names={"text_inputs"},
+                outputs=[GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT,
+                                   persist=True)],
+            ),
+            graph_walks={walk}, ranks=[0], worker_graph_id=wg_id,
+        )
+    mine = [wg(0, "prefill"), wg(1, "decode")]
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=mine,
+        all_wg_ids_to_graph_walks={0: {"prefill"}, 1: {"decode"}},
+        all_wg_ids_to_dyn_loops={0: set(), 1: set()},
+        all_wg_ids_to_nodes={0: {"LLM"}, 1: {"LLM"}},
+        node_to_partition={"LLM": "default"},
+        sharding_config=_sharding(),
+    )
+    if request.param == "python":
+        book = PythonTensorBookkeeping()
+        tm = _StubTensorManager(book)
+        return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
+                                   **common), book, tm.tensor_store)
+    book = RustTensorBookkeeping()
+    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
+
+
+def _run_walk(rt, book, store, rid, walk, wg_id, uuid):
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("text_inputs", "LLM")]))
+    ready = _ready(rt)
+    rt.pop_rids("LLM", walk, [rid])
+    book.put_tensor(uuid, _info(uuid))
+    book.increment_ref(uuid, 1)
+    rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=walk, node_name="LLM",
+            output_signals=["new_token"],
+            wg_ids=ParallelList([rid], [wg_id]),
+            tensors=[uuid], num_tensors=[1],
+        ),
+        store,
+    )
+    return ready
+
+
+def test_the_node_becomes_ready_again_in_the_next_walk(two_walks):
+    """The handover a t2t request depends on.
+
+    Stuck here the request simply stops: prefill runs once, the walk advances,
+    and the node never becomes ready in the new walk -- no error anywhere.
+    """
+    rt, book, store = two_walks
+    rid = rt.add_request(
+        request_id="r1", partition="default", graph_walk="prefill",
+        partition_worker_graph_ids=[0, 1],
+        worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+    )
+    assert _run_walk(rt, book, store, rid, "prefill", 0, uuid=1) == [
+        ("LLM", "prefill", [rid])
+    ]
+
+    # The conductor advances the partition.
+    rt.set_walk(rid, "default", "decode")
+    assert _run_walk(rt, book, store, rid, "decode", 1, uuid=2) == [
+        ("LLM", "decode", [rid])
+    ], "the node never became ready in the new walk"
+
+
+def test_a_batch_transitions_together(two_walks):
+    """Same handover with three requests, which is how it actually runs."""
+    rt, book, store = two_walks
+    rids = [
+        rt.add_request(
+            request_id=f"r{i}", partition="default", graph_walk="prefill",
+            partition_worker_graph_ids=[0, 1],
+            worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+        )
+        for i in range(3)
+    ]
+    rt.ingest_inputs_batch(ParallelList(
+        rids, [_spec("text_inputs", "LLM") for _ in rids],
+    ))
+    assert _ready(rt) == [("LLM", "prefill", sorted(rids))]
+    rt.pop_rids("LLM", "prefill", rids)
+    uuids = list(range(10, 10 + len(rids)))
+    for u in uuids:
+        book.put_tensor(u, _info(u))
+        book.increment_ref(u, 1)
+    rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk="prefill", node_name="LLM",
+            output_signals=["new_token"],
+            wg_ids=ParallelList(rids, [0] * len(rids)),
+            tensors=uuids, num_tensors=[1] * len(rids),
+        ),
+        store,
+    )
+    for rid in rids:
+        rt.set_walk(rid, "default", "decode")
+    rt.ingest_inputs_batch(ParallelList(
+        rids, [_spec("text_inputs", "LLM") for _ in rids],
+    ))
+    assert _ready(rt) == [("LLM", "decode", sorted(rids))]
+
+
+# --- one walk spanning two LOCAL worker graphs (the i2t shape) ----------------
+
+@pytest.fixture(params=["python", "rust"])
+def two_local_graphs(request):
+    """``encoder`` and ``LLM`` in SEPARATE worker graphs on the SAME worker.
+
+    BAGEL's prefill_vit is exactly this: vit_encoder is one graph, LLM is
+    another, both on rank 0, both in one walk. Rust compiles ``Dest::Local``
+    per worker graph, so the cross-graph edge reads as External -- it has to be
+    resolved against the local worker-graph index or the LLM node never gets
+    its input.
+    """
+    enc = WorkerGraph(
+        section=GraphNode(
+            name="encoder", input_names={"image_inputs"},
+            outputs=[GraphEdge(name="img_emb", next_node="LLM")],
+        ),
+        graph_walks={WALK}, ranks=[0], worker_graph_id=0,
+    )
+    llm = WorkerGraph(
+        section=GraphNode(
+            name="LLM", input_names={"img_emb"},
+            outputs=[GraphEdge(name="new_token", next_node=EMIT_TO_CLIENT,
+                               persist=True)],
+        ),
+        graph_walks={WALK}, ranks=[0], worker_graph_id=1,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[enc, llm],
+        all_wg_ids_to_graph_walks={0: {WALK}, 1: {WALK}},
+        all_wg_ids_to_dyn_loops={0: set(), 1: set()},
+        all_wg_ids_to_nodes={0: {"encoder"}, 1: {"LLM"}},
+        node_to_partition={"encoder": "default", "LLM": "default"},
+        sharding_config=_sharding(),
+    )
+    if request.param == "python":
+        book = PythonTensorBookkeeping()
+        tm = _StubTensorManager(book)
+        return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
+                                   **common), book, tm.tensor_store)
+    book = RustTensorBookkeeping()
+    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
+
+
+def test_an_edge_into_a_sibling_local_graph_is_ingested_not_only_sent(
+    two_local_graphs,
+):
+    """The i2t stall: the encoder's output has to reach LLM on this worker.
+
+    Routed only onto the wire, LLM never becomes ready -- and the tensor's
+    reference accounting comes out wrong too, which is how the same uuid ends
+    up freed while a ready slot still names it.
+    """
+    rt, book, store = two_local_graphs
+    rid = rt.add_request(
+        request_id="r1", partition="default", graph_walk=WALK,
+        partition_worker_graph_ids=[0, 1],
+        worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+    )
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("image_inputs", "encoder")]))
+    assert _ready(rt) == [("encoder", WALK, [rid])]
+    rt.pop_rids("encoder", WALK, [rid])
+
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)  # the safety hold
+    rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="encoder",
+            output_signals=["img_emb"],
+            wg_ids=ParallelList([rid], [0]),
+            tensors=[1], num_tensors=[1],
+        ),
+        store,
+    )
+
+    # The sibling graph's node got the input.
+    assert _ready(rt) == [("LLM", WALK, [rid])], "LLM never received img_emb"
+    # And it is still held: one local consumer, not zero.
+    assert not book.can_gc(1), "freed while LLM's ready slot still names it"
