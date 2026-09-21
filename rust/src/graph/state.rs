@@ -294,6 +294,48 @@ impl RequestState {
         self.refresh_ready(node);
     }
 
+    /// Python's `ReadySignals.clear` on the CURRENT slot: release the inputs
+    /// the just-executed node consumed.
+    ///
+    /// Returns the uuids to dereference. A loop's external inputs are held
+    /// for re-injection on the next iteration (Python's `_persist_for_loop`),
+    /// so they are excluded -- and that is structural, from the spec's
+    /// `external_inputs`, not per-request state.
+    pub fn clear_consumed_inputs(&mut self, node: NodeId) -> Vec<u64> {
+        let graph = self.graph.clone();
+        let spec = graph.node(node);
+        let held: Vec<Sym> = {
+            let mut names = Vec::new();
+            let mut cur = spec.loop_id;
+            while let Some(lid) = cur {
+                let ls = graph.lp(lid);
+                names.extend(
+                    ls.external_inputs
+                        .iter()
+                        .filter(|(_, d)| *d == node)
+                        .map(|(n, _)| *n),
+                );
+                cur = ls.parent;
+            }
+            names
+        };
+
+        let st = &mut self.nodes[node as usize];
+        let mut freed = Vec::new();
+        for (i, name) in spec.inputs.iter().enumerate() {
+            if held.contains(name) {
+                continue;
+            }
+            if let Some(tensors) = st.cur.tensors[i].take() {
+                freed.extend(tensors.iter().map(|t| t.uuid));
+            }
+            st.cur.mask &= !(1 << i);
+            st.cur.final_chunk &= !(1 << i);
+        }
+        self.refresh_ready(node);
+        freed
+    }
+
     pub fn set_spec_scheduled(&mut self, node: NodeId, on: bool) {
         self.nodes[node as usize].scheduled = on;
         self.refresh_ready(node);

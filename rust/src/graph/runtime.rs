@@ -736,6 +736,75 @@ impl GraphRuntime {
         Ok(uningested)
     }
 
+    /// Per rid, loop name -> current iteration, for the partition's live
+    /// worker graphs.
+    fn get_dynamic_loop_iters(
+        &self, request_ids: Vec<u32>, partition: &str,
+    ) -> Vec<Vec<(String, u32)>> {
+        let Some(p) = self.interner.get(partition) else {
+            return request_ids.iter().map(|_| vec![]).collect();
+        };
+        request_ids
+            .iter()
+            .map(|&rid| {
+                let mut out = Vec::new();
+                let Some(info) = self.info(rid) else { return out };
+                let Some(part) = info.partitions.get(&p) else { return out };
+                for &wg in &part.walk_worker_graphs {
+                    let Some(state) = &self.states[wg as usize][rid as usize]
+                    else {
+                        continue;
+                    };
+                    let g = &self.graphs[wg as usize];
+                    for (lid, iter) in state.loop_indices().into_iter().enumerate() {
+                        out.push((
+                            self.interner.name(g.lp(lid as LoopId).name).to_string(),
+                            iter,
+                        ));
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// No-op by construction. Python clears `tensor_info` off the node's
+    /// output edges because the edges are per-request objects that carry it;
+    /// here outputs are passed into `complete_and_route_batch`, so there is
+    /// nothing stale to clear.
+    fn reset_outputs(
+        &mut self, node_name: &str, rids: Vec<u32>, wg_ids: Vec<u32>,
+    ) {
+        let _ = (node_name, rids, wg_ids);
+    }
+
+    /// Release the inputs the just-executed node consumed, dereferencing them
+    /// in the bookkeeper the store shares.
+    fn cleanup_consumed_inputs(
+        &mut self, node_name: &str, rids: Vec<u32>, wg_ids: Vec<u32>,
+    ) -> PyResult<()> {
+        if rids.len() != wg_ids.len() {
+            return Err(PyValueError::new_err(
+                "cleanup_consumed_inputs: rids and wg_ids must be the same length",
+            ));
+        }
+        let mut freed: Vec<u64> = Vec::new();
+        for (rid, wg_id) in rids.into_iter().zip(wg_ids) {
+            let Some(wg) = self.wg_index(wg_id) else { continue };
+            let Some(node) = self.nid(wg, node_name) else { continue };
+            if let Some(state) = &mut self.states[wg as usize][rid as usize] {
+                freed.extend(state.clear_consumed_inputs(node));
+            }
+        }
+        if !freed.is_empty() {
+            let mut bk = self.bookkeeping.lock().unwrap();
+            for uuid in freed {
+                bk.dereference(uuid, 1);
+            }
+        }
+        Ok(())
+    }
+
     fn num_handles(&self) -> usize {
         self.rids.len()
     }

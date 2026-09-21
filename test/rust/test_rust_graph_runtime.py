@@ -334,3 +334,71 @@ def test_mismatched_lengths_are_rejected(runtime):
         runtime.ingest_inputs_batch(
             ParallelList([1, 2], [_spec("prompt", "prefill")])
         )
+
+
+# --- consumed inputs and loop iters ------------------------------------------
+
+def test_cleanup_releases_consumed_inputs(runtime):
+    rid = _admit(runtime)
+    runtime.ingest_inputs_batch(
+        ParallelList([rid], [_spec("prompt", "prefill", uuids=[7])])
+    )
+    runtime.cleanup_consumed_inputs("prefill", [rid], [WG_ID])
+    # The slot is free again, so the same signal lands rather than refusing.
+    assert runtime.ingest_inputs_batch(
+        ParallelList([rid], [_spec("prompt", "prefill")]), can_buffer=False
+    ) == []
+
+
+def test_cleanup_holds_a_loops_external_inputs():
+    """A loop's external inputs are re-injected each iteration, so clearing
+    them would strand the loop waiting for a signal nobody will resend."""
+    body = GraphNode(
+        name="body", input_names={"seed", "tok"},
+        outputs=[GraphEdge(name="tok", next_node="body")],
+    )
+    wg = WorkerGraph(
+        section=Sequential(sections=[Loop(
+            name="lp", section=body,
+            outputs=[GraphEdge(name="tok", next_node="sink")], max_iters=4,
+        )]),
+        graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    rt = rust_runtime.RustGraphRuntime(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: {"lp"}},
+        all_wg_ids_to_nodes={WG_ID: {"body"}},
+        node_to_partition={"body": "default"},
+        sharding_config=ShardingConfig(
+            groups=[], tp_enabled_nodes=set(), shard_dim={},
+        ),
+        bookkeeping=RustTensorBookkeeping(),
+    )
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(ParallelList(
+        [rid, rid],
+        [_spec("seed", "body", uuids=[1]), _spec("tok", "body", uuids=[2])],
+    ))
+    rt.cleanup_consumed_inputs("body", [rid], [WG_ID])
+
+    # "seed" is external to the loop, so it is still held; "tok" loops back
+    # and was released.
+    assert rt.ingest_inputs_batch(
+        ParallelList([rid], [_spec("seed", "body")]), can_buffer=False
+    ) == [0], "the external input must still be held"
+    assert rt.ingest_inputs_batch(
+        ParallelList([rid], [_spec("tok", "body")]), can_buffer=False
+    ) == [], "the loop-back input was consumed and released"
+
+
+def test_dynamic_loop_iters_report_per_rid(runtime):
+    rid = _admit(runtime)
+    got = runtime.get_dynamic_loop_iters([rid], "default")
+    assert got.keys == [rid]
+    assert got.values[0] == {"ar_loop": 0}
+
+
+def test_dynamic_loop_iters_for_an_unknown_partition_are_empty(runtime):
+    rid = _admit(runtime)
+    assert runtime.get_dynamic_loop_iters([rid], "nope").values == [{}]

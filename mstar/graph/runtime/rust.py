@@ -325,14 +325,34 @@ class RustGraphRuntime(GraphRuntime):
             is_streaming,
         )
 
+    def get_dynamic_loop_iters(
+        self, request_ids: list[int], partition: str,
+    ) -> ParallelList[int, dict[str, int]]:
+        return ParallelList(
+            list(request_ids),
+            [
+                dict(pairs)
+                for pairs in self._rust.get_dynamic_loop_iters(
+                    list(request_ids), partition
+                )
+            ],
+        )
+
+    def reset_outputs(
+        self, node_name: str, rids: list[int], wg_ids: list[int],
+    ):
+        self._rust.reset_outputs(node_name, rids, wg_ids)
+
+    def cleanup_consumed_inputs(
+        self, node_name: str, rids: list[int], wg_ids: list[int],
+    ):
+        self._rust.cleanup_consumed_inputs(node_name, rids, wg_ids)
+
     # --------- not ported yet ----------
     #
     # Everything a forward pass needs. Until these land, MSTAR_RUST_GRAPH=1
     # admits requests and answers the structural queries but cannot run a step.
 
-    get_dynamic_loop_iters = _unported("get_dynamic_loop_iters")
-    reset_outputs = _unported("reset_outputs")
-    cleanup_consumed_inputs = _unported("cleanup_consumed_inputs")
     pop_rids = _unported("pop_rids")
     has_ready_excluding = _unported("has_ready_excluding")
     get_ready_nodes = _unported("get_ready_nodes")

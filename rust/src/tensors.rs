@@ -167,7 +167,7 @@ impl Bookkeeping {
 
     /// Start tracking a uuid. Reference state resets: `put_tensor` on a live
     /// uuid means a NEW tensor, not an update (that is `update_info`).
-    fn put_tensor(&mut self, uuid: u64, info: TensorInfoArg) {
+    pub fn put_tensor(&mut self, uuid: u64, info: TensorInfoArg) {
         let interned = self.intern_info(&info);
         self.ref_info.insert(uuid, ReferenceInfo::default());
         self.tensor_info.insert(uuid, interned);
@@ -193,7 +193,7 @@ impl Bookkeeping {
     /// tensor lands before its final descriptor exists: a slice re-points an
     /// arriving info at a freshly minted uuid, and a fan-in consolidation
     /// mints one for a tensor it has just concatenated.
-    fn update_info(&mut self, uuid: u64, info: TensorInfoArg) {
+    pub fn update_info(&mut self, uuid: u64, info: TensorInfoArg) {
         let interned = self.intern_info(&info);
         self.tensor_info.insert(uuid, interned);
     }
@@ -214,25 +214,25 @@ impl Bookkeeping {
         Ok(())
     }
 
-    fn get_info(&self, uuid: u64) -> Option<TensorInfoOut> {
+    pub fn get_info(&self, uuid: u64) -> Option<TensorInfoOut> {
         self.tensor_info.get(&uuid).map(|i| self.export(i))
     }
 
-    fn get_info_batch(&self, uuids: Vec<u64>) -> Vec<Option<TensorInfoOut>> {
+    pub fn get_info_batch(&self, uuids: Vec<u64>) -> Vec<Option<TensorInfoOut>> {
         uuids.into_iter().map(|u| self.get_info(u)).collect()
     }
 
     /// Drop the record. The caller frees the tensor itself.
-    fn forget_tensor(&mut self, uuid: u64) {
+    pub fn forget_tensor(&mut self, uuid: u64) {
         self.ref_info.remove(&uuid);
         self.tensor_info.remove(&uuid);
     }
 
-    fn is_tracked(&self, uuid: u64) -> bool {
+    pub fn is_tracked(&self, uuid: u64) -> bool {
         self.ref_info.contains_key(&uuid)
     }
 
-    fn increment_ref(&mut self, uuid: u64, n: i64) -> PyResult<()> {
+    pub fn increment_ref(&mut self, uuid: u64, n: i64) -> PyResult<()> {
         if n < 0 {
             return Err(PyValueError::new_err(format!(
                 "Tried to increment tensor {uuid} reference by {n}"
@@ -262,7 +262,7 @@ impl Bookkeeping {
 
     /// A negative `n` is legal here: `set_output_ref_counts` corrects downward
     /// from the safety hold by dereferencing a negative delta.
-    fn dereference(&mut self, uuid: u64, n: i64) {
+    pub fn dereference(&mut self, uuid: u64, n: i64) {
         if let Some(e) = self.entry(uuid) {
             e.ref_count -= n;
         }
@@ -284,30 +284,30 @@ impl Bookkeeping {
         Ok(())
     }
 
-    fn set_persist(&mut self, uuid: u64, persist: bool) {
+    pub fn set_persist(&mut self, uuid: u64, persist: bool) {
         if let Some(e) = self.entry(uuid) {
             e.persist = persist;
         }
     }
 
-    fn set_persist_batch(&mut self, uuids: Vec<u64>, persist: bool) {
+    pub fn set_persist_batch(&mut self, uuids: Vec<u64>, persist: bool) {
         for uuid in uuids {
             self.set_persist(uuid, persist);
         }
     }
 
-    fn set_mem_registered(&mut self, uuid: u64, mem_registered: bool) {
+    pub fn set_mem_registered(&mut self, uuid: u64, mem_registered: bool) {
         if let Some(e) = self.entry(uuid) {
             e.mem_registered = mem_registered;
         }
     }
 
-    fn is_registered(&self, uuid: u64) -> bool {
+    pub fn is_registered(&self, uuid: u64) -> bool {
         self.ref_info.get(&uuid).is_some_and(|e| e.mem_registered)
     }
 
     /// No references left and not being persisted for the conductor.
-    fn can_gc(&self, uuid: u64) -> bool {
+    pub fn can_gc(&self, uuid: u64) -> bool {
         self.ref_info
             .get(&uuid)
             .is_some_and(|e| e.ref_count <= 0 && !e.persist)
@@ -315,11 +315,11 @@ impl Bookkeeping {
 
     /// Which of `uuids` are now free. One call instead of one per tensor after
     /// a batch of refcount changes.
-    fn collectable(&self, uuids: Vec<u64>) -> Vec<u64> {
+    pub fn collectable(&self, uuids: Vec<u64>) -> Vec<u64> {
         uuids.into_iter().filter(|&u| self.can_gc(u)).collect()
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.ref_info.len()
     }
 
