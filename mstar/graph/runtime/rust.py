@@ -14,11 +14,14 @@ Build: ``maturin develop --release`` in ``rust/`` (see ``docs/installation.rst``
 """
 from __future__ import annotations
 
+from copy import deepcopy
+
 from mstar_rust import GraphRuntime as _RustGraphRuntime
 
 from mstar.communication.tensor_store import TensorBookkeeping
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphSection, Loop
+from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.runtime.base import (
     GraphRuntime,
     ParallelList,
@@ -56,8 +59,28 @@ def _edge_args(section: GraphSection, edge) -> dict:
     }
 
 
-def _loops_of(section: GraphSection) -> list[Loop]:
-    return list(section.get_loops().values())
+def _loops_with_registries(section: GraphSection) -> list[Loop]:
+    """The section's loops, with ``_managing_registry`` populated.
+
+    A Loop only learns its enclosing registry when a ``WorkerGraphIO`` is built
+    over the section, which normally happens per request. Compiling needs the
+    loop nesting, so one is built here purely for that side effect -- over a
+    COPY, since the object mutates the sections it walks and the pristine
+    section is shared by every request.
+    """
+    io = WorkerGraphIO(deepcopy(section))
+    return list(io.loops.values())
+
+
+def _parent_loop_name(lp: Loop) -> str | None:
+    """The enclosing loop, or None at the top level.
+
+    ``_managing_registry`` is a LoopStateRegistry only when the loop is nested;
+    at the top it is the worker graph's own registry, which has no ``loop``.
+    """
+    registry = lp._managing_registry
+    parent = getattr(registry, "loop", None)
+    return None if parent is None else parent.name
 
 
 def worker_graph_args(worker_graph: WorkerGraph) -> dict:
@@ -70,7 +93,7 @@ def worker_graph_args(worker_graph: WorkerGraph) -> dict:
     """
     section = worker_graph.section
     nodes = section.get_nodes()
-    loops = _loops_of(section)
+    loops = _loops_with_registries(section)
     loop_names = {lp.name for lp in loops}
 
     return {
@@ -81,7 +104,10 @@ def worker_graph_args(worker_graph: WorkerGraph) -> dict:
                 "name": name,
                 "async_enabled": bool(node.enable_async_scheduling),
                 "inputs": sorted(node.input_names),
-                "streaming_inputs": sorted(getattr(node, "streaming_inputs", ())),
+                # _streaming_inputs, not streaming_inputs: the public name is
+                # on ReadySignals. Populated during worker-graph construction
+                # by _register_streaming, so it is set by the time we compile.
+                "streaming_inputs": sorted(node._streaming_inputs),
                 "outputs": [_edge_args(section, e) for e in node.outputs],
             }
             for name, node in nodes.items()
@@ -90,10 +116,7 @@ def worker_graph_args(worker_graph: WorkerGraph) -> dict:
             {
                 "name": lp.name,
                 "max_iters": lp.max_iters,
-                "parent": getattr(
-                    getattr(lp, "_managing_registry", None), "loop", None
-                )
-                and lp._managing_registry.loop.name,
+                "parent": _parent_loop_name(lp),
                 # Directly-owned only: a node inside a child loop belongs there.
                 "member_nodes": [
                     n for n in lp.section.get_nodes()
@@ -101,15 +124,13 @@ def worker_graph_args(worker_graph: WorkerGraph) -> dict:
                 ],
                 "outputs": [_edge_args(section, e) for e in lp.outputs],
                 "accumulated": [
-                    _edge_args(section, e)
-                    for e in getattr(lp, "accumulated_outputs", ())
+                    _edge_args(section, e) for e in lp.accumulated_outputs
                 ],
                 "loop_back": sorted(lp._loop_back_inputs or ()),
                 "external_inputs": sorted(lp._external_inputs or ()),
             }
             for lp in loops
         ],
-        "leader_nodes": [],
     }
 
 

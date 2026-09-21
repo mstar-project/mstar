@@ -71,7 +71,6 @@ pub struct NodeSpec {
     pub outputs: Vec<EdgeSpec>,
     /// Innermost enclosing loop, if any.
     pub loop_id: Option<LoopId>,
-    pub is_leader: bool,
 }
 
 impl NodeSpec {

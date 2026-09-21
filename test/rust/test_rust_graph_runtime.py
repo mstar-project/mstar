@@ -181,3 +181,73 @@ def test_an_unported_method_says_so(runtime):
     # three frames away.
     with pytest.raises(NotImplementedError, match="not ported yet"):
         runtime.complete_and_route_batch(None, None)
+
+
+# --- the compile seam's loop handling ----------------------------------------
+
+def test_loop_nesting_survives_the_crossing():
+    """``_managing_registry`` is only populated by a WorkerGraphIO, which the
+    worker normally builds per request. Compiling needs the nesting, so the
+    seam builds one for that side effect -- without it every loop crosses as
+    top-level and a nested loop's completion accounts to the wrong registry."""
+    from mstar.graph.runtime.rust import worker_graph_args
+
+    inner = Loop(
+        name="inner_loop",
+        section=GraphNode(
+            name="inner_node", input_names={"x"},
+            outputs=[GraphEdge(name="x", next_node="inner_node")],
+        ),
+        outputs=[GraphEdge(name="x", next_node="outer_node")],
+        max_iters=3,
+    )
+    outer = Loop(
+        name="outer_loop",
+        section=Sequential(sections=[inner]),
+        outputs=[GraphEdge(name="x", next_node="sink")],
+        max_iters=5,
+    )
+    wg = WorkerGraph(
+        section=Sequential(sections=[outer]), graph_walks={WALK},
+        ranks=[0], worker_graph_id=WG_ID,
+    )
+
+    args = worker_graph_args(wg)
+    parents = {lp["name"]: lp["parent"] for lp in args["loops"]}
+    assert parents["outer_loop"] is None, "a top-level loop has no parent"
+    assert parents["inner_loop"] == "outer_loop"
+
+
+def test_compiling_does_not_mutate_the_shared_section():
+    """The seam walks a COPY: WorkerGraphIO writes _managing_registry into the
+    sections it visits, and the pristine section is shared by every request."""
+    from mstar.graph.runtime.rust import worker_graph_args
+
+    wg = WorkerGraph(
+        section=_graph(), graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    before = {
+        name: node._managing_registry
+        for name, node in wg.section.get_nodes().items()
+    }
+    worker_graph_args(wg)
+    after = {
+        name: node._managing_registry
+        for name, node in wg.section.get_nodes().items()
+    }
+    assert before == after, "compiling must leave the shared section untouched"
+
+
+def test_streaming_inputs_cross():
+    """Read from _streaming_inputs; the public name is on ReadySignals, so a
+    getattr on the wrong one silently sends an empty set and every streaming
+    node loses its ready-for-streaming seed."""
+    from mstar.graph.runtime.rust import worker_graph_args
+
+    node = GraphNode(name="consumer", input_names={"chunk", "prompt"}, outputs=[])
+    node._register_streaming({"chunk"})
+    wg = WorkerGraph(
+        section=node, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    args = worker_graph_args(wg)
+    assert args["nodes"][0]["streaming_inputs"] == ["chunk"]

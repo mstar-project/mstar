@@ -246,7 +246,8 @@ pub struct WorkerGraphArg {
     #[pyo3(item)] graph_walks: Vec<String>,
     #[pyo3(item)] nodes: Vec<NodeArg>,
     #[pyo3(item)] loops: Vec<LoopArg>,
-    #[pyo3(item)] leader_nodes: Vec<String>,
+    // Leadership is NOT here: it is per worker, not per worker graph, and
+    // arrives via set_node_metadata's parallel_leader_nodes.
 }
 
 #[pymethods]
@@ -271,7 +272,7 @@ impl GraphRuntime {
 
         // Compile graphs
         for (wg, wga) in worker_graphs.iter().enumerate() {
-            let graph = compile_one(&mut it, &wga.nodes, &wga.loops, &wga.leader_nodes)?;
+            let graph = compile_one(&mut it, &wga.nodes, &wga.loops)?;
             for walk in &wga.graph_walks {
                 let walk_sym = it.intern(walk);
                 for n in &graph.nodes {

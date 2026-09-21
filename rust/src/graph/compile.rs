@@ -51,7 +51,6 @@ pub fn compile_one(
     it: &mut StrToId,
     nodes: &[NodeArg],
     loops: &[LoopArg],
-    leader_nodes: &[String],
 ) -> PyResult<GraphRef> {
     let local: FxHashMap<&str, NodeId> = nodes.iter().enumerate()
         .map(|(i, n)| (n.name.as_str(), i as NodeId)).collect();
@@ -101,7 +100,6 @@ pub fn compile_one(
             async_enabled: n.async_enabled,
             only_streaming: full != 0 && streaming_mask == full,
             outputs, loop_id: None,
-            is_leader: leader_nodes.iter().any(|l| *l == n.name),
         });
     }
 
