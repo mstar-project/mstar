@@ -242,3 +242,69 @@ def test_fail_requests_and_empty_collections():
 def test_every_registered_tag_is_unique():
     tags = list(_TYPE_TO_TAG.values())
     assert len(tags) == len(set(tags))
+
+
+# ----------------------------------------------------------------------
+# reached-through-a-loose-field types
+# ----------------------------------------------------------------------
+
+
+def test_dataclass_reached_through_an_untyped_field_round_trips():
+    """Regression: CudaIpcKVTransferInfo travels inside step_metadata (a bare
+    ``dict``), so no annotation names it. Enumerating such types by hand is a
+    standing trap — one gets added and it fails at runtime on whichever path
+    first carries it — so the codec tags them self-describingly instead."""
+    from mstar.engine.resources.kv.transfer import CudaIpcKVTransferInfo
+
+    probe = CudaIpcKVTransferInfo(
+        cuda_share=(1, 2), size=(3, 4), stride=(4, 1), offset=8,
+        dtype="float16", requires_grad=False, layout=None,
+    )
+    fi = _fwd_info()
+    fi.step_metadata = {"probe": probe, "n": 3, "nested": [probe, "x"]}
+    msg = WorkerMessage(
+        message_type=WorkerMessageType.INPUT_SIGNALS,
+        body=InputSignals(request_id="r", partition_name="p",
+                          request_info=fi, inputs=[]),
+    )
+    md = roundtrip(msg).body.request_info.step_metadata
+    assert isinstance(md["probe"], CudaIpcKVTransferInfo)
+    assert md["probe"].dtype == "float16"
+    assert md["probe"].offset == 8
+    assert md["n"] == 3
+    assert isinstance(md["nested"][0], CudaIpcKVTransferInfo)
+    assert md["nested"][1] == "x"
+
+
+def test_required_field_that_is_none_survives():
+    """Regression: omitting None keeps frames small, but only a field WITH a
+    default can be reconstructed from its absence. A required field that is
+    legitimately None has to go on the wire or the reconstruct raises."""
+    from mstar.engine.resources.kv.transfer import CudaIpcKVTransferInfo
+
+    probe = CudaIpcKVTransferInfo(
+        cuda_share=(1,), size=(1,), stride=(1,), offset=0,
+        dtype="f32", requires_grad=False, layout=None,  # required, and None
+    )
+    fi = _fwd_info()
+    fi.step_metadata = {"probe": probe}
+    msg = WorkerMessage(
+        message_type=WorkerMessageType.INPUT_SIGNALS,
+        body=InputSignals(request_id="r", partition_name="p",
+                          request_info=fi, inputs=[]),
+    )
+    assert roundtrip(msg).body.request_info.step_metadata["probe"].layout is None
+
+
+def test_non_mstar_types_are_refused_rather_than_imported_from_the_wire():
+    from dataclasses import dataclass
+
+    import mstar.communication.wire as _wire
+
+    @dataclass
+    class Outsider:
+        x: int
+
+    Outsider.__module__ = "somewhere.else"
+    with pytest.raises(_wire.WireError, match="not an mstar type"):
+        _wire._encode_tagged(Outsider(x=1))

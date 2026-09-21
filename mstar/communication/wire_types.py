@@ -22,6 +22,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.base import PublishedInfo
 from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.manager import PublishedKVInfo
+from mstar.engine.resources.kv.transfer import CudaIpcKVTransferInfo
 from mstar.engine.resources.position.manager import PublishedPositionInfo
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
@@ -82,6 +83,7 @@ _TYPES: dict[str, type] = {
     # polymorphic leaves
     "fwd_pass_info": CurrentForwardPassInfo,
     "published_kv": PublishedKVInfo,
+    "cuda_ipc_kv_transfer": CudaIpcKVTransferInfo,
     "published_position": PublishedPositionInfo,
     "kv_req_config": KVReqConfig,
     "sampling_req_config": SamplingReqConfig,

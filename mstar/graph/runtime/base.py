@@ -1,9 +1,10 @@
 
 from abc import ABC, abstractmethod
-from typing import Generic, NamedTuple, TypeVar
+from typing import NamedTuple
 
 from mstar.communication.tensors import TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.utils.containers import ParallelList
 
 #
 # NOTE:
@@ -11,14 +12,11 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 # will be referred to by their integer handle. When being sent to other workers,
 # then the handle will be dereferenced to the actual uuid string.
 #
-# (2) The TensorStore class will have the tracking of persist / refcounts / etc
-# in rust to prevent more hops to Python in complete_and_route_batch.
-# Rust owns the whole record -- metadata (dims/dtype/stride/nbytes/address/
-# source_*/shm_*) plus ref_cnt / persist / mem_registered. The torch.Tensor
-# itself stays a Python object that Rust holds opaquely (Py<PyAny>) and hands
-# back for get_tensor. Because Rust has the record, TensorSpec collapses to
-# just the uuid handle, and store_batch mints those handles instead of
-# str(uuid4()) -- so (1)'s interning costs nothing on the output path.
+# (2) TensorStore stays Python and keeps dict[uuid, Tensor]. A separate
+# bookkeeper -- metadata plus ref_cnt / persist / mem_registered -- is what
+# gets a Rust backend, so Rust never sees a tensor and never has to drop a
+# Python object. Because the bookkeeper holds the metadata, the routing call
+# only needs uuid handles.
 #
 # (3) per-partition info will also probably eventually be ported into the
 # GraphRuntime so that we don't have to do a hop to Python for everything
@@ -48,19 +46,20 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 # (mstar.communication.wire), as do all the others, so there is no codec
 # prerequisite left here.
 #
+# (7) Request handles are recycled, which string rids effectively were not.
+# Anything keyed by a handle must be purged when the request is removed, or a
+# stale entry silently attaches to whichever request next gets that handle.
+# The ones that exist today: MicroScheduler.{failed_rids, admit_errors,
+# held_until, backlog, pending_tp_follow_count} (via clear_rid),
+# Worker._last_active / _pending_removes / _pending_loop_stops, and the tensor
+# manager's per-request maps. clear_rid covers the scheduler set; the rest are
+# worth auditing as part of the refactor.
+#
 # (6) Rust sends directly: RawZmqCommunicator::send takes &self with its peer
 # table behind a Mutex, so the runtime can hold an Arc to the same instance
 # the Python communicator wraps. The receive side should decode and ingest in
 # Rust too, or peer edges become Python objects again on arrival.
 #
-
-TK = TypeVar('TK')
-TV = TypeVar('TV')
-class ParallelList(NamedTuple, Generic[TK, TV]):
-    keys: list[TK]
-    values: list[TV]
-
-    # TODO: methods for iterating items, e.g.
 
 
 class SpeculationOutput(NamedTuple):
@@ -137,15 +136,19 @@ class RouteOutput(NamedTuple):
 
 class SendInput(NamedTuple):
     completion_id: int
+    # Opaque to the runtime for now: a Rust backend reads the few keys it needs
+    # (graph_walk, partition_name, resource_publish_info, fwd_index) out of the
+    # msgpack without owning the type.
     per_request_info: ParallelList[int, CurrentForwardPassInfo]
     new_token_counts: ParallelList[int, dict[str, int]]
 
-    # for WORKER_GRAPHS_DONE; see note (5)
-    # rid -> {edge name -> tokens consumed}
+    # WORKER_GRAPHS_DONE fields the runtime cannot derive, so they come in here.
+    # rid -> {edge name -> tokens consumed}; from StreamBuffer._consumed
     stream_tokens_consumed: ParallelList[int, dict[str, int]] | None = None
     # rids whose partition finished on this pass (from final_stream_rids)
     partition_done_rids: list[int] | None = None
-    # rid -> msgpack(rx_info, tx_info, graph_timings); None unless enable_prof
+    # rid -> msgpack(rx_info, tx_info, graph_timings). All three are populated
+    # only under enable_prof, so this is None in production.
     profiling: ParallelList[int, bytes] | None = None
 
     # only for SHM arena tensor management
@@ -180,7 +183,38 @@ class GraphRuntime(ABC):
     def remove_request(
         self, rid: int
     ):
-        """``rid`` is the handle ``add_request`` returned, not the uuid."""
+        """``rid`` is the handle ``add_request`` returned, not the uuid.
+
+        Handles are RECYCLED, so anything keyed by one must be purged here or on
+        the same event. A leaked string rid was harmless -- the string never
+        recurred -- but a leaked handle silently attaches to whichever request
+        gets that handle next, which reads as one request inheriting another's
+        state. Known handle-keyed maps: MicroScheduler.{failed_rids,
+        admit_errors, held_until, backlog, pending_tp_follow_count} (purged by
+        clear_rid), Worker.{_last_active, _pending_removes,
+        _pending_loop_stops}, and the tensor manager's per-request maps.
+        """
+        pass
+
+    # --------- rid <-> handle, at the process boundary ----------
+    #
+    # Handles are worker-internal. Messages carry the string, so the only
+    # translations are: de-intern at each send site, intern at each receive
+    # handler. In worker.py that is 12 sends and 9 receive handlers.
+
+    @abstractmethod
+    def get_rid_string(self, handle: int) -> str:
+        """For a message about to leave this process."""
+        pass
+
+    @abstractmethod
+    def get_rid_handle(self, rid: str) -> int | None:
+        """For a message that just arrived.
+
+        None when the rid is unknown -- a message can legitimately arrive for a
+        request this rank already removed (the micro-scheduler already treats
+        that as "not ready"), so this must not raise on the race.
+        """
         pass
 
     @abstractmethod
@@ -231,6 +265,9 @@ class GraphRuntime(ABC):
         ``is_final_streaming_chunk`` has to survive the ingest: the pass that
         CONSUMES the chunk is the one that reports partition_done, so the flag
         lives in the node's input slot until then.
+
+        A Rust backend should decode peer frames and ingest them here directly,
+        or every peer edge becomes a Python object again on arrival.
         """
         pass
 
@@ -357,6 +394,10 @@ class GraphRuntime(ABC):
         (4) Output signals -> api server
         (5) Remote streaing tensors
         (6) WG done messages to the conductor
+
+        A Rust backend sends these itself: RawZmqCommunicator::send takes &self
+        with its peer table behind a Mutex, so it can hold an Arc to the same
+        instance the Python communicator wraps -- no hop back to Python.
         """
         pass
 

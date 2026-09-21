@@ -7,6 +7,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass
 
+from mstar.communication.tensor_store import (  # NameToTensorList re-exported
+    NameToTensorList,
+    TensorStore,
+)
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.profile.format import RxInfo, TxInfo
@@ -34,79 +38,6 @@ class FutureAndPointers:
     graph_edges: list[GraphEdge]
     request_id: str = ""
     rx_time: float | None = None # seconds
-
-
-@dataclass
-class TensorAndReferenceInfo:
-    tensor: torch.Tensor
-    ref_cnt: int = 0
-    persist: bool = False
-    mem_registered: bool = False
-
-
-NameToTensorList = dict[str, list[torch.Tensor]]
-UuidToTensorAndRef = dict[int, TensorAndReferenceInfo]
-
-class TensorStore:
-    def __init__(self):
-        # request ID to {UUID -> tensor}
-        self.per_req_tensors: dict[str, UuidToTensorAndRef] = {}
-
-    def get_tensor(self, request_id: str, uuid: int) -> torch.Tensor:
-        return self.per_req_tensors[request_id][uuid].tensor
-
-    def put_tensor(self, request_id: str, uuid: int, tensor: torch.Tensor):
-        self.per_req_tensors.setdefault(
-            request_id, {}
-        )[uuid] = TensorAndReferenceInfo(tensor)
-
-    def check_uuid_presence(self, request_id: str, uuid: int):
-        return uuid in self.per_req_tensors.get(request_id, {})
-
-    def remove_tensor(self, request_id: str, uuid: int):
-        if not self.check_uuid_presence(request_id, uuid):
-            return
-        del self.per_req_tensors[request_id][uuid]
-        if not self.per_req_tensors[request_id]:
-            del self.per_req_tensors[request_id]
-
-    def get_all_uuids(self, request_id: str) -> list[int]:
-        return list(self.per_req_tensors.get(request_id, {}).keys())
-
-    def can_gc(self, request_id: str, uuid: int)-> bool:
-        if not self.check_uuid_presence(request_id, uuid):
-            return False
-        info = self.per_req_tensors[request_id][uuid]
-        return info.ref_cnt <= 0 and not info.persist
-
-    def is_registered(self, request_id: str, uuid: int):
-        if not self.check_uuid_presence(request_id, uuid):
-            return False
-        return self.per_req_tensors[request_id][uuid].mem_registered
-
-    def set_metadata(
-        self, request_id: str, uuid: int,
-        persist: bool | None = None,
-        mem_registered: bool | None = None
-    ):
-        if not self.check_uuid_presence(request_id, uuid):
-            return
-        if persist is not None:
-            self.per_req_tensors[request_id][uuid].persist = persist
-        if mem_registered is not None:
-            self.per_req_tensors[request_id][uuid].mem_registered = mem_registered
-
-    def increment_ref(self, request_id: str, uuid: int, n: int=1):
-        if not self.check_uuid_presence(request_id, uuid):
-            return
-        assert n >= 0, f"Tried to increment tensor {uuid} reference by a negative number {n}"
-        self.per_req_tensors[request_id][uuid].ref_cnt += n
-
-    def dereference(self, request_id: str, uuid: int, n: int=1):
-        if not self.check_uuid_presence(request_id, uuid):
-            return
-        info = self.per_req_tensors[request_id][uuid]
-        info.ref_cnt -= n
 
 
 # ---------------------------------------------------------------------------
@@ -500,11 +431,10 @@ class TensorCommunicationManager(ABC):
                 # must call set_output_ref_counts() to adjust to the real
                 # fanout after routing is computed.
                 for info in graph_node_info[name]:
-                    self.tensor_store.increment_ref(request_id, info.uuid, n=1)
+                    self.tensor_store.increment_ref(info.uuid, n=1)
             else:
                 for info in graph_node_info[name]:
-                    self.tensor_store.increment_ref(
-                        request_id, info.uuid, n=len([
+                    self.tensor_store.increment_ref(info.uuid, n=len([
                             e for e in edges if e.next_node != EMPTY_DESTINATION
                         ])
                     )
@@ -535,7 +465,7 @@ class TensorCommunicationManager(ABC):
         for uuid, count in actual_counts.items():
             delta = count - 1  # subtract the safety hold of 1
             if delta > 0:
-                self.tensor_store.increment_ref(request_id, uuid, n=delta)
+                self.tensor_store.increment_ref(uuid, n=delta)
             elif delta < 0:
                 self.dereference(request_id, uuid, n=-delta)
 
@@ -568,7 +498,7 @@ class TensorCommunicationManager(ABC):
         )
         dest_tp_size = dest_group.tp_size if dest_group is not None else 1
         if info.source_tp_size != dest_tp_size and shard_dim is not None:
-            canonical_tensor = self.tensor_store.get_tensor(request_id, info.uuid)
+            canonical_tensor = self.tensor_store.get_tensor(info.uuid)
             # Canonical layout has shard_dim leading and is contiguous, so a
             # contiguous byte range maps to a contiguous range of rows along
             # dim 0. Slicing along dim 0 keeps the view contiguous.
@@ -709,7 +639,7 @@ class TensorCommunicationManager(ABC):
 
                 tensors: list[torch.Tensor] = []
                 for info in edge.tensor_info:
-                    self.tensor_store.dereference(req_id, info.uuid, 1)
+                    self.tensor_store.dereference(info.uuid, 1)
                     seen_uuids.add(info.uuid)
                     self.uuid_to_shard_dim[info.uuid] = shard_dim
                     tensors.append(self.get_tensor(req_id, info.uuid))
@@ -734,7 +664,7 @@ class TensorCommunicationManager(ABC):
                             self.tensor_store.put_tensor(req_id, uuid_, tensor)
                             # +1 for graph-node usage (released by the
                             # downstream consumer via _cleanup_consumed_inputs)
-                            self.tensor_store.increment_ref(req_id, uuid_, 1)
+                            self.tensor_store.increment_ref(uuid_, 1)
                             # consolidated tensor is in its original layout
                             # (cat happened along the real shard_dim); record
                             # None so get_tensor doesn't try to un-rearrange.
@@ -788,24 +718,24 @@ class TensorCommunicationManager(ABC):
     # ---- shared: TensorStore delegation ----
 
     def get_tensor(self, request_id: str, uuid: int) -> torch.Tensor:
-        tensor = self.tensor_store.get_tensor(request_id=request_id, uuid=uuid)
+        tensor = self.tensor_store.get_tensor(uuid)
         shard_dim = self.uuid_to_shard_dim.get(uuid)
         if shard_dim is None:
             return tensor
         return self._undo_leading_shard_dim(shard_dim, tensor)
 
     def set_persist(self, request_id: str, uuid: int, persist: bool):
-        self.tensor_store.set_metadata(request_id, uuid, persist=persist)
-        if self.tensor_store.can_gc(request_id, uuid):
+        self.tensor_store.set_metadata(uuid, persist=persist)
+        if self.tensor_store.can_gc(uuid):
             self._cleanup_by_uuid(request_id, uuid)
 
     def dereference(self, request_id: str, uuid: int, n: int = 1):
-        self.tensor_store.dereference(request_id, uuid, n=n)
-        if self.tensor_store.can_gc(request_id, uuid):
+        self.tensor_store.dereference(uuid, n=n)
+        if self.tensor_store.can_gc(uuid):
             self._cleanup_by_uuid(request_id, uuid)
 
     def increment_ref(self, request_id: str, uuid: int, n: int = 1):
-        self.tensor_store.increment_ref(request_id, uuid, n=n)
+        self.tensor_store.increment_ref(uuid, n=n)
 
     def has_inflight_reads(self, request_id: str) -> bool:
         """Whether any async read for this request is still touching a remote
@@ -834,7 +764,7 @@ class TensorCommunicationManager(ABC):
         self.req_tx_info.pop(request_id, None)
         for uuid in self.tensor_store.get_all_uuids(request_id):
             self.uuid_to_shard_dim.pop(uuid, None)
-            if not self.tensor_store.can_gc(request_id, uuid) and not force:
+            if not self.tensor_store.can_gc(uuid) and not force:
                 logger.warning(
                     "Deferring cleanup of tensor uuid %s "
                     "(awaiting TENSOR_RECEIVED ACK or unpersist)", uuid
@@ -899,13 +829,12 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             torch.cuda.default_stream().synchronize()
         for info in tensor_infos:
             uuid = info.uuid
-            already_registered = self.tensor_store.is_registered(request_id, uuid)
+            already_registered = self.tensor_store.is_registered(uuid)
             if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
                 if already_registered:
                     continue
                 logger.debug("Registering %s for send", uuid)
-                tensor = self.tensor_store.get_tensor(
-                    request_id=request_id, uuid=uuid
+                tensor = self.tensor_store.get_tensor(uuid
                 )
                 t0 = time.perf_counter()
                 ret_value = self.transfer_engine.register_memory(
@@ -922,26 +851,25 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                         request_id, uuid, tensor.nbytes, time.perf_counter() - t0
                     )
             elif self.enable_prof and not already_registered:
-                tensor = self.tensor_store.get_tensor(request_id, uuid)
+                tensor = self.tensor_store.get_tensor(uuid)
                 self._record_tx(request_id, uuid, tensor.nbytes, 0.0)
-            self.tensor_store.set_metadata(
-                request_id, uuid, mem_registered=True
+            self.tensor_store.set_metadata(uuid, mem_registered=True
             )
 
     def _cleanup_by_uuid(self, request_id: str, uuid: int):
         super()._cleanup_by_uuid(request_id, uuid)
         logger.debug("Deleting tensor uuid %s", uuid)
-        if not self.tensor_store.check_uuid_presence(request_id, uuid):
+        if not self.tensor_store.check_uuid_presence(uuid):
             logger.warning("Trying to cleanup tensor %s, but uuid not found", uuid)
             return
         if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP) \
-                and self.tensor_store.is_registered(request_id, uuid):
+                and self.tensor_store.is_registered(uuid):
             ret_value = self.transfer_engine.unregister_memory(
-                self.tensor_store.get_tensor(request_id, uuid).data_ptr()
+                self.tensor_store.get_tensor(uuid).data_ptr()
             )
             if ret_value != 0:
                 raise RuntimeError("Mooncake memory unregistration failed.")
-        self.tensor_store.remove_tensor(request_id, uuid)
+        self.tensor_store.remove_tensor(uuid)
 
     def start_read_tensors(
         self, request_id: str, graph_edges: list[GraphEdge],
@@ -965,10 +893,10 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                         next_node=graph_edge.next_node,
                         graph_walk=graph_walk, info=info
                     )
-                    self.tensor_store.increment_ref(request_id, info.uuid, 1)
+                    self.tensor_store.increment_ref(info.uuid, 1)
                     continue
-                if self.tensor_store.check_uuid_presence(request_id, info.uuid):
-                    self.tensor_store.increment_ref(request_id, info.uuid, 1)
+                if self.tensor_store.check_uuid_presence(info.uuid):
+                    self.tensor_store.increment_ref(info.uuid, 1)
                     continue
                 buffer = torch.empty(
                     info.dims, dtype=info.dtype, device=self.device
@@ -976,13 +904,11 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 self.tensor_store.put_tensor(
                     request_id=request_id, uuid=info.uuid, tensor=buffer
                 )
-                self.tensor_store.set_metadata(
-                    request_id, info.uuid, mem_registered=True
+                self.tensor_store.set_metadata(info.uuid, mem_registered=True
                 )
                 # +1 for transit (released by get_ready_tensors)
                 # +1 for graph-node usage (released by _cleanup_consumed_inputs)
-                self.tensor_store.increment_ref(
-                    request_id, info.uuid, 2
+                self.tensor_store.increment_ref(info.uuid, 2
                 )
 
                 if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
@@ -1111,16 +1037,16 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         with ctx:
             for info in tensor_infos:
                 uuid = info.uuid
-                if self.tensor_store.is_registered(request_id, uuid):
+                if self.tensor_store.is_registered(uuid):
                     continue
-                tensor = self.tensor_store.get_tensor(request_id, uuid)
+                tensor = self.tensor_store.get_tensor(uuid)
                 t0 = time.perf_counter()
                 data = _serialize_tensor(tensor)
                 path = self._shm_path(self.my_entity_id, uuid)
                 with open(path, "wb") as f:
                     f.write(data)
                 self._shm_files[uuid] = path
-                self.tensor_store.set_metadata(request_id, uuid, mem_registered=True)
+                self.tensor_store.set_metadata(uuid, mem_registered=True)
                 if self.enable_prof:
                     # SHM: the serialize + file write IS the send work.
                     self._record_tx(
@@ -1157,10 +1083,10 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                             next_node=graph_edge.next_node,
                             graph_walk=graph_walk, info=info
                         )
-                        self.tensor_store.increment_ref(request_id, info.uuid, 1)
+                        self.tensor_store.increment_ref(info.uuid, 1)
                         continue
-                    if self.tensor_store.check_uuid_presence(request_id, info.uuid):
-                        self.tensor_store.increment_ref(request_id, info.uuid, 1)
+                    if self.tensor_store.check_uuid_presence(info.uuid):
+                        self.tensor_store.increment_ref(info.uuid, 1)
                         continue
                     if info.shm_segment is not None:
                         raise RuntimeError(
@@ -1175,10 +1101,10 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     tensor = _deserialize_tensor(data, self.device, tensor_info=info)
                     h2d_did_work = True
                     self.tensor_store.put_tensor(request_id, info.uuid, tensor)
-                    self.tensor_store.set_metadata(request_id, info.uuid, mem_registered=False)
+                    self.tensor_store.set_metadata(info.uuid, mem_registered=False)
                     # +1 for transit (released by get_ready_tensors)
                     # +1 for graph-node usage (released by _cleanup_consumed_inputs)
-                    self.tensor_store.increment_ref(request_id, info.uuid, 2)
+                    self.tensor_store.increment_ref(info.uuid, 2)
                     logger.debug("SHM: read tensor %s from %s", info.uuid, path)
                 self.pending.append(
                     FutureAndPointers(
@@ -1194,7 +1120,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
     def _cleanup_by_uuid(self, request_id: str, uuid: int):
         super()._cleanup_by_uuid(request_id, uuid)
         logger.debug("SHM: cleaning up tensor uuid %s", uuid)
-        if not self.tensor_store.check_uuid_presence(request_id, uuid):
+        if not self.tensor_store.check_uuid_presence(uuid):
             logger.warning("SHM: cleanup tensor %s, uuid not found", uuid)
             return
         if uuid in self._shm_files:
@@ -1204,7 +1130,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                 logger.debug("SHM: unlinked %s", path)
             except FileNotFoundError:
                 pass
-        self.tensor_store.remove_tensor(request_id, uuid)
+        self.tensor_store.remove_tensor(uuid)
 
 
 # ---------------------------------------------------------------------------

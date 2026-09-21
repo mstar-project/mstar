@@ -61,7 +61,7 @@ def test_producer_to_consumer_roundtrip(tmp_path):
     cons.start_read_tensors("r1", edges)
     for name, originals in tensors.items():
         for original, info in zip(originals, infos[name], strict=True):
-            got = cons.tensor_store.get_tensor("r1", info.uuid)
+            got = cons.tensor_store.get_tensor(info.uuid)
             assert torch.equal(got, original), name
 
 
@@ -109,7 +109,7 @@ def test_arena_grows_then_spills(tmp_path):
                          tensor_info=more["more"])
         cons.start_read_tensors("r3", [edge])
         for val, info in zip(vals, more["more"], strict=True):
-            got = cons.tensor_store.get_tensor("r3", info.uuid)
+            got = cons.tensor_store.get_tensor(info.uuid)
             assert torch.equal(got, val)
         # Reclaim unlinks the spilled files.
         for info in spilled:
@@ -163,9 +163,9 @@ def test_mixed_edge_and_fragmentation_signature(tmp_path, caplog):
                          tensor_info=mixed["mixed"])
         cons.start_read_tensors("r6", [edge])
         assert torch.equal(
-            cons.tensor_store.get_tensor("r6", s_info.uuid), small)
+            cons.tensor_store.get_tensor(s_info.uuid), small)
         assert torch.equal(
-            cons.tensor_store.get_tensor("r6", b_info.uuid), big)
+            cons.tensor_store.get_tensor(b_info.uuid), big)
     finally:
         del os.environ["MSTAR_SHM_ARENA_SPILL_AFTER_S"]
 
@@ -219,7 +219,7 @@ def test_transport_mismatch_fails_loudly(tmp_path):
     file_prod.register_for_send("rm2", [infos["y"][0]])
     edge = GraphEdge(next_node="B", name="y", tensor_info=infos["y"])
     arena_cons.start_read_tensors("rm2", [edge])
-    got = arena_cons.tensor_store.get_tensor("rm2", infos["y"][0].uuid)
+    got = arena_cons.tensor_store.get_tensor(infos["y"][0].uuid)
     assert torch.equal(got, y)
 
 
@@ -254,7 +254,7 @@ def test_instance_unique_names_no_collision(tmp_path):
     edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
     cons.start_read_tensors("r", [edge])
     assert torch.equal(
-        cons.tensor_store.get_tensor("r", infos["x"][0].uuid), x)
+        cons.tensor_store.get_tensor(infos["x"][0].uuid), x)
 
 
 def test_orphan_sweep(tmp_path):

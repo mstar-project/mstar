@@ -258,7 +258,7 @@ def test_unacked_result_tensors_leak_producer_buffer():
 
         shm_path = os.path.join(tmpdir, f"mstar_worker_0_{uuid}")
         assert os.path.isfile(shm_path)
-        assert not producer.tensor_store.can_gc("req1", uuid)  # held by send ref
+        assert not producer.tensor_store.can_gc(uuid)  # held by send ref
 
         # No ack arrives; the producer's own cleanup must defer the buffer.
         producer.cleanup_request("req1")
@@ -322,7 +322,7 @@ def test_cleanup_request_defers_persisted_tensor():
         uuid = _store_persisted_input(mgr, "req1")
         path = os.path.join(tmpdir, f"mstar_api_server_preprocess_worker_{uuid}")
         assert os.path.isfile(path)
-        assert not mgr.tensor_store.can_gc("req1", uuid)  # persist holds it
+        assert not mgr.tensor_store.can_gc(uuid)  # persist holds it
 
         mgr.cleanup_request("req1")
         assert os.path.isfile(path)  # deferred, not force-unlinked
@@ -341,7 +341,7 @@ def test_force_cleanup_request_drops_persisted_tensor():
 
         mgr.force_cleanup_request("req1")
         assert not os.path.isfile(path)
-        assert not mgr.tensor_store.check_uuid_presence("req1", uuid)
+        assert not mgr.tensor_store.check_uuid_presence(uuid)
 
 
 def test_force_cleanup_request_reclaims_unacked_buffer():
@@ -352,7 +352,7 @@ def test_force_cleanup_request_reclaims_unacked_buffer():
         _, uuid = _produce_registered_output(producer, "req1")
         shm_path = os.path.join(tmpdir, f"mstar_worker_0_{uuid}")
         assert os.path.isfile(shm_path)
-        assert not producer.tensor_store.can_gc("req1", uuid)  # held by send ref
+        assert not producer.tensor_store.can_gc(uuid)  # held by send ref
 
         producer.force_cleanup_request("req1")
         assert not os.path.isfile(shm_path)  # dropped regardless of ref count

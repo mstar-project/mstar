@@ -568,15 +568,14 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         with ctx:
             for info_arg in tensor_infos:
                 uuid = info_arg.uuid
-                if self.tensor_store.is_registered(request_id, uuid):
+                if self.tensor_store.is_registered(uuid):
                     continue
-                tensor = self.tensor_store.get_tensor(request_id, uuid)
+                tensor = self.tensor_store.get_tensor(uuid)
                 t0 = time.perf_counter()
                 t = tensor.detach().contiguous()
                 nbytes = t.numel() * t.element_size()
                 loc = self._reserve(nbytes)
-                if loc is not None and self.tensor_store.is_registered(
-                        request_id, uuid):
+                if loc is not None and self.tensor_store.is_registered(uuid):
                     # Lost a concurrent-duplicate race: another thread
                     # registered this uuid while our reserve released the
                     # GIL. Return our slot instead of orphaning it.
@@ -592,8 +591,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                         f.write(data)
                     self._shm_files[uuid] = path
                     self._arena_ts[uuid] = time.monotonic()
-                    self.tensor_store.set_metadata(
-                        request_id, uuid, mem_registered=True)
+                    self.tensor_store.set_metadata(uuid, mem_registered=True)
                     if self.enable_prof:
                         self._record_tx(request_id, uuid, len(data),
                                         time.perf_counter() - t0)
@@ -625,8 +623,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 seg_name = self._arena.segment_name(seg)
                 info_arg.shm_segment = seg_name
                 info_arg.shm_offset = off
-                self.tensor_store.set_metadata(
-                    request_id, uuid, mem_registered=True)
+                self.tensor_store.set_metadata(uuid, mem_registered=True)
                 if self.enable_prof:
                     self._record_tx(
                         request_id, uuid, nbytes, time.perf_counter() - t0)
@@ -673,13 +670,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                             next_node=graph_edge.next_node,
                             graph_walk=graph_walk, info=info,
                         )
-                        self.tensor_store.increment_ref(
-                            request_id, info.uuid, 1)
+                        self.tensor_store.increment_ref(info.uuid, 1)
                         continue
-                    if self.tensor_store.check_uuid_presence(
-                            request_id, info.uuid):
-                        self.tensor_store.increment_ref(
-                            request_id, info.uuid, 1)
+                    if self.tensor_store.check_uuid_presence(info.uuid):
+                        self.tensor_store.increment_ref(info.uuid, 1)
                         continue
                     if info.shm_segment is None:
                         # Spilled at the producer (arena saturated): read the
@@ -695,11 +689,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     h2d_did_work = h2d_did_work or tensor.numel() > 0
                     self.tensor_store.put_tensor(
                         request_id, info.uuid, tensor)
-                    self.tensor_store.set_metadata(
-                        request_id, info.uuid, mem_registered=False)
+                    self.tensor_store.set_metadata(info.uuid, mem_registered=False)
                     # +1 transit (released by get_ready_tensors), +1 usage
                     # (released by _cleanup_consumed_inputs).
-                    self.tensor_store.increment_ref(request_id, info.uuid, 2)
+                    self.tensor_store.increment_ref(info.uuid, 2)
                 read_edges.append(
                     (graph_edge, time.perf_counter() - rx_t0))
         future = None
@@ -804,6 +797,6 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 os.unlink(path)   # spilled tensor: reclaim the file
             except FileNotFoundError:
                 pass
-        if not self.tensor_store.check_uuid_presence(request_id, uuid):
+        if not self.tensor_store.check_uuid_presence(uuid):
             return
-        self.tensor_store.remove_tensor(request_id, uuid)
+        self.tensor_store.remove_tensor(uuid)

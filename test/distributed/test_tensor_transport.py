@@ -349,7 +349,7 @@ def test_colocated_replicated_to_sharded_slices_locally(make_manager, protocol):
     # producer's refcount. _send only registered one outgoing edge (rank 0),
     # so without this the colocated slice's dereference would drop the
     # producer's ref to 0 and GC the canonical tensor.
-    mgr.tensor_store.increment_ref("req1", producer_uuid, 1)
+    mgr.tensor_store.increment_ref(producer_uuid, 1)
 
     # Worker-pre-computed per-receiver slice metadata.
     half_nbytes = edge.tensor_info[0].nbytes // 2
@@ -365,7 +365,7 @@ def test_colocated_replicated_to_sharded_slices_locally(make_manager, protocol):
     slice_uuid = ready["req1"][0].tensor_info[0].uuid
     # A fresh UUID — producer's UUID stays available for the other LLM rank.
     assert slice_uuid != producer_uuid
-    assert mgr.tensor_store.check_uuid_presence("req1", producer_uuid)
+    assert mgr.tensor_store.check_uuid_presence(producer_uuid)
 
     received = mgr.get_tensor("req1", slice_uuid)
     expected = original[:, :4]

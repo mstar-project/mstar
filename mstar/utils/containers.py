@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Hashable, Iterator
-from typing import Generic, TypeVar
+from typing import Generic, NamedTuple, TypeVar
 
 T = TypeVar("T", bound=Hashable)
 
@@ -42,3 +42,25 @@ class RecentSet(Generic[T]):
 
     def __repr__(self) -> str:
         return f"RecentSet(maxlen={self.maxlen}, items={list(self._order)!r})"
+
+
+TK = TypeVar('TK')
+TV = TypeVar('TV')
+
+class ParallelList(NamedTuple, Generic[TK, TV]):
+    keys: list[TK]
+    values: list[TV]
+
+    def __len__(self) -> int:
+        return len(self.keys)
+
+    def __iter__(self) -> Iterator[tuple[TK, TV]]:
+        # strict: the two lists being the same length is the invariant of the
+        # whole type; a silent truncation here would drop requests.
+        return zip(self.keys, self.values, strict=True)
+
+    @classmethod
+    def from_dict(cls, d: dict[TK, TV]) -> "ParallelList[TK, TV]":
+        keys = list(d.keys())
+        values = [d[k] for k in keys]
+        return cls(keys, values)

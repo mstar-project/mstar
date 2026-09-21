@@ -17,6 +17,8 @@ Notes:
 """
 import dataclasses
 import enum
+import importlib
+import logging
 import pickle
 import typing
 from typing import Any
@@ -31,8 +33,16 @@ _TAG_TO_TYPE: dict[str, type] = {}
 _TYPE_TO_TAG: dict[type, str] = {}
 _POLYMORPHIC: tuple[type, ...] = ()
 
-#: cls -> ((field, encode, decode), ...); built on first use.
+#: cls -> ((field, encode, decode, omit_if_none), ...); built on first use.
 _PLANS: dict[type, tuple] = {}
+
+
+logger = logging.getLogger(__name__)
+
+#: Tag prefix for a dataclass reached through a loosely-typed field and never
+#: explicitly registered. Self-describing so the decoder can find it without
+#: maintenance -- the curated tags in wire_types.py stay short.
+AUTO_PREFIX = "auto:"
 
 
 class WireError(Exception):
@@ -85,7 +95,16 @@ def _plan(cls) -> tuple:
     if plan is None:
         hints = typing.get_type_hints(cls)
         plan = tuple(
-            (f.name, _encoder(hints.get(f.name, Any)), _decoder(hints.get(f.name, Any)))
+            (
+                f.name,
+                _encoder(hints.get(f.name, Any)),
+                _decoder(hints.get(f.name, Any)),
+                # Omitting None keeps frames small, but only a field with a
+                # default can be reconstructed from its absence. A REQUIRED
+                # field that is legitimately None has to go on the wire.
+                f.default is not dataclasses.MISSING
+                or f.default_factory is not dataclasses.MISSING,
+            )
             for f in dataclasses.fields(cls)
         )
         _PLANS[cls] = plan
@@ -173,7 +192,7 @@ def _decoder(hint):
         return dec_union
 
     if origin is list:
-        inner = _decoder(args[0]) if args else _identity
+        inner = _decoder(args[0]) if args else _dynamic_decode
         return lambda v: [inner(x) for x in v]
     if origin is tuple:
         if len(args) == 2 and args[1] is Ellipsis:
@@ -182,7 +201,7 @@ def _decoder(hint):
         decs = [_decoder(a) for a in args]
         return lambda v: tuple(d(x) for d, x in zip(decs, v, strict=False))
     if origin in (set, frozenset):
-        inner = _decoder(args[0]) if args else _identity
+        inner = _decoder(args[0]) if args else _dynamic_decode
         return lambda v: origin(inner(x) for x in v)
 
     if origin is dict:
@@ -204,44 +223,93 @@ def _decoder(hint):
         if dataclasses.is_dataclass(hint):
             return lambda v: _decode_dataclass(v, hint)
 
-    return _identity
+    return _dynamic_decode
 
 
 # -- dataclass encode / decode ----------------------------------------------
 
 def _encode_dataclass(obj) -> dict:
     out = {}
-    for name, enc, _ in _plan(type(obj)):
+    for name, enc, _, omit_if_none in _plan(type(obj)):
         v = getattr(obj, name)
-        if v is not None:  # absent means default; keeps frames small
-            out[name] = enc(v)
+        if v is None:
+            if not omit_if_none:
+                out[name] = None
+            continue
+        out[name] = enc(v)
     return out
 
 
 def _decode_dataclass(raw: dict, cls: type):
     kwargs = {}
-    for name, _, dec in _plan(cls):
+    for name, _, dec, _omit in _plan(cls):
         if name in raw:
-            kwargs[name] = dec(raw[name])
+            v = raw[name]
+            kwargs[name] = None if v is None else dec(v)
     return cls(**kwargs)
 
 
 def _encode_tagged(obj):
-    tag = _TYPE_TO_TAG.get(type(obj))
+    cls = type(obj)
+    tag = _TYPE_TO_TAG.get(cls)
     if tag is None:
-        raise WireError(
-            f"{type(obj).__name__} crosses the wire under an abstract type "
-            f"but is not registered; call wire.register(tag, cls)"
-        )
+        # Reached through a loosely-typed field (bare dict, Any, an abstract
+        # base whose subclass lives in a module wire_types does not import).
+        # Enumerating those by hand is a standing trap -- one gets added and
+        # the failure shows up at runtime on whichever path first carries it --
+        # so fall back to a self-describing tag instead of raising.
+        if not cls.__module__.startswith("mstar."):
+            raise WireError(
+                f"{cls.__module__}.{cls.__qualname__} is not an mstar type; "
+                f"the wire only resolves mstar classes automatically"
+            )
+        tag = f"{AUTO_PREFIX}{cls.__module__}:{cls.__qualname__}"
+        register(tag, cls)
+        logger.debug("auto-registered %s for the wire as %r", cls.__name__, tag)
     return [tag, _encode_dataclass(obj)]
+
+
+def _resolve_auto_tag(tag: str) -> type:
+    module_name, _, qualname = tag.removeprefix(AUTO_PREFIX).partition(":")
+    if not module_name.startswith("mstar."):
+        raise WireError(f"refusing to import {module_name!r} from the wire")
+    obj = importlib.import_module(module_name)
+    for part in qualname.split("."):
+        obj = getattr(obj, part)
+    if not dataclasses.is_dataclass(obj):
+        raise WireError(f"wire tag {tag!r} does not name a dataclass")
+    return obj
 
 
 def _decode_tagged(raw):
     tag, payload = raw
     cls = _TAG_TO_TYPE.get(tag)
     if cls is None:
-        raise WireError(f"unknown wire tag {tag!r}")
+        if not tag.startswith(AUTO_PREFIX):
+            raise WireError(f"unknown wire tag {tag!r}")
+        cls = _resolve_auto_tag(tag)
+        register(tag, cls)
     return _decode_dataclass(payload, cls)
+
+
+def _looks_tagged(raw) -> bool:
+    return (
+        isinstance(raw, list) and len(raw) == 2 and isinstance(raw[0], str)
+        and (raw[0] in _TAG_TO_TYPE or raw[0].startswith(AUTO_PREFIX))
+    )
+
+
+def _dynamic_decode(raw):
+    """Mirror of ``_dynamic``. A field with no useful declared type still has
+    to give back what it was handed, so nested dataclasses -- encoded as
+    ``[tag, payload]`` -- are decoded here rather than surfacing as lists."""
+    if _looks_tagged(raw):
+        return _decode_tagged(raw)
+    if isinstance(raw, list):
+        return [_dynamic_decode(v) for v in raw]
+    if isinstance(raw, dict):
+        return {k: _dynamic_decode(v) for k, v in raw.items()}
+    return raw
 
 
 def _dynamic(value):
