@@ -191,6 +191,28 @@ def test_a_read_in_that_matches_everything_published_moves_nothing():
     kv.assert_pages_conserved()
 
 
+def test_a_read_in_takes_the_stream_over_from_the_lease():
+    kv = _manager()
+    tokens = list(range(64))
+    _ingest(kv, "a", tokens)
+    _run(kv, "a", tokens)
+    kv.remove_request("a")
+
+    _ingest(kv, "b", tokens)
+    assert kv._streams["b"]["main"].lease, "the ingest matched nothing to hold"
+    out = kv.admit_retrieve("b", NODE, WALK, _published(kv, "b", 64, list(range(4))))
+
+    assert out.ok, "the read-in was refused"
+    assert kv._streams["b"]["main"].lease is None, (
+        "the stream is holding a lease nothing will convert: its pages came "
+        "from the published image, not from `admit`"
+    )
+    assert kv.resolve_cached_prefix("b", NODE, WALK) is None, (
+        "the step was told to skip tokens the read-in had already counted"
+    )
+    kv.assert_pages_conserved()
+
+
 def test_a_read_in_with_nothing_local_moves_all_of_it():
     kv = _manager()
     _ingest(kv, "b", list(range(2000, 2064)))

@@ -1,11 +1,11 @@
 """A matched prefix is held from the probe until admit takes it over.
 
-The probe runs on the CPU while the step is still being prepared, so between
-matching and owning there is a window in which nothing but the lease stops the
-pages being evicted or handed out. The window is not short: an allocation
-failure sends the whole batch back through ``prepare_inputs``, so the same
-stream is probed again, and the second answer has to be the first one without a
-second reference being taken.
+The probe runs on the CPU when the request is ingested, before anything about
+its step exists, so between matching and owning there is a window — now every
+scheduling decision in between — in which nothing but the lease stops the pages
+being evicted or handed out. Nothing probes again: the step is answered the
+length the ingest settled, which is what lets two ranks that ingest at
+different moments still skip the same tokens.
 """
 
 from __future__ import annotations
@@ -122,6 +122,33 @@ def test_a_second_request_with_the_same_prompt_matches_what_the_first_wrote():
     matched = kv.resolve_cached_prefix("r1", NODE, WALK)
 
     assert matched == 96, f"6 full pages were indexed but {matched} tokens matched"
+    kv.assert_pages_conserved()
+
+
+def test_the_ingest_is_what_walks_the_index():
+    kv = _manager()
+    keys = _seed(kv, list(range(100)))
+
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}))
+
+    assert kv._streams["r1"]["main"].lease, (
+        "nothing was held until the step asked, so the index the request "
+        "matched would be whichever one its rank had reached by then"
+    )
+    kv.assert_pages_conserved()
+
+
+def test_a_prefix_committed_after_the_ingest_is_not_picked_up():
+    kv = _manager()
+    tokens = list(range(100))
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": _keys(tokens)}))
+
+    _seed(kv, tokens)
+
+    assert kv.resolve_cached_prefix("r1", NODE, WALK) is None, (
+        "the step matched pages indexed after this request was ingested, so "
+        "two ranks keying at their own pace could skip different lengths"
+    )
     kv.assert_pages_conserved()
 
 
@@ -377,12 +404,15 @@ def test_a_lease_is_cut_to_the_smallest_answer_and_the_rest_given_back():
 # ── what is done with the lock down ─────────────────────────────────────
 
 
-def _assert_hashed_with_the_lock_down(kv: KVManager, monkeypatch) -> None:
-    """Fail any key hashed while this manager's lock is held."""
+def _assert_hashed_with_the_lock_down(kv: KVManager, monkeypatch) -> list[bool]:
+    """Fail any key hashed while this manager's lock is held. Returns the
+    record of keys hashed, so a caller can tell a pass from a no-op."""
     real = manager_mod.fingerprint
+    hashed: list[bool] = []
 
     def _fingerprint(*fields):
         free = []
+        hashed.append(True)
 
         def _try():
             if kv._lock.acquire(blocking=False):
@@ -399,15 +429,18 @@ def _assert_hashed_with_the_lock_down(kv: KVManager, monkeypatch) -> None:
         return real(*fields)
 
     monkeypatch.setattr(manager_mod, "fingerprint", _fingerprint)
+    return hashed
 
 
-def test_a_probe_hashes_the_prompt_with_the_lock_down(monkeypatch):
+def test_the_ingest_hashes_the_prompt_with_the_lock_down(monkeypatch):
     kv = _manager()
     keys = _seed(kv, list(range(100)))
     kv.remove_request("seed")
-    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}))
-    _assert_hashed_with_the_lock_down(kv, monkeypatch)
+    hashed = _assert_hashed_with_the_lock_down(kv, monkeypatch)
 
+    kv.ingest_request("r1", KVReqConfig(prefix_keys={"main": keys}))
+
+    assert hashed, "the ingest hashed nothing, so the check above never ran"
     assert kv.resolve_cached_prefix("r1", NODE, WALK), "the probe matched nothing"
     kv.assert_pages_conserved()
 
@@ -438,23 +471,42 @@ def _removed_in_the_window(kv: KVManager, monkeypatch, rid: str) -> None:
     monkeypatch.setattr(kv, "_keyed_label", _keyed_label)
 
 
-def test_a_probe_raced_by_a_remove_raises_nothing(monkeypatch):
+def _removed_while_hashing(kv: KVManager, monkeypatch, rid: str) -> None:
+    """Remove ``rid`` from another thread while its chain is being hashed,
+    whenever that thread can take the manager's lock at that moment."""
+    real = manager_mod.fingerprint
+
+    def _fingerprint(*fields):
+        def _remove():
+            if kv._lock.acquire(blocking=False):
+                try:
+                    kv.remove_request(rid)
+                finally:
+                    kv._lock.release()
+
+        remover = threading.Thread(target=_remove)
+        remover.start()
+        remover.join()
+        return real(*fields)
+
+    monkeypatch.setattr(manager_mod, "fingerprint", _fingerprint)
+
+
+def test_an_ingest_raced_by_a_remove_raises_nothing(monkeypatch):
     kv = _manager()
     keys = _seed(kv, list(range(64)))
     kv.remove_request("seed")
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": keys}))
-    _removed_in_the_window(kv, monkeypatch, "r0")
+    _removed_while_hashing(kv, monkeypatch, "r0")
 
     try:
-        kv.resolve_cached_prefix("r0", NODE, WALK)
+        kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": keys}))
     except KeyError as error:
         pytest.fail(
-            f"a remove between the label lookup and the lock failed the batch: {error!r}"
+            f"a remove while the chain was hashing failed the request: {error!r}"
         )
-    kv.remove_request("r0")
 
     assert kv.resolve_cached_prefix("r0", NODE, WALK) is None, (
-        "a removed request was still probed"
+        "a removed request came back out of the probe holding a lease"
     )
     kv.assert_pages_conserved()
 
