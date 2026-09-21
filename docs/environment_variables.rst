@@ -53,13 +53,14 @@ Communication
        a 7168-token prefill in four 2048-token slices spent 5.5 ms a layer in Marlin against 3.4 in
        one. Lower it where the prefill's memory is short.
    * - ``MSTAR_MOE_BF16_TOKENS``
-     - ``0``
+     - ``6144``
      - A prefill slice of at least this many tokens runs Kimi K3's routed experts as bf16 grouped GEMMs on
        weights dequantized from the Marlin tiles once per layer (``marlin/dequant.py``) instead of the
        Marlin kernels, which dequantize inside their inner loop and run compute-bound at large token
-       counts. Off (``0``) by default: on an H100 at the pruned75 shapes the dequantization and the row
-       gathers eat the GEMMs' gain until about 8192 tokens. Eager steps only; expert-parallel ranks keep
-       Marlin.
+       counts. The dequantization and the row gathers cost a fixed 2 to 3 ms a layer, so the path pays
+       only for the longest slices (an 8-prompt prefill of 1024-token prompts: 100 to 550 ms less TTFT on
+       8xH100). ``0`` turns it off. Eager steps only; expert-parallel ranks keep Marlin. The path is
+       warmed once at setup so no request pays its compilation.
    * - ``MSTAR_AUX_STREAM``
      - ``1``
      - ``0`` keeps every captured step on one stream. By default a layer's independent branches
