@@ -64,6 +64,13 @@ class _FakeQueue:
         return {}
 
 
+class _FakeRuntime:
+    """The runtime owns the (walk, node) -> worker graph index now."""
+
+    def get_worker_graph_id_for_node(self, node_name, graph_walk):
+        return "wg0"
+
+
 class _FakeWorkerGraphsManager:
     def __init__(self, queue):
         self.queues = {"wg0": queue}
@@ -71,9 +78,6 @@ class _FakeWorkerGraphsManager:
 
     def get_partition_for_node(self, node_name):
         return "p0"
-
-    def get_worker_graph_id_for_node(self, rid, node_name, graph_walk=None):
-        return "wg0"
 
     def get_fwd_info(self, rid, partition):
         return None
@@ -89,6 +93,7 @@ def _setup(rids=("r0", "r1")):
         # Follower role: NODE is parallel here but this rank does not lead it.
         parallel_leader_nodes=set(),
     )
+    sched.runtime = _FakeRuntime()
     queue = _FakeQueue(rids, NODE)
     manager = _FakeWorkerGraphsManager(queue)
     return sched, manager

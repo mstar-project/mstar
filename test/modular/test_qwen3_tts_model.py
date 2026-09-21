@@ -871,7 +871,7 @@ def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
 def test_qwen3_tts_streaming_policy_flushes_only_new_tail_audio():
     config = _tiny_model_config()
     stream = StreamBuffer(
-        request_id="request",
+        rid=0,
         edge_name="codec_tokens",
         from_partition="Talker",
         policy=LeftContextChunkPolicy(

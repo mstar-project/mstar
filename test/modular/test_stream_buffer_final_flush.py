@@ -30,7 +30,7 @@ def _drive(policy, total_frames, drain_before_done):
     buffer before ``signal_done`` and triggered the hang.
     """
     sb = StreamBuffer(
-        request_id="r", edge_name="new_token",
+        rid=0, edge_name="new_token",
         from_partition="LLM", policy=policy,
     )
     finals = []
@@ -96,7 +96,7 @@ def test_continue_after_producer_done_never_marks_final():
     change that."""
     policy = FixedChunkPolicy(chunk_size=30, continue_after_done=True)
     sb = StreamBuffer(
-        request_id="r", edge_name="new_token", from_partition="LLM", policy=policy,
+        rid=0, edge_name="new_token", from_partition="LLM", policy=policy,
     )
     for i in range(90):  # exact multiple — the trigger for the plain-policy hang
         uid = f"t{i}"

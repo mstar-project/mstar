@@ -63,7 +63,6 @@ from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import (
     NodeOutputRouting,
-    WorkerGraphQueues,
     WorkerGraphsManager,
 )
 
@@ -248,17 +247,22 @@ class Worker:
             enable_prof=self.enable_prof
         )
 
+        # The graph runtime is taking this over method by method. It owns the
+        # per-request queues; the manager is handed the SAME dict so the two
+        # read one copy of the state while the port is in flight.
+        self._rid_runtime = PythonGraphRuntime(
+            my_worker_id=self.worker_id,
+            my_worker_graphs=my_worker_graphs,
+            all_wg_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
+            all_wg_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
+            all_wg_ids_to_nodes=all_worker_graph_ids_to_nodes,
+            node_to_partition=node_to_partition,
+            sharding_config=sharding_config,
+            tensor_manager=self.tensor_manager,
+        )
+
         self.worker_graphs_manager = WorkerGraphsManager(
-            queues={
-                worker_graph.worker_graph_id: WorkerGraphQueues(
-                    worker_graph_id=worker_graph.worker_graph_id,
-                    graph_walks=worker_graph.graph_walks,
-                    worker_graph=worker_graph,
-                    per_request_queues={},
-                    tensor_manager=self.tensor_manager
-                )
-                for worker_graph in my_worker_graphs
-            },
+            queues=self._rid_runtime.queues,
             per_request_info={},
             all_worker_graph_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
             all_worker_graph_ids_to_dyn_loops=all_worker_graph_ids_to_dyn_loops,
@@ -332,6 +336,7 @@ class Worker:
 
         # Both take wire rid strings and hand back handles; everything else in
         # these two is already handle-keyed.
+        self.scheduler.runtime = self._rid_runtime
         self.scheduler.rid_of = self._rid
         self.tensor_manager.rid_to_str = self._rid_str
 
@@ -367,8 +372,6 @@ class Worker:
         # request's ADMITTED lifetime keys on the handle; the lifecycle sets
         # below stay strings because DRAIN can arrive before NEW, so no handle
         # exists yet. Messages always carry the string.
-        self._rid_runtime = PythonGraphRuntime()
-
         self._pending_loop_stops: set[PendingLoopStop] = set()
         # Let the scheduler see deferred removes so it stops initiating new work
         # for those rids (shared by reference — mutations are visible to both).
@@ -463,7 +466,7 @@ class Worker:
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         # The one place a handle is minted. Everything below keys on it.
         rid = self._rid_runtime.add_request(
-            rid=body.request_id,
+            request_id=body.request_id,
             partition=body.request_info.partition_name,
             graph_walk=body.request_info.graph_walk,
             partition_worker_graph_ids=body.partition_worker_graph_ids,
@@ -555,7 +558,7 @@ class Worker:
                     worker, msg=WorkerMessage(
                         message_type=WorkerMessageType.REMOVE_REQUEST,
                         body=RemoveRequest(
-                            rid=body.request_id,
+                            request_id=body.request_id,
                             source=MessageSource.TP_RANK_0,
                         )
                     )
@@ -732,6 +735,9 @@ class Worker:
             # A fwd_info off the wire carries only the string; stamp the handle
             # so submodules keying per-request state can use it directly.
             body.request_info.rid_handle = rid
+            self._rid_runtime.set_walk(
+                rid, body.partition_name, body.request_info.graph_walk,
+            )
             self.worker_graphs_manager.update_request_info(
                 rid, current_fwd_info=body.request_info,
                 partition_name=body.partition_name
@@ -1199,7 +1205,7 @@ class Worker:
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
-                    rid=self._rid_str(rid),
+                    request_id=self._rid_str(rid),
                     inputs=edges,
                     request_info=self.worker_graphs_manager.get_fwd_info(rid, partition_name),
                     partition_name=partition_name
@@ -1239,7 +1245,7 @@ class Worker:
                 message = APIServerMessage(
                     message_type="result_tensors",
                     body=ResultTensors(
-                        rid=self._rid_str(rid),
+                        request_id=self._rid_str(rid),
                         modality=graph_edge.output_modality,
                         graph_edge=graph_edge,
                         loop_indices=nested_loop_indices,
@@ -1262,7 +1268,7 @@ class Worker:
             message = WorkerMessage(
                 message_type=WorkerMessageType.INPUT_SIGNALS,
                 body=InputSignals(
-                    rid=self._rid_str(rid),
+                    request_id=self._rid_str(rid),
                     inputs=edges,
                     request_info=self.worker_graphs_manager.get_fwd_info(rid, partition_name),
                     partition_name=partition_name
@@ -1288,7 +1294,7 @@ class Worker:
             message = ConductorMessage(
                 message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
                 body=WorkerGraphsDone(
-                    rid=self._rid_str(rid),
+                    request_id=self._rid_str(rid),
                     worker_graph_ids=outputs.completed_worker_graph_ids,
                     is_first_tp_rank=outputs.is_first_tp_rank,
                     persist_signals=self.worker_graphs_manager.flush_persist_signals(rid),
@@ -2315,11 +2321,11 @@ class Worker:
             range_pop(synchronize=False)
             range_push("worker.postprocess.check_stop", synchronize=False)
 
-        for rid, req_info in batch_N.node_batch.per_request_info.items():
-            new_iters = self.worker_graphs_manager.get_dynamic_loop_iters(
-                rid, partition=batch_N.partition,
-            )
-            req_info.dynamic_loop_iter_counts.update(new_iters)
+        per_request_info = batch_N.node_batch.per_request_info
+        for rid, new_iters in self._rid_runtime.get_dynamic_loop_iters(
+            list(per_request_info), partition=batch_N.partition,
+        ):
+            per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
 
         # Check for stops
         engine = self.engine_manager.get_engine(batch_N.node_name)
@@ -2383,7 +2389,7 @@ class Worker:
                     msg=WorkerMessage(
                         message_type=WorkerMessageType.STOP_LOOPS,
                         body=StopLoops(
-                            rid=self._rid_str(rid),
+                            request_id=self._rid_str(rid),
                             loop_names=loop_names,
                             loop_stop_times=batch_N.node_batch.per_request_info[rid].loop_stop_times,
                             partition_name=batch_N.partition
@@ -2574,7 +2580,7 @@ class Worker:
         for rid in to_apply:
             self._pending_removes.discard(rid)
             self._remove_request(RemoveRequest(
-                rid=self._rid_str(rid), source=MessageSource.SELF,
+                request_id=self._rid_str(rid), source=MessageSource.SELF,
             ))
 
     def _drop_failed_rids(
@@ -3181,12 +3187,11 @@ class Worker:
                 node_batch = self._build_executing_batch(batch)
                 batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
-                for rid, req_info in node_batch.per_request_info.items():
-                    req_info.dynamic_loop_iter_counts.update(
-                        self.worker_graphs_manager.get_dynamic_loop_iters(
-                            rid, partition=batch_partition,
-                        )
-                    )
+                for rid, new_iters in self._rid_runtime.get_dynamic_loop_iters(
+                    list(node_batch.per_request_info), partition=batch_partition,
+                ):
+                    node_batch.per_request_info[rid] \
+                        .dynamic_loop_iter_counts.update(new_iters)
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 

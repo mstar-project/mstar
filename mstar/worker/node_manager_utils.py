@@ -252,21 +252,17 @@ class WorkerGraphsManager:
     # to in the colocated case.
     node_to_partition: dict[str, str] = field(default_factory=dict)
 
-    # Inverted index: (graph_walk, node_name) -> worker_graph_id.
-    # Built in __post_init__ from all_worker_graph_ids_to_graph_walks +
-    # all_worker_graph_ids_to_nodes. Lets get_worker_graph_id_for_node skip
-    # the linear scan over the request's worker_graph_ids.
+    # (graph_walk, node_name) -> worker_graph_id, built once at init.
+    # PythonGraphRuntime has the same index; this copy stays until the three
+    # readers below (process_node_outputs routing, get_nested_loop_idxs_for_node)
+    # move to the runtime. Both are derived from the same immutable inputs, so
+    # they cannot diverge.
     walk_node_to_worker_graph_id: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def __post_init__(self):
         for wg_id, walks in self.all_worker_graph_ids_to_graph_walks.items():
             for walk in walks:
                 for node in self.all_worker_graph_ids_to_nodes.get(wg_id, set()):
-                    # Multiple worker graphs may share a (walk, node) only when
-                    # walks are co-partitioned; the last write wins. This index
-                    # is only consulted with (walk, node) pairs that the
-                    # request's per_request_info already includes, so the
-                    # ambiguity is moot for routing.
                     self.walk_node_to_worker_graph_id[(walk, node)] = wg_id
 
     def update_request_info(
@@ -345,28 +341,6 @@ class WorkerGraphsManager:
                     rid, inputs, can_buffer=can_buffer
                 )
         return inputs
-
-    def get_worker_graph_id_for_node(
-        self, rid: int, node_name: str,
-        graph_walk: str | None = None,
-    ) -> str:
-        """Worker graph that owns ``node_name`` for this request.
-
-        ``graph_walk`` defaults to the node's partition's current walk. Pass it
-        explicitly when the walk is dictated by someone else (e.g. a TP
-        follower acting on the leader's ``ScheduleTPNode``), since this
-        worker's own partition state may have advanced past it.
-        """
-        if graph_walk is None:
-            partition = self.get_partition_for_node(node_name)
-            graph_walk = self.get_graph_walk(rid, partition)
-        wg_id = self.walk_node_to_worker_graph_id.get((graph_walk, node_name))
-        if wg_id is None:
-            raise RuntimeError(
-                f"Could not find worker graph for node {node_name!r}, "
-                f"request {rid!r}, graph_walk {graph_walk!r}"
-            )
-        return wg_id
 
     def mark_node_complete(
         self, rid: int, worker_graph_id: int, node_name: str,
@@ -589,20 +563,6 @@ class WorkerGraphsManager:
         wgio = self.queues[wgid].per_request_queues.get(rid)
         return wgio.get_nested_loop_idxs_for_node(node_name)
 
-    def get_dynamic_loop_iters(
-        self, rid: int,
-        partition: str,
-    ) -> dict[str, int]:
-        part_info = self.per_request_info[rid].per_partition_info[partition]
-        worker_graph_ids = part_info.graph_walk_worker_graph_ids
-
-        iter_counts: dict[str, int] = {}
-        for worker_graph_id in worker_graph_ids:
-            iter_counts.update(
-                self.queues[worker_graph_id].get_dynamic_loop_iters(rid)
-            )
-        return iter_counts
-
     def add_request(
         self, rid: int,
         partition_worker_graph_ids: list[int], # for this worker's worker graphs
@@ -619,10 +579,8 @@ class WorkerGraphsManager:
         my_worker_graph_ids = [gid for gid in partition_worker_graph_ids if gid in self.queues]
         partition_name = current_fwd_info.partition_name
 
-        for graph_id in partition_worker_graph_ids:
-            if graph_id in self.queues:
-                self.queues[graph_id].add_request(rid)
-
+        # The per-request queue lifecycle belongs to PythonGraphRuntime, which
+        # runs first on this path and shares this exact queues dict.
 
         if rid not in self.per_request_info:
             # Note: conductor.py passes the same worker_graph_to_worker dict
@@ -678,10 +636,8 @@ class WorkerGraphsManager:
             )
 
     def remove_request(self, rid: int):
-        if rid in self.per_request_info:
-            for queue_id in self.per_request_info[rid].worker_graph_ids:
-                self.queues[queue_id].remove_request(rid)
-            del self.per_request_info[rid]
+        # Queue teardown belongs to PythonGraphRuntime.remove_request.
+        self.per_request_info.pop(rid, None)
 
     def check_dyn_loop(self, rid: int, partition_name: str, loop_name: str) -> bool:
         ngw = NodeAndGraphWalk(

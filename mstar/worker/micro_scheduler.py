@@ -8,6 +8,7 @@ from enum import Enum
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AdmitRuntimeError
 from mstar.graph.base import GraphNode
+from mstar.graph.runtime.base import GraphRuntime
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import WorkerGraphsManager
@@ -117,6 +118,9 @@ class MicroScheduler:
     ):
         self.engine_manager = engine_manager
         self.batch_number = 0
+        # The graph runtime, installed by the worker. Interning and the
+        # (walk, node) -> worker graph index both live there.
+        self.runtime: "GraphRuntime | None" = None
         # Interns a wire rid string; the worker installs the real one. Only the
         # TP-follow messages need it -- everything else here is already handles.
         # Defaults to the identity so a scheduler driven directly with string
@@ -225,9 +229,7 @@ class MicroScheduler:
         if not rids:
             return {}, {}
         node_partition = worker_graphs_manager.get_partition_for_node(node_name)
-        wgid = worker_graphs_manager.get_worker_graph_id_for_node(
-            rids[0], node_name, graph_walk=graph_walk,
-        )
+        wgid = self.runtime.get_worker_graph_id_for_node(node_name, graph_walk)
         queue = worker_graphs_manager.queues[wgid]
         for rid in rids:
             # An unknown rid (removed on this rank) counts as not ready.

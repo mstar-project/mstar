@@ -15,9 +15,10 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
+from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.model.base import WorkerGraph
+from mstar.utils.containers import ParallelList
 from mstar.worker.node_manager_utils import (
-    WorkerGraphQueues,
     WorkerGraphsManager,
 )
 
@@ -89,81 +90,99 @@ def _make_ar_walk_graph():
     ])
 
 
-def _make_manager(wg_id=0, graph_walk="decode", worker_id="worker0"):
-    """Build a WorkerGraphsManager with one WorkerGraphQueues + one request."""
-    graph = _make_ar_walk_graph()
+def _build(section, wg_id, walk, nodes, loops=frozenset(), worker_id="worker0"):
+    """Wire a runtime + manager the way Worker does, and admit one request.
+
+    The runtime owns the per-request queue lifecycle and the manager is handed
+    the SAME queues dict, so both see one copy of the state.
+    """
     worker_graph = WorkerGraph(
-        section=graph,
-        graph_walks={graph_walk},
-        ranks=[0],
-        worker_graph_id=wg_id,
+        section=section, graph_walks={walk}, ranks=[0], worker_graph_id=wg_id,
     )
-    queues = {
-        wg_id: WorkerGraphQueues(
-            worker_graph_id=wg_id,
-            graph_walks={graph_walk},
-            worker_graph=worker_graph,
-            per_request_queues={},
-            tensor_manager=StubTensorManager(),
-        )
-    }
+    all_walks = {wg_id: {walk}}
+    all_nodes = {wg_id: set(nodes)}
+    all_loops = {wg_id: set(loops)}
+    node_to_partition = dict.fromkeys(nodes, "default")
+
+    runtime = PythonGraphRuntime(
+        my_worker_id=worker_id,
+        my_worker_graphs=[worker_graph],
+        all_wg_ids_to_graph_walks=all_walks,
+        all_wg_ids_to_dyn_loops=all_loops,
+        all_wg_ids_to_nodes=all_nodes,
+        node_to_partition=node_to_partition,
+        sharding_config=_sharding_config(),
+        tensor_manager=StubTensorManager(),
+    )
     mgr = WorkerGraphsManager(
-        queues=queues,
+        queues=runtime.queues,
         per_request_info={},
         base_sharding_config=_sharding_config(),
         worker_id=worker_id,
-        all_worker_graph_ids_to_graph_walks={wg_id: {graph_walk}},
-        all_worker_graph_ids_to_nodes={wg_id: {"prefill", "ar_decode"}},
-        all_worker_graph_ids_to_dyn_loops={wg_id: {"ar_loop"}},
-        node_to_partition={"prefill": "default", "ar_decode": "default"},
+        all_worker_graph_ids_to_graph_walks=all_walks,
+        all_worker_graph_ids_to_nodes=all_nodes,
+        all_worker_graph_ids_to_dyn_loops=all_loops,
+        node_to_partition=node_to_partition,
+    )
+    fwd_info = _fwd_info(walk)
+    rid = runtime.add_request(
+        request_id=fwd_info.request_id,
+        partition=fwd_info.partition_name,
+        graph_walk=walk,
+        partition_worker_graph_ids=[wg_id],
+        worker_graph_to_workers=ParallelList([wg_id], [[worker_id]]),
     )
     mgr.add_request(
-        rid="rid",
+        rid=rid,
         partition_worker_graph_ids=[wg_id],
         worker_graph_to_workers={wg_id: [worker_id]},
-        current_fwd_info=_fwd_info(graph_walk),
+        current_fwd_info=fwd_info,
     )
-    return mgr, wg_id, graph_walk
+    return mgr, runtime, rid
+
+
+def _make_manager(wg_id=0, graph_walk="decode", worker_id="worker0"):
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), wg_id, graph_walk,
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"}, worker_id=worker_id,
+    )
+    return mgr, wg_id, graph_walk, runtime, rid
 
 
 # --- tests -------------------------------------------------------------------
 
 def test_inverted_index_populated_at_init():
-    mgr, wg_id, walk = _make_manager()
+    mgr, wg_id, walk, runtime, rid = _make_manager()
     # Both nodes should be indexed under the walk.
-    assert mgr.walk_node_to_worker_graph_id[(walk, "prefill")] == wg_id
-    assert mgr.walk_node_to_worker_graph_id[(walk, "ar_decode")] == wg_id
+    assert runtime._walk_node_to_wg_id[(walk, "prefill")] == wg_id
+    assert runtime._walk_node_to_wg_id[(walk, "ar_decode")] == wg_id
     # Unknown (walk, node) pairs should not be in the index.
-    assert ("other_walk", "prefill") not in mgr.walk_node_to_worker_graph_id
+    assert ("other_walk", "prefill") not in runtime._walk_node_to_wg_id
 
 
 def test_get_worker_graph_id_uses_inverted_index():
-    mgr, wg_id, _ = _make_manager()
-    assert mgr.get_worker_graph_id_for_node("rid", "prefill") == wg_id
-    assert mgr.get_worker_graph_id_for_node("rid", "ar_decode") == wg_id
+    mgr, wg_id, walk, runtime, rid = _make_manager()
+    assert runtime.get_worker_graph_id_for_node("prefill", walk) == wg_id
+    assert runtime.get_worker_graph_id_for_node("ar_decode", walk) == wg_id
 
 
 def test_get_worker_graph_id_raises_for_unknown_node():
-    mgr, _, walk = _make_manager()
-    # An unknown node either has no partition (KeyError on fwd_info lookup) or
-    # an unknown (walk, node) in the inverted index (RuntimeError below). Both
-    # paths surface as exceptions — what matters is that the manager doesn't
-    # silently return a wrong wg id.
-    # Add a fake partition mapping so we reach the inverted-index check.
-    mgr.node_to_partition["mystery_node"] = "default"
+    mgr, wg_id, walk, runtime, rid = _make_manager()
+    # What matters is that an unknown (walk, node) raises rather than silently
+    # returning some other worker graph.
     with pytest.raises(RuntimeError, match="Could not find worker graph"):
-        mgr.get_worker_graph_id_for_node("rid", "mystery_node")
+        runtime.get_worker_graph_id_for_node("mystery_node", walk)
 
 
 def test_mark_node_complete_returns_node_completion_output():
-    mgr, wg_id, _ = _make_manager()
+    mgr, wg_id, walk, runtime, rid = _make_manager()
     # Ingest prompt → prefill, then complete prefill.
-    leftovers = mgr.process_new_inputs("rid", [
+    leftovers = mgr.process_new_inputs(rid, [
         GraphEdge(name="prompt", next_node="prefill"),
     ])
     assert leftovers == []  # prefill is in this wg, edge claimed
 
-    completion = mgr.mark_node_complete("rid", wg_id, "prefill")
+    completion = mgr.mark_node_complete(rid, wg_id, "prefill")
     # Top-level GraphNode completion returns its outputs (token + kv_cache → ar_decode)
     # with no filtered signals (prefill isn't loop-managed).
     names = sorted((e.name, e.next_node) for e in completion.output_edges)
@@ -172,8 +191,8 @@ def test_mark_node_complete_returns_node_completion_output():
 
 
 def test_process_new_inputs_leftovers_when_destination_unknown():
-    mgr, _, _ = _make_manager()
-    leftovers = mgr.process_new_inputs("rid", [
+    mgr, wg_id, walk, runtime, rid = _make_manager()
+    leftovers = mgr.process_new_inputs(rid, [
         GraphEdge(name="prompt", next_node="prefill"),
         GraphEdge(name="some_other_input", next_node="not_in_this_wg"),
     ])
@@ -183,31 +202,31 @@ def test_process_new_inputs_leftovers_when_destination_unknown():
 
 
 def test_stop_loops_returns_loop_back_signal_set():
-    mgr, wg_id, _ = _make_manager()
+    mgr, wg_id, walk, runtime, rid = _make_manager()
     # Drive prefill → ar_decode so the loop is active.
-    mgr.process_new_inputs("rid", [GraphEdge(name="prompt", next_node="prefill")])
-    mgr.mark_node_complete("rid", wg_id, "prefill")
+    mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+    mgr.mark_node_complete(rid, wg_id, "prefill")
 
     stopped = mgr.stop_loops(
-        rid="rid",
+        rid=rid,
         partition="default",
         loop_names={"ar_loop"},
     )
     # ar_loop has two loop-back inputs: (token, ar_decode) and (kv_cache, ar_decode).
     assert stopped == {("token", "ar_decode"), ("kv_cache", "ar_decode")}
     # _finish_signal should be set on the live loop.
-    wgio = mgr.queues[wg_id].per_request_queues["rid"]
+    wgio = mgr.queues[wg_id].per_request_queues[rid]
     assert wgio.loops["ar_loop"]._finish_signal is True
 
 
 def test_stop_loops_snapshots_loop_stop_times_when_req_info_provided():
-    mgr, wg_id, walk = _make_manager()
-    mgr.process_new_inputs("rid", [GraphEdge(name="prompt", next_node="prefill")])
-    mgr.mark_node_complete("rid", wg_id, "prefill")
-    fwd_info = mgr.get_fwd_info("rid", "default")
+    mgr, wg_id, walk, runtime, rid = _make_manager()
+    mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+    mgr.mark_node_complete(rid, wg_id, "prefill")
+    fwd_info = mgr.get_fwd_info(rid, "default")
 
     mgr.stop_loops(
-        rid="rid",
+        rid=rid,
         partition="default",
         loop_names={"ar_loop"},
         req_info=fwd_info,
@@ -224,23 +243,23 @@ def test_loop_done_drops_loop_back_and_keeps_terminal_outputs():
     """Drive prefill and two ar_decode iterations, requesting loop termination
     before the second completes. The final completion should report loop-back
     signals in ``filtered_signals`` and return only the terminal outputs."""
-    mgr, wg_id, _ = _make_manager()
-    mgr.process_new_inputs("rid", [GraphEdge(name="prompt", next_node="prefill")])
-    mgr.mark_node_complete("rid", wg_id, "prefill")
+    mgr, wg_id, walk, runtime, rid = _make_manager()
+    mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+    mgr.mark_node_complete(rid, wg_id, "prefill")
     # Route prefill's outputs back in.
-    mgr.process_new_inputs("rid", [
+    mgr.process_new_inputs(rid, [
         GraphEdge(name="token", next_node="ar_decode"),
         GraphEdge(name="kv_cache", next_node="ar_decode"),
     ])
-    mgr.mark_node_complete("rid", wg_id, "ar_decode")  # advance: iter 0 done
+    mgr.mark_node_complete(rid, wg_id, "ar_decode")  # advance: iter 0 done
 
     # Now request a stop on ar_loop, then complete the next iter.
-    mgr.process_new_inputs("rid", [
+    mgr.process_new_inputs(rid, [
         GraphEdge(name="token", next_node="ar_decode"),
         GraphEdge(name="kv_cache", next_node="ar_decode"),
     ])
-    mgr.stop_loops("rid", "default", {"ar_loop"})
-    completion = mgr.mark_node_complete("rid", wg_id, "ar_decode")
+    mgr.stop_loops(rid, "default", {"ar_loop"})
+    completion = mgr.mark_node_complete(rid, wg_id, "ar_decode")
 
     assert sorted(completion.filtered_signals) == [
         ("kv_cache", "ar_decode"), ("token", "ar_decode"),
@@ -264,38 +283,13 @@ def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
         outputs=[],  # no declared outputs — KV-cache-only step
     )
     wg_id = 1
-    worker_graph = WorkerGraph(
-        section=empty_outputs_graph,
-        graph_walks={"prefill_text"},
-        ranks=[0],
-        worker_graph_id=wg_id,
+    mgr, _runtime, rid = _build(
+        empty_outputs_graph, wg_id, "prefill_text", nodes={"prefill_text"},
     )
-    mgr = WorkerGraphsManager(
-        queues={wg_id: WorkerGraphQueues(
-            worker_graph_id=wg_id,
-            graph_walks={"prefill_text"},
-            worker_graph=worker_graph,
-            per_request_queues={},
-            tensor_manager=StubTensorManager(),
-        )},
-        per_request_info={},
-        base_sharding_config=_sharding_config(),
-        worker_id="worker0",
-        all_worker_graph_ids_to_graph_walks={wg_id: {"prefill_text"}},
-        all_worker_graph_ids_to_nodes={wg_id: {"prefill_text"}},
-        all_worker_graph_ids_to_dyn_loops={wg_id: set()},
-        node_to_partition={"prefill_text": "default"},
-    )
-    mgr.add_request(
-        rid="rid",
-        partition_worker_graph_ids=[wg_id],
-        worker_graph_to_workers={wg_id: ["worker0"]},
-        current_fwd_info=_fwd_info("prefill_text"),
-    )
-    mgr.process_new_inputs("rid", [GraphEdge(name="text_inputs", next_node="prefill_text")])
-    assert not mgr.queues[wg_id].is_done("rid")  # not done before complete
-    mgr.mark_node_complete("rid", wg_id, "prefill_text")
-    assert mgr.queues[wg_id].is_done("rid"), \
+    mgr.process_new_inputs(rid, [GraphEdge(name="text_inputs", next_node="prefill_text")])
+    assert not mgr.queues[wg_id].is_done(rid)  # not done before complete
+    mgr.mark_node_complete(rid, wg_id, "prefill_text")
+    assert mgr.queues[wg_id].is_done(rid), \
         "mark_node_complete on a no-output node must flip is_done"
 
 
@@ -320,41 +314,16 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
         ],
     )
     wg_id = 2
-    worker_graph = WorkerGraph(
-        section=single_node_graph,
-        graph_walks={"prefill"},
-        ranks=[0],
-        worker_graph_id=wg_id,
+    mgr, _runtime, rid = _build(
+        single_node_graph, wg_id, "prefill", nodes={"prefill"},
     )
-    mgr = WorkerGraphsManager(
-        queues={wg_id: WorkerGraphQueues(
-            worker_graph_id=wg_id,
-            graph_walks={"prefill"},
-            worker_graph=worker_graph,
-            per_request_queues={},
-            tensor_manager=StubTensorManager(),
-        )},
-        per_request_info={},
-        base_sharding_config=_sharding_config(),
-        worker_id="worker0",
-        all_worker_graph_ids_to_graph_walks={wg_id: {"prefill"}},
-        all_worker_graph_ids_to_nodes={wg_id: {"prefill"}},
-        all_worker_graph_ids_to_dyn_loops={wg_id: set()},
-        node_to_partition={"prefill": "default"},
-    )
-    mgr.add_request(
-        rid="rid",
-        partition_worker_graph_ids=[wg_id],
-        worker_graph_to_workers={wg_id: ["worker0"]},
-        current_fwd_info=_fwd_info("prefill"),
-    )
-    mgr.process_new_inputs("rid", [GraphEdge(name="prompt", next_node="prefill")])
-    mgr.mark_node_complete("rid", wg_id, "prefill")
+    mgr.process_new_inputs(rid, [GraphEdge(name="prompt", next_node="prefill")])
+    mgr.mark_node_complete(rid, wg_id, "prefill")
 
     routing = mgr.process_node_outputs(
-        "rid",
+        rid,
         node_name="prefill",
-        outputs=list(mgr.queues[wg_id].per_request_queues["rid"].nodes["prefill"].outputs),
+        outputs=list(mgr.queues[wg_id].per_request_queues[rid].nodes["prefill"].outputs),
         graph_walk="prefill",
     )
     assert wg_id in routing.completed_worker_graph_ids, \

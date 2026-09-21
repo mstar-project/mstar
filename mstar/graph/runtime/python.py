@@ -85,9 +85,25 @@ class PythonGraphRuntime(GraphRuntime):
         self._all_wg_ids_to_graph_walks = all_wg_ids_to_graph_walks
         self._all_wg_ids_to_dyn_loops = all_wg_ids_to_dyn_loops
         self._all_wg_ids_to_nodes = all_wg_ids_to_nodes
+
+        # (graph_walk, node) -> worker graph. Saves a linear scan over the
+        # request's worker graphs on every routing decision. Two worker graphs
+        # can share a (walk, node) only when their walks are co-partitioned, so
+        # last-write-wins is unambiguous for the pairs this is queried with.
+        self._walk_node_to_wg_id: dict[tuple[str, str], int] = {}
+        for wg_id, walks in all_wg_ids_to_graph_walks.items():
+            for walk in walks:
+                for node in all_wg_ids_to_nodes.get(wg_id, set()):
+                    self._walk_node_to_wg_id[(walk, node)] = wg_id
         self._node_to_partition = node_to_partition
         self._sharding_config = sharding_config
 
+
+    @property
+    def queues(self) -> dict[int, WorkerGraphQueues]:
+        """Shared with WorkerGraphsManager while the port is in flight; the
+        runtime owns the per-request lifecycle (add_request / remove_request)."""
+        return self._queues
 
     # --------- Bookkeeping ----------
 
@@ -193,8 +209,17 @@ class PythonGraphRuntime(GraphRuntime):
         request_info = self._request_info.get(rid)
         if request_info is None:
             return
-        request_info.partition_info.get(partition).graph_walk = walk
-
+        part_info = request_info.partition_info.get(partition)
+        if part_info is None or part_info.graph_walk == walk:
+            return
+        part_info.graph_walk = walk
+        # The walk selects which of the request's worker graphs are live, so it
+        # has to be re-derived here; leaving it stale would route this pass's
+        # inputs into the previous walk's graphs.
+        part_info.graph_walk_worker_graph_ids = [
+            wg_id for wg_id in request_info.worker_graph_ids
+            if walk in self._all_wg_ids_to_graph_walks[wg_id]
+        ]
 
     def set_speculatively_scheduled(
         self, node: str, wg_id: int, rids: list[int],
@@ -210,12 +235,25 @@ class PythonGraphRuntime(GraphRuntime):
         self, request_ids: list[int],
         partition: str,
     ) -> ParallelList[int, dict[str, int]]:
-        raise NotImplementedError
+        values = []
+        for rid in request_ids:
+            iter_counts: dict[str, int] = {}
+            part_info = self._request_info[rid].partition_info[partition]
+            for wg_id in part_info.graph_walk_worker_graph_ids:
+                iter_counts.update(self._queues[wg_id].get_dynamic_loop_iters(rid))
+            values.append(iter_counts)
+        return ParallelList(list(request_ids), values)
 
     def get_worker_graph_id_for_node(
         self, node: str, graph_walk: str,
     ) -> int:
-        raise NotImplementedError
+        wg_id = self._walk_node_to_wg_id.get((graph_walk, node))
+        if wg_id is None:
+            raise RuntimeError(
+                f"Could not find worker graph for node {node!r}, "
+                f"graph_walk {graph_walk!r}"
+            )
+        return wg_id
 
     # --------- Inputs ----------
 

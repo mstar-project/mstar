@@ -70,6 +70,13 @@ class _FakeQueue:
         return {}
 
 
+class _FakeRuntime:
+    """The runtime owns the (walk, node) -> worker graph index now."""
+
+    def get_worker_graph_id_for_node(self, node_name, graph_walk):
+        return "wg0"
+
+
 class _FakeWorkerGraphsManager:
     def __init__(self, queue):
         self.queues = {"wg0": queue}
@@ -78,18 +85,17 @@ class _FakeWorkerGraphsManager:
     def get_partition_for_node(self, node_name):
         return "p0"
 
-    def get_worker_graph_id_for_node(self, rid, node_name, graph_walk=None):
-        return "wg0"
-
     def get_fwd_info(self, rid, partition):
         return None
 
 
 def _sched(engine=None):
-    return MicroScheduler(
+    sched = MicroScheduler(
         engine_manager=_FakeEngineManager(engine or _FakeEngine()),
         parallel_leader_nodes=set(),  # follower role
     )
+    sched.runtime = _FakeRuntime()
+    return sched
 
 
 def _head(rids, seq=5, from_seq=4):
