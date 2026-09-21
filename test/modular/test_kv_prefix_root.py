@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from mstar.engine.engine import Engine
+from mstar.engine.resources import Resource
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec
 from mstar.engine.resources.kv.manager import KVManager
@@ -223,4 +224,58 @@ def test_the_engine_hands_each_cache_the_walks_its_streams_name():
     assert kv._keyed_walks == {"main": {"prefill_text", "decode"}}, (
         "the cache was opened without the walks its keys describe, so every "
         "walk's pages would be filed under them"
+    )
+
+
+# ── which resources are offered the root ────────────────────────────────
+
+
+class _Recording(Resource):
+    """Keeps state across requests of its own, and records the root it is handed."""
+
+    def __init__(self):
+        self.roots: list[bytes] = []
+
+    @classmethod
+    def build(cls, spec, info):
+        raise NotImplementedError
+
+    def enable_prefix_cache(self, root, walks=None):
+        self.roots.append(root)
+
+
+class _Plain(Resource):
+    """Keeps nothing across requests, so has nothing to open."""
+
+    @classmethod
+    def build(cls, spec, info):
+        raise NotImplementedError
+
+
+def _open(resources: dict) -> None:
+    engine = Engine.__new__(Engine)
+    engine._resources = resources
+    kv = resources[KV]
+    engine._open_prefix_caches(
+        {KV: KVSpec(resource_key=KV, nodes={"LLM"}, config=kv.config)}, _Model(),
+    )
+
+
+def test_every_resource_is_offered_the_root_not_just_the_kv_cache():
+    other = _Recording()
+
+    _open({KV: _kv(), "other": other})
+
+    assert len(other.roots) == 1 and isinstance(other.roots[0], bytes), (
+        "a resource that is not a KVManager was never asked to open its cache"
+    )
+
+
+def test_a_resource_with_nothing_to_open_leaves_the_cache_beside_it_open():
+    kv = _kv()
+
+    _open({KV: kv, "plain": _Plain()})
+
+    assert kv._index is not None, (
+        "a resource with nothing to open kept the cache beside it shut"
     )
