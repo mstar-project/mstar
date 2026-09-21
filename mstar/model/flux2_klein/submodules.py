@@ -190,7 +190,7 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         *,
         loop_name: str,
         attn_resource_key: str | None,
-        compile_transformer: bool = True, compile_eager_rounding: bool = True,
+        compile_transformer: bool = True, compile_eager_rounding: bool = True, compile_exact_ops: bool = False,
         max_batch_size: int = 8,
         capture_shapes=(),
         capture_batch_sizes=(1, 2, 4, 8),
@@ -207,7 +207,9 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         if self._compile:
             # In place, so the module keeps its identity (dtype property, tests' swaps);
             # dynamic=False traces one graph per (batch, shape) — announced per shape.
-            compile_transformer_forward(transformer, eager_rounding=compile_eager_rounding)
+            compile_transformer_forward(
+                transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+            )
 
     # hooks -----------------------------------------------------------------
     def shape_key_for(self, fwd_info: CurrentForwardPassInfo) -> KleinShape:
@@ -284,14 +286,39 @@ VAE_COMPILE_MODE = "max-autotune-no-cudagraphs"
 VAE_DECODE_BATCH_SIZES = (1, 2, 4, 8)
 
 
-def compile_transformer_forward(transformer: nn.Module, eager_rounding: bool = True) -> None:
+# Modules whose eager CUDA kernels differ in the last bit from inductor's decompositions:
+# reductions (LayerNorm / RMSNorm mean and variance) and transcendental activations (SiLU).
+EXACT_OP_TYPES = (nn.LayerNorm, nn.RMSNorm, nn.SiLU)
+
+
+def exclude_from_compile(transformer: nn.Module) -> int:
+    """Keep the transformer's norms and activations on the eager kernels inside a compiled
+    forward: each excluded module's forward becomes a dynamo graph break, so inductor only
+    fuses the pointwise chains around the GEMMs and attention. A module opts in by type
+    (``EXACT_OP_TYPES``) or with a ``compile_exact_op = True`` class attribute. Returns the
+    number of modules excluded."""
+    count = 0
+    for module in transformer.modules():
+        if isinstance(module, EXACT_OP_TYPES) or getattr(module, "compile_exact_op", False):
+            module.forward = torch._dynamo.disable(module.forward)
+            count += 1
+    return count
+
+
+def compile_transformer_forward(transformer: nn.Module, eager_rounding: bool = True, exact_ops: bool = False) -> None:
     """Compile ``transformer.forward`` in place (one static graph per shape; the graph runner
     captures those kernels). With ``eager_rounding`` inductor rounds every intermediate to the
     tensor dtype exactly where eager PyTorch does (``emulate_precision_casts``): without it, fused
     bf16 chains keep fp32 intermediates and the served images drift to 35-39 dB from the bit-exact
-    eager path on a 4-step distilled sampler (measured); with it the fusions keep eager numerics."""
+    eager path on a 4-step distilled sampler (measured). Even with it the compiled transformer
+    lands at a median 37.6 dB over 100 prompts (klein-4B), because inductor's own reductions and
+    activation decompositions round differently: ``exact_ops`` keeps those modules eager
+    (``exclude_from_compile``) and compiles the rest."""
     import torch._inductor.config as inductor_config
 
+    if exact_ops:
+        excluded = exclude_from_compile(transformer)
+        logger.info("compiled transformer keeps %d norm / activation modules on the eager kernels", excluded)
     inductor_config.emulate_precision_casts = bool(eager_rounding)
     transformer.forward = torch.compile(transformer.forward, fullgraph=False, dynamic=False)
 
