@@ -188,10 +188,17 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
   captured as a CUDA graph for batch sizes 1 to 64.
 - ``eartts_talker`` advances every live session in one backbone pass per frame
-  (caches padded and masked to the longest session, per-row positions, per-row
-  seeded sampling noise), so a session's speech does not depend on which other
-  sessions share the step. Its KV still lives in per-request state and it runs
-  eager; it is the largest per-frame cost.
+  through the engine's paged KV (``talker_kv`` / ``talker_attn`` /
+  ``talker_pos``): each session owns two streams, the conditional and the
+  unconditional CFG context, planned together under one combined label, so a
+  step is one packed batch of two tokens per session (a session's first step
+  prefills its 38-token speaker/text warm-up instead). The pool's head dim is
+  128: FlashInfer computes 64/128/256 exactly and returns wrong values for the
+  talker's 72, so q/k/v are zero-padded (exact) and RoPE is applied in torch
+  from the positions the position resource planned. Sampling noise is drawn
+  per row from the request's seeded generator before the step, so a session's
+  speech does not depend on which other sessions share it. The per-frame step
+  is captured as a CUDA graph for 1 to 64 sessions.
 - The nano text tokenizer is read from the ``nano/`` folder of
   ``pipecat-ai/NVIDIA-NemotronLabs-VoiceChat-11B-Spark`` (the base checkpoint
   ships only the RNN-T tokenizer); prefetch both repositories on machines
