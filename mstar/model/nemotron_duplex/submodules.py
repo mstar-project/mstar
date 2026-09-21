@@ -422,14 +422,16 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         noise, one pair per MaskGIT iteration."""
         e = self.config.eartts
         n = len(gens)
-        u = torch.empty(e.inference_num_iter, n, 1, e.mog_num_predictions, device=device)
-        eps = torch.empty(e.inference_num_iter, n, 1, e.code_dim, device=device)
+        # rows first: the engine's static-input buffers are narrowed along the
+        # leading (batch) dim when a smaller batch replays a capture
+        u = torch.empty(n, e.inference_num_iter, 1, e.mog_num_predictions, device=device)
+        eps = torch.empty(n, e.inference_num_iter, 1, e.code_dim, device=device)
         for i, k in enumerate(maskgit_schedule(e.inference_num_iter, e.mog_exponent, e.num_quantizers)):
             if k == 0:
                 continue
             # the same draws, in the same order, as the sequential per-session step
-            u[i] = torch.stack([torch.rand((1, e.mog_num_predictions), device=device, generator=g) for g in gens])
-            eps[i] = torch.stack([torch.randn((1, e.code_dim), device=device, generator=g) for g in gens])
+            u[:, i] = torch.stack([torch.rand((1, e.mog_num_predictions), device=device, generator=g) for g in gens])
+            eps[:, i] = torch.stack([torch.randn((1, e.code_dim), device=device, generator=g) for g in gens])
         return {"noise_u": u, "noise_eps": eps}
 
     # -- engine contract -------------------------------------------------
@@ -526,7 +528,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             last = hidden                                                 # [2N, H]: cond rows, uncond rows
         else:
             last = engine_inputs.resources[TALKER_ATTN].select_last_hidden(hidden, label=TALKER_CFG_LABEL)
-        noise = [(noise_u[i], noise_eps[i]) for i in range(e.inference_num_iter)]
+        noise = [(noise_u[:, i], noise_eps[:, i]) for i in range(e.inference_num_iter)]
         codes = self.talker.generate_step(
             last[:n].unsqueeze(1), hidden_uncond=last[n:].unsqueeze(1),
             num_iter=e.inference_num_iter, guidance_scale=e.inference_guidance_scale,
