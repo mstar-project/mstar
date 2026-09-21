@@ -23,7 +23,6 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
@@ -48,9 +47,10 @@ class TimestepEmbedder(nn.Module):
         super().__init__()
         self.linear_in = nn.Linear(in_channels, dim, bias=False)
         self.linear_out = nn.Linear(dim, dim, bias=False)
+        self.act = nn.SiLU()
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.linear_out(F.silu(self.linear_in(features)))
+        return self.linear_out(self.act(self.linear_in(features)))
 
 
 class SwiGLUFeedForward(nn.Module):
@@ -62,10 +62,11 @@ class SwiGLUFeedForward(nn.Module):
         self.inner_dim = inner_dim
         self.linear_in = nn.Linear(dim, inner_dim * 2, bias=False)
         self.linear_out = nn.Linear(inner_dim, dim, bias=False)
+        self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.linear_in(x).split(self.inner_dim, dim=-1)
-        return self.linear_out(F.silu(gate) * up)
+        return self.linear_out(self.act(gate) * up)
 
 
 def _modulate(norm: nn.LayerNorm, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -174,6 +175,7 @@ class Flux2SingleBlock(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, eps=eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=eps)
         self.out = nn.Linear(self.inner_dim + self.mlp_hidden_dim, dim, bias=False)
+        self.act = nn.SiLU()
 
     def forward(
         self,
@@ -191,7 +193,7 @@ class Flux2SingleBlock(nn.Module):
         k = apply_rotary_interleaved(self.k_norm(k), cos, sin)
         attn = joint_attention(q, k, v, ragged).flatten(2, 3).to(q.dtype)
         gate_in, up = mlp.split(self.mlp_hidden_dim, dim=-1)
-        out = self.out(torch.cat([attn, F.silu(gate_in) * up], dim=-1))
+        out = self.out(torch.cat([attn, self.act(gate_in) * up], dim=-1))
         return x + gate * out
 
 
@@ -210,6 +212,7 @@ class Flux2DiT(nn.Module):
         self.mod_double_img = nn.Linear(dim, 6 * dim, bias=False)
         self.mod_double_txt = nn.Linear(dim, 6 * dim, bias=False)
         self.mod_single = nn.Linear(dim, 3 * dim, bias=False)
+        self.mod_act = nn.SiLU()
         self.img_in = nn.Linear(config.in_channels, dim, bias=False)
         self.txt_in = nn.Linear(config.joint_attention_dim, dim, bias=False)
         self.double_blocks = nn.ModuleList(Flux2DoubleBlock(config) for _ in range(config.num_layers))
@@ -248,7 +251,7 @@ class Flux2DiT(nn.Module):
         ``(cos, sin)`` tables over the joint ``[txt | img]`` layout. Returns the velocity
         ``[B, L(+R), out_channels]``; the caller drops reference-token rows."""
         temb = self.embed_time(timestep, guidance)
-        mod_act = F.silu(temb)
+        mod_act = self.mod_act(temb)
         mod_img = tuple(m.unsqueeze(1) for m in self.mod_double_img(mod_act).chunk(6, dim=-1))
         mod_txt = tuple(m.unsqueeze(1) for m in self.mod_double_txt(mod_act).chunk(6, dim=-1))
         mod_single = tuple(m.unsqueeze(1) for m in self.mod_single(mod_act).chunk(3, dim=-1))
