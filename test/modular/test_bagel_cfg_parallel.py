@@ -166,6 +166,16 @@ def test_shm_kv_transfer_copies_only_requested_page_ranges(tmp_path):
     assert torch.count_nonzero(destination_cache.tensor[:, 1]) == 0
 
 
+def test_shm_kv_transfer_requires_deployment_directory():
+    cache = _kv_cache(torch.zeros((1, 1, 2, 4, 1, 1)))
+
+    with pytest.raises(
+        ValueError,
+        match="shm_dir is required for shared-memory KV transfer",
+    ):
+        ShmKVTransferEngine(cache, "producer", None)  # type: ignore[arg-type]
+
+
 def test_shm_publication_refreshes_when_seq_len_changes(tmp_path):
     source = torch.zeros((1, 1, 2, 4, 1, 1), dtype=torch.float32)
     source_cache = _kv_cache(source)

@@ -333,18 +333,15 @@ class ShmKVTransferEngine(KVTransferEngine):
         self,
         kv_cache: KVCache,
         entity_id: str,
-        shm_dir: str | None = None,
+        shm_dir: str,
         resource_key: str = "kv",
     ):
-        self._kv_cache = kv_cache
-        root = shm_dir or os.getenv("MSTAR_KV_SHM_DIR")
-        if root is None:
-            root = (
-                "/dev/shm/mstar_kv"
-                if os.path.isdir("/dev/shm")
-                else "/tmp/mstar_kv"
+        if not shm_dir:
+            raise ValueError(
+                "shm_dir is required for shared-memory KV transfer"
             )
-        self._shm_dir = root
+        self._kv_cache = kv_cache
+        self._shm_dir = shm_dir
         os.makedirs(self._shm_dir, mode=0o700, exist_ok=True)
         os.chmod(self._shm_dir, 0o700)
         self._entity_id = entity_id
@@ -585,6 +582,10 @@ class KVTransferManager:
             if kv_cache.device.type == "cuda":
                 self._kv_transfer_engine = CudaIpcKVTransferEngine(kv_cache)
             elif needs_remote_transfer:
+                if not transfer_engine_info.shm_dir:
+                    raise ValueError(
+                        "shm_dir is required for shared-memory KV transfer"
+                    )
                 self._kv_transfer_engine = ShmKVTransferEngine(
                     kv_cache=kv_cache,
                     entity_id=transfer_engine_info.my_entity_id,
