@@ -156,7 +156,6 @@ class CacheStream:
         self.released = 0
         self.generation += 1
         self.step_in_flight = False
-        self.converted = False
 
         if freed:
             self.page_indices.clear()
@@ -1254,6 +1253,9 @@ class KVManager(AttentionResource):
                 # over a sealed one its other owners still read. drop the pages
                 # and let the next write allocate; `free` asks for the same
                 self._release_lease(stream)
+                # here, not in `CacheStream.reset`: an offload resets the stream
+                # too, and the probe after its reload still owes the same length
+                stream.converted = False
                 drop = free or self._arena.any_sealed(stream.page_indices)
                 if drop:
                     self._arena.release(stream.page_indices)
