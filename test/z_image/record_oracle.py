@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--width", type=int, default=1024)
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--prompt", default=PROMPT, help="caption to record (e.g. a long one beyond the captured buckets)")
     args = ap.parse_args()
 
     import diffusers
@@ -57,7 +58,7 @@ def main():
         return {}
 
     result = pipe(
-        prompt=PROMPT, height=args.height, width=args.width, num_inference_steps=args.steps, guidance_scale=0.0,
+        prompt=args.prompt, height=args.height, width=args.width, num_inference_steps=args.steps, guidance_scale=0.0,
         generator=torch.Generator(device="cpu").manual_seed(args.seed), callback_on_step_end=on_step_end,
         callback_on_step_end_tensor_inputs=["latents", "prompt_embeds"],
     )
@@ -65,7 +66,7 @@ def main():
         torch.save(tensor, out / f"{name}.pt")
     result.images[0].save(out / "image.png")
     meta = {
-        "repo": args.repo, "prompt": PROMPT, "height": args.height, "width": args.width, "steps": args.steps,
+        "repo": args.repo, "prompt": args.prompt, "height": args.height, "width": args.width, "steps": args.steps,
         "seed": args.seed, "generator_device": "cpu", "dtype": "bfloat16", "guidance_scale": 0.0,
         "torch": torch.__version__, "diffusers": diffusers.__version__, "transformers": transformers.__version__,
         "cuda": torch.version.cuda, "gpu": torch.cuda.get_device_name(0), "python": platform.python_version(),
