@@ -1939,7 +1939,7 @@ impl GraphRuntime {
                             walk, edge.dest_sym,
                             dst_walk, &edge.tensors,
                             &mut shards
-                        );
+                        ).map_err(|e| PyValueError::new_err(e.to_string()))?;
                         for shard in shards {
                             let mut new_edge = edge.clone();
                             new_edge.tensors = shard.tensors;
@@ -1973,7 +1973,7 @@ impl GraphRuntime {
                 self.info(rid)
                     .zip(node_sym)
                     .and_then(|(i, n)| i.shard.as_ref()?.group_of(n, walk_sym))
-                    .is_none_or(|g| g.tp_rank == 0),
+                    .is_none_or(|g| g.tp_rank == Some(0)),
             );
 
             // Sweep EVERY worker graph this request runs in this walk, not

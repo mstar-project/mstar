@@ -43,7 +43,9 @@ pub struct Group {
     pub workers: Vec<Sym>,
     pub workers_set: FxHashSet<Sym>,
     pub tp_size: u32,
-    pub tp_rank: u32,
+    /// `None` until the conductor sets it. Defaulting to 0 would make every
+    /// rank the broadcaster.
+    pub tp_rank: Option<u32>,
 }
 
 impl Group {
@@ -64,7 +66,7 @@ impl Group {
             workers_set: workers.iter().copied().collect(),
             workers,
             tp_size,
-            tp_rank: tp_rank.unwrap_or(0),
+            tp_rank,
         })
     }
 }
@@ -76,6 +78,10 @@ pub enum ShardError {
     /// consumers must resolve to exactly one group, or the `None` lookup is
     /// ambiguous.
     DuplicateStreamingGroup { node: Sym },
+    /// A source group the conductor never ranked. Python asserts too.
+    MissingTpRank { node: Sym, walk: Sym },
+    /// Destination ranks must divide the shard dim evenly.
+    NotDivisible { total: i64, dest_tp: u32 },
 }
 
 impl std::fmt::Display for ShardError {
@@ -88,6 +94,16 @@ impl std::fmt::Display for ShardError {
                 f,
                 "two groups both claim node {node} with graph_walks=None -- \
                  streaming consumers must have exactly one sharding group"
+            ),
+            ShardError::MissingTpRank { node, walk } => write!(
+                f,
+                "source group for node {node} / walk {walk} has no tp_rank; \
+                 the conductor sets one per worker"
+            ),
+            ShardError::NotDivisible { total, dest_tp } => write!(
+                f,
+                "total shard dim size {total} not divisible by dest tp_size \
+                 {dest_tp}"
             ),
         }
     }
@@ -130,6 +146,14 @@ impl ShardingTemplate {
             for &node in &template.nodes {
                 for &walk in &walks {
                     if let Some(workers) = node_to_workers.get(&(node, walk)) {
+                        // Python checks every key the group claims, not just
+                        // whichever bound it first.
+                        if workers.len() as u32 != template.tp_size {
+                            return Err(ShardError::WorkerCount {
+                                got: workers.len(),
+                                tp_size: template.tp_size,
+                            });
+                        }
                         let idx = match bound {
                             Some(i) => i,
                             None => {
@@ -236,6 +260,8 @@ impl ShardMap {
     }
 
     /// Destinations for one edge. `out` is reused across calls.
+    ///
+    /// Errors where Python asserts: an unranked source group, an uneven split.
     pub fn fanout(
         &self,
         signal: Sym,
@@ -245,12 +271,19 @@ impl ShardMap {
         dst_walk: Option<Sym>,
         t: &[TensorRef],
         out: &mut Vec<FanoutDest>,
-    ) {
+    ) -> Result<(), ShardError> {
         out.clear();
         let sg = self.group_of(src, Some(src_walk));
         let dg = self.group_of(dst, dst_walk);
         let (src_worker, src_rank, src_tp) = match sg {
-            Some(g) => (Some(g.workers[g.tp_rank as usize]), g.tp_rank, g.tp_size),
+            Some(g) => {
+                // Not unwrap_or(0): rank 0 is the broadcaster.
+                let rank = g.tp_rank.ok_or(ShardError::MissingTpRank {
+                    node: src,
+                    walk: src_walk,
+                })?;
+                (Some(g.workers[rank as usize]), rank, g.tp_size)
+            }
             None => (None, 0, 1),
         };
         let shard_dim = self.shard_dim.get(&signal).copied();
@@ -283,31 +316,49 @@ impl ShardMap {
                     }
                 }
             }
-            return;
+            return Ok(());
         }
 
-        let sizes: Vec<i64> = t.iter().map(|x| x.dim0).collect();
-        let total = sizes.first().copied().unwrap_or(0) * src_tp as i64;
-        let per_dest = total / dest_tp as i64;
-        let s_start = src_rank as i64 * sizes.first().copied().unwrap_or(0);
-        let s_end = s_start + sizes.first().copied().unwrap_or(0);
+        // Every tensor, before routing any: truncating would silently drop
+        // the remainder rows.
+        for x in t {
+            let total = x.dim0 * src_tp as i64;
+            if total % dest_tp as i64 != 0 {
+                return Err(ShardError::NotDivisible { total, dest_tp });
+            }
+        }
+
+        // WHICH destinations overlap: the first tensor decides, as in Python.
+        let first = t.first().map_or(0, |x| x.dim0);
+        let per_dest0 = (first * src_tp as i64) / dest_tp as i64;
+        let s0_start = src_rank as i64 * first;
+        let s0_end = s0_start + first;
         for r in 0..dest_tp {
-            let d_start = r as i64 * per_dest;
-            let d_end = d_start + per_dest;
-            if s_end <= d_start { break; }
-            if s_start >= d_end { continue; }
-            // Each tensor is cut at the same rows: the overlap between this
-            // source rank's span and this destination rank's.
-            let (lo, hi) = (s_start.max(d_start), s_end.min(d_end));
+            let d0_start = r as i64 * per_dest0;
+            let d0_end = d0_start + per_dest0;
+            if s0_end <= d0_start { break; }
+            if s0_start >= d0_end { continue; }
             out.push(FanoutDest {
                 worker: dest_workers[r as usize],
-                // Relative to this source's own slab, which starts at s_start.
+                // WHERE each is cut is per tensor: leading dims may differ,
+                // and the first one's rows are the wrong bytes for the rest.
                 tensors: t
                     .iter()
-                    .map(|x| slice_rows(x, lo - s_start, hi - s_start))
+                    .map(|x| {
+                        let per_dest = (x.dim0 * src_tp as i64) / dest_tp as i64;
+                        let s_start = src_rank as i64 * x.dim0;
+                        let s_end = s_start + x.dim0;
+                        let d_start = r as i64 * per_dest;
+                        let d_end = d_start + per_dest;
+                        // The two spans' overlap, on this tensor's own dim.
+                        let (lo, hi) = (s_start.max(d_start), s_end.min(d_end));
+                        // Relative to this source's own slab.
+                        slice_rows(x, lo - s_start, hi - s_start)
+                    })
                     .collect(),
             });
         }
+        Ok(())
     }
 
     /// Python's `compute_fanin`: how many SOURCE ranks contribute to the copy
@@ -395,7 +446,7 @@ mod tests {
         let g = m.group_of(NODE_A, Some(WALK_X)).unwrap();
         assert_eq!(g.workers, vec![100, 101]);
         assert_eq!(g.tp_size, 2);
-        assert_eq!(g.tp_rank, 1, "clone_empty carries the conductor's rank");
+        assert_eq!(g.tp_rank, Some(1), "clone_empty carries the conductor's rank");
         // graph_walks was explicit, so no streaming entry.
         assert!(m.group_of(NODE_A, None).is_none());
     }
@@ -503,14 +554,16 @@ mod tests {
         // that it goes to ONE destination rather than both.
         let tensors = [TensorRef { uuid: 1, dim0: 4, nbytes: 32, offset: 0 }];
         let mut out = Vec::new();
-        m.fanout(SIGNAL, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out);
+        m.fanout(SIGNAL, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out)
+            .unwrap();
         assert_eq!(out.len(), 1, "rank 0's rows belong to dest rank 0 alone");
         assert_eq!(out[0].worker, 100);
         assert_eq!(out[0].tensors, tensors.to_vec());
 
         // The same edge without a shard dim is replicated: untouched refs.
         let mut out2 = Vec::new();
-        m.fanout(999, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out2);
+        m.fanout(999, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out2)
+            .unwrap();
         assert!(out2.iter().all(|d| d.tensors == tensors.to_vec()));
     }
 
@@ -540,7 +593,8 @@ mod tests {
         // 4 rows of 8 bytes.
         let tensors = [TensorRef { uuid: 1, dim0: 4, nbytes: 32, offset: 0 }];
         let mut out = Vec::new();
-        m.fanout(SIGNAL, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out);
+        m.fanout(SIGNAL, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out)
+            .unwrap();
         assert_eq!(out.len(), 2);
         // Halves: two rows each, the second starting two rows in.
         assert_eq!(
@@ -551,6 +605,131 @@ mod tests {
             out[1].tensors,
             vec![TensorRef { uuid: 1, dim0: 2, nbytes: 16, offset: 16 }],
         );
+    }
+
+    /// NODE_A at `src_tp`, NODE_B at `dst_tp`, one sharded signal.
+    fn sharded(src_tp: u32, dst_tp: u32, rank: Option<u32>) -> ShardMap {
+        const SIGNAL: Sym = 50;
+        let mut t = template(vec![
+            GroupTemplate {
+                nodes: vec![NODE_A], tp_size: src_tp,
+                graph_walks: Some(vec![WALK_X]), tp_rank: rank,
+            },
+            GroupTemplate {
+                nodes: vec![NODE_B], tp_size: dst_tp,
+                graph_walks: Some(vec![WALK_X]), tp_rank: Some(0),
+            },
+        ]);
+        t.shard_dim.insert(SIGNAL, 0);
+        let src: Vec<Sym> = (0..src_tp).map(|i| 100 + i).collect();
+        let dst: Vec<Sym> = (0..dst_tp).map(|i| 200 + i).collect();
+        t.instantiate(&n2w(&[
+            ((NODE_A, WALK_X), &src),
+            ((NODE_B, WALK_X), &dst),
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn tensors_of_different_leading_extent_are_each_cut_on_their_own_dim() {
+        // Cutting the 8-row tensor on the 4-row one's rows would send half
+        // of it and call it whole.
+        const SIGNAL: Sym = 50;
+        let m = sharded(1, 2, Some(0));
+        let tensors = [
+            TensorRef { uuid: 1, dim0: 4, nbytes: 16, offset: 0 },
+            TensorRef { uuid: 2, dim0: 8, nbytes: 64, offset: 0 },
+        ];
+        let mut out = Vec::new();
+        m.fanout(SIGNAL, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out)
+            .unwrap();
+
+        assert_eq!(out.len(), 2);
+        // Halves of each: 2 rows of the first, 4 of the second.
+        assert_eq!(out[0].tensors, vec![
+            TensorRef { uuid: 1, dim0: 2, nbytes: 8, offset: 0 },
+            TensorRef { uuid: 2, dim0: 4, nbytes: 32, offset: 0 },
+        ]);
+        assert_eq!(out[1].tensors, vec![
+            TensorRef { uuid: 1, dim0: 2, nbytes: 8, offset: 8 },
+            TensorRef { uuid: 2, dim0: 4, nbytes: 32, offset: 32 },
+        ]);
+    }
+
+    #[test]
+    fn a_shard_dim_the_destination_ranks_do_not_divide_is_rejected() {
+        // 3 rows across 2 ranks: truncating would drop the third silently.
+        const SIGNAL: Sym = 50;
+        let m = sharded(1, 2, Some(0));
+        let tensors = [TensorRef { uuid: 1, dim0: 3, nbytes: 12, offset: 0 }];
+        let mut out = Vec::new();
+        let r =
+            m.fanout(SIGNAL, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out);
+        assert!(matches!(
+            r.err(),
+            Some(ShardError::NotDivisible { total: 3, dest_tp: 2 })
+        ));
+    }
+
+    #[test]
+    fn every_tensor_is_checked_for_divisibility_not_just_the_first() {
+        const SIGNAL: Sym = 50;
+        let m = sharded(1, 2, Some(0));
+        let tensors = [
+            TensorRef { uuid: 1, dim0: 4, nbytes: 16, offset: 0 },
+            TensorRef { uuid: 2, dim0: 5, nbytes: 20, offset: 0 },
+        ];
+        let mut out = Vec::new();
+        let r =
+            m.fanout(SIGNAL, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out);
+        assert!(matches!(
+            r.err(),
+            Some(ShardError::NotDivisible { total: 5, dest_tp: 2 })
+        ));
+    }
+
+    #[test]
+    fn a_source_group_with_no_tp_rank_is_rejected_rather_than_read_as_rank_0() {
+        const SIGNAL: Sym = 50;
+        let m = sharded(2, 2, None);
+        assert_eq!(m.group_of(NODE_A, Some(WALK_X)).unwrap().tp_rank, None);
+        let tensors = [TensorRef { uuid: 1, dim0: 4, nbytes: 16, offset: 0 }];
+        let mut out = Vec::new();
+        let r =
+            m.fanout(SIGNAL, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out);
+        assert!(matches!(r.err(), Some(ShardError::MissingTpRank { .. })));
+    }
+
+    #[test]
+    fn a_missing_tp_rank_is_caught_on_the_replicated_path_too() {
+        // Replicated routing reads the rank too, so the check precedes the
+        // branch; where Python's assert is.
+        let m = sharded(2, 2, None);
+        let tensors = [TensorRef { uuid: 1, dim0: 4, nbytes: 16, offset: 0 }];
+        let mut out = Vec::new();
+        let r =
+            m.fanout(999, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out);
+        assert!(matches!(r.err(), Some(ShardError::MissingTpRank { .. })));
+    }
+
+    #[test]
+    fn a_worker_count_mismatch_is_caught_on_a_later_node_too() {
+        // The group binds on NODE_A, then claims a narrower NODE_B. Checking
+        // only the binding key would route NODE_B on NODE_A's workers.
+        let t = template(vec![GroupTemplate {
+            nodes: vec![NODE_A, NODE_B],
+            tp_size: 2,
+            graph_walks: Some(vec![WALK_X]),
+            tp_rank: Some(0),
+        }]);
+        let r = t.instantiate(&n2w(&[
+            ((NODE_A, WALK_X), &[100, 101]),
+            ((NODE_B, WALK_X), &[102]),
+        ]));
+        assert!(matches!(
+            r.err(),
+            Some(ShardError::WorkerCount { got: 1, tp_size: 2 })
+        ));
     }
 
     #[test]
