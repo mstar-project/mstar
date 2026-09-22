@@ -32,14 +32,13 @@ from mstar.model.components.distributed.linear import (
     RowParallelLinear,
 )
 from mstar.model.components.distributed.merged_linear import COLUMN, REPLICATED, MergedParallelLinear
-from mstar.model.kimi_k3.components.gated_norm_kernel import gated_rmsnorm
-from mstar.utils.streams import Fork
 from mstar.model.kimi_k3.components.common import (
-    fused_decode_kernels,
     attach_dim0_loader,
+    fused_decode_kernels,
     replicated_loader,
     restore_kept_dtypes,
 )
+from mstar.model.kimi_k3.components.gated_norm_kernel import gated_rmsnorm
 from mstar.model.kimi_k3.reference.kda import (
     KDAState,
     from_v_first,
@@ -50,6 +49,7 @@ from mstar.model.kimi_k3.reference.kda import (
     short_conv,
     to_v_first,
 )
+from mstar.utils.streams import Fork
 
 KDA_STACKED_PARAMS = [(".qkv_proj", ".q_proj", 0), (".qkv_proj", ".k_proj", 1), (".qkv_proj", ".v_proj", 2)]
 # the checkpoint's g_proj / b_proj / f_a_proj land in the merged in_proj by segment name
