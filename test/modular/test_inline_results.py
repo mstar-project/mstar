@@ -17,11 +17,11 @@ from mstar.api_server.request_types import INLINE_MAX_BYTES, InlineResults, Resu
 from mstar.communication.tensors import _deserialize_tensor, _serialize_tensor
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.worker.worker import inline_output_bytes
 
 
 def _loop_idx():
     return NestedLoopIndices(loop_name_order=[], loop_indices={}, wg_fwd_pass_idx=0)
-from mstar.worker.worker import inline_output_bytes
 
 
 def _info(uuid, tensor):
