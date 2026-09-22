@@ -28,6 +28,12 @@ class AttentionConfig:
     flashinfer_backend: str = "auto"
     sliding_window: int | None = None
 
+    def __post_init__(self) -> None:
+        if self.sliding_window is not None and (
+            type(self.sliding_window) is not int or self.sliding_window <= 0
+        ):
+            raise ValueError("sliding_window must be a positive integer or None")
+
 
 @dataclass
 class AttentionSpec(NodeResourceSpec):
