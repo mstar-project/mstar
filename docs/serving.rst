@@ -212,6 +212,11 @@ no longer read. It raises an error with a message describing the migration.
 cached pages. A single request opts out by sending ``prefix_cache=False``, which
 travels with its other ``model_kwargs``.
 
+A cached prompt no longer reserves its pages, so the pool no longer limits how many
+requests are admitted: it has to hold the decode of every request allowed to run at once.
+Set ``cpu_offload_pages`` so a full pool has a request to move to the host; without it, a
+decode step that finds no free page holds its requests until they time out.
+
 **Single GPU.** Everything on rank 0:
 
 .. code-block:: yaml
