@@ -763,6 +763,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--enable-nvtx", action="store_true")
+    parser.add_argument(
+        "--protocol",
+        choices=("binary", "ndjson"),
+        default="binary",
+        help="streaming wire format; 'ndjson' forces the base64 path for A/B runs",
+    )
     return parser
 
 
@@ -877,7 +883,12 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
     concurrent_result: dict | None = None
     startup_started = time.perf_counter()
     try:
-        client = MStarClient(url, timeout=args.request_timeout)
+        client = MStarClient(
+            url,
+            timeout=args.request_timeout,
+            enable_nvtx=args.enable_nvtx,
+            prefer_binary=args.protocol == "binary",
+        )
         rollout._wait_for_health(client, proc, args.startup_timeout)
         startup_seconds = time.perf_counter() - startup_started
         print(f"server ready after {startup_seconds:.1f}s")
@@ -1025,6 +1036,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
         "geometry": {"width": variant.width, "height": variant.height, "fps": 60.0},
         "configuration": {
             "weight_source": weight_source,
+            "stream_protocol": args.protocol,
             "steps": args.steps,
             "warmup_steps": args.warmup_steps,
             "rng_seed": args.seed,
