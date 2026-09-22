@@ -13,7 +13,8 @@ The ``k`` logits go through the target's ``lm_head`` and a sequential Markov cor
 
 Tensor-parallel like the target: heads split for ``q_b_proj`` / ``kv_b_proj`` / ``o_proj``, the
 MLP intermediate split, ``context_proj`` split on its outputs and all-gathered, the LoRA-A
-projections, norms and the Markov head replicated. Parameter names follow the checkpoint (``ckpt/Kimi-K3-DSpark``), so the loader needs
+projections, norms and the Markov head replicated. Parameter names follow the checkpoint
+(``ckpt/Kimi-K3-DSpark``), so the loader needs
 only the gate/up fusion rule; ``embed_tokens`` and ``confidence_head`` are skipped.
 """
 from __future__ import annotations
@@ -72,7 +73,8 @@ class DSparkAttention(nn.Module):
         self.scale = cfg.qk_head_dim ** -0.5 * rope.attn_scale_factor
         self.q_a_proj = ReplicatedLinear(cfg.hidden_size, cfg.q_lora_rank)
         self.q_a_layernorm = KimiRMSNorm(cfg.q_lora_rank, eps=cfg.rms_norm_eps)
-        self.q_b_proj = ColumnParallelLinear(comm_group, cfg.q_lora_rank, cfg.num_attention_heads * cfg.qk_head_dim, bias=False)
+        self.q_b_proj = ColumnParallelLinear(comm_group, cfg.q_lora_rank, cfg.num_attention_heads * cfg.qk_head_dim,
+                                             bias=False)
         self.kv_a_proj_with_mqa = ReplicatedLinear(cfg.hidden_size, cfg.kv_lora_rank + cfg.qk_rope_head_dim)
         self.kv_a_layernorm = KimiRMSNorm(cfg.kv_lora_rank, eps=cfg.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -94,7 +96,8 @@ class DSparkAttention(nn.Module):
         if self._absorbed is None:
             c = self.cfg
             w = self.kv_b_proj.weight.view(self.num_heads, c.qk_nope_head_dim + c.v_head_dim, c.kv_lora_rank)
-            self._absorbed = (w[:, : c.qk_nope_head_dim].contiguous(), w[:, c.qk_nope_head_dim :].transpose(1, 2).contiguous())
+            self._absorbed = (w[:, : c.qk_nope_head_dim].contiguous(),
+                              w[:, c.qk_nope_head_dim :].transpose(1, 2).contiguous())
         return self._absorbed
 
     def latent(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -123,7 +126,8 @@ class DSparkAttention(nn.Module):
     def finish(self, o_lat: torch.Tensor) -> torch.Tensor:
         t = o_lat.shape[0]
         _, w_uv = self.absorb()
-        attn = torch.einsum("thl,hlv->thv", o_lat, w_uv.to(o_lat.dtype)).reshape(t, self.num_heads * self.cfg.v_head_dim)
+        attn = torch.einsum("thl,hlv->thv", o_lat, w_uv.to(o_lat.dtype))
+        attn = attn.reshape(t, self.num_heads * self.cfg.v_head_dim)
         return self.o_proj(attn)
 
     def forward_block(self, x: torch.Tensor, positions: torch.Tensor, rows: int, attn, kv_layer: torch.Tensor,
@@ -137,7 +141,8 @@ class DSparkAttention(nn.Module):
             from mstar.model.kimi_k3.dspark.block_attn_kernel import dspark_block_attention
 
             # one launch: the block's scores, softmax and output and the merge with the context part
-            return self.finish(dspark_block_attention(q_lat, q_pe, lat, o_ctx, lse_ctx, rows, self.cfg.kv_lora_rank, self.scale))
+            merged = dspark_block_attention(q_lat, q_pe, lat, o_ctx, lse_ctx, rows, self.cfg.kv_lora_rank, self.scale)
+            return self.finish(merged)
         scores = self.block_scores(q_lat, q_pe, lat, rows)  # [rows, H, k, k]
         lse_blk = torch.logsumexp(scores, dim=-1)  # [rows, H, k]
         c = lat[..., : self.cfg.kv_lora_rank].view(rows, -1, self.cfg.kv_lora_rank).float()
@@ -259,7 +264,8 @@ class DSparkDraft(nn.Module):
         for i, lat in enumerate(self.context_latents(states, positions)):
             self.kv.write_kv(lat, layer_idx=i, label=label)
 
-    def block_hidden(self, ids: torch.Tensor, positions: torch.Tensor, rows: int, label: str | None = None) -> torch.Tensor:
+    def block_hidden(self, ids: torch.Tensor, positions: torch.Tensor, rows: int,
+                     label: str | None = None) -> torch.Tensor:
         """The block's final hidden states ``[rows * k, hidden]`` (before the head)."""
         assert self.kv is not None and self.attn is not None, "bind_resources first"
         x = self.embed_tokens(ids)
