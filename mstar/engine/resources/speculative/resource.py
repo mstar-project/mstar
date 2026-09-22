@@ -150,7 +150,8 @@ class SpecAcceptance(Resource):
                 if entry is None or self._published.get(rid) == entry[0]:
                     continue
                 seq, verdict = entry
-                out[rid] = SpecAccepted(accepted=verdict.accepted, rejected=verdict.k - verdict.accepted, label=segment.label)
+                out[rid] = SpecAccepted(accepted=verdict.accepted, rejected=verdict.k - verdict.accepted,
+                                        label=segment.label)
                 self._published[rid] = seq
         return out
 
@@ -221,7 +222,8 @@ class SpecAcceptance(Resource):
             for rid in request_ids:
                 entry = self._settled.get(rid)
                 if entry is None:
-                    raise RuntimeError(f"no verdict for {rid}: its verify step was not committed before its outputs were read")
+                    raise RuntimeError(f"no verdict for {rid}: its verify step was not committed "
+                                       "before its outputs were read")
                 out.append(entry[1])
         return out
 
