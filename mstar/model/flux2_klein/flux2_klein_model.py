@@ -94,6 +94,7 @@ class Flux2KleinModel(Model):
         compile_exact_ops: bool | list[str] = False,
         cuda_graph: bool = True,
         capture_sizes: list[list[int]] | None = None,
+        capture_edit_sizes: list[list[int]] | None = None,
         capture_batch_sizes: list[int] | None = None,
         max_batch_size: int = 8,
         max_image_area: int = 2048 * 2048,
@@ -116,6 +117,12 @@ class Flux2KleinModel(Model):
         self.cuda_graph = bool(cuda_graph)
         # Default capture: the model's native 1024x1024 text-to-image shape.
         self.capture_sizes = [tuple(int(v) for v in s) for s in (capture_sizes or [[1024, 1024]])]
+        # Edit buckets: one reference image of the output size (an edit's default output size is its
+        # reference's), captured for these output sizes; None = the capture_sizes, [] = none.
+        self.capture_edit_sizes = (
+            list(self.capture_sizes) if capture_edit_sizes is None
+            else [tuple(int(v) for v in s) for s in capture_edit_sizes]
+        )
         self.capture_batch_sizes = [int(b) for b in (capture_batch_sizes or [1, 2, 4, 8])]
         self.max_batch_size = int(max_batch_size)
         # largest output (pixels) a request may ask for: an unbounded size lets one request occupy the worker for
@@ -414,10 +421,18 @@ class Flux2KleinModel(Model):
         if not self.cuda_graph:
             return []
         text_len = self.config.text_encoder.max_sequence_length
-        return [
+        shapes: list[tuple[str, Hashable]] = [
             (IMAGE_GEN_WALK, KleinShape(grid=self.config.latent_grid(h, w), text_len=text_len))
             for h, w in self.capture_sizes
         ]
+        for h, w in self.capture_edit_sizes:
+            grid = self.config.latent_grid(h, w)
+            shapes.append((IMAGE_EDIT_WALK, KleinShape(grid=grid, text_len=text_len, ref_grids=(grid,))))
+        return shapes
+
+    def warmup_sizes(self) -> list[tuple[int, int]]:
+        """Output sizes whose VAE decode is warmed at load: the generation and edit capture sizes."""
+        return list(dict.fromkeys([*self.capture_sizes, *self.capture_edit_sizes]))
 
     def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None):
         if node_name in self._submodule_cache:
@@ -449,7 +464,7 @@ class Flux2KleinModel(Model):
             return KleinVaeDecoderSubmodule(
                 self._vae_module(device), self.config, max_batch_size=self.max_batch_size,
                 compile_decode=self.vae_compile,
-                warmup_grids=[self.config.latent_grid(h, w) for h, w in self.capture_sizes],
+                warmup_grids=[self.config.latent_grid(h, w) for h, w in self.warmup_sizes()],
                 # the VAE compiles four static sizes (each ~30-60 s of autotuning at a cold start) and
                 # splits other batches into them; the dit captures every batch size up to the maximum
                 decode_batch_sizes=[s for s in VAE_DECODE_BATCH_SIZES if s <= self.max_batch_size],
