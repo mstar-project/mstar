@@ -6,11 +6,10 @@ import torch
 from mstar.engine.resources import (
     SPEC_ACCEPTANCE,
     KVConfig,
-    KVSpec,
     KVStep,
     Segment,
-    SpecAccepted,
     SpecAcceptanceSpec,
+    SpecAccepted,
     SpecStep,
     StepContext,
     SubmoduleStep,
