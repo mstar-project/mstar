@@ -65,14 +65,14 @@ def _worker(rank: int, world: int, port: int) -> None:
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
-                for t, o in zip(xs, outs):
+                for t, o in zip(xs, outs, strict=True):
                     ws.all_reduce(t, out=o)
             for _ in range(4):
                 for o in outs:
                     o.zero_()
                 g.replay()
                 torch.cuda.synchronize()
-                for o, r in zip(outs, refs):
+                for o, r in zip(outs, refs, strict=True):
                     assert torch.equal(o, r)
             assert not ws.timed_out()
             # after the graph work the eager path still agrees (the counter is shared)
@@ -113,14 +113,14 @@ def _worker(rank: int, world: int, port: int) -> None:
             torch.cuda.synchronize()
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
-                for t, o in zip(xs, outs):
+                for t, o in zip(xs, outs, strict=True):
                     fch.all_reduce(t, out=o)
             for _ in range(3):
                 for o in outs:
                     o.zero_()
                 g.replay()
                 torch.cuda.synchronize()
-                for o, r in zip(outs, refs):
+                for o, r in zip(outs, refs, strict=True):
                     assert torch.equal(o, r), "flashinfer graph replay"
         dist.barrier()
     finally:
