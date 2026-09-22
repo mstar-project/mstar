@@ -19,6 +19,7 @@ class AttnBackend(Enum):
     FLASHINFER = "flashinfer"
     DENSE = "dense"
     MLA = "mla"
+    XPU_PAGED = "xpu_paged"
 
 
 @dataclass

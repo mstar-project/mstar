@@ -40,17 +40,58 @@ class PositionManager(Resource):
     @classmethod
     def build(cls, spec: PositionSpec, info: EngineResourceInfo):
         if spec.config.backend == PosBackend.ROPE:
-            return RopeManager(config=spec.config, device=info.device)
+            kv_config = info.dependency(spec.config.kv_cache).config
+            return RopeManager(
+                config=spec.config,
+                device=info.device,
+                max_seq_len=kv_config.max_seq_len,
+                head_dim=kv_config.head_dim,
+                dtype=info.kv_dtype,
+            )
         raise ValueError(f"Unknown position backend {spec.config.backend!r}")
 
 
 class RopeManager(PositionManager):
     """rotary position on top flashinfer in-place kernels"""
 
-    def __init__(self, config: PositionConfig, device: torch.device):
+    def __init__(
+        self,
+        config: PositionConfig,
+        device: torch.device,
+        max_seq_len: int = 32768,
+        head_dim: int | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
         self._config = config
         self._device = device
         self._kv_cache_name = config.kv_cache
+        self._max_seq_len = max_seq_len
+        self._rope_cache_key: tuple | None = None
+        self._rope_cache: torch.Tensor | None = None
+        if device.type == "xpu":
+            if config.llama31_params:
+                raise NotImplementedError(
+                    "Llama 3.1 RoPE scaling is not implemented for XPU"
+                )
+            rotary_dim = config.rotary_dim or head_dim
+            if rotary_dim is None:
+                raise ValueError(
+                    "XPU RoPE needs PositionConfig.rotary_dim or the "
+                    "dependent KV cache's head_dim"
+                )
+            cache_dtype = config.rope_dtype or dtype
+            self._rope_cache_key = (
+                rotary_dim,
+                config.rope_scale,
+                config.rope_theta,
+                cache_dtype,
+            )
+            self._rope_cache = self._build_rope_cache(
+                rotary_dim,
+                config.rope_scale,
+                config.rope_theta,
+                cache_dtype,
+            )
 
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
@@ -285,6 +326,37 @@ class RopeManager(PositionManager):
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)
 
+    def _build_rope_cache(
+        self,
+        rotary_dim: int,
+        rope_scale: float,
+        rope_theta: float,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        positions = (
+            torch.arange(
+                self._max_seq_len,
+                device=self._device,
+                dtype=torch.float32,
+            )
+            / rope_scale
+        )
+        inv_freq = 1.0 / (
+            rope_theta
+            ** (
+                torch.arange(
+                    0,
+                    rotary_dim,
+                    2,
+                    device=self._device,
+                    dtype=torch.float32,
+                )
+                / rotary_dim
+            )
+        )
+        freqs = torch.outer(positions, inv_freq)
+        return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(dtype)
+
     def apply_qk(
         self,
         q: torch.Tensor,
@@ -315,12 +387,46 @@ class RopeManager(PositionManager):
             if key in ("low_freq_factor", "high_freq_factor", "old_context_len")
         } or config.llama31_params
 
+        rotary_dim = rotary_dim if rotary_dim is not None else config.rotary_dim
+        interleave = (
+            interleave if interleave is not None else config.interleave
+        )
+        rope_scale = (
+            rope_scale if rope_scale is not None else config.rope_scale
+        )
+        rope_theta = (
+            rope_theta if rope_theta is not None else config.rope_theta
+        )
+
+        cos_sin_cache = None
+        kernel_pos_ids = pos_ids[:q.shape[0]]
+        if q.device.type == "xpu":
+            rotary_dim = rotary_dim or q.shape[-1]
+            cache_key = (rotary_dim, rope_scale, rope_theta, q.dtype)
+            if cache_key != self._rope_cache_key:
+                raise RuntimeError(
+                    "RoPE runtime arguments do not match the cache built "
+                    f"from PositionConfig: runtime={cache_key}, "
+                    f"configured={self._rope_cache_key}"
+                )
+            cos_sin_cache = self._rope_cache
+            assert cos_sin_cache is not None
+            # vllm-xpu-kernels requires int64 position IDs. Normalize only at
+            # this backend boundary so position planning and CUDA stay
+            # unchanged.
+            kernel_pos_ids = kernel_pos_ids.to(
+                device=q.device,
+                dtype=torch.long,
+            )
         torch.ops.mstar.rope_apply_qk_inplace(
-            q, k, pos_ids[:q.shape[0]],
-            rotary_dim if rotary_dim is not None else config.rotary_dim,
-            interleave if interleave is not None else config.interleave,
-            rope_scale if rope_scale is not None else config.rope_scale,
-            rope_theta if rope_theta is not None else config.rope_theta,
+            q,
+            k,
+            kernel_pos_ids,
+            cos_sin_cache,
+            rotary_dim,
+            interleave,
+            rope_scale,
+            rope_theta,
             **llama31_params,
         )
         return q.to(orig_dtype), k.to(orig_dtype)

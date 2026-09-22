@@ -51,7 +51,7 @@ def write_wav(pcm_data: bytes, path: str):
 def main():
     parser = argparse.ArgumentParser(description="Orpheus TTS client")
     parser.add_argument("--text", default="Describe this image.", help="Text to synthesize")
-    parser.add_argument("--image", default="test/bagel/bagel.png", help="Image input")
+    parser.add_argument("--image", default="test/manual/bagel/bagel.png", help="Image input")
     parser.add_argument("--voice", default="ethan", help="Voice name")
     parser.add_argument("--output", default="output.wav", help="Output WAV file path")
     args = parser.parse_args()

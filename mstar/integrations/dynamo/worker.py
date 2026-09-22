@@ -95,6 +95,9 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
+    # Without the handle the liveness polling in finalize_setup / _process_messages
+    # is inert, and a dead conductor would hang this process instead of failing it.
+    server.conductor_proc = conductor_proc
     return server, conductor_proc, model_name
 
 
@@ -163,6 +166,8 @@ def serve(server: APIServer, model_name: str, args) -> None:
         loop = asyncio.get_running_loop()
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(signal.SIGTERM, runtime.shutdown)
+        # Conductor death is detected on the message thread, so hop to the loop.
+        server.set_on_fatal(lambda: loop.call_soon_threadsafe(runtime.shutdown))
         surfaces = []
         for surface in specs:
             endpoint = runtime.endpoint(
@@ -216,7 +221,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    from mstar.api_server.entrypoint import _shutdown_conductor_process
+    from mstar.api_server.entrypoint import (
+        DeadConductorError,
+        _shutdown_conductor_process,
+    )
     from mstar.utils.logging_config import quiet_noisy_loggers
 
     logging.basicConfig(
@@ -226,6 +234,7 @@ def main(argv: list[str] | None = None) -> None:
     quiet_noisy_loggers()
 
     server, conductor_proc, model_name = build_server(args)
+    exit_code = 0
     try:
         # Same gate the native server binds behind: every worker has loaded
         # weights, warmed up, and captured CUDA graphs.
@@ -233,6 +242,14 @@ def main(argv: list[str] | None = None) -> None:
         serve(server, model_name, args)
     except KeyboardInterrupt:
         pass
+    except DeadConductorError as e:
+        logger.error("%s", e)
+        exit_code = 1
     finally:
         server.cleanup()
         _shutdown_conductor_process(conductor_proc)
+    # A worker or conductor death is a failed run, as on the native path.
+    if server.fatal_error is not None:
+        exit_code = 1
+    if exit_code:
+        raise SystemExit(exit_code)

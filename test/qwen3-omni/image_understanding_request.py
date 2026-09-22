@@ -10,7 +10,7 @@ from _env import get_server_url
 
 URL = get_server_url()
 
-IMAGE_PATH = "test/bagel/bagel.png"
+IMAGE_PATH = "test/manual/bagel/bagel.png"
 
 
 def main():

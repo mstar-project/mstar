@@ -1,6 +1,3 @@
-import sys
-import types
-
 import torch
 
 from mstar.engine.resources.position.config import PositionConfig
@@ -9,12 +6,15 @@ from mstar.engine.resources.position.manager import RopeManager
 
 def test_apply_qk_uses_autocast_for_the_tensor_device(monkeypatch):
     kernel_dtypes = []
-    flashinfer = types.SimpleNamespace(
-        rope=types.SimpleNamespace(
-            apply_rope_pos_ids_inplace=lambda q, k, pos_ids, **kwargs: kernel_dtypes.append((q.dtype, k.dtype)),
-        )
+
+    def record_kernel_dtypes(q, k, *args, **kwargs):
+        kernel_dtypes.append((q.dtype, k.dtype))
+
+    monkeypatch.setattr(
+        torch.ops.mstar,
+        "rope_apply_qk_inplace",
+        record_kernel_dtypes,
     )
-    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer)
 
     manager = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
     manager._current_pos_ids["main"] = torch.arange(1)

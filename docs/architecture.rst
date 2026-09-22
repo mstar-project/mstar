@@ -34,6 +34,21 @@ High-level components
 - **Streaming** (``mstar/streaming/``): streaming output with configurable chunking
   policies and async partition topology.
 
+Process failures
+----------------
+
+A worker that dies (an exception during setup, an OOM kill, a segfault) sends nothing, so
+the conductor polls its worker process handles during the startup wait and, twice a
+second, from its main loop. A dead worker is fatal for the deployment. The conductor logs
+the worker, its pid, its exit code or signal and the nodes it hosted, fails every request
+that is still waiting with a 503 that names it, terminates the remaining workers and exits
+non-zero. The API server polls the conductor the same way. If it exits before the workers
+are ready, the server never binds. If it exits while serving, pending requests get a 503,
+new ones are refused, the HTTP server stops and the process exits non-zero. Each worker
+also watches its parent and exits if the conductor is gone, so a conductor that is killed
+outright cannot leave workers behind holding GPU memory. SIGINT and SIGTERM shutdowns are
+unaffected.
+
 Core design principles
 ----------------------
 

@@ -93,6 +93,7 @@ def test_result_reads_drain_ahead_of_preprocess():
         profile_queue=queue.Queue(),
         cleanup_request_queue=queue.Queue(),
         abort_request_queue=queue.Queue(),
+        reads_done_queue=queue.Queue(),
         discard_tensor_queue=queue.Queue(),
         stop_event=stop,
         communicator=_RecordingCommunicator(),
@@ -131,6 +132,7 @@ class _StubPreprocessWorker:
         self.pending = pending
         self.final = final
         self.cleaned = []
+        self.drained_flags = []
 
     def has_pending_tensors(self, rid):
         return self.pending
@@ -138,8 +140,11 @@ class _StubPreprocessWorker:
     def received_final_chunks(self, rid, final_outputs):
         return self.final
 
-    def cleanup_request(self, rid):
+    def finished_reading(self, rid, drained=True):
+        # New teardown: the API server signals READS_DONE to the conductor
+        # instead of cleaning up locally; the conductor drives the hard cleanup.
         self.cleaned.append(rid)
+        self.drained_flags.append(drained)
 
 
 def _pending_request():
@@ -177,6 +182,9 @@ def test_ttl_expiry_with_undelivered_chunks_fails_request():
     assert req.error_status == 500
     assert "r1" not in server.recently_completed
     assert pw.cleaned == ["r1"]
+    # Chunks were still pending, so reads may be in flight: the READS_DONE ACK
+    # must be gated on them rather than sent outright.
+    assert pw.drained_flags == [False]
 
 
 def test_drained_completion_stays_successful():
@@ -190,6 +198,21 @@ def test_drained_completion_stays_successful():
 
     assert req.event.is_set()
     assert req.error is None
+    # Fully delivered: ACK immediately, no drain check on the happy path.
+    assert pw.drained_flags == [True]
+
+
+def test_client_gone_gates_the_reads_done_ack():
+    """The client handler pops pending_requests on its own timeout, which can
+    happen with chunks still in flight — that ACK must be gated too."""
+    pw = _StubPreprocessWorker(pending=True, final=False)
+    server = _api_server_stub(pw)
+    server.recently_completed["r4"] = time.time()
+
+    server._prune_recently_completed()
+
+    assert pw.cleaned == ["r4"]
+    assert pw.drained_flags == [False]
 
 
 def test_stream_carries_error_as_final_chunk():

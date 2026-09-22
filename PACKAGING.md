@@ -2,22 +2,23 @@
 
 ## Install names
 
-The engine is published as **`m-star`** on PyPI (the bare `mstar` name was
-already taken). The import package and console scripts are unchanged:
+The engine is published as **`mstar-ai`** on PyPI. The bare `mstar` name is
+taken by an unrelated project, and PyPI's similarity rule (separators are
+dropped before names are compared) refuses `m-star` while that project
+exists. The import package and console scripts are unchanged:
 
 ```
-pip install m-star
+pip install mstar-ai
 python -c "import mstar"
 mstar --help
 ```
 
-`mstar-ai` and `mstar-project` are alias packages (under
-`packaging/aliases/`) that carry no code and just depend on `m-star`, so
-`pip install mstar-ai` resolves to the same thing. They mirror m-star's
-extras, so `pip install "mstar-ai[all]"` forwards to `m-star[all]`; keep
-their `[project.optional-dependencies]` in sync when m-star's extras change.
-PyPI treats `m-star`, `m_star`, `m.star`, and `M-Star` as one name, but
-`mstar` (no separator) is a separate project.
+`mstar-project` and `mstar-serve` are alias packages (under
+`packaging/aliases/`) that carry no code and just depend on `mstar-ai`, so
+`pip install mstar-project` resolves to the same thing. They mirror mstar-ai's
+extras, so `pip install "mstar-project[all]"` forwards to `mstar-ai[all]`. Keep
+their `[project.optional-dependencies]` in sync when mstar-ai's extras change.
+PyPI treats `mstar-ai`, `mstar_ai`, `mstar.ai` and `MSTAR-AI` as one name.
 
 ## Default configs
 
@@ -32,25 +33,37 @@ for a pip install and falls back to the repo `configs/` for checkouts.
 
 ## Cutting a release
 
-Version lives in `pyproject.toml` (`[project] version`). To release:
+Version lives in `pyproject.toml` (`[project] version`), and the alias
+packages carry the same version in `packaging/aliases/*/pyproject.toml`. To
+release:
 
-1. Bump the version and land it on `main`.
-2. Publish a GitHub Release with a matching tag (e.g. `v0.2.0`).
-3. The `Publish to PyPI` workflow builds the sdist and wheel and uploads
-   them over Trusted Publishing (OIDC — no token stored in the repo).
+1. Bump the version in all three pyproject files and land it on `main`.
+2. Publish a GitHub Release with a matching tag (e.g. `v0.2.1`). The workflow
+   refuses a tag that does not match the version.
+3. The `Publish to PyPI` workflow builds the engine and the alias packages and
+   uploads them over Trusted Publishing (OIDC, no token stored in the repo).
+   The `pypi` environment asks one of its reviewers to approve the run first.
 
-One-time PyPI setup: add a pending Trusted Publisher for project `m-star`
-(owner `mstar-project`, repo `mstar`, workflow `release.yml`, environment
-`pypi`).
+One-time PyPI setup: each project needs a pending Trusted Publisher (owner
+`mstar-project`, repo `mstar`, workflow `release.yml`, environment `pypi`).
+PyPI allows only one pending publisher per configuration at a time and turns
+it into a real one at the first upload, so the three projects are bootstrapped
+in turn: add the publisher for `mstar-ai` and publish the release (the alias
+steps fail as not authorized), add the one for `mstar-project` and re-run the
+failed job, then the same for `mstar-serve`. The uploads skip files that
+already exist, so re-runs are safe. Once all three projects exist, a single run
+publishes all of them.
 
 ## Local build / dry run
 
 ```
 pip install build twine
-python -m build                       # -> dist/m_star-<ver>.tar.gz + .whl
-twine upload --repository testpypi dist/*     # optional TestPyPI dry run
+python -m build                                        # -> dist/mstar_ai-<ver>.tar.gz + .whl
+python -m build --outdir dist packaging/aliases/mstar-project
+python -m build --outdir dist packaging/aliases/mstar-serve
+twine check dist/*
+twine upload --repository testpypi dist/*              # optional TestPyPI dry run
 ```
 
-The alias packages are built and published from their own directories, e.g.
-`cd packaging/aliases/mstar-ai && python -m build`, and only need
-re-publishing if their metadata changes.
+The alias packages are published by the release workflow together with the
+engine, so they need no separate upload.

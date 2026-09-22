@@ -35,7 +35,11 @@ def parse_args() -> argparse.Namespace:
         choices=["text_to_text", "text_to_image", "image_to_text", "mixture"],
         help="Type of requests to send",
     )
-    parser.add_argument("--image-path", default="test/bagel/bagel.png", help="Image file for image-input requests")
+    parser.add_argument(
+        "--image-path",
+        default="test/manual/bagel/bagel.png",
+        help="Image file for image-input requests",
+    )
     parser.add_argument("--prompt", default=None, help="Text prompt override")
     parser.add_argument("--think-mode", action="store_true", help="Enable think_mode in model_kwargs")
     parser.add_argument("--output", default=None, help="Optional path to save JSON results")
