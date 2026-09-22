@@ -50,7 +50,8 @@ def test_flashinfer_backend_matches_triton(mode, tol):
     # a later device / dtype pass keeps the converted layout and the backend on the parameters
     moe.to(DEV)
     moe.to(torch.bfloat16)
-    assert moe.experts.gate_up_packed.dtype == torch.uint8 and moe._backend.w13.data_ptr() == moe.experts.gate_up_packed.data_ptr()
+    assert moe.experts.gate_up_packed.dtype == torch.uint8
+    assert moe._backend.w13.data_ptr() == moe.experts.gate_up_packed.data_ptr()
     with torch.no_grad():
         again = moe._routed(z, idx, w).float()
     torch.testing.assert_close(again, out, rtol=0, atol=0)
