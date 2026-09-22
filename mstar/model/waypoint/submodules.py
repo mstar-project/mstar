@@ -337,8 +337,8 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     ) -> torch.Tensor:
         """``[1, 1, C, H, W]`` of fresh noise for this frame.
 
-        Drawn straight onto the device. Determinism is now per-GPU: 
-        a CUDA generator reproduces run-to-run on the same arch + torch build, 
+        Drawn straight onto the device. Determinism is now per-GPU:
+        a CUDA generator reproduces run-to-run on the same arch + torch build,
         not against a CPU draw or another arch. Runs in ``prepare_inputs``, outside any
         captured region, so this is a normal stream-ordered kernel launch.
         """

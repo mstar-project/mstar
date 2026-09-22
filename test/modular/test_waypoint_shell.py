@@ -1295,7 +1295,7 @@ def test_decode_latent_batches_rows_independently(taehv_weights, ae_config):
         decode_latent(
             taehv_weights, latent, history, output_size=(360, 640), initialize=True,
         )
-        for latent, history in zip(latents, histories)
+        for latent, history in zip(latents, histories, strict=True)
     ]
 
     batched_latent = torch.cat(latents, dim=0)

@@ -31,7 +31,7 @@ def fake_cuda_runtime(monkeypatch):
     Stubbing them keeps these policy tests running where there is no GPU."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 0)
-    monkeypatch.setattr(torch.cuda.graphs, "graph_pool_handle", lambda: object())
+    monkeypatch.setattr(torch.cuda.graphs, "graph_pool_handle", object)
 
 
 class _Group:
