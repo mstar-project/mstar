@@ -21,9 +21,10 @@ General questions are welcome too — a plain issue or an email to <atindra@cs.s
 ### CPU core tests
 
 The **CPU Core** CI job runs the graph I/O, resource runner, admission failure,
-micro-scheduler, and worker drain tests on a GitHub-hosted Ubuntu runner whenever
-a PR targeting `main` is opened, updated, or reopened. It needs no GPU or model
-weights. New updates cancel an older CPU Core run for the same PR.
+micro-scheduler, worker drain, and ragged-attention head-dimension padding tests
+on a GitHub-hosted Ubuntu runner whenever a PR targeting `main` is opened,
+updated, or reopened. It needs no GPU or model weights. New updates cancel an
+older CPU Core run for the same PR.
 
 To reproduce the job in a clean Linux environment with Python 3.12:
 
@@ -39,11 +40,14 @@ python -m pytest -q -ra --strict-markers --durations=20 \
   test/modular/test_resource_runner.py \
   test/modular/test_admit_failure_handling.py \
   test/modular/test_micro_scheduler.py \
-  test/modular/test_worker_drain.py
+  test/modular/test_worker_drain.py \
+  test/modular/test_ragged_attention_cpu.py
 ```
 
 Keep the file list explicit: other modules under `test/modular/` require GPU
-backends during collection. CI prints the slowest tests and saves the JUnit report
+backends during collection. `test_ragged_attention_cpu.py` contains the padding
+validation checks; the GPU attention and capture tests remain in
+`test_ragged_attention.py`. CI prints the slowest tests and saves the JUnit report
 as the `cpu-core-results` artifact for seven days. Making **CPU Core** a required
 merge check is a separate repository ruleset or branch protection setting.
 

@@ -54,7 +54,8 @@ jobs:
             test/modular/test_resource_runner.py \
             test/modular/test_admit_failure_handling.py \
             test/modular/test_micro_scheduler.py \
-            test/modular/test_worker_drain.py
+            test/modular/test_worker_drain.py \
+            test/modular/test_ragged_attention_cpu.py
       - name: Upload CPU core test report
         if: always()
         uses: actions/upload-artifact@v4
