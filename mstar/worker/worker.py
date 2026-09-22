@@ -16,7 +16,7 @@ from time import sleep
 
 import torch
 
-from mstar.api_server.request_types import APIServerMessage, ResultTensors
+from mstar.api_server.request_types import INLINE_MAX_BYTES, APIServerMessage, InlineResults, ResultTensors
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
@@ -32,8 +32,6 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
-from mstar.api_server.request_types import INLINE_MAX_BYTES, InlineResults
-from mstar.communication.tensors import _serialize_tensor
 from mstar.utils.coalesce import apply_coalesced
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
