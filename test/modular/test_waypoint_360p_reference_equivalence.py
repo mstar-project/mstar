@@ -12,7 +12,6 @@ a comparison between separately compiled serving processes.
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import os
@@ -32,8 +31,8 @@ from test_waypoint_reference_equivalence import (
     _commit,
     _deviation,
     _divergent_stages,
-    _import_reference,
     _island_tables,
+    _load_reference,
     _new_request,
     _port_forward,
     _port_frame,
@@ -42,6 +41,7 @@ from test_waypoint_reference_equivalence import (
     _reference_importable,
     _reset,
     _ring_deviation,
+    _seed_clip,
     _stage_capture,
     _stage_modules,
 )
@@ -119,43 +119,6 @@ def _context(
     }
 
 
-def _seed_clip() -> tuple[torch.Tensor, str]:
-    import cv2
-    import numpy as np
-
-    raw = SEED_IMAGE.read_bytes()
-    digest = hashlib.sha256(raw).hexdigest()
-    image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
-    image = cv2.cvtColor(cv2.resize(image, (640, 360)), cv2.COLOR_BGR2RGB)
-    return torch.from_numpy(np.repeat(image[None], 4, axis=0)), digest
-
-
-def _load_reference() -> dict:
-    WorldModel, StaticKVCache, patch_model = _import_reference()
-    torch.set_float32_matmul_precision("high")
-    cfg = WorldModel.load_config(str(CHECKPOINT))
-    assert (cfg.tokens_per_frame, cfg.height, cfg.width) == (128, 8, 16)
-    model = WorldModel.from_pretrained(str(CHECKPOINT), cfg=cfg, device=DEVICE, dtype=DTYPE).eval()
-    islands = {
-        "freq": model.denoise_step_emb.freq.clone(),
-        "xy": model.transformer.rope_angles.xy.clone(),
-        "inv_t": model.transformer.rope_angles.inv_t.clone(),
-    }
-    bare_conditioner = model.denoise_step_emb
-    patch_model.apply_inference_patches(model)
-    patch_model.flex_attention = __import__(
-        "mstar.engine.resources.attn.flex", fromlist=["flex_attention_masked"]
-    ).flex_attention_masked
-    cache = StaticKVCache(cfg, batch_size=1, dtype=DTYPE).to(device=DEVICE)
-    return {
-        "cfg": cfg,
-        "model": model,
-        "kv": cache,
-        "islands": islands,
-        "bare_conditioner": bare_conditioner,
-    }
-
-
 def _reference_decoder_histories(session) -> tuple[torch.Tensor, ...]:
     return tuple(value for value in session.streaming_ae_model.decoder_memory if torch.is_tensor(value))
 
@@ -174,7 +137,8 @@ def test_360p_reference_compat_is_bit_exact_end_to_end():
     assert ROLLOUT_FRAMES > 32, "the live gate must cross two 16-frame local windows"
     assert ROLLOUT_FRAMES <= len(CONTROL_SEQUENCE) + 1
 
-    reference = _load_reference()
+    reference = _load_reference(CHECKPOINT)
+    assert (reference["cfg"].tokens_per_frame, reference["cfg"].height, reference["cfg"].width) == (128, 8, 16)
     config = replace(waypoint_1_5_1b_360p(), reference_compat=True, compile_dit=False)
     port = _build_port(config, CHECKPOINT)
 
@@ -193,7 +157,7 @@ def test_360p_reference_compat_is_bit_exact_end_to_end():
         print(f"conditioner sigma={value:<7.4f} maxabs={gap:.4e} rel={relative:.4e}")
         assert gap == 0.0, f"360p conditioner sigma={value} maxabs={gap:.4e} rel={relative:.4e}"
 
-    clip, seed_digest = _seed_clip()
+    clip, seed_digest = _seed_clip(SEED_IMAGE, (640, 360))
     assert seed_digest == SEED_SHA256
     ae = load_taehv(str(AE_CHECKPOINT)).to(device=DEVICE, dtype=DTYPE)
     from src.ae import ChunkedStreamingTAEHV as ReferenceTAEHV

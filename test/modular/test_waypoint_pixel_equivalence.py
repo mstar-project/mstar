@@ -22,7 +22,6 @@ things it is still authoritative for, both gated below at zero tolerance:
 
 from __future__ import annotations
 
-import hashlib
 import os
 import sys
 from dataclasses import replace
@@ -50,6 +49,7 @@ from test_waypoint_reference_equivalence import (
     _reference_frame,
     _reference_importable,
     _reset,
+    _seed_clip,
 )
 
 from mstar.model.waypoint.components.taehv import ChunkedStreamingTAEHV, load_taehv
@@ -139,14 +139,7 @@ def oracle():
 def seed_clip():
     """The oracle's seed frame as ``[4, 720, 1280, 3]`` uint8, decoded and
     resized in ``record_oracle.load_seed_frame``'s order."""
-    import cv2
-    import numpy as np
-
-    raw = SEED_IMAGE.read_bytes()
-    digest = hashlib.sha256(raw).hexdigest()
-    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
-    img = cv2.cvtColor(cv2.resize(img, (1280, 720)), cv2.COLOR_BGR2RGB)
-    return torch.from_numpy(np.repeat(img[None], 4, axis=0)), digest
+    return _seed_clip(SEED_IMAGE, (1280, 720))
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +323,7 @@ def _distances(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     return torch.stack([(right - row).flatten(1).norm(dim=1) for row in left])
 
 
+@pytest.mark.skipif(not (REPRO / "frames").is_dir(), reason=f"repro recording not at {REPRO}")
 def test_the_primed_frame_matches_the_oracle_exactly(rollout, oracle):
     """The one frame the oracle *is* a bit-exact target for.
 
@@ -354,6 +348,7 @@ def test_the_primed_frame_matches_the_oracle_exactly(rollout, oracle):
     assert gap == 0, f"primed pixels differ from the oracle by maxabs={gap}/255"
 
 
+@pytest.mark.skipif(not (REPRO / "frames").is_dir(), reason=f"repro recording not at {REPRO}")
 def test_the_emitted_stream_stays_aligned_with_the_oracle(rollout, oracle):
     """A decoder desync is a *shift*, and a shift is visible without a tolerance:
     every raw frame's nearest neighbour in the recording must be itself. Over

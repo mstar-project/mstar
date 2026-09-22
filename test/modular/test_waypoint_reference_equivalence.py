@@ -36,6 +36,7 @@ rounding.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import sys
 from dataclasses import replace
@@ -133,21 +134,13 @@ class _DitNode(NodeSubmodule):
         raise NotImplementedError("binding stand-in")
 
 
-@pytest.fixture(scope="module")
-def reference():
-    """The served reference: inference patches applied, flex pinned to the port's
-    compiled kernel. The three fp32 island tables are captured *before* patching
-    -- ``CachedDenoiseStepEmb`` keeps no handle back to the module it replaces.
-    """
+def _load_reference(checkpoint: Path = CHECKPOINT) -> dict:
+    # Served reference: islands cloned pre-patch, flex pinned to the port's kernel, matmul precision 'high' for the reference's batch-5 sigma LUT (TF32, not 'highest').
     WorldModel, StaticKVCache, patch_model = _import_reference()
-    # The oracle recorded at 'high'; its own calibration measured high and medium
-    # bit-identical for this model, and high vs highest differing (metadata.json).
-    # It also decides the reference's sigma LUT: that table is a batch-5 fp32 GEMM,
-    # which rounds through TF32 here and not at 'highest'.
     torch.set_float32_matmul_precision("high")
 
-    cfg = WorldModel.load_config(str(CHECKPOINT))
-    model = WorldModel.from_pretrained(str(CHECKPOINT), cfg=cfg, device=DEVICE, dtype=DTYPE).eval()
+    cfg = WorldModel.load_config(str(checkpoint))
+    model = WorldModel.from_pretrained(str(checkpoint), cfg=cfg, device=DEVICE, dtype=DTYPE).eval()
     islands = {
         "freq": model.denoise_step_emb.freq.clone(),
         "xy": model.transformer.rope_angles.xy.clone(),
@@ -159,7 +152,7 @@ def reference():
     patch_model.apply_inference_patches(model)
     patch_model.flex_attention = flex_attention_masked
     cache = StaticKVCache(cfg, batch_size=1, dtype=DTYPE).to(device=DEVICE)
-    yield {
+    return {
         "cfg": cfg,
         "model": model,
         "kv": cache,
@@ -167,6 +160,27 @@ def reference():
         "bare_conditioner": bare_conditioner,
         "bare_cond_head": bare_cond_head,
     }
+
+
+def _seed_clip(image_path: Path, size: tuple[int, int]) -> tuple[torch.Tensor, str]:
+    # Recorder-order seed clip: decode image_path, resize to size (w, h), RGB, four-frame stack.
+    import cv2
+    import numpy as np
+
+    raw = image_path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    image = cv2.cvtColor(cv2.resize(image, size), cv2.COLOR_BGR2RGB)
+    return torch.from_numpy(np.repeat(image[None], 4, axis=0)), digest
+
+
+@pytest.fixture(scope="module")
+def reference():
+    """The served reference: inference patches applied, flex pinned to the port's
+    compiled kernel. The three fp32 island tables are captured *before* patching
+    -- ``CachedDenoiseStepEmb`` keeps no handle back to the module it replaces.
+    """
+    yield _load_reference()
 
 
 def _build_port(config, checkpoint: Path = CHECKPOINT):
