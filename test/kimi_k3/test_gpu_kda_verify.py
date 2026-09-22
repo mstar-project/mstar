@@ -5,8 +5,18 @@ import pytest
 import torch
 
 from mstar.engine.resources import (
-    DeltaNetGeometry, LinearAttnConfig, LinearAttnSpec, LinearAttnStep, LinearAttnVariant,
-    RecurrentStateConfig, RecurrentStateSpec, RecurrentStep, Segment, StepContext, StepRunner, SubmoduleStep,
+    DeltaNetGeometry,
+    LinearAttnConfig,
+    LinearAttnSpec,
+    LinearAttnStep,
+    LinearAttnVariant,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+    RecurrentStep,
+    Segment,
+    StepContext,
+    StepRunner,
+    SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.linear_attn.kda_kernels import FLAKDAKernels, KDAParams, SpecBlocks
