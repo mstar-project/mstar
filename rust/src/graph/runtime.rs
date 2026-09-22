@@ -966,6 +966,12 @@ pub struct RouteOut {
     #[pyo3(get)] pub register_rids: Vec<u32>,
     #[pyo3(get)] pub new_token_output_idxs: Vec<usize>,
     #[pyo3(get)] pub local_streaming_tensor_idxs: Vec<usize>,
+    /// Rids this completion will actually build a frame for. The caller skips
+    /// preparing `per_request_info` for everyone else -- that payload is
+    /// re-encoded every pass (it is mutated in place, so it cannot be
+    /// cached), and inside a loop on a single-worker deployment neither an
+    /// INPUT_SIGNALS nor a WORKER_GRAPHS_DONE goes out on most passes.
+    #[pyo3(get)] pub rids_needing_request_info: Vec<u32>,
 }
 
 /// Routing parked between complete_and_route_batch and send_outputs.
@@ -1831,6 +1837,7 @@ impl GraphRuntime {
         let mut first_tp_rank: FxHashMap<u32, bool> = FxHashMap::default();
         let mut speculative: FxHashMap<u32, bool> = FxHashMap::default();
         let mut staged: FxHashSet<u64> = FxHashSet::default();
+        let mut sends_a_frame: FxHashSet<u32> = FxHashSet::default();
         let mut cursor = 0usize;
 
         for (i, &rid) in input.rids.iter().enumerate() {
@@ -2019,6 +2026,41 @@ impl GraphRuntime {
                 ingested_locally.push(took);
             }
 
+            // Which rids will actually produce a frame carrying
+            // `per_request_info`: an INPUT_SIGNALS to a peer, or a
+            // WORKER_GRAPHS_DONE. EmitToClient does not carry it.
+            //
+            // `is_local` is the whole point. A node in a SIBLING worker graph
+            // on this worker compiles to External (Orpheus streams new_token
+            // from the LLM graph into snac_decoder), and counting that as a
+            // send makes every decode pass look like it needs the payload --
+            // which is exactly nothing skipped. What matters is whether any
+            // destination worker is someone OTHER than us, mirroring
+            // take_send_plan's own skip.
+            let me_now = self.shard.me;
+            for (e, &is_local) in edges.iter().zip(&ingested_locally) {
+                let dest = match e.dest {
+                    Dest::External(d) => d,
+                    Dest::Local(d) if e.declined_local => self.g(wg).node(d).name,
+                    _ => continue,
+                };
+                let goes_out = match e.worker {
+                    // Post-fanout: one edge, one destination worker.
+                    Some(w) => w != me_now || !is_local,
+                    None => walk_sym
+                        .and_then(|w| {
+                            let workers =
+                                self.info(rid)?.node_to_workers.get(&(dest, w))?;
+                            Some(workers.iter().any(|&x| x != me_now))
+                        })
+                        .unwrap_or(false),
+                };
+                if goes_out {
+                    sends_a_frame.insert(rid);
+                    break;
+                }
+            }
+
             // A local consumer that refused the edge makes it remote, as
             // Python's `leftover` branch does. Recorded here so the
             // registration, the reference count and take_send_plan agree.
@@ -2156,6 +2198,15 @@ impl GraphRuntime {
 
             routing.insert(rid, edges);
         }
+
+        // A wg can finish without this node routing anything for that rid, so
+        // the completed set is its own source of frames.
+        for rid in completed_wgs.keys() {
+            if !sends_a_frame.contains(rid) {
+                sends_a_frame.insert(*rid);
+            }
+        }
+        out.rids_needing_request_info = sends_a_frame.into_iter().collect();
 
         self.completion_counter += 1;
         out.completion_id = self.completion_counter;

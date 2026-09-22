@@ -2382,15 +2382,25 @@ class Worker:
             route_output.new_token_output_idxs,
             flat_rids, flat_uuids, signals, signal_idxs,
         )
-        _t_send = _time.perf_counter() if self._phase_period else 0.0
-        self._graph_runtime.send_outputs(SendInput(
+        # Split so the Python-side argument building is not attributed to the
+        # runtime: these four comprehensions are per-rid, and the rust wrapper
+        # then rebuilds all four again before Rust sees anything.
+        _t_prep = _time.perf_counter() if self._phase_period else 0.0
+        # None from a runtime that does not work it out (Python's), which
+        # keeps the old behaviour of preparing it for everyone.
+        _needs_info = route_output.rids_needing_request_info
+        _info_rids = (
+            send_rids if _needs_info is None
+            else [r for r in send_rids if r in _needs_info]
+        )
+        _send_input = SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
-                send_rids,
+                _info_rids,
                 [
                     self.request_state.get_fwd_info(
                         rid, batch_N.partition
-                    ) for rid in send_rids
+                    ) for rid in _info_rids
                 ],
             ),
             new_token_counts=ParallelList(
@@ -2407,7 +2417,11 @@ class Worker:
             ),
             profiling=self._profiling_payloads(send_rids) if self.enable_prof
             else None,
-        ))
+        )
+        _t_send = _time.perf_counter() if self._phase_period else 0.0
+        if self._phase_period:
+            self._phase_record("worker.postprocess.send_prep", _t_send - _t_prep)
+        self._graph_runtime.send_outputs(_send_input)
         if self._phase_period:
             self._phase_record(
                 "worker.postprocess.send", _time.perf_counter() - _t_send,

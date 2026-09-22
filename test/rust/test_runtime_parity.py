@@ -1191,3 +1191,92 @@ def test_push_back_re_readies_a_node_whose_inputs_were_consumed(pair):
     rt.push_back_node("prefill", [rid], [WG_ID])
     assert _ready(rt) == [("prefill", WALK, [rid])], "the push back was lost"
 
+
+
+def test_a_mutated_fwd_info_is_re_encoded():
+    """``resource_publish_info`` is mutated IN PLACE, every forward pass.
+
+    ``engine.finalize_batch`` calls ``info.update_publish_info(...)`` on the
+    stored ``current_fwd_info`` object -- the identity never changes, so a
+    cache keyed on ``is`` hits forever and the first pass's bytes get spliced
+    into every later frame. Python hands the live object over and always
+    serialises current state, so this is a Rust-path-only divergence.
+    """
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.engine.resources.kv.manager import PublishedKVInfo
+
+    rt, _book, _store = _rust()
+    info = CurrentForwardPassInfo(
+        request_id="r1", graph_walk=WALK, fwd_index=0, random_seed=0,
+        max_tokens=8, partition_name="default",
+    )
+    first = rt._encoded_fwd_info(1, info)
+
+    # What finalize_batch does at the end of every pass.
+    info.update_publish_info({"kv": PublishedKVInfo(world_size=2)})
+    second = rt._encoded_fwd_info(1, info)
+
+    assert second != first, (
+        "the publish info added this pass never reached the wire"
+    )
+
+
+def test_a_purely_local_completion_needs_no_request_info():
+    """Nothing goes out, so nobody's ``per_request_info`` has to be prepared.
+
+    ``prefill -> ar_decode`` is one worker graph on one worker: no
+    INPUT_SIGNALS to a peer, no WORKER_GRAPHS_DONE (the loop has not
+    finished), so the re-encode would be pure waste.
+    """
+    rt, book, store = _rust()
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    rt.pop_rids("prefill", WALK, [rid])
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)
+    out = rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="prefill",
+            output_signals=["kv_cache", "token"],
+            wg_ids=ParallelList([rid], [WG_ID]),
+            tensors=[1], num_tensors=[1, 0],
+        ),
+        store,
+    )
+    assert out.rids_needing_request_info == frozenset()
+
+
+def test_a_finished_worker_graph_asks_for_request_info(streams_to_sibling):
+    """A WORKER_GRAPHS_DONE carries it, so a finished wg is a send.
+
+    ``LLM`` here is a single node with no loop, so completing it finishes the
+    worker graph and a WGD goes to the conductor -- the rid needs its
+    payload even though the only output edge is a locally-ingested stream.
+
+    (The sibling stream itself is NOT a send: it compiles to External because
+    the consumer is another worker graph, but it lands in this worker's
+    StreamBuffer. Counting that as a send is what made an earlier version of
+    this flag skip nothing at all on Orpheus.)
+    """
+    rt, book, store = streams_to_sibling
+    if not hasattr(rt, "_rust"):
+        pytest.skip("flag is only computed by the rust runtime")
+    rid = rt.add_request(
+        request_id="r1", partition="default", graph_walk=WALK,
+        partition_worker_graph_ids=[0, 1],
+        worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+    )
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("text_inputs", "LLM")]))
+    rt.pop_rids("LLM", WALK, [rid])
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)
+    out = rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="LLM",
+            output_signals=["new_token"],
+            wg_ids=ParallelList([rid], [0]),
+            tensors=[1], num_tensors=[1],
+        ),
+        store,
+    )
+    assert rid in out.rids_needing_request_info

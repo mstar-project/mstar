@@ -16,6 +16,7 @@ Build: ``maturin develop --release`` in ``rust/`` (see ``docs/installation.rst``
 """
 from __future__ import annotations
 
+import time as _time
 from copy import deepcopy
 
 from mstar_rust import GraphRuntime as _RustGraphRuntime
@@ -42,6 +43,7 @@ from mstar.graph.runtime.base import (
     SpeculationPrepOutput,
 )
 from mstar.model.base import WorkerGraph
+from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 
 def _edge_args(section: GraphSection, edge) -> dict:
@@ -227,7 +229,6 @@ class RustGraphRuntime(GraphRuntime):
         self._sharding: dict[int, ShardingConfig] = {}
         # rid -> (the object, its wire bytes). Keyed by handle, so it is
         # dropped on removal: handles are recycled.
-        self._fwd_info_bytes: dict[int, tuple[object, bytes]] = {}
 
     # --------- Bookkeeping ----------
 
@@ -268,7 +269,6 @@ class RustGraphRuntime(GraphRuntime):
         # Handles are recycled, so anything left keyed by this one attaches to
         # a DIFFERENT request later.
         self._sharding.pop(rid, None)
-        self._fwd_info_bytes.pop(rid, None)
         self._rust.remove_request(rid)
 
     def get_sharding_config(self, rid: int) -> ShardingConfig | None:
@@ -524,6 +524,7 @@ class RustGraphRuntime(GraphRuntime):
             register_rids=out.register_rids,
             new_token_output_idxs=out.new_token_output_idxs,
             local_streaming_tensor_idxs=out.local_streaming_tensor_idxs,
+            rids_needing_request_info=frozenset(out.rids_needing_request_info),
         )
 
     def stop_loops_batched(
@@ -585,7 +586,11 @@ class RustGraphRuntime(GraphRuntime):
         ``PublishedInfo`` is abstract and would otherwise mean a Rust change
         for every new resource. Both splice in untouched.
         """
-        self._rust.send_outputs(
+        # The wrapper's own per-rid rebuilding, timed apart from the crossing:
+        # four comprehensions over the batch run before Rust sees anything, on
+        # top of the four that built SendInput.
+        _t0 = _time.perf_counter() if PHASE_PERIOD else 0.0
+        args = dict(
             completion_id=input.completion_id,
             request_infos=[
                 (rid, self._encoded_fwd_info(rid, info))
@@ -609,19 +614,30 @@ class RustGraphRuntime(GraphRuntime):
             ],
             profiling=list(input.profiling or []),
         )
+        if PHASE_PERIOD:
+            _t1 = _time.perf_counter()
+            phase_record("rust.send_outputs.marshal", _t1 - _t0)
+            self._rust.send_outputs(**args)
+            phase_record("rust.send_outputs.call", _time.perf_counter() - _t1)
+        else:
+            self._rust.send_outputs(**args)
 
     def _encoded_fwd_info(self, rid: int, info) -> bytes | None:
-        """``CurrentForwardPassInfo`` as wire bytes, encoded once per request.
+        """``CurrentForwardPassInfo`` as wire bytes, re-encoded every pass.
 
-        The worker mutates it exactly once, at admit (``rid_handle``), and
-        re-sends the same object every pass -- so re-encoding per pass would
-        be pure waste.
+        NOT cached. This object is mutated IN PLACE:
+        ``engine.finalize_batch`` folds each pass's published resource state
+        into ``resource_publish_info`` on the very object the worker keeps, so
+        its identity never changes and a cache keyed on ``is`` hits forever --
+        splicing the first pass's bytes into every later frame. An ``==``
+        check would not save it either; the mutation is inside a dict of
+        abstract ``PublishedInfo``.
+
+        Python's runtime hands the live object to msgpack every pass, so this
+        is what parity costs. See
+        ``test_a_mutated_fwd_info_is_re_encoded``.
         """
         if info is None:
             return None
-        cached = self._fwd_info_bytes.get(rid)
-        if cached is None or cached[0] is not info:
-            cached = (info, wire.encode_field(info, CurrentForwardPassInfo))
-            self._fwd_info_bytes[rid] = cached
-        return cached[1]
+        return wire.encode_field(info, CurrentForwardPassInfo)
 

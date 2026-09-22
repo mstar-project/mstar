@@ -169,6 +169,17 @@ class RouteOutput(NamedTuple):
     register_rids: list[int]
     new_token_output_idxs: list[int]
     local_streaming_tensor_idxs: list[int]
+    # The rids this completion will actually build a frame for -- one bound
+    # for a peer worker (INPUT_SIGNALS) or the conductor (WORKER_GRAPHS_DONE).
+    # Only those need `per_request_info`, and preparing it is not free: the
+    # object is mutated in place every pass, so it cannot be cached and has to
+    # be re-encoded. On a single-worker deployment inside a loop neither frame
+    # goes out on most passes, and the whole encode is wasted.
+    #
+    # ``None`` means "not computed, prepare it for everyone", so a runtime
+    # that does not work this out keeps behaving as before -- Python's does
+    # not, and does not need to: it hands the live object over untouched.
+    rids_needing_request_info: frozenset[int] | None = None
 
 
 class SendInput(NamedTuple):
