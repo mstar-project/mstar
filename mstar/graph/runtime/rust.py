@@ -400,6 +400,7 @@ class RustGraphRuntime(GraphRuntime):
                 )
                 for signal, next_node, uuids, final in out.input_edges
             ],
+            output_signals=self.get_output_signals(node_name, graph_walk),
             input_edges_per_rid=out.input_edges_per_rid,
         )
 

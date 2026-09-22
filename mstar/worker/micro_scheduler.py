@@ -39,6 +39,11 @@ class ScheduledBatch:
     # rid handle -> the node's ready inputs, as the pop reported them. Carried
     # so the batch build never has to walk node.ready_signals again.
     input_edges: dict[int, list[EdgeSpec]] = field(default_factory=dict)
+    # The node's output edge names, recorded by the POP. Structural, so it is
+    # the same for every rid and survives a split. Carried here so completion
+    # never has to ask the runtime again -- and so the names come from the
+    # GRAPH rather than from whatever tensors the model happened to return.
+    output_signals: list[str] = field(default_factory=list)
     # ``ScheduleTPNode.spec_seq`` this batch came off the TP-follow FIFO with,
     # -1 otherwise. ``split_off_first`` / ``merge`` only ever see -1.
     tp_seq: int = -1
@@ -81,6 +86,7 @@ class ScheduledBatch:
             input_edges={
                 rid: self.input_edges[rid] for rid in keep_rids[:bs]
             },
+            output_signals=self.output_signals,
         ), ScheduledBatch(
             node_name=self.node_name,
             graph_walk=self.graph_walk,
@@ -90,6 +96,7 @@ class ScheduledBatch:
             input_edges={
                 rid: self.input_edges[rid] for rid in keep_rids[bs:] + exclude_rids
             },
+            output_signals=self.output_signals,
         )
 
     def __len__(self):
@@ -263,6 +270,7 @@ class MicroScheduler:
         return (
             dict(zip(batch_rids, wg_ids, strict=True)),
             self._input_edges_by_rid(popped),
+            popped.output_signals,
         )
 
     def _try_schedule_tp_follow(
@@ -289,7 +297,7 @@ class MicroScheduler:
         )
         if popped is None:
             return
-        request_to_worker_graph, input_edges = popped
+        request_to_worker_graph, input_edges, output_signals = popped
 
         self.pop_tp_follow_head()
 
@@ -298,6 +306,7 @@ class MicroScheduler:
             graph_walk=first_tp_node.graph_walk,
             request_to_worker_graph=request_to_worker_graph,
             input_edges=input_edges,
+            output_signals=output_signals,
             tp_seq=first_tp_node.spec_seq,
         )
 
@@ -575,6 +584,7 @@ class MicroScheduler:
             graph_walk=graph_walk,
             request_to_worker_graph=dict(zip(batch_rids, wg_ids, strict=True)),
             input_edges=self._input_edges_by_rid(popped),
+            output_signals=popped.output_signals,
         )
 
 

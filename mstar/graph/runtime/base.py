@@ -105,6 +105,13 @@ class PopRidsOutput(NamedTuple):
     # _build_executing_batch can walk either the same way.
     input_edges: list[EdgeSpec]
     input_edges_per_rid: list[int]
+    # The node's output edge names, structural and identical for every rid in
+    # the batch. Reported by the POP rather than asked for separately: it is
+    # needed at completion, and deriving it from the tensors the model returned
+    # would take whatever the model happened to emit, including names no edge
+    # carries. Trailing with a default so a caller that does not need them can
+    # leave it off.
+    output_signals: tuple[str, ...] = ()
 
 
 class SpeculationPrepInput(NamedTuple):

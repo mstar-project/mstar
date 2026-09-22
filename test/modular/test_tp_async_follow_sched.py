@@ -154,7 +154,7 @@ def test_pop_ready_rids_pops_exactly_the_named_set():
 
     popped = sched.pop_ready_rids(manager, NODE, WALK, ["r1", "r2"])
     assert popped is not None
-    wg, input_edges = popped
+    wg, input_edges, _output_signals = popped
     assert list(wg) == ["r1", "r2"]  # wire order preserved
     assert wg == {"r1": "wg0", "r2": "wg0"}
     assert set(input_edges) == {"r1", "r2"}

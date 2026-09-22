@@ -1019,3 +1019,79 @@ def test_an_edge_into_a_sibling_local_graph_is_ingested_not_only_sent(
     assert _ready(rt) == [("LLM", WALK, [rid])], "LLM never received img_emb"
     # And it is still held: one local consumer, not zero.
     assert not book.can_gc(1), "freed while LLM's ready slot still names it"
+
+
+@pytest.fixture(params=["python", "rust"])
+def streams_to_sibling(request):
+    """``LLM`` streams new_token into ``snac_decoder``, a SEPARATE local graph.
+
+    Orpheus exactly: the producer and the streaming consumer are different
+    worker graphs on the same worker, so the edge compiles to External even
+    though the consumer is local.
+    """
+    llm = WorkerGraph(
+        section=GraphNode(
+            name="LLM", input_names={"text_inputs"},
+            outputs=[GraphEdge(name="new_token", next_node="snac_decoder",
+                               is_streaming=True)],
+        ),
+        graph_walks={WALK}, ranks=[0], worker_graph_id=0,
+    )
+    snac = WorkerGraph(
+        section=GraphNode(
+            name="snac_decoder", input_names={"new_token"},
+            outputs=[GraphEdge(name="audio", next_node=EMIT_TO_CLIENT)],
+        ),
+        graph_walks={"snac_chunk"}, ranks=[0], worker_graph_id=1,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[llm, snac],
+        # The consumer is in its OWN walk and partition, as in Orpheus: the
+        # producer streams out of `decode` into `snac_chunk`.
+        all_wg_ids_to_graph_walks={0: {WALK}, 1: {"snac_chunk"}},
+        all_wg_ids_to_dyn_loops={0: set(), 1: set()},
+        all_wg_ids_to_nodes={0: {"LLM"}, 1: {"snac_decoder"}},
+        node_to_partition={"LLM": "default", "snac_decoder": "SNAC"},
+        sharding_config=_sharding(),
+    )
+    if request.param == "python":
+        book = PythonTensorBookkeeping()
+        tm = _StubTensorManager(book)
+        return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
+                                   **common), book, tm.tensor_store)
+    book = RustTensorBookkeeping()
+    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
+
+
+def test_a_stream_to_a_sibling_graph_is_reported_local(streams_to_sibling):
+    """It must come back as a LOCAL stream, not be staged for a remote read.
+
+    Reported as remote, the chunk never reaches the worker's StreamBuffer:
+    the consumer gets an edge with no tensors, which is what surfaces as an
+    empty ``inputs["new_token"]`` in the submodule.
+    """
+    rt, book, store = streams_to_sibling
+    rid = rt.add_request(
+        request_id="r1", partition="default", graph_walk=WALK,
+        partition_worker_graph_ids=[0, 1],
+        worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+    )
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("text_inputs", "LLM")]))
+    rt.pop_rids("LLM", WALK, [rid])
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)
+
+    out = rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="LLM",
+            output_signals=["new_token"],
+            wg_ids=ParallelList([rid], [0]),
+            tensors=[1], num_tensors=[1],
+        ),
+        store,
+    )
+    assert out.local_streaming_tensor_idxs == [0], "the chunk was not local"
+    assert out.register_tensor_idxs == [], "a local chunk must not be staged"
+    # A streaming edge does NOT go straight into the node: the StreamBuffer
+    # decides when a chunk is whole, so the consumer is not ready yet.
+    assert _ready(rt) == []

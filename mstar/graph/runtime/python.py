@@ -529,6 +529,7 @@ class PythonGraphRuntime(GraphRuntime):
             wg_ids=ParallelList(rids, wg_ids),
             input_edges=input_edges,
             input_edges_per_rid=input_edges_per_rid,
+            output_signals=self.get_output_signals(node_name, graph_walk),
         )
 
     def _scan_ready(
@@ -1179,6 +1180,10 @@ class PythonGraphRuntime(GraphRuntime):
         rids, wg_ids = input.wg_ids.keys, input.wg_ids.values
         n_signals = len(input.output_signals)
         uuid_to_idx = {uuid: i for i, uuid in enumerate(input.tensors)}
+        # Drop the previous pass's outputs here rather than making the caller
+        # remember: this is the only thing that writes them, so the reset
+        # belongs on the same round trip.
+        self.reset_outputs(input.node_name, list(rids), list(wg_ids))
 
         routing_per_rid: dict[int, NodeOutputRouting] = {}
         register_idxs: list[int] = []

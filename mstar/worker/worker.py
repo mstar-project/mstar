@@ -1648,6 +1648,11 @@ class Worker:
             node_name=spec_node,
             graph_walk=pending.graph_walk,
             request_to_worker_graph=request_to_worker_graph,
+            # A speculated batch never went through pop_rids, so it has to ask:
+            # left empty, completion would route none of the node's outputs.
+            output_signals=self._graph_runtime.get_output_signals(
+                spec_node, pending.graph_walk,
+            ),
             tp_seq=tp_seq,
         )
         spec_node_batch = self._make_executing_batch(
@@ -2266,13 +2271,11 @@ class Worker:
         # uuids. The store keeps the descriptors, so routing needs no
         # TensorPointerInfo objects.
         rids = list(batch_N.batch.request_to_worker_graph)
-        signals = self._graph_runtime.get_output_signals(
-            batch_N.node_name, batch_N.graph_walk,
-        )
-        self._graph_runtime.reset_outputs(  # drop stale outputs
-            batch_N.node_name, rids,
-            [batch_N.batch.request_to_worker_graph[r] for r in rids],
-        )
+        # Recorded by the pop that scheduled this batch, not asked for again --
+        # and taken from the GRAPH, so a model returning a tensor under a name
+        # no edge carries cannot change what gets routed. Stale outputs are
+        # dropped by complete_and_route_batch itself.
+        signals = batch_N.batch.output_signals
         flat_uuids: list[int] = []
         flat_rids: list[int] = []
         num_tensors: list[int] = []

@@ -1163,11 +1163,17 @@ impl GraphRuntime {
             self.requests[handle as usize] = Some(info);
         }
 
-        // Open this partition's worker graphs. A worker graph can serve more
-        // than one partition, so the walk state is created once and the
-        // per-partition lists just point at it.
-        let live = self.live_wgs(walk_sym);
-        for &wg in &live {
+        // Open EVERY local worker graph of this partition, not just the ones
+        // in the admission walk. A partition moves through several walks and
+        // each has its own worker graph; a request with no state in the next
+        // walk's graph cannot have a signal ingested there, so the node never
+        // becomes ready and the request stops after one pass. Python opens
+        // all of them -- the conductor sends the partition's full list.
+        let mine: Vec<WgIndex> = worker_graph_ids
+            .iter()
+            .filter_map(|&wg_id| self.wg_index(wg_id))
+            .collect();
+        for &wg in &mine {
             // In range by construction: the vectors were grown for this
             // handle above.
             if self.states[wg as usize][handle as usize].is_none() {
@@ -1176,8 +1182,11 @@ impl GraphRuntime {
             }
         }
 
+        // The partition's LIVE list is still only the current walk's graphs:
+        // that is what selects where this pass's inputs route.
+        let live = self.live_wgs(walk_sym);
         let info = self.requests[handle as usize].as_mut().expect("just set");
-        for &wg in &live {
+        for &wg in &mine {
             if !info.worker_graphs.contains(&wg) {
                 info.worker_graphs.push(wg);
             }
@@ -1427,6 +1436,10 @@ impl GraphRuntime {
     /// output edges because the edges are per-request objects that carry it;
     /// here outputs are passed into `complete_and_route_batch`, so there is
     /// nothing stale to clear.
+    /// A no-op by construction: nothing here caches a node's outputs between
+    /// passes. `complete` derives them from the tensors it is handed, so there
+    /// is no stale set to drop -- where Python clears `GraphNode.outputs`.
+    /// Kept so the contract is satisfied; the caller no longer invokes it.
     fn reset_outputs(
         &mut self, node_name: &str, rids: Vec<u32>, wg_ids: Vec<u32>,
     ) {
@@ -1772,24 +1785,73 @@ impl GraphRuntime {
 
             // Local destinations ingest now, so a consumer on this worker sees
             // the routed tensors without a round trip.
+            //
+            // `Dest::Local` only means "a node in THIS worker graph". A node in
+            // a SIBLING worker graph on this same worker compiles to
+            // `External`, and one walk routinely spans several graphs
+            // (vit_encoder and LLM are separate graphs in BAGEL's prefill_vit).
+            // Resolved against node_owner, which is Python's
+            // _walk_node_to_wg_id: without this the edge only ever leaves on
+            // the wire, and the sibling graph's node never receives it.
             let mut local_counts: FxHashMap<u64, i64> = FxHashMap::default();
+            let mut ingested_locally: Vec<bool> = Vec::with_capacity(edges.len());
             for e in &edges {
-                for t in &e.tensors {
-                    if matches!(e.dest, Dest::Local(_)) {
-                        *local_counts.entry(t.uuid).or_insert(0) += 1;
-                    }
-                }
-                if let Dest::Local(d) = e.dest {
-                    if let Some(slot) = g.node(d).slot_of(e.name) {
-                        if let Some(st) = self.state_mut(wg, rid) {
-                            st.ingest(d, slot, e.tensors.clone(), true, false);
+                let target = match e.dest {
+                    Dest::Local(d) => Some((wg, d)),
+                    // A streaming destination is local when THIS WORKER runs
+                    // it at all -- Python resolves the fanout with
+                    // dest_graph_walk=None and asks whether its own id is in
+                    // it. The consumer normally lives in another walk
+                    // entirely (Orpheus streams from `decode` into
+                    // `snac_chunk`), so a walk-keyed lookup would never
+                    // find it.
+                    Dest::External(name) if e.streaming => self
+                        .graphs
+                        .iter()
+                        .position(|g| g.by_name.contains_key(&name))
+                        .map(|i| (i as WgIndex, self.graphs[i].by_name[&name])),
+                    // A non-streaming destination has to be live in THIS walk,
+                    // as Python's _walk_node_to_wg_id lookup is.
+                    Dest::External(name) => walk_sym
+                        .and_then(|w| self.node_owner.get(&(w, name)).copied())
+                        .and_then(|owner| {
+                            let g2 = self.graphs[owner as usize].clone();
+                            g2.by_name.get(&name).copied().map(|d| (owner, d))
+                        }),
+                    _ => None,
+                };
+                let mut took = false;
+                if let Some((owner, d)) = target {
+                    if e.streaming {
+                        // A streaming edge never goes straight into the node:
+                        // it lands in the worker's StreamBuffer, which decides
+                        // when a chunk is whole. Reported to the caller via
+                        // local_streaming_tensor_idxs below.
+                        took = true;
+                    } else {
+                        let slot =
+                            self.graphs[owner as usize].node(d).slot_of(e.name);
+                        if let Some(slot) = slot {
+                            if let Some(st) = self.state_mut(owner, rid) {
+                                // A declining graph falls through to the wire,
+                                // as Python's `leftover` branch does.
+                                took = st.ingest(
+                                    d, slot, e.tensors.clone(), true, false,
+                                );
+                            }
                         }
                     }
                 }
+                if took {
+                    for t in &e.tensors {
+                        *local_counts.entry(t.uuid).or_insert(0) += 1;
+                    }
+                }
+                ingested_locally.push(took);
             }
 
             let mut new_token_seen: FxHashSet<Sym> = FxHashSet::default();
-            for e in &edges {
+            for (e, &is_local) in edges.iter().zip(&ingested_locally) {
                 let idxs: Vec<usize> = e
                     .tensors
                     .iter()
@@ -1802,14 +1864,22 @@ impl GraphRuntime {
                 if e.new_token && new_token_seen.insert(e.name) {
                     out.new_token_output_idxs.extend(&idxs);
                 }
-                if e.streaming && matches!(e.dest, Dest::Local(_)) {
+                // `is_local`, not Dest::Local: the consumer is just as local
+                // when it lives in a SIBLING worker graph on this worker, which
+                // compiles to External (Orpheus streams new_token from the LLM
+                // graph into the snac_decoder graph).
+                if e.streaming && is_local {
                     out.local_streaming_tensor_idxs.extend(&idxs);
                 }
                 // What a remote consumer will read. Deduped by uuid and
                 // skipping anything already staged, so a re-emitted edge does
                 // not stage twice.
+                // A tensor handled locally is not staged for a remote read;
+                // Python leaves streaming_local and the locally-ingested edge
+                // out of the register set for the same reason.
                 let remote = e.persist
-                    || matches!(e.dest, Dest::External(_) | Dest::EmitToClient);
+                    || (!is_local
+                        && matches!(e.dest, Dest::External(_) | Dest::EmitToClient));
                 if remote {
                     for (&idx, t) in idxs.iter().zip(&e.tensors) {
                         if staged.insert(t.uuid) {
@@ -1838,6 +1908,7 @@ impl GraphRuntime {
             //
             // EMPTY_DESTINATION is 0, not 1: it routes nowhere, and Python
             // drops it before the count.
+            let me_sym = self.shard.me;
             let edge_refs: Vec<i64> = edges
                 .iter()
                 .map(|e| {
@@ -1848,9 +1919,21 @@ impl GraphRuntime {
                         // Already in local_counts.
                         Dest::Local(_) | Dest::Empty => 0,
                         Dest::EmitToClient => 1,
+                        // One reference per destination WORKER, minus this
+                        // one when the edge was already ingested into a local
+                        // graph -- that copy is in local_counts. Python does
+                        // the same by popping its own id out of the fanout.
                         Dest::External(d) => walk_sym
                             .and_then(|w| {
-                                Some(self.info(rid)?.node_to_workers.get(&(d, w))?.len())
+                                let workers =
+                                    self.info(rid)?.node_to_workers.get(&(d, w))?;
+                                let mine = self.node_owner.contains_key(&(w, d));
+                                Some(
+                                    workers
+                                        .iter()
+                                        .filter(|&&x| !(mine && x == me_sym))
+                                        .count(),
+                                )
                             })
                             .unwrap_or(0) as i64,
                     }
@@ -2261,7 +2344,23 @@ impl GraphRuntime {
                                 self.info(rid)?.node_to_workers.get(&(dest, w)).cloned()
                             })
                             .unwrap_or_default();
+                        // Skip ourselves when the node lives in a local worker
+                        // graph: complete_and_route_batch already ingested it
+                        // there, and a self-send would arrive for a slot that
+                        // is already full.
+                        // Same rule as the routing side: a streaming consumer
+                        // counts as ours whatever walk it lives in.
+                        let mine = if e.streaming {
+                            self.graphs.iter().any(|g| g.by_name.contains_key(&dest))
+                        } else {
+                            walk.map(|w| self.node_owner.contains_key(&(w, dest)))
+                                .unwrap_or(false)
+                        };
+                        let me_sym = self.shard.me;
                         for worker in workers {
+                            if mine && worker == me_sym {
+                                continue;
+                            }
                             plan.to_workers.push((
                                 rid,
                                 self.interner.name(worker).to_string(),
