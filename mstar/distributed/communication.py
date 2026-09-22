@@ -305,9 +305,9 @@ class CommGroup:
         """Whether :meth:`all_reduce` of this shape would run NCCL's kernel (no Lamport channel, too
         large for the symmetric-memory buffers): the sizes at which a producer that needs only its own
         columns of the sum is better off with :meth:`reduce_scatter_stacked`."""
-        if self.world_size == 1:
-            return False
-        if device.type != "cuda" or not self._symm_available():
+        if self.world_size == 1 or device.type != "cuda":
+            return False  # off the GPU there is no NCCL path; test doubles simulate all_reduce alone
+        if not self._symm_available():
             return True
         if self.lamport_applies(shape, dtype, device):
             return False
