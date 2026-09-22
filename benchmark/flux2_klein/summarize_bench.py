@@ -6,14 +6,22 @@
 Rows are grouped by ``(tag, model)``: the latency file supplies the B=1 median / p95, the
 throughput file the images/s at each concurrency and the peak VRAM. Missing pieces print as
 ``n/a`` rather than being invented.
+
+Seed fidelity: a ``fidelity_<tag>_<model key>.json`` written by ``psnr.py --json`` next to the
+result files (``notes/gpu_fidelity.sh``) fills the "PSNR vs diffusers" column with the median and
+minimum PSNR of the row's latency images against the bit-exact eager references at the same
+seeds; ``exact`` means every compared image was identical.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
+
+MODEL_KEYS = {"9b": "flux2_klein_9b", "klein": "flux2_klein", "z-image": "z_image_turbo", "z_image": "z_image_turbo"}
 
 
 def load_results(paths: list[str | Path]) -> dict[tuple[str, str], dict]:
@@ -23,6 +31,38 @@ def load_results(paths: list[str | Path]) -> dict[tuple[str, str], dict]:
         data = json.loads(Path(path).read_text())
         rows[(data["tag"], data["model"])][data["mode"]] = data
     return rows
+
+
+def model_key(model: str) -> str:
+    """The registry key a served model id maps to (``black-forest-labs/FLUX.2-klein-9B`` -> ``flux2_klein_9b``)."""
+    lowered = model.lower()
+    return next((key for needle, key in MODEL_KEYS.items() if needle in lowered), model)
+
+
+def load_fidelity(paths: list[str | Path]) -> dict[tuple[str, str], dict]:
+    """``{(tag, model key): psnr summary}`` from the ``fidelity_<tag>_<model key>.json`` files next to the results."""
+    fidelity: dict[tuple[str, str], dict] = {}
+    for directory in {Path(path).resolve().parent for path in paths}:
+        for file in sorted(directory.glob("fidelity_*.json")):
+            summary = json.loads(file.read_text()).get("summary") or {}
+            if not summary.get("n"):
+                continue
+            stem = file.stem[len("fidelity_"):]
+            keys = sorted(set(MODEL_KEYS.values()), key=len, reverse=True)
+            key = next((k for k in keys if stem.endswith("_" + k)), None)
+            if key is not None:
+                fidelity[(stem[: -len(key) - 1], key)] = summary
+    return fidelity
+
+
+def _fmt_fidelity(summary: dict | None) -> str:
+    if not summary:
+        return "n/a"
+    if summary.get("exact") == summary["n"]:
+        return f"exact (n={summary['n']})"
+    median, minimum = summary["median"], summary["min"]
+    text = "exact" if math.isinf(median) else f"{median:.1f} dB"
+    return f"{text} (min {'exact' if math.isinf(minimum) else f'{minimum:.1f}'}, n={summary['n']})"
 
 
 def _fmt_s(value: float | None) -> str:
@@ -43,10 +83,13 @@ def _fmt_vram(*entries: dict | None) -> str:
     return "n/a" if not peaks else f"{max(peaks) / 1024:.1f} GiB"
 
 
-def render_table(rows: dict[tuple[str, str], dict], concurrencies: tuple[int, ...] = (4, 8, 16)) -> str:
+def render_table(
+    rows: dict[tuple[str, str], dict], concurrencies: tuple[int, ...] = (4, 8, 16),
+    fidelity: dict[tuple[str, str], dict] | None = None,
+) -> str:
     """The protocol's markdown table for the image row set."""
     head = ["System", "model", "size / steps", "output", "B=1 latency median", "p95"]
-    head += [f"images/s @{c}" for c in concurrencies] + ["peak VRAM", "notes"]
+    head += [f"images/s @{c}" for c in concurrencies] + ["peak VRAM", "PSNR vs diffusers", "notes"]
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for (tag, model), parts in sorted(rows.items()):
         lat, thr = parts.get("latency"), parts.get("throughput")
@@ -68,7 +111,8 @@ def render_table(rows: dict[tuple[str, str], dict], concurrencies: tuple[int, ..
             output = f"{observed} (default)"
         cells = [tag, model, size, output, _fmt_s(lat and lat["median_s"]), _fmt_s(lat and lat["p95_s"])]
         cells += [_fmt_rate(by_c.get(str(c))) for c in concurrencies]
-        cells += [_fmt_vram(lat, *by_c.values()), "; ".join(notes)]
+        cells += [_fmt_vram(lat, *by_c.values())]
+        cells += [_fmt_fidelity((fidelity or {}).get((tag, model_key(model)))), "; ".join(notes)]
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
@@ -78,7 +122,7 @@ def main() -> None:
     ap.add_argument("results", nargs="+", help="bench_images.py JSON files")
     ap.add_argument("--concurrency", type=int, nargs="+", default=[4, 8, 16])
     args = ap.parse_args()
-    print(render_table(load_results(args.results), tuple(args.concurrency)))
+    print(render_table(load_results(args.results), tuple(args.concurrency), load_fidelity(args.results)))
 
 
 if __name__ == "__main__":
