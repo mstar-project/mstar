@@ -112,6 +112,10 @@ def main():
     ap.add_argument("--attention", choices=["sdpa", "flashinfer"], default="sdpa",
                     help="only sdpa here: flashinfer needs the engine's ragged resource (server path)")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--exact-ops", action="store_true",
+                    help="with --compile: the served default compile_exact_ops=[norms]")
+    ap.add_argument("--vae-compile", action="store_true",
+                    help="the served default: compiled VAE decode, warmed for this size")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--oracle-dir", default="")
@@ -129,10 +133,17 @@ def main():
 
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
-    model = Flux2KleinModel(model_path_hf=args.repo, attention_backend="sdpa", compile=args.compile, cuda_graph=False)
+    model = Flux2KleinModel(
+        model_path_hf=args.repo, attention_backend="sdpa", compile=args.compile,
+        compile_exact_ops=["norms"] if args.exact_ops else False, vae_compile=args.vae_compile, cuda_graph=False,
+        capture_sizes=[[args.height, args.width]],
+    )
     model.set_config(Flux2KleinConfig.from_snapshot(resolve_snapshot_dir(args.repo)))
     t0 = time.perf_counter()
     subs = {name: model.get_submodule(name, device=device) for name in ("text_encoder", "dit", "vae_decoder")}
+    if args.vae_compile:
+        # as the engine does at load: compile the decode for this grid (unwarmed grids decode eagerly)
+        subs["vae_decoder"].warmup([model.config.latent_grid(args.height, args.width)])
     torch.cuda.synchronize()
     print(f"loaded in {time.perf_counter() - t0:.1f}s; peak alloc {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
     oracle = Path(args.oracle_dir) if args.oracle_dir else None
@@ -159,6 +170,7 @@ def main():
           f"(peak alloc {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB)")
     for name, samples in timer.stages.items():
         print(f"  {name:14s} median {statistics.median(samples):7.2f} ms")
+    print(f"  {'stages sum':14s}        {sum(statistics.median(v) for v in timer.stages.values()):7.2f} ms")
     from mstar.model.components.diffusion.image_io import uint8_to_png
 
     Path(args.out).write_bytes(uint8_to_png(image.cpu()))
