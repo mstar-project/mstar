@@ -111,6 +111,55 @@ class RetentionPolicy:
 
 
 @dataclass
+class PrefixChain:
+    """The keys that name a stream's pages, and how far the index holds them."""
+    # one key per page of this stream's prompt, from the preprocess worker
+    keys: list[bytes]
+    # tokens after the last page this stream keyed: the prompt's own tail and
+    # the generated ids after it, keyed together once they fill a page
+    unkeyed: list[int] | None
+    # how many of `keys` name a whole page. The prompt's last key names a
+    # partial one whenever the prompt does not end on a boundary, and that key
+    # is neither an index entry nor a parent until the page behind it fills
+    keyed_pages: int
+    # tokens the chain accounts for: its prompt, and every token sampled since
+    covered_len: int
+    # how many of this stream's pages the index already holds
+    cursor: int = 0
+    # set once this stream has been reported, so a request that is admitted
+    # again (a refused admit, a second partition) is still one line
+    reported: bool = False
+
+    @classmethod
+    def seed(cls, keys: list[bytes], tail: list[int], page_size: int) -> "PrefixChain":
+        keyed_pages = len(keys) - (1 if tail else 0)
+        return cls(
+            keys=list(keys), unkeyed=tail, keyed_pages=keyed_pages,
+            covered_len=keyed_pages * page_size + len(tail),
+        )
+
+    def extend(self, tokens: list[int], page_size: int) -> None:
+        self.unkeyed.extend(tokens)
+        self.covered_len += len(tokens)
+        while len(self.unkeyed) >= page_size:
+            whole = self.keyed_pages
+            key = page_key(
+                self.keys[whole - 1] if whole else b"",
+                self.unkeyed[:page_size],
+            )
+            # overwrites the partial key the prompt left here, if any
+            if whole < len(self.keys):
+                self.keys[whole] = key
+            else:
+                self.keys.append(key)
+            self.keyed_pages = whole + 1
+            del self.unkeyed[:page_size]
+
+    def pages_filled(self, stored_len: int, page_size: int) -> int:
+        return min(stored_len // page_size, self.keyed_pages)
+
+
+@dataclass
 class CacheStream:
     """(request, label) cache stream metadata"""
     page_indices: list[int] = field(default_factory=list)
@@ -123,28 +172,14 @@ class CacheStream:
     # a failed retrieve, latched: the future is consumed once, but every later
     # readiness check has to keep reporting the stream as unusable
     read_error: BaseException | None = None
-    # one key per page of this stream's prompt, from the preprocess worker
-    keys: list[bytes] | None = None
+    # None while the stream is unkeyed, and once its keys stop describing it
+    chain: PrefixChain | None = None
     # pages the index matched for this stream and is holding for it, from the
     # probe until `admit` converts them onto `page_indices`
     lease: list[int] | None = None
     # from the admit that converted a lease until `commit`: a refused admit
     # sends the step back through the probe, which has to answer the same
     converted: bool = False
-    # how many of this stream's pages the index already holds
-    cursor: int = 0
-    # tokens after the last page this stream keyed: the prompt's own tail and
-    # the generated ids after it, keyed together once they fill a page
-    unkeyed: list[int] | None = None
-    # set once this stream has been reported, so a request that is admitted
-    # again (a refused admit, a second partition) is still one line
-    reported: bool = False
-    # how many of `keys` name a whole page. The prompt's last key names a
-    # partial one whenever the prompt does not end on a boundary, and that key
-    # is neither an index entry nor a parent until the page behind it fills
-    keyed_pages: int = 0
-    # tokens the chain accounts for: its prompt, and every token sampled since
-    covered_len: int = 0
     offloaded: bool = False
     generation: int = 0
 
@@ -169,11 +204,7 @@ class CacheStream:
         Not part of `reset`, which an offload calls too: a reload brings the
         same tokens back, so the chain that describes them has to survive it.
         """
-        self.keys = None
-        self.unkeyed = None
-        self.cursor = 0
-        self.keyed_pages = 0
-        self.covered_len = 0
+        self.chain = None
 
 
 @dataclass
@@ -410,7 +441,7 @@ class KVManager(AttentionResource):
                 return len(stream.lease) * self.config.page_size
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
-            keys = list(stream.keys)
+            keys = list(stream.chain.keys)
         # with the lock down: one SHA-256 a page of prompt, and every admit,
         # commit and remove on this manager waits behind it
         rooted = [fingerprint(self._prefix_root, key) for key in keys]
@@ -453,25 +484,26 @@ class KVManager(AttentionResource):
         second owner would be reading bytes that are still moving. A dummy or
         padded row is left out: its pages hold whatever the capture wrote.
         """
+        chain = stream.chain
         if (
             self._index is None
             or ctx.capture
             or segment.request_id not in ctx.request_ids
-            or not stream.keys
+            or chain is None
         ):
             return
         walks = self._keyed_walks.get(segment.label)
         if walks is not None and ctx.graph_walk not in walks:
             # a walk the keys never described wrote this span: an image written
             # where the keyed text would sit would be filed under the text's keys
-            stream.keys = None
+            stream.chain = None
             return
         # what was here before this write, not after: a decode step can commit
         # before the token it writes is read back and counted
-        if stream.released or stream.stored_len - segment.span > stream.covered_len:
-            stream.keys = None
+        if stream.released or stream.stored_len - segment.span > chain.covered_len:
+            stream.chain = None
             return
-        filled = min(stream.stored_len // self.config.page_size, stream.keyed_pages)
+        filled = chain.pages_filled(stream.stored_len, self.config.page_size)
         if stream.retention is not None:
             filled = min(
                 filled, stream.retention.protected_prefix // self.config.page_size
@@ -480,34 +512,35 @@ class KVManager(AttentionResource):
         # is holding a copy of the page the index named
         parent = (
             self._index.page_for(
-                fingerprint(self._prefix_root, stream.keys[stream.cursor - 1])
+                fingerprint(self._prefix_root, chain.keys[chain.cursor - 1])
             )
-            if stream.cursor else None
+            if chain.cursor else None
         )
-        while stream.cursor < filled:
-            key = fingerprint(self._prefix_root, stream.keys[stream.cursor])
-            page = stream.page_indices[stream.cursor]
+        while chain.cursor < filled:
+            key = fingerprint(self._prefix_root, chain.keys[chain.cursor])
+            page = stream.page_indices[chain.cursor]
             if not self._index.insert(key, page, parent):
                 # another request filled this page first and its copy is the
                 # one the index names; ours stays private to this stream
                 page = self._index.page_for(key)
             parent = page
-            stream.cursor += 1
+            chain.cursor += 1
 
     def _report_admission(self, segment: Segment, stream: CacheStream) -> None:
         """One line per request that a declared stream admitted."""
         # silent where the cache is closed: the keys are still on the stream,
         # and a line saying nothing matched would read as a miss
-        if self._index is None or not stream.keys or stream.reported:
+        chain = stream.chain
+        if self._index is None or chain is None or chain.reported:
             return
-        stream.reported = True
-        matched = stream.cursor
+        chain.reported = True
+        matched = chain.cursor
         logger.info(
             "KV %s: %s/%s matched %d of its %d pages, whole prompt already "
             "cached %s, replica %s",
             self.name, segment.request_id, segment.label,
-            matched, stream.keyed_pages,
-            bool(matched) and matched == stream.keyed_pages,
+            matched, chain.keyed_pages,
+            bool(matched) and matched == chain.keyed_pages,
             self._replica,
         )
 
@@ -527,7 +560,7 @@ class KVManager(AttentionResource):
             or not rooted
             or stream.stored_len
             or stream.offloaded
-            or not stream.keys
+            or stream.chain is None
         ):
             return
         # never past what the other side published, and only whole pages
@@ -541,7 +574,7 @@ class KVManager(AttentionResource):
         self._arena.release(stream.page_indices)
         stream.page_indices = list(matched)
         stream.stored_len = len(matched) * self.config.page_size
-        stream.cursor = len(matched)
+        stream.chain.cursor = len(matched)
 
     def _warn_unkeyed(self, rid: str, node_name: str, graph_walk: str) -> None:
         """Say once per node that a stream the model declared arrived with no keys.
@@ -596,10 +629,7 @@ class KVManager(AttentionResource):
         if not keys:
             return
         tail = list((overrides.prefix_tail or {}).get(label) or ())
-        stream.keys = list(keys)
-        stream.unkeyed = tail
-        stream.keyed_pages = len(keys) - (1 if tail else 0)
-        stream.covered_len = stream.keyed_pages * self.config.page_size + len(tail)
+        stream.chain = PrefixChain.seed(keys, tail, self.config.page_size)
 
     def extend_prefix_chain(
         self, rid: str, node_name: str, graph_walk: str, outputs,
@@ -619,30 +649,14 @@ class KVManager(AttentionResource):
             if not sampled:
                 return
             stream = self._streams.get(rid, {}).get(label)
-            if stream is None or stream.keys is None or stream.unkeyed is None:
+            if stream is None or stream.chain is None or stream.chain.unkeyed is None:
                 return
             if stream.released:
                 # past a front release `page_indices[k]` is no longer page k of
                 # the chain, and nothing here can say which page a key names
-                stream.keys = None
+                stream.chain = None
                 return
-            tokens = sampled[0].flatten().tolist()
-            stream.unkeyed.extend(tokens)
-            stream.covered_len += len(tokens)
-            page_size = self.config.page_size
-            while len(stream.unkeyed) >= page_size:
-                whole = stream.keyed_pages
-                key = page_key(
-                    stream.keys[whole - 1] if whole else b"",
-                    stream.unkeyed[:page_size],
-                )
-                # overwrites the partial key the prompt left here, if any
-                if whole < len(stream.keys):
-                    stream.keys[whole] = key
-                else:
-                    stream.keys.append(key)
-                stream.keyed_pages = whole + 1
-                del stream.unkeyed[:page_size]
+            stream.chain.extend(sampled[0].flatten().tolist(), self.config.page_size)
 
     def _release_lease(self, stream: CacheStream) -> None:
         """Give back a lease `admit` never converted; a converted one leaves
@@ -672,7 +686,7 @@ class KVManager(AttentionResource):
             self._streams.setdefault(rid, {"main": CacheStream()})
             self._overrides.setdefault(rid, overrides)
             for label, stream in self._streams[rid].items():
-                if stream.keys is None:
+                if stream.chain is None:
                     self._seed_keys(rid, label, stream)
 
     def admit_retrieve(
@@ -720,11 +734,11 @@ class KVManager(AttentionResource):
 
                 stream = self._ensure_label(rid, label)
                 own = seq_info.latest_kv_transfer_info == self._own_transfer_info()
-                if not own:
+                if not own and stream.chain is not None:
                     # the rank that published this sampled the first token after
                     # it, so a chain extended here would start one token late,
                     # read or not: a local match can cover the whole record
-                    stream.unkeyed = None
+                    stream.chain.unkeyed = None
                 new_len = seq_info.seq_len
                 self._take_local_match(stream, new_len, rooted.get(label))
                 old_len = stream.stored_len
@@ -804,7 +818,7 @@ class KVManager(AttentionResource):
                         len(stream.lease) * self.config.page_size
                     )
                     # they came out of the index, so they are already in it
-                    stream.cursor = len(stream.lease)
+                    stream.chain.cursor = len(stream.lease)
                     stream.lease = None
                     stream.converted = True
                 self._report_admission(segment, stream)

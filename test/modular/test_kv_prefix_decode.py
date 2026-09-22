@@ -183,7 +183,7 @@ def test_a_stop_on_the_boundary_leaves_the_page_one_slot_short():
     _sampled(kv, "r0", EOS)
 
     stream = kv._streams["r0"]["main"]
-    assert stream.keyed_pages == 1, "the chain did not reach the page boundary"
+    assert stream.chain.keyed_pages == 1, "the chain did not reach the page boundary"
     assert stream.stored_len == PAGE_SIZE - 1, (
         "the id that ended the request was written into a slot"
     )

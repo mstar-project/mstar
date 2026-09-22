@@ -93,7 +93,7 @@ def _batch(kv: KVManager, rids: tuple[str, ...], span: int) -> None:
 
 
 def _indexed_page(kv: KVManager, rid: str, page: int) -> int | None:
-    keys = kv._streams[rid]["main"].keys
+    keys = kv._streams[rid]["main"].chain.keys
     return kv._index.page_for(fingerprint(ROOT, keys[page]))
 
 

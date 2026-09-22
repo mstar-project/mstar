@@ -126,7 +126,7 @@ def test_an_image_after_the_text_leaves_the_chain_at_the_text():
     assert _indexed(kv) == len(PROMPT) // PAGE_SIZE, (
         "a page holding the image was filed under a key over sampled text"
     )
-    assert kv._streams["r0"]["main"].keys is None, (
+    assert kv._streams["r0"]["main"].chain is None, (
         "the chain kept growing over a stream that holds tokens it never saw"
     )
 
@@ -175,7 +175,7 @@ def test_a_peers_publish_drops_the_partial_chain_even_when_nothing_is_read():
     assert stream.page_indices == kv._streams["r0"]["main"].page_indices, (
         "the peer's pages were read in rather than matched here"
     )
-    assert stream.unkeyed is None, (
+    assert stream.chain.unkeyed is None, (
         "a peer's publish this cache already held left the chain open, and the "
         "peer's first sampled token would be keyed one place late"
     )
@@ -230,7 +230,7 @@ def test_a_decode_step_that_commits_before_its_token_is_read_back_keeps_the_chai
         _sampled(kv, "r0", token)
     kv.assert_pages_conserved()
 
-    assert kv._streams["r0"]["main"].keys is not None, (
+    assert kv._streams["r0"]["main"].chain is not None, (
         "a step that ran ahead of the read-back was taken for a gap in the chain"
     )
     assert _indexed(kv) == (len(PROMPT) + 30) // PAGE_SIZE, (
@@ -258,7 +258,7 @@ def test_a_stream_that_released_its_front_keys_nothing_further():
     assert _indexed(kv) == indexed, (
         "a page was filed under a key for whatever used to be at its index"
     )
-    assert kv._streams["r0"]["main"].keys is None, (
+    assert kv._streams["r0"]["main"].chain is None, (
         "the chain carried on over a stream whose pages had moved under it"
     )
 
@@ -326,7 +326,7 @@ def test_an_image_walk_writing_first_files_nothing_and_ends_the_chain():
         "pages the image walk wrote were filed under keys chained over the "
         "prompt's text"
     )
-    assert kv._streams["r0"]["main"].keys is None, (
+    assert kv._streams["r0"]["main"].chain is None, (
         "the chain outlived a walk it never described"
     )
     kv.assert_pages_conserved()

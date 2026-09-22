@@ -303,7 +303,7 @@ def test_ingest_puts_the_requests_keys_on_the_stream():
 
     kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0", b"k1"]}))
 
-    assert kv._streams["r0"]["main"].keys == [b"k0", b"k1"], (
+    assert kv._streams["r0"]["main"].chain.keys == [b"k0", b"k1"], (
         "the chain the request brought never reached its stream"
     )
 
@@ -314,7 +314,7 @@ def test_a_label_the_request_did_not_key_carries_none():
 
     stream = kv._ensure_label("r0", "cfg_text")
 
-    assert stream.keys is None, "an unkeyed label was given another label's keys"
+    assert stream.chain is None, "an unkeyed label was given another label's keys"
 
 
 def test_a_request_can_opt_out_of_the_cache():
@@ -324,7 +324,7 @@ def test_a_request_can_opt_out_of_the_cache():
         prefix_keys={"main": [b"k0"]}, prefix_cache=False,
     ))
 
-    assert kv._streams["r0"]["main"].keys is None, (
+    assert kv._streams["r0"]["main"].chain is None, (
         "an opted-out request still carried its keys onto the stream"
     )
 
