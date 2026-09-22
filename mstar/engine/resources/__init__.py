@@ -59,13 +59,13 @@ from mstar.engine.resources.sampler.config import (
     SamplerStep,
     SamplingReqConfig,
 )
-from mstar.engine.resources.speculative import SPEC_ACCEPTANCE, SpecAccepted, SpecAcceptanceSpec, SpecStep
 from mstar.engine.resources.spec import (
     NodeResourceSpec,
     ResourceReqConfig,
     apply_yaml_overrides,
     resolve_spec_dependencies,
 )
+from mstar.engine.resources.speculative import SPEC_ACCEPTANCE, SpecAcceptanceSpec, SpecAccepted, SpecStep
 from mstar.engine.resources.step import (
     AdmitFailedReason,
     AdmitOutcome,
