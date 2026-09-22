@@ -31,4 +31,5 @@ def test_sharded_norm_matches_the_whole_row():
     got = torch.cat([norm.forward_sharded(shards[r], _Group(tp, r, stats), chunk) for r in range(tp)], dim=-1)
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
     # a single rank holds whole rows: the two are the same computation
-    torch.testing.assert_close(norm.forward_sharded(x, _Group(1, 0, [stats[0] * 0 + x.float().pow(2).sum(-1, keepdim=True)]), d), want)
+    whole = _Group(1, 0, [x.float().pow(2).sum(-1, keepdim=True)])
+    torch.testing.assert_close(norm.forward_sharded(x, whole, d), want)
