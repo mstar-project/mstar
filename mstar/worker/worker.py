@@ -2204,15 +2204,18 @@ class Worker:
 
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
+        #
+        # Timed on its own because it dominates postprocess_batch and is NOT
+        # CPU work -- it is the GPU wait, parked here rather than in
+        # await_gpu. Lumped in, postprocess_batch reads as ~65% of the
+        # iteration and looks like CPU overhead worth optimising.
         if self.device.type != "cpu" and batch_N.batch.request_to_worker_graph:
             if batch_N.node_batch.completion_event is not None:
-                if self.enable_nvtx:
-                    range_push("worker.postprocess.completion_event_sync", synchronize=False)
-                batch_N.node_batch.completion_event.synchronize()
-                if self.enable_nvtx:
-                    range_pop(synchronize=False)
+                with self._span("worker.postprocess.event_sync"):
+                    batch_N.node_batch.completion_event.synchronize()
             else:
-                torch.accelerator.synchronize(self.device)
+                with self._span("worker.postprocess.device_sync"):
+                    torch.accelerator.synchronize(self.device)
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
@@ -2227,12 +2230,18 @@ class Worker:
         ):
             per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
 
-        # Check for stops
+        # Check for stops. Prematerialising pulls sampled tokens to the host,
+        # so this can carry a device transfer as well as the stop logic.
+        _t_stop = _time.perf_counter() if self._phase_period else 0.0
         engine = self.engine_manager.get_engine(batch_N.node_name)
         cpu_outputs = self._prematerialize_for_check_stop(
             outputs, batch_N.node_batch.completion_event,
         )
         stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs)
+        if self._phase_period:
+            self._phase_record(
+                "worker.postprocess.check_stop", _time.perf_counter() - _t_stop,
+            )
         if batch_N.node_batch.failed_requests:
             # A rid whose stop check raised has no trustworthy stop decision:
             # routing it would either run its loop forever or end it early.
@@ -2281,6 +2290,7 @@ class Worker:
         flat_rids: list[int] = []
         num_tensors: list[int] = []
         signal_idxs: list[int] = []
+        _t_store = _time.perf_counter() if self._phase_period else 0.0
         for rid in rids:
             info_by_signal = self.tensor_manager.store_and_return_tensor_info(
                 rid=rid, tensors=outputs.get(rid) or {},
@@ -2301,7 +2311,14 @@ class Worker:
         self.tensor_manager.increment_ref_batch(
             flat_uuids, [1] * len(flat_uuids)
         )
+        if self._phase_period:
+            self._phase_record(
+                "worker.postprocess.store_tensors",
+                _time.perf_counter() - _t_store,
+            )
 
+        # The graph runtime's own share of postprocess: the routing call.
+        _t_route = _time.perf_counter() if self._phase_period else 0.0
         route_output = self._graph_runtime.complete_and_route_batch(
             RouteInput(
                 partition=batch_N.partition,
@@ -2317,6 +2334,10 @@ class Worker:
             ),
             self.tensor_manager.tensor_store,
         )
+        if self._phase_period:
+            self._phase_record(
+                "worker.postprocess.route", _time.perf_counter() - _t_route,
+            )
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -2361,6 +2382,7 @@ class Worker:
             route_output.new_token_output_idxs,
             flat_rids, flat_uuids, signals, signal_idxs,
         )
+        _t_send = _time.perf_counter() if self._phase_period else 0.0
         self._graph_runtime.send_outputs(SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
@@ -2386,6 +2408,10 @@ class Worker:
             profiling=self._profiling_payloads(send_rids) if self.enable_prof
             else None,
         ))
+        if self._phase_period:
+            self._phase_record(
+                "worker.postprocess.send", _time.perf_counter() - _t_send,
+            )
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
