@@ -6,6 +6,10 @@ whole inputs recur (which is what would make skipping an encoder worth it), and
 which copy of the node each request landed on (which is what would make routing
 by prefix worth it). They are per request, so they are logged where a request is
 admitted, once, however many times it is admitted.
+
+A request that reaches a declared node with no keys is never reported, so a
+break between the preprocess worker and the node leaves an empty cache and a
+quiet log. The node says so once, not once a request.
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _manager(prefix_cache: bool = True) -> KVManager:
+def _manager(prefix_cache: bool = True, walks=None) -> KVManager:
     kv = KVManager(
         cfg=KVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
@@ -65,7 +69,7 @@ def _manager(prefix_cache: bool = True) -> KVManager:
         ),
         device=torch.device("cpu"), dtype=torch.float32,
     )
-    kv.enable_prefix_cache(ROOT)
+    kv.enable_prefix_cache(ROOT, walks)
     return kv
 
 
@@ -203,4 +207,58 @@ def test_a_request_admitted_twice_is_still_one_line(caplog):
 
     assert len(_lines(caplog)) == 1, (
         "every step of a request would be a line, not every request"
+    )
+
+
+# ── a declared node that its keys never reach ───────────────────────────
+
+DECLARED = {"main": (WALK, "decode")}
+
+
+def _serve(kv: KVManager, count: int, keyed: bool) -> None:
+    for n in range(count):
+        rid = f"r{n}"
+        _ingest(kv, rid, list(range(64)), keyed=keyed)
+        kv.resolve_cached_prefix(rid, NODE, WALK)
+        _run(kv, rid, 64)
+        kv.remove_request(rid)
+
+
+def _warnings(caplog) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+
+
+def test_a_declared_node_its_keys_never_reach_warns_once(caplog):
+    kv = _manager(walks=DECLARED)
+
+    with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
+        _serve(kv, 10, keyed=False)
+
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1, f"ten unkeyed requests gave {len(warnings)} warnings, not one"
+    assert NODE in warnings[0] and "main" in warnings[0], (
+        f"the warning does not name the node and the label that went unkeyed: {warnings[0]}"
+    )
+
+
+def test_a_declared_node_that_receives_its_keys_never_warns(caplog):
+    kv = _manager(walks=DECLARED)
+
+    with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
+        _serve(kv, 10, keyed=True)
+
+    assert _warnings(caplog) == [], "a node receiving its keys was warned it had none"
+
+
+def test_an_undeclared_node_never_warns(caplog):
+    kv = _manager()
+
+    with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
+        _serve(kv, 10, keyed=False)
+
+    assert _warnings(caplog) == [], (
+        "a node the model never declared was warned about keys it was never owed"
     )
