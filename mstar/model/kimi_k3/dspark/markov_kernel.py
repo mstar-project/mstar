@@ -85,7 +85,8 @@ def markov_argmax(logits: torch.Tensor, prev: torch.Tensor, w1: torch.Tensor, w2
         ROWS=rows, RP=rp, R=r, BV=bv, ROUND_BF16=w2.dtype == torch.bfloat16, IEEE=w2.dtype == torch.float32,
         num_warps=4,
     )
-    _markov_final_kernel[(rows,)](vals, idxs, out, n_chunks, out.stride(0), NC=triton.next_power_of_2(n_chunks), num_warps=4)
+    _markov_final_kernel[(rows,)](vals, idxs, out, n_chunks, out.stride(0),
+                                  NC=triton.next_power_of_2(n_chunks), num_warps=4)
 
 
 def markov_argmax_workspace(rows: int, v: int, device) -> tuple[torch.Tensor, torch.Tensor]:
