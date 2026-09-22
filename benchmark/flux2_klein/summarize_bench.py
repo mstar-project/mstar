@@ -70,7 +70,7 @@ def _fmt_s(value: float | None) -> str:
 
 
 def _fmt_rate(entry: dict | None) -> str:
-    if entry is None:
+    if entry is None or entry.get("images_per_s") is None:
         return "n/a"
     spread = ""
     if "images_per_s_min" in entry:
@@ -102,6 +102,19 @@ def render_table(
         if thr and by_c:
             first = next(iter(by_c.values()))
             notes.append(f"{first.get('images', '?')} images x {first.get('repeats', 1)} repeats per level")
+        if any_part.get("engine"):  # pipeline_bench.py rows: in-process, no HTTP, the engine's own PNG path
+            compiled = " + torch.compile" if any_part.get("compile") else ""
+            notes.append(f"in-process {any_part['engine_version']}{compiled}")
+            if lat and lat.get("pipe_median_s") is not None:
+                notes.append(f"pipeline only {lat['pipe_median_s']:.3f} s")
+            pipeline_rates = [f"{by_c[str(c)]['images_per_s_pipeline']:.2f}" for c in concurrencies
+                              if str(c) in by_c and by_c[str(c)].get("images_per_s_pipeline") is not None]
+            if pipeline_rates:
+                notes.append("pipeline-only img/s " + " / ".join(pipeline_rates))
+            failed = [str(c) for c in concurrencies if str(c) in by_c and by_c[str(c)].get("error")]
+            if failed:
+                notes.append("failed @" + ",".join(failed) + ": " + by_c[failed[0]]["error"].split(":")[0])
+            notes.append(any_part.get("batching", ""))
         observed = next(
             (p.get("observed_output_format") for p in (lat, thr) if p and p.get("observed_output_format")), None,
         )
