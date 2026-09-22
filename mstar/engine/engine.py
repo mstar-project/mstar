@@ -564,10 +564,24 @@ class Engine:
                     mark = built.fingerprint() if built is not None else None
                     if mark is not None:
                         parts.append(mark)
-            resource.enable_prefix_cache(fingerprint(*shared, *parts), {
+            opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
                 label: (stream.walk, stream.decode_walk)
                 for label, stream in declared.get(key, {}).items()
             })
+            if not opened or not declared.get(key):
+                continue
+            nodes = ", ".join(sorted(specs_by_key[key].nodes))
+            for label in declared[key]:
+                logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
+            if not resource.supports_eviction:
+                # a cached prompt reserves none of its pages, so admission no
+                # longer bounds how many requests decode at once
+                logger.warning(
+                    "KV %s: prefix cache on with cpu_offload_pages 0: a decode "
+                    "step that finds nothing to evict holds its requests until "
+                    "they time out; cpu_offload_pages gives the worker a victim",
+                    key,
+                )
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.

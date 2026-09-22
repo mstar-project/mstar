@@ -92,13 +92,14 @@ class Resource(ABC):
 
     def enable_prefix_cache(
         self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
-    ) -> None:
-        """Open whatever this resource keeps across requests, under ``root``.
+    ) -> bool:
+        """Open whatever this resource keeps across requests, under ``root``;
+        True if anything opened.
 
         ``walks`` names, per label, the walk that writes the keyed span and the
         one that decodes after it.
         """
-        return
+        return False
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,

@@ -368,23 +368,24 @@ class KVManager(AttentionResource):
 
     def enable_prefix_cache(
         self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
-    ) -> None:
+    ) -> bool:
         """Open the index under ``root``, the identity every key hangs from."""
         self._keyed_walks = {
             label: frozenset(walk for walk in named if walk is not None)
             for label, named in (walks or {}).items()
         }
         if not self.config.prefix_cache:
-            return
+            return False
         if self._world_size > 1:
             logger.info(
                 "KV %s: prefix cache off at world size %d: the ranks index "
                 "independently and would match different lengths",
                 self.name, self._world_size,
             )
-            return
+            return False
         self._prefix_root = root
         self._index = PrefixIndex(self._arena)
+        return True
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
