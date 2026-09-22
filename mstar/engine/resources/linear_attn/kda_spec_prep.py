@@ -5,7 +5,8 @@ slot, the prefix's convolution runs over them and the block's over the window af
 with the taps in tap order and SiLU like the reference; prefix positions past the accepted length
 come out as no-op tokens (k = v = 0, raw gate and beta -1e4: decay 1, beta 0); the window after the
 prefix (after the block, for a step that commits its block) is written back to the pool, the block
-saved as the next pending prefix with its raw gates and betas. The outputs are packed ``prefix + block`` rows for ``kda_recurrent_checkpoint``: the prefix
+saved as the next pending prefix with its raw gates and betas. The outputs are packed ``prefix + block``
+rows for ``kda_recurrent_checkpoint``: the prefix
 part has one slot per pool prefix position (``KP`` = the largest block + 1), the block ``K1`` tokens, so a
 block shorter than the pool's (a block length that follows the batch size, down to one token) packs the
 same way.
