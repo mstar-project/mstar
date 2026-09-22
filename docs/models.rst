@@ -317,7 +317,9 @@ the plain compile, even with eager rounding, lands at a median 35 to 38 dB PSNR 
 path over the 100 protocol prompts, because a 4- or 8-step distilled sampler amplifies the last
 bit of inductor's own reductions and activation decompositions), ``cuda_graph`` with
 ``capture_sizes`` / ``capture_batch_sizes`` (the denoise step, Euler update included, is captured
-per listed ``[height, width]`` and batch size; other shapes run the eager batched path),
+per listed ``[height, width]`` and batch size; other shapes run the eager batched path) and
+``capture_edit_sizes`` (klein: edit buckets with one reference image of the output size, the shape
+of an edit that keeps its reference's size; defaults to ``capture_sizes``, ``[]`` captures none),
 ``max_batch_size``, and ``vae_compile`` (``torch.compile`` of the VAE decode with inductor
 autotuning: 89 to 29 ms at 1024² on an H100; its fused reductions move the image by about 55 dB
 PSNR from the eager decode on every prompt, and the autotuner may pick other conv kernels in
