@@ -128,7 +128,8 @@ def test_attn_res_folded_add_and_norm_are_exact(m, d, t):
         x, p = attn_res_add_read_triton(prefix, add, blocks, w, 1e-5)
         assert torch.equal(p, summed) and p.data_ptr() != prefix.data_ptr()
         assert torch.equal(x, attn_res_read_triton(summed, blocks, w, 1e-5))
-        xn, pn = attn_res_add_read_triton(prefix, add, blocks, w, 1e-5, out_norm_weight=norm.weight, out_eps=norm.variance_epsilon)
+        xn, pn = attn_res_add_read_triton(prefix, add, blocks, w, 1e-5, out_norm_weight=norm.weight,
+                                          out_eps=norm.variance_epsilon)
         assert torch.equal(pn, summed)
         assert torch.equal(xn, norm(attn_res_read_triton(summed, blocks, w, 1e-5)))
         # the module's read: CUDA (folded) and CPU (eager) paths agree with each other
@@ -138,7 +139,8 @@ def test_attn_res_folded_add_and_norm_are_exact(m, d, t):
         x_mod, p_mod = mod.read(prefix, blocks, out_norm=norm, add=add)
         assert torch.equal(p_mod, summed)
         assert torch.equal(x_mod, attn_res_add_read_triton(
-            prefix, add, blocks, mod.score_weight(), mod.eps, out_norm_weight=norm.weight, out_eps=norm.variance_epsilon)[0])
+            prefix, add, blocks, mod.score_weight(), mod.eps, out_norm_weight=norm.weight,
+            out_eps=norm.variance_epsilon)[0])
         mod_cpu = AttnResRead(d).to(torch.bfloat16)
         mod_cpu.load_state_dict(mod.state_dict())
         norm_cpu = KimiRMSNorm(d).to(torch.bfloat16)
@@ -152,7 +154,8 @@ def test_attn_res_folded_add_and_norm_are_exact(m, d, t):
 
 
 @cuda
-@pytest.mark.parametrize("rows,d,dtype", [(1, 4608, torch.bfloat16), (5, 4608, torch.bfloat16), (64, 384, torch.bfloat16), (3, 96, torch.float32)])
+@pytest.mark.parametrize("rows,d,dtype", [(1, 4608, torch.bfloat16), (5, 4608, torch.bfloat16),
+                                          (64, 384, torch.bfloat16), (3, 96, torch.float32)])
 def test_slot_indexed_conv_update_matches_fla(rows, d, dtype):
     """The in-place slot-indexed conv update equals fla's kernel on the gathered windows, output
     and updated windows bit for bit (same fp32 taps, same rounding), and leaves the other slots alone."""
