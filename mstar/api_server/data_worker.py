@@ -3,9 +3,9 @@
 import logging
 import os
 import queue
-from dataclasses import dataclass
 import threading
 import time
+from dataclasses import dataclass
 
 import torch
 
@@ -24,7 +24,7 @@ from mstar.api_server.request_types import (
     ResultTensors,
 )
 from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
-from mstar.communication.tensors import _deserialize_tensor, NameToTensorList, create_tensor_communication_manager
+from mstar.communication.tensors import NameToTensorList, _deserialize_tensor, create_tensor_communication_manager
 from mstar.model.base import Model
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils.ipc_format import (
