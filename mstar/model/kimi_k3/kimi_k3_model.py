@@ -32,13 +32,13 @@ from mstar.engine.resources import (
     RecurrentStateSpec,
     ResourceReqConfig,
     SamplerSpec,
-    SpecAcceptanceSpec,
     SamplingReqConfig,
+    SpecAcceptanceSpec,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.kimi_k3.config import SPEC, KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, KimiK3Config
+from mstar.model.kimi_k3.config import KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, SPEC, KimiK3Config
 from mstar.model.kimi_k3.tokenizer import KimiK3Tokenizer
 from mstar.model.submodule_base import NodeSubmodule
 
