@@ -23,7 +23,7 @@ def test_graceful_sigterm_runs_atexit(tmp_path):
         f"atexit.register(lambda: open({str(marker)!r}, 'w').write('atexit ran'));"
         "os.kill(os.getpid(), signal.SIGTERM); time.sleep(30)"
     )
-    r = subprocess.run([sys.executable, "-c", code], timeout=60)
+    r = subprocess.run([sys.executable, "-c", code], timeout=60, check=False)
     assert r.returncode == 0 and marker.read_text() == "atexit ran"
 
 
