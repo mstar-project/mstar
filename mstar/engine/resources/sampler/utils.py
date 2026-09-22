@@ -779,10 +779,14 @@ def sample_cuda_graphable_gpu(
     so the CUDA-graph path can apply the same vLLM-style repetition penalty as
     the regular ``Sampler``, then samples with
     ``flashinfer.sampling.top_k_top_p_sampling_from_probs`` (``deterministic=True``
-    — the graph-safe variant that avoids CPU-seeded RNG paths). Greedy requests
-    are encoded as ``(temperature=1.0, top_k=1)`` so ``from_probs`` returns the
-    argmax and this function never branches on CPU values (``include_greedy`` is
-    therefore left off).
+    — the graph-safe variant that avoids CPU-seeded RNG paths). Greedy rows keep
+    ``temperature == 0`` in the device buffer and the prep kernel turns them into
+    a one-hot at argmax on-device (``include_greedy=True`` is a constexpr, no CPU
+    branch), so ``from_probs`` returns the argmax regardless of the philox draw.
+    Encoding greedy as ``(temperature=1.0, top_k=1)`` instead is NOT greedy:
+    top-k rejection sampling accepts any token with no strictly-greater
+    probability, so exact top-1 ties (common in bf16 logits) are broken by the
+    per-request seed and identical greedy requests diverge.
 
     The autotune sync inside ``fused_temperature_softmax`` only fires the first
     time a kernel key is seen, which happens during eager warmup — by capture
@@ -809,7 +813,7 @@ def sample_cuda_graphable_gpu(
             logits, temperature,
             penalty=rep_penalty if apply_penalty else None,
             seen_mask=seen_tokens if apply_penalty else None,
-            include_greedy=False,
+            include_greedy=True,
         )
         top_k = torch.where(top_k > 0, top_k, logits.shape[1])
         # NOTE: this is NOT batch-invariant — flashinfer's deterministic RNG
@@ -1176,8 +1180,10 @@ class SamplerBuffers:
             k = int(cfg.top_k)
             p = float(cfg.top_p) if cfg.top_p else 1.0
         else:
-            # Greedy: encoded as (temp=1, top_k=1) so from_probs returns argmax.
-            t, k, p = 1.0, 1, 1.0
+            # Greedy: temperature 0 -> the fused prep kernel emits a one-hot at
+            # argmax (first index on ties), which from_probs returns for any
+            # seed. See ``sample_cuda_graphable_gpu``.
+            t, k, p = 0.0, 0, 1.0
         self.temperature.write_master_row(slot, t)
         self.top_k.write_master_row(slot, k)
         self.top_p.write_master_row(slot, p)
