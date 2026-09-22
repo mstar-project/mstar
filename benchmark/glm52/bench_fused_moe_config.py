@@ -22,6 +22,7 @@ before it competes on speed.
     # smoke-test the plumbing first
     ... --block-n 32 64 --group-m 1 --num-warps 4 --num-stages 3 --iters 20
 """
+
 from __future__ import annotations
 
 import argparse
@@ -86,9 +87,7 @@ def fmt_cfg(bn, gm, nw, ns) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tokens", type=int, default=4, help="rows in the trunk (k+1)")
     ap.add_argument("--top-k", type=int, default=8)
     ap.add_argument("--experts", type=int, default=256)
@@ -104,17 +103,20 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=200, help="graph replays timed")
     ap.add_argument("--top", type=int, default=10, help="rows printed per launch")
     ap.add_argument(
-        "--time-budget-s", type=float, default=300.0,
-        help="soft wall-clock cap on the whole sweep; stop starting new configs "
-             "past this and report whatever finished",
+        "--time-budget-s",
+        type=float,
+        default=300.0,
+        help="soft wall-clock cap on the whole sweep; stop starting new configs past this and report whatever finished",
     )
     a = ap.parse_args()
 
     assert torch.cuda.is_available(), "needs a GPU (CUDA_VISIBLE_DEVICES=<idle>)"
     torch.manual_seed(0)
     dev = torch.device("cuda")
-    print(f"torch {torch.__version__} | triton {triton.__version__} | cuda {torch.version.cuda} "
-          f"| device {torch.cuda.get_device_name(0)}")
+    print(
+        f"torch {torch.__version__} | triton {triton.__version__} | cuda {torch.version.cuda} "
+        f"| device {torch.cuda.get_device_name(0)}"
+    )
 
     E, H, I, T, K = a.experts, a.hidden, a.inter, a.tokens, a.top_k
     QBLOCK = 128
@@ -145,19 +147,24 @@ def main() -> None:
         "gate_up (N=512, K=6144, top_k=8)",
         "down (N=6144, K=256, top_k=1, mul_routed_weight=True)",
     ]
-    print(f"\nshape: tokens={T} top_k={K} E={E} H={H} I/rank={I} | "
-          f"BLOCK_SIZE_K={QBLOCK} (fixed, = fp8 quant group)")
+    print(f"\nshape: tokens={T} top_k={K} E={E} H={H} I/rank={I} | BLOCK_SIZE_K={QBLOCK} (fixed, = fp8 quant group)")
     print(f"BASE CONFIG (from get_default_config): {base_cfg}")
-    print(f"  get_default_config alone picked BLOCK_SIZE_K={raw_block_k}; fused_experts_fp8 always "
-          f"overrides it to the fp8 quant block ({QBLOCK}) before launching")
-    print("  num_warps / num_stages: not set by get_default_config -> Triton's nvidia-backend "
-          f"compiler default applies (num_warps=4, num_stages=3 in triton {triton.__version__}'s "
-          "CUDAOptions)")
-    print(f"sweep grid: BLOCK_SIZE_M={a.block_m} BLOCK_SIZE_N={a.block_n} "
-          f"GROUP_SIZE_M={a.group_m} num_warps={a.num_warps} "
-          f"num_stages={a.num_stages} -> {len(grid)} configs/launch/block_m, "
-          f"{len(grid) * len(launch_names) * len(a.block_m)} compiles total, "
-          f"time budget {a.time_budget_s:.0f}s\n")
+    print(
+        f"  get_default_config alone picked BLOCK_SIZE_K={raw_block_k}; fused_experts_fp8 always "
+        f"overrides it to the fp8 quant block ({QBLOCK}) before launching"
+    )
+    print(
+        "  num_warps / num_stages: not set by get_default_config -> Triton's nvidia-backend "
+        f"compiler default applies (num_warps=4, num_stages=3 in triton {triton.__version__}'s "
+        "CUDAOptions)"
+    )
+    print(
+        f"sweep grid: BLOCK_SIZE_M={a.block_m} BLOCK_SIZE_N={a.block_n} "
+        f"GROUP_SIZE_M={a.group_m} num_warps={a.num_warps} "
+        f"num_stages={a.num_stages} -> {len(grid)} configs/launch/block_m, "
+        f"{len(grid) * len(launch_names) * len(a.block_m)} compiles total, "
+        f"time budget {a.time_budget_s:.0f}s\n"
+    )
 
     t_start = time.time()
     budget_exceeded = False
@@ -173,28 +180,61 @@ def main() -> None:
         default_cfg = dict(base_cfg, BLOCK_SIZE_M=BLOCK_M)
 
         R.invoke_fused_moe_kernel_fp8_w8a8(
-            A=a_q, B=w1, C=c1, A_scale=a_s, B_scale=w1s, topk_weights=topk_w,
-            topk_ids=topk_ids, sorted_token_ids=sorted_ids, expert_ids=expert_ids,
-            num_tokens_post_padded=n_post, mul_routed_weight=False, top_k=K,
-            config=default_cfg, compute_type=ct, block_shape=(QBLOCK, QBLOCK),
+            A=a_q,
+            B=w1,
+            C=c1,
+            A_scale=a_s,
+            B_scale=w1s,
+            topk_weights=topk_w,
+            topk_ids=topk_ids,
+            sorted_token_ids=sorted_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=n_post,
+            mul_routed_weight=False,
+            top_k=K,
+            config=default_cfg,
+            compute_type=ct,
+            block_shape=(QBLOCK, QBLOCK),
         )
         R.act_and_mul_triton(c1, c2, activation="silu")
         a2_q, a2_s = R.per_token_group_quant_fp8(c2, QBLOCK)
 
         def up(cfg, _si=sorted_ids, _ei=expert_ids, _np=n_post):
             R.invoke_fused_moe_kernel_fp8_w8a8(
-                A=a_q, B=w1, C=c1, A_scale=a_s, B_scale=w1s, topk_weights=topk_w,
-                topk_ids=topk_ids, sorted_token_ids=_si, expert_ids=_ei,
-                num_tokens_post_padded=_np, mul_routed_weight=False, top_k=K,
-                config=cfg, compute_type=ct, block_shape=(QBLOCK, QBLOCK),
+                A=a_q,
+                B=w1,
+                C=c1,
+                A_scale=a_s,
+                B_scale=w1s,
+                topk_weights=topk_w,
+                topk_ids=topk_ids,
+                sorted_token_ids=_si,
+                expert_ids=_ei,
+                num_tokens_post_padded=_np,
+                mul_routed_weight=False,
+                top_k=K,
+                config=cfg,
+                compute_type=ct,
+                block_shape=(QBLOCK, QBLOCK),
             )
 
-        def down(cfg, _si=sorted_ids, _ei=expert_ids, _np=n_post):
+        def down(cfg, _si=sorted_ids, _ei=expert_ids, _np=n_post, _aq=a2_q, _as=a2_s):
             R.invoke_fused_moe_kernel_fp8_w8a8(
-                A=a2_q, B=w2, C=c3.view(T * K, H), A_scale=a2_s, B_scale=w2s,
-                topk_weights=topk_w, topk_ids=topk_ids, sorted_token_ids=_si,
-                expert_ids=_ei, num_tokens_post_padded=_np, mul_routed_weight=True,
-                top_k=1, config=cfg, compute_type=ct, block_shape=(QBLOCK, QBLOCK),
+                A=_aq,
+                B=w2,
+                C=c3.view(T * K, H),
+                A_scale=_as,
+                B_scale=w2s,
+                topk_weights=topk_w,
+                topk_ids=topk_ids,
+                sorted_token_ids=_si,
+                expert_ids=_ei,
+                num_tokens_post_padded=_np,
+                mul_routed_weight=True,
+                top_k=1,
+                config=cfg,
+                compute_type=ct,
+                block_shape=(QBLOCK, QBLOCK),
             )
 
         launches = [
@@ -212,25 +252,35 @@ def main() -> None:
             fn(default_cfg)
             torch.cuda.synchronize()
             ref_out = out_buf.clone()
-            default_us[name] = bench_graph(lambda fn=fn: fn(default_cfg), a.capture_n, a.iters)
+            default_us[name] = bench_graph(lambda fn=fn, dc=default_cfg: fn(dc), a.capture_n, a.iters)
             cross_default[(BLOCK_M, name)] = default_us[name]
-            print(f"  default: BN={default_cfg['BLOCK_SIZE_N']} "
-                  f"GM={default_cfg['GROUP_SIZE_M']} W=auto S=auto "
-                  f"-> {default_us[name]:8.2f} us/launch (in-graph; reference for bit-identity)")
+            print(
+                f"  default: BN={default_cfg['BLOCK_SIZE_N']} "
+                f"GM={default_cfg['GROUP_SIZE_M']} W=auto S=auto "
+                f"-> {default_us[name]:8.2f} us/launch (in-graph; reference for bit-identity)"
+            )
 
             rows: list = []
             skips: list = []
             for i, (bn, gm, nw, ns) in enumerate(grid):
                 if not budget_exceeded and time.time() - t_start > a.time_budget_s:
                     budget_exceeded = True
-                    print(f"  time budget ({a.time_budget_s:.0f}s) reached at config {i}/{len(grid)}; "
-                          "not starting any more configs")
+                    print(
+                        f"  time budget ({a.time_budget_s:.0f}s) reached at config {i}/{len(grid)}; "
+                        "not starting any more configs"
+                    )
                 if budget_exceeded:
                     skips.append((bn, gm, nw, ns, "not attempted (time budget)"))
                     continue
 
-                cfg = dict(BLOCK_SIZE_M=BLOCK_M, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=QBLOCK,
-                           GROUP_SIZE_M=gm, num_warps=nw, num_stages=ns)
+                cfg = dict(
+                    BLOCK_SIZE_M=BLOCK_M,
+                    BLOCK_SIZE_N=bn,
+                    BLOCK_SIZE_K=QBLOCK,
+                    GROUP_SIZE_M=gm,
+                    num_warps=nw,
+                    num_stages=ns,
+                )
                 try:
                     out_buf.zero_()
                     fn(cfg)
@@ -268,16 +318,18 @@ def main() -> None:
         for name, _, _ in launches:
             rows = all_rows[name]
             skips = all_skips[name]
-            print(f"\n  {name}: top {min(a.top, len(rows))} of {len(rows)} ok / "
-                  f"{len(skips)} skipped")
-            print(f"  {'rank':<5}{'BLOCK_N':>8}{'GROUP_M':>8}{'warps':>7}{'stages':>7}"
-                  f"{'us/launch':>12}{'bit-id':>8}{'vs default':>12}")
+            print(f"\n  {name}: top {min(a.top, len(rows))} of {len(rows)} ok / {len(skips)} skipped")
+            print(
+                f"  {'rank':<5}{'BLOCK_N':>8}{'GROUP_M':>8}{'warps':>7}{'stages':>7}"
+                f"{'us/launch':>12}{'bit-id':>8}{'vs default':>12}"
+            )
             for rank, (bn, gm, nw, ns, us, ok) in enumerate(rows[: a.top], 1):
                 delta = 100.0 * (us - default_us[name]) / default_us[name]
-                print(f"  {rank:<5}{bn:>8}{gm:>8}{nw:>7}{ns:>7}{us:>12.2f}{str(ok):>8}"
-                      f"{delta:>+11.1f}%")
-            print(f"  {'--':<5}{'--':>8}{'--':>8}{'--':>7}{'--':>7}"
-                  f"{default_us[name]:>12.2f}{'ref':>8}{'0.0%':>12}   <- current default")
+                print(f"  {rank:<5}{bn:>8}{gm:>8}{nw:>7}{ns:>7}{us:>12.2f}{str(ok):>8}{delta:>+11.1f}%")
+            print(
+                f"  {'--':<5}{'--':>8}{'--':>8}{'--':>7}{'--':>7}"
+                f"{default_us[name]:>12.2f}{'ref':>8}{'0.0%':>12}   <- current default"
+            )
 
             bit_id_rows = [r for r in rows if r[5]]
             if bit_id_rows:
@@ -304,34 +356,27 @@ def main() -> None:
         print(f"{'=' * 72}")
         for name in launch_names:
             print(f"\n  {name}:")
-            print(f"  {'BM':>4}  {'best config':>28}  {'us/launch':>10}  {'bit-id':>7}"
-                  f"  {'vs BM=16 default':>17}")
+            print(f"  {'BM':>4}  {'best config':>28}  {'us/launch':>10}  {'bit-id':>7}  {'vs BM=16 default':>17}")
             for bm in a.block_m:
                 key = (bm, name)
                 if key in cross_best:
                     bn, gm, nw, ns, us, ok = cross_best[key]
-                    ref = cross_default.get((16, name),
-                                           cross_default.get((a.block_m[0], name), us))
+                    ref = cross_default.get((16, name), cross_default.get((a.block_m[0], name), us))
                     delta = 100.0 * (us - ref) / ref
-                    print(f"  {bm:>4}  {fmt_cfg(bn, gm, nw, ns):>28}  {us:>10.2f}"
-                          f"  {str(ok):>7}  {delta:>+16.1f}%")
+                    print(f"  {bm:>4}  {fmt_cfg(bn, gm, nw, ns):>28}  {us:>10.2f}  {str(ok):>7}  {delta:>+16.1f}%")
                 else:
                     print(f"  {bm:>4}  {'(no usable configs)':>28}")
 
         print(f"\n  per-step projection ({a.layers} layers):")
         for bm in a.block_m:
-            total = sum(
-                cross_best.get((bm, n), (0, 0, 0, 0, 999, False))[4]
-                for n in launch_names
-            )
-            ref_total = sum(
-                cross_default.get((16, n), cross_default.get((a.block_m[0], n), 0))
-                for n in launch_names
-            )
+            total = sum(cross_best.get((bm, n), (0, 0, 0, 0, 999, False))[4] for n in launch_names)
+            ref_total = sum(cross_default.get((16, n), cross_default.get((a.block_m[0], n), 0)) for n in launch_names)
             delta = total - ref_total
             proj_ms = delta * a.layers / 1000.0
-            print(f"    BM={bm}: {total:.2f} us/layer ({delta:+.2f} vs BM=16 default), "
-                  f"x {a.layers} layers = {proj_ms:+.3f} ms/step")
+            print(
+                f"    BM={bm}: {total:.2f} us/layer ({delta:+.2f} vs BM=16 default), "
+                f"x {a.layers} layers = {proj_ms:+.3f} ms/step"
+            )
     else:
         BLOCK_M = a.block_m[0]
         if all((BLOCK_M, n) in cross_best for n in launch_names):
@@ -345,15 +390,21 @@ def main() -> None:
             d_layer = d_gu + d_dn
             proj_ms = d_layer * a.layers / 1000.0
             print("\n=== best pair vs default ===")
-            print(f"  gate_up: default {ref_gu:.2f} us -> best {us_gu:.2f} us "
-                  f"(BN={bn_gu} GM={gm_gu} W={nw_gu} S={ns_gu}, bit-identical={ok_gu}), "
-                  f"delta {d_gu:+.2f} us/layer")
-            print(f"  down:    default {ref_dn:.2f} us -> best {us_dn:.2f} us "
-                  f"(BN={bn_dn} GM={gm_dn} W={nw_dn} S={ns_dn}, bit-identical={ok_dn}), "
-                  f"delta {d_dn:+.2f} us/layer")
-            print(f"  PROJECTION: {d_layer:.2f} us/layer saved "
-                  f"x {a.layers} layers = {proj_ms:.3f} ms/decode step "
-                  f"(T={T}-row trunk, top_k={K})")
+            print(
+                f"  gate_up: default {ref_gu:.2f} us -> best {us_gu:.2f} us "
+                f"(BN={bn_gu} GM={gm_gu} W={nw_gu} S={ns_gu}, bit-identical={ok_gu}), "
+                f"delta {d_gu:+.2f} us/layer"
+            )
+            print(
+                f"  down:    default {ref_dn:.2f} us -> best {us_dn:.2f} us "
+                f"(BN={bn_dn} GM={gm_dn} W={nw_dn} S={ns_dn}, bit-identical={ok_dn}), "
+                f"delta {d_dn:+.2f} us/layer"
+            )
+            print(
+                f"  PROJECTION: {d_layer:.2f} us/layer saved "
+                f"x {a.layers} layers = {proj_ms:.3f} ms/decode step "
+                f"(T={T}-row trunk, top_k={K})"
+            )
         else:
             print("could not compute a best pair -- one or both launches had no usable configs")
 
