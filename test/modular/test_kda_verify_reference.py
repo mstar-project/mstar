@@ -104,7 +104,8 @@ def test_verify_blocks_match_the_dense_reference_over_the_accepted_sequence():
         assert torch.allclose(from_v_first(state[slot]), want_state, atol=1e-5, rtol=1e-5)
         assert torch.allclose(conv[slot], want_conv, atol=1e-6)
         # the block's outputs: what the dense reference gives at those positions after the accepted sequence
-        want_o, _, _ = dense(params, torch.cat([acc_qkv, b_qkv]), torch.cat([acc_g, b_g]), torch.cat([acc_beta, b_beta]))
+        want_o, _, _ = dense(params, torch.cat([acc_qkv, b_qkv]), torch.cat([acc_g, b_g]),
+                             torch.cat([acc_beta, b_beta]))
         assert torch.allclose(o.float(), want_o[-K1:], atol=1e-5, rtol=1e-5)
         # the target accepted `accepted` drafts: bonus + accepted tokens join the sequence
         attn.set_prefix_len(spec.length, torch.tensor([accepted], dtype=torch.int32))
@@ -120,7 +121,8 @@ def test_verify_blocks_match_the_dense_reference_over_the_accepted_sequence():
     assert runner.admit(s).ok
     runner.plan(s)
     o = attn.run(b_qkv, b_g, b_beta, conv, state, params, spec=spec)
-    want_o, want_state, _ = dense(params, torch.cat([acc_qkv, b_qkv]), torch.cat([acc_g, b_g]), torch.cat([acc_beta, b_beta]))
+    want_o, want_state, _ = dense(params, torch.cat([acc_qkv, b_qkv]), torch.cat([acc_g, b_g]),
+                                  torch.cat([acc_beta, b_beta]))
     assert torch.allclose(o.float(), want_o[-K1:], atol=1e-5, rtol=1e-5)
     _, ckpt, _ = dense(params, acc_qkv, acc_g, acc_beta)
     assert torch.allclose(from_v_first(state[slot]), ckpt, atol=1e-5, rtol=1e-5)
@@ -170,7 +172,8 @@ def test_shorter_and_empty_blocks_follow_the_pool_slots():
         _, want_state, want_conv = dense(params, *committed)
         assert torch.allclose(from_v_first(state[slot]), want_state, atol=1e-5, rtol=1e-5)
         assert torch.allclose(conv[slot], want_conv, atol=1e-6)
-        want_o, _, _ = dense(params, torch.cat([acc_qkv, b_qkv]), torch.cat([acc_g, b_g]), torch.cat([acc_beta, b_beta]))
+        want_o, _, _ = dense(params, torch.cat([acc_qkv, b_qkv]), torch.cat([acc_g, b_g]),
+                             torch.cat([acc_beta, b_beta]))
         assert o.shape == (span, H, D) and torch.allclose(o.float(), want_o[-span:], atol=1e-5, rtol=1e-5)
         attn.set_prefix_len(spec.length, torch.tensor([accepted], dtype=torch.int32))
         assert int(spec.length[slot, 0]) == (accepted + 1 if span > 1 else 0)
