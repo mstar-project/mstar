@@ -136,7 +136,7 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
 
-    if _cuda_op_available():
+    if _cuda_op_available() and topk_ids.is_cuda : #Check tensor for CUDA
         torch.ops._mstar_moe_C.moe_align_block_size(
             topk_ids,
             num_experts,

@@ -6,13 +6,13 @@ Companion to ``bench_fused_moe_grid.py``, which measures the grid-size clamp
 at a fixed config; this script fixes the grid and sweeps the compile-time
 tiles of ``fused_moe_kernel_fp8_w8a8`` -- ``BLOCK_SIZE_N``, ``GROUP_SIZE_M``,
 ``num_warps``, ``num_stages`` -- for the gate/up and down GEMMs separately.
-``fused_experts_fp8`` tunes only gate/up today and reuses that config for
-down, so whether the split matters is part of what this measures.
+``fused_experts_fp8`` now tunes gate/up and down separately at decode shapes;
+this script validates the split and finds the per-launch optimum.
 
-``BLOCK_SIZE_M`` stays at 16: ``moe_align_block_size`` builds the padded slot
-layout and ``expert_ids`` for one block size, so another value needs a fresh
-alignment pass, not a relabelled tile.  ``BLOCK_SIZE_K`` stays at 128: the
-kernel static-asserts it equals the weight's fp8 quant-block K.
+``BLOCK_SIZE_M`` can also be swept (``--block-m``).  Each value needs its own
+``moe_align_block_size`` pass (the padded slot layout is block-size-specific),
+so the sweep runs once per value.  ``BLOCK_SIZE_K`` stays at 128: the kernel
+static-asserts it equals the weight's fp8 quant-block K.
 
 Every swept config is checked bit-identical against the default's output
 before it competes on speed.
@@ -95,6 +95,7 @@ def main() -> None:
     ap.add_argument("--hidden", type=int, default=6144)
     ap.add_argument("--inter", type=int, default=256, help="moe_intermediate / TP")
     ap.add_argument("--layers", type=int, default=75, help="only to scale the per-step projection")
+    ap.add_argument("--block-m", type=int, nargs="+", default=[16, 64])
     ap.add_argument("--block-n", type=int, nargs="+", default=[32, 64, 128, 256])
     ap.add_argument("--group-m", type=int, nargs="+", default=[1, 8])
     ap.add_argument("--num-warps", type=int, nargs="+", default=[4, 8])
@@ -116,7 +117,7 @@ def main() -> None:
           f"| device {torch.cuda.get_device_name(0)}")
 
     E, H, I, T, K = a.experts, a.hidden, a.inter, a.tokens, a.top_k
-    QBLOCK = 128  # fp8 weight quant block (block_n, block_k); also forces BLOCK_SIZE_K
+    QBLOCK = 128
     fp8 = R.FP8_DTYPE
 
     w1 = (torch.randn(E, 2 * I, H, device=dev) * 0.05).to(fp8)
@@ -129,199 +130,232 @@ def main() -> None:
     topk_w = (topk_w / topk_w.sum(-1, keepdim=True)).to(torch.bfloat16)
     topk_ids = topk_ids.to(torch.int32).contiguous()
 
-    # Today's default: ONE call, shared by both launches -- get_default_config's
-    # M<=E branch ignores N/K/top_k, so this happens to be shape-correct for
-    # both even though gate/up is N=512,K=6144 and down is N=6144,K=256 (see
-    # module docstring).
-    default_cfg = R.get_default_config(M=T, E=E, N=2 * I, K=H, top_k=K)
-    raw_block_k = default_cfg["BLOCK_SIZE_K"]
-    default_cfg["BLOCK_SIZE_K"] = QBLOCK  # fused_experts_fp8's forced override
-    BLOCK_M = default_cfg["BLOCK_SIZE_M"]
-    assert BLOCK_M == 16, (
-        f"decode shape's default BLOCK_SIZE_M is {BLOCK_M}, not 16 -- get_default_config "
-        "changed and this script's fixed-16 / single-alignment assumption is stale"
-    )
-
-    # moe_align_block_size's block_size must equal BLOCK_SIZE_M (align.py: the
-    # padded slot layout and expert_ids are built for exactly that block
-    # size). BLOCK_SIZE_M is fixed at 16 for the whole sweep, so one call
-    # covers it -- see the module docstring for why it can't be swept here.
-    sorted_ids, expert_ids, n_post = R.moe_align_block_size(topk_ids, BLOCK_M, E)
-    ct = R._tl_compute_type(x.dtype)
+    base_cfg = R.get_default_config(M=T, E=E, N=2 * I, K=H, top_k=K)
+    raw_block_k = base_cfg["BLOCK_SIZE_K"]
+    base_cfg["BLOCK_SIZE_K"] = QBLOCK
 
     a_q, a_s = R.per_token_group_quant_fp8(x, QBLOCK)
+    ct = R._tl_compute_type(x.dtype)
     c1 = torch.empty(T * K, 2 * I, device=dev, dtype=x.dtype)
     c2 = torch.empty(T * K, I, device=dev, dtype=x.dtype)
     c3 = torch.empty(T, K, H, device=dev, dtype=x.dtype)
 
-    # Real (non-degenerate) down-GEMM input: run gate/up + SwiGLU for real
-    # instead of feeding zeros, so the down-GEMM bit-identity check is
-    # sensitive to indexing bugs (e.g. b_scale's group lookup when
-    # BLOCK_SIZE_N spans multiple 128-wide quant groups), not just "0 == 0".
-    R.invoke_fused_moe_kernel_fp8_w8a8(
-        A=a_q, B=w1, C=c1, A_scale=a_s, B_scale=w1s, topk_weights=topk_w,
-        topk_ids=topk_ids, sorted_token_ids=sorted_ids, expert_ids=expert_ids,
-        num_tokens_post_padded=n_post, mul_routed_weight=False, top_k=K,
-        config=default_cfg, compute_type=ct, block_shape=(QBLOCK, QBLOCK),
-    )
-    R.act_and_mul_triton(c1, c2, activation="silu")
-    a2_q, a2_s = R.per_token_group_quant_fp8(c2, QBLOCK)
-
-    def up(cfg):
-        R.invoke_fused_moe_kernel_fp8_w8a8(
-            A=a_q, B=w1, C=c1, A_scale=a_s, B_scale=w1s, topk_weights=topk_w,
-            topk_ids=topk_ids, sorted_token_ids=sorted_ids, expert_ids=expert_ids,
-            num_tokens_post_padded=n_post, mul_routed_weight=False, top_k=K,
-            config=cfg, compute_type=ct, block_shape=(QBLOCK, QBLOCK),
-        )
-
-    def down(cfg):
-        R.invoke_fused_moe_kernel_fp8_w8a8(
-            A=a2_q, B=w2, C=c3.view(T * K, H), A_scale=a2_s, B_scale=w2s, topk_weights=topk_w,
-            topk_ids=topk_ids, sorted_token_ids=sorted_ids, expert_ids=expert_ids,
-            num_tokens_post_padded=n_post, mul_routed_weight=True, top_k=1,
-            config=cfg, compute_type=ct, block_shape=(QBLOCK, QBLOCK),
-        )
-
-    launches = [
-        ("gate_up (N=512, K=6144, top_k=8)", up, c1),
-        ("down (N=6144, K=256, top_k=1, mul_routed_weight=True)", down, c3.view(T * K, H)),
-    ]
-
     grid = list(itertools.product(a.block_n, a.group_m, a.num_warps, a.num_stages))
-    print(f"\nshape: tokens={T} top_k={K} E={E} H={H} I/rank={I} | BLOCK_SIZE_M={BLOCK_M} "
-          f"(fixed, = align block) BLOCK_SIZE_K={QBLOCK} (fixed, = fp8 quant group)")
-    print(f"DEFAULT CONFIG (today, both launches share it): {default_cfg}")
+    launch_names = [
+        "gate_up (N=512, K=6144, top_k=8)",
+        "down (N=6144, K=256, top_k=1, mul_routed_weight=True)",
+    ]
+    print(f"\nshape: tokens={T} top_k={K} E={E} H={H} I/rank={I} | "
+          f"BLOCK_SIZE_K={QBLOCK} (fixed, = fp8 quant group)")
+    print(f"BASE CONFIG (from get_default_config): {base_cfg}")
     print(f"  get_default_config alone picked BLOCK_SIZE_K={raw_block_k}; fused_experts_fp8 always "
           f"overrides it to the fp8 quant block ({QBLOCK}) before launching")
     print("  num_warps / num_stages: not set by get_default_config -> Triton's nvidia-backend "
           f"compiler default applies (num_warps=4, num_stages=3 in triton {triton.__version__}'s "
           "CUDAOptions)")
-    print(f"sweep grid: BLOCK_SIZE_N={a.block_n} GROUP_SIZE_M={a.group_m} num_warps={a.num_warps} "
-          f"num_stages={a.num_stages} -> {len(grid)} configs/launch, {len(grid) * len(launches)} "
-          f"compiles total, time budget {a.time_budget_s:.0f}s\n")
+    print(f"sweep grid: BLOCK_SIZE_M={a.block_m} BLOCK_SIZE_N={a.block_n} "
+          f"GROUP_SIZE_M={a.group_m} num_warps={a.num_warps} "
+          f"num_stages={a.num_stages} -> {len(grid)} configs/launch/block_m, "
+          f"{len(grid) * len(launch_names) * len(a.block_m)} compiles total, "
+          f"time budget {a.time_budget_s:.0f}s\n")
 
     t_start = time.time()
     budget_exceeded = False
-    default_us: dict[str, float] = {}
-    all_rows: dict[str, list] = {}
-    all_skips: dict[str, list] = {}
+    cross_best: dict[tuple[int, str], tuple] = {}
+    cross_default: dict[tuple[int, str], float] = {}
 
-    for name, fn, out_buf in launches:
-        print(f"=== {name} ===")
-        out_buf.zero_()
-        fn(default_cfg)
-        torch.cuda.synchronize()
-        ref_out = out_buf.clone()
-        default_us[name] = bench_graph(lambda fn=fn: fn(default_cfg), a.capture_n, a.iters)
-        print(f"  default: BN={default_cfg['BLOCK_SIZE_N']} GM={default_cfg['GROUP_SIZE_M']} "
-              f"W=auto S=auto -> {default_us[name]:8.2f} us/launch (in-graph; reference for "
-              "bit-identity)")
+    for BLOCK_M in a.block_m:
+        print(f"\n{'=' * 72}")
+        print(f"BLOCK_SIZE_M = {BLOCK_M}")
+        print(f"{'=' * 72}")
 
-        rows: list = []
-        skips: list = []
-        for i, (bn, gm, nw, ns) in enumerate(grid):
-            if not budget_exceeded and time.time() - t_start > a.time_budget_s:
-                budget_exceeded = True
-                print(f"  time budget ({a.time_budget_s:.0f}s) reached at config {i}/{len(grid)}; "
-                      "not starting any more configs")
-            if budget_exceeded:
-                skips.append((bn, gm, nw, ns, "not attempted (time budget)"))
-                continue
+        sorted_ids, expert_ids, n_post = R.moe_align_block_size(topk_ids, BLOCK_M, E)
+        default_cfg = dict(base_cfg, BLOCK_SIZE_M=BLOCK_M)
 
-            cfg = dict(BLOCK_SIZE_M=BLOCK_M, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=QBLOCK,
-                       GROUP_SIZE_M=gm, num_warps=nw, num_stages=ns)
-            try:
-                out_buf.zero_()
-                fn(cfg)
-                torch.cuda.synchronize()
-            except Exception as e:
-                reason = str(e).splitlines()[0][:160]
-                skips.append((bn, gm, nw, ns, reason))
-                print(f"  {i + 1:>3}/{len(grid)} {fmt_cfg(bn, gm, nw, ns)} -> SKIP ({reason})")
-                if not _context_alive(dev):
-                    print("  !! CUDA context looks dead after that failure -- aborting the sweep "
-                          "early, reporting what finished so far.")
+        R.invoke_fused_moe_kernel_fp8_w8a8(
+            A=a_q, B=w1, C=c1, A_scale=a_s, B_scale=w1s, topk_weights=topk_w,
+            topk_ids=topk_ids, sorted_token_ids=sorted_ids, expert_ids=expert_ids,
+            num_tokens_post_padded=n_post, mul_routed_weight=False, top_k=K,
+            config=default_cfg, compute_type=ct, block_shape=(QBLOCK, QBLOCK),
+        )
+        R.act_and_mul_triton(c1, c2, activation="silu")
+        a2_q, a2_s = R.per_token_group_quant_fp8(c2, QBLOCK)
+
+        def up(cfg, _si=sorted_ids, _ei=expert_ids, _np=n_post):
+            R.invoke_fused_moe_kernel_fp8_w8a8(
+                A=a_q, B=w1, C=c1, A_scale=a_s, B_scale=w1s, topk_weights=topk_w,
+                topk_ids=topk_ids, sorted_token_ids=_si, expert_ids=_ei,
+                num_tokens_post_padded=_np, mul_routed_weight=False, top_k=K,
+                config=cfg, compute_type=ct, block_shape=(QBLOCK, QBLOCK),
+            )
+
+        def down(cfg, _si=sorted_ids, _ei=expert_ids, _np=n_post):
+            R.invoke_fused_moe_kernel_fp8_w8a8(
+                A=a2_q, B=w2, C=c3.view(T * K, H), A_scale=a2_s, B_scale=w2s,
+                topk_weights=topk_w, topk_ids=topk_ids, sorted_token_ids=_si,
+                expert_ids=_ei, num_tokens_post_padded=_np, mul_routed_weight=True,
+                top_k=1, config=cfg, compute_type=ct, block_shape=(QBLOCK, QBLOCK),
+            )
+
+        launches = [
+            (launch_names[0], up, c1),
+            (launch_names[1], down, c3.view(T * K, H)),
+        ]
+
+        default_us: dict[str, float] = {}
+        all_rows: dict[str, list] = {}
+        all_skips: dict[str, list] = {}
+
+        for name, fn, out_buf in launches:
+            print(f"\n--- {name} ---")
+            out_buf.zero_()
+            fn(default_cfg)
+            torch.cuda.synchronize()
+            ref_out = out_buf.clone()
+            default_us[name] = bench_graph(lambda fn=fn: fn(default_cfg), a.capture_n, a.iters)
+            cross_default[(BLOCK_M, name)] = default_us[name]
+            print(f"  default: BN={default_cfg['BLOCK_SIZE_N']} "
+                  f"GM={default_cfg['GROUP_SIZE_M']} W=auto S=auto "
+                  f"-> {default_us[name]:8.2f} us/launch (in-graph; reference for bit-identity)")
+
+            rows: list = []
+            skips: list = []
+            for i, (bn, gm, nw, ns) in enumerate(grid):
+                if not budget_exceeded and time.time() - t_start > a.time_budget_s:
                     budget_exceeded = True
-                continue
+                    print(f"  time budget ({a.time_budget_s:.0f}s) reached at config {i}/{len(grid)}; "
+                          "not starting any more configs")
+                if budget_exceeded:
+                    skips.append((bn, gm, nw, ns, "not attempted (time budget)"))
+                    continue
 
-            ok = torch.equal(out_buf, ref_out)
-            try:
-                us = bench_graph(lambda cfg=cfg, fn=fn: fn(cfg), a.capture_n, a.iters)
-            except Exception as e:
-                reason = f"graph capture: {str(e).splitlines()[0][:150]}"
-                skips.append((bn, gm, nw, ns, reason))
-                print(f"  {i + 1:>3}/{len(grid)} {fmt_cfg(bn, gm, nw, ns)} -> SKIP ({reason})")
-                if not _context_alive(dev):
-                    print("  !! CUDA context looks dead after that failure -- aborting the sweep "
-                          "early, reporting what finished so far.")
-                    budget_exceeded = True
-                continue
+                cfg = dict(BLOCK_SIZE_M=BLOCK_M, BLOCK_SIZE_N=bn, BLOCK_SIZE_K=QBLOCK,
+                           GROUP_SIZE_M=gm, num_warps=nw, num_stages=ns)
+                try:
+                    out_buf.zero_()
+                    fn(cfg)
+                    torch.cuda.synchronize()
+                except Exception as e:
+                    reason = str(e).splitlines()[0][:160]
+                    skips.append((bn, gm, nw, ns, reason))
+                    print(f"  {i + 1:>3}/{len(grid)} {fmt_cfg(bn, gm, nw, ns)} -> SKIP ({reason})")
+                    if not _context_alive(dev):
+                        print("  !! CUDA context dead -- aborting sweep early")
+                        budget_exceeded = True
+                    continue
 
-            rows.append((bn, gm, nw, ns, us, ok))
-            flag = "OK" if ok else "DIFFERS FROM DEFAULT"
-            print(f"  {i + 1:>3}/{len(grid)} {fmt_cfg(bn, gm, nw, ns)} -> {us:8.2f} us  {flag}")
+                ok = torch.equal(out_buf, ref_out)
+                try:
+                    us = bench_graph(lambda cfg=cfg, fn=fn: fn(cfg), a.capture_n, a.iters)
+                except Exception as e:
+                    reason = f"graph capture: {str(e).splitlines()[0][:150]}"
+                    skips.append((bn, gm, nw, ns, reason))
+                    print(f"  {i + 1:>3}/{len(grid)} {fmt_cfg(bn, gm, nw, ns)} -> SKIP ({reason})")
+                    if not _context_alive(dev):
+                        print("  !! CUDA context dead -- aborting sweep early")
+                        budget_exceeded = True
+                    continue
 
-        rows.sort(key=lambda r: r[4])
-        all_rows[name] = rows
-        all_skips[name] = skips
-        print()
+                rows.append((bn, gm, nw, ns, us, ok))
+                flag = "OK" if ok else "DIFFERS FROM DEFAULT"
+                print(f"  {i + 1:>3}/{len(grid)} {fmt_cfg(bn, gm, nw, ns)} -> {us:8.2f} us  {flag}")
+
+            rows.sort(key=lambda r: r[4])
+            all_rows[name] = rows
+            all_skips[name] = skips
+
+        print(f"\n=== BLOCK_SIZE_M={BLOCK_M} summary ===")
+        for name, _, _ in launches:
+            rows = all_rows[name]
+            skips = all_skips[name]
+            print(f"\n  {name}: top {min(a.top, len(rows))} of {len(rows)} ok / "
+                  f"{len(skips)} skipped")
+            print(f"  {'rank':<5}{'BLOCK_N':>8}{'GROUP_M':>8}{'warps':>7}{'stages':>7}"
+                  f"{'us/launch':>12}{'bit-id':>8}{'vs default':>12}")
+            for rank, (bn, gm, nw, ns, us, ok) in enumerate(rows[: a.top], 1):
+                delta = 100.0 * (us - default_us[name]) / default_us[name]
+                print(f"  {rank:<5}{bn:>8}{gm:>8}{nw:>7}{ns:>7}{us:>12.2f}{str(ok):>8}"
+                      f"{delta:>+11.1f}%")
+            print(f"  {'--':<5}{'--':>8}{'--':>8}{'--':>7}{'--':>7}"
+                  f"{default_us[name]:>12.2f}{'ref':>8}{'0.0%':>12}   <- current default")
+
+            bit_id_rows = [r for r in rows if r[5]]
+            if bit_id_rows:
+                cross_best[(BLOCK_M, name)] = min(bit_id_rows, key=lambda r: r[4])
+            elif rows:
+                print("  ! no bit-identical config; picking fastest anyway, FLAGGED")
+                cross_best[(BLOCK_M, name)] = min(rows, key=lambda r: r[4])
+
+            if skips:
+                uniq: dict[str, list] = {}
+                for bn, gm, nw, ns, reason in skips:
+                    uniq.setdefault(reason, []).append((bn, gm, nw, ns))
+                print(f"  skip reasons ({len(skips)} configs):")
+                for reason, cfgs in list(uniq.items())[:6]:
+                    bn0, gm0, nw0, ns0 = cfgs[0]
+                    print(f"    x{len(cfgs):<3} e.g. BN={bn0} GM={gm0} W={nw0} S={ns0}: {reason}")
 
     elapsed = time.time() - t_start
-    print(f"total sweep time: {elapsed:.1f} s\n")
+    print(f"\ntotal sweep time: {elapsed:.1f} s")
 
-    # ---- final tables ----
-    best: dict[str, tuple] = {}
-    for name, _, _ in launches:
-        rows = all_rows[name]
-        skips = all_skips[name]
-        print(f"=== {name}: top {min(a.top, len(rows))} of {len(rows)} ok / {len(skips)} skipped ===")
-        print(f"{'rank':<5}{'BLOCK_N':>8}{'GROUP_M':>8}{'warps':>7}{'stages':>7}{'us/launch':>12}"
-              f"{'bit-id':>8}{'vs default':>12}")
-        for rank, (bn, gm, nw, ns, us, ok) in enumerate(rows[: a.top], 1):
-            delta = 100.0 * (us - default_us[name]) / default_us[name]
-            print(f"{rank:<5}{bn:>8}{gm:>8}{nw:>7}{ns:>7}{us:>12.2f}{str(ok):>8}{delta:>+11.1f}%")
-        print(f"{'--':<5}{'--':>8}{'--':>8}{'--':>7}{'--':>7}{default_us[name]:>12.2f}{'ref':>8}"
-              f"{'0.0%':>12}   <- current default (BN={default_cfg['BLOCK_SIZE_N']} "
-              f"GM={default_cfg['GROUP_SIZE_M']} W/S=auto)")
+    if len(a.block_m) > 1:
+        print(f"\n{'=' * 72}")
+        print("CROSS BLOCK_SIZE_M COMPARISON")
+        print(f"{'=' * 72}")
+        for name in launch_names:
+            print(f"\n  {name}:")
+            print(f"  {'BM':>4}  {'best config':>28}  {'us/launch':>10}  {'bit-id':>7}"
+                  f"  {'vs BM=16 default':>17}")
+            for bm in a.block_m:
+                key = (bm, name)
+                if key in cross_best:
+                    bn, gm, nw, ns, us, ok = cross_best[key]
+                    ref = cross_default.get((16, name),
+                                           cross_default.get((a.block_m[0], name), us))
+                    delta = 100.0 * (us - ref) / ref
+                    print(f"  {bm:>4}  {fmt_cfg(bn, gm, nw, ns):>28}  {us:>10.2f}"
+                          f"  {str(ok):>7}  {delta:>+16.1f}%")
+                else:
+                    print(f"  {bm:>4}  {'(no usable configs)':>28}")
 
-        bit_id_rows = [r for r in rows if r[5]]
-        if bit_id_rows:
-            best[name] = min(bit_id_rows, key=lambda r: r[4])
-        elif rows:
-            print("  ! no bit-identical config found among the ones that ran; picking the "
-                  "fastest anyway, FLAGGED")
-            best[name] = min(rows, key=lambda r: r[4])
-
-        if skips:
-            uniq: dict[str, list] = {}
-            for bn, gm, nw, ns, reason in skips:
-                uniq.setdefault(reason, []).append((bn, gm, nw, ns))
-            print(f"  skip reasons ({len(skips)} configs):")
-            for reason, cfgs in list(uniq.items())[:6]:
-                bn0, gm0, nw0, ns0 = cfgs[0]
-                print(f"    x{len(cfgs):<3} e.g. BN={bn0} GM={gm0} W={nw0} S={ns0}: {reason}")
-        print()
-
-    if len(best) == len(launches):
-        name_gu, name_dn = launches[0][0], launches[1][0]
-        bn_gu, gm_gu, nw_gu, ns_gu, us_gu, ok_gu = best[name_gu]
-        bn_dn, gm_dn, nw_dn, ns_dn, us_dn, ok_dn = best[name_dn]
-        d_gu = default_us[name_gu] - us_gu
-        d_dn = default_us[name_dn] - us_dn
-        d_layer = d_gu + d_dn
-        proj_ms = d_layer * a.layers / 1000.0
-        print("=== best pair vs today's default ===")
-        print(f"  gate_up: default {default_us[name_gu]:.2f} us -> best {us_gu:.2f} us "
-              f"(BN={bn_gu} GM={gm_gu} W={nw_gu} S={ns_gu}, bit-identical={ok_gu}), "
-              f"delta {d_gu:+.2f} us/layer")
-        print(f"  down:    default {default_us[name_dn]:.2f} us -> best {us_dn:.2f} us "
-              f"(BN={bn_dn} GM={gm_dn} W={nw_dn} S={ns_dn}, bit-identical={ok_dn}), "
-              f"delta {d_dn:+.2f} us/layer")
-        print(f"  PROJECTION (not a measured end-to-end run): {d_layer:.2f} us/layer saved "
-              f"x {a.layers} layers = {proj_ms:.3f} ms/decode step (T={T}-row trunk, top_k={K})")
+        print(f"\n  per-step projection ({a.layers} layers):")
+        for bm in a.block_m:
+            total = sum(
+                cross_best.get((bm, n), (0, 0, 0, 0, 999, False))[4]
+                for n in launch_names
+            )
+            ref_total = sum(
+                cross_default.get((16, n), cross_default.get((a.block_m[0], n), 0))
+                for n in launch_names
+            )
+            delta = total - ref_total
+            proj_ms = delta * a.layers / 1000.0
+            print(f"    BM={bm}: {total:.2f} us/layer ({delta:+.2f} vs BM=16 default), "
+                  f"x {a.layers} layers = {proj_ms:+.3f} ms/step")
     else:
-        print("could not compute a best pair -- one or both launches had no usable configs")
+        BLOCK_M = a.block_m[0]
+        if all((BLOCK_M, n) in cross_best for n in launch_names):
+            name_gu, name_dn = launch_names
+            bn_gu, gm_gu, nw_gu, ns_gu, us_gu, ok_gu = cross_best[(BLOCK_M, name_gu)]
+            bn_dn, gm_dn, nw_dn, ns_dn, us_dn, ok_dn = cross_best[(BLOCK_M, name_dn)]
+            ref_gu = cross_default[(BLOCK_M, name_gu)]
+            ref_dn = cross_default[(BLOCK_M, name_dn)]
+            d_gu = ref_gu - us_gu
+            d_dn = ref_dn - us_dn
+            d_layer = d_gu + d_dn
+            proj_ms = d_layer * a.layers / 1000.0
+            print("\n=== best pair vs default ===")
+            print(f"  gate_up: default {ref_gu:.2f} us -> best {us_gu:.2f} us "
+                  f"(BN={bn_gu} GM={gm_gu} W={nw_gu} S={ns_gu}, bit-identical={ok_gu}), "
+                  f"delta {d_gu:+.2f} us/layer")
+            print(f"  down:    default {ref_dn:.2f} us -> best {us_dn:.2f} us "
+                  f"(BN={bn_dn} GM={gm_dn} W={nw_dn} S={ns_dn}, bit-identical={ok_dn}), "
+                  f"delta {d_dn:+.2f} us/layer")
+            print(f"  PROJECTION: {d_layer:.2f} us/layer saved "
+                  f"x {a.layers} layers = {proj_ms:.3f} ms/decode step "
+                  f"(T={T}-row trunk, top_k={K})")
+        else:
+            print("could not compute a best pair -- one or both launches had no usable configs")
 
 
 if __name__ == "__main__":
