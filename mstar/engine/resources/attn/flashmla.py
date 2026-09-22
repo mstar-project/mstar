@@ -152,7 +152,8 @@ class FlashMLAWrapper:
         q = torch.cat([q_nope, q_pe], dim=-1).view(rows, self.s_q, self.num_qo_heads, FLASHMLA_HEAD_DIM)
         k = kv_cache_layer.view(kv_cache_layer.shape[0], self.page_size, 1, FLASHMLA_HEAD_DIM)
         out, lse = flash_mla_with_kvcache(
-            q, k, self._block_table, self._kv_len_buf, FLASHMLA_HEAD_DIM_V, self._sched, None, self.sm_scale, causal=True,
+            q, k, self._block_table, self._kv_len_buf, FLASHMLA_HEAD_DIM_V, self._sched, None, self.sm_scale,
+            causal=True,
         )
         out = out.view(rows * self.s_q, self.num_qo_heads, FLASHMLA_HEAD_DIM_V)
         if return_lse:
