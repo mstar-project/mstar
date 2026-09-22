@@ -15,7 +15,8 @@ from mstar.model.kimi_k3.dspark.model import DSparkDraft
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 DEV = torch.device("cuda")
 K = 7
-CFG = DSparkConfig(hidden_size=1024, intermediate_size=2048, num_hidden_layers=2, num_attention_heads=8, q_lora_rank=256,
+CFG = DSparkConfig(hidden_size=1024, intermediate_size=2048, num_hidden_layers=2, num_attention_heads=8,
+                   q_lora_rank=256,
                    kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128, vocab_size=4096,
                    target_hidden_size=1024, target_layer_ids=(1, 3), mask_token_id=4095, markov_rank=16,
                    rope=YarnParams(original_max_position_embeddings=2048, factor=2.0))
@@ -41,10 +42,13 @@ def build(monkeypatch):
     draft.rope.__init__(CFG.qk_rope_head_dim, CFG.rope, 4096)
     draft.rope.to(DEV)
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
-    kv_cfg = KVConfig(num_layers=CFG.num_hidden_layers, num_kv_heads=1, head_dim=CFG.kv_lora_rank + CFG.qk_rope_head_dim,
-                      max_seq_len=1024, max_num_pages=32, page_size=64, layout=KVLayout.MLA, kv_lora_rank=CFG.kv_lora_rank,
+    kv_cfg = KVConfig(num_layers=CFG.num_hidden_layers, num_kv_heads=1,
+                      head_dim=CFG.kv_lora_rank + CFG.qk_rope_head_dim,
+                      max_seq_len=1024, max_num_pages=32, page_size=64, layout=KVLayout.MLA,
+                      kv_lora_rank=CFG.kv_lora_rank,
                       qk_rope_head_dim=CFG.qk_rope_head_dim, num_qo_heads=CFG.num_attention_heads)
-    kv = manager_mod.KVManager(cfg=kv_cfg, name="dspark_kv", joint_comm_group=None, transfer_engine_info=None, device=DEV,
+    kv = manager_mod.KVManager(cfg=kv_cfg, name="dspark_kv", joint_comm_group=None, transfer_engine_info=None,
+                               device=DEV,
                                dtype=torch.bfloat16)
     attn = FlashInferMLAManager(kv_cache="dspark_kv", device=DEV, dtype=torch.bfloat16, kv_config=kv_cfg,
                                 sm_scale=draft.layers[0].self_attn.scale)
@@ -88,7 +92,8 @@ def test_paged_draft_matches_the_dense_reference(monkeypatch, tc):
     torch.cuda.synchronize()
     diff = (hidden.float() - want_hidden.float()).abs().max().item()
     scale = want_hidden.float().abs().mean().item()
-    print(f"tc={tc}: max |hidden diff| {diff:.4f} (mean |hidden| {scale:.4f}); drafts {drafts[0].tolist()} vs {want_drafts.tolist()}")
+    print(f"tc={tc}: max |hidden diff| {diff:.4f} (mean |hidden| {scale:.4f}); "
+          f"drafts {drafts[0].tolist()} vs {want_drafts.tolist()}")
     assert torch.allclose(hidden.float(), want_hidden.float(), atol=0.15 * scale + 0.05, rtol=0.05), diff
     assert torch.allclose(logits, want_logits, atol=0.5, rtol=0.05)
     assert (drafts[0] == want_drafts).sum().item() >= K - 1, (drafts[0].tolist(), want_drafts.tolist())
