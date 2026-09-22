@@ -1,7 +1,6 @@
+import logging
 from dataclasses import dataclass, field
 from typing import Any
-
-import logging
 
 import torch
 import torch.distributed as dist
