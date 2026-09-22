@@ -168,5 +168,6 @@ def test_a_tp_follower_pops_each_rider_under_its_own_walk():
 
 def test_executing_batch_answers_each_rows_walk():
     batch = ExecutingBatch(node_name=NODE, per_request_info={}, request_walks={"d0": "decode"},
-                           step_context=StepContext(request_ids=("p0", "d0"), graph_walk="prefill", slot=0, capture=False))
+                           step_context=StepContext(request_ids=("p0", "d0"), graph_walk="prefill", slot=0,
+                                                    capture=False))
     assert batch.walk_of("p0") == "prefill" and batch.walk_of("d0") == "decode"
