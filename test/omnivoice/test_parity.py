@@ -41,12 +41,17 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.diffusion_sampler.config import (
+    DiffusionSamplerSpec,
+    DiffusionSamplingReqConfig,
+)
+from mstar.engine.resources.diffusion_sampler.resource import DiffusionSamplerResource
 from mstar.model.omnivoice.components.backbone import CanvasItem, build_packed_canvas
 from mstar.model.omnivoice.components.text import build_prefix
 from mstar.model.omnivoice.components.unmask import (
     apply_reveal,
     build_reveal_schedule,
-    predict_tokens_with_scoring,
 )
 from mstar.model.omnivoice.config import OmniVoiceConfig
 from mstar.model.omnivoice.submodules import (
@@ -190,50 +195,6 @@ def test_reveal_schedule_covers_the_canvas():
             assert sum(schedule) == target_len * NUM_CODEBOOK
 
 
-def test_mask_class_is_never_predicted():
-    item = _item("solo", prefix_len=10, target_len=6)
-    canvas = build_packed_canvas([item], MASK_ID, torch.device("cpu"))
-    logits = torch.randn(1, NUM_CODEBOOK, 2 * canvas.flat_target_total, 1025)
-    c_logits, u_logits = canvas.slice_logits(logits, item)
-    assert c_logits.shape == (1, NUM_CODEBOOK, 6, 1025)
-
-    pred, _ = predict_tokens_with_scoring(
-        c_logits, u_logits, MASK_ID, guidance_scale=2.0, class_temperature=0.0
-    )
-    assert (pred != MASK_ID).all()
-
-
-def test_sampling_is_reproducible_under_a_seed():
-    """Same seed, same draw; different seed, different draw.
-
-    Both stochastic paths are covered: the token choice inside
-    ``predict_tokens_with_scoring`` and the reveal order in ``apply_reveal``.
-    """
-    item = _item("seeded", prefix_len=10, target_len=6)
-    canvas = build_packed_canvas([item], MASK_ID, torch.device("cpu"))
-    logits = torch.randn(1, NUM_CODEBOOK, 2 * canvas.flat_target_total, 1025)
-    c_logits, u_logits = canvas.slice_logits(logits, item)
-
-    def draw(seed):
-        gen = torch.Generator().manual_seed(seed)
-        pred, scores = predict_tokens_with_scoring(
-            c_logits, u_logits, MASK_ID, guidance_scale=2.0,
-            class_temperature=1.0, generator=gen,
-        )
-        tokens = torch.full((1, NUM_CODEBOOK, 6), MASK_ID, dtype=torch.long)
-        revealed = apply_reveal(
-            tokens=tokens, pred_tokens=pred, scores=scores, reveal_count=5,
-            audio_mask_id=MASK_ID, layer_penalty_factor=0.1,
-            position_temperature=1.0, generator=gen,
-        )
-        return pred.clone(), revealed.clone()
-
-    pred_a, rev_a = draw(1234)
-    pred_b, rev_b = draw(1234)
-    pred_c, rev_c = draw(5678)
-    assert torch.equal(pred_a, pred_b)
-    assert torch.equal(rev_a, rev_b)
-    assert not (torch.equal(pred_a, pred_c) and torch.equal(rev_a, rev_c))
 
 
 # ---------------------------------------------------------------------------
@@ -382,23 +343,51 @@ def _run_ours(backbone, config, specs, num_step=None):
             num_step=num_step, t_shift=GREEDY["t_shift"],
         ))
 
+    # Scored through the resource, exactly as the submodule does it, so this
+    # tier proves parity of the path that actually serves rather than of a
+    # second copy of the maths kept alive for the test.
+    sampler = _sampler(config, [item.request_id for item in items])
+
     for k in range(num_step):
         canvas = build_packed_canvas(items, config.audio_mask_id, torch.device("cuda"))
-        logits = backbone(canvas).to(torch.float32)
+        logits = backbone(canvas)
+        total = canvas.flat_target_total
+        tokens, logprobs = sampler.sample(
+            [item.request_id for item in items],
+            logits[0, :, :total, :].to(torch.float32),
+            logits[0, :, total:, :].to(torch.float32),
+            seq_lens=[item.target_len for item in items],
+        )
         for item, schedule in zip(items, schedules, strict=True):
-            c_logits, u_logits = canvas.slice_logits(logits, item)
-            pred, scores = predict_tokens_with_scoring(
-                c_logits, u_logits, config.audio_mask_id,
-                guidance_scale=GREEDY["guidance_scale"],
-                class_temperature=GREEDY["class_temperature"],
-            )
+            sl = slice(item.flat_start, item.flat_start + item.target_len)
             apply_reveal(
-                tokens=item.tokens, pred_tokens=pred, scores=scores,
+                tokens=item.tokens,
+                pred_tokens=tokens[:, sl].unsqueeze(0),
+                scores=logprobs[:, sl].unsqueeze(0),
                 reveal_count=schedule[k], audio_mask_id=config.audio_mask_id,
                 layer_penalty_factor=GREEDY["layer_penalty_factor"],
                 position_temperature=GREEDY["position_temperature"],
             )
     return [item.tokens[0].cpu() for item in items]
+
+
+def _sampler(config, request_ids):
+    """The real resource, configured the way the model declares it."""
+    spec = DiffusionSamplerSpec(
+        resource_key="diffusion_sampler", nodes={"backbone"},
+        vocab_size=config.audio_vocab_size,
+        num_rows=config.num_audio_codebook,
+        forbidden_class=config.audio_mask_id,
+    )
+    res = DiffusionSamplerResource.build(
+        spec, EngineResourceInfo(device=torch.device("cuda"))
+    )
+    for rid in request_ids:
+        res.ingest_request(rid, DiffusionSamplingReqConfig(
+            guidance_scale=GREEDY["guidance_scale"],
+            temperature=GREEDY["class_temperature"],
+        ))
+    return res
 
 
 def _step0_logits(backbone, config, specs, which=0):
@@ -600,14 +589,16 @@ def test_postprocess_reveals_without_touching_the_loop_edge():
     ``apply_reveal`` writes in place, so the write has to land on a copy; if it
     did not, the engine's own copy of that step's state would change under it.
     """
-    target_len, vocab = 16, MASK_ID + 1
+    target_len = 16
     sub = OmniVoiceBackboneSubmodule(backbone=None, config=OmniVoiceConfig())
     edge = torch.full((NUM_CODEBOOK, target_len), MASK_ID, dtype=torch.long)
 
-    # Logits that make the argmax a fixed, non-mask token everywhere.
-    logits = torch.zeros(NUM_CODEBOOK, target_len, vocab)
-    logits[..., 7] = 10.0
-    outputs = {"c_logits": [logits], "u_logits": [logits.clone()]}
+    # Scoring already happened in forward_batched, so postprocess is handed
+    # tokens and their log-probabilities, not logits.
+    outputs = {
+        "pred_tokens": [torch.full((NUM_CODEBOOK, target_len), 7, dtype=torch.long)],
+        "scores": [torch.zeros(NUM_CODEBOOK, target_len)],
+    }
     inputs = NodeInputs(tensor_inputs={
         "audio_tokens": edge,
         "step_index": torch.zeros(1, dtype=torch.int64),
@@ -616,7 +607,7 @@ def test_postprocess_reveals_without_touching_the_loop_edge():
     sub.postprocess("a", _fwd_info("a", 0), outputs, inputs)
 
     assert bool((edge == MASK_ID).all()), "postprocess wrote through the input edge"
-    assert "c_logits" not in outputs and "u_logits" not in outputs
+    assert "pred_tokens" not in outputs and "scores" not in outputs
     tokens = outputs["audio_tokens"][0]
     assert tokens.shape == (NUM_CODEBOOK, target_len)
     assert int(outputs["step_index"][0].reshape(-1)[0]) == 1

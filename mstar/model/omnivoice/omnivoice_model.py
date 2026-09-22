@@ -31,6 +31,11 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.engine.resources import NodeResourceSpec
+from mstar.engine.resources.diffusion_sampler.config import (
+    DiffusionSamplerSpec,
+    DiffusionSamplingReqConfig,
+)
+from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -53,6 +58,7 @@ from mstar.model.omnivoice.components.text import (
 )
 from mstar.model.omnivoice.config import OmniVoiceConfig
 from mstar.model.omnivoice.submodules import (
+    DIFFUSION_SAMPLER,
     UNMASK_LOOP_NAME,
     OmniVoiceBackboneSubmodule,
     OmniVoiceCode2WavSubmodule,
@@ -104,16 +110,27 @@ class OmniVoiceModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """No engine-built resources: every node here is stateless.
+        """One resource: the diffusion sampler. Deliberately no KV cache.
 
-        There is deliberately no KV cache.  The canvas is rewritten each
-        iteration and attention is bidirectional, so the prefix attends *into*
-        the region that changed and its hidden states change with it — nothing
-        computed at step k is valid at step k+1.  Sampling is not a sampler
-        resource either: the reveal picks cells by confidence rank across the
-        whole canvas rather than drawing one token per position.
+        The canvas is rewritten each iteration and attention is bidirectional,
+        so the prefix attends *into* the region that changed and its hidden
+        states change with it; nothing computed at step k is valid at step
+        k+1.
+
+        Sampling is a resource, but not the autoregressive one: a step scores
+        every unrevealed cell and needs the log-probabilities back, because
+        the reveal ranks cells by confidence rather than drawing one token per
+        position. The ranking and the write stay in the submodule.
         """
-        return []
+        return [
+            DiffusionSamplerSpec(
+                resource_key=DIFFUSION_SAMPLER,
+                nodes={"backbone"},
+                vocab_size=self.config.audio_vocab_size,
+                num_rows=self.config.num_audio_codebook,
+                forbidden_class=self.config.audio_mask_id,
+            )
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_reference = GraphNode(
@@ -537,6 +554,30 @@ class OmniVoiceModel(Model):
             unpersist_tensors=unpersist_tensors,
             step_metadata=self._get_step_metadata(full_metadata),
         )
+
+    def get_request_resource_configs(
+        self, partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        """Hand the sampler this request's scoring knobs.
+
+        The same three values also ride ``step_metadata``, because the reveal
+        in ``postprocess`` reads the temperature that governs *position*
+        order, which is a different knob from the one governing token choice.
+        """
+        del partition_fwd_args
+        model_kwargs = model_kwargs or {}
+        defaults = self.config.generation
+        return {
+            DIFFUSION_SAMPLER: DiffusionSamplingReqConfig(
+                guidance_scale=float(
+                    model_kwargs.get("guidance_scale", defaults.guidance_scale)
+                ),
+                temperature=float(
+                    model_kwargs.get("class_temperature", defaults.class_temperature)
+                ),
+            )
+        }
 
     def _get_step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
         """Per-pass metadata the submodules read from ``request_info.step_metadata``."""
