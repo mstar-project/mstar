@@ -400,7 +400,7 @@ class RustGraphRuntime(GraphRuntime):
                 )
                 for signal, next_node, uuids, final in out.input_edges
             ],
-            output_signals=self.get_output_signals(node_name, graph_walk),
+            output_signals=tuple(out.output_signals),
             input_edges_per_rid=out.input_edges_per_rid,
         )
 
@@ -433,10 +433,10 @@ class RustGraphRuntime(GraphRuntime):
             SpeculationOutput(
                 node_name=n, graph_walk=w,
                 is_new_loop_iter=new_iter, loop_name=loop_name,
+                output_signals=tuple(signals),
             )
-            for n, w, new_iter, loop_name in self._rust.speculate_node(
-                node_name, graph_walk, sample_rid
-            )
+            for n, w, new_iter, loop_name, signals
+            in self._rust.speculate_node(node_name, graph_walk, sample_rid)
         ]
 
     def get_spec_target(
@@ -448,10 +448,11 @@ class RustGraphRuntime(GraphRuntime):
         )
         if out is None:
             return None
-        node_name, walk, new_iter, loop_name = out
+        node_name, walk, new_iter, loop_name, signals = out
         return SpeculationOutput(
             node_name=node_name, graph_walk=walk,
             is_new_loop_iter=new_iter, loop_name=loop_name,
+            output_signals=tuple(signals),
         )
 
     def _spec_prep_arg(self, input: SpeculationPrepInput) -> dict:

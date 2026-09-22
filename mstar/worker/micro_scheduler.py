@@ -115,7 +115,9 @@ class SchedulingType(Enum):
 class PopReadyResult(NamedTuple):
     wg_ids: dict[int, int]
     edge_specs: dict[int, EdgeSpec]
-    output_signals: dict[int, tuple[str, ...]]
+    # Flat, not per-rid: the node's output edge names are structural, so every
+    # rid in the batch shares them.
+    output_signals: tuple[str, ...]
 
 
 class MicroScheduler:
@@ -206,8 +208,13 @@ class MicroScheduler:
         """``ScheduleTPNode`` crosses the wire, so its rids are strings. A rid
         this rank has already removed maps to -1, which no request ever owns, so
         it reads as not-ready exactly as an unknown string rid used to."""
-        return [self.rid_of(r) if self.rid_of(r) is not None else -1
-                for r in message.request_ids]
+        # Resolved once per rid, not twice: this runs several times per pass on
+        # a follower, and each call is a boundary crossing under the Rust
+        # runtime.
+        return [
+            -1 if (handle := self.rid_of(r)) is None else handle
+            for r in message.request_ids
+        ]
 
     def register_tp_follow(
         self, message: ScheduleTPNode
@@ -255,9 +262,7 @@ class MicroScheduler:
         Checked for every rid before anything is popped, so the caller
         retries later for a partially ready set."""
         if not rids:
-            return PopReadyResult(
-                {}, {}, {}
-            )
+            return PopReadyResult({}, {}, ())
         # Engine readiness first: pop_rids treats it as a prerequisite, and it
         # is all-or-nothing too, so one not-ready rid leaves the set intact.
         node_partition = request_state.get_partition_for_node(node_name)

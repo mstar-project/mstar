@@ -47,10 +47,22 @@ pub enum Dest {
     Empty, // EMPTY_DESTINATION: persist-only, routed nowhere
 }
 
+impl Dest {
+    pub fn is_to_worker(&self) -> bool {
+        match self {
+            Dest::Local(_) => true,
+            Dest::External(_) => true,
+            Dest::EmitToClient => false,
+            Dest::Empty => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EdgeSpec {
     pub name: Sym,
     pub dest: Dest,
+    pub dest_sym: Sym,
     pub persist: bool,
     pub new_token: bool,
     pub streaming: bool,

@@ -75,6 +75,11 @@ class SpeculationOutput(NamedTuple):
     # ingest_for_speculation (which mutates speculative slot state).
     is_new_loop_iter: bool = False
     loop_name: str | None = None
+    # The TARGET's output edge names, same as PopRidsOutput carries for a
+    # normally-scheduled batch. A speculated batch never goes through
+    # pop_rids, so without these the caller has to ask again on every forward
+    # pass -- and decode, the hot path, is almost entirely speculated.
+    output_signals: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

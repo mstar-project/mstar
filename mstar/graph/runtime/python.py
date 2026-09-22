@@ -642,6 +642,9 @@ class PythonGraphRuntime(GraphRuntime):
                 node_name=info.node_name, graph_walk=graph_walk,
                 is_new_loop_iter=info.is_new_loop_iter,
                 loop_name=info.loop_name,
+                output_signals=tuple(
+                    self.get_output_signals(info.node_name, graph_walk)
+                ),
             ))
         return out
 
@@ -697,6 +700,9 @@ class PythonGraphRuntime(GraphRuntime):
             graph_walk=graph_walk,
             is_new_loop_iter=info.is_new_loop_iter,
             loop_name=info.loop_name,
+            output_signals=tuple(
+                self.get_output_signals(info.node_name, graph_walk)
+            ),
         )
 
     def prep_follow_spec_rids(

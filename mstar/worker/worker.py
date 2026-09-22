@@ -1648,11 +1648,10 @@ class Worker:
             node_name=spec_node,
             graph_walk=pending.graph_walk,
             request_to_worker_graph=request_to_worker_graph,
-            # A speculated batch never went through pop_rids, so it has to ask:
-            # left empty, completion would route none of the node's outputs.
-            output_signals=self._graph_runtime.get_output_signals(
-                spec_node, pending.graph_walk,
-            ),
+            # Reported by whichever step chose the target -- speculate_node on
+            # the leader, get_spec_target on a follower -- so the hot path does
+            # not cross back into the runtime once per forward pass.
+            output_signals=spec_target.output_signals,
             tp_seq=tp_seq,
         )
         spec_node_batch = self._make_executing_batch(

@@ -191,7 +191,7 @@ def test_pop_ready_rids_empty_set_is_a_valid_no_op():
     sched = _sched()
     manager = _FakeRequestStateManager(_FakeQueue(["r0"]))
     sched.runtime = manager.runtime
-    assert sched.pop_ready_rids(manager, NODE, WALK, []) == ({}, {})
+    assert sched.pop_ready_rids(manager, NODE, WALK, []) == ({}, {}, ())
     assert sched.batch_number == 0
 
 

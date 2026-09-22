@@ -120,6 +120,7 @@ impl LoopState {
 pub struct RoutedEdge {
     pub name: Sym,
     pub dest: Dest,
+    pub dest_sym: Sym,
     pub persist: bool,
     pub new_token: bool,
     pub streaming: bool,
@@ -136,9 +137,9 @@ pub struct RoutedEdge {
 
 fn routed(e: &EdgeSpec, tensors: Vec<TensorRef>) -> RoutedEdge {
     RoutedEdge {
-        name: e.name, dest: e.dest, persist: e.persist, new_token: e.new_token,
-        streaming: e.streaming, modality: e.modality, tensors,
-        persist_for_loop: false, declined_local: false,
+        name: e.name, dest: e.dest, dest_sym: e.dest_sym, persist: e.persist,
+        new_token: e.new_token, streaming: e.streaming, modality: e.modality,
+        tensors, persist_for_loop: false, declined_local: false,
     }
 }
 
@@ -211,10 +212,24 @@ impl RequestState {
     fn refresh_ready(&mut self, id: NodeId) {
         let spec = self.graph.node(id);
         let st = &self.nodes[id as usize];
-        let live = !st.scheduled && !st.completed;
+        let live = !st.completed;
         let ready = st.cur.mask == spec.full_mask && live;
         let (w, b) = Self::bit(id);
-        if ready { self.ready[w] |= 1 << b } else { self.ready[w] &= !(1 << b) }
+        // `scheduled` gates the ADD only, never a removal. Python's
+        // register_ingested_input skips the queue add for a
+        // speculatively-scheduled node -- so it does not get double-queued
+        // while its spec batch runs -- but a node already queued stays
+        // queued. Folding the flag into the predicate (`live`) instead made
+        // marking a node withdraw it from the ready set, and unmarking put it
+        // back. The streaming half of this rule lives in
+        // note_ingested_for_streaming.
+        if ready {
+            if !st.scheduled {
+                self.ready[w] |= 1 << b
+            }
+        } else {
+            self.ready[w] &= !(1 << b)
+        }
     }
 
     /// FIXME: bug-for-bug with Python, whose behaviour here is probably wrong.
@@ -330,10 +345,15 @@ impl RequestState {
         true
     }
 
-    /// Undo `take_for_schedule` — the node's inputs were never consumed, so
-    /// readiness recomputes to what it was.
+    /// Undo `take_for_schedule`: put the node back in the ready set.
+    ///
+    /// Unconditional, as Python's `ready_node_names.add(node_name)` is. A
+    /// recompute is wrong here: cleanup_consumed_inputs normally runs before
+    /// the push back, so the input slots are already empty and the node would
+    /// silently stay unready -- losing the batch the caller is handing back.
     pub fn push_back(&mut self, node: NodeId) {
-        self.refresh_ready(node);
+        let (w, b) = Self::bit(node);
+        self.ready[w] |= 1 << b;
     }
 
     /// Python's `ReadySignals.clear` on the CURRENT slot: release the inputs
@@ -378,9 +398,14 @@ impl RequestState {
         freed
     }
 
+    /// The flag alone: it gates future ingests, and touching readiness here
+    /// is what made marking withdraw an already-ready node.
     pub fn set_spec_scheduled(&mut self, node: NodeId, on: bool) {
         self.nodes[node as usize].scheduled = on;
-        self.refresh_ready(node);
+    }
+
+    pub fn is_spec_scheduled(&self, node: NodeId) -> bool {
+        self.nodes[node as usize].scheduled
     }
 
     // -- completion ----------------------------------------------------------
@@ -566,7 +591,12 @@ impl RequestState {
         let ext = self.loops[lid as usize].ext_inputs.clone();
         for (name, dest, t) in ext {
             out.push(RoutedEdge {
-                name, dest: Dest::Local(dest), persist: false, new_token: false,
+                name, dest: Dest::Local(dest),
+                // The dest node's interned NAME, not its NodeId: `dest_sym`
+                // is what the sharding fanout looks a group up by, and the
+                // two are different namespaces that happen to share a repr.
+                dest_sym: graph.node(dest).name,
+                persist: false, new_token: false,
                 streaming: false, modality: 0, tensors: t,
                 persist_for_loop: true, declined_local: false,
             });

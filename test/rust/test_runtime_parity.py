@@ -1095,3 +1095,68 @@ def test_a_stream_to_a_sibling_graph_is_reported_local(streams_to_sibling):
     # A streaming edge does NOT go straight into the node: the StreamBuffer
     # decides when a chunk is whole, so the consumer is not ready yet.
     assert _ready(rt) == []
+
+
+def test_the_speculation_target_reports_its_output_signals(pair):
+    """A speculated batch never goes through pop_rids, so the target carries
+    the names instead -- left empty, completion routes none of the node's
+    outputs, and decode is almost entirely speculated."""
+    rt, _book, _store = pair
+    rid = _admit(rt)
+    out = rt.speculate_node("prefill", WALK, rid)
+    assert [o.node_name for o in out] == ["ar_decode"]
+    # ar_decode's own edges, sorted and deduped -- it sends `token` to itself
+    # and to the loop output, so a raw edge list would repeat it.
+    assert tuple(out[0].output_signals) == ("kv_cache", "token")
+    assert tuple(out[0].output_signals) == tuple(
+        rt.get_output_signals("ar_decode", WALK)
+    )
+
+
+def test_the_follower_target_reports_the_same_signals(pair):
+    """get_spec_target is the follower's route to the same information: it
+    cannot call speculate_node, and it builds the same ScheduledBatch."""
+    rt, _book, _store = pair
+    rid = _admit(rt)
+    target = rt.get_spec_target("prefill", "ar_decode", WALK, rid)
+    assert target is not None
+    assert tuple(target.output_signals) == tuple(
+        rt.get_output_signals("ar_decode", WALK)
+    )
+
+
+def test_marking_speculatively_scheduled_does_not_unready_the_node(pair):
+    """Python sets a flag that gates FUTURE ingests; it never withdraws a node
+    that is already ready. Rust folded `scheduled` into the readiness
+    predicate, so marking a node pulled it out of the ready set -- and
+    unmarking put it back."""
+    rt, _book, _store = pair
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    assert _ready(rt) == [("prefill", WALK, [rid])]
+
+    rt.set_speculatively_scheduled("prefill", WG_ID, [rid], True)
+    assert _ready(rt) == [("prefill", WALK, [rid])], "marking withdrew it"
+
+    rt.set_speculatively_scheduled("prefill", WG_ID, [rid], False)
+    assert _ready(rt) == [("prefill", WALK, [rid])]
+
+
+def test_push_back_re_readies_a_node_whose_inputs_were_consumed(pair):
+    """``push_back_node`` puts a popped node back after an OOM hold.
+
+    Python adds the name back unconditionally. Rust recomputed readiness from
+    the current input slots, so a node whose inputs had already been cleared
+    -- which is the normal order, cleanup runs before the push back -- stayed
+    silently unready and the batch was lost.
+    """
+    rt, _book, _store = pair
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    rt.pop_rids("prefill", WALK, [rid])
+    rt.cleanup_consumed_inputs("prefill", [rid], [WG_ID])
+    assert _ready(rt) == []
+
+    rt.push_back_node("prefill", [rid], [WG_ID])
+    assert _ready(rt) == [("prefill", WALK, [rid])], "the push back was lost"
+

@@ -56,6 +56,7 @@ pub fn compile_one(
         .map(|(i, n)| (n.name.as_str(), i as NodeId)).collect();
 
     let mk_edge = |it: &mut StrToId, e: &EdgeArg, local: &FxHashMap<&str, NodeId>| {
+        let dest_sym = it.intern(&e.dest);
         let dest = if e.dest == EMIT_TO_CLIENT {
             Dest::EmitToClient
         } else if e.dest == EMPTY_DESTINATION {
@@ -63,7 +64,7 @@ pub fn compile_one(
         } else if let Some(&id) = local.get(e.dest.as_str()) {
             Dest::Local(id)
         } else {
-            Dest::External(it.intern(&e.dest))
+            Dest::External(dest_sym)
         };
         let dest_slot = match dest {
             Dest::Local(id) => nodes[id as usize].inputs.iter()
@@ -71,7 +72,8 @@ pub fn compile_one(
             _ => 0,
         };
         EdgeSpec {
-            name: it.intern(&e.name), dest, persist: e.persist,
+            name: it.intern(&e.name), dest,
+            dest_sym, persist: e.persist,
             new_token: e.new_token, streaming: e.streaming,
             modality: it.intern(&e.modality), dest_slot,
         }

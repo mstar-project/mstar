@@ -3,7 +3,7 @@
 
 use crate::graph::frames;
 use crate::graph::compile::{EMIT_TO_CLIENT, EMPTY_DESTINATION, LoopArg, NodeArg, compile_one};
-use crate::graph::shard::{GroupTemplate, ShardingTemplate};
+use crate::graph::shard::{FanoutDest, GroupTemplate, ShardingTemplate};
 use crate::graph::spec::*;
 use crate::graph::request::{LoopStopTime, RequestInfo, WgIndex, WorkerGraphMeta};
 use crate::graph::state::{RequestState, RoutedEdge, SpecNode, TensorRef};
@@ -180,6 +180,21 @@ pub struct GraphRuntime {
 }
 
  impl GraphRuntime {
+    /// Does THIS worker run `node` for this request?
+    ///
+    /// Compiling the node is not enough: under data parallelism the conductor
+    /// picks a replica per worker-graph group, so a worker can hold the graph
+    /// while this particular request's copy of that node lives on a peer.
+    /// Python asks the same question by popping its own id out of the fanout.
+    fn runs_for_request(&self, rid: u32, node: Sym) -> bool {
+        let me = self.shard.me;
+        self.info(rid).is_some_and(|i| {
+            i.node_to_workers
+                .iter()
+                .any(|(&(n, _), workers)| n == node && workers.contains(&me))
+        })
+    }
+
     /// The request id string behind a handle.
     fn rid_name(&self, rid: u32) -> PyResult<String> {
         self.rids
@@ -224,13 +239,18 @@ pub struct GraphRuntime {
         stream_tokens_consumed: &[(String, i64)],
         request_info_encoded: Option<&[u8]>,
         profiling_encoded: Option<&[u8]>,
+        speculative: bool,
     ) -> PyResult<Vec<u8>> {
         let request_id = self.rid_name(rid)?;
-        let partition_done = self
-            .interner
-            .get(partition_name)
-            .and_then(|p| self.info(rid).map(|i| i.stream_done(p)))
-            .unwrap_or(false);
+        // `and not speculative`, as Python has it: a speculatively-scheduled
+        // node has not really finished the partition, so reporting it done
+        // here would tell the conductor the stream ended a pass early.
+        let partition_done = !speculative
+            && self
+                .interner
+                .get(partition_name)
+                .and_then(|p| self.info(rid).map(|i| i.stream_done(p)))
+                .unwrap_or(false);
 
         let (persist, new_tokens, output_signals, loop_indices) =
             match self.requests[rid as usize].as_mut() {
@@ -430,6 +450,7 @@ pub struct GraphRuntime {
             .map(|e| RoutedEdge {
                 name: e.name,
                 dest: e.dest,
+                dest_sym: e.dest_sym,
                 persist: e.persist,
                 new_token: e.new_token,
                 streaming: e.streaming,
@@ -445,15 +466,31 @@ pub struct GraphRuntime {
         Some(out)
     }
 
+    /// The target, plus its output edge names.
+    ///
+    /// The names ride along because a speculated batch never goes through
+    /// pop_rids: without them the caller has to come back and ask for them
+    /// once per forward pass, on the hottest path there is.
     fn spec_output(
         &self, g: &GraphRef, graph_walk: &str, sn: &SpecNode,
-    ) -> (String, String, bool, Option<String>) {
+    ) -> (String, String, bool, Option<String>, Vec<String>) {
+        // Sorted and deduped, as Python's `sorted({edge.name for ...})`:
+        // one node can carry the same signal to two destinations.
+        let mut signals: Vec<String> = g
+            .node(sn.node)
+            .outputs
+            .iter()
+            .map(|e| self.interner.name(e.name).to_string())
+            .collect();
+        signals.sort();
+        signals.dedup();
         (
             self.interner.name(g.node(sn.node).name).to_string(),
             graph_walk.to_string(),
             sn.is_new_loop_iter,
             sn.loop_id
                 .map(|lid| self.interner.name(g.lp(lid).name).to_string()),
+            signals,
         )
     }
 
@@ -617,7 +654,8 @@ pub struct GraphRuntime {
             .outputs
             .iter()
             .map(|e| RoutedEdge {
-                name: e.name, dest: e.dest, persist: e.persist,
+                name: e.name, dest: e.dest, 
+                dest_sym: e.dest_sym, persist: e.persist,
                 new_token: e.new_token, streaming: e.streaming,
                 modality: e.modality, tensors: vec![],
                 persist_for_loop: false, declined_local: false,
@@ -773,6 +811,26 @@ pub struct GraphRuntime {
         self.walk_to_local_wgs.get(&walk).cloned().unwrap_or_default()
     }
 
+    /// The walk's local worker graphs, restricted to the ones THIS REQUEST is
+    /// registered with -- Python's `[wg for wg in info.worker_graph_ids if
+    /// walk in ...]`.
+    ///
+    /// Walk-wide is nearly the same thing, because a graph the request is not
+    /// in has no state and gets skipped. Not everywhere, though:
+    /// get_dynamic_loop_iters reads the list directly, so with two partitions
+    /// of one request sharing a walk on this worker, one partition would
+    /// report the other's loop counters.
+    fn live_wgs_for(&self, rid: u32, walk: Sym) -> Vec<WgIndex> {
+        let all = self.live_wgs(walk);
+        match self.info(rid) {
+            Some(info) => all
+                .into_iter()
+                .filter(|w| info.worker_graphs.contains(w))
+                .collect(),
+            None => all,
+        }
+    }
+
     /// Bounds-checked. A handle can legitimately outlive its request -- a
     /// message for a rid this rank already removed is a benign race -- and an
     /// unchecked index would panic ACROSS the FFI boundary.
@@ -809,6 +867,9 @@ pub struct PopRidsOut {
     /// (signal, next_node, uuids, is_final_streaming_chunk)
     #[pyo3(get)] pub input_edges: Vec<(String, String, Vec<u64>, bool)>,
     #[pyo3(get)] pub input_edges_per_rid: Vec<usize>,
+    /// The node's output edge names, sorted and deduped. Reported by the POP
+    /// so the caller does not cross back once per forward pass just to ask.
+    #[pyo3(get)] pub output_signals: Vec<String>,
 }
 
 /// Whether any edge carrying this uuid is a persist signal.
@@ -878,6 +939,10 @@ pub struct Completion {
     /// Computed at completion, not at send: the conductor counts one report
     /// per request, so every rank claiming rank 0 multiplies it by tp_size.
     pub first_tp_rank: FxHashMap<u32, bool>,
+    /// Per rid: was the completed node SPECULATIVELY scheduled? Captured
+    /// before `complete`, which clears the flag. A speculative batch has not
+    /// really finished the partition, so it must not report it done.
+    pub speculative: FxHashMap<u32, bool>,
 }
 
 /// `SpeculationPrepInput`.
@@ -1185,8 +1250,13 @@ impl GraphRuntime {
         }
 
         // The partition's LIVE list is still only the current walk's graphs:
-        // that is what selects where this pass's inputs route.
-        let live = self.live_wgs(walk_sym);
+        // that is what selects where this pass's inputs route. Restricted to
+        // this request's own graphs, as Python's is.
+        let live: Vec<WgIndex> = self
+            .live_wgs(walk_sym)
+            .into_iter()
+            .filter(|w| mine.contains(w))
+            .collect();
         let info = self.requests[handle as usize].as_mut().expect("just set");
         for &wg in &mine {
             if !info.worker_graphs.contains(&wg) {
@@ -1240,7 +1310,7 @@ impl GraphRuntime {
     fn set_walk(&mut self, rid: u32, partition: &str, walk: &str) -> bool {
         let Some(p) = self.interner.get(partition) else { return false };
         let walk_sym = self.interner.intern(walk);
-        let live = self.live_wgs(walk_sym);
+        let live = self.live_wgs_for(rid, walk_sym);
         let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut())
         else {
             return false;
@@ -1553,6 +1623,19 @@ impl GraphRuntime {
         }
 
         let mut out = PopRidsOut::default();
+        // Structural: the same for every rid in the batch.
+        out.output_signals = {
+            let g = self.g(wg).clone();
+            let mut v: Vec<String> = g
+                .node(node)
+                .outputs
+                .iter()
+                .map(|e| self.interner.name(e.name).to_string())
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
         for rid in request_ids {
             let Some(state) = self.state_mut(wg, rid) else {
                 continue;
@@ -1584,7 +1667,7 @@ impl GraphRuntime {
     /// in prep_spec_rids.
     fn speculate_node(
         &mut self, node_name: &str, graph_walk: &str, sample_rid: u32,
-    ) -> Vec<(String, String, bool, Option<String>)> {
+    ) -> Vec<(String, String, bool, Option<String>, Vec<String>)> {
         let Some(wg) = self.owner_of(node_name, graph_walk) else {
             return vec![];
         };
@@ -1620,7 +1703,7 @@ impl GraphRuntime {
         spec_node_name: &str,
         graph_walk: &str,
         sample_rid: u32,
-    ) -> Option<(String, String, bool, Option<String>)> {
+    ) -> Option<(String, String, bool, Option<String>, Vec<String>)> {
         let wg = self.owner_of(curr_node_name, graph_walk)?;
         let source = self.nid(wg, curr_node_name)?;
         let want = self.nid(wg, spec_node_name)?;
@@ -1699,11 +1782,13 @@ impl GraphRuntime {
         let walk_wgs: Vec<WgIndex> = walk_sym
             .and_then(|w| self.walk_to_local_wgs.get(&w).cloned())
             .unwrap_or_default();
+        let walk = walk_sym.unwrap_or_default();
 
         let mut out = RouteOut::default();
         let mut routing: FxHashMap<u32, Vec<RoutedEdge>> = FxHashMap::default();
         let mut completed_wgs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
         let mut first_tp_rank: FxHashMap<u32, bool> = FxHashMap::default();
+        let mut speculative: FxHashMap<u32, bool> = FxHashMap::default();
         let mut staged: FxHashSet<u64> = FxHashSet::default();
         let mut cursor = 0usize;
 
@@ -1738,7 +1823,41 @@ impl GraphRuntime {
             let Some(state) = self.state_mut(wg, rid) else {
                 continue;
             };
-            let (mut edges, _filtered, freed_inputs) = state.complete(node, &out_tensors);
+            // Before complete(), which clears the flag.
+            let was_speculative = state.is_spec_scheduled(node);
+            let (mut pre_shard_edges, _filtered, freed_inputs) = state.complete(node, &out_tensors);
+            let me_sym = self.shard.me;
+            let mut edges = if let Some(info) = &self.requests[rid as usize] {
+                if let Some(sharding) = &info.shard {
+                    let mut sharded_edges: Vec<RoutedEdge> = vec![];
+                    let mut shards: Vec<FanoutDest> = vec![];
+                    for edge in &pre_shard_edges {
+                        let dst_walk = if edge.streaming {
+                            None
+                        } else { Some(walk) };
+                        sharding.fanout(
+                            edge.name, node,
+                            walk, edge.dest_sym,
+                            dst_walk, &edge.tensors,
+                            &mut shards
+                        );
+                        for shard in &shards {
+                            let mut new_edge = edge.clone();
+                            if shard.worker != me_sym && edge.dest.is_to_worker() {
+                                new_edge.dest = Dest::External(edge.dest_sym);
+                            }
+                            sharded_edges.push(new_edge);
+                        }
+                    }
+                    sharded_edges
+                } else {
+                    pre_shard_edges
+                }
+            } else {
+                pre_shard_edges
+            };
+            
+            speculative.insert(rid, was_speculative);
 
             // No group means singleton / non-TP, which is rank 0. The
             // conductor counts one report per request, so a rank wrongly
@@ -1756,8 +1875,7 @@ impl GraphRuntime {
             // just the one owning the completed node: a wg can become done
             // without ingesting an edge here, when the completed node's
             // outputs all go to EMPTY_DESTINATION / EMIT_TO_CLIENT / a
-            // streaming partition (Orpheus prefill, BAGEL vae_decoder,
-            // Code2Wav).
+            // streaming partition.
             //
             // Each one that is done is RESET. A worker graph completes many
             // times over a request, and without the reset `is_done` latches:
@@ -1811,11 +1929,13 @@ impl GraphRuntime {
                         .graphs
                         .iter()
                         .position(|g| g.by_name.contains_key(&name))
+                        .filter(|_| self.runs_for_request(rid, name))
                         .map(|i| (i as WgIndex, self.graphs[i].by_name[&name])),
                     // A non-streaming destination has to be live in THIS walk,
                     // as Python's _walk_node_to_wg_id lookup is.
                     Dest::External(name) => walk_sym
                         .and_then(|w| self.node_owner.get(&(w, name)).copied())
+                        .filter(|_| self.runs_for_request(rid, name))
                         .and_then(|owner| {
                             let g2 = self.graphs[owner as usize].clone();
                             g2.by_name.get(&name).copied().map(|d| (owner, d))
@@ -1918,7 +2038,6 @@ impl GraphRuntime {
             //
             // EMPTY_DESTINATION is 0, not 1: it routes nowhere, and Python
             // drops it before the count.
-            let me_sym = self.shard.me;
             let edge_refs: Vec<i64> = edges
                 .iter()
                 .map(|e| {
@@ -1993,6 +2112,7 @@ impl GraphRuntime {
                 routing,
                 completed_wgs,
                 first_tp_rank,
+                speculative,
             },
         );
         Ok(out)
@@ -2139,6 +2259,11 @@ impl GraphRuntime {
         stream_tokens_consumed: Vec<(u32, Vec<(String, i64)>)>,
         profiling: Vec<(u32, Option<Vec<u8>>)>,
     ) -> PyResult<()> {
+        let spec_flags = self
+            .completions
+            .get(&completion_id)
+            .map(|c| c.speculative.clone())
+            .unwrap_or_default();
         let plan = self.take_send_plan(completion_id)?;
         let partition = plan.partition.clone();
         let encoded: FxHashMap<u32, Option<Vec<u8>>> =
@@ -2238,6 +2363,7 @@ impl GraphRuntime {
                 consumed.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]),
                 encoded.get(&rid).and_then(|b| b.as_deref()),
                 profiling.get(&rid).and_then(|b| b.as_deref()),
+                spec_flags.get(&rid).copied().unwrap_or(false),
             )?;
             self.dispatch("conductor", &bytes)?;
         }

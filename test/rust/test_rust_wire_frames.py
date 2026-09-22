@@ -389,3 +389,82 @@ def test_a_loop_nobody_else_runs_sends_nothing(tmp_path):
     rt, rid, inboxes = _loop_mesh(tmp_path)
     rt.stop_loops_batched("default", WALK, "ar_decode", [rid], [["nope"]])
     assert _collect(inboxes[PEER], first_wait_ms=100) == []
+
+
+# --- a replicated result leaves from rank 0 only ------------------------------
+
+def _emit_mesh(tmp_path, tp_rank, shard_dim=None):
+    """One node emitting to the client, inside a TP/SP group of two."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    inbox = ZmqCommunicator("api_server", str(tmp_path))
+    wg = {"wg_id": WG_ID, "graph_walks": [WALK],
+          "nodes": [_node("only", ["prompt"], [("out", "emit_to_client", False)])],
+          "loops": []}
+    rt = GraphRuntime(
+        worker_graphs=[wg], remote_worker_graphs=[],
+        sharding={
+            "groups": [{"nodes": ["only"], "tp_size": 2,
+                        "graph_walks": None, "tp_rank": tp_rank}],
+            "shard_dim": [] if shard_dim is None else [("out", shard_dim)],
+            "tp_enabled_nodes": [], "sp_enabled_nodes": [],
+        },
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [ME, PEER], [2])
+    info = TensorPointerInfo(
+        dims=[2, 3], dtype=torch.bfloat16, nbytes=12, address=1,
+        stride=[3, 1], uuid=1, source_session_id="h:1", source_entity=ME,
+    )
+    book.put_tensor(1, info)
+    book.increment_ref(1, 1)
+    rt.ingest_inputs_batch([rid], [{
+        "signal": "prompt", "next_node": "only", "uuids": [],
+        "is_final_streaming_chunk": False,
+    }])
+    rt.pop_rids("only", WALK, [rid])
+    out = rt.complete_and_route_batch({
+        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
+        "tensors": [1], "num_tensors": [1],
+    })
+    rt.send_outputs(
+        completion_id=out.completion_id, request_infos=[(rid, None)],
+        new_token_counts=[], nested=[], stream_tokens_consumed=[], profiling=[],
+    )
+    return _collect(inbox, first_wait_ms=300)
+
+
+def test_a_replicated_result_is_emitted_by_rank_0_only(tmp_path):
+    """Every rank emitting means the api server gets the same result twice,
+    and the duplicate lands after the request is gone -- "Message for unknown
+    request". The client has no sharding group, so Python's fanout yields a
+    destination only when source_tp_rank == 0.
+    """
+    assert len(_emit_mesh(tmp_path / "r0", tp_rank=0)) == 1
+    assert _emit_mesh(tmp_path / "r1", tp_rank=1) == []
+
+
+def test_a_sharded_result_is_emitted_by_every_rank(tmp_path):
+    """The opposite case: each rank holds a different slice, so each sends
+    its own -- gating on rank 0 there would drop half the output."""
+    assert len(_emit_mesh(tmp_path / "s0", tp_rank=0, shard_dim=0)) == 1
+    assert len(_emit_mesh(tmp_path / "s1", tp_rank=1, shard_dim=0)) == 1
+
+
+def test_a_speculative_completion_does_not_report_the_partition_done(tmp_path):
+    """A speculatively-scheduled node has not really finished the partition.
+
+    Reported done, the conductor believes the stream ended a pass early --
+    which is why Python carries `and not speculative`.
+    """
+    mesh = _Mesh(tmp_path, outs=[("out", "", False)])
+    rid = mesh.admit()
+    mesh.rt.mark_stream_partition_done(rid, "default")
+
+    # Not speculative: the flag rides through as the stream reported it.
+    assert mesh.run(rid, uuids=[])["conductor"][0].body.partition_done
+
+    mesh.rt.set_speculatively_scheduled("only", WG_ID, [rid], True)
+    body = mesh.run(rid, uuids=[])["conductor"][0].body
+    assert not body.partition_done, "a speculative pass reported done"

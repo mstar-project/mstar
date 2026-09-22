@@ -202,10 +202,30 @@ impl ShardingTemplate {
 }
 
 pub struct FanoutDest {
+    /// `Sym::MAX` for a special destination (the client / the conductor),
+    /// which has no sharding group and therefore no worker of its own.
     pub worker: Sym,
-    pub full: bool,
-    pub start: i64,
-    pub end: i64,
+    /// The tensors as THIS destination should see them: the source refs
+    /// unchanged for a replicated signal, sliced on the shard dim otherwise.
+    ///
+    /// Sliced here rather than reported as (start, end) for the caller to
+    /// apply: the slice is expressible entirely in `TensorRef`'s own fields,
+    /// so nothing downstream has to know the shard dim existed.
+    pub tensors: Vec<TensorRef>,
+}
+
+/// Python's per-destination slice (`ShardingConfig.fanout_graph_edges`):
+/// keep rows `start..end` of the leading (canonical) shard dim.
+fn slice_rows(t: &TensorRef, start: i64, end: i64) -> TensorRef {
+    // nbytes per row of the shard dim; a zero-length dim has no rows to take.
+    let row = if t.dim0 == 0 { 0 } else { t.nbytes / t.dim0 };
+    TensorRef {
+        uuid: t.uuid,
+        dim0: end - start,
+        nbytes: (end - start) * row,
+        // Assigned, not accumulated -- Python sets `new_info.offset = offset`.
+        offset: start * row,
+    }
 }
 
 impl ShardMap {
@@ -235,26 +255,31 @@ impl ShardMap {
         };
         let shard_dim = self.shard_dim.get(&signal).copied();
 
-        let Some(dg) = dg else {
-            // special destination (client / conductor): single logical dest
-            out.push(FanoutDest { worker: Sym::MAX, full: true, start: 0, end: 0 });
-            return;
+        // A special destination (client / conductor) has no group. Python does
+        // NOT short-circuit here: it gives the dest a single pseudo-worker with
+        // tp_size 1 and runs the same branches. That matters both ways -- a
+        // replicated signal then leaves from rank 0 ONLY (every rank emitting
+        // is how the api server ends up seeing one result twice), and a sharded
+        // one is still sliced per source rank rather than sent whole.
+        let (dest_workers, dest_tp): (Vec<Sym>, u32) = match dg {
+            Some(g) => (g.workers.clone(), g.tp_size),
+            None => (vec![Sym::MAX], 1),
         };
 
         if shard_dim.is_none() {
-            // replicated: the source's own worker if it is in the dest group,
+            // Replicated: the source's own worker if it is in the dest group,
             // plus (rank 0 only) every dest worker not already holding it.
             if let Some(sw) = src_worker {
-                if dg.workers.contains(&sw) {
-                    out.push(FanoutDest { worker: sw, full: true, start: 0, end: 0 });
+                if dest_workers.contains(&sw) {
+                    out.push(FanoutDest { worker: sw, tensors: t.to_vec() });
                 }
             }
             if src_rank == 0 {
-                for &w in &dg.workers {
+                for &w in &dest_workers {
                     if Some(w) != src_worker
                         && !sg.is_some_and(|g| g.workers_set.contains(&w))
                     {
-                        out.push(FanoutDest { worker: w, full: true, start: 0, end: 0 });
+                        out.push(FanoutDest { worker: w, tensors: t.to_vec() });
                     }
                 }
             }
@@ -263,19 +288,24 @@ impl ShardMap {
 
         let sizes: Vec<i64> = t.iter().map(|x| x.dim0).collect();
         let total = sizes.first().copied().unwrap_or(0) * src_tp as i64;
-        let per_dest = total / dg.tp_size as i64;
+        let per_dest = total / dest_tp as i64;
         let s_start = src_rank as i64 * sizes.first().copied().unwrap_or(0);
         let s_end = s_start + sizes.first().copied().unwrap_or(0);
-        for r in 0..dg.tp_size {
+        for r in 0..dest_tp {
             let d_start = r as i64 * per_dest;
             let d_end = d_start + per_dest;
             if s_end <= d_start { break; }
             if s_start >= d_end { continue; }
+            // Each tensor is cut at the same rows: the overlap between this
+            // source rank's span and this destination rank's.
+            let (lo, hi) = (s_start.max(d_start), s_end.min(d_end));
             out.push(FanoutDest {
-                worker: dg.workers[r as usize],
-                full: false,
-                start: s_start.max(d_start),
-                end: s_end.min(d_end),
+                worker: dest_workers[r as usize],
+                // Relative to this source's own slab, which starts at s_start.
+                tensors: t
+                    .iter()
+                    .map(|x| slice_rows(x, lo - s_start, hi - s_start))
+                    .collect(),
             });
         }
     }
@@ -423,18 +453,59 @@ mod tests {
             .unwrap();
         assert_eq!(m.shard_dim.get(&SIGNAL), Some(&0));
 
-        let tensors = [TensorRef { uuid: 1, dim0: 4, nbytes: 0, offset: 0 }];
+        // 4 rows, 8 bytes each. Equal tp sizes, so rank 0's slab maps whole
+        // onto dest rank 0 -- the slice is the identity, and the point here is
+        // that it goes to ONE destination rather than both.
+        let tensors = [TensorRef { uuid: 1, dim0: 4, nbytes: 32, offset: 0 }];
         let mut out = Vec::new();
         m.fanout(SIGNAL, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out);
-        assert!(
-            out.iter().all(|d| !d.full),
-            "a sharded signal must fan out as slices, not whole tensors"
-        );
+        assert_eq!(out.len(), 1, "rank 0's rows belong to dest rank 0 alone");
+        assert_eq!(out[0].worker, 100);
+        assert_eq!(out[0].tensors, tensors.to_vec());
 
-        // The same edge without a shard dim is replicated.
+        // The same edge without a shard dim is replicated: untouched refs.
         let mut out2 = Vec::new();
         m.fanout(999, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out2);
-        assert!(out2.iter().all(|d| d.full));
+        assert!(out2.iter().all(|d| d.tensors == tensors.to_vec()));
+    }
+
+    #[test]
+    fn an_unsharded_source_is_cut_across_the_destination_ranks() {
+        const SIGNAL: Sym = 50;
+        // src tp 1 -> dest tp 2: the one slab really is split, which is what
+        // exercises the dims/nbytes/offset the slice carries.
+        let mut t = template(vec![
+            GroupTemplate {
+                nodes: vec![NODE_A], tp_size: 1,
+                graph_walks: Some(vec![WALK_X]), tp_rank: Some(0),
+            },
+            GroupTemplate {
+                nodes: vec![NODE_B], tp_size: 2,
+                graph_walks: Some(vec![WALK_X]), tp_rank: Some(0),
+            },
+        ]);
+        t.shard_dim.insert(SIGNAL, 0);
+        let m = t
+            .instantiate(&n2w(&[
+                ((NODE_A, WALK_X), &[100]),
+                ((NODE_B, WALK_X), &[100, 101]),
+            ]))
+            .unwrap();
+
+        // 4 rows of 8 bytes.
+        let tensors = [TensorRef { uuid: 1, dim0: 4, nbytes: 32, offset: 0 }];
+        let mut out = Vec::new();
+        m.fanout(SIGNAL, NODE_A, WALK_X, NODE_B, Some(WALK_X), &tensors, &mut out);
+        assert_eq!(out.len(), 2);
+        // Halves: two rows each, the second starting two rows in.
+        assert_eq!(
+            out[0].tensors,
+            vec![TensorRef { uuid: 1, dim0: 2, nbytes: 16, offset: 0 }],
+        );
+        assert_eq!(
+            out[1].tensors,
+            vec![TensorRef { uuid: 1, dim0: 2, nbytes: 16, offset: 16 }],
+        );
     }
 
     #[test]
