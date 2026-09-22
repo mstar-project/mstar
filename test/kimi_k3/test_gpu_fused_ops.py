@@ -188,6 +188,7 @@ def test_slot_indexed_conv_update_matches_fla(rows, d, dtype):
     assert torch.equal(y1, y2) and torch.equal(st1, st2)
 
 
+@cuda
 @pytest.mark.parametrize("t,chunks", [(1, 2), (9, 4), (300, 8)])
 def test_topk_sum_reduce_writes_column_chunks(t, chunks):
     """The top-k sum written into a ``[T, chunks, D / chunks]`` view of a ``[chunks, T, D / chunks]``
