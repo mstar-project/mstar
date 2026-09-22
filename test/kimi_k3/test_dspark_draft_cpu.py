@@ -35,10 +35,12 @@ def build(monkeypatch):
     for name, p in draft.named_parameters():
         p.data = torch.ones_like(p) if name.endswith("norm.weight") else torch.randn_like(p) * 0.2
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
-    kv_cfg = KVConfig(num_layers=CFG.num_hidden_layers, num_kv_heads=1, head_dim=CFG.kv_lora_rank + CFG.qk_rope_head_dim,
+    kv_cfg = KVConfig(num_layers=CFG.num_hidden_layers, num_kv_heads=1,
+                      head_dim=CFG.kv_lora_rank + CFG.qk_rope_head_dim,
                       max_seq_len=64, max_num_pages=16, page_size=4, layout=KVLayout.MLA, kv_lora_rank=CFG.kv_lora_rank,
                       qk_rope_head_dim=CFG.qk_rope_head_dim, num_qo_heads=CFG.num_attention_heads)
-    kv = manager_mod.KVManager(cfg=kv_cfg, name="dspark_kv", joint_comm_group=None, transfer_engine_info=None, device=CPU,
+    kv = manager_mod.KVManager(cfg=kv_cfg, name="dspark_kv", joint_comm_group=None, transfer_engine_info=None,
+                               device=CPU,
                                dtype=torch.float32)
     attn = FlashInferMLAManager(kv_cache="dspark_kv", device=CPU, dtype=torch.float32, kv_config=kv_cfg,
                                 sm_scale=draft.layers[0].self_attn.scale)
