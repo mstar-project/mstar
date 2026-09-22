@@ -82,3 +82,24 @@ def test_fidelity_column_reads_the_psnr_files_next_to_the_results(tmp_path):
     assert "| exact (n=20) |" in next(line for line in lines if line.startswith("| diffusers |"))
     assert "| 12.6 dB (min 11.2, n=20) |" in next(line for line in lines if line.startswith("| sglang |"))
     assert "| n/a | n=20 |" in next(line for line in lines if line.startswith("| mstar |"))  # no file: nothing invented
+
+
+def test_python_api_rows_note_the_in_process_engine_and_pipeline_only_numbers(tmp_path):
+    lat = {**_latency("diffusers_compile", "black-forest-labs/FLUX.2-klein-4B", 0.642, 0.722, 56000, observed="png"),
+           "engine": "diffusers", "engine_version": "diffusers 0.40.0", "compile": True, "pipe_median_s": 0.311,
+           "batching": "batched call: list of prompts"}
+    thr = _throughput("diffusers_compile", "black-forest-labs/FLUX.2-klein-4B", {4: 1.65, 8: 1.64, 16: 1.64}, 56000)
+    thr.update({"engine": "diffusers", "engine_version": "diffusers 0.40.0", "compile": True})
+    for c in ("4", "8"):
+        thr["by_concurrency"][c]["images_per_s_pipeline"] = 3.36
+    thr["by_concurrency"]["16"] = {"concurrency": 16, "images": 32, "error": "OutOfMemoryError: CUDA out of memory"}
+    files = []
+    for name, data in {"lat": lat, "thr": thr}.items():
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(data))
+        files.append(path)
+    lines = render_table(load_results(files)).splitlines()
+    row = next(line for line in lines if line.startswith("| diffusers_compile |"))
+    assert "| 1.65 (1.55-1.75) | 1.64 (1.54-1.74) | n/a |" in row  # the failed level is n/a, not invented
+    assert "in-process diffusers 0.40.0 + torch.compile; pipeline only 0.311 s; pipeline-only img/s 3.36 / 3.36" in row
+    assert "failed @16: OutOfMemoryError" in row and "batched call: list of prompts" in row
