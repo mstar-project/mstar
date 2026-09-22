@@ -319,7 +319,12 @@ bit of inductor's own reductions and activation decompositions), ``cuda_graph`` 
 ``capture_sizes`` / ``capture_batch_sizes`` (the denoise step, Euler update included, is captured
 per listed ``[height, width]`` and batch size; other shapes run the eager batched path) and
 ``capture_edit_sizes`` (klein: edit buckets with one reference image of the output size, the shape
-of an edit that keeps its reference's size; defaults to ``capture_sizes``, ``[]`` captures none),
+of an edit that keeps its reference's size; defaults to ``capture_sizes``, ``[]`` captures none; the
+eight edit buckets of the 1024² default cost about 8 GiB of peak VRAM on klein-4B and 6 GiB on 9B,
+and every extra capture size adds roughly 7 minutes of startup), ``async_scheduling`` (speculative
+scheduling of the image nodes: the worker assembles a batch's next step while the current one runs
+and merges requests that became ready meanwhile; off by default because the measured lockstep
+default batches concurrent requests better — price it per deployment with the benchmark client),
 ``max_batch_size``, and ``vae_compile`` (``torch.compile`` of the VAE decode with inductor
 autotuning: 89 to 29 ms at 1024² on an H100; its fused reductions move the image by about 55 dB
 PSNR from the eager decode on every prompt, and the autotuner may pick other conv kernels in
