@@ -94,7 +94,8 @@ def test_unpack_cuts_at_a_stop_token_unless_eos_is_ignored(tiny_dir):
     sub = model.get_submodule("LLM", device="cpu")
     stop = next(iter(model.config.stop_token_ids))
     tokens = torch.tensor([[5, 6, stop, 8], [9, 10, 11, 12]])
-    verdicts = [SimpleNamespace(accepted=3, tokens=tokens[0].tolist()), SimpleNamespace(accepted=2, tokens=tokens[1].tolist())]
+    verdicts = [SimpleNamespace(accepted=3, tokens=tokens[0].tolist()),
+                SimpleNamespace(accepted=2, tokens=tokens[1].tolist())]
     sub._acceptance = SimpleNamespace(verdicts_for=lambda rids: verdicts)
     static = {"spec_tokens": tokens, "spec_accepted": torch.tensor([3, 2]), "next_inputs": torch.tensor([[8], [11]])}
     info = {"a": SimpleNamespace(resource_configs={SAMPLER: SimpleNamespace(ignore_eos=False)}),
