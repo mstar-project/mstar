@@ -9,6 +9,7 @@ KV_CACHE = "kv_cache"
 LOCAL_ATTN = "local_attn"
 GLOBAL_ATTN = "global_attn"
 ROPE = "rope"
+SAMPLER = "sampler"
 
 
 @dataclass
