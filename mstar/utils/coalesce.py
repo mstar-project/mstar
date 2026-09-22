@@ -53,7 +53,8 @@ def storage_spans(tensors: list[torch.Tensor]) -> list[StorageSpan]:
         hi = max(m.offset + m.numel for m in members)
         first = tensors[members[0].index]
         view = torch.empty(0, dtype=first.dtype, device=first.device).set_(first.untyped_storage(), lo, (hi - lo,))
-        spans.append(StorageSpan(view=view, members=[_Member(m.index, m.offset - lo, m.numel, m.shape) for m in members]))
+        span_members = [_Member(m.index, m.offset - lo, m.numel, m.shape) for m in members]
+        spans.append(StorageSpan(view=view, members=span_members))
     return spans
 
 
