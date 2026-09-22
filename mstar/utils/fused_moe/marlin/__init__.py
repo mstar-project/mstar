@@ -89,7 +89,8 @@ def repack_experts(ops, packed: torch.Tensor, size_n: int, size_k: int) -> torch
 def prepare_scales(scale: torch.Tensor, size_n: int, size_k: int) -> torch.Tensor:
     """``scale [E, N, K/32]`` E8M0-as-uint8 -> ``[E, K/32, N]`` E8M0 in Marlin order."""
     s = scale.view(torch.float8_e8m0fnu).to(torch.bfloat16)
-    return torch.stack([mxfp4_process_scales(marlin_permute_scales(s[i].T, size_k, size_n, 32)) for i in range(s.shape[0])])
+    return torch.stack([mxfp4_process_scales(marlin_permute_scales(s[i].T, size_k, size_n, 32))
+                        for i in range(s.shape[0])])
 
 
 _BF16_BUFFERS: dict = {}
@@ -251,7 +252,8 @@ class MarlinMXFP4Experts:
         rows[order] = torch.arange(order.numel(), device=z.device)  # where token t's j-th pair landed
         if out is None:
             out = torch.empty(m, k, dtype=z.dtype, device=z.device)
-        moe_indexed_topk_sum_triton(c3, rows.view(m, top_k).to(torch.int32), topk_weight.to(torch.float32).contiguous(), out)
+        moe_indexed_topk_sum_triton(c3, rows.view(m, top_k).to(torch.int32),
+                                    topk_weight.to(torch.float32).contiguous(), out)
         return out
 
     def _forward(
