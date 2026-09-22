@@ -105,7 +105,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         if self.cuda_graphs and any(b not in self.capture_batch_sizes for b, _ in pairs):
             # a step's block is decided per capture bucket, so the bounds must be bucket sizes for a
             # batch and the bucket it replays in to agree
-            raise ValueError(f"speculative_schedule bounds must be capture batch sizes {self.capture_batch_sizes}: {pairs}")
+            raise ValueError("speculative_schedule bounds must be capture batch sizes "
+                             f"{self.capture_batch_sizes}: {pairs}")
         return tuple(pairs)
 
     def block_length(self, rows: int) -> int:
@@ -152,7 +153,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         if speculating:
             # the block is a property of the step: the capture bucket's row count decides it (every
             # row of a bucket shares the block), the real count for an eager step
-            rows = slot_lease.bucket.bs if slot_lease is not None and slot_lease.bucket is not None else len(request_ids)
+            bucket = slot_lease.bucket if slot_lease is not None else None
+            rows = bucket.bs if bucket is not None else len(request_ids)
             k = self.block_length(rows)
             segments = [Segment(request_id=rid, label="main", span=k + 1) for rid in request_ids]
         else:
@@ -217,7 +219,8 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         token repeated, accepted only where the target repeats itself."""
         return bonus.expand(-1, self.speculative_tokens if k is None else k)
 
-    def _forward_verify(self, engine_inputs: ModelInputsFromEngine, text_inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _forward_verify(self, engine_inputs: ModelInputsFromEngine,
+                        text_inputs: torch.Tensor) -> dict[str, torch.Tensor]:
         """One speculative decode step (plan section 8.6). The rows carry their bonus tokens (one
         id each); the draft proposes ``k`` tokens per row (the DSpark draft against its context cache,
         or the stand-in's repeated bonus); the target verifies ``[bonus, drafts]`` in one pass
