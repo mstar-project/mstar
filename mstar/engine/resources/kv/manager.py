@@ -690,15 +690,18 @@ class KVManager(AttentionResource):
                     return AdmitOutcome(ok=True, ready=False)
 
                 stream = self._ensure_label(rid, label)
-                # the rank that published this sampled the first token after
-                # it, so a chain extended here would start one token late
-                stream.unkeyed = None
+                own = seq_info.latest_kv_transfer_info == self._own_transfer_info()
+                if not own:
+                    # the rank that published this sampled the first token after
+                    # it, so a chain extended here would start one token late,
+                    # read or not: a local match can cover the whole record
+                    stream.unkeyed = None
                 new_len = seq_info.seq_len
                 self._take_local_match(stream, new_len, rooted.get(label))
                 old_len = stream.stored_len
                 if new_len <= old_len:
                     continue
-                if seq_info.latest_kv_transfer_info == self._own_transfer_info():
+                if own:
                     # This shouldn't happen: the pages already ARE in this cache;
                     # opening our own IPC handle raises `invalid device context`
                     logger.warning(
