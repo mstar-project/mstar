@@ -175,6 +175,7 @@ def test_cuda_graph_configs_one_bucket_per_shape():
     assert set(cfg.single_request_inputs.tensor_inputs) == {LATENTS, "cond", "sigma", "sigma_next", "timestep"}
     assert cfg.get_total_tokens(4) == [44]
     assert cfg.caps_eager_batch_size is False and cfg.compile is False
+    assert cfg.static_seq_dims == {key: 0 for key in cfg.single_request_inputs.tensor_inputs}
     assert ToyDenoise().get_cuda_graph_configs(torch.device("cpu")) == []
 
 
