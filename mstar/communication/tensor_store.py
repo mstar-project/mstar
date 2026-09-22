@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -40,6 +40,54 @@ class ReferenceInfo:
     mem_registered: bool = False
 
 
+@dataclass
+class ColumnarTensorInfo:
+    """One node's output batch, marshalled as columns of primitives.
+
+    The fields above the columns are constant for the whole batch, so they
+    cross into the bookkeeper once and intern once instead of per tensor.
+    ``tp_size``/``tp_rank`` belong there too: the sharding group is a property
+    of the node and this rank, not of the request, so one batch -- one node,
+    one graph walk, one worker -- cannot be heterogeneous in them.
+    """
+
+    source_session_id: str
+    source_entity: str
+    source_node_name: str
+    source_graph_walk: str
+    tp_size: int
+    tp_rank: int
+    uuids: list[int] = field(default_factory=list)
+    addresses: list[int] = field(default_factory=list)
+    nbytes: list[int] = field(default_factory=list)
+    ndims: list[int] = field(default_factory=list)
+    dims_flat: list[int] = field(default_factory=list)
+    stride_flat: list[int] = field(default_factory=list)
+    dtype_idx: list[int] = field(default_factory=list)
+    dtype_names: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        self._seen_dtypes: dict[torch.dtype, int] = {}
+
+    def add_tensors_canonical(
+        self, uuids: list[int],
+        canonicals: list[torch.Tensor],
+    ):
+        self.uuids.extend(uuids)
+        for tensor in canonicals:
+            self.addresses.append(tensor.data_ptr())
+            self.nbytes.append(tensor.nbytes)
+            dims = tensor.shape
+            self.ndims.append(len(dims))
+            self.dims_flat.extend(dims)
+            self.stride_flat.extend(tensor.stride())
+            idx = self._seen_dtypes.get(tensor.dtype)
+            if idx is None:
+                idx = self._seen_dtypes[tensor.dtype] = len(self.dtype_names)
+                self.dtype_names.append(_dtype_name(tensor.dtype))
+            self.dtype_idx.append(idx)
+
+
 class TensorBookkeeping(ABC):
     """Per-uuid reference state. Never sees a tensor or a request id.
 
@@ -59,6 +107,21 @@ class TensorBookkeeping(ABC):
     ):
         for uuid, info in zip(uuids, infos, strict=True):
             self.put_tensor(uuid, info)
+
+    @property
+    def has_put_tensor_batch_columns(self):
+        return False
+
+    def put_tensor_batch_columns(
+        self, infos: ColumnarTensorInfo,
+    ):
+        """Columnar put, for a backend that pays per tensor to marshal.
+
+        Returns whether it handled the batch. The default says no: a Python
+        bookkeeper stores the descriptor by reference and has nothing to
+        marshal, so flattening it into columns would only add work.
+        """
+        raise NotImplementedError("Columnar put not implemented for this backend")
 
     @abstractmethod
     def update_info(self, uuid: int, info: TensorPointerInfo):
@@ -107,6 +170,16 @@ class TensorBookkeeping(ABC):
 
     def increment_ref_batch(self, uuids: list[int], counts: list[int]):
         for uuid, n in zip(uuids, counts, strict=True):
+            self.increment_ref(uuid, n)
+
+    def increment_ref_batch_uniform(self, uuids: list[int], n: int = 1):
+        """``increment_ref_batch`` where every uuid takes the same count.
+
+        The safety hold on a freshly stored output batch is always 1, so the
+        caller would otherwise build an n-long list of ones per batch purely
+        to satisfy the parallel-list signature.
+        """
+        for uuid in uuids:
             self.increment_ref(uuid, n)
 
     @abstractmethod
@@ -278,6 +351,32 @@ class RustTensorBookkeeping(TensorBookkeeping):
     ):
         self._rust.put_tensor_batch(uuids, [_to_rust(i) for i in infos])
 
+    @property
+    def has_put_tensor_batch_columns(self):
+        return True
+
+    def put_tensor_batch_columns(
+        self, infos: ColumnarTensorInfo
+    ):
+        """Store a batch already marshalled as columns of primitives.
+
+        ``_to_rust`` builds a 15-key dict per tensor and pyo3 then allocates a
+        String per string field per tensor, which is where storing a batch
+        actually spends its time -- batching the *call* alone measured zero.
+        Here the caller has filled the columns as it minted, so no
+        ``TensorPointerInfo`` is built to be torn apart again, and the fields
+        that are invariant across one node's output batch cross and intern
+        once rather than per tensor.
+        """
+        self._rust.put_tensor_batch_columns(
+            infos.uuids, infos.addresses, infos.nbytes, infos.ndims,
+            infos.dims_flat, infos.stride_flat, infos.dtype_names,
+            infos.dtype_idx, infos.tp_size, infos.tp_rank,
+            infos.source_session_id, infos.source_entity,
+            infos.source_node_name, infos.source_graph_walk,
+        )
+        return True
+
     def update_info(self, uuid: int, info: TensorPointerInfo):
         self._rust.update_info(uuid, _to_rust(info))
 
@@ -309,6 +408,9 @@ class RustTensorBookkeeping(TensorBookkeeping):
 
     def increment_ref_batch(self, uuids: list[int], counts: list[int]):
         self._rust.increment_ref_batch(uuids, counts)
+
+    def increment_ref_batch_uniform(self, uuids: list[int], n: int = 1):
+        self._rust.increment_ref_batch_uniform(uuids, n)
 
     def dereference(self, uuid: int, n: int = 1):
         self._rust.dereference(uuid, n)
@@ -397,6 +499,53 @@ class TensorStore:
             self._uuid_to_rid[uuid] = rid
         self.bookkeeping.put_tensor_batch(tensors.keys, info)
 
+    @property
+    def has_put_tensor_batch_columns(self) -> bool:
+        """Whether the caller should marshal into ``ColumnarTensorInfo``.
+
+        The manager asks before it starts minting, because the two forms are
+        built differently -- columnar fills its columns as it goes, where the
+        other materialises a ``TensorPointerInfo`` per tensor.
+        """
+        return self.bookkeeping.has_put_tensor_batch_columns
+
+    def put_tensor_batch_multi(
+        self, rids: list[Rid], uuids: list[int],
+        tensors: list[torch.Tensor], infos: list[TensorPointerInfo],
+    ):
+        """``put_tensor_batch`` spanning requests: one bookkeeping call for a
+        whole output batch rather than one per request.
+
+        The maps below are plain dicts, so keeping them in a Python loop costs
+        nothing; it is ``bookkeeping.put_tensor_batch`` that is a Rust boundary
+        crossing, and taking every request at once collapses it to one.
+        """
+        self._own(rids, uuids, tensors)
+        self.bookkeeping.put_tensor_batch(uuids, infos)
+
+    def put_tensor_batch_columns(
+        self, rids: list[Rid], tensors: list[torch.Tensor],
+        columns: ColumnarTensorInfo,
+    ):
+        """``put_tensor_batch_multi`` for a backend that marshals per tensor.
+
+        Takes the columns the caller filled while minting instead of a
+        descriptor per tensor. ``columns.uuids`` is the same order as
+        ``tensors``, which is what keeps the ownership maps aligned.
+        """
+        self._own(rids, columns.uuids, tensors)
+        self.bookkeeping.put_tensor_batch_columns(columns)
+
+    def _own(
+        self, rids: list[Rid], uuids: list[int], tensors: list[torch.Tensor],
+    ):
+        """Record which request owns each tensor. Pure Python dicts, so this
+        stays a loop -- only the bookkeeping call crosses into Rust."""
+        for rid, uuid, tensor in zip(rids, uuids, tensors, strict=True):
+            self._tensors[uuid] = tensor
+            self._rid_to_uuids.setdefault(rid, set()).add(uuid)
+            self._uuid_to_rid[uuid] = rid
+
     def check_uuid_presence(self, uuid: int) -> bool:
         return uuid in self._tensors
 
@@ -446,6 +595,9 @@ class TensorStore:
 
     def increment_ref(self, uuid: int, n: int = 1):
         self.bookkeeping.increment_ref(uuid, n)
+
+    def increment_ref_batch_uniform(self, uuids: list[int], n: int = 1):
+        self.bookkeeping.increment_ref_batch_uniform(uuids, n)
 
     def increment_ref_batch(self, uuids: list[int], counts: list[int]):
         self.bookkeeping.increment_ref_batch(uuids, counts)

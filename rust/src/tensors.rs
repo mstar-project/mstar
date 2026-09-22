@@ -200,6 +200,98 @@ impl Bookkeeping {
         Ok(())
     }
 
+    /// `put_tensor_batch` as columns instead of a dict per tensor.
+    ///
+    /// The dict form costs the same per tensor however many are sent -- a
+    /// 15-key Python dict to build, then a dict lookup and a fresh String per
+    /// field to convert -- so batching the *call* saves nothing measurable.
+    /// This takes primitives, and hoists the fields that are invariant across
+    /// one node's output batch (both source strings, the node name and the
+    /// graph walk) out of the per-tensor work: they cross once and intern
+    /// once. `dims` and `stride` arrive concatenated, split by `ndims`;
+    /// dtypes arrive as a distinct table plus an index, since a batch has one
+    /// or two.
+    #[allow(clippy::too_many_arguments)]
+    fn put_tensor_batch_columns(
+        &mut self,
+        uuids: Vec<u64>,
+        addresses: Vec<u64>,
+        nbytes: Vec<i64>,
+        ndims: Vec<u32>,
+        dims_flat: Vec<i64>,
+        stride_flat: Vec<i64>,
+        dtype_names: Vec<String>,
+        dtype_idx: Vec<u32>,
+        tp_size: u32,
+        tp_rank: u32,
+        source_session_id: String,
+        source_entity: String,
+        source_node_name: Option<String>,
+        source_graph_walk: Option<String>,
+    ) -> PyResult<()> {
+        let n = uuids.len();
+        if addresses.len() != n
+            || nbytes.len() != n
+            || ndims.len() != n
+            || dtype_idx.len() != n
+        {
+            return Err(PyValueError::new_err(
+                "put_tensor_batch_columns: every per-tensor column must have \
+                 the same length as uuids",
+            ));
+        }
+        let total: usize = ndims.iter().map(|d| *d as usize).sum();
+        if dims_flat.len() != total || stride_flat.len() != total {
+            return Err(PyValueError::new_err(
+                "put_tensor_batch_columns: dims_flat/stride_flat length must \
+                 equal the sum of ndims",
+            ));
+        }
+
+        // Interned once for the whole batch rather than once per tensor.
+        let session = self.strings.intern(&source_session_id);
+        let entity = self.strings.intern(&source_entity);
+        let node = source_node_name.as_deref().map(|s| self.strings.intern(s));
+        let walk = source_graph_walk.as_deref().map(|s| self.strings.intern(s));
+        let dtypes: Vec<Sym> =
+            dtype_names.iter().map(|d| self.strings.intern(d)).collect();
+
+        let mut at = 0usize;
+        for i in 0..n {
+            let k = ndims[i] as usize;
+            let dtype = *dtypes.get(dtype_idx[i] as usize).ok_or_else(|| {
+                PyValueError::new_err(
+                    "put_tensor_batch_columns: dtype_idx out of range",
+                )
+            })?;
+            let uuid = uuids[i];
+            let info = TensorPointerInfo {
+                dims: dims_flat[at..at + k].to_vec(),
+                dtype,
+                nbytes: nbytes[i],
+                address: addresses[i],
+                stride: stride_flat[at..at + k].to_vec(),
+                uuid,
+                source_session_id: session,
+                source_entity: entity,
+                // A freshly stored output carries no slice offset and no shm
+                // placement yet; register_for_send stamps those on later via
+                // update_info, exactly as the dict path leaves them.
+                offset: 0,
+                source_tp_size: tp_size,
+                source_tp_rank: tp_rank,
+                shm_segment: None,
+                shm_offset: 0,
+                source_node_name: node,
+                source_graph_walk: walk,
+            };
+            self.ref_info.insert(uuid, ReferenceInfo::default());
+            self.tensor_info.insert(uuid, info);
+            at += k;
+        }
+        Ok(())
+    }
+
     /// Rebind a descriptor without touching its refcount. Needed where the
     /// tensor lands before its final descriptor exists: a slice re-points an
     /// arriving info at a freshly minted uuid, and a fan-in consolidation
@@ -266,6 +358,22 @@ impl Bookkeeping {
             ));
         }
         for (uuid, n) in uuids.into_iter().zip(counts) {
+            self.increment_ref(uuid, n)?;
+        }
+        Ok(())
+    }
+
+    /// `increment_ref_batch` where every uuid takes the same count.
+    ///
+    /// The safety hold a worker puts on a freshly stored output batch is
+    /// always 1, so the caller would otherwise build an n-long list of ones
+    /// per batch just to hand it straight back across the boundary.
+    fn increment_ref_batch_uniform(
+        &mut self,
+        uuids: Vec<u64>,
+        n: i64,
+    ) -> PyResult<()> {
+        for uuid in uuids {
             self.increment_ref(uuid, n)?;
         }
         Ok(())
@@ -387,6 +495,32 @@ impl TensorBookkeeping {
         self.inner.lock().unwrap().put_tensor_batch(uuids, infos)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn put_tensor_batch_columns(
+        &self,
+        uuids: Vec<u64>,
+        addresses: Vec<u64>,
+        nbytes: Vec<i64>,
+        ndims: Vec<u32>,
+        dims_flat: Vec<i64>,
+        stride_flat: Vec<i64>,
+        dtype_names: Vec<String>,
+        dtype_idx: Vec<u32>,
+        tp_size: u32,
+        tp_rank: u32,
+        source_session_id: String,
+        source_entity: String,
+        source_node_name: Option<String>,
+        source_graph_walk: Option<String>,
+    ) -> PyResult<()> {
+        self.inner.lock().unwrap().put_tensor_batch_columns(
+            uuids, addresses, nbytes, ndims, dims_flat, stride_flat,
+            dtype_names, dtype_idx, tp_size, tp_rank,
+            source_session_id, source_entity, source_node_name,
+            source_graph_walk,
+        )
+    }
+
     fn update_info(&self, uuid: u64, info: TensorInfoArg) {
         self.inner.lock().unwrap().update_info(uuid, info)
     }
@@ -422,6 +556,12 @@ impl TensorBookkeeping {
         &self, uuids: Vec<u64>, counts: Vec<i64>,
     ) -> PyResult<()> {
         self.inner.lock().unwrap().increment_ref_batch(uuids, counts)
+    }
+
+    fn increment_ref_batch_uniform(
+        &self, uuids: Vec<u64>, n: i64,
+    ) -> PyResult<()> {
+        self.inner.lock().unwrap().increment_ref_batch_uniform(uuids, n)
     }
 
     #[pyo3(signature = (uuid, n = 1))]

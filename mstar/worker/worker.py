@@ -2291,31 +2291,27 @@ class Worker:
         # no edge carries cannot change what gets routed. Stale outputs are
         # dropped by complete_and_route_batch itself.
         signals = batch_N.batch.output_signals
-        flat_uuids: list[int] = []
-        flat_rids: list[int] = []
-        num_tensors: list[int] = []
-        signal_idxs: list[int] = []
         _t_store = _time.perf_counter() if self._phase_period else 0.0
-        for rid in rids:
-            info_by_signal = self.tensor_manager.store_and_return_tensor_info(
-                rid=rid, tensors=outputs.get(rid) or {},
-                node_name=batch_N.node_name,
-                graph_walk=batch_N.graph_walk,
-                skip_cuda_sync=True,
-            )
-            for i, signal in enumerate(signals):
-                infos = info_by_signal.get(signal, [])
-                num_tensors.append(len(infos))
-                flat_uuids.extend(info.uuid for info in infos)
-                flat_rids.extend(rid for _ in infos)
-                signal_idxs.extend(i for _ in infos)
+        # One store call for the batch rather than one per request, and the
+        # flat columns come back already built: the manager fills them as it
+        # mints, so nothing is keyed by request and signal only to be taken
+        # apart again here.
+        stored = self.tensor_manager.store_and_return_tensor_info_batch(
+            rids, outputs, signals,
+            node_name=batch_N.node_name,
+            graph_walk=batch_N.graph_walk,
+            skip_cuda_sync=True,
+        )
+        flat_uuids = stored.flat_uuids
+        flat_rids = stored.flat_rids
+        signal_idxs = stored.signal_idxs
+        num_tensors = stored.num_tensors
         # Safety hold: ref=1 until the real fanout is known, which
         # complete_and_route_batch settles. One call for the batch rather than
         # one per tensor -- with a Rust bookkeeper each is a boundary crossing,
-        # and a 128-request batch has hundreds of them.
-        self.tensor_manager.increment_ref_batch(
-            flat_uuids, [1] * len(flat_uuids)
-        )
+        # and a 128-request batch has hundreds of them. The count is uniform,
+        # so it crosses as a scalar rather than a list built per batch.
+        self.tensor_manager.increment_ref_batch_uniform(flat_uuids, 1)
         if self._phase_period:
             self._phase_record(
                 "worker.postprocess.store_tensors",

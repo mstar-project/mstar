@@ -7,8 +7,10 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from mstar.communication.tensor_store import (  # NameToTensorList re-exported
+    ColumnarTensorInfo,
     NameToTensorList,
     TensorStore,
 )
@@ -32,6 +34,23 @@ from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
 
 logger = logging.getLogger(__name__)
+
+
+class StoredOutputs(NamedTuple):
+    """One batch's stored outputs, in the layout routing consumes.
+
+    ``flat_uuids``/``flat_rids``/``signal_idxs`` are index-parallel, one entry
+    per stored tensor. ``num_tensors`` has one entry per (request, signal)
+    pair, request-major then signal order. Returned as columns rather than a
+    dict keyed by request and signal because the only caller flattens it
+    immediately -- building the dict just to take it apart again cost more
+    than the store itself.
+    """
+
+    flat_uuids: list[int]
+    flat_rids: list[int]
+    signal_idxs: list[int]
+    num_tensors: list[int]
 
 
 @dataclass
@@ -343,38 +362,44 @@ class TensorCommunicationManager(ABC):
         )
         return tensor.permute(*inverse_perm).contiguous()
 
-    def store_and_return_tensor_info(
+    def _source_tp(
+        self, cfg: ShardingConfig | None,
+        node_name: str | None, graph_walk: str | None,
+    ) -> tuple[int, int]:
+        """This rank's ``(tp_size, tp_rank)`` for the node being stored.
+
+        ``register_request`` is a hard prereq on the worker side, but the API
+        server calls the store without registering, so a missing config means
+        "no group" / TP=1 rather than an error.
+        """
+        source_group = (
+            cfg.get_sharding_group(node_name, graph_walk)
+            if cfg is not None else None
+        )
+        if source_group is None:
+            return 1, 0
+        return source_group.tp_size, source_group._tp_rank or 0
+
+    def _mint_tensor_infos(
         self, rid: int, tensors: NameToTensorList,
-        node_name: str | None=None,
-        graph_walk: str | None=None,
-        skip_cuda_sync: bool = False,
+        node_name: str | None, graph_walk: str | None,
+        out_rids: list[int], out_uuids: list[int],
+        out_tensors: list[torch.Tensor],
+        out_infos: list[TensorPointerInfo] | None = None,
     ) -> dict[str, list[TensorPointerInfo]]:
-        # CUDA sync ensures GPU writes to ``tensors`` are visible before
-        # callers hand out ``tensor.data_ptr()`` to peers (RDMA register,
-        # SHM serialize). With same-thread async scheduling the caller
-        # has typically already synced on ``output.completion_event``
-        # (which waits for *only* the producing step, not the queued next
-        # step), so the unconditional default-stream sync here would
-        # uselessly drain GPU(N+1). Pass ``skip_cuda_sync=True`` from
-        # those call sites.
-        if not skip_cuda_sync and torch.cuda.is_available():
-            torch.cuda.default_stream().synchronize()
-        tensor_info: dict[str, list[TensorPointerInfo]] = {}
+        """Mint uuids and descriptors for one request's outputs.
 
-        # register_request is a hard prereq on the worker side, but the API
-        # server calls this without registering. Default to "no group" / TP=1
-        # when no sharding_config is present.
+        Touches no store: the flat ``(rid, uuid, tensor, info)`` columns are
+        appended to the caller's lists, so the caller decides how wide a batch
+        to hand ``put_tensor_batch_multi``. Minting order is name then tensor,
+        which is what makes the caller's flat columns index-parallel.
+        """
         cfg = self.sharding_configs.get(rid)
-        if cfg is not None:
-            source_group = cfg.get_sharding_group(node_name, graph_walk)
-        else:
-            source_group = None
-        if source_group is not None:
-            source_tp_size = source_group.tp_size
-            source_tp_rank = source_group._tp_rank or 0
-        else:
-            source_tp_size, source_tp_rank = 1, 0
+        source_tp_size, source_tp_rank = self._source_tp(
+            cfg, node_name, graph_walk,
+        )
 
+        tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name, tensor_list in tensors.items():
             tensor_info[name] = []
 
@@ -404,9 +429,10 @@ class TensorCommunicationManager(ABC):
                     _source_node_name=node_name,
                     _source_graph_walk=graph_walk,
                 )
-                self.tensor_store.put_tensor(
-                    rid=rid, uuid=tensor_uuid, tensor=canonical, info=info,
-                )
+                out_rids.append(rid)
+                out_uuids.append(tensor_uuid)
+                out_tensors.append(canonical)
+                out_infos.append(info)
                 if cfg is not None:
                     self.uuid_to_shard_dim[tensor_uuid] = shard_dim
                 if self.enable_prof:
@@ -415,6 +441,217 @@ class TensorCommunicationManager(ABC):
                 logger.debug("Storing tensor name %s uuid %s", name, tensor_uuid)
                 tensor_info[name].append(info)
         return tensor_info
+
+    def store_and_return_tensor_info(
+        self, rid: int, tensors: NameToTensorList,
+        node_name: str | None=None,
+        graph_walk: str | None=None,
+        skip_cuda_sync: bool = False,
+    ) -> dict[str, list[TensorPointerInfo]]:
+        # CUDA sync ensures GPU writes to ``tensors`` are visible before
+        # callers hand out ``tensor.data_ptr()`` to peers (RDMA register,
+        # SHM serialize). With same-thread async scheduling the caller
+        # has typically already synced on ``output.completion_event``
+        # (which waits for *only* the producing step, not the queued next
+        # step), so the unconditional default-stream sync here would
+        # uselessly drain GPU(N+1). Pass ``skip_cuda_sync=True`` from
+        # those call sites.
+        if not skip_cuda_sync and torch.cuda.is_available():
+            torch.cuda.default_stream().synchronize()
+        rids: list[int] = []
+        uuids: list[int] = []
+        canonicals: list[torch.Tensor] = []
+        infos: list[TensorPointerInfo] = []
+        tensor_info = self._mint_tensor_infos(
+            rid, tensors, node_name, graph_walk,
+            rids, uuids, canonicals, infos,
+        )
+        self.tensor_store.put_tensor_batch_multi(rids, uuids, canonicals, infos)
+        return tensor_info
+
+    def store_and_return_tensor_info_batch(
+        self,
+        rids: list[int],
+        outputs: dict[int, NameToTensorList],
+        signals: list[str],
+        node_name: str | None=None,
+        graph_walk: str | None=None,
+        skip_cuda_sync: bool = False,
+    ) -> StoredOutputs:
+        """Store a whole output batch and return the columns routing needs.
+
+        One pass: the flat columns are filled as the uuids are minted, so no
+        per-request or per-signal dict is built to be taken apart again. The
+        mint order is therefore request-major then signal order, which is the
+        order the columns are in -- that is what keeps them index-parallel.
+
+        Which form is marshalled depends on the backend. A bookkeeper that
+        pays per tensor to marshal (the Rust one) gets columns of primitives;
+        one that stores the descriptor by reference (the Python one) gets
+        descriptors, since building columns for it would only add work.
+        """
+        if not skip_cuda_sync and torch.cuda.is_available():
+            torch.cuda.default_stream().synchronize()
+
+        flat_uuids: list[int] = []
+        flat_rids: list[int] = []
+        signal_idxs: list[int] = []
+        num_tensors: list[int] = []
+        canonicals: list[torch.Tensor] = []
+        # Outputs under a name no signal carries: still stored (the model
+        # produced them) but never routed, so they stay out of the flat
+        # columns. Normally empty, and skipped entirely when it is.
+        extra_uuids: list[int] = []
+        extra_rids: list[int] = []
+        extra_canonicals: list[torch.Tensor] = []
+
+        columnar = self.tensor_store.has_put_tensor_batch_columns
+        infos: list[TensorPointerInfo] = []
+        columns: ColumnarTensorInfo | None = None
+        if columnar:
+            # Invariant across one node's output batch, so carried once for
+            # the whole batch and interned once on the far side.
+            first_rid = next(iter(rids), None)
+            tp_size, tp_rank = self._source_tp(
+                self.sharding_configs.get(first_rid), node_name, graph_walk,
+            )
+            columns = ColumnarTensorInfo(
+                source_session_id=self.my_session_id,
+                source_entity=self.my_entity_id,
+                source_node_name=node_name,
+                source_graph_walk=graph_walk,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+            )
+
+        for rid in rids:
+            tensors = outputs.get(rid) or {}
+            cfg = self.sharding_configs.get(rid)
+            source_tp_size, source_tp_rank = self._source_tp(
+                cfg, node_name, graph_walk,
+            )
+            if columnar and (source_tp_size, source_tp_rank) != (
+                columns.tp_size, columns.tp_rank
+            ):
+                raise ValueError(
+                    f"request {rid} has sharding "
+                    f"{(source_tp_size, source_tp_rank)} for node "
+                    f"{node_name!r} walk {graph_walk!r}, but the batch was "
+                    f"built for {(columns.tp_size, columns.tp_rank)}; one "
+                    "batch is one node on one worker and cannot mix "
+                    "sharding groups"
+                )
+
+            matched = 0
+            for i, signal in enumerate(signals):
+                tensor_list = tensors.get(signal)
+                if not tensor_list:
+                    num_tensors.append(0)
+                    continue
+                matched += 1
+                shard_dim = (
+                    cfg.shard_dim.get(signal) if cfg is not None else None
+                )
+                for tensor in tensor_list:
+                    tensor_uuid = self._uuid_minter.mint()
+                    canonical = self._ensure_leading_shard_dim(
+                        shard_dim, tensor,
+                    )
+                    flat_uuids.append(tensor_uuid)
+                    flat_rids.append(rid)
+                    signal_idxs.append(i)
+                    canonicals.append(canonical)
+                    if not columnar:
+                        infos.append(self._tensor_info(
+                            canonical, tensor_uuid, source_tp_size,
+                            source_tp_rank, node_name, graph_walk,
+                        ))
+                    if cfg is not None:
+                        self.uuid_to_shard_dim[tensor_uuid] = shard_dim
+                    if self.enable_prof:
+                        self.uuid_to_edge_name[tensor_uuid] = signal
+                num_tensors.append(len(tensor_list))
+
+            if matched != len(tensors):
+                self._mint_unrouted(
+                    rid, tensors, signals, cfg, source_tp_size, source_tp_rank,
+                    node_name, graph_walk, extra_uuids, extra_rids,
+                    extra_canonicals, infos if not columnar else None,
+                )
+
+        store_uuids = flat_uuids + extra_uuids if extra_uuids else flat_uuids
+        store_rids = flat_rids + extra_rids if extra_uuids else flat_rids
+        store_tensors = (
+            canonicals + extra_canonicals if extra_uuids else canonicals
+        )
+        if columnar:
+            columns.add_tensors_canonical(store_uuids, store_tensors)
+            self.tensor_store.put_tensor_batch_columns(
+                store_rids, store_tensors, columns,
+            )
+        else:
+            self.tensor_store.put_tensor_batch_multi(
+                store_rids, store_uuids, store_tensors, infos,
+            )
+        return StoredOutputs(flat_uuids, flat_rids, signal_idxs, num_tensors)
+
+    def _tensor_info(
+        self, canonical: torch.Tensor, tensor_uuid: int,
+        source_tp_size: int, source_tp_rank: int,
+        node_name: str | None, graph_walk: str | None,
+    ) -> TensorPointerInfo:
+        """One output's descriptor. Only the non-columnar backends build these
+        -- see ``store_and_return_tensor_info_batch``."""
+        return TensorPointerInfo(
+            dims=canonical.shape,
+            dtype=canonical.dtype,
+            stride=canonical.stride(),
+            nbytes=canonical.nbytes,
+            address=canonical.data_ptr(),
+            uuid=tensor_uuid,
+            source_session_id=self.my_session_id,
+            source_entity=self.my_entity_id,
+            source_tp_size=source_tp_size,
+            source_tp_rank=source_tp_rank,
+            _source_node_name=node_name,
+            _source_graph_walk=graph_walk,
+        )
+
+    def _mint_unrouted(
+        self, rid: int, tensors: NameToTensorList, signals: list[str],
+        cfg, source_tp_size: int, source_tp_rank: int,
+        node_name: str | None, graph_walk: str | None,
+        out_uuids: list[int], out_rids: list[int],
+        out_tensors: list[torch.Tensor],
+        out_infos: list[TensorPointerInfo] | None,
+    ) -> None:
+        """Store outputs the graph carries no signal for.
+
+        ``complete_and_route_batch`` drops them, but the model did produce
+        them, so they are stored exactly as before -- just kept out of the
+        routing columns. The signal set is built only when a name actually
+        went unmatched, which is not the normal case.
+        """
+        routed = frozenset(signals)
+        for name, tensor_list in tensors.items():
+            if name in routed:
+                continue
+            shard_dim = cfg.shard_dim.get(name) if cfg is not None else None
+            for tensor in tensor_list:
+                tensor_uuid = self._uuid_minter.mint()
+                canonical = self._ensure_leading_shard_dim(shard_dim, tensor)
+                out_uuids.append(tensor_uuid)
+                out_rids.append(rid)
+                out_tensors.append(canonical)
+                if out_infos is not None:
+                    out_infos.append(self._tensor_info(
+                        canonical, tensor_uuid, source_tp_size,
+                        source_tp_rank, node_name, graph_walk,
+                    ))
+                if cfg is not None:
+                    self.uuid_to_shard_dim[tensor_uuid] = shard_dim
+                if self.enable_prof:
+                    self.uuid_to_edge_name[tensor_uuid] = name
 
     def store_and_populate_graph_edges(
         self, rid: int, tensors: NameToTensorList,
@@ -823,6 +1060,11 @@ class TensorCommunicationManager(ABC):
         """One call for the batch. With a Rust bookkeeper each single call is
         a boundary crossing, and an output batch has hundreds."""
         self.tensor_store.increment_ref_batch(uuids, counts)
+
+    def increment_ref_batch_uniform(self, uuids: list[int], n: int = 1):
+        """``increment_ref_batch`` for a uniform count, which is what the
+        safety hold on a stored output batch always is."""
+        self.tensor_store.increment_ref_batch_uniform(uuids, n)
 
     def has_inflight_reads(self, rid: int) -> bool:
         """Whether any async read for this request is still touching a remote
