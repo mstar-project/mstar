@@ -101,7 +101,8 @@ class ExpertSharding:
     def expert_map(self, device: torch.device | str) -> torch.Tensor:
         """``[num_experts]`` int32: global expert id -> local id, ``invalid_id`` elsewhere."""
         m = torch.full((self.num_experts,), self.invalid_id, dtype=torch.int32)
-        m[self.expert_offset:self.expert_offset + self.local_experts] = torch.arange(self.local_experts, dtype=torch.int32)
+        local = torch.arange(self.local_experts, dtype=torch.int32)
+        m[self.expert_offset:self.expert_offset + self.local_experts] = local
         return m.to(device)
 
     def localize(self, topk_idx: torch.Tensor) -> torch.Tensor:
