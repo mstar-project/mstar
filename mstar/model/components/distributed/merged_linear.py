@@ -128,7 +128,8 @@ class MergedParallelLinear(nn.Module):
         return self.split(self.forward(x))
 
     def extra_repr(self) -> str:
-        segs = ", ".join(f"{s.name}={self.local_sizes[s.name]}{'r' if s.sharding == REPLICATED else ''}" for s in self.segments)
+        segs = ", ".join(f"{s.name}={self.local_sizes[s.name]}{'r' if s.sharding == REPLICATED else ''}"
+                         for s in self.segments)
         return f"in={self.input_size}, out_local={self.output_size_local} [{segs}], tp={self.tp_size}"
 
 
