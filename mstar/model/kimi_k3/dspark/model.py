@@ -25,9 +25,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.distributed.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
-from mstar.model.kimi_k3.components.common import KimiRMSNorm, ReplicatedLinear
-from mstar.model.kimi_k3.components.common import fused_decode_kernels
+from mstar.model.components.distributed.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
+from mstar.model.kimi_k3.components.common import KimiRMSNorm, ReplicatedLinear, fused_decode_kernels
 from mstar.model.kimi_k3.dspark.config import DSparkConfig
 from mstar.model.kimi_k3.dspark.markov_kernel import markov_argmax, markov_argmax_workspace
 from mstar.model.kimi_k3.dspark.rope import YarnRotary
