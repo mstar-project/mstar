@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, ".")
 
-from benchmark.flux2_klein.summarize_bench import load_results, render_table  # noqa: E402
+from benchmark.flux2_klein.summarize_bench import load_fidelity, load_results, model_key, render_table  # noqa: E402
 
 
 def _latency(tag, model, median, p95, vram, observed=None):
@@ -54,3 +54,31 @@ def test_image_format_detection():
     assert image_format(b"\xff\xd8\xff\xe0" + b"0" * 8) == "jpeg"
     assert image_format(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "webp"
     assert image_format(b"GIF89a") == "unknown" and image_format(None) is None
+
+
+def test_fidelity_column_reads_the_psnr_files_next_to_the_results(tmp_path):
+    files = []
+    for name, data in {
+        "a_lat": _latency("diffusers", "black-forest-labs/FLUX.2-klein-4B", 0.6, 0.62, 20000, observed="png"),
+        "b_lat": _latency("sglang", "black-forest-labs/FLUX.2-klein-9B", 0.7, 0.72, 40000, observed="png"),
+        "c_lat": _latency("mstar", "flux2_klein", 0.4, 0.45, 20000, observed="png"),
+    }.items():
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(data))
+        files.append(path)
+    (tmp_path / "fidelity_diffusers_flux2_klein.json").write_text(json.dumps(
+        {"values": {}, "missing": [], "summary": {"n": 20, "exact": 20, "min": None, "median": None, "max": None}},
+    ))
+    (tmp_path / "fidelity_sglang_flux2_klein_9b.json").write_text(json.dumps(
+        {"values": {}, "missing": [], "summary": {"n": 20, "exact": 0, "min": 11.2, "median": 12.6, "max": 14.0}},
+    ))
+    assert model_key("black-forest-labs/FLUX.2-klein-9B") == "flux2_klein_9b"
+    assert model_key("Tongyi-MAI/Z-Image-Turbo") == "z_image_turbo"
+    assert model_key("flux2_klein") == "flux2_klein"
+    fidelity = load_fidelity(files)
+    assert set(fidelity) == {("diffusers", "flux2_klein"), ("sglang", "flux2_klein_9b")}
+    lines = render_table(load_results(files), fidelity=fidelity).splitlines()
+    assert "| peak VRAM | PSNR vs diffusers | notes |" in lines[0]
+    assert "| exact (n=20) |" in next(line for line in lines if line.startswith("| diffusers |"))
+    assert "| 12.6 dB (min 11.2, n=20) |" in next(line for line in lines if line.startswith("| sglang |"))
+    assert "| n/a | n=20 |" in next(line for line in lines if line.startswith("| mstar |"))  # no file: nothing invented
