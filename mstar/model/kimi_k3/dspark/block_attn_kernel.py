@@ -32,12 +32,14 @@ def _dspark_block_attn_kernel(
     for l0 in tl.static_range(0, BL, BLC):
         l = l0 + tl.arange(0, BLC)
         lm = l < L
-        qc = tl.load(q_lat + (tok_i * stride_ql_tok + h * stride_ql_head)[:, None] + l[None, :], mask=im[:, None] & lm[None, :], other=0.0)
+        qc = tl.load(q_lat + (tok_i * stride_ql_tok + h * stride_ql_head)[:, None] + l[None, :],
+                     mask=im[:, None] & lm[None, :], other=0.0)
         cc = tl.load(lat + tok_j[:, None] * (L + R) + l[None, :], mask=jm[:, None] & lm[None, :], other=0.0)
         s += tl.sum(qc.to(tl.float32)[:, None, :] * cc.to(tl.float32)[None, :, :], axis=2)
     e = tl.arange(0, BR)
     em = e < R
-    qp = tl.load(q_pe + (tok_i * stride_qp_tok + h * stride_qp_head)[:, None] + e[None, :], mask=im[:, None] & em[None, :], other=0.0)
+    qp = tl.load(q_pe + (tok_i * stride_qp_tok + h * stride_qp_head)[:, None] + e[None, :],
+                 mask=im[:, None] & em[None, :], other=0.0)
     kp = tl.load(lat + tok_j[:, None] * (L + R) + L + e[None, :], mask=jm[:, None] & em[None, :], other=0.0)
     s += tl.sum(qp.to(tl.float32)[:, None, :] * kp.to(tl.float32)[None, :, :], axis=2)
     s = s * scale
@@ -60,7 +62,8 @@ def _dspark_block_attn_kernel(
         o_blk = tl.sum(p[:, :, None] * cc.to(tl.float32)[None, :, :], axis=1)  # [BK, BLC]
         oc = tl.load(o_ctx + (tok_i * H + h)[:, None] * L + l[None, :], mask=im[:, None] & lm[None, :], other=0.0)
         o = (oc.to(tl.float32) * w_ctx[:, None] + o_blk * w_blk[:, None]) / denom[:, None]
-        tl.store(out + (tok_i * H + h)[:, None] * L + l[None, :], o.to(out.dtype.element_ty), mask=im[:, None] & lm[None, :])
+        tl.store(out + (tok_i * H + h)[:, None] * L + l[None, :], o.to(out.dtype.element_ty),
+                 mask=im[:, None] & lm[None, :])
 
 
 def dspark_block_attention(
