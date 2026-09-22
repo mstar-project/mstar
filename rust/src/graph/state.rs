@@ -234,21 +234,28 @@ impl RequestState {
         }
     }
 
-    /// FIXME: bug-for-bug with Python, whose behaviour here is probably wrong.
-    /// `ReadySignals.update` sets this via an `issuperset` call that is a
-    /// tautology, and keeps it in a set a node-level clear does not touch --
-    /// so it is neither "only streaming inputs missing" nor derived state.
-    /// Mirrored because Python is the oracle; fix `mstar/graph/base.py` first.
+    /// Python's `ReadySignals.is_ready_for_streaming`, folded into the
+    /// registry set `register_ingested_input` maintains.
+    ///
+    /// "Streaming-ready" means every input still missing is a streaming one,
+    /// which arrives incrementally -- so the node can run on what it has.
+    /// Python expressed that with an `issuperset` that was a tautology (both
+    /// operands are subsets of input_names), which made any node with any
+    /// input at all read as streaming-ready; fixed there, mirrored here.
     fn note_ingested_for_streaming(&mut self, id: NodeId) {
         let spec = self.graph.node(id);
         let st = &self.nodes[id as usize];
         // The mask alone, no liveness: Python's `ReadySignals.is_ready`.
         let full = st.cur.mask == spec.full_mask;
+        // input_names ⊆ ready_names ∪ streaming_inputs, as bits: nothing is
+        // missing except streaming slots.
+        let only_streaming_missing =
+            spec.full_mask & !st.cur.mask & !spec.streaming_mask == 0;
         let sched = st.scheduled;
         let (w, b) = Self::bit(id);
         if full {
             self.ready_streaming[w] &= !(1 << b);
-        } else if !sched {
+        } else if only_streaming_missing && !sched {
             // Only the add is gated on _speculatively_scheduled, as in Python.
             self.ready_streaming[w] |= 1 << b;
         }
