@@ -8,7 +8,6 @@ from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.runner import topo_sort
 from mstar.model.kimi_k3.config import KDA_ATTN, KDA_STATE, MLA_ATTN, MLA_KV, SAMPLER, SPEC
 from mstar.model.registry import get_model_class
-from mstar.model.submodule_base import ARNodeInputs
 
 
 def test_speculative_mode_declares_the_acceptance_resource_and_the_prefix_blocks(tiny_dir):
