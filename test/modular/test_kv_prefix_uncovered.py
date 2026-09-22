@@ -6,7 +6,8 @@ stream after the text, and a request read in from another rank starts its decode
 from a token that rank sampled. Keep keying past either and a page is filed
 under a key that describes different tokens, and the next request with those
 tokens attends it. Once the stream holds what the chain never saw, the chain
-stops.
+stops. A stream reading back its own publish, as a colocated decode does every
+step, sampled that token itself and keeps its chain.
 
 A decode step is launched before the token its predecessor sampled is read back,
 so a step can commit the token it writes before the chain has counted it. That
@@ -76,13 +77,13 @@ def _manager() -> KVManager:
     return kv
 
 
-def _ingest(kv: KVManager, rid: str) -> None:
-    whole = len(PROMPT) // PAGE_SIZE
+def _ingest(kv: KVManager, rid: str, prompt: list[int] = PROMPT) -> None:
+    whole = len(prompt) // PAGE_SIZE
     kv.ingest_request(rid, KVReqConfig(
         prefix_keys={"main": chain([
-            PROMPT[at:at + PAGE_SIZE] for at in range(0, len(PROMPT), PAGE_SIZE)
+            prompt[at:at + PAGE_SIZE] for at in range(0, len(prompt), PAGE_SIZE)
         ])},
-        prefix_tail={"main": PROMPT[whole * PAGE_SIZE:]},
+        prefix_tail={"main": prompt[whole * PAGE_SIZE:]},
         prefix_decode={"main": TENSOR},
     ))
 
@@ -156,6 +157,30 @@ def test_a_read_in_stream_keys_nothing_it_generates():
     )
 
 
+def test_a_peers_publish_drops_the_partial_chain_even_when_nothing_is_read():
+    kv = _manager()
+    whole = PROMPT[:2 * PAGE_SIZE]
+    _ingest(kv, "r0", whole)
+    _step(kv, "r0", len(whole))
+    _ingest(kv, "r1", whole)
+    published = PublishedKVInfo.build_for_rank(0, 1, {"main": KVSequenceInfo(
+        seq_len=len(whole), latest_kv_transfer_info="peer",
+        page_indices=list(range(2)),
+    )})
+
+    assert kv.admit_retrieve("r1", NODE, WALK, published).ok
+    kv.assert_pages_conserved()
+
+    stream = kv._streams["r1"]["main"]
+    assert stream.page_indices == kv._streams["r0"]["main"].page_indices, (
+        "the peer's pages were read in rather than matched here"
+    )
+    assert stream.unkeyed is None, (
+        "a peer's publish this cache already held left the chain open, and the "
+        "peer's first sampled token would be keyed one place late"
+    )
+
+
 # ── what is not a gap ───────────────────────────────────────────────────
 
 
@@ -172,6 +197,24 @@ def test_a_text_stream_keeps_its_chain_through_its_decode():
 
     assert _indexed(kv) == (len(PROMPT) + 30) // PAGE_SIZE, (
         "a stream that holds nothing but its prompt and its samples lost its chain"
+    )
+
+
+def test_a_stream_reading_its_own_publish_keeps_keying_its_samples():
+    kv = _manager()
+    _ingest(kv, "r0")
+    _step(kv, "r0", len(PROMPT))
+    _sampled(kv, "r0", 9000)
+
+    # a colocated decode is handed the record its own last step published
+    for token in range(9001, 9031):
+        assert kv.admit_retrieve("r0", NODE, WALK, kv.publish("r0")).ok
+        _step(kv, "r0", 1)
+        _sampled(kv, "r0", token)
+    kv.assert_pages_conserved()
+
+    assert _indexed(kv) == (len(PROMPT) + 30) // PAGE_SIZE, (
+        "a stream reading back its own publish stopped keying what it sampled"
     )
 
 
