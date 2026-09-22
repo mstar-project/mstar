@@ -415,7 +415,8 @@ class KimiLatentMoE(nn.Module):
         y, s_out = self._fork_experts.run(
             lambda: self._routed_scattered(z, topk_idx, topk_weight) if scatter
             else self._routed_reduced(z, topk_idx, topk_weight),
-            lambda: self._shared(mixed) if self.shared_experts is not None else None,  # partial over the intermediate shards
+            # the shared experts' partial over the intermediate shards
+            lambda: self._shared(mixed) if self.shared_experts is not None else None,
         )
         if scatter:
             # this rank's columns of the sum, normalized with the rows' statistics summed over the group
