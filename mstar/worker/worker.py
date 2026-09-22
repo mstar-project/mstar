@@ -1945,7 +1945,9 @@ class Worker:
         if popped is None:
             _return_all_polled()
             return None
-        fresh_wg, fresh_edges = popped
+
+        # output_signals are handled by _assemble_speculation
+        fresh_wg, fresh_edges, _ = popped
 
         # The leader's list is the composition every rank runs: all-or-nothing,
         # no local finished-rid skipping, no room_for_continuing cap.

@@ -4,6 +4,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AdmitRuntimeError
@@ -110,6 +111,11 @@ class SchedulingType(Enum):
     # is for the model to declare a (node, graph_walk) priority, since only it
     # knows which walk is latency-sensitive. Worth weighing against
     # head-of-line blocking: a busy high-priority walk starves the rest.
+
+class PopReadyResult(NamedTuple):
+    wg_ids: dict[int, int]
+    edge_specs: dict[int, EdgeSpec]
+    output_signals: dict[int, tuple[str, ...]]
 
 
 class MicroScheduler:
@@ -244,12 +250,14 @@ class MicroScheduler:
     def pop_ready_rids(
         self, request_state: RequestStateManager,
         node_name: str, graph_walk: str, rids: list[int],
-    ) -> tuple[dict[int, int], dict[int, list[EdgeSpec]]] | None:
+    ) -> PopReadyResult | None:
         """Pop ``node_name`` for exactly ``rids``, all or none.
         Checked for every rid before anything is popped, so the caller
         retries later for a partially ready set."""
         if not rids:
-            return {}, {}
+            return PopReadyResult(
+                {}, {}, {}
+            )
         # Engine readiness first: pop_rids treats it as a prerequisite, and it
         # is all-or-nothing too, so one not-ready rid leaves the set intact.
         node_partition = request_state.get_partition_for_node(node_name)
@@ -267,7 +275,7 @@ class MicroScheduler:
 
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[(node_name, graph_walk)] = self.batch_number
-        return (
+        return PopReadyResult(
             dict(zip(batch_rids, wg_ids, strict=True)),
             self._input_edges_by_rid(popped),
             popped.output_signals,
