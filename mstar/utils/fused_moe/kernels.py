@@ -460,10 +460,12 @@ def moe_indexed_topk_sum_kernel(
         wj = tl.load(weight_ptr + t * TOPK + j).to(tl.float32)
         acc += wj * tl.load(src_ptr + r * hidden_dim + offs, mask=mask, other=0.0).to(tl.float32)
     out_cols = (offs // chunk_dim) * tl.cast(output_stride_chunk, tl.int64) + offs % chunk_dim
-    tl.store(output_ptr + t * tl.cast(output_stride_0, tl.int64) + out_cols, acc.to(output_ptr.dtype.element_ty), mask=mask)
+    tl.store(output_ptr + t * tl.cast(output_stride_0, tl.int64) + out_cols, acc.to(output_ptr.dtype.element_ty),
+             mask=mask)
 
 
-def moe_indexed_topk_sum_triton(src: torch.Tensor, rows: torch.Tensor, weight: torch.Tensor, output: torch.Tensor) -> None:
+def moe_indexed_topk_sum_triton(src: torch.Tensor, rows: torch.Tensor, weight: torch.Tensor,
+                                output: torch.Tensor) -> None:
     """``src [T * top_k, D]`` contiguous, ``rows [T, top_k]`` int32, ``weight [T, top_k]`` fp32; ``output`` as
     for :func:`moe_sum_reduce_triton` (``[T, D]`` or a column-chunked ``[T, chunks, D / chunks]`` view)."""
     assert src.is_contiguous() and rows.is_contiguous() and weight.is_contiguous()
@@ -471,7 +473,8 @@ def moe_indexed_topk_sum_triton(src: torch.Tensor, rows: torch.Tensor, weight: t
     assert weight.shape == (token_num, top_k) and weight.dtype == torch.float32
     hidden_dim = src.shape[1]
     if output.dim() == 3:
-        assert output.shape[0] == token_num and output.shape[1] * output.shape[2] == hidden_dim and output.stride(2) == 1
+        assert output.shape[0] == token_num and output.shape[1] * output.shape[2] == hidden_dim
+        assert output.stride(2) == 1
         chunk_dim, stride_chunk = output.shape[2], output.stride(1)
     else:
         assert output.shape == (token_num, hidden_dim) and output.stride(1) == 1
