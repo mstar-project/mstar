@@ -2892,7 +2892,8 @@ class Worker:
                 parts.append(f"{name}: p50={p50:.2f}ms p95={p95:.2f}ms mean={mean:.2f}ms n={n}")
             if self.scheduler.mixed_steps:
                 parts.append(
-                    f"mixed steps: {self.scheduler.mixed_steps} carrying {self.scheduler.mixed_rows} rows of another walk"
+                    f"mixed steps: {self.scheduler.mixed_steps} carrying "
+                    f"{self.scheduler.mixed_rows} rows of another walk"
                 )
             logger.info(
                 "Worker %s phase-timing iter=%d: %s",
