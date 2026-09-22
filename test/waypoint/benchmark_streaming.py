@@ -404,7 +404,7 @@ def _run_concurrent_wave(
                 enable_nvtx=enable_nvtx,
                 start_barrier=barrier,
             )
-            for request_id, seed in zip(request_ids, seeds)
+            for request_id, seed in zip(request_ids, seeds, strict=True)
         ]
         barrier.wait(timeout=30)
         wave_start = time.perf_counter()
@@ -529,7 +529,7 @@ def _concurrent_server_metrics(log_text: str, request_ids: set[str], startup_sec
         histogram[len(batch)] = histogram.get(len(batch), 0) + 1
 
     timestamps = sorted(_dit_step_timestamps(log_text, request_ids))
-    spacing_ms = [(later - earlier) * 1000.0 for earlier, later in zip(timestamps, timestamps[1:])]
+    spacing_ms = [(later - earlier) * 1000.0 for earlier, later in zip(timestamps, timestamps[1:], strict=False)]
     return {
         "rows_per_step_histogram": histogram,
         "step_spacing_ms": {"p50": _percentile(spacing_ms, 0.50), "p95": _percentile(spacing_ms, 0.95)},
@@ -577,7 +577,7 @@ def _run_concurrent_phase(
         stall_threshold_seconds=stall_threshold_seconds,
         enable_nvtx=enable_nvtx,
     )
-    for request_id, (_, stream_failures) in zip(warmup_ids, warmup_results):
+    for request_id, (_, stream_failures) in zip(warmup_ids, warmup_results, strict=True):
         failures.extend(f"concurrent-warmup {request_id}: {failure}" for failure in stream_failures)
     rollout._wait_for_cleanup(log_path, tuple(warmup_ids), proc, request_timeout)
 
@@ -597,7 +597,7 @@ def _run_concurrent_phase(
         enable_nvtx=enable_nvtx,
     )
     per_stream = []
-    for request_id, (metrics, stream_failures) in zip(measured_ids, measured_results):
+    for request_id, (metrics, stream_failures) in zip(measured_ids, measured_results, strict=True):
         failures.extend(f"concurrent-measured {request_id}: {failure}" for failure in stream_failures)
         per_stream.append(metrics)
     rollout._wait_for_cleanup(log_path, tuple(measured_ids), proc, request_timeout, offset=log_offset)
@@ -664,7 +664,7 @@ def _human_summary(result: dict, artifact: Path) -> str:
             f"(worlds={concurrent['worlds']} batch={concurrent['batch']})"
         )
         for idx, (stream, realtime) in enumerate(
-            zip(concurrent["per_stream"], concurrent["realtime_per_stream"])
+            zip(concurrent["per_stream"], concurrent["realtime_per_stream"], strict=True)
         ):
             gaps = stream["inter_chunk_gap_seconds"]
             lines.append(

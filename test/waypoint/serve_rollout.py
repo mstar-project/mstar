@@ -277,12 +277,11 @@ def _pixel_diff_summary(actual: bytes, expected: bytes, chunk_size: int) -> str:
         return f"length mismatch: actual={len(actual)} bytes, expected={len(expected)} bytes"
     max_abs_diff = 0
     num_differing = 0
-    for a, b in zip(actual, expected):
+    for a, b in zip(actual, expected, strict=True):
         diff = a - b if a > b else b - a
         if diff:
             num_differing += 1
-            if diff > max_abs_diff:
-                max_abs_diff = diff
+            max_abs_diff = max(max_abs_diff, diff)
     num_chunks = len(actual) // chunk_size
     chunks_differing = sum(
         1

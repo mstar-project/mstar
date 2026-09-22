@@ -373,7 +373,7 @@ class FlexAttentionManager(AttentionManager):
         plan: RingPlan,
     ) -> None:
         counts, indices, period = self._visibility_table_for(geometry)
-        for b, (w, f) in enumerate(zip(plan.session_idx, plan.frame_pos)):
+        for b, (w, f) in enumerate(zip(plan.session_idx, plan.frame_pos, strict=True)):
             phase = f if f < period else period + f % period
             mask.full_kv_num_blocks[b].copy_(counts[w, phase])
             mask.full_kv_indices[b].copy_(indices[w, phase])
