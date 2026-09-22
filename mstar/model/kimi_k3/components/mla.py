@@ -21,8 +21,8 @@ from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import ColumnParallelLinear, RowParallelLinear
 from mstar.model.components.distributed.merged_linear import COLUMN, REPLICATED, MergedParallelLinear
 from mstar.model.kimi_k3.components.common import KimiRMSNorm, fused_decode_kernels
-from mstar.utils.streams import Fork
 from mstar.model.kimi_k3.components.mla_out_kernel import mla_out
+from mstar.utils.streams import Fork
 
 # rows up to which the one-launch output kernel beats the einsum path (bench/kernels/mla_out_crossover.py)
 MLA_OUT_MAX_ROWS = 32
