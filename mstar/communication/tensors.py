@@ -545,8 +545,8 @@ class TensorCommunicationManager(ABC):
                 if info.uuid in actual_counts:
                     actual_counts[info.uuid] += 1
 
-        for uuid, count in actual_counts.items():
-            delta = count - 1  # subtract the safety hold of 1
+        for uuid, seen in actual_counts.items():
+            delta = seen - 1  # subtract the safety hold of 1
             if delta > 0:
                 self.tensor_store.increment_ref(request_id, uuid, n=delta)
             elif delta < 0:
