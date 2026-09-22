@@ -9,8 +9,6 @@ from typing import Any, Callable, Mapping
 
 import torch
 
-from mstar.utils.coalesce import clone_coalesced
-
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
@@ -45,6 +43,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
 )
 from mstar.profile.worker import ExecTimings
+from mstar.utils.coalesce import clone_coalesced
 from mstar.utils.profiler import mark, range_pop, range_push
 
 logger = logging.getLogger(__name__)
