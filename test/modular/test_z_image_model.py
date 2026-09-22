@@ -59,6 +59,12 @@ def test_graph_structure():
     for wg in model.get_worker_graphs(CONFIG_PATH):
         walks_seen |= wg.graph_walks
     assert walks_seen == {ENCODE_TEXT_WALK, IMAGE_GEN_WALK}
+    assert not text.enable_async_scheduling and not loop.section.enable_async_scheduling
+    assert not decoder.enable_async_scheduling  # lockstep by default
+    fast = _make_model(async_scheduling=True).get_graph_walk_graphs()
+    fast_loop, fast_decoder = fast[IMAGE_GEN_WALK].sections
+    assert fast[ENCODE_TEXT_WALK].enable_async_scheduling and fast_loop.section.enable_async_scheduling
+    assert fast_decoder.enable_async_scheduling
 
 
 def test_resources_and_dummy_mode():
