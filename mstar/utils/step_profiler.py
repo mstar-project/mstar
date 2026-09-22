@@ -78,7 +78,8 @@ class StepProfiler:
             acts = [torch.profiler.ProfilerActivity.CPU]
             if torch.cuda.is_available():
                 acts.append(torch.profiler.ProfilerActivity.CUDA)
-            self._prof = torch.profiler.profile(activities=acts, with_stack=self.with_stack, record_shapes=self.with_stack)
+            self._prof = torch.profiler.profile(activities=acts, with_stack=self.with_stack,
+                                                record_shapes=self.with_stack)
             self._prof.__enter__()
             self._profiled, self._batch_sizes, self._bs = 0, [], bs
             logger.info("%s: profiling %d %s steps from step %d%s", self.tag, count, self.graph_walk, seen,
@@ -117,8 +118,10 @@ class StepProfiler:
                 launches += ev.count
         table = prof.key_averages().table(sort_by="cuda_time_total" if torch.cuda.is_available() else "cpu_time_total",
                                           row_limit=45)
-        bs = f"batch sizes {min(self._batch_sizes)}..{max(self._batch_sizes)}" if self._batch_sizes else "batch sizes unknown"
-        logger.info("%s: window %d: %d %s steps profiled (%s): %.3f ms of CUDA time and %.1f kernel launches per step\n%s",
+        bs = (f"batch sizes {min(self._batch_sizes)}..{max(self._batch_sizes)}" if self._batch_sizes
+              else "batch sizes unknown")
+        logger.info("%s: window %d: %d %s steps profiled (%s): %.3f ms of CUDA time and %.1f kernel launches "
+                    "per step\n%s",
                     self.tag, self._window + 1, n, self.graph_walk, bs, cuda_us / n / 1000.0, launches / n, table)
         try:
             os.makedirs(self.out_dir, exist_ok=True)
