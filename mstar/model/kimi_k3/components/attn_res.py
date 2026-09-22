@@ -61,7 +61,8 @@ class AttnResRead(nn.Module):
         ):
             from mstar.model.kimi_k3.components.attn_res_kernel import attn_res_add_read_triton, attn_res_read_triton
 
-            norm_kw = {} if out_norm is None else dict(out_norm_weight=out_norm.weight, out_eps=out_norm.variance_epsilon)
+            norm_kw = {} if out_norm is None else dict(out_norm_weight=out_norm.weight,
+                                                       out_eps=out_norm.variance_epsilon)
             if add is not None:
                 return attn_res_add_read_triton(prefix, add, blocks, self.score_weight(), self.eps, **norm_kw)
             return attn_res_read_triton(prefix, blocks, self.score_weight(), self.eps, **norm_kw), prefix
