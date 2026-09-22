@@ -12,6 +12,7 @@ room for that.
 from mstar.model.components.attention import Attention, CrossAttention
 from mstar.model.components.decoder_layer import DecoderLayer, GatedDecoderLayer
 from mstar.model.components.linear import FusedColumnLinear
+from mstar.model.components.linear_attn import GatedDeltaNet, GDNProjLayout
 from mstar.model.components.mlp import MLP, FusedGatedMLP, GatedMLP
 from mstar.model.components.moe import (
     ParallelSparseMoeBlock,
@@ -21,7 +22,7 @@ from mstar.model.components.moe import (
     TopKRouter,
     dispatch_experts_fused,
 )
-from mstar.model.components.norm import AdaRMSNorm, RMSNorm
+from mstar.model.components.norm import AdaRMSNorm, RMSNorm, RMSNormGated
 
 __all__ = [
         "Attention",
@@ -39,5 +40,8 @@ __all__ = [
     "TopKRouter",
     "dispatch_experts_fused",
     "AdaRMSNorm",
+    "GDNProjLayout",
+    "GatedDeltaNet",
+    "RMSNormGated",
     "RMSNorm",
 ]

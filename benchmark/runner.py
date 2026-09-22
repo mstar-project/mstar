@@ -522,6 +522,8 @@ def parse_args() -> BenchmarkConfig:
     # "default" uses the BAGEL-codebase transforms.
     parser.add_argument("--bagel-image-preprocess", choices=["default", "vllm"], default="vllm")
 
+    parser.add_argument("--model-id", type=str, default=None)
+
     # VBench args
     vbench = parser.add_argument_group("vbench")
     vbench.add_argument(
@@ -651,10 +653,18 @@ def parse_args() -> BenchmarkConfig:
     # disable_cfg is Bagel-specific; only pass it when the target model accepts
     # it so robotics models (Pi05, VJepa2AC) don't see a stray kwarg.
     model_type = ModelType(args.model)
+    # `--model-id` is what the request names, so a size other than the family's
+    # default (e.g. Qwen3.5-9B) reaches the server. Only Qwen3.5 is a family of
+    # sizes today; the rest pin one checkpoint and their constructors take no
+    # such argument, so passing it would be a TypeError rather than a no-op.
+    extra = (
+        {"model_id": args.model_id}
+        if args.model_id and model_type == ModelType.QWEN3_5 else {}
+    )
     if model_type == ModelType.BAGEL:
         model = model_type.inst(disable_cfg=args.disable_cfg, image_preprocess=args.bagel_image_preprocess)
     else:
-        model = model_type.inst()
+        model = model_type.inst(**extra)
 
     return BenchmarkConfig(
         url=args.url,

@@ -64,6 +64,17 @@ HF_MODELS: dict[str, dict] = {
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
 }
 
+# qwen 3.5 family: dense (MoE TODO)
+qwen_3_5_dense_sizes = ("0.8", "2", "4", "9", "27")
+MODEL_REGISTRY.update({
+    f"qwen3_5_{size}b": ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel") \
+        for size in qwen_3_5_dense_sizes
+})
+HF_MODELS.update({
+    f"qwen3_5_{size}b": {"model_path_hf": f"Qwen/Qwen3.5-{size}B"} \
+        for size in qwen_3_5_dense_sizes
+})
+
 
 def get_model_class(name: str) -> type[Model]:
     if name not in MODEL_REGISTRY:

@@ -81,7 +81,7 @@ dynamo = [
 
 bagel = [
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",
@@ -118,7 +118,7 @@ cosmos3 = [
     # build; on a mismatch the engine logs a warning and falls back to the
     # paged flashinfer backend. See docs/models.rst.
     "fa3-fwd",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",
@@ -133,7 +133,7 @@ qwen3_omni = [
     # prebuilt wheels aren't on PyPI, so a plain install compiles from source
     # (and fails on CUDA 13). Install it separately; see docs/installation.rst.
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",
@@ -150,7 +150,7 @@ qwen3_omni = [
 
 qwen3_tts = [
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "qwen-tts==0.1.1",
@@ -160,7 +160,7 @@ qwen3_tts = [
 
 orpheus = [
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -168,7 +168,7 @@ orpheus = [
 ]
 
 pi05 = [
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -199,7 +199,7 @@ wan22 = [
 ]
 
 vjepa2_ac = [
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -209,7 +209,7 @@ vjepa2_ac = [
 # ASR models: Whisper-large-v3, Higgs Audio
 asr = [
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -227,7 +227,7 @@ all = [
     "diffusers>=0.39",
     "fa3-fwd",
     "einops",
-    "flashinfer-python>=0.6.4",
+    "flashinfer-python>=0.6.14",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "Pillow",
@@ -303,6 +303,8 @@ ignore = [
 "test/modular/test_phase1.py" = ["E402"]
 # Imports are deliberately placed after module-level pytest.importorskip().
 "test/rust/*.py" = ["E402"]
+# Vendored from vLLM and kept diffable against upstream; see its docstring.
+"mstar/utils/causal_conv1d/kernels.py" = ["B007", "F841", "PLR5501"]
 
 [tool.ruff.format]
 quote-style = "double"
