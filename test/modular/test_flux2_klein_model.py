@@ -424,6 +424,10 @@ def test_image_nodes_schedule_in_lockstep():
         collect(section)
     assert set(nodes) == {"text_encoder", "vae_encoder", "dit", "vae_decoder"}
     assert {name: node.enable_async_scheduling for name, node in nodes.items()} == dict.fromkeys(nodes, False)
+    nodes.clear()
+    for section in _make_model(async_scheduling=True).get_graph_walk_graphs().values():
+        collect(section)  # the knob flips every image node to speculative scheduling
+    assert {name: node.enable_async_scheduling for name, node in nodes.items()} == dict.fromkeys(nodes, True)
 
 
 def test_vae_compile_knob_reaches_the_decoder_node():
