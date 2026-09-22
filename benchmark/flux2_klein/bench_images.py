@@ -120,6 +120,8 @@ def _body(args, prompt: str, seed: int) -> dict:
         body["guidance_scale"] = args.guidance
     if args.output_format:
         body["output_format"] = args.output_format
+    if args.extra_json:
+        body.update(json.loads(args.extra_json))
     return body
 
 
@@ -226,6 +228,8 @@ def main():
     ap.add_argument("--output-format", default=None, choices=[None, "png", "jpeg", "webp"],
                     help="request this output_format (servers default differently: SGLang to JPEG, others to PNG)")
     ap.add_argument("--seed", type=int, default=0, help="request i uses seed + i")
+    ap.add_argument("--extra-json", default="",
+                    help='extra request fields as JSON, e.g. \'{"png_compress_level": 0}\'')
     ap.add_argument("--n", type=int, default=20, help="measured requests (latency) / images per concurrency level")
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--concurrency", type=int, nargs="+", default=[4, 8, 16])
@@ -248,7 +252,7 @@ def main():
     result.update({
         "tag": args.tag, "url": url, "model": args.model, "size": args.size, "steps": args.steps,
         "guidance": args.guidance, "seed": args.seed, "prompts_file": args.prompts, "num_prompts": len(prompts),
-        "output_format": args.output_format,
+        "output_format": args.output_format, "extra_json": args.extra_json or None,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     })
     if args.out:
