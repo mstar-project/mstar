@@ -9,6 +9,7 @@ uv.lock
 *.sqlite
 *.prof
 *.json
+!test/command_a_plus/fixtures/tiny_config.json
 profiler/
 traces/
 

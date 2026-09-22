@@ -1,3 +1,5 @@
+from collections.abc import Iterable
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -219,3 +221,37 @@ class CommandAPlusLanguageModel(nn.Module):
             layer.self_attn.attend.set_layer_idx(layer_idx)
             query_sequence = layer(query_sequence)
         return self.norm(query_sequence)
+
+
+class CommandAPlusForCausalLM(nn.Module):
+    def __init__(
+        self,
+        config: CommandAPlusTextConfig,
+        comm_group: CommGroup | None = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.model = CommandAPlusLanguageModel(config, comm_group)
+        self.logit_scale = config.logit_scale
+
+    def forward(
+        self,
+        query_sequence: torch.Tensor,
+        *,
+        label: str,
+    ) -> torch.Tensor:
+        return self.model(query_sequence, label=label)
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        # [T, H] @ [V / tp, H].T -> [T, V / tp]
+        local_logits = F.linear(hidden_states, self.model.embed_tokens.weight)
+        logits = self.model.comm_group.all_gather(local_logits, dim=-1)
+        return logits * self.logit_scale
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from mstar.model.command_a_plus.weight_loading import load_command_a_plus_weights
+
+        return load_command_a_plus_weights(self, weights, config=self.config)
