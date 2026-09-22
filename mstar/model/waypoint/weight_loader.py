@@ -1,54 +1,13 @@
-"""Weight loading for the native Waypoint-1.5-1B DiT (mstar loader pattern).
+"""Weight loading for the native Waypoint DiT (mstar loader pattern).
 
-``build_waypoint_dit`` constructs ``WaypointDiT`` on meta, casts it to the serving
-dtypes while still on meta (so ``to_empty`` allocates storage in the final
-dtypes), moves it to the device, **re-ties ``cond_proj``**, then streams the
-safetensors shards through ``load_weights_into``.
-
-``retie_cond_proj()`` must follow ``to_empty``; skipping it leaves 23 blocks of
-``cond_proj`` this loader never fills.
-
-The key map. Thirteen transforms sit between the checkpoint's 393 keys and this
-module's 174 parameters:
-
-===  ==============================================================  ===========
-T0   ``transformer.blocks.{i}.`` -> ``blocks.{i}.``                  prefix
-T1   ``unpatchify.weight`` ``[D,C,ph,pw]`` -> ``[C*ph*pw,D]``        reshape
-T2   ``unpatchify.bias`` ``[C]`` -> ``[C*ph*pw]``                    reshape
-T3   ``dit_mlp.{leaf}`` -> ``mlp.{leaf}``, 5-name allowlist          rename
-T4   ``{attn,mlp}_cond_head.bias_in`` -> ``cond_head.bias_in``       merge
-T5   ``attn_cond_head.cond_proj.{j}`` -> ``cond_head..{j}``          rename
-T6   ``mlp_cond_head.cond_proj.{j}`` -> ``cond_head..{j+3}``         rename
-T7   ``ctrl_mlpfusion.fc1_{x,c}`` -> ``ctrl_mlpfusion.mlp.fc1``      fuse dim 1
-T8   ``ctrl_mlpfusion.fc2`` -> ``ctrl_mlpfusion.mlp.fc2``            rename
-T9   ``cond_head.cond_proj.*`` for blocks 1..23                      drop
-T10  ``ctrl_cfg.null_emb``                                           drop
-T11  ``attn.{q,k,v}_proj`` -> ``attn.qkv_proj``                      fuse dim 0
-T12  any ``.cond_heads.`` key (note the plural)                      drop
-===  ==============================================================  ===========
-
-T0's source spelling is the reference's two-level ``WorldModel``/``WorldDiT``
-split, which ``components/dit.py`` collapses. Both spellings are accepted, as
-are the canonical post-transform spellings the reference's own
-``pop``/``setdefault`` transforms tolerate; which the shipped file uses could not
-be established statically.
-
-Three things mstar's machinery does not give you. The fusions need a fan-in and
-``name_remapper`` is ``str -> str|None``, so both go through ``StackedParamRule``
-with a ``_SliceShardLoader`` attached after ``to_empty``. ``load_weights_into``
-returns *target* names and q/k/v share one target, so the remapper tallies
-``(target, shard_id)`` pairs. T1/T2 have no reshape hook, so they ride an adapter
-over the shard iterator, which is also where the transcribed config facts
-(``n_kv_heads``, ``patch``) are checked against the shapes on disk.
-
-Completeness is a hard contract: a key that reaches no parameter, a parameter no
-key reached, a fused shard that never arrived, or two keys writing one slot all
-raise. Explicitly dropped keys (T9/T10/T12) are expected and silent.
-
-The unconditional drops (T10/T12) run **before** the shape validation, because a
-``.cond_heads.`` key ending in ``.k_proj.weight`` is a T12 drop and not a GQA
-violation. T9's per-block ``cond_proj`` drop is not in that pre-filter: those
-keys are what ``_CondProjTieCheck`` compares.
+``build_waypoint_dit`` builds ``WaypointDiT`` on meta, casts it to the
+serving dtypes, materializes it on the device, re-ties ``cond_proj`` (must
+follow ``to_empty``, which un-aliases it), then streams the safetensors
+shards through ``load_weights_into`` via ``remap_checkpoint_key``. The
+fused q/k/v and MLP-fusion projections route through
+``WAYPOINT_STACKED_PARAMS`` instead, since a name remapper can't express a
+fan-in. Loading is a completeness contract: any unexpected, missing, or
+duplicate-claimed key raises.
 """
 
 from __future__ import annotations
@@ -77,20 +36,16 @@ __all__ = [
 ]
 
 
-# Which block's cond_proj set is the physical one. Not a knob: it records that
-# WaypointDiT.retie_cond_proj hardcodes self.blocks[0], so any other value turns
-# the six kept keys into unexpected-key failures and leaves the six real
-# parameters unloaded. _assert_cond_proj_tied checks the tree still agrees.
+# Which block's cond_proj is physical; must match WaypointDiT.retie_cond_proj's
+# hardcoded blocks[0], or loading fails. _assert_cond_proj_tied checks this.
 COND_PROJ_SOURCE_BLOCK = 0
 
 # Slot ids for the two port-side fusions. Order defines the layout.
 QKV_SHARD_IDS: tuple[str, ...] = ("q", "k", "v")
 CTRL_FC1_SHARD_IDS: tuple[str, ...] = ("x", "c")
 
-# Fused-shard routing. The leading dots matter: without them ".v_proj" would
-# also match inside "qkv_proj". Not LLAMA_STACKED_PARAMS, whose extra
-# gate_proj/up_proj rules would be live substring matchers for parameters
-# Waypoint does not have.
+# Fused-shard routing; leading dots matter so ".v_proj" doesn't also match
+# inside "qkv_proj".
 WAYPOINT_STACKED_PARAMS: list[StackedParamRule] = [
     StackedParamRule(".qkv_proj", ".q_proj", "q"),
     StackedParamRule(".qkv_proj", ".k_proj", "k"),
@@ -102,17 +57,17 @@ WAYPOINT_STACKED_PARAMS: list[StackedParamRule] = [
 # The port's block prefix (``components/dit.py`` collapses WorldModel/WorldDiT).
 MODEL_BLOCK_PREFIX = "blocks."
 
-# ``transformer.`` optional: T0. Accepts the reference's two-level spelling and
-# the collapsed one.
+# ``transformer.`` prefix is optional: accepts both the reference's two-level
+# spelling and the collapsed one.
 _BLOCK_RE = re.compile(r"^(?:transformer\.)?blocks\.(\d+)\.(.+)$")
 # Legacy half-heads. j is range(3) on both sides; a j >= 3 is malformed and is
 # left unmapped so it surfaces as unexpected.
 _LEGACY_COND_PROJ_RE = re.compile(r"^(attn|mlp)_cond_head\.cond_proj\.(\d+)\.weight$")
 _COND_PROJ_RE = re.compile(r"^cond_head\.cond_proj\.(\d+)\.weight$")
 
-# T3 is an allowlist, not a dit_mlp.* wildcard, so a future dit_mlp.* key
-# surfaces instead of being absorbed. expert_*/router do not exist under
-# moe=False; they are listed because the reference renames them.
+# Allowlist, not a dit_mlp.* wildcard, so an unrecognized dit_mlp.* key
+# surfaces as unexpected. expert_*/router don't exist under moe=False but
+# are listed since the reference renames them.
 _DIT_MLP_LEAVES: tuple[str, ...] = (
     "fc1.weight",
     "fc2.weight",
@@ -121,56 +76,47 @@ _DIT_MLP_LEAVES: tuple[str, ...] = (
     "router.weight",
 )
 
-# T10. CFG.forward is a training-time dropout with no call site in the
-# reference's WorldModel.forward, so the port has no tensor for it. Dropped
-# explicitly rather than left unmatched, so unexpected-key accounting keeps
-# no hole.
+# CFG dropout is training-time only; the port has no tensor for it, so this
+# key is dropped explicitly rather than left to surface as unexpected.
 _DROPPED_TOP_LEVEL_KEYS = frozenset({"ctrl_cfg.null_emb"})
 
-# T12. Substring filter, unconditional, note the plural.
+# Substring filter, unconditional; note the plural ("cond_heads").
 _COND_HEADS_FRAGMENT = ".cond_heads."
 
 # Half the CondHead slots come from each legacy half-head.
 _COND_PROJ_PER_HEAD = CondHead.n_cond // 2
 
-# T4 precedence over the three spellings that share cond_head.bias_in, lowest
-# first, highest wins — the reference's pop/setdefault outcome: mlp beats attn,
-# canonical beats both. The attn spelling is a FALLBACK, not a drop; which of the
-# two the shipped file carries is unestablished, and dropping it unconditionally
-# would leave 24 unloaded bias_in on an attn-only file.
-#
-# A rank rather than last-write-wins because this loader streams: the three
-# spellings can arrive in any shard order and the resident weight must not depend
-# on it. Arbitration lives in build_waypoint_dit, which sees every key.
+# Precedence order for the three spellings sharing cond_head.bias_in, lowest
+# first: mlp beats attn, canonical beats both (matches the reference's
+# pop/setdefault outcome). Rank rather than last-write-wins because shards can
+# arrive in any order; arbitration lives in build_waypoint_dit.
 _BIAS_IN_SPELLINGS: tuple[str, ...] = (
     "attn_cond_head.bias_in",
     "mlp_cond_head.bias_in",
     "cond_head.bias_in",
 )
 
-# Reference init for the value-residual scalar, used by the no-checkpoint path.
+# Reference init for the value-residual scalar (no-checkpoint path only).
 _V_LAMB_INIT = 0.5
-# Weight init std for the no-checkpoint path. Not a checkpoint fact; it only has
-# to produce finite, sanely scaled activations for a structural smoke test.
+# Weight init std for the no-checkpoint structural smoke-test path.
 _STRUCTURAL_INIT_STD = 0.02
 
 
 # --------------------------------------------------------------------------
-# Name remapping (T0, T3-T6, T8-T12)
+# Name remapping
 # --------------------------------------------------------------------------
 
 
 def _remap_block_suffix(suffix: str, layer_idx: int) -> str | None:
     """Map one per-block checkpoint suffix to its parameter suffix, or ``None``
     to drop it. ``suffix`` excludes the ``blocks.{i}.`` prefix."""
-    # T4: both legacy spellings map to the one target; rank in build_waypoint_dit
+    # Both legacy spellings map to the one target; rank in build_waypoint_dit
     # decides which of the three writes.
     if suffix in ("attn_cond_head.bias_in", "mlp_cond_head.bias_in"):
         suffix = "cond_head.bias_in"
 
-    # T5/T6: identity index map for the attn head, +3 for the mlp head. Slots
-    # 0-2 drive the attention sublayer and 3-5 the MLP sublayer; swapping them
-    # is silent and numerically catastrophic.
+    # Identity index map for the attn head, +3 for the mlp head. Slots 0-2
+    # drive attention, 3-5 drive MLP; swapping them is silent and catastrophic.
     legacy = _LEGACY_COND_PROJ_RE.match(suffix)
     if legacy is not None:
         head, j = legacy.group(1), int(legacy.group(2))
@@ -178,40 +124,39 @@ def _remap_block_suffix(suffix: str, layer_idx: int) -> str | None:
             slot = j if head == "attn" else j + _COND_PROJ_PER_HEAD
             suffix = f"cond_head.cond_proj.{slot}.weight"
 
-    # T3.
     for leaf in _DIT_MLP_LEAVES:
         if suffix == "dit_mlp." + leaf:
             suffix = "mlp." + leaf
             break
 
-    # T8. Guarded on fc2 alone, separately from T7's both-halves guard.
+    # Guarded on fc2 alone, separately from the fc1 fusion's both-halves guard.
     if suffix == "ctrl_mlpfusion.fc2.weight":
         suffix = "ctrl_mlpfusion.mlp.fc2.weight"
 
-    # T9. Runs last, on the post-T5/T6 name, so it catches both the legacy
+    # Runs last, on the post-remap name, so it catches both the legacy
     # half-head spellings and an already-canonical one.
     if _COND_PROJ_RE.match(suffix) is not None and layer_idx != COND_PROJ_SOURCE_BLOCK:
         return None
 
-    # T7 (fc1_x/fc1_c) and T11 (q/k/v_proj) are left alone: fan-ins, which a
-    # remapper cannot express. WAYPOINT_STACKED_PARAMS routes them.
+    # fc1_x/fc1_c and q/k/v_proj are left alone: fan-ins a remapper can't
+    # express. WAYPOINT_STACKED_PARAMS routes them instead.
     return suffix
 
 
 def _is_unconditionally_dropped(name: str) -> bool:
-    """T12 and T10 — the drops that depend on nothing but the key.
+    """Drops that depend on nothing but the key name.
 
     One predicate, two call sites, so the shard adapter's pre-filter and the
-    remapper cannot drift apart. T9 is not here even though it is also a drop:
-    those 138 keys are what ``_CondProjTieCheck`` has to see, so they survive the
-    stream filter and are dropped later, in the remapper.
+    remapper can't drift apart. The per-block cond_proj drop is not here:
+    those keys must survive to reach ``_CondProjTieCheck`` and are dropped
+    later, in the remapper.
     """
     return _COND_HEADS_FRAGMENT in name or name in _DROPPED_TOP_LEVEL_KEYS
 
 
 def _bias_in_rank(name: str) -> int | None:
-    """T4 precedence rank of a per-block ``bias_in`` key, or ``None`` if the key
-    is not one. Higher wins; see ``_BIAS_IN_SPELLINGS``."""
+    """Precedence rank of a per-block ``bias_in`` key, or ``None`` if not one.
+    Higher wins; see ``_BIAS_IN_SPELLINGS``."""
     block = _BLOCK_RE.match(name)
     if block is None:
         return None
@@ -222,49 +167,43 @@ def _bias_in_rank(name: str) -> int | None:
 
 
 def remap_checkpoint_key(name: str) -> str | None:
-    """Map one Waypoint checkpoint key to the native parameter path, or return
-    ``None`` for a key that is intentionally dropped (T9/T10/T12).
+    """Map one Waypoint checkpoint key to the native parameter path, or
+    ``None`` for a key that's intentionally dropped.
 
-    Pure function of the key — no model, no config; a key mapped to a name that
-    is not a parameter is the caller's problem.
-
-    Not injective in exactly one place: all three T4 ``bias_in`` spellings map to
-    ``blocks.{i}.cond_head.bias_in``, and picking a winner needs the whole key
-    set, so ``build_waypoint_dit`` settles it. Everywhere else a second key
-    resolving to a claimed slot is a hard error.
+    Pure function of the key — no model, no config. Not injective in one
+    place: all three ``bias_in`` spellings map to
+    ``blocks.{i}.cond_head.bias_in``, and ``build_waypoint_dit`` picks the
+    winner since that needs the whole key set.
     """
-    if _is_unconditionally_dropped(name):  # T10/T12
+    if _is_unconditionally_dropped(name):
         return None
 
     block = _BLOCK_RE.match(name)
     if block is None:
-        # Top-level keys are identity: denoise_step_emb.mlp.{fc1,fc2}.weight,
-        # ctrl_emb.mlp.{fc1,fc2}.weight, patchify.weight, unpatchify.{weight,bias},
-        # out_norm.fc.weight.
+        # Top-level keys (patchify, unpatchify, denoise_step_emb, ctrl_emb,
+        # out_norm) pass through unchanged.
         return name
 
     layer_idx, suffix = int(block.group(1)), block.group(2)
     mapped = _remap_block_suffix(suffix, layer_idx)
     if mapped is None:
         return None
-    # T0.
     return f"{MODEL_BLOCK_PREFIX}{layer_idx}.{mapped}"
 
 
 # --------------------------------------------------------------------------
-# Tensor transforms and shape validation (T1, T2) over the shard stream
+# Tensor transforms and shape validation over the shard stream
 # --------------------------------------------------------------------------
 
 
 def _unpatchify_weight(tensor: torch.Tensor, config: WaypointConfig, key: str) -> torch.Tensor:
-    """T1. ``[D, C, ph, pw]`` conv kernel -> ``[C*ph*pw, D]`` Linear weight.
+    """``[D, C, ph, pw]`` conv kernel -> ``[C*ph*pw, D]`` Linear weight.
 
-    ``permute(1, 2, 3, 0)`` then ``reshape``: the Linear's output feature axis is
-    ordered ``(c, ph, pw)`` with pw fastest, because ``WaypointDiT.forward``
-    unpacks it as ``view(B, N, Hp, Wp, C, ph, pw)``. Dropping the permute, or
-    transposing ph/pw inside it, keeps the shape and silently reprojects every
-    output sub-pixel. ``reshape``, not ``view`` — the permuted tensor is not
-    contiguous.
+    ``permute(1, 2, 3, 0)`` then ``reshape``: the output feature axis must be
+    ordered ``(c, ph, pw)`` with pw fastest to match ``WaypointDiT.forward``'s
+    ``view(B, N, Hp, Wp, C, ph, pw)``. Dropping the permute, or swapping
+    ph/pw, keeps the shape but silently reprojects every output sub-pixel.
+    ``reshape``, not ``view``: the permuted tensor isn't contiguous.
     """
     ph, pw = config.patch
     if tensor.ndim == 4:
@@ -283,7 +222,7 @@ def _unpatchify_weight(tensor: torch.Tensor, config: WaypointConfig, key: str) -
         return tensor.permute(1, 2, 3, 0).reshape(-1, d_model)
 
     # Already canonical (a checkpoint written post-transform). The reference's
-    # own ndim == 4 guard makes T1 idempotent the same way.
+    # own ndim == 4 guard makes this idempotent the same way.
     expected = (config.channels * ph * pw, config.d_model)
     if tuple(tensor.shape) != expected:
         raise RuntimeError(
@@ -295,13 +234,11 @@ def _unpatchify_weight(tensor: torch.Tensor, config: WaypointConfig, key: str) -
 
 
 def _unpatchify_bias(tensor: torch.Tensor, config: WaypointConfig, key: str) -> torch.Tensor:
-    """T2. One learned bias per latent channel, repeated across the patch.
+    """One learned bias per latent channel, repeated across the patch.
 
-    ``[C] -> [C,1,1] -> expand(-1, ph, pw) -> reshape(-1)``. The expand target is
-    ``(C, ph, pw)`` so the flatten agrees with T1's row ordering; a
-    ``repeat(ph*pw)`` produces the same ``[128]`` shape with the bias on the
-    wrong sub-pixel, which integrates into a slow colour drift over a rollout
-    rather than failing.
+    ``[C] -> [C,1,1] -> expand(-1, ph, pw) -> reshape(-1)``, matching the
+    weight's row ordering. ``repeat(ph*pw)`` produces the same shape but puts
+    the bias on the wrong sub-pixel — a silent numerical bug, not a crash.
     """
     ph, pw = config.patch
     if tensor.numel() == config.channels:
@@ -343,10 +280,9 @@ def _check_attn_proj(
 ) -> None:
     """Validate an unfused q/k/v projection against the config's head counts.
 
-    This is the check that pins ``n_kv_heads``. It is worth doing explicitly even
-    though ``_SliceShardLoader`` would also catch it: a wrong ``n_kv_heads``
-    reshapes attention without erroring anywhere downstream, and "shard 'k' shape
-    mismatch" does not tell a reader which config field to go look at.
+    Pins ``n_kv_heads`` explicitly: a wrong value silently reshapes attention
+    without erroring downstream, and a shard-shape-mismatch error wouldn't
+    say which config field to check.
     """
     if tensor.ndim != 2 or tuple(tensor.shape) != (rows, config.d_model):
         raise RuntimeError(
@@ -382,17 +318,13 @@ def _cond_proj_slot(key: str) -> tuple[int, int] | None:
 
 
 class _CondProjTieCheck:
-    """Confirms the checkpoint's 24 stored ``cond_proj`` sets agree before 23 of
-    them are dropped.
+    """Confirms the checkpoint's per-block ``cond_proj`` copies agree before
+    all but ``COND_PROJ_SOURCE_BLOCK``'s are dropped.
 
-    The port keeps ``COND_PROJ_SOURCE_BLOCK``'s copy; the reference keeps block
-    23's, because it loads all 24 into one shared tensor and the last write wins.
-    Nothing in the file or in either loader enforces that they match, so a
-    fine-tune that broke the tie would silently make the two serve different
-    video. Compares the matrices in full; whichever block arrives first for a
-    slot becomes that slot's reference, so the result does not depend on shard
-    ordering. Retains 6 x ``[2048, 2048]`` fp32 (96 MiB) for the load;
-    ``verify_cond_proj_tie=False`` is the escape hatch.
+    Nothing else enforces this, so a fine-tune that broke the tie would
+    silently make the port and reference serve different video. Compares
+    matrices in full, independent of shard order; ``verify_cond_proj_tie=False``
+    skips it.
     """
 
     def __init__(self) -> None:
@@ -404,8 +336,7 @@ class _CondProjTieCheck:
         if slot_info is None or tensor.ndim != 2:
             return
         block_idx, slot = slot_info
-        # fp32 on CPU: uniform, lossless from the checkpoint's bf16, and it keeps
-        # the retained set off the serving device.
+        # fp32 on CPU: uniform, lossless from bf16, and off the serving device.
         seen = tensor.detach().to(device="cpu", dtype=torch.float32)
         known = self._reference.get(slot)
         if known is None:
@@ -421,22 +352,19 @@ def _adapt_checkpoint_stream(
     config: WaypointConfig,
     tie_check: _CondProjTieCheck | None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Apply the two reshaping transforms and validate the transcribed config
+    """Apply the reshape transforms and validate the transcribed config
     facts, in one streaming pass over the shards.
 
-    T1/T2 live here rather than in the remapper because mstar has no reshape
-    hook: ``name_remapper`` sees names only, and ``weight_loader`` is per-target.
-
-    Drops run before validation: the checks fire on key *suffixes*, so a key
-    T12 drops unconditionally can still end in ``.k_proj.weight``
-    (``…blocks.0.cond_heads.0.k_proj.weight`` does) and a dropped key's shape is
-    not this model's business.
+    Lives here rather than in the remapper because mstar has no reshape
+    hook: ``name_remapper`` sees names only. Drops run before validation,
+    since a dropped key's shape (e.g. ``…cond_heads.0.k_proj.weight``) is not
+    this model's business.
     """
     q_rows = config.n_heads * config.d_head
     kv_rows = config.n_kv_heads * config.d_head
 
     for key, tensor in weights:
-        if _is_unconditionally_dropped(key):  # T10/T12, before anything reads a shape
+        if _is_unconditionally_dropped(key):  # before anything reads a shape
             continue
 
         # Order matters: "unpatchify.weight".endswith("patchify.weight") is True,
@@ -458,7 +386,7 @@ def _adapt_checkpoint_stream(
 
 
 # --------------------------------------------------------------------------
-# Fused-parameter shard loaders (T7, T11)
+# Fused-parameter shard loaders
 # --------------------------------------------------------------------------
 
 
@@ -466,10 +394,9 @@ class _SliceShardLoader:
     """``param.weight_loader`` for a port-side fused parameter.
 
     Copies one checkpoint shard into its slice of the fused tensor. Neither
-    fusion target is a ``FusedColumnLinear`` — both are plain ``nn.Linear`` — so
-    neither carries a loader, and ``default_weight_loader`` asserts
-    ``loaded_shard_id is None``. ``ctrl_mlpfusion`` also concatenates along dim 1
-    (the input-feature axis), which ``FusedColumnLinear`` does not do.
+    fusion target is a ``FusedColumnLinear`` (both are plain ``nn.Linear``),
+    so neither carries a loader and ``default_weight_loader`` won't accept a
+    shard id.
     """
 
     def __init__(self, param_name: str, dim: int, layout: dict[str, tuple[int, int]]):
@@ -484,9 +411,8 @@ class _SliceShardLoader:
         loaded_shard_id: str | int | None = None,
     ) -> None:
         if loaded_shard_id is None:
-            # A checkpoint already written in the fused spelling. Only reachable
-            # for ctrl_mlpfusion.mlp.fc1, whose fused form the reference also
-            # accepts; harmless and symmetric for qkv_proj.
+            # Checkpoint already in fused form; only reachable for
+            # ctrl_mlpfusion.mlp.fc1, which the reference also accepts fused.
             if tuple(param.data.shape) != tuple(loaded_weight.shape):
                 raise RuntimeError(
                     f"{self.param_name}: pre-fused checkpoint tensor has shape "
@@ -517,8 +443,8 @@ def _attach_shard_loaders(
     """Install ``_SliceShardLoader`` on every fused parameter and return
     ``{param_name: required shard ids}``.
 
-    MUST run after ``to_empty(device)``: that reallocates the Parameter objects
-    and drops attached attributes along with the meta storage — the same reason
+    Must run after ``to_empty(device)``, which reallocates the Parameter
+    objects and drops attached attributes — the same reason
     ``FusedColumnLinear`` re-attaches its loaders from ``_apply``.
     """
     q_rows = config.n_heads * config.d_head
@@ -528,8 +454,8 @@ def _attach_shard_loaders(
     fused: dict[str, tuple[str, ...]] = {}
     for name, param in dit.named_parameters():
         if name.endswith(".attn.qkv_proj.weight"):
-            # cat([q, k, v], dim=0), matching the split in components/attention.py.
-            # GQA makes the shards unequal, so a q/k swap raises but a k/v swap
+            # cat([q, k, v], dim=0), matching components/attention.py's split.
+            # GQA makes shards unequal: a q/k swap raises, but a k/v swap
             # loads cleanly and produces meaningless attention.
             dim, layout = 0, {
                 "q": (0, q_rows),
@@ -538,10 +464,9 @@ def _attach_shard_loaders(
             }
             expected_shape = (q_rows + 2 * kv_rows, d_model)
         elif name.endswith(".ctrl_mlpfusion.mlp.fc1.weight"):
-            # cat([fc1_x, fc1_c], dim=1) — x first. layers.MLPFusion splits it
-            # back with chunk(2, dim=1), whose low columns are the token half;
-            # the reverse order keeps the [2048, 4096] shape and applies
-            # controller conditioning to tokens and vice versa.
+            # cat([fc1_x, fc1_c], dim=1), x first — layers.MLPFusion splits it
+            # back with chunk(2, dim=1); swapping the order swaps which half
+            # gets token vs. controller conditioning.
             dim, layout = 1, {"x": (0, d_model), "c": (d_model, d_model)}
             expected_shape = (d_model, 2 * d_model)
         else:
@@ -567,11 +492,9 @@ def _attach_shard_loaders(
 def parameter_census(dit: WaypointDiT) -> tuple[int, int, int]:
     """``(deduplicated tensors, deduplicated numel, raw state_dict numel)``.
 
-    ``named_parameters()`` deduplicates aliased Parameters; ``state_dict()`` does
-    not, so the gap between the two counts is exactly the tied ``cond_proj``. For
-    the 720P checkpoint this is ``(174, 1_281_958_040, 1_860_771_992)``; counting
-    off the checkpoint gives 2,048 more in each, because that carries
-    ``ctrl_cfg.null_emb`` ``[1, 1, 2048]``, which the port drops (T10).
+    ``named_parameters()`` deduplicates aliased Parameters; ``state_dict()``
+    does not, so the gap between the two counts is exactly the tied
+    ``cond_proj``.
     """
     params = dict(dit.named_parameters())
     return (
@@ -584,12 +507,10 @@ def parameter_census(dit: WaypointDiT) -> tuple[int, int, int]:
 def _assert_cond_proj_tied(dit: WaypointDiT, config: WaypointConfig) -> None:
     """Fail if ``retie_cond_proj()`` did not take.
 
-    ``named_parameters()`` deduplicates aliased Parameters, so a correctly tied
-    model reports 6 ``cond_proj`` tensors and an un-tied one reports
-    ``6 * n_layers``. An un-tied model is otherwise silent: numerically correct,
-    0.6B parameters heavier, and visible only as 138 unloaded parameters. The
-    count catches "never tied"; the resident/stored numel gap catches a partial
-    tie. Both bounds come from ``config``, not the 720P numbers.
+    An un-tied model is otherwise silent: numerically correct, just heavier
+    and missing loaded parameters. The tensor count catches "never tied";
+    the numel gap between ``state_dict()`` and ``named_parameters()`` catches
+    a partial tie.
     """
     tied = [name for name, _ in dit.named_parameters() if ".cond_head.cond_proj." in name]
     if len(tied) != CondHead.n_cond:
@@ -599,9 +520,8 @@ def _assert_cond_proj_tied(dit: WaypointDiT, config: WaypointConfig) -> None:
             f"{config.n_layers} blocks). to_empty(device) un-ties them and "
             "retie_cond_proj() must be called after it, not before."
         )
-    # COND_PROJ_SOURCE_BLOCK records which block retie_cond_proj aliases the
-    # others onto; if the two disagree, T9 drops the six keys the module keeps
-    # and keeps the six it drops.
+    # If COND_PROJ_SOURCE_BLOCK disagrees with which block retie_cond_proj
+    # aliases onto, the loader drops the keys the module keeps and vice versa.
     owner_prefix = f"{MODEL_BLOCK_PREFIX}{COND_PROJ_SOURCE_BLOCK}.cond_head.cond_proj."
     if not all(name.startswith(owner_prefix) for name in tied):
         raise RuntimeError(
@@ -639,13 +559,11 @@ def _assert_expected_layout(dit: WaypointDiT) -> None:
 def _initialize_structurally(dit: WaypointDiT, seed: int = 0) -> None:
     """Fill a ``to_empty``-materialized model with finite values.
 
-    ``to_empty`` allocates *uninitialized* storage, which routinely contains NaN
-    and Inf bit patterns, so a "no checkpoint" model is unusable even for a shape
-    smoke test until something writes every parameter. This is not the
-    reference's init; only ``v_lamb`` = 0.5 and the zeroed 1-D tensors match it.
-
-    Iterating ``named_parameters()`` writes each tied ``cond_proj`` once, which is
-    what makes the aliasing survive.
+    ``to_empty`` allocates uninitialized storage (often NaN/Inf), so this
+    isn't usable even for a shape smoke test until every parameter is
+    written. Not the reference's init — only ``v_lamb`` and the zeroed 1-D
+    tensors match it. Iterating ``named_parameters()`` (not ``state_dict()``)
+    keeps the tied ``cond_proj`` aliased.
     """
     generators: dict[torch.device, torch.Generator] = {}
     with torch.no_grad():
@@ -679,14 +597,12 @@ def build_waypoint_dit(
     """Meta-build, materialize on ``device``, and load the checkpoint into a
     ready-to-serve (eval-mode) native Waypoint DiT.
 
-    ``config``'s transcribed ``n_kv_heads`` and ``patch`` are validated against
-    the shapes in the file. ``checkpoint_dir`` is a local directory the caller
-    has already resolved; nothing here downloads. ``skip_weight_loading`` builds
-    a randomly initialized structure for shape and plumbing work.
+    ``checkpoint_dir`` is a local directory the caller has already resolved;
+    nothing here downloads. ``skip_weight_loading`` builds a randomly
+    initialized structure for shape/plumbing work instead.
 
-    Raises ``RuntimeError`` on any completeness failure: an unexpected checkpoint
-    key, an unloaded parameter, a fused shard that never arrived, two keys
-    claiming one slot, or divergent ``cond_proj`` copies.
+    Raises ``RuntimeError`` on any completeness failure: an unexpected,
+    missing, or duplicate-claimed key, or divergent ``cond_proj`` copies.
     """
     if not skip_weight_loading and checkpoint_dir is None:
         raise ValueError(
@@ -718,26 +634,25 @@ def build_waypoint_dit(
 
     unexpected: list[str] = []
     conflicts: list[str] = []
-    # (target, shard_id) -> the checkpoint key that claimed it. load_weights_into's
-    # returned set holds target names only, so q, k and v collapse to one entry
-    # and a k_proj missing from every layer would still satisfy
-    # `set(params) - loaded`.
+    # (target, shard_id) -> claiming checkpoint key. load_weights_into's
+    # returned set holds target names only, so q/k/v collapse to one entry;
+    # `set(params) - loaded` alone wouldn't catch a missing k_proj.
     arrivals: dict[tuple[str, str | int | None], str] = {}
-    # T4's arbitrated collision: {target: (rank, winning checkpoint key)}.
+    # Arbitrated bias_in collision: {target: (rank, winning checkpoint key)}.
     bias_in_claims: dict[str, tuple[int, str]] = {}
 
     def remap(name: str) -> str | None:
         mapped = remap_checkpoint_key(name)
         if mapped is None:
-            return None  # T9/T10/T12: expected, silent, not an unexpected key.
+            return None  # Expected drop, not an unexpected key.
         target, shard_id = _apply_stacked(mapped, WAYPOINT_STACKED_PARAMS)
         if target not in params:
             unexpected.append(name)
             return None
 
-        # T4 is the one collision resolved rather than refused: three spellings
-        # legitimately share cond_head.bias_in and the reference picks between
-        # them (mlp > attn, canonical > both). Rank, not arrival order.
+        # The one collision resolved rather than refused: three spellings
+        # legitimately share cond_head.bias_in; rank decides the winner, not
+        # arrival order (see _BIAS_IN_SPELLINGS).
         rank = _bias_in_rank(name)
         if rank is not None:
             held = bias_in_claims.get(target)
@@ -759,11 +674,11 @@ def build_waypoint_dit(
             slot = target if shard_id is None else f"{target}[{shard_id}]"
             conflicts.append(f"{claimed_by} and {name} -> {slot}")
 
-        # The same "one slot, two writers" failure across the fused/unfused
-        # spellings, which (target, shard_id) cannot see: a pre-fused tensor
-        # claims (target, None) and a split shard claims (target, "q"), so they
-        # never collide, both write, and the survivor is a shard-order-dependent
-        # mix. Either spelling alone is fine; both together are refused.
+        # Same "two writers, one slot" failure across fused/unfused spellings,
+        # invisible to (target, shard_id): a pre-fused tensor claims (target,
+        # None) while a split shard claims (target, "q"), so they never
+        # collide directly. Either spelling alone is fine; both together are
+        # refused.
         if target in fused_shards:
             rival_slots = (
                 [(target, s) for s in fused_shards[target]]
@@ -796,9 +711,9 @@ def build_waypoint_dit(
     missing_shards = sorted(
         f"{name}[{shard_id}]"
         for name, shard_ids in fused_shards.items()
-        # A pre-fused tensor satisfies every shard of its target at once, and
-        # `remap` refuses a file carrying both spellings, so (name, None) here
-        # means the pre-fused tensor was the only writer.
+        # A pre-fused tensor satisfies every shard at once; `remap` refuses a
+        # file with both spellings, so (name, None) means it was the only
+        # writer.
         if (name, None) not in arrivals
         for shard_id in shard_ids
         if (name, shard_id) not in arrivals

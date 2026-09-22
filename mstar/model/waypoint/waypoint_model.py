@@ -1,47 +1,33 @@
 """WaypointModel: Waypoint-1.5-1B interactive video world model.
 
 Architecture (two nodes):
-    vae_encoder - TAEHV encode. The seed clip (``temporal_compression`` raw
+    vae_encoder - TAEHV encode: the seed clip (``temporal_compression`` raw
                   frames) into the one latent frame it stands for.
     dit         - the 1.28B world DiT. One engine step is one latent frame:
                   four frozen Euler denoise passes plus one committing cache
-                  pass, then a TAEHV decode of that frame, all inside a single
-                  ``forward``. The decode is fused in (rather than left on its
-                  own node) so a same-worker speculative N+1 can start while
-                  N's frame is still going out to the client — a separate
-                  decoder node would decode frame N only after N+1 was
-                  already queued.
+                  pass, then a TAEHV decode of that frame, fused into a single
+                  ``forward`` so a same-worker speculative N+1 can start while
+                  N's frame is still going out.
 
 Graph walks (2):
     prime   - vae_encoder -> dit.append_frame(+decode). Seeds the world and
-              decoder state from a real frame, advances the ring clock by one,
-              and emits nothing (the dit's rollout instance is a separate
-              ``GraphNode`` with ``outputs=[]``).
+              decoder state from a real frame and emits nothing.
     rollout - Loop("rollout_loop") over a single dit.generate_frame(+decode)
               node with a self loop-back ("clock") and
               ``enable_async_scheduling=True``; one latent frame decoded and
               emitted per iteration.
 
-**Prime decodes as well as encodes**, and not for symmetry: the functional
-decoder's first call spends ``frames_to_trim`` of temporal memory priming
-itself, so a prime that only encoded would leave the first *rollout* frame
-paying for it and every frame after that shifted against the world it came
-from. Silently — drifting video, no exception. The reconstructed seed frames
-are internal initialization output and are never sent to the client.
+Prime also decodes (not just encodes): the functional decoder's first call
+spends ``frames_to_trim`` of temporal memory priming itself, so an
+encode-only prime would leave every rollout frame quietly drifting from the
+reference. The reconstructed seed frames are never sent to the client.
 
-The world state is the ring KV cache. It is an engine resource
-(``get_node_resources`` below), not a model-owned buffer: a per-request ring in
-``PerRequestState`` cannot survive CUDA-graph capture, and the resource
-lifecycle is the only place that can hand a request one of the node's worlds —
-or refuse it when they are all taken. That refusal is a backstop, though — see
-``get_worker_graphs``.
+The world state is the ring KV cache, an engine resource
+(``get_node_resources`` below) rather than a model-owned buffer, since a
+per-request ring cannot survive CUDA-graph capture.
 
-``num_sessions`` and ``max_batch_size`` are separate numbers and stay separate.
-``num_sessions`` is how many sessions are *resident* (one ring span each, folded
-into the token dimension by ``LayerRingCache``); ``max_batch_size`` is how many
-share one *forward step*, set by ``step_batch_size`` (<= ``num_sessions``), so up
-to that many resident worlds batch into one step instead of each taking a
-separate turn.
+``num_sessions`` (resident worlds) and ``max_batch_size`` (rows sharing one
+forward step, set by ``step_batch_size <= num_sessions``) are separate knobs.
 """
 
 import logging
@@ -100,10 +86,9 @@ logger = logging.getLogger(__name__)
 DIT_NODE = "dit"
 VAE_ENCODER_NODE = "vae_encoder"
 
-# The scripted action stream, one row per frame. Named once because the walk
-# declarations, the initial-args validation and the per-walk edge builder all
-# have to agree with WaypointDitSubmodule._controller_slice, which reads these
-# names off the request's inputs dict.
+# The scripted action stream, one row per frame. Named once since walk
+# declarations, arg validation and the edge builder must all agree with
+# WaypointDitSubmodule._controller_slice on these names.
 _CONTROLLER_STREAMS = ("mouse", "button", "scroll")
 
 _VARIANT_FACTORIES = {
@@ -118,7 +103,7 @@ class WaypointModel(Model):
     PRIME_WALK = PRIME_WALK
     ROLLOUT_WALK = ROLLOUT_WALK
 
-    # Loop name — referenced by ``WaypointDitSubmodule.check_stop`` through
+    # Referenced by ``WaypointDitSubmodule.check_stop`` via
     # ``request_info.dynamic_loop_iter_counts[...]``.
     ROLLOUT_LOOP_NAME = ROLLOUT_LOOP_NAME
 
@@ -144,10 +129,9 @@ class WaypointModel(Model):
                 f"Waypoint variant {variant!r} is not implemented; known variants "
                 f"are {sorted(_VARIANT_FACTORIES)}."
             )
-        # The generic registry passes None so the selected variant chooses its
-        # published repository. Any explicit source remains authoritative,
-        # including a local path or a deliberately cross-variant Hub ID; the
-        # manifest preflight will reject it if its geometry is incompatible.
+        # None picks the variant's published repository; an explicit source
+        # (local path or cross-variant Hub ID) is authoritative and the
+        # manifest preflight rejects it if its geometry is incompatible.
         self.model_path_hf = (
             WAYPOINT_VARIANT_HF_REPOS[variant]
             if model_path_hf is None
@@ -167,17 +151,15 @@ class WaypointModel(Model):
         }
         self.config: WaypointConfig = replace(config, **overrides)
         # ``build_waypoint_dit`` never downloads: the caller resolves the local
-        # directory holding model.safetensors. ``cache_dir`` is where a
-        # snapshot lands if one is fetched out of band; the two are not the same
-        # thing and conflating them is how a half-downloaded repo gets loaded.
+        # directory holding model.safetensors. ``cache_dir`` is only where an
+        # out-of-band snapshot lands.
         self.checkpoint_dir = checkpoint_dir or self.model_path_hf
-        # The TAEHV weights ship in their own repo, so ``ae_path`` is a local
-        # override of ``config.ae_uri`` and not of ``checkpoint_dir``.
+        # TAEHV weights ship in their own repo, so ``ae_path`` overrides
+        # ``config.ae_uri``, not ``checkpoint_dir``.
         self.ae_uri = ae_path or self.config.ae_uri
         self.checkpoint_revision = checkpoint_revision
         self.ae_revision = ae_revision
-        # Dummy mode: get_submodule returns None for every node, so engines and
-        # tests run without weights, GPU or network.
+        # Dummy mode: get_submodule returns None for every node.
         self.skip_weight_loading = skip_weight_loading
 
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
@@ -191,23 +173,15 @@ class WaypointModel(Model):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """The ring KV cache holding the world, and the FlexAttention over it.
 
-        The ring geometry is copied out of ``WaypointConfig`` layer by layer
-        rather than summarized: Waypoint's layers are not alike (the six global
-        layers hold 16 frames spaced 8 apart, the other eighteen hold 16
-        consecutive frames), and ``ring_frames`` and ``ring_buckets`` are two
-        separate questions. They happen to agree on every layer of the
-        *compacted* 720P ring, which is exactly what makes deriving one from the
-        other look safe — flip ``full_global_ring`` back to the reference's
-        sizing and a global layer is 128 frames indexed by 16 buckets.
+        Ring geometry is copied out of ``WaypointConfig`` layer by layer since
+        Waypoint's layers are not alike (six global layers hold 16 frames
+        spaced 8 apart, the other eighteen hold 16 consecutive frames), so
+        ``ring_frames`` and ``ring_buckets`` cannot be derived from one another.
 
-        FlexAttention rather than the paged FlashInfer default: a paged
-        kernel changes the accumulation order over the KV blocks, and a
-        mask-or-position bug in this model does not raise, it produces
-        plausible, smoothly drifting video. Bit-exactness against the reference
-        is the only check there is, so the kernel has to be the reference's.
-
-        The attention spec names the cache by key, so ``depends_on`` orders the
-        two: the ring is built first and the attention resource resolves it.
+        FlexAttention rather than the paged FlashInfer default: a paged kernel
+        changes the KV accumulation order, and a mask/position bug here would
+        not raise, it would just drift the video. Bit-exactness against the
+        reference is the only check there is.
         """
         ring_config = RingKVConfig(
             num_layers=self.config.n_layers,
@@ -223,26 +197,15 @@ class WaypointModel(Model):
                 )
                 for i in range(self.config.n_layers)
             ),
-            # How many sessions this node holds resident. One by default
-            # because a world is ~816 MiB of ring at 720P and a model has no
-            # business assuming the box; a deployment raises it under
-            # ``resources: {kv: {num_sessions: N}}`` and raises
-            # ``max_concurrent_requests`` with it (see ``get_worker_graphs``).
-            # Not the step batch — that is ``max_batch_size``, set by
-            # ``step_batch_size`` (<= num_sessions).
+            # Resident session count, not the step batch (that's
+            # ``max_batch_size``/``step_batch_size``). Default 1; a deployment
+            # raises it via ``resources: {kv: {num_sessions: N}}`` along with
+            # ``max_concurrent_requests`` (see ``get_worker_graphs``).
             num_sessions=1,
         )
-        # Logged, not merely allocated: this declaration is worth ~816 MiB per
-        # world and nothing downstream prints it. The report carries the
-        # counterfactual under the other ``full_global_ring`` setting, which is
-        # the number you want *before* the engine commits to one of them.
-        #
-        # `ring_config.num_sessions` is the DECLARED count, which is what this
-        # line can honestly report: `EngineManager.build` calls
-        # `apply_yaml_overrides` on the specs after this hook returns, so a
-        # deployment's `num_sessions` has not landed yet. The reported total
-        # scales linearly with it -- the world dim is folded into the token
-        # axis -- so N worlds is N times the number below.
+        # Logged since nothing downstream prints this ~816 MiB/world cost.
+        # Uses the DECLARED num_sessions: `apply_yaml_overrides` may still
+        # raise it after this hook returns.
         logger.info(
             "%s", describe_ring_memory(self.config, num_sessions=ring_config.num_sessions)
         )
@@ -267,9 +230,9 @@ class WaypointModel(Model):
         )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # -- prime: encode the seed clip, commit it to the world, decode it to
-        # -- initialize the fused decoder's state, and discard the
-        # -- reconstructed seed frames (outputs=[] below).
+        # prime: encode the seed clip, commit it to the world, decode it to
+        # init the fused decoder's state, and discard the reconstructed seed
+        # frames (outputs=[] below).
         prime = Sequential([
             GraphNode(
                 name=VAE_ENCODER_NODE,
@@ -283,25 +246,15 @@ class WaypointModel(Model):
             ),
         ])
 
-        # -- rollout: one frame decoded and emitted per iteration, from a
-        # -- single node.
-        # --
-        # -- The "clock" self loop-back is what makes the dit a same-node
-        # -- speculation target (GraphNode.is_ready_for_speculation /
-        # -- WorkerGraphIO.ingest_for_speculation): it carries no information
-        # -- of its own (the submodule ignores its value; frame_pos and
-        # -- rollout_step live in host state), it only has to be a name the
-        # -- loop re-injects every iteration. enable_async_scheduling=True lets
-        # -- the worker build iteration N+1 while N is still on the GPU; the
-        # -- overshoot that can result — N+1 dispatched before check_stop(N)
-        # -- registers the loop's finish signal — is vetoed host-side in
-        # -- WaypointDitSubmodule.prepare_inputs before it can commit a frame
-        # -- into the ring, which has no undo.
-        # --
-        # -- There is no separate decoder node left to order against: the
-        # -- decode happens inside the same forward as the denoise passes, so
-        # -- a frame is decoded and emitted exactly once, when its dit
-        # -- iteration runs.
+        # rollout: one frame decoded and emitted per iteration, from a single
+        # node. The "clock" self loop-back carries no data (frame_pos and
+        # rollout_step live in host state); it only makes the dit a same-node
+        # speculation target (GraphNode.is_ready_for_speculation). Under
+        # enable_async_scheduling=True the worker can build iteration N+1
+        # before check_stop(N) registers the loop's finish signal; that
+        # overshoot is vetoed host-side in
+        # WaypointDitSubmodule.prepare_inputs before it can commit into the
+        # ring, which has no undo.
         rollout = Loop(
             name=ROLLOUT_LOOP_NAME,
             section=GraphNode(
@@ -313,9 +266,8 @@ class WaypointModel(Model):
                 ],
                 enable_async_scheduling=True,
             ),
-            # Ceiling only; the request's num_steps stops the loop early via
-            # WaypointDitSubmodule.check_stop (and the overshoot veto above
-            # catches what check_stop is too late for under async scheduling).
+            # Ceiling only; num_steps stops the loop early via
+            # WaypointDitSubmodule.check_stop.
             max_iters=self.config.max_frames,
             outputs=[],
             accumulated_outputs=[],
@@ -327,38 +279,22 @@ class WaypointModel(Model):
         """Refuse to build unless the deployment caps concurrency at the number
         of worlds the ring was sized for.
 
-        This is the **primary** gate on the world pool, not a nicety. A world is
-        claimed at ``admit``, i.e. once a batch has already been formed — by
-        then the only thing ``RingKVManager.admit`` can do about a request the
-        pool cannot hold is fail it terminally. What actually keeps arrivals
-        inside the pool is the conductor's FIFO admit queue, and that queue only
-        exists when ``max_concurrent_requests`` is set: the conductor drains
-        ``waiting_queue`` while ``len(self.requests) < max_concurrent_requests``,
-        so an unset value admits everything on arrival and every request past
-        the Nth dies at admit. Unset therefore stays fatal, exactly as before —
-        what changed is that the accepted value is a range rather than the
-        single number 1.
+        The primary gate on the world pool: a world is claimed at ``admit``,
+        and the conductor's FIFO admit queue (only active when
+        ``max_concurrent_requests`` is set) is what keeps arrivals inside the
+        pool. ``max_batch_size``/``step_batch_size`` caps a step's row count,
+        not how many worlds may exist, so it does not substitute for this
+        check.
 
-        ``max_batch_size`` does NOT cover this, independent of its value. It
-        caps how many requests share one *step* (``step_batch_size``, <=
-        ``num_sessions``); worlds beyond that batch still alternate steps — each
-        holds its own world and the BlockMask keeps them apart — but it says
-        nothing about how many may exist, which is the thing the pool bounds.
-
-        A limit *below* ``num_sessions`` is legal and only wasteful: it allocates
-        rings (~816 MiB each at 720P) for worlds no request can ever reach, so
-        it is warned about rather than refused.
-
-        Checked here because this hook is the only place a model sees the key:
-        the Conductor reads it out of the YAML itself and
+        Checked here because this hook is the only place a model sees the
+        key: the Conductor reads it from the YAML and
         ``api_server/entrypoint.py`` forwards only ``model_kwargs`` to
         ``Model.__init__``.
         """
         with open(config_path, "r") as f:
             config = yaml.safe_load(f) or {}
-        # The same block ``EngineManager.build`` feeds to
-        # ``apply_yaml_overrides``, read here for the same key, so the gate and
-        # the allocation cannot disagree about how many worlds exist.
+        # Same block ``EngineManager.build`` feeds to
+        # ``apply_yaml_overrides``, so the gate and the allocation agree.
         overrides = (config.get("resources") or {}).get(KV_RESOURCE) or {}
         num_sessions = overrides.get("num_sessions", 1)
         if (
@@ -421,15 +357,12 @@ class WaypointModel(Model):
         clip, if any) as the edges the walk's first nodes consume.
 
         ``prompt`` is ignored: this checkpoint has ``prompt_conditioning=None``
-        and carries no cross-attention, so a text prompt would have nowhere to
-        go. Raising on one would break clients that send an empty default.
+        and carries no cross-attention.
 
-        ``actions`` is a list of per-step dicts, exactly one per generated latent:
-        ``{"mouse": [dx, dy], "buttons": [id, ...], "scroll": s}``. The button
-        field is a set of pressed ids that gets one-hot scattered into
-        ``n_buttons`` columns, matching the reference's ``CtrlInput``; an
-        omitted field is that control's neutral value. Prime uses a separate
-        internal idle action and never consumes action zero.
+        ``actions`` is a list of per-step dicts, one per generated latent:
+        ``{"mouse": [dx, dy], "buttons": [id, ...], "scroll": s}``; buttons are
+        one-hot scattered into ``n_buttons`` columns and an omitted field is
+        that control's neutral value. Prime never consumes action zero.
         """
         del prompt, input_modalities
         if output_modalities != ["video_frame"]:
@@ -526,13 +459,9 @@ class WaypointModel(Model):
     def _seed_clip(self, image: torch.Tensor) -> torch.Tensor:
         """The prime walk's ``[temporal_compression, H, W, 3]`` uint8 clip.
 
-        One frame is repeated to fill it, the reference's way of seeding from a
-        still (``gen_sample.py``'s ``seed_frame_x4``). Fewer or more frames is
-        refused: the streaming encoder emits one latent per ``t_downscale``, so a
-        short clip buffers silently and a long one encodes twice.
-
-        Resolution is not checked, only the aspect ratio -- the AE resizes 16:9
-        input onto its own grid and decodes back to the variant's resolution.
+        A single frame is repeated to fill it (seeding from a still). Fewer or
+        more frames is refused since the streaming encoder emits one latent
+        per ``t_downscale``. Only the aspect ratio is checked, not resolution.
         """
         frames = image if image.dim() == 4 else image.unsqueeze(0)
         if frames.dtype != torch.uint8 or frames.shape[-1] != 3:
@@ -566,8 +495,8 @@ class WaypointModel(Model):
         self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None,
     ) -> bytes:
         """One step's frames as raw uint8 RGB bytes,
-        ``[temporal_compression, H, W, 3]`` in C order. No container: the emit is
-        per engine step, and a per-step mp4 is a fragment nothing plays."""
+        ``[temporal_compression, H, W, 3]`` in C order. No container: the emit
+        is per engine step."""
         del request_kwargs
         if modality != "video_frame":
             raise ValueError(f"Unsupported modality for Waypoint: {modality!r}")
@@ -629,10 +558,9 @@ class WaypointModel(Model):
                 "Waypoint requires exactly one output modality, 'video_frame'; "
                 f"got {output_modalities!r}."
             )
-        # A backstop, not the primary guard: process_prompt already rejected a
-        # malformed request on the data worker, where a ValueError becomes a
-        # 400. A raise here runs at the conductor, whose main loop swallows it,
-        # so the client would hang instead.
+        # Backstop: process_prompt already rejects a malformed request (400).
+        # A raise here runs at the conductor, whose main loop swallows it, so
+        # the client would hang instead.
         for name in _CONTROLLER_STREAMS:
             if not input_signals.get(name):
                 raise ValueError(
@@ -736,11 +664,10 @@ class WaypointModel(Model):
     def get_autocast_dtype(self):
         """Allocate BF16 resources while every node disables autocast.
 
-        The dtype layout is settled at build time — ``cast_serving_dtypes()``
-        takes the meta module to bf16 and pins the fp32 islands back, and the AE
-        is built bf16 whole. The submodules' ``disable_autocast`` flags preserve
-        that mixed layout. Returning BF16 here is also the explicit ring-KV
-        allocation dtype; returning None silently allocated the ring in fp32.
+        The dtype layout is settled at build time (``cast_serving_dtypes()``
+        pins fp32 islands after casting the rest to bf16); this is also the
+        ring-KV allocation dtype, and returning None would silently allocate
+        the ring in fp32.
         """
         return torch.bfloat16
 
@@ -748,9 +675,8 @@ class WaypointModel(Model):
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None, sp_group=None,
     ) -> torch.nn.Module | None:
-        # ``autocast_dtype``/``tp_group``/``sp_group`` exist for interface
-        # parity: weights load in the checkpoint's own dtypes and neither the
-        # ring nor the BlockMask shards yet.
+        # autocast_dtype/tp_group/sp_group exist for interface parity only:
+        # weights load in the checkpoint's own dtypes and nothing shards yet.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         submodule = self._create_submodule(node_name, device)
@@ -783,11 +709,9 @@ class WaypointModel(Model):
     def _resolve_checkpoints(self) -> None:
         """Resolve both artifacts and validate the DiT manifest before allocation.
 
-        The first requested node triggers this once. Resolving both together is
-        intentional: startup must fail on a missing AE before a multi-gigabyte
-        DiT has been allocated, even when the engine happens to ask for the DiT
-        node first. Tensor completeness and the pinned TAEHV runtime architecture
-        are then validated while loading, before request admission.
+        Triggered once by the first requested node. Resolved together so
+        startup fails on a missing AE before the multi-gigabyte DiT has been
+        allocated, even if the DiT node is requested first.
         """
         if self._checkpoints_resolved:
             return
@@ -802,9 +726,8 @@ class WaypointModel(Model):
             resolve_waypoint_checkpoint,
         )
 
-        # Dependency validation is part of the same preflight as both weight
-        # sources. In particular it must precede the DiT resolver: a missing or
-        # empty TAEHV install should not trigger a multi-GiB download first.
+        # Must precede the DiT resolver: a missing TAEHV install shouldn't
+        # trigger a multi-GiB download first.
         require_taehv_runtime()
         self.checkpoint_dir = str(resolve_waypoint_checkpoint(
             self.checkpoint_dir,
@@ -821,9 +744,7 @@ class WaypointModel(Model):
 
     def _taehv_weights(self, device: str) -> torch.nn.Module:
         """The AE weights, built once and shared by both VAE nodes: they differ
-        only in streaming state, which is per request and not held here. bf16 at
-        build is the reference's serving dtype, and with ``disable_autocast`` on
-        both nodes it is the dtype the convs actually run in."""
+        only in per-request streaming state, not held here."""
         if self._taehv is None:
             from mstar.model.waypoint.components.taehv import load_taehv
 

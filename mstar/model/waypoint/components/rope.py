@@ -1,15 +1,9 @@
 """OrthoRoPE: Waypoint's orthogonal (x, y, t) rotary position embedding.
 
 ``d_xy`` and ``d_t`` count rotation *pairs*, not dims: at ``d_head == 64`` x
-owns dims 0..15, y 16..31 and t 32..63, and nothing is left unrotated. The
-three bands are disjoint, so the axes' phases add independently.
-
-Both classes are fp32 islands, made so by running the arithmetic in fp32 rather
-than by pinning dtypes: they hold no parameter and no buffer, so neither
-appears in ``layers.FP32_MODULE_PATHS``, and their frequency tables live in a
-``DeviceTableCache`` outside the module tree.
-
-The cache stores post-RoPE keys, so replayed history is never re-rotated.
+owns dims 0..15, y 16..31 and t 32..63, disjoint bands whose phases add
+independently. The cache stores post-RoPE keys, so replayed history is never
+re-rotated.
 """
 
 import torch
@@ -61,9 +55,8 @@ class OrthoRoPEAngles(nn.Module):
         """``[B, T]`` integer position grids -> ``(cos, sin)``, each
         ``[B, 1, T, d_head // 2]`` fp32 with a broadcast head axis.
 
-        ``t_pos`` is the RoPE clock, not the ring clock ``f_pos``; they are
-        equal for this checkpoint (``ts_mult == 1``) and diverge at any other
-        serving fps.
+        ``t_pos`` is the RoPE clock, not the ring clock ``f_pos`` -- equal here
+        (``ts_mult == 1``), but they diverge at other serving fps.
         """
         xy, inv_t = self._tables.get(x_pos.device)
 

@@ -1,16 +1,10 @@
 """Configuration for Waypoint-1.5 (autoregressive video world model).
 
-The values here are facts of the published 720P and 360P checkpoint manifests,
-hardcoded so that constructing the model never touches the network. The
-reference reads those YAML files through OmegaConf with
-``MODEL_CONFIG_DEFAULTS`` merged underneath; this dataclass is the merged result.
-
-One 1.28B DiT denoises exactly one latent frame per step and the KV cache IS the
-world state, so attention geometry is per-layer heterogeneous (18 layers over a
-16-frame local window, 6 over a 128-frame window at stride 8; see
-``global_layers`` / ``ring_frames``) and every frame costs 5 forwards: 4
-non-committing Euler passes over ``scheduler_sigmas``, then 1 committing pass at
-sigma=0 that writes the settled K/V into the ring.
+Hardcodes the published 720P/360P checkpoint manifests so constructing the
+model never touches the network. Attention geometry is per-layer heterogeneous
+(local vs. global window; see ``global_layers`` / ``ring_frames``), and each
+frame costs 4 non-committing Euler passes plus 1 committing pass that writes
+the settled K/V into the ring.
 """
 
 import math
@@ -26,9 +20,8 @@ WAYPOINT_VARIANT_HF_REPOS: dict[str, str] = {
 
 WAYPOINT_SCHEDULER_SIGMAS = (1.0, 0.9, 0.75, 0.3, 0.0)
 
-# Geometry is the only manifest-field difference between the two deployment
-# configs; the repositories still hold variant-specific weights. Startup
-# validation reads this rather than a downloaded checkpoint.
+# Only manifest field that differs between the two deployment configs; startup
+# validation reads this instead of a downloaded checkpoint.
 WAYPOINT_VARIANT_GEOMETRY: dict[str, tuple[int, int, int]] = {
     WAYPOINT_VARIANT_720P: (512, 16, 32),
     WAYPOINT_VARIANT_360P: (128, 8, 16),
@@ -45,7 +38,7 @@ class WaypointConfig:
 
     variant: str = WAYPOINT_VARIANT_720P
 
-    # ---- Transformer ------------------------------------------------------
+    # Transformer
     n_layers: int = 24
     n_heads: int = 32
     n_kv_heads: int = 16  # GQA: 2 query heads per kv head
@@ -53,36 +46,33 @@ class WaypointConfig:
     mlp_ratio: int = 4
     channels: int = 32  # VAE latent channels
 
-    # ---- Token grid -------------------------------------------------------
+    # Token grid
     # height/width are POST-patch token counts, not latent pixels: the latent
-    # frame is (height*patch[0], width*patch[1]) and patchify collapses it to
-    # tokens_per_frame tokens. The reference asserts tokens_per_frame == h*w.
+    # frame is (height*patch[0], width*patch[1]), collapsed to tokens_per_frame.
     tokens_per_frame: int = 512
     height: int = 16
     width: int = 32
     patch: tuple[int, int] = (2, 2)
 
-    # ---- Attention geometry -----------------------------------------------
-    # Layer i is "global" iff (i - global_attn_offset % period) % period == 0:
-    # {3, 7, 11, 15, 19, 23}. Local layers see local_window consecutive frames;
-    # global layers see global_window frames at stride global_pinned_dilation,
-    # i.e. 16 retained frames spanning 128 frames of history.
+    # Attention geometry
+    # Local layers see local_window consecutive frames; global layers see
+    # global_window frames at stride global_pinned_dilation (see global_layers
+    # for which layer indices are global).
     local_window: int = 16
     global_window: int = 128
     global_pinned_dilation: int = 8
     global_attn_period: int = 4
     global_attn_offset: int = -1
 
-    # ---- RoPE -------------------------------------------------------------
+    # RoPE
     # OrthoRoPE splits the head into disjoint axis slices: d_head//8 rotation
-    # PAIRS to x, d_head//8 to y, d_head//4 to t -- 8+8+16 = 32 pairs for
-    # d_head=64, so x owns dims 0-15, y 16-31, t 32-63 and nothing is left
-    # unrotated. The counts are pairs, not dims.
+    # pairs to x, d_head//8 to y, d_head//4 to t (8+8+16=32 pairs for d_head=64,
+    # so x owns dims 0-15, y 16-31, t 32-63, nothing left unrotated).
     rope_impl: str = "ortho"
     rope_nyquist_frac: float = 0.8
     rope_theta: float = 10000.0
 
-    # ---- Conditioning -----------------------------------------------------
+    # Conditioning
     noise_conditioning: str = "wan"  # WAN-style CondHead with a shared cond_proj
     value_residual: bool = True
     gated_attn: bool = False
@@ -91,71 +81,58 @@ class WaypointConfig:
 
     ctrl_conditioning: bool = True
     ctrl_cond_dropout: float = 0.0
-    # Controller conditioning is injected on layers where i % period == 0, i.e.
-    # 8 of 24 layers: {0, 3, 6, 9, 12, 15, 18, 21}.
+    # Injected on layers where i % period == 0 (8 of 24 layers).
     ctrl_conditioning_period: int = 3
     n_buttons: int = 256
 
-    # ---- Sampling ---------------------------------------------------------
+    # Sampling
     # 5 entries -> 4 Euler steps -> one separate committing pass at sigma=0.
     # Not a per-request knob: the reference's cached sigma/cond tables key on it.
     scheduler_sigmas: tuple[float, ...] = WAYPOINT_SCHEDULER_SIGMAS
 
-    # ---- Temporal ---------------------------------------------------------
+    # Temporal
     base_fps: int = 15  # fps the RoPE time axis was trained against
     inference_fps: int = 60  # raw video fps
     temporal_compression: int = 4  # raw frames per latent frame (TAEHV)
     max_frames: int = 512  # training-time rollout ceiling; not enforced here
 
-    # ---- VAE --------------------------------------------------------------
+    # VAE
     taehv_ae: bool = True
     ae_uri: str = "Overworld-Models/taehv1_5"
     auto_aspect_ratio: bool = True
 
-    # ---- Port-local knobs (NOT checkpoint facts) --------------------------
-    # The reference allocates global-layer ring storage as
-    # ``global_window * tokens_per_frame`` tokens but can only address
-    # ``global_window // global_pinned_dilation`` frame slots, so 7/8 of it is
-    # permanently unwritten and masked off. Compacting it is bit-exact and saves
-    # ~1.35 GiB; True restores the reference's allocation for an A/B parity run.
+    # Port-local knobs (not checkpoint facts)
+    # Reference over-allocates global-layer ring storage 8x (only
+    # global_window // global_pinned_dilation frame slots are ever addressed);
+    # compacting it is bit-exact. True restores the reference's allocation for
+    # an A/B parity run.
     full_global_ring: bool = False
 
-    # The reference's ``NoCastModule._apply`` casts every tensor it holds to the
-    # requested dtype and back, so its derived fp32 tables (``rope_angles.xy``/
-    # ``inv_t``, ``denoise_step_emb.freq``) are served bf16-quantized —
-    # parameters recover from ``load_state_dict``, non-persistent buffers never
-    # do — and its cached sigma LUT rounds the same way through a TF32 batch-5
-    # GEMM the served per-sigma GEMV avoids. True reproduces that rounding, which
-    # is what the live parity gate compares against; False serves exact tables
-    # and deliberately diverges from the released reference.
+    # Reference's NoCastModule casts held tensors to dtype and back, so derived
+    # fp32 tables (rope angles, sigma LUT) are served bf16-quantized. True
+    # reproduces that rounding (what the parity gate compares against); False
+    # serves exact tables and diverges from the released reference.
     reference_compat: bool = True
 
-    # torch.compile the two OUTER regions (denoise pass, cache pass), matching
-    # the reference's two @torch.compile(fullgraph=True, dynamic=False) sites.
-    # Independent of CUDA graph capture, and of the masked FlexAttention
-    # primitive, which stays compiled for correctness (engine/resources/attn/flex.py).
+    # torch.compile the two outer regions (denoise pass, cache pass), matching
+    # the reference. Independent of CUDA graph capture and of FlexAttention,
+    # which stays compiled for correctness regardless.
     compile_dit: bool = True
 
-    # Attempt fixed-shape CUDA graph capture for the encoder prime, DiT prime,
-    # steady DiT rollout, and decoder prime/rollout paths. An optimization:
-    # disabled declares no buckets, and a failed capture falls back to eager
-    # submodule forwards.
+    # Attempt fixed-shape CUDA graph capture for encoder/DiT/decoder prime and
+    # rollout paths; disabled or failed capture falls back to eager forwards.
     cuda_graph: bool = True
 
     # Also capture the one-time DiT prime/cache pass. Subordinate to
-    # ``cuda_graph``: disabled leaves the steady rollout graph alone and serves
-    # prime through the compiled eager forward. On by default since
-    # PRIME-GRAPH-001 measured lower startup p95 at both resolutions; False is
-    # that A/B's control arm and stays reachable.
+    # cuda_graph: disabled serves prime through the compiled eager forward.
     capture_dit_prime: bool = True
 
-    # Rows carried per rollout step; one per resident world sharing the DiT
-    # forward. Must be <= `resources.kv.num_sessions` (checked at YAML-load time
-    # in waypoint_model.py, where num_sessions is known).
+    # Rows carried per rollout step, one per resident world sharing the DiT
+    # forward. Must be <= resources.kv.num_sessions (checked at YAML-load time).
     step_batch_size: int = 1
 
-    # Guard rails the ported modules assert against, kept here so a drifting
-    # checkpoint fails loudly at construction rather than silently mis-serving.
+    # Guard rails: a drifting checkpoint fails loudly here instead of silently
+    # mis-serving.
     _supported_rope_impls: tuple[str, ...] = field(
         default=("ortho",), repr=False, compare=False
     )
@@ -319,7 +296,7 @@ class WaypointConfig:
                 + "."
             )
 
-    # ---- Derived ----------------------------------------------------------
+    # Derived
 
     @property
     def d_head(self) -> int:
@@ -353,12 +330,10 @@ class WaypointConfig:
 
     @property
     def ts_mult(self) -> int:
-        """RoPE time-axis stride per latent frame.
+        """RoPE time-axis stride per latent frame; here equal to 1.
 
-        ``base_fps // (inference_fps // temporal_compression)`` = 1 here, so the
-        RoPE clock ``t_pos`` and the ring-bucketing clock ``f_pos`` are equal.
-        They stay two separate values through the model: another inference_fps
-        separates them, and conflating them drifts silently rather than crashing.
+        Keeps the RoPE clock (``t_pos``) and ring-bucketing clock (``f_pos``)
+        in step; conflating them drifts silently rather than crashing.
         """
         return self.base_fps // (self.inference_fps // self.temporal_compression)
 
