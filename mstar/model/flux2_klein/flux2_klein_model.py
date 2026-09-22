@@ -99,6 +99,7 @@ class Flux2KleinModel(Model):
         max_batch_size: int = 8,
         max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
+        async_scheduling: bool = False,
         lora: list | None = None,
         **kwargs,
     ):
@@ -129,6 +130,12 @@ class Flux2KleinModel(Model):
         # minutes (8192^2 = 262k tokens of quadratic attention); requests above it are rejected before scheduling
         self.max_image_area = int(max_image_area)
         self.vae_compile = bool(vae_compile)
+        # Speculative (asynchronous) scheduling of the image nodes: the worker assembles each batch's next step
+        # while the current one runs and merges requests that became ready meanwhile. Off by default: measured
+        # on 2026-09-18 it launched each request's next step alone (38 of 43 steps unbatched at 8 concurrent
+        # requests); lockstep waits for the step to finish (~2 ms of launch overlap per step) and batches
+        # everything ready. The knob exists to re-price it as the engine's merge logic evolves.
+        self.async_scheduling = bool(async_scheduling)
         # LoRA adapters folded into the transformer at load time (static merge).
         self.loras = [LoraSpec.parse(item) for item in (lora or [])]
 
@@ -179,12 +186,12 @@ class Flux2KleinModel(Model):
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
-            name="text_encoder", enable_async_scheduling=False,
+            name="text_encoder", enable_async_scheduling=self.async_scheduling,
             input_names=[TEXT_INPUTS, TEXT_MASK],
             outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=TEXT_EMBEDS, persist=True)],
         )
         encode_image = GraphNode(
-            name="vae_encoder", enable_async_scheduling=False,
+            name="vae_encoder", enable_async_scheduling=self.async_scheduling,
             input_names=[IMAGE_INPUTS],
             outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=REF_LATENTS, persist=True)],
         )
@@ -204,17 +211,15 @@ class Flux2KleinModel(Model):
                 input_names=dit_inputs,
                 # latents is the only loop-carried edge; the step index is the loop counter
                 outputs=[GraphEdge(next_node="dit", name=LATENTS)],
-                # Lockstep, not speculative: the worker otherwise launches each request's next
-                # step alone while the current one runs (38 of 43 steps unbatched at 8 concurrent
-                # requests), so concurrent requests never share a batch. Waiting for the step to
-                # finish costs ~2 ms of launch overlap per step and batches everything ready.
-                enable_async_scheduling=False,
+                # Lockstep by default (see the async_scheduling knob): waiting for the step to finish
+                # costs ~2 ms of launch overlap per step and batches everything ready.
+                enable_async_scheduling=self.async_scheduling,
             ),
             max_iters=self.config.max_denoise_steps,
             outputs=[GraphEdge(next_node="vae_decoder", name=LATENTS)],
         )
         decoder = GraphNode(
-            name="vae_decoder", enable_async_scheduling=False,
+            name="vae_decoder", enable_async_scheduling=self.async_scheduling,
             input_names=[LATENTS],
             outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=IMAGE_OUTPUT, output_modality="image")],
         )
