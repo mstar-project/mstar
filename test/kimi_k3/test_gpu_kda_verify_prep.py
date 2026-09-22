@@ -63,8 +63,9 @@ def reference(qkv, g_raw, beta_raw, conv_state, spec, slots, conv_w, rows, k1, h
     return (y[:, 0], y[:, 1], y[:, 2], g, beta, (plen - 1).to(torch.int32)), (conv_state, prefix, g_blk, b_blk), pad
 
 
-@pytest.mark.parametrize("h,d,k1,kp,rows,strided", [(4, 32, 8, 8, 5, False), (2, 48, 6, 6, 3, True), (4, 64, 4, 4, 1, False),
-                                                    (2, 32, 2, 8, 3, True), (2, 32, 1, 8, 2, False)])
+@pytest.mark.parametrize("h,d,k1,kp,rows,strided", [
+    (4, 32, 8, 8, 5, False), (2, 48, 6, 6, 3, True), (4, 64, 4, 4, 1, False),
+    (2, 32, 2, 8, 3, True), (2, 32, 1, 8, 2, False)])
 def test_prep_matches_the_torch_glue(h, d, k1, kp, rows, strided):
     """``kp`` prefix slots (the pool's largest block + 1) and a block of ``k1`` tokens, shorter when the
     block length follows the batch size, down to a single token; ``strided`` hands the gates and betas
@@ -89,13 +90,14 @@ def test_prep_matches_the_torch_glue(h, d, k1, kp, rows, strided):
     want, want_pool, pad = reference(qkv, g_raw, beta_raw, conv_state, spec, slots, conv_w, rows, k1, h, d)
     got = kda_verify_prep(qkv, g_raw, beta_raw, conv_state, spec, slots, conv_w, rows, k1, h, d)
     torch.cuda.synchronize()
-    for name, a, b in zip(("q", "k", "v"), got[:3], want[:3]):
+    for name, a, b in zip(("q", "k", "v"), got[:3], want[:3], strict=True):
         assert a.shape == b.shape == (rows * (kp + k1), p), (name, a.shape)
         assert torch.equal(a, b), (name, (a.float() - b.float()).abs().max(), (a != b).float().mean())
     assert torch.equal(got[3], want[3]), "raw gates"
     assert torch.equal(got[4], want[4]), "raw betas"
     assert got[5].tolist() == want[5].tolist() == [max(0, min(int(length[s, 0]), kp)) - 1 for s in slots.tolist()]
-    for name, a, b in zip(("conv window", "prefix", "prefix gates", "prefix betas"), (conv_state, prefix, spec_g, spec_beta), want_pool):
+    names = ("conv window", "prefix", "prefix gates", "prefix betas")
+    for name, a, b in zip(names, (conv_state, prefix, spec_g, spec_beta), want_pool, strict=True):
         assert torch.equal(a, b), name
     # the no-op tokens: k = v = 0 and -1e4 raw gate / beta exactly where the prefix is past its length
     padded = torch.cat([pad, torch.zeros(rows, k1, dtype=torch.bool, device=DEV)], dim=1).reshape(-1)
@@ -121,7 +123,7 @@ def test_prep_is_capturable():
 
     def restore():
         torch.cuda.synchronize()
-        for x, y in zip(pool, before):
+        for x, y in zip(pool, before, strict=True):
             x.copy_(y)
         torch.cuda.synchronize()
 
@@ -136,9 +138,10 @@ def test_prep_is_capturable():
         with torch.cuda.graph(graph):
             got = kda_verify_prep(*args)
     torch.cuda.synchronize()
-    assert all(torch.equal(x, y) for x, y in zip(pool, before)), "the capture itself must not run the kernel"
+    unchanged = all(torch.equal(x, y) for x, y in zip(pool, before, strict=True))
+    assert unchanged, "the capture itself must not run the kernel"
     graph.replay()
     torch.cuda.synchronize()
-    for a, b in zip(got, want):
+    for a, b in zip(got, want, strict=True):
         assert torch.equal(a, b)
-    assert all(torch.equal(x, y) for x, y in zip(pool, pool_after_eager))
+    assert all(torch.equal(x, y) for x, y in zip(pool, pool_after_eager, strict=True))
