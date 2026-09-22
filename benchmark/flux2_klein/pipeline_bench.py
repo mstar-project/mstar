@@ -235,7 +235,7 @@ def run_throughput(engine, args, prompts: list[str]) -> dict:
         runs = []
         with VramPoller(args.vram_gpu) as vram:
             for _ in range(max(1, args.repeats)):
-                t0, latencies, index = time.perf_counter(), [], 0
+                t0, latencies, index, pipe_wall = time.perf_counter(), [], 0, 0.0
                 while index < args.n:
                     batch = min(concurrency, args.n - index)
                     tb = time.perf_counter()
@@ -244,19 +244,26 @@ def run_throughput(engine, args, prompts: list[str]) -> dict:
                         [args.seed + index + j for j in range(batch)],
                     )
                     latencies.extend([time.perf_counter() - tb] * batch)  # every image in the batch waited the batch
+                    pipe_wall += engine.last_pipe_s
                     index += batch
                 wall = time.perf_counter() - t0
-                runs.append({"wall_s": wall, "images_per_s": args.n / wall, "request_latency": _summary(latencies)})
+                runs.append({
+                    "wall_s": wall, "images_per_s": args.n / wall, "request_latency": _summary(latencies),
+                    "pipe_wall_s": pipe_wall, "images_per_s_pipeline": args.n / pipe_wall,
+                })
         rates = sorted(r["images_per_s"] for r in runs)
+        pipeline_rates = sorted(r["images_per_s_pipeline"] for r in runs)
         results[str(concurrency)] = {
             "concurrency": concurrency, "images": args.n, "repeats": len(runs),
             "images_per_s": statistics.median(rates), "images_per_s_min": rates[0], "images_per_s_max": rates[-1],
+            "images_per_s_pipeline": statistics.median(pipeline_rates),
             "wall_s": statistics.median(r["wall_s"] for r in runs),
             "request_latency": runs[len(runs) // 2]["request_latency"], "runs": runs,
             "peak_vram_mib": vram.peak_mib,
         }
         print(f"throughput concurrency={concurrency}: {statistics.median(rates):.3f} images/s "
-              f"(median of {len(runs)}; min {rates[0]:.3f}, max {rates[-1]:.3f})", flush=True)
+              f"(median of {len(runs)}; min {rates[0]:.3f}, max {rates[-1]:.3f}; pipeline only "
+              f"{statistics.median(pipeline_rates):.3f})", flush=True)
     return {"mode": "throughput", "by_concurrency": results, "observed_output_format": "png"}
 
 
