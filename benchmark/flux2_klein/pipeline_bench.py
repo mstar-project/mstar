@@ -231,8 +231,32 @@ def run_latency(engine, args, prompts: list[str]) -> dict:
 def run_throughput(engine, args, prompts: list[str]) -> dict:
     results = {}
     for concurrency in args.concurrency:
-        engine.generate(prompts[:concurrency], list(range(args.seed, args.seed + concurrency)))  # warm the batch shape
-        runs = []
+        try:
+            results[str(concurrency)] = _throughput_level(engine, args, prompts, concurrency)
+        except Exception as exc:  # noqa: BLE001 - one level failing (OOM at a large batch) must not lose the others
+            print(f"throughput concurrency={concurrency}: FAILED {type(exc).__name__}: {str(exc)[:300]}", flush=True)
+            results[str(concurrency)] = {
+                "concurrency": concurrency, "images": args.n, "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+            }
+            _free_gpu_memory()
+    return {"mode": "throughput", "by_concurrency": results, "observed_output_format": "png"}
+
+
+def _free_gpu_memory() -> None:
+    try:
+        import torch
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _throughput_level(engine, args, prompts: list[str], concurrency: int) -> dict:
+    """One concurrency level: warm the batch shape, then ``--repeats`` timed passes over ``--n`` images."""
+    engine.generate(prompts[:concurrency], list(range(args.seed, args.seed + concurrency)))  # warm the batch shape
+    runs = []
+    if True:
         with VramPoller(args.vram_gpu) as vram:
             for _ in range(max(1, args.repeats)):
                 t0, latencies, index, pipe_wall = time.perf_counter(), [], 0, 0.0
@@ -253,7 +277,7 @@ def run_throughput(engine, args, prompts: list[str]) -> dict:
                 })
         rates = sorted(r["images_per_s"] for r in runs)
         pipeline_rates = sorted(r["images_per_s_pipeline"] for r in runs)
-        results[str(concurrency)] = {
+        level = {
             "concurrency": concurrency, "images": args.n, "repeats": len(runs),
             "images_per_s": statistics.median(rates), "images_per_s_min": rates[0], "images_per_s_max": rates[-1],
             "images_per_s_pipeline": statistics.median(pipeline_rates),
@@ -264,7 +288,7 @@ def run_throughput(engine, args, prompts: list[str]) -> dict:
         print(f"throughput concurrency={concurrency}: {statistics.median(rates):.3f} images/s "
               f"(median of {len(runs)}; min {rates[0]:.3f}, max {rates[-1]:.3f}; pipeline only "
               f"{statistics.median(pipeline_rates):.3f})", flush=True)
-    return {"mode": "throughput", "by_concurrency": results, "observed_output_format": "png"}
+        return level
 
 
 def main() -> None:
