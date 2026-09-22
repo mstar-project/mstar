@@ -17,7 +17,8 @@ def test_from_env_parses_windows_and_rank_filter(tmp_path):
     assert StepProfiler.from_env("worker_3", env) is not None and StepProfiler.from_env("worker_0", env) is None
     env["MSTAR_TORCH_PROFILE_RANKS"] = "all"
     assert StepProfiler.from_env("worker_7", env).tag == "worker_7"
-    assert StepProfiler.from_env("worker_0", {"MSTAR_TORCH_PROFILE": "2:3", "MSTAR_TORCH_PROFILE_WALK": "prefill"}).graph_walk == "prefill"
+    env = {"MSTAR_TORCH_PROFILE": "2:3", "MSTAR_TORCH_PROFILE_WALK": "prefill"}
+    assert StepProfiler.from_env("worker_0", env).graph_walk == "prefill"
     assert StepProfiler.from_env("worker_0", {}) is None
 
 
