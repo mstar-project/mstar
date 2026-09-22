@@ -39,16 +39,15 @@ from mstar.model.components.expert_sharding import ExpertSharding
 from mstar.model.kimi_k3.components.common import (
     KimiRMSNorm,
     SiTUAndMul,
+    fused_decode_kernels,
     replicated_loader,
     restore_kept_dtypes,
 )
+from mstar.model.kimi_k3.components.router_kernel import fused_route, fused_route_supported, gate_logits
 from mstar.model.kimi_k3.reference.moe import routed_experts_loop
 from mstar.model.kimi_k3.reference.mxfp4 import MXFP4_GROUP, dequant_mxfp4
-from mstar.model.kimi_k3.components.common import fused_decode_kernels
-from mstar.utils.streams import Fork
-from mstar.model.kimi_k3.components.router_kernel import fused_route, fused_route_supported, gate_logits
 from mstar.model.kimi_k3.reference.router import noaux_tc_route
-
+from mstar.utils.streams import Fork
 
 # stacked-shard rules for the merged input projection; the shared-expert rules must precede the
 # generic ``.gate_proj -> .gate_up_proj`` rules of the dense MLPs in the model's rule list
