@@ -9,6 +9,11 @@ The other half is where the cache stays shut: above one rank, because the ranks
 walk their indexes independently and would match different lengths; and for a
 model that names no checkpoint, until the deployment sets a salt, because two
 builds that differ only in their weights would share every key.
+
+Where it opens, the engine says so, and warns a cache with no host pages: a
+cached prompt reserves none of its pages, so nothing bounds how many requests
+decode at once, and with nothing to offload a full pool holds them until they
+time out.
 """
 
 from __future__ import annotations
@@ -32,6 +37,10 @@ from mstar.model.base import PrefixStream
 
 KV = "kv"
 ROPE = "rope"
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the host pool pins its memory"
+)
 
 
 class _StubTransfer:
@@ -235,6 +244,55 @@ def test_the_index_opens_empty():
 
     assert kv._index is not None, "the cache was asked to open and did not"
     assert kv._index.lookup([b"anything"]) == [], "the index opened with entries"
+
+
+# ── what the engine says when it opens ──────────────────────────────────
+
+
+def _said_at_load(caplog, kv, model) -> tuple[list[str], list[str]]:
+    """The engine's info and warning lines from opening ``kv``."""
+    with caplog.at_level(logging.INFO, logger=Engine.__module__):
+        _root(kv=kv, model=model)
+    said = [r for r in caplog.records if r.name == Engine.__module__]
+    return (
+        [r.getMessage() for r in said if r.levelno == logging.INFO],
+        [r.getMessage() for r in said if r.levelno == logging.WARNING],
+    )
+
+
+@requires_cuda
+def test_a_keyed_node_with_host_pages_says_what_opened_and_no_more(caplog):
+    info, warnings = _said_at_load(
+        caplog, _kv(prefix_cache_salt="deployment", cpu_offload_pages=4), _Declaring(),
+    )
+
+    assert len(info) == 1 and "main" in info[0] and "LLM" in info[0], (
+        "the cache opened without saying which label it keys on which node"
+    )
+    assert warnings == [], "a cache with host pages to offload to was warned it had none"
+
+
+def test_a_keyed_node_without_host_pages_is_warned_its_decode_can_hold(caplog):
+    info, warnings = _said_at_load(caplog, _kv(prefix_cache_salt="deployment"), _Declaring())
+
+    assert len(info) == 1 and "main" in info[0] and "LLM" in info[0], (
+        "the cache opened without saying which label it keys on which node"
+    )
+    assert len(warnings) == 1 and "cpu_offload_pages" in warnings[0], (
+        "a cache with nothing to offload opened without saying a full pool "
+        "holds its decode until the requests time out"
+    )
+
+
+@pytest.mark.parametrize("overrides, model", [
+    ({}, _Model), ({"prefix_cache": False}, _Declaring),
+], ids=["nothing declared", "cache off"])
+def test_an_uncached_node_says_nothing_at_load(caplog, overrides, model):
+    info, warnings = _said_at_load(caplog, _kv(**overrides), model())
+
+    assert info == [] and warnings == [], (
+        "a node with no cache in use logged one, or a warning about one"
+    )
 
 
 # ── the keys the request brought ────────────────────────────────────────
