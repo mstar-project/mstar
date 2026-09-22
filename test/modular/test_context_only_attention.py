@@ -28,7 +28,8 @@ def _cfg():
 
 
 def test_context_only_views_drop_the_appended_tail():
-    views = [SequenceView("a", "main", [3, 7, 1], length=8, to_compute=3), SequenceView("b", "main", [4, 2], length=6, to_compute=3)]
+    views = [SequenceView("a", "main", [3, 7, 1], length=8, to_compute=3),
+             SequenceView("b", "main", [4, 2], length=6, to_compute=3)]
     out = context_only_views(views, [2, 2], PAGE)
     assert out[0].length == 5 and out[0].to_compute == 2 and out[0].page_idxs == [3, 7]
     assert out[1].length == 3 and out[1].to_compute == 2 and out[1].page_idxs == [4]
