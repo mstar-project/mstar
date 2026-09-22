@@ -94,7 +94,9 @@ def test_marlin_backend_replays_in_cuda_graph():
         x2 = torch.randn(3, hidden, device=DEV, dtype=torch.bfloat16)
         z2 = moe.routed_down(x2)
         idx2, w2 = moe.gate(x2)
-        static_z.copy_(z2); static_idx.copy_(idx2); static_w.copy_(w2)
+        static_z.copy_(z2)
+        static_idx.copy_(idx2)
+        static_w.copy_(w2)
         g.replay()
         torch.cuda.synchronize()
         expect = moe._routed(z2, idx2, w2)
@@ -278,5 +280,6 @@ def test_bf16_path_warm_up_prepares_the_shared_buffers():
     keys = [k for k in _BF16_BUFFERS if k[:3] == shape]
     assert took > 0 and len(keys) == 1, (took, keys)
     w13, w2 = _BF16_BUFFERS[keys[0]]
-    assert w13.shape == (moe.num_experts, 2 * moe.inter_local, moe.latent_size) and w2.shape == (moe.num_experts, moe.latent_size, moe.inter_local)
+    assert w13.shape == (moe.num_experts, 2 * moe.inter_local, moe.latent_size)
+    assert w2.shape == (moe.num_experts, moe.latent_size, moe.inter_local)
     be.bf16_min_tokens = type(be).bf16_min_tokens
