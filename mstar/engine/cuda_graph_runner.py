@@ -629,7 +629,10 @@ class CudaGraphRunner:
             # — and the buffer is shared, so its layout cannot vary anyway
             seq_dim = self._static_buffer_seq_dims[buf_key]
         else:
-            seq_dim = self._seq_dim(value, seq_len)
+            # a config that knows its layout says so (``static_seq_dims``); the
+            # size-matching guess is only for the ones that don't
+            declared = self._capture_configs[config_idx].static_seq_dims.get(key)
+            seq_dim = declared if declared is not None else self._seq_dim(value, seq_len)
             self._static_buffer_seq_dims[buf_key] = seq_dim
         stored = value.movedim(seq_dim, 0) if seq_dim != 0 else value
         shared = self._shared_static_buffers.get(buf_key)
