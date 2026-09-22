@@ -216,7 +216,8 @@ class FlashInferMLAManager(AttentionManager):
         # MSTAR_MLA_DECODE_BACKEND=flashmla asks for it; measured no faster than FlashInfer's Hopper kernel
         # on an H100 at 1 to 64 rows, so FlashInfer stays the default
         self._flashmla = (flashmla_wanted() and flashmla_available()
-                          and flashmla_supports(kv_config.kv_lora_rank, kv_config.qk_rope_head_dim, kv_config.page_size))
+                          and flashmla_supports(kv_config.kv_lora_rank, kv_config.qk_rope_head_dim,
+                                                kv_config.page_size))
         if self._flashmla:
             logger.info("MLA attention: FlashMLA serves the decode plans of %r", kv_cache)
         if sm_scale is None:
@@ -241,7 +242,8 @@ class FlashInferMLAManager(AttentionManager):
 
     def _flashmla_kwargs(self) -> dict:
         k = self._wrapper_kwargs
-        return dict(num_qo_heads=k["num_qo_heads"], kv_lora_rank=k["kv_lora_rank"], qk_rope_head_dim=k["qk_rope_head_dim"],
+        return dict(num_qo_heads=k["num_qo_heads"], kv_lora_rank=k["kv_lora_rank"],
+                    qk_rope_head_dim=k["qk_rope_head_dim"],
                     page_size=k["page_size"], sm_scale=k["sm_scale"], device=k["device"],
                     max_pages_per_row=-(-int(self._kv_config.max_seq_len) // int(k["page_size"])))
 
