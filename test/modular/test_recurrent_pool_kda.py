@@ -238,7 +238,8 @@ def test_capture_rows_take_no_slots():
     rids = [f"__cg_LLM_0_slot1_{i}__" for i in range(8)]  # more rows than the pool has slots
     for rid in rids:
         runner.ingest_request(rid)
-    s = SubmoduleStep(segments=[Segment(rid, "main", 1) for rid in rids], steps={POOL: RecurrentStep(), ATTN: LinearAttnStep()})
+    s = SubmoduleStep(segments=[Segment(rid, "main", 1) for rid in rids],
+                      steps={POOL: RecurrentStep(), ATTN: LinearAttnStep()})
     ctx = StepContext(request_ids=rids, graph_walk="decode", slot=1, capture=True,
                       slot_lease=SlotLease(bucket=BucketKey(bs=8, num_tokens=8, graph_walk="decode"), slot=1))
     s.set_ctx(ctx)
