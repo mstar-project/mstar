@@ -133,6 +133,7 @@ pub struct RoutedEdge {
     /// goes out on the wire instead -- staged, counted and sent like any
     /// remote edge, as Python does.
     pub declined_local: bool,
+    pub worker: Option<Sym>,
 }
 
 fn routed(e: &EdgeSpec, tensors: Vec<TensorRef>) -> RoutedEdge {
@@ -140,6 +141,7 @@ fn routed(e: &EdgeSpec, tensors: Vec<TensorRef>) -> RoutedEdge {
         name: e.name, dest: e.dest, dest_sym: e.dest_sym, persist: e.persist,
         new_token: e.new_token, streaming: e.streaming, modality: e.modality,
         tensors, persist_for_loop: false, declined_local: false,
+        worker: None,
     }
 }
 
@@ -599,6 +601,7 @@ impl RequestState {
                 persist: false, new_token: false,
                 streaming: false, modality: 0, tensors: t,
                 persist_for_loop: true, declined_local: false,
+                worker: None,
             });
         }
     }

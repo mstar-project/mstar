@@ -1097,6 +1097,37 @@ def test_a_stream_to_a_sibling_graph_is_reported_local(streams_to_sibling):
     assert _ready(rt) == []
 
 
+def test_a_sibling_graph_chunk_is_held_once_not_twice(streams_to_sibling):
+    """One local reader, so one release frees it.
+
+    The edge compiles to External, and the fanout names THIS worker -- so the
+    post-fanout count and the local ingest are the same copy. Counting the
+    fanout destination on top of local_counts settles the hold to 2, and the
+    tensor is never collected.
+    """
+    rt, book, store = streams_to_sibling
+    rid = rt.add_request(
+        request_id="r1", partition="default", graph_walk=WALK,
+        partition_worker_graph_ids=[0, 1],
+        worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+    )
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("text_inputs", "LLM")]))
+    rt.pop_rids("LLM", WALK, [rid])
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)
+    rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="LLM",
+            output_signals=["new_token"],
+            wg_ids=ParallelList([rid], [0]),
+            tensors=[1], num_tensors=[1],
+        ),
+        store,
+    )
+    book.dereference(1, 1)
+    assert book.can_gc(1), "still held after its only reader released"
+
+
 def test_the_speculation_target_reports_its_output_signals(pair):
     """A speculated batch never goes through pop_rids, so the target carries
     the names instead -- left empty, completion routes none of the node's

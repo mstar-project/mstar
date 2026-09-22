@@ -211,6 +211,28 @@ pub struct GraphRuntime {
         uuids.iter().filter_map(|u| bk.info_raw(*u).cloned()).collect()
     }
 
+    /// The same descriptors, cut down to what THIS destination should see.
+    ///
+    /// The bookkeeper holds the whole tensor; the fanout decided each
+    /// destination's slice of it and recorded it on the ref. Python does this
+    /// in `fanout_graph_edges`, which clones the info and overwrites exactly
+    /// these three fields -- so an unsharded edge, whose ref still spans the
+    /// whole thing, comes out unchanged.
+    fn sliced_infos(&self, refs: &[TensorRef]) -> Vec<crate::tensors::TensorPointerInfo> {
+        let bk = self.bookkeeping.lock().unwrap();
+        refs.iter()
+            .filter_map(|r| {
+                let mut i = bk.info_raw(r.uuid).cloned()?;
+                if let Some(d) = i.dims.first_mut() {
+                    *d = r.dim0;
+                }
+                i.nbytes = r.nbytes;
+                i.offset = r.offset;
+                Some(i)
+            })
+            .collect()
+    }
+
     /// Send, or drop on the floor when this runtime has no transport. Silence
     /// is right for the no-transport case: the frame builders are exercised
     /// without a socket, and the worker's flag gate already refuses to pair
@@ -458,6 +480,7 @@ pub struct GraphRuntime {
                 tensors: vec![],
                 persist_for_loop: false,
                 declined_local: false,
+                worker: None,
             })
             .collect();
         let state = self.state_mut(wg, rid)?;
@@ -659,6 +682,7 @@ pub struct GraphRuntime {
                 new_token: e.new_token, streaming: e.streaming,
                 modality: e.modality, tensors: vec![],
                 persist_for_loop: false, declined_local: false,
+                worker: None,
             })
             .collect();
         state.ingest_for_speculation(curr_node, &source_edges);
@@ -879,18 +903,35 @@ fn e_persist(edges: &[RoutedEdge], uuid: u64) -> bool {
         .any(|e| e.persist && e.tensors.iter().any(|t| t.uuid == uuid))
 }
 
+/// One edge, bound for one worker. Post-fanout, so a signal read by several
+/// workers is several of these.
+pub struct WireEdge {
+    pub rid: u32,
+    pub worker: String,
+    pub signal: String,
+    pub next_node: String,
+    /// The REFS, not bare uuids: the fanout may have sliced them for this
+    /// destination, and the bookkeeper still holds the whole tensor. Looking
+    /// the descriptor up by uuid alone would put the unsliced dims back on
+    /// the wire.
+    pub tensors: Vec<TensorRef>,
+    pub streaming: bool,
+    pub shard_dim: Option<u32>,
+    pub total_fanin: u32,
+}
+
 /// What a completion has to send. Grouped by kind rather than by message so
 /// the caller builds one frame per (worker, rid) instead of per edge.
 #[pyclass]
 #[derive(Default)]
 pub struct SendPlan {
     #[pyo3(get)] pub partition: String,
-    /// (rid, worker, signal, next_node, uuids, is_streaming)
-    #[pyo3(get)] pub to_workers: Vec<(u32, String, String, String, Vec<u64>, bool)>,
-    /// (rid, signal, uuids)
+    pub to_workers: Vec<WireEdge>,
+    /// (rid, signal, uuids). Python's `to_conductor` is built BEFORE the
+    /// fanout, so a persist signal reports the whole tensor.
     #[pyo3(get)] pub persist: Vec<(u32, String, Vec<u64>)>,
-    /// (rid, signal, modality, uuids)
-    #[pyo3(get)] pub emit: Vec<(u32, String, String, Vec<u64>)>,
+    /// (rid, signal, modality, tensors) -- sliced, as to_workers is.
+    pub emit: Vec<(u32, String, String, Vec<TensorRef>)>,
     /// (rid, finished worker graph ids, is_first_tp_rank)
     #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool)>,
 }
@@ -1825,26 +1866,32 @@ impl GraphRuntime {
             };
             // Before complete(), which clears the flag.
             let was_speculative = state.is_spec_scheduled(node);
-            let (mut pre_shard_edges, _filtered, freed_inputs) = state.complete(node, &out_tensors);
+            let (pre_shard_edges, _filtered, freed_inputs) = state.complete(node, &out_tensors);
             let me_sym = self.shard.me;
             let mut edges = if let Some(info) = &self.requests[rid as usize] {
                 if let Some(sharding) = &info.shard {
                     let mut sharded_edges: Vec<RoutedEdge> = vec![];
-                    let mut shards: Vec<FanoutDest> = vec![];
                     for edge in &pre_shard_edges {
                         let dst_walk = if edge.streaming {
                             None
                         } else { Some(walk) };
+                        let mut shards: Vec<FanoutDest> = vec![];
                         sharding.fanout(
                             edge.name, node,
                             walk, edge.dest_sym,
                             dst_walk, &edge.tensors,
                             &mut shards
                         );
-                        for shard in &shards {
+                        for shard in shards {
                             let mut new_edge = edge.clone();
-                            if shard.worker != me_sym && edge.dest.is_to_worker() {
-                                new_edge.dest = Dest::External(edge.dest_sym);
+                            new_edge.tensors = shard.tensors;
+                            if edge.dest.is_to_worker() {
+                                new_edge.worker = Some(shard.worker);
+                                // A peer's copy cannot be ingested here, so a
+                                // Local dest has to become a wire send.
+                                if shard.worker != me_sym {
+                                    new_edge.dest = Dest::External(edge.dest_sym);
+                                }
                             }
                             sharded_edges.push(new_edge);
                         }
@@ -2040,7 +2087,8 @@ impl GraphRuntime {
             // drops it before the count.
             let edge_refs: Vec<i64> = edges
                 .iter()
-                .map(|e| {
+                .zip(&ingested_locally)
+                .map(|(e, &is_local)| {
                     if e.persist {
                         return 0;
                     }
@@ -2056,15 +2104,24 @@ impl GraphRuntime {
                         // the same by popping its own id out of the fanout.
                         Dest::External(d) => walk_sym
                             .and_then(|w| {
-                                let workers =
-                                    self.info(rid)?.node_to_workers.get(&(d, w))?;
-                                let mine = self.node_owner.contains_key(&(w, d));
-                                Some(
-                                    workers
-                                        .iter()
-                                        .filter(|&&x| !(mine && x == me_sym))
-                                        .count(),
-                                )
+                                if let Some(dst) = e.worker {
+                                    // Post-fanout: this edge IS one
+                                    // destination. Ours only when nothing
+                                    // ingested it -- otherwise local_counts
+                                    // already has it, and take_send_plan
+                                    // skips the self-send.
+                                    Some(usize::from(!(dst == me_sym && is_local)))
+                                } else {
+                                    let workers =
+                                        self.info(rid)?.node_to_workers.get(&(d, w))?;
+                                    let mine = self.node_owner.contains_key(&(w, d));
+                                    Some(
+                                        workers
+                                            .iter()
+                                            .filter(|&&x| !(mine && x == me_sym))
+                                            .count(),
+                                    )
+                                }
                             })
                             .unwrap_or(0) as i64,
                     }
@@ -2292,16 +2349,17 @@ impl GraphRuntime {
         // One frame per (request, worker): the plan is per edge, and a worker
         // taking several of a request's signals should see one message.
         let mut grouped: Vec<((u32, String), Vec<frames::OutEdge>)> = Vec::new();
-        for (rid, worker, signal, next_node, uuids, streaming) in plan.to_workers {
-            let infos = self.infos(&uuids);
-            let key = (rid, worker);
+        for w in plan.to_workers {
+            let infos = self.sliced_infos(&w.tensors);
+            let key = (w.rid, w.worker);
+            let edge = frames::OutEdge {
+                name: w.signal, next_node: w.next_node,
+                is_streaming: w.streaming, infos,
+                shard_dim: w.shard_dim, total_fanin: w.total_fanin,
+            };
             match grouped.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, edges)) => edges.push(frames::OutEdge {
-                    name: signal, next_node, is_streaming: streaming, infos,
-                }),
-                None => grouped.push((key, vec![frames::OutEdge {
-                    name: signal, next_node, is_streaming: streaming, infos,
-                }])),
+                Some((_, edges)) => edges.push(edge),
+                None => grouped.push((key, vec![edge])),
             }
         }
         for ((rid, worker), edges) in &grouped {
@@ -2320,10 +2378,10 @@ impl GraphRuntime {
             self.dispatch(worker, &bytes)?;
         }
 
-        for (rid, signal, modality, uuids) in plan.emit {
+        for (rid, signal, modality, refs) in plan.emit {
             let request_id = self.rid_name(rid)?;
             let sig = self.interner.intern(&signal);
-            let infos = self.infos(&uuids);
+            let infos = self.sliced_infos(&refs);
             let loop_indices = nested.get(&rid).cloned();
             if let Some(info) = self.requests[rid as usize].as_mut() {
                 info.pending.output_signals.push(sig);
@@ -2460,8 +2518,29 @@ impl GraphRuntime {
             ..Default::default()
         };
 
+        let src_node = self.interner.get(&c.node_name);
         for (rid, edges) in c.routing {
             let walk = self.interner.get(&c.graph_walk);
+            // What the receiver needs to put a sharded arrival back together.
+            // Python stamps both in fanout_graph_edges, on the sending side.
+            let sharding = self.requests[rid as usize]
+                .as_ref()
+                .and_then(|i| i.shard.as_ref());
+            let wire_shape = |signal: Sym, dest: Sym, streaming: bool, worker: Sym| {
+                match (sharding, src_node, walk) {
+                    (Some(sh), Some(src), Some(w)) => (
+                        sh.shard_dim_of(signal),
+                        // The same walk convention the fanout used: a
+                        // streaming consumer is resolved walk-independently.
+                        sh.fanin(
+                            signal, src, w, dest,
+                            if streaming { None } else { Some(w) },
+                            worker,
+                        ),
+                    ),
+                    _ => (None, 1),
+                }
+            };
             for e in edges {
                 let uuids: Vec<u64> = e.tensors.iter().map(|t| t.uuid).collect();
                 let name = self.interner.name(e.name).to_string();
@@ -2473,15 +2552,19 @@ impl GraphRuntime {
                         rid,
                         name.clone(),
                         self.interner.name(e.modality).to_string(),
-                        uuids.clone(),
+                        e.tensors.clone(),
                     )),
                     Dest::External(dest) => {
                         // Who runs that node for THIS request.
-                        let workers = walk
-                            .and_then(|w| {
-                                self.info(rid)?.node_to_workers.get(&(dest, w)).cloned()
-                            })
-                            .unwrap_or_default();
+                        let workers = if let Some(w) = e.worker {
+                            vec![w]
+                        } else {
+                            walk
+                                .and_then(|w| {
+                                    self.info(rid)?.node_to_workers.get(&(dest, w)).cloned()
+                                })
+                                .unwrap_or_default()
+                        };
                         // Skip ourselves when the node lives in a local worker
                         // graph: complete_and_route_batch already ingested it
                         // there, and a self-send would arrive for a slot that
@@ -2499,14 +2582,18 @@ impl GraphRuntime {
                             if mine && worker == me_sym {
                                 continue;
                             }
-                            plan.to_workers.push((
+                            let (shard_dim, total_fanin) =
+                                wire_shape(e.name, dest, e.streaming, worker);
+                            plan.to_workers.push(WireEdge {
                                 rid,
-                                self.interner.name(worker).to_string(),
-                                name.clone(),
-                                self.interner.name(dest).to_string(),
-                                uuids.clone(),
-                                e.streaming,
-                            ));
+                                worker: self.interner.name(worker).to_string(),
+                                signal: name.clone(),
+                                next_node: self.interner.name(dest).to_string(),
+                                tensors: e.tensors.clone(),
+                                streaming: e.streaming,
+                                shard_dim,
+                                total_fanin,
+                            });
                         }
                     }
                     // Refused locally, so send it to the node's owner like
@@ -2520,14 +2607,18 @@ impl GraphRuntime {
                             })
                             .unwrap_or_default();
                         for worker in workers {
-                            plan.to_workers.push((
+                            let (shard_dim, total_fanin) =
+                                wire_shape(e.name, dest, e.streaming, worker);
+                            plan.to_workers.push(WireEdge {
                                 rid,
-                                self.interner.name(worker).to_string(),
-                                name.clone(),
-                                self.interner.name(dest).to_string(),
-                                uuids.clone(),
-                                e.streaming,
-                            ));
+                                worker: self.interner.name(worker).to_string(),
+                                signal: name.clone(),
+                                next_node: self.interner.name(dest).to_string(),
+                                tensors: e.tensors.clone(),
+                                streaming: e.streaming,
+                                shard_dim,
+                                total_fanin,
+                            });
                         }
                     }
                     Dest::Local(_) | Dest::Empty => {}

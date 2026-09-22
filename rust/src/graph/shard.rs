@@ -309,6 +309,51 @@ impl ShardMap {
             });
         }
     }
+
+    /// Python's `compute_fanin`: how many SOURCE ranks contribute to the copy
+    /// this destination rank ends up holding.
+    ///
+    /// Rides the wire as `_total_fanin`, which is what tells the receiver to
+    /// buffer the arrival until the other contributors land. Left at 1, a
+    /// gather (source tp > dest tp) takes whichever half arrives first and
+    /// drops the rest, silently.
+    ///
+    /// The receiver could derive this -- every descriptor carries
+    /// `source_tp_size` -- but Python computes it here, and Python is the
+    /// oracle.
+    pub fn fanin(
+        &self,
+        signal: Sym,
+        src: Sym,
+        src_walk: Sym,
+        dst: Sym,
+        dst_walk: Option<Sym>,
+        dst_worker: Sym,
+    ) -> u32 {
+        // Replicated: whoever sends it sends the whole thing.
+        if !self.shard_dim.contains_key(&signal) {
+            return 1;
+        }
+        let src_tp = self.group_of(src, Some(src_walk)).map_or(1, |g| g.tp_size);
+        let dg = self.group_of(dst, dst_walk);
+        // A special destination (the client) has no group: tp 1 at rank 0.
+        let dest_tp = dg.map_or(1, |g| g.tp_size);
+        let dest_rank = dg
+            .and_then(|g| g.workers.iter().position(|&w| w == dst_worker))
+            .unwrap_or(0) as u32;
+        // Scaled integer coords, so the total span is src_tp * dest_tp and
+        // both sides divide it evenly.
+        let lo = dest_rank * src_tp;
+        let hi = lo + src_tp;
+        (0..src_tp)
+            .filter(|r| r * dest_tp < hi && (r + 1) * dest_tp > lo)
+            .count() as u32
+    }
+
+    /// The signal's shard dim, if it has one. `_shard_dim` on the wire.
+    pub fn shard_dim_of(&self, signal: Sym) -> Option<u32> {
+        self.shard_dim.get(&signal).copied()
+    }
 }
 
 #[cfg(test)]

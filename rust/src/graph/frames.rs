@@ -225,8 +225,10 @@ fn graph_edge(
     modality: &str,
     is_streaming: bool,
     infos: &[TensorPointerInfo],
+    shard_dim: Option<u32>,
+    total_fanin: u32,
 ) -> Value {
-    Value::Map(vec![
+    let mut m = vec![
         (s("next_node"), s(next_node)),
         (s("name"), s(name)),
         (
@@ -239,8 +241,14 @@ fn graph_edge(
         (s("output_modality"), s(modality)),
         (s("_persist_for_loop"), false.into()),
         (s("_final_stream_chunk"), false.into()),
-        (s("_total_fanin"), 1.into()),
-    ])
+        (s("_total_fanin"), total_fanin.into()),
+    ];
+    // `_shard_dim` defaults to None, and wire.py omits a None-with-a-default,
+    // so a replicated signal must NOT carry the key at all.
+    if let Some(d) = shard_dim {
+        m.push((s("_shard_dim"), d.into()));
+    }
+    Value::Map(m)
 }
 
 /// One edge on an INPUT_SIGNALS frame.
@@ -249,6 +257,10 @@ pub struct OutEdge {
     pub next_node: String,
     pub is_streaming: bool,
     pub infos: Vec<TensorPointerInfo>,
+    /// Both stamped by the sender's fanout, as Python does it. They tell the
+    /// receiver how to put a sharded signal back together.
+    pub shard_dim: Option<u32>,
+    pub total_fanin: u32,
 }
 
 /// INPUT_SIGNALS to a peer worker. One frame per (request, worker): the plan
@@ -275,7 +287,7 @@ impl InputSignals<'_> {
                         .map(|e| {
                             graph_edge(
                                 bk, &e.name, &e.next_node, "", e.is_streaming,
-                                &e.infos,
+                                &e.infos, e.shard_dim, e.total_fanin,
                             )
                         })
                         .collect(),
@@ -314,7 +326,7 @@ impl ResultTensors<'_> {
                 s("graph_edge"),
                 graph_edge(
                     bk, self.signal, EMIT_TO_CLIENT, self.modality, false,
-                    &self.infos,
+                    &self.infos, None, 1,
                 ),
             ),
             (

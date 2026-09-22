@@ -468,3 +468,169 @@ def test_a_speculative_completion_does_not_report_the_partition_done(tmp_path):
     mesh.rt.set_speculatively_scheduled("only", WG_ID, [rid], True)
     body = mesh.run(rid, uuids=[])["conductor"][0].body
     assert not body.partition_done, "a speculative pass reported done"
+
+
+# --- the fanout reaches each destination worker once, with its own slice -----
+
+P2 = "worker_2"
+
+
+def _fanout_mesh(tmp_path, shard_dim=None):
+    """A tp1 source feeding a tp2 destination group on two peers.
+
+    The case the same-group edges never exercise: source and destination in
+    DIFFERENT groups, so the fanout really does name more than one worker.
+    """
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    boxes = {p: ZmqCommunicator(p, str(tmp_path)) for p in (PEER, P2)}
+    wg = {"wg_id": WG_ID, "graph_walks": [WALK], "loops": [],
+          "nodes": [_node("src", ["prompt"], [("out", "sink", False)])]}
+    rt = GraphRuntime(
+        worker_graphs=[wg],
+        remote_worker_graphs=[{"wg_id": 1, "graph_walks": [WALK],
+                               "nodes": ["sink"], "dyn_loops": []}],
+        sharding={
+            "groups": [
+                {"nodes": ["src"], "tp_size": 1,
+                 "graph_walks": None, "tp_rank": 0},
+                {"nodes": ["sink"], "tp_size": 2,
+                 "graph_walks": None, "tp_rank": 0},
+            ],
+            "shard_dim": [] if shard_dim is None else [("out", shard_dim)],
+            "tp_enabled_nodes": [], "sp_enabled_nodes": [],
+        },
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [ME, PEER, P2],
+                         [1, 2])
+    # 4 rows of 6 bytes.
+    book.put_tensor(1, _info(1, dims=[4, 3], nbytes=24))
+    book.increment_ref(1, 1)
+
+    rt.ingest_inputs_batch([rid], [{
+        "signal": "prompt", "next_node": "src", "uuids": [],
+        "is_final_streaming_chunk": False,
+    }])
+    rt.pop_rids("src", WALK, [rid])
+    out = rt.complete_and_route_batch({
+        "partition": "default", "graph_walk": WALK, "node_name": "src",
+        "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
+        "tensors": [1], "num_tensors": [1],
+    })
+    rt.send_outputs(
+        completion_id=out.completion_id, request_infos=[(rid, None)],
+        new_token_counts=[], nested=[], stream_tokens_consumed=[],
+        profiling=[],
+    )
+    return book, {p: _collect(box, first_wait_ms=600) for p, box in boxes.items()}
+
+
+def test_a_replicated_edge_reaches_each_worker_exactly_once(tmp_path):
+    """The fanout names two workers, and take_send_plan expands per worker
+    too. Doing both turns one edge into four sends -- which arrive as the
+    signal listed twice in one frame, since frames group by (rid, worker)."""
+    _book, got = _fanout_mesh(tmp_path)
+    assert [e.name for e in got[PEER][0].body.inputs] == ["out"]
+    assert [e.name for e in got[P2][0].body.inputs] == ["out"]
+
+
+def test_each_destination_rank_gets_its_own_slice(tmp_path):
+    """The slice the fanout computed has to reach the WIRE. The bookkeeper
+    still holds the whole tensor, so a frame built from the uuid alone puts
+    the unsliced dims back on."""
+    _book, got = _fanout_mesh(tmp_path, shard_dim=0)
+    lo = got[PEER][0].body.inputs[0].tensor_info[0]
+    hi = got[P2][0].body.inputs[0].tensor_info[0]
+    # 4 rows split two ways: 2 rows each, the second starting 12 bytes in.
+    assert (lo.dims[0], lo.nbytes, lo.offset) == (2, 12, 0)
+    assert (hi.dims[0], hi.nbytes, hi.offset) == (2, 12, 12)
+
+
+def test_the_hold_settles_to_the_number_of_readers(tmp_path):
+    """Two workers read it, so it takes two releases to free -- counting the
+    post-fanout edges AND the per-worker expansion settles it to four, and
+    the tensor is never collected."""
+    book, _got = _fanout_mesh(tmp_path)
+    releases = 0
+    while not book._rust.can_gc(1) and releases < 8:
+        book._rust.dereference(1, 1)
+        releases += 1
+    assert releases == 2
+
+
+# --- what the receiver needs to reassemble a sharded arrival ----------------
+
+def _gather_mesh(tmp_path, src_tp, dest_tp, my_rank=0, shard_dim=0):
+    """A src_tp -> dest_tp edge, viewed from source rank `my_rank`."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    boxes = {p: ZmqCommunicator(p, str(tmp_path)) for p in (PEER, P2)}
+    wg = {"wg_id": WG_ID, "graph_walks": [WALK], "loops": [],
+          "nodes": [_node("src", ["prompt"], [("out", "sink", False)])]}
+    rt = GraphRuntime(
+        worker_graphs=[wg],
+        remote_worker_graphs=[{"wg_id": 1, "graph_walks": [WALK],
+                               "nodes": ["sink"], "dyn_loops": []}],
+        sharding={
+            "groups": [
+                {"nodes": ["src"], "tp_size": src_tp,
+                 "graph_walks": None, "tp_rank": my_rank},
+                {"nodes": ["sink"], "tp_size": dest_tp,
+                 "graph_walks": None, "tp_rank": 0},
+            ],
+            "shard_dim": [] if shard_dim is None else [("out", shard_dim)],
+            "tp_enabled_nodes": [], "sp_enabled_nodes": [],
+        },
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    srcs = [ME, PEER][:src_tp]
+    dests = [PEER, P2][:dest_tp]
+    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1],
+                         srcs + dests, [src_tp, dest_tp])
+    book.put_tensor(1, _info(1, dims=[4, 3], nbytes=24))
+    book.increment_ref(1, 1)
+    rt.ingest_inputs_batch([rid], [{
+        "signal": "prompt", "next_node": "src", "uuids": [],
+        "is_final_streaming_chunk": False,
+    }])
+    rt.pop_rids("src", WALK, [rid])
+    out = rt.complete_and_route_batch({
+        "partition": "default", "graph_walk": WALK, "node_name": "src",
+        "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
+        "tensors": [1], "num_tensors": [1],
+    })
+    rt.send_outputs(
+        completion_id=out.completion_id, request_infos=[(rid, None)],
+        new_token_counts=[], nested=[], stream_tokens_consumed=[],
+        profiling=[],
+    )
+    return {p: _collect(box, first_wait_ms=600) for p, box in boxes.items()}
+
+
+def test_a_gather_tells_the_receiver_to_wait_for_both_halves(tmp_path):
+    """src tp2 -> dest tp1: the one destination is fed by BOTH source ranks.
+
+    `tensors.py` only buffers shards when _total_fanin > 1, so left at 1 the
+    destination takes whichever half lands first and drops the other --
+    silently, with a full-looking tensor.
+    """
+    got = _gather_mesh(tmp_path, src_tp=2, dest_tp=1)
+    edge = got[PEER][0].body.inputs[0]
+    assert edge._total_fanin == 2
+    assert edge._shard_dim == 0
+
+
+def test_an_aligned_edge_has_no_fanin(tmp_path):
+    """tp2 -> tp2: each destination rank is fed by exactly one source rank."""
+    got = _gather_mesh(tmp_path, src_tp=2, dest_tp=2)
+    assert got[PEER][0].body.inputs[0]._total_fanin == 1
+
+
+def test_a_replicated_signal_carries_no_shard_dim(tmp_path):
+    """`_shard_dim` defaults to None and wire.py omits a None-with-a-default,
+    so the key must be absent rather than 0 -- 0 is a real dim."""
+    got = _gather_mesh(tmp_path, src_tp=1, dest_tp=1, shard_dim=None)
+    edge = got[PEER][0].body.inputs[0]
+    assert edge._shard_dim is None
+    assert edge._total_fanin == 1
