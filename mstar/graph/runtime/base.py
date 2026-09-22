@@ -215,6 +215,7 @@ class GraphRuntime(ABC):
     # back. ``SendInput.nested_loop_indices`` may then carry None.
     provides_nested_loop_indices: bool = False
 
+
     # --------- Bookkeeping ----------
     @abstractmethod
     def set_node_metadata(

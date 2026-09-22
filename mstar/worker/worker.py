@@ -2183,8 +2183,9 @@ class Worker:
             if rid not in valid_rids:
                 batch_N.batch.request_to_worker_graph.pop(rid, None)
 
-        # One crossing per rid, so skipped entirely when the runtime
-        # snapshots the loop context itself.
+        # One crossing per rid, so skipped entirely when the runtime keeps
+        # the loop context itself -- it snapshots at its own routing call,
+        # which is before the counters advance.
         per_req_nested_idxs = {} if (
             self._graph_runtime.provides_nested_loop_indices
         ) else {

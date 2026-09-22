@@ -650,3 +650,134 @@ def test_a_replicated_signal_carries_no_shard_dim(tmp_path):
     edge = got[PEER][0].body.inputs[0]
     assert edge._shard_dim is None
     assert edge._total_fanin == 1
+
+
+# --- loop indices come from the runtime's own snapshot ------------------------
+
+def _looping_emit_mesh(tmp_path):
+    """A looping node that emits, with a real transport.
+
+    The combination the other fixtures miss: `_Mesh` has no loop, `_loop_mesh`
+    never completes a worker graph. Without both at once nothing exercises a
+    loop-index-carrying frame built from the runtime's OWN snapshot, which is
+    where a timing bug in that snapshot hides.
+    """
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    inboxes = {p: ZmqCommunicator(p, str(tmp_path))
+               for p in ("conductor", "api_server", PEER)}
+    wg = {
+        "wg_id": WG_ID, "graph_walks": [WALK],
+        "nodes": [_node("ar_decode", ["token"],
+                        [("out", "emit_to_client", False),
+                         ("token", "ar_decode", False)])],
+        "loops": [{
+            "name": "ar_loop", "max_iters": 8, "parent": None,
+            "member_nodes": ["ar_decode"],
+            # EMPTY_DESTINATION: routed nowhere. A destination no worker
+            # runs is an error -- see test_an_output_nobody_runs_is_an_error.
+            "outputs": [{"name": "token", "dest": "", "persist": False,
+                         "new_token": False, "streaming": False,
+                         "modality": ""}],
+            "accumulated": [], "loop_back": [("token", "ar_decode")],
+            "external_inputs": [("token", "ar_decode")],
+        }],
+    }
+    rt = GraphRuntime(
+        worker_graphs=[wg], remote_worker_graphs=[],
+        sharding={"groups": [], "shard_dim": [],
+                  "tp_enabled_nodes": [], "sp_enabled_nodes": []},
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [ME], [1])
+    return rt, book, rid, inboxes
+
+
+def _iterate(rt, book, rid, uuid, stop_first=False):
+    """One pass of the loop, driven exactly as the worker drives it."""
+    rt.ingest_inputs_batch([rid], [{
+        "signal": "token", "next_node": "ar_decode", "uuids": [],
+        "is_final_streaming_chunk": False,
+    }])
+    rt.pop_rids("ar_decode", WALK, [rid])
+    book.put_tensor(uuid, _info(uuid))
+    book.increment_ref(uuid, 1)
+    if stop_first:
+        rt.stop_loops_batched("default", WALK, "ar_decode", [rid], [["ar_loop"]])
+    out = rt.complete_and_route_batch({
+        "partition": "default", "graph_walk": WALK, "node_name": "ar_decode",
+        "output_signals": ["out", "token"], "rids": [rid], "wg_ids": [WG_ID],
+        "tensors": [uuid], "num_tensors": [1, 0],
+    })
+    _send(rt, out.completion_id, request_infos=[(rid, None)])
+
+
+def test_the_emitted_frame_carries_the_runtimes_own_loop_snapshot(tmp_path):
+    """No `nested` argument: the indices must come from Rust's snapshot."""
+    rt, book, rid, inboxes = _looping_emit_mesh(tmp_path)
+    _iterate(rt, book, rid, 1)
+    got = _collect(inboxes["api_server"])
+    assert len(got) == 1
+    idx = got[0].body.loop_indices
+    assert idx is not None, "the snapshot never reached the frame"
+    assert idx.loop_indices == {"ar_loop": 0}, idx.loop_indices
+    assert idx.loop_name_order == ["ar_loop"]
+
+
+def test_the_loop_index_advances_with_the_iteration(tmp_path):
+    """A stale snapshot would report the same index twice."""
+    rt, book, rid, inboxes = _looping_emit_mesh(tmp_path)
+    _iterate(rt, book, rid, 1)
+    _iterate(rt, book, rid, 2)
+    got = _collect(inboxes["api_server"])
+    assert len(got) == 2
+    seen = [g.body.loop_indices.loop_indices["ar_loop"] for g in got]
+    assert seen == [0, 1], seen
+
+
+def test_a_stop_in_the_same_pass_does_not_move_the_index(tmp_path):
+    """A stop lands between the worker's check and the routing call.
+
+    The frame must still report the iteration the pass actually ran at.
+    ``register_loop_finish`` only raises ``finish_signal`` -- ``curr_iter``
+    moves in ``advance_loop``, during the completion -- so the routing call is
+    a valid place to snapshot. This pins that: if a stop ever starts advancing
+    the counter, the snapshot has to move earlier and this goes red.
+    """
+    rt, book, rid, inboxes = _looping_emit_mesh(tmp_path)
+    _iterate(rt, book, rid, 1)
+    _collect(inboxes["api_server"])
+
+    # Second pass, with a stop landing between the snapshot and the send.
+    _iterate(rt, book, rid, 2, stop_first=True)
+    got = _collect(inboxes["api_server"])
+    assert len(got) == 1
+    assert got[0].body.loop_indices.loop_indices == {"ar_loop": 1}, (
+        "a stop moved the reported index; the snapshot needs to move earlier"
+    )
+
+
+def test_an_output_nobody_runs_is_an_error(tmp_path):
+    """A destination no worker runs must raise, not panic.
+
+    The fanout marks such a destination with a sentinel worker id. Carried
+    through to the frame it indexes past the interner, and an index-out-of-
+    bounds panic crosses the FFI boundary as a bare PanicException with no
+    hint about the graph. Python raises ValueError from route_node_outputs
+    naming the node; this should say the same thing.
+    """
+    mesh = _Mesh(tmp_path, outs=[("out", "nowhere", False)])
+    rid = mesh.admit()
+    _put(mesh, 1)
+    mesh.rt.ingest_inputs_batch([rid], [{
+        "signal": "prompt", "next_node": "only", "uuids": [],
+        "is_final_streaming_chunk": False,
+    }])
+    mesh.rt.pop_rids("only", WALK, [rid])
+    out = mesh.rt.complete_and_route_batch({
+        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
+        "tensors": [1], "num_tensors": [1],
+    })
+    with pytest.raises(ValueError, match="unknown node/graph walk.*nowhere"):
+        _send(mesh.rt, out.completion_id, request_infos=[(rid, None)])

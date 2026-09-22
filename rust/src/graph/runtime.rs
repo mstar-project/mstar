@@ -1915,7 +1915,11 @@ impl GraphRuntime {
                 .map(|e| by_signal.get(&e.name).cloned().unwrap_or_default())
                 .collect();
 
-            // Before complete(), which advances the loop counters.
+            // Before complete(), which advances the loop counters via
+            // advance_loop. stop_loops runs earlier in the worker's pass but
+            // only sets `finish_signal` (state.rs::register_loop_finish) --
+            // it does NOT move curr_iter -- so capturing here reports the
+            // same counters a snapshot taken before it would have.
             if let Some(idx) = self.nested_idxs_interned(wg, rid, node) {
                 nested_snapshot.insert(rid, idx);
             }
@@ -2723,6 +2727,19 @@ impl GraphRuntime {
                         e.tensors.clone(),
                     )),
                     Dest::External(dest) => {
+                        // `Sym::MAX` is the fanout's marker for a destination
+                        // with no sharding group, i.e. one no worker runs.
+                        // Caught here rather than at the name lookup, which
+                        // would index past the interner and panic ACROSS the
+                        // FFI boundary. Python raises on the same graph, from
+                        // route_node_outputs, with this message.
+                        if e.worker == Some(Sym::MAX) {
+                            return Err(PyValueError::new_err(format!(
+                                "Output edge targets unknown node/graph walk: \
+                                 {}. Check graph construction.",
+                                self.interner.name(dest),
+                            )));
+                        }
                         // Who runs that node for THIS request.
                         let workers = if let Some(w) = e.worker {
                             vec![w]

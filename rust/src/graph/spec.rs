@@ -35,6 +35,13 @@ impl StrToId {
     pub fn name(&self, id: Sym) -> &str {
         &self.names[id as usize]
     }
+    /// For an id that might not be one of ours -- notably `Sym::MAX`, which
+    /// the fanout invents for a destination with no sharding group. Every
+    /// other Sym comes from `intern` and is valid by construction, so the
+    /// infallible `name` stays the normal path.
+    pub fn try_name(&self, id: Sym) -> Option<&str> {
+        self.names.get(id as usize).map(|s| &**s)
+    }
 }
 
 /// Where an output edge goes, resolved at compile time so the hot path never
