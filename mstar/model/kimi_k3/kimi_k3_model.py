@@ -247,7 +247,8 @@ class KimiK3Model(Model):
             speculative += [
                 KVSpec(resource_key=DSPARK_KV, nodes={LLM}, config=draft_kv, plan_after=(SPEC,)),
                 AttentionSpec(resource_key=DSPARK_ATTN, nodes={LLM},
-                              config=AttentionConfig(kv_cache=DSPARK_KV, backend=AttnBackend.FLASHINFER_MLA, sm_scale=scale)),
+                              config=AttentionConfig(kv_cache=DSPARK_KV, backend=AttnBackend.FLASHINFER_MLA,
+                                                     sm_scale=scale)),
             ]
         return [
             # the cache trims a verify step's rejected tail from the acceptance verdicts, so it plans after them
@@ -368,7 +369,8 @@ class KimiK3Model(Model):
             loaded = draft.load_weights(_resolve_snapshot(self.speculative_draft, self.cache_dir))
             missing = {n for n, _ in draft.named_parameters()} - loaded
             if missing:
-                raise ValueError(f"draft checkpoint left {len(missing)} parameters unloaded, e.g. {sorted(missing)[:3]}")
+                raise ValueError(f"draft checkpoint left {len(missing)} parameters unloaded, "
+                                 f"e.g. {sorted(missing)[:3]}")
             draft.eval()
             graph_safe = graph_safe and flashinfer_mla_supports(d.kv_lora_rank, d.qk_rope_head_dim)
             logger.info("Loaded the DSpark draft (%d layers, %d drafts per step) on %s", d.num_hidden_layers,
