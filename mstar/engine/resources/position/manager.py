@@ -34,7 +34,7 @@ class PublishedPositionInfo(PublishedInfo):
 
 
 class PositionManager(Resource):
-    # the scheme is the other half of this, checked per declared node at load
+    # only under a sequential scheme, which the load check enforces
     prefix_skip_safe = True
 
     # NOTE: not an `AttentionResource`, so no label/layer cursors — this is
@@ -160,11 +160,9 @@ class RopeManager(PositionManager):
             self._matched[rid] = matched_len
 
     def admit(self, step: "PositionStep", ctx: StepContext) -> AdmitOutcome:
-        """Start a matched prefix's counter past it, as a published one starts.
+        """Start a matched prefix's counter past it, as a retrieved one does.
 
-        Those tokens were written at the positions the run that cached them
-        gave them, and this run never planned them, so a counter left at zero
-        would rotate the step's own tokens over the top of them.
+        The skipped tokens sit at 0 through n-1, so a counter left at 0 would write over them.
         """
         del ctx
         # taken by the step it was held for: a label the request writes later

@@ -284,8 +284,7 @@ class PreprocessWorkerThread:
             model.prefix_key_streams()
             if model is not None and model_config else {}
         )
-        # resolved the way the worker resolves it at load, so both sides page a
-        # stream identically; not resolved at all when no node declared one
+        # resolved as the worker does at load, so both split a prompt into the same pages
         self._prefix_page_sizes = (
             _kv_page_sizes(model, model_config) if self._prefix_streams else {}
         )
@@ -438,14 +437,10 @@ class PreprocessWorkerThread:
             ))
 
     def _prefix_keys(self, tensors: dict) -> tuple[dict, dict, dict]:
-        """Chain a page key per page of every id-keyed stream the model declared.
+        """Key each page of every declared stream, by resource and label.
 
-        The root is left empty here: the KV manager folds in the one that names
-        the process, so a key computed here means the same thing in any of them.
-
-        Also gives back the tokens after the prompt's last whole page, and
-        where a sampled token will arrive: a page that a generated token
-        completes is keyed over both halves, and only this side sees the first.
+        Returns the keys, the prompt tail past the last whole page, and the output
+        tensor each stream's sampled ids arrive in. The keys are unrooted.
         """
         keys: dict[str, dict[str, list[bytes]]] = {}
         tails: dict[str, dict[str, list[int]]] = {}

@@ -66,15 +66,11 @@ class KVReqConfig(ResourceReqConfig):
     needed_labels: list[str] | None = None
     needed_labels_per_node: dict[str, list[str]] = field(default_factory=dict)
     needed_labels_per_node_walk: dict[tuple[str, str], list[str]] = field(default_factory=dict)
-    # one page key per page of this request's declared streams, by label,
-    # chained on the preprocess worker and handed over by the conductor
+    # label -> one key per page, from the preprocess worker
     prefix_keys: dict[str, list[bytes]] | None = None
-    # the prompt tokens after its last whole page: the page they will finish
-    # is keyed over them and the tokens generated next, and the manager has
-    # no other way to see them
+    # label -> prompt tokens past the last whole page, keyed once generation fills it
     prefix_tail: dict[str, list[int]] | None = None
-    # label -> the output tensor a sampled token arrives under, for the
-    # labels whose node said its decode ids are that token
+    # label -> the output tensor its sampled ids arrive in, if the stream keys generation
     prefix_decode: dict[str, str] | None = None
     prefix_cache: bool = True
 

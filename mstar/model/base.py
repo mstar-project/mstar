@@ -48,19 +48,12 @@ class ProcessPromptOutput(NamedTuple):
 
 
 class PrefixStream(NamedTuple):
-    """The input tensor whose contents key one cache stream's pages.
-
-    ``keyed_by`` is ``"ids"`` where the tensor holds token ids, or
-    ``"digest"`` where the span is written from embeddings and a digest of the
-    input that produced them stands in.
-    """
+    """The input tensor whose token ids key one cache stream's pages."""
     tensor: str
     keyed_by: str
-    # the walk that writes the keyed span: a page any other walk writes into
-    # this stream is not a page the keys describe
+    # the walk that writes the keyed span; a write from any other walk ends the chain
     walk: str
-    # the walk whose input ids are the token just sampled, so that what the
-    # model generates is keyed the way its prompt was; None keys no generation
+    # the walk whose input is the last sampled token, to key generated pages; None keys the prompt only
     decode_walk: str | None = None
 
 
@@ -399,10 +392,8 @@ class Model(ABC):
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.
 
-        The prefix cache hashes the checkpoint's manifest into its root. The
-        default leaves the weights out of the root, so two builds that differ
-        only in weights would share keys, which is why the cache stays shut
-        until the model names a checkpoint or the deployment sets a salt.
+        The prefix cache hashes the checkpoint's manifest into its root. None leaves
+        the weights out, so the cache stays shut unless the deployment sets a salt.
         """
         return None
 

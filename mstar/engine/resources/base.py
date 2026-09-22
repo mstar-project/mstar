@@ -86,8 +86,7 @@ class Resource(ABC):
     def depends_on(self) -> set[str]:
         return set()
 
-    # whether this kind of resource survives a step it never saw the front of.
-    # A node is declared for prefix reuse only if all of its resources do
+    # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
 
     def enable_prefix_cache(
@@ -106,7 +105,7 @@ class Resource(ABC):
     ) -> int | None:
         """How many of this request's leading tokens this resource already holds.
 
-        None is no opinion; zero is an opinion that nothing can be skipped.
+        None leaves the length to other resources; 0 means nothing can be skipped.
         """
         return None
 

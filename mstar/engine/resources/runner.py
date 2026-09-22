@@ -125,7 +125,7 @@ class StepRunner:
         self, rid: str, node_name: str, graph_walk: str,
         inputs, matched_len: int,
     ) -> None:
-        """Hand every resource the length they agreed on, untrimmed inputs."""
+        """Give every resource the agreed length, with the untrimmed inputs."""
         for key in self._sweep(self._node_order, self._order, node_name):
             self._resources[key].apply_cached_prefix(
                 rid, node_name, graph_walk, inputs, matched_len,

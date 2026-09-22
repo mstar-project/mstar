@@ -24,9 +24,7 @@ def _field(payload: bytes) -> bytes:
 def fingerprint(*fields: object) -> bytes:
     """SHA-256 over ``fields``, in the encoding page keys use.
 
-    For the process constants a hit depends on rather than a page's contents,
-    so a deployment that changes one of them cannot match what an older one
-    wrote.
+    Used for process constants, so changing one makes every older key unreachable.
     """
     hasher = hashlib.sha256()
     for field in fields:
@@ -55,7 +53,7 @@ def chain(
     """Key every page of one stream, folding each key into the next.
 
     ``digests_by_page`` is keyed by the page holding an item's first
-    placeholder, so an item spanning pages is named once and the fold carries it.
+    placeholder, so an item spanning pages is hashed once.
     """
     digests_by_page = digests_by_page or {}
     keys = []

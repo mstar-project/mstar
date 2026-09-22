@@ -521,14 +521,8 @@ class Engine:
         return runners
 
     def _open_prefix_caches(self, specs_by_key, model) -> None:
-        """Root each resource's cache in everything its pages depend on.
-
-        A page's contents depend on the weights, the preprocessing that built
-        the prompt, and the configuration of the resources that wrote it — its
-        own, and every resource planned against it. Folding all of that into one
-        root means a deployment that differs anywhere cannot reach pages an
-        older one left behind.
-        """
+        """Root each resource's cache in the weights, the preprocessing, and the
+        config of every resource its pages were planned against."""
         checkpoint = model.checkpoint_path() if model is not None else None
         shared = [
             checkpoint_identity(checkpoint) if checkpoint is not None else b"",
@@ -574,8 +568,8 @@ class Engine:
             for label in declared[key]:
                 logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
             if not resource.supports_eviction:
-                # a cached prompt reserves none of its pages, so admission no
-                # longer bounds how many requests decode at once
+                # a hit allocates only the prompt's tail, so admission no longer
+                # bounds how many requests decode at once
                 logger.warning(
                     "KV %s: prefix cache on with cpu_offload_pages 0: a decode "
                     "step that finds nothing to evict holds its requests until "
@@ -646,10 +640,8 @@ class Engine:
     ) -> NodeInputs:
         """Cut the leading tokens this node's resources already hold.
 
-        Only the walk the model keyed is probed, and on it only inputs the
-        default cut can slice: a guided walk writes more than one span from one
-        set of inputs and carries its step info to say so, so a one-span match
-        would reach only one of them.
+        Only the keyed walk is probed, and only when `split_inputs` can cut its
+        inputs; a guided walk writes two labels from one input, so it is skipped.
         """
         walk = batch.step_context.graph_walk
         if walk not in self._keyed_walks.get(batch.node_name, ()):

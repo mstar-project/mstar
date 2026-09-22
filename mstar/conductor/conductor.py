@@ -414,10 +414,8 @@ class Conductor:
         config to its resource at ingest. KV shape is not part of this — that
         is a deployment-wide property the model declares in its resource specs.
 
-        A declared stream is given a config whether the model asked for one or
-        not: the chain below is handed to the config named for the resource
-        that declared it, so a resource with no config would never see its keys
-        and would never match anything.
+        A declared stream gets a config even when the model returned none, or its
+        keys would have nowhere to go.
         """
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs

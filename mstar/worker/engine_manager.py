@@ -20,12 +20,10 @@ logger = logging.getLogger(__name__)
 def _refuse_uncacheable_positions(
     specs: list[NodeResourceSpec], model: Model,
 ) -> None:
-    """Refuse a keyed cache whose positions are not a token's index.
+    """Refuse a keyed cache whose positions are not sequential.
 
-    A cached page is only reusable where the tokens land at the positions they
-    were written at, and rotation is applied before a key is stored. Only a
-    declared stream is checked: a model that keys nothing is free to place
-    positions however it likes.
+    A cached page is reusable only at the positions it was written at, since its
+    K is stored already rotated.
     """
     declared = set(model.prefix_key_streams())
     if not declared:
