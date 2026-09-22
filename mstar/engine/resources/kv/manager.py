@@ -305,6 +305,8 @@ class KVManager(AttentionResource):
         self._index: PrefixIndex | None = None
         # label -> the walks its keys describe; a label not here is not gated
         self._keyed_walks: dict[str, frozenset[str]] = {}
+        # nodes already warned that a declared stream reached them unkeyed
+        self._warned_unkeyed: set[str] = set()
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
         self._world_size = joint_comm_group.world_size if joint_comm_group is not None else 1
         self._comm_group = joint_comm_group
@@ -399,6 +401,7 @@ class KVManager(AttentionResource):
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
             if label is None:
+                self._warn_unkeyed(rid, node_name, graph_walk)
                 return None
             stream = self._ensure_label(rid, label)
             if stream.converted:
@@ -539,6 +542,31 @@ class KVManager(AttentionResource):
         stream.page_indices = list(matched)
         stream.stored_len = len(matched) * self.config.page_size
         stream.cursor = len(matched)
+
+    def _warn_unkeyed(self, rid: str, node_name: str, graph_walk: str) -> None:
+        """Say once per node that a stream the model declared arrived with no keys.
+
+        Nothing else would: an unkeyed request is served in full and never
+        reported, so the cache stays empty while every other line looks healthy.
+        """
+        overrides = self._overrides.get(rid)
+        if (
+            self._index is None
+            or node_name in self._warned_unkeyed
+            or overrides is None
+            or not overrides.prefix_cache
+        ):
+            return
+        keys = overrides.prefix_keys or {}
+        for label in overrides.get_labels(node_name, graph_walk):
+            if graph_walk in self._keyed_walks.get(label, ()) and not keys.get(label):
+                self._warned_unkeyed.add(node_name)
+                logger.warning(
+                    "KV %s: requests reach %s with no keys for %s, which the "
+                    "model declared for prefix reuse, so nothing will be cached",
+                    self.name, node_name, label,
+                )
+                return
 
     def _keyed_label(
         self, rid: str, node_name: str, graph_walk: str,
