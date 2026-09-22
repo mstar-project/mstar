@@ -121,7 +121,7 @@ def apply_reveal(
 
     Args:
         tokens: ``[1, C, T]``, the request's live canvas, modified in place.
-        pred_tokens, scores: ``[1, C, T]`` from ``predict_tokens_with_scoring``.
+        pred_tokens, scores: ``[1, C, T]`` from the diffusion sampler.
         generator: the request's seeded RNG, or ``None`` for the global one.
     """
     if reveal_count <= 0:

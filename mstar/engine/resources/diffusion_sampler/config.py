@@ -68,11 +68,10 @@ class DiffusionSamplingReqConfig(ResourceReqConfig):
 
 @dataclass(frozen=True)
 class DiffusionSamplerStep(ResourceStep):
-    """Which diffusion iteration this step is.
+    """Nothing to stage: the sampler's whole input arrives with the call.
 
-    Carried so the resource can reseed per step: one generator for a whole
-    request would only replay if every step ran in the same order, which async
-    scheduling does not promise.
+    Deliberately empty. An earlier draft carried the diffusion iteration here,
+    which was the wrong shape: requests in one step are at *different*
+    iterations, since each runs its own ``num_step``. The iteration is a
+    per-request argument to ``sample`` instead.
     """
-
-    iteration: int = 0

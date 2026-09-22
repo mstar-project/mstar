@@ -263,6 +263,12 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
                 guidance_scale=float(
                     engine_inputs.per_request_info[rid].step_metadata["guidance_scale"]
                 ),
+                # Which diffusion step this request is on. Requests in one
+                # batch are generally at different iterations, and the
+                # sampler seeds its draw per request from it.
+                iteration=int(
+                    row.tensor_inputs["step_index"].reshape(-1)[0].item()
+                ),
             )
             for rid, row in zip(engine_inputs.request_ids, inputs, strict=True)
         ]
@@ -283,9 +289,11 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
         would let the first case allocate a logits tensor several hundred MB
         wide.
 
-        The cap is deliberately conservative and has room now that the
-        float32 upcast is per request rather than over the whole batch, but
-        raising it is a measurement, not a guess, so it stays where it was.
+        Scoring runs batched over the gathered positions, so the float32
+        copy is of the whole step's target region rather than of one request.
+        That is the trade this cap now guards: batched scoring is worth more
+        than the smaller peak, and raising the cap is a measurement rather
+        than a guess, so it stays where it was.
         """
         packed = sum(inp.input_seq_len for inp in model_inputs)
         if packed > self.config.max_packed_tokens:
@@ -334,6 +342,7 @@ class OmniVoiceBackboneSubmodule(NodeSubmodule):
             [item.request_id for item in items],
             c_packed, u_packed,
             seq_lens=[item.target_len for item in items],
+            iterations=[item.iteration for item in items],
         )
 
         outputs: dict[str, NameToTensorList] = {}

@@ -9,7 +9,6 @@ import torch
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.diffusion_sampler.config import (
     DiffusionSamplerSpec,
-    DiffusionSamplerStep,
     DiffusionSamplingReqConfig,
 )
 from mstar.engine.resources.diffusion_sampler.resource import DiffusionSamplerResource
@@ -122,8 +121,7 @@ def test_a_seeded_request_replays():
         cfg = DiffusionSamplingReqConfig(temperature=1.0)
         cfg.apply_conductor_config(seed=seed)
         res.ingest_request("a", cfg)
-        res.plan(DiffusionSamplerStep(iteration=iteration), ctx=None)
-        return res.sample(["a"], c, seq_lens=[7])[0]
+        return res.sample(["a"], c, seq_lens=[7], iterations=[iteration])[0]
 
     assert torch.equal(draw(1234), draw(1234))
     assert not torch.equal(draw(1234), draw(5678))
@@ -151,3 +149,28 @@ def test_mismatched_shapes_are_rejected_at_the_seam():
     except ValueError:
         return
     raise AssertionError("expected ValueError for a 2-D logits tensor")
+
+
+def test_a_seeded_draw_ignores_its_neighbours():
+    """The whole point of per-request seeding: batching must not change a draw."""
+    ca, cb = _logits(6, seed=11), _logits(9, seed=12)
+
+    def cfg(seed):
+        c = DiffusionSamplingReqConfig(temperature=1.0)
+        c.apply_conductor_config(seed=seed)
+        return c
+
+    alone = _build()
+    alone.ingest_request("a", cfg(99))
+    solo, _ = alone.sample(["a"], ca, seq_lens=[6], iterations=[3])
+
+    together = _build()
+    together.ingest_request("a", cfg(99))
+    together.ingest_request("b", cfg(1234))
+    packed, _ = together.sample(
+        ["a", "b"], torch.cat([ca, cb], dim=1),
+        seq_lens=[6, 9], iterations=[3, 7],
+    )
+    assert torch.equal(packed[:, :6], solo), (
+        "request a's draw changed because b was in the same step"
+    )

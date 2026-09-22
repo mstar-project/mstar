@@ -87,6 +87,9 @@ class CanvasItem:
     # flat_u_start stays -1 for an item with no unconditional document.
     flat_start: int = field(default=-1)
     flat_u_start: int = field(default=-1)
+    # Which unmask iteration this request is on. Only the sampler's seeding
+    # reads it; the packing does not care.
+    iteration: int = field(default=0)
 
     @property
     def target_len(self) -> int:
