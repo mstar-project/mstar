@@ -1,22 +1,10 @@
 """The Waypoint-1.5 DiT: 24 blocks, the 4+1 pass driver, and the world clock.
 
 Five forwards per generated frame: four frozen Euler denoise passes over
-``config.scheduler_sigmas``, then one committing pass at sigma=0. Only the last
-writes the ring. The loop is plain Python here, not engine steps.
-
-Two clocks, threaded separately: ``f_pos`` drives buckets, slots and
-visibility, ``t_pos = f_pos * config.ts_mult`` is the RoPE time coordinate.
-They are numerically equal at this checkpoint's ``ts_mult == 1``; conflating
-them is silent drift at any other serving fps.
-
-``cond_proj`` is physically shared by all 24 blocks, and ``retie_cond_proj()``
-is public because ``to_empty(device)`` silently un-ties it. Controller
-conditioning is fused on 8 of 24 layers (``i % 3 == 0``); the other 16 carry no
-``ctrl_mlpfusion`` submodule at all.
-
-The port collapses the reference's ``WorldModel``/``WorldDiT`` pair into one
-module, so blocks live at ``blocks.{i}``, not ``transformer.blocks.{i}``.
-Everything below that prefix keeps the reference's spelling.
+``config.scheduler_sigmas``, then one committing pass at sigma=0 that writes
+the ring. Two clocks are threaded separately: ``f_pos`` (buckets, slots,
+visibility) and ``t_pos = f_pos * config.ts_mult`` (RoPE time); conflating
+them is silent drift at any fps where ``ts_mult != 1``.
 """
 
 from typing import NamedTuple
@@ -93,12 +81,10 @@ class WaypointDiTBlock(nn.Module):
         commit: bool,
         cond_idx: int,
     ) -> tuple[Tensor, Tensor]:
-        """``x`` ``[B, N*T, D]``, ``cond``/``ctrl_emb`` ``[B, N, D]`` (per frame)
-        -> ``(x, v1)``. ``v1`` is layer 0's pre-lerp V, threaded down the stack.
-        ``cond_idx`` is the ``scheduler_sigmas`` slot, for the cond_head cache.
-
-        Only ``f_pos`` reaches this far -- the RoPE angles are built once at the
-        root -- so the ``[B]`` ring clock is passed rather than the whole bundle.
+        """``x`` ``[B, N*T, D]``, ``cond``/``ctrl_emb`` ``[B, N, D]`` (per frame) ->
+        ``(x, v1)``. ``v1`` is layer 0's pre-lerp V, threaded down the stack;
+        ``cond_idx`` is the ``scheduler_sigmas`` slot for the cond_head cache.
+        Only ``f_pos`` reaches this far -- RoPE angles are built once at the root.
         """
         s0, b0, g0, s1, b1, g1 = self.cond_head(cond, cond_idx)
 
@@ -131,9 +117,8 @@ class WaypointDiT(nn.Module):
         dit.retie_cond_proj()       # MUST follow to_empty
         load_weights_into(dit, ...)
 
-    The KV ring is NOT part of this module: it is derived state owned by an
-    engine resource bound after materialization, so no ``to_empty`` or
-    ``state_dict`` walk can leave it holding garbage.
+    The KV ring is derived state owned by an engine resource, bound after
+    materialization -- not part of this module.
     """
 
     def __init__(self, config: WaypointConfig):
@@ -178,7 +163,7 @@ class WaypointDiT(nn.Module):
     # No `bind_resources` here: the driver holds no resource handle, it passes
     # `commit` down to the layers, which own the only calls into the ring.
 
-    # ---- Build-time surface ------------------------------------------------
+    # Build-time surface
 
     @property
     def dtype(self) -> torch.dtype:
@@ -203,12 +188,9 @@ class WaypointDiT(nn.Module):
         """Alias blocks 1..23's six ``cond_proj`` matrices onto block 0's.
 
         Public, and separate from ``__init__``, because ``to_empty(device)``
-        destroys the tying: ``Module._apply`` allocates per parameter with no
-        cross-module memo, so the 24 blocks come out holding 24 independent
-        copies. Nothing raises; the symptoms are +0.6B resident parameters and
-        23 unfilled ``cond_proj`` sets.
-
-        ``bias_in`` is deliberately NOT tied -- it is genuinely per-layer.
+        destroys the tying (``Module._apply`` has no cross-module memo, so
+        each block would get 24 independent copies). ``bias_in`` is
+        deliberately NOT tied -- it is genuinely per-layer.
         """
         ref_proj = self.blocks[0].cond_head.cond_proj
         for block in self.blocks[1:]:
@@ -244,12 +226,9 @@ class WaypointDiT(nn.Module):
     def _materialize_cond_cache(self, device: torch.device) -> None:
         """Fold every block's cond_head GEMMs into a per-sigma gather.
 
-        The six modulation tensors depend only on the sigma-indexed cond, and
-        sigma is one of ``scheduler_sigmas``. Each cond is built at M=1, exactly
-        as ``forward`` receives it, so the cached rows are bit-identical to the
-        live projection they replace (bf16 GEMV in, bf16 gather out). Runs after
-        weight load, before ``compile_regions``, on the same footing as the
-        conditioner LUT.
+        Each cond is built at M=1, exactly as ``forward`` receives it, so
+        cached rows are bit-identical to the live projection they replace.
+        Runs after weight load, before ``compile_regions``.
         """
         sigmas = self._sigma_schedule(device, self.dtype)
         with torch.no_grad():
@@ -259,7 +238,7 @@ class WaypointDiT(nn.Module):
         for block in self.blocks:
             block.cond_head.build_cache(conds)
 
-    # ---- Positions ---------------------------------------------------------
+    # Positions
 
     def _pos_ids(self, frame_pos: Tensor) -> WaypointPosIds:
         """Build one frame's position streams from the ring clock."""
@@ -278,7 +257,7 @@ class WaypointDiT(nn.Module):
             f_pos=frame_pos, t_pos=t_pos, y_pos=y_pos[None].expand(B, -1), x_pos=x_pos[None].expand(B, -1)
         )
 
-    # ---- One forward -------------------------------------------------------
+    # One forward
 
     def forward(
         self,
@@ -294,15 +273,11 @@ class WaypointDiT(nn.Module):
     ) -> Tensor:
         """One pass over one latent frame; returns the rectified-flow velocity.
 
-        ``x`` ``[B, N, C, H, W]`` latent (N == 1), ``sigma`` ``[B, N]``,
-        ``frame_pos`` ``[B]`` int64 ring clock, controller inputs ``[B, N, 2]`` /
-        ``[B, N, n_buttons]`` / ``[B, N, 1]``. Returns ``[B, N, C, H, W]``.
-
-        ``commit`` says whether this pass keeps its K/V: False for the four
-        denoise passes, True for the fifth. An argument rather than resource
-        state -- all five passes sit inside one engine step. ``cond_idx`` is
-        this pass's ``scheduler_sigmas`` slot; it selects the cached modulation
-        row and must match ``sigma``.
+        ``x`` ``[B, N, C, H, W]`` (N == 1), ``sigma`` ``[B, N]``, ``frame_pos``
+        ``[B]`` int64 ring clock. Returns ``[B, N, C, H, W]``. ``commit`` says
+        whether this pass keeps its K/V (False for the four denoise passes,
+        True for the fifth); ``cond_idx`` selects the cached modulation row
+        and must match ``sigma``.
         """
         B, N, C, H, W = x.shape
         ph, pw = self.patch
@@ -339,23 +314,22 @@ class WaypointDiT(nn.Module):
                 commit=commit, cond_idx=cond_idx,
             )
 
-        # silu sits BETWEEN the adaLN norm and the unpatchify projection
-        # (reference world_model.py:348-352), not after it.
+        # silu sits BETWEEN the adaLN norm and the unpatchify projection,
+        # not after it (matches the reference).
         h = F.silu(self.out_norm(h, cond))
         h = self.unpatchify(h)  # [B, N*T, C*ph*pw]
         h = h.view(B, N, Hp, Wp, C, ph, pw).permute(0, 1, 4, 2, 5, 3, 6)
         return h.reshape(B, N, C, Hp * ph, Wp * pw)
 
-    # ---- The 4+1 driver ----------------------------------------------------
+    # The 4+1 driver
 
     def _sigma_schedule(self, device: torch.device, dtype: torch.dtype) -> Tensor:
-        """The sigma table, memoized per (device, dtype) and resolved by the
+        """The sigma table, memoized per (device, dtype); resolved by the
         caller *outside* the compiled region -- materializing a tensor from a
         Python list inside ``fullgraph=True`` is a graph break.
 
-        The dtype is load-bearing: the reference builds this table in the serving
-        dtype and takes ``.diff()`` there, so the Euler step sizes are bf16
-        differences of bf16 sigmas. fp32 changes two of the four steps.
+        The dtype is load-bearing: Euler step sizes are bf16 differences of
+        bf16 sigmas; fp32 changes two of the four steps.
         """
         key = (device, dtype)
         schedule = self._sigma_cache.get(key)
@@ -377,9 +351,9 @@ class WaypointDiT(nn.Module):
         """Four frozen Euler steps of the rectified-flow ODE. Returns the settled
         latent; **does not write the ring**.
 
-        ``commit=False`` matters: each step attends to a different noisy version
-        of the same frame, so none of them may keep its K/V. They still see
-        themselves, through the unconditional scratch write at the ring tail.
+        ``commit=False`` matters: each step attends to a different noisy
+        version of the same frame, so none may keep its K/V (they still see
+        themselves via the unconditional scratch write at the ring tail).
         """
         # One reused sigma buffer, filled per step; a fresh allocation per step
         # would defeat cudagraph capture.
@@ -444,12 +418,11 @@ class WaypointDiT(nn.Module):
         Five forwards: 4 frozen + 1 committing, all sharing one ``frame_pos``.
         The caller owns the ring clock and advances it once per committed frame.
         """
-        # The .clone() is load-bearing, and must stay OUTSIDE the compiled
-        # region. Both passes run inside ONE CUDA-graph capture, so the cache
-        # pass allocates from the graph's private pool -- where the denoise
-        # pass's output buffer is a free block. The cache pass's first
-        # allocation can land on it and stomp the latent it is reading, at an
-        # address baked into the graph and repeated on every replay.
+        # The .clone() is load-bearing and must stay OUTSIDE the compiled
+        # region: both passes share one CUDA-graph capture, so without it the
+        # cache pass's first allocation can land on the denoise pass's freed
+        # output buffer and stomp the latent it is reading -- baked into the
+        # graph and repeated on every replay.
         sigmas = self._sigma_schedule(noise.device, noise.dtype)
         x0 = self._denoise_pass(
             noise, frame_pos, sigmas, mouse=mouse, button=button, scroll=scroll

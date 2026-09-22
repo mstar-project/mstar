@@ -38,10 +38,9 @@ def pixel_size_for_latent(latent_height: int, latent_width: int) -> tuple[int, i
 def load_taehv(ae_uri: str, cache_dir: str | None = None) -> nn.Module:
     """Load the shared weights module from a resolved local checkpoint.
 
-    Hub resolution belongs to ``checkpoint.resolve_taehv_checkpoint`` so only
-    the required file is downloaded and missing artifacts fail before allocation.
-    ``cache_dir`` remains accepted for compatibility with existing direct
-    callers, but is intentionally unused here.
+    Hub resolution belongs to ``checkpoint.resolve_taehv_checkpoint``, so only
+    the required file is downloaded. ``cache_dir`` is accepted for
+    compatibility with existing callers but is unused here.
     """
     del cache_dir
     try:

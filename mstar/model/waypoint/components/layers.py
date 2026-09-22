@@ -1,20 +1,9 @@
 """Stateless layer primitives for the Waypoint-1.5 DiT.
 
 Port of ``world_engine/src/model/nn.py`` plus the three conditioning modules
-from ``world_engine/src/model/world_model.py``. Nothing here holds sequence
-state and nothing here touches the KV ring.
-
-Parameter names are checkpoint keys: ``fc1``/``fc2``, ``bias_in``, ``cond_proj``
-and ``mlp`` are the reference's attribute names and the names ``weight_loader``
-remaps onto. mstar's shared ``components.mlp.MLP`` spells its projections
-``linear_in``/``linear_out``, so it is not reused.
-
-``NoiseConditioner`` is an fp32 island: it runs its body under
-``autocast(enabled=False)`` on ``.float()`` inputs and publishes
-``FP32_MODULE_PATHS`` for ``WaypointDiT.cast_serving_dtypes()`` to re-pin after
-the global bf16 cast. Its Fourier frequency table is derived state, held outside
-the module tree so ``to_empty(device)`` cannot leave it uninitialized -- no
-loader completeness check covers buffers.
+from ``world_engine/src/model/world_model.py``. Parameter names track
+checkpoint keys (``fc1``/``fc2``, ``bias_in``, ``cond_proj``, ``mlp``), not
+mstar's usual ``components.mlp.MLP`` spelling, so this doesn't reuse it.
 """
 
 import torch
@@ -44,14 +33,10 @@ def _bf16_bits(x: torch.Tensor) -> torch.Tensor:
 
 class DeviceTableCache:
     """Per-device replicas of small derived fp32 tables (RoPE frequencies,
-    Fourier frequencies).
+    Fourier frequencies), held outside the module tree so they stay out of
+    ``state_dict``/``to_empty``'s reach and fp32 forever.
 
-    A pure function of the config, so neither checkpoint state nor something a
-    dtype cast should reach. Holding them here rather than as non-persistent
-    buffers keeps them out of ``state_dict``, out of ``to_empty``'s reach, and
-    fp32 forever.
-
-    Callers MUST build the CPU tables with an explicit ``device="cpu"``: module
+    Callers MUST build the CPU tables with an explicit ``device="cpu"``:
     ``__init__`` runs under ``with torch.device("meta")``, where an
     ambient-device ``torch.arange`` produces a data-less meta tensor.
     """
@@ -148,10 +133,8 @@ class NoiseConditioner(nn.Module):
 
     fp32 island: ``FP32_MODULE_PATHS`` pins ``self.mlp`` back to fp32 after the
     serving bf16 cast, and the body runs under ``autocast(enabled=False)`` on a
-    ``.float()`` sigma. The four denoise sigmas are close together
-    (1.0, 0.9, 0.75, 0.3) and this embedding is the only thing that separates
-    them. ``* 1000`` scales [0, 1] into the Fourier basis's rotating range;
-    ``* 2**0.5`` restores unit variance after the sin/cos concat.
+    ``.float()`` sigma. ``* 1000`` scales [0, 1] into the Fourier basis's
+    rotating range; ``* 2**0.5`` restores unit variance after the sin/cos concat.
     """
 
     def __init__(
@@ -232,11 +215,10 @@ class NoiseConditioner(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build (once per device) the reference's sigma table.
 
-        The batch shape is load-bearing: all ``S`` sigmas in one call is an M=S
-        GEMM, which under ``float32_matmul_precision('high')`` rounds through
-        TF32 where the served M=1 GEMV stays exact fp32. Built on first use
-        because it needs loaded weights, so an eager forward must warm it before
-        ``compile_regions``.
+        The batch shape is load-bearing: an M=S GEMM (all S sigmas in one
+        call) rounds through TF32 under ``float32_matmul_precision('high')``,
+        where the served M=1 GEMV stays exact fp32. Built on first use, so an
+        eager forward must warm it before ``compile_regions``.
         """
         device = torch.device(device)
         if device not in self._lut:
@@ -275,13 +257,11 @@ class ControllerInputEmbedding(nn.Module):
 class MLPFusion(nn.Module):
     """Fuses a per-frame conditioning vector into that frame's tokens.
 
-    The parameter tree is ``MLP(2*D, D, D)`` over ``cat([x, cond])`` -- one
-    ``[D, 2D]`` ``mlp.fc1`` for the loader to fill. The compute splits that
-    matrix instead (``chunk(2, dim=1)``) so ``cond`` broadcasts over the T tokens
-    of its frame rather than being repeated into a ``[B, N*T, 2D]`` concat.
-
-    That split is compute-time only. Stored ``fc1_x``/``fc1_c`` parameters would
-    undo transform 7, whose job is to ``cat(dim=1)`` them into ``mlp.fc1``.
+    Parameter tree is ``MLP(2*D, D, D)`` over ``cat([x, cond])`` -- one
+    ``[D, 2D]`` ``mlp.fc1`` for the loader to fill. Compute splits that matrix
+    instead (``chunk(2, dim=1)``) so ``cond`` broadcasts over the T tokens of
+    its frame, compute-time only -- stored split parameters would undo the
+    loader's concat into ``mlp.fc1``.
     """
 
     def __init__(self, config: WaypointConfig):
@@ -307,18 +287,9 @@ class CondHead(nn.Module):
     block's six adaLN modulation tensors (scale/shift/gate for attention, then
     the same three for the MLP).
 
-    The per-layer/shared split is why the checkpoint is 1.86B on disk and 1.28B
-    resident: ``bias_in`` is genuinely per-layer (24 copies, present only for
-    ``noise_conditioning == "wan"``), while the six ``cond_proj`` Linears are
-    physically shared across all 24 blocks -- the DiT aliases blocks 1..23's
-    ``.weight`` onto block 0's and the loader drops the other 23 sets.
-
-    The aliasing is established by ``WaypointDiT.retie_cond_proj``, which must run
-    after ``to_empty``; see its docstring for what un-ties it.
-
-    The checkpoint spells this head as two half-heads, ``attn_cond_head``
-    (indices 0..2) and ``mlp_cond_head`` (indices 3..5), with a ``bias_in`` on
-    each; the loader merges them and keeps the mlp one.
+    ``bias_in`` is genuinely per-layer; the six ``cond_proj`` Linears are
+    physically shared across all 24 blocks via ``WaypointDiT.retie_cond_proj``
+    (must run after ``to_empty`` -- see its docstring).
     """
 
     n_cond = 6

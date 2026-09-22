@@ -1,18 +1,9 @@
 """Waypoint self-attention: fused QKV, value residual, OrthoRoPE, ring cache.
 
-``WorldEngine.__init__`` applies ``apply_inference_patches`` unconditionally, so
-the served reference module is the fused ``patch_model.MergedQKVAttn``. That
-fused form, not three separate GEMMs, is the parity target.
-
-``qkv_proj.weight`` is ``cat([q, k, v], dim=0)`` — rows 0:2048 Q, 2048:3072 K,
-3072:4096 V. GQA makes the slabs unequal, so a wrong order is a shape error for
-Q but *not* between K and V: swapping those two loads cleanly and serves wrong
-video.
-
-This module reaches the world state only through the two resources bound in
-``bind_resources``. It never sees the ring, the slot arithmetic or the
-``BlockMask`` — ``visible`` is a ``[capacity]`` bool row it hands straight back
-to ``attend``.
+The served reference is the fused ``patch_model.MergedQKVAttn``, not three
+separate GEMMs, so that fused form is the parity target. ``qkv_proj.weight``
+is ``cat([q, k, v], dim=0)``; GQA makes the K/V slabs unequal, so swapping
+them loads cleanly but serves wrong video.
 """
 
 import torch

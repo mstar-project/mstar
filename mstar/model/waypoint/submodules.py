@@ -25,7 +25,7 @@ PRIME_WALK = "prime"
 ROLLOUT_WALK = "rollout"
 ROLLOUT_LOOP_NAME = "rollout_loop"
 
-# Resource labels this node declares;
+# Resource labels this node declares.
 KV_RESOURCE = "kv"
 ATTN_RESOURCE = "attn"
 
@@ -39,38 +39,25 @@ _SPLITMIX_MIX2 = 0x94D049BB133111EB
 def _frame_seed(request_seed: int, frame_pos: int) -> int:
     """A reproducible seed for one ``(request, frame)`` pair.
 
-    Stateless by construction: nothing here reads or advances a generator, so
-    frame k's noise is a pure function of the request's seed and the ring clock
-    and a resumed or re-run frame draws the identical tensor. A
-    ``torch.Generator`` advanced in place would work too, right up
-    until the state it accumulates — which ``get_state`` does not serialize —
-    made a resumed rollout diverge from the one it resumed.
-
-    A splitmix64 finalizer rather than ``seed + frame_pos``: the cheap version
-    makes request seeds 0 and 1 share every frame's noise but the first, which
-    reads as "the sampler is broken" rather than "the seeds collided".
-    Re-seeding from ``request_seed`` alone is the other failure — every frame
-    gets identical noise and the video stops evolving.
+    Stateless by construction: a pure function of the request's seed and the
+    frame position, so a resumed or re-run frame draws the identical tensor.
+    A splitmix64 finalizer rather than ``seed + frame_pos`` avoids nearby
+    seeds sharing correlated noise.
     """
     z = (request_seed + (frame_pos + 1) * _SPLITMIX_GAMMA) & _U64
     z = ((z ^ (z >> 30)) * _SPLITMIX_MIX1) & _U64
     z = ((z ^ (z >> 27)) * _SPLITMIX_MIX2) & _U64
     z ^= z >> 31
-    # manual_seed takes a signed 64-bit; keep it non-negative rather than
-    # relying on the accepted-range edge.
+    # manual_seed takes a signed 64-bit; keep it non-negative.
     return z & (_U64 >> 1)
 
 
 def _rollout_capture_batch_sizes(step_batch_size: int) -> list[int]:
     """Powers of two up to ``step_batch_size``, with ``step_batch_size`` itself.
 
-    Capturing every size ``1..B`` makes startup linear in B: each bucket is a new
-    static shape, so the DiT re-traces both fullgraph regions and the decode
-    re-tunes its convs for it. A geometric set makes startup grow with ``log B``
-    instead; a step of ``n`` rows replays the smallest bucket ``>= n`` and pads
-    the tail with dummy rows the ring parks on spare worlds (see
-    ``RingKVManager.plan``). This is what every other batched model already does
-    -- the engine default ``CAPTURE_BATCH_SIZES`` is the same geometric set.
+    A geometric bucket set makes capture startup grow with ``log B`` instead
+    of linearly in B; a step of ``n`` rows replays the smallest bucket
+    ``>= n`` and pads the tail with dummy rows (see ``RingKVManager.plan``).
     """
     sizes = []
     bs = 1
@@ -84,18 +71,9 @@ def _rollout_capture_batch_sizes(step_batch_size: int) -> list[int]:
 class _SingleRequestMixin:
     """Serve one request per step, through the engine's batched entry point.
 
-    A copy of the wan22 idiom (``wan22/submodules.py``), deliberately not an
-    import: the two models share no other code and a cross-model dependency
-    here would make a wan22 refactor a Waypoint bug.
-
-    The v1 engine always dispatches to ``forward_batched`` — the worker builds
-    every batch with ``running_batched=True`` — so a submodule that only defines
-    ``forward`` never runs.
-
-    Only ``WaypointVaeEncoderSubmodule`` uses this now: prime's encode is once
-    per request, off the steady-state path, so it stays capped at 1. The dit
-    node's step is batched (see ``WaypointDitSubmodule.max_batch_size`` and
-    ``forward_batched``); this mixin no longer describes it.
+    The v1 engine always dispatches to ``forward_batched``, so a submodule
+    that only defines ``forward`` never runs. Copied from the wan22 idiom
+    rather than imported, since the two models share no other code.
     """
 
     def max_batch_size(self, graph_walk: str):
@@ -146,23 +124,18 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     """The world DiT: one latent frame per engine step, TAEHV-decoded in the
     same forward.
 
-    The decode is fused in rather than left on its own node so that a
-    same-worker speculative N+1 (``GraphNode.enable_async_scheduling``) can
-    start while N's frame is still going out: a separate decoder node
-    would decode frame N only after N+1 was already queued, adding a frame of
-    latency to every step it was meant to hide. See ``WaypointModel``'s
-    module docstring for the resulting two-node graph.
+    The decode is fused in rather than left on its own node so a same-worker
+    speculative N+1 (``GraphNode.enable_async_scheduling``) can start while
+    N's frame is still going out. See ``WaypointModel``'s module docstring
+    for the resulting two-node graph.
     """
 
-    # ``WaypointConfig.compile_dit`` exclusively controls the two deliberate
-    # full-graph regions. Do not let the engine independently compile this
-    # wrapper and fuse across those boundaries when the flag is disabled.
+    # Do not let the engine independently compile this wrapper and fuse
+    # across the DiT's own full-graph regions.
     disable_torch_compile = True
 
-    # Waypoint pins an explicit fp32 island list at build time. The model returns
-    # BF16 as the resource/allocation dtype, while this flag prevents
-    # EngineManager from blanket-casting the mixed-dtype module and dragging
-    # those fp32 islands to bf16.
+    # Waypoint pins an explicit fp32 island list at build time; this flag
+    # prevents EngineManager from blanket-casting those islands to bf16.
     disable_autocast = True
 
     def __init__(self, dit: WaypointDiT, taehv: torch.nn.Module, config: WaypointConfig):
@@ -171,14 +144,11 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         self.dit = dit
         self.taehv = taehv
         self.config = config
-        # The decoder node this replaces was captured with the engine's
-        # ``compile=True``, i.e. ``torch.compile(mode="max-autotune-no-cudagraphs",
-        # fullgraph=False, dynamic=False)`` (``CudaGraphRunner``), and only when
-        # graphs were on. Same options, same gate: Inductor's mode decides which
-        # GEMM/conv kernels the decode runs, and a different mode changes the low
-        # bits of every pixel (the 720p payload SHA in VALIDATION.md is the gate).
+        # Matches the engine's own capture options (``compile=True`` ->
+        # ``torch.compile(mode="max-autotune-no-cudagraphs", fullgraph=False,
+        # dynamic=False)``) so Inductor picks the same kernels bit-for-bit.
         # Wrapping just the decode call keeps the engine from compiling across
-        # the denoise/decode boundary (this wrapper stays ``disable_torch_compile``).
+        # the denoise/decode boundary.
         self._decode_latent = (
             torch.compile(
                 decode_latent, mode="max-autotune-no-cudagraphs",
@@ -200,20 +170,13 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
 
     def max_batch_size(self, graph_walk: str) -> int:
         """Both walks carry up to ``step_batch_size`` rows: one per resident
-        world sharing the forward. Prime rows batch too, when several
-        requests are admitted in the same step.
-        """
+        world sharing the forward."""
         return self.config.step_batch_size
 
     def can_batch(self, batch, model_inputs) -> bool:
-        """Batch concurrent rows into one forward, matching every other batched
-        model. A captured lease replays batched regardless of this flag; it is
-        the eager fallback (graphs off, or a shape with no captured bucket) that
-        would otherwise run one forward per request. Rows are independent --
-        ``preprocess`` concatenates on the batch dim and every resource is
-        scoped per row -- so any admitted set (capped by ``max_batch_size``) is
-        batchable.
-        """
+        """Rows are independent (``preprocess`` concatenates on the batch dim
+        and every resource is scoped per row), so any admitted set is
+        batchable."""
         del batch, model_inputs
         return True
 
@@ -232,34 +195,27 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         the noise to denoise from (rollout) or the latent to prime with. Also
         the nine decoder histories the fused decode reads and writes.
 
-        Runs on the host, outside any captured region — which is the whole
-        reason the noise is drawn here. A captured region
-        cannot call the RNG, and ``cuda_graph_runner``'s dummy metadata
-        hardcodes ``random_seed=0``, so a forward that seeded itself would draw
-        the capture-time dummy's noise forever.
+        Runs on the host, outside any captured region, which is why the noise
+        is drawn here rather than in ``forward``: a captured region cannot
+        call the RNG.
 
-        ``inputs.get("clock")`` — the rollout node's loop-back to itself — is
-        never read. Its only job is to sit in ``input_names`` so
-        ``GraphNode.is_ready_for_speculation`` can propose "dit, next iter" as
-        a same-node speculation target; the value carries nothing, since
-        ``frame_pos``/``rollout_step`` already live in host state.
+        ``inputs.get("clock")`` is never read; it only has to be present in
+        ``input_names`` for ``GraphNode.is_ready_for_speculation`` to propose
+        the next iteration as a same-node speculation target.
         """
         device = self.get_device()
         dtype = self.dit.dtype
-        # The clock is per request and lives on the host; frame 0 is the first
-        # frame of the session, priming included.
+        # The clock is per request and lives on the host.
         state = self.request_state(fwd_info.request_id)
 
         if graph_walk == ROLLOUT_WALK:
             requested = int(fwd_info.step_metadata.get("num_steps", 0) or 0)
             rollout_step = int(state.get("rollout_step", 0))
             if requested and rollout_step >= requested:
-                # Async scheduling (enable_async_scheduling=True) can dispatch
-                # iteration N+1 before this request's check_stop(N) has
-                # registered the loop's finish signal. Veto it here, before any
-                # tensor work: None makes the engine skip the forward, and the
-                # overshoot never commits a frame into the ring, which has no
-                # undo. Mirrors Wan22DitSubmodule.prepare_inputs.
+                # Async scheduling can dispatch iteration N+1 before
+                # check_stop(N) registers the loop's finish signal. Veto here,
+                # before any tensor work: None skips the forward, so the
+                # overshoot never commits a frame into the ring.
                 logger.info(
                     "Waypoint dit: skipping async-overshoot rollout step %d "
                     "(request %s runs %d steps)",
@@ -270,8 +226,8 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         frame_pos = int(state.get("frame_pos", 0))
 
         if graph_walk == PRIME_WALK:
-            # Prime is an internal cache operation. It has its own idle action
-            # and must not consume the client's action zero.
+            # Prime has its own idle action and must not consume the
+            # client's action zero.
             mouse, button, scroll = self._idle_controller(device, dtype)
         else:
             action_index = int(state.get("rollout_step", 0))
@@ -311,15 +267,11 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict:
-        """Concatenate every row's tensors along the batch dim.
-
-        Each row already carries a leading 1 (``frame_pos [1]``,
-        ``noise``/``latent`` ``[1, 1, C, H, W]``, ``mouse``/``button``/``scroll``
-        ``[1, 1, *]``, the nine histories ``[1, C, h, w]``), in
+        """Concatenate every row's tensors along the batch dim, in
         ``engine_inputs.request_ids`` order (``inputs[i]`` pairs positionally
-        with row ``i`` — the row-order invariant every batched resource below
+        with row ``i`` -- the row-order invariant every batched resource below
         this node relies on). ``len(inputs) == 1`` returns the row unchanged,
-        no copy, which is what B=1 ran before this method concatenated anything.
+        no copy.
         """
         if len(inputs) == 1:
             return inputs[0].tensor_inputs
@@ -337,10 +289,9 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     ) -> torch.Tensor:
         """``[1, 1, C, H, W]`` of fresh noise for this frame.
 
-        Drawn straight onto the device. Determinism is now per-GPU:
-        a CUDA generator reproduces run-to-run on the same arch + torch build,
-        not against a CPU draw or another arch. Runs in ``prepare_inputs``, outside any
-        captured region, so this is a normal stream-ordered kernel launch.
+        Drawn straight onto the device. Determinism is per-GPU: a CUDA
+        generator reproduces run-to-run on the same arch + torch build, not
+        against a CPU draw or another arch.
         """
         shape = (1, 1, *self.config.latent_shape)
         if device.type == "meta":
@@ -366,16 +317,9 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         """This frame's ``(mouse, button, scroll)``, each ``[1, 1, *]``.
 
         The request carries the whole scripted action stream as ``[1, F, *]``
-        and one frame is sliced out per step (actions are materialized at
-        request time; interactive conditioning needs a
-        refillable mid-``Loop`` edge that does not exist yet). The stream is a
-        loop-external input, so the conductor re-injects the same tensor every
-        iteration and the request's rollout counter advances through it. Prime
-        owns a separate idle controller and never calls this method.
-
-        The API boundary already validates exact stream length. Raising here is
-        a backstop against a scheduler/state bug; repeating the final row would
-        silently map multiple generated latents to one user action.
+        and one frame is sliced out per step; the conductor re-injects the
+        same loop-external tensor every iteration while the rollout counter
+        advances through it. Prime never calls this method.
         """
         widths = {"mouse": 2, "button": self.config.n_buttons, "scroll": 1}
         out = []
@@ -411,10 +355,9 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     def _zero_histories(self, device: torch.device) -> tuple[torch.Tensor, ...]:
         """Fresh zero-valued histories, shaped for this config's latent grid.
 
-        Takes a device rather than a real latent: nothing here needs a value,
-        only the shape ``initial_decoder_histories`` derives from one, and this
-        method runs both from a request's first ``prepare_inputs`` (before the
-        dit has produced anything this session) and from the capture template.
+        Takes a device rather than a real latent since only the shape
+        matters; used both from a request's first ``prepare_inputs`` and
+        from the capture template.
         """
         seed_latent = torch.zeros(
             (1, *self.config.latent_shape), dtype=self.ae_dtype, device=device,
@@ -422,13 +365,8 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         return initial_decoder_histories(self.taehv, seed_latent)
 
     def _history_state(self, request_id: str) -> tuple[torch.Tensor, ...]:
-        """The request's nine decoder histories, seeded to zero on first use.
-
-        Seeding happens on the first call any request makes — prime, since
-        prime always runs first — because the real values only exist inside
-        this fixed-shape state, not off any graph edge: there is no decoder
-        node's ``prepare_inputs`` to seed them anymore.
-        """
+        """The request's nine decoder histories, seeded to zero on first use
+        (prime, since prime always runs first)."""
         state = self.request_state(request_id)
         histories = tuple(
             state.get(f"{DECODER_HISTORY_PREFIX}{idx}") for idx in range(9)
@@ -447,20 +385,11 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         """Every request's ring clock, for ``RingKVStep``.
 
         Read off the same host ``state["frame_pos"]`` that ``prepare_inputs``
-        derives the ``[1]`` device tensor from and that ``postprocess``
-        advances — one source, so the number the step declares cannot drift
-        from the one the forward runs at. Read on the host and never off
-        ``inputs``: the ``frame_pos`` in there is a device tensor by then, and
-        an ``.item()`` on it would be a sync per step.
-
-        One pair per rid, and no ``None`` anywhere in the return type. The
-        singular version this replaces returned ``None`` for any batch it could
-        not describe with one number, and ``RingKVManager``'s continuity check
-        — the only thing standing between a stalled clock and a world quietly
-        rewriting its own history — then did nothing for that step. There must
-        be no batch shape that switches it off, so there is no shape that
-        declines to answer: a batch this submodule cannot serve is refused for
-        being a batch, with every clock in it still named.
+        derives its device tensor from and ``postprocess`` advances, never off
+        ``inputs`` (a device tensor by then, so an ``.item()`` would sync per
+        step). One pair per rid, with no ``None`` in the return type: a batch
+        this submodule cannot describe is refused rather than silently
+        skipping ``RingKVManager``'s continuity check.
         """
         return tuple(
             (rid, int(self.request_state(rid).get("frame_pos", 0))) for rid in request_ids
@@ -477,19 +406,12 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     ) -> SubmoduleStep:
         """Name both resources so the runner drives their lifecycle.
 
-        Neither step carries segments and neither resource reserves anything:
-        a ring overwrites in place, so there is no span to admit and no page
-        table to plan. Declaring them anyway is not ceremony — ``admit`` is
-        where a request is handed one of the node's worlds (and refused when
-        they are all taken), and a node that declares no step is never admitted
-        at all.
-
-        The one thing the KV step does carry is the ring clock, and it is a
-        ``RingKVStep`` rather than a ``KVStep`` so that it can. The clock has to
-        advance by exactly one per committed frame; declaring it here is what
-        lets ``RingKVManager.admit`` check that against the frame its ``commit``
-        last recorded for that rid, at the one point per frame where both
-        numbers exist. A desynced clock rewrites history without raising.
+        Neither step carries segments or reserves anything: a ring overwrites
+        in place, so there is no span to admit. Declaring them is still
+        required for ``admit`` to hand a request one of the node's worlds. The
+        KV step carries the ring clock via ``RingKVStep``, letting
+        ``RingKVManager.admit`` check it against the frame its last ``commit``
+        recorded for that rid.
         """
         del graph_walk, inputs, slot_lease, piecewise_leases, kwargs
         return SubmoduleStep(
@@ -520,10 +442,9 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         call, and return the decoded frame, the updated histories, and the
         clock passthrough.
 
-        ``engine_inputs`` is read for nothing at all here, on purpose: under
-        capture it is the dummy request's forever. The ring and the
-        attention backend come off ``self.node_resources``, which the DiT and
-        its 24 attention layers resolved once at ``bind_node_resources`` time.
+        ``engine_inputs`` is unused here, on purpose: under capture it is the
+        dummy request's forever. The ring and attention backend come off
+        ``self.node_resources``, resolved once at ``bind_node_resources``.
         """
         del engine_inputs
         histories = tuple(kwargs.pop(f"{DECODER_HISTORY_PREFIX}{idx}") for idx in range(9))
@@ -551,9 +472,8 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         )
         result: NameToTensorList = {
             "video_output": [frames],
-            # [B], not []: the loop-back edge to next iteration's "clock"
-            # input, whose only job is to be a name in ready_signals (see
-            # prepare_inputs). Harmless on prime too, whose node declares no
+            # Loop-back edge for next iteration's "clock" input; see
+            # prepare_inputs. Harmless on prime, whose node declares no
             # outputs at all.
             "clock": [frame_pos],
         }
@@ -572,11 +492,8 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         """Run the batched ``forward`` once, then split its rows back out.
 
         Row ``i`` of every output tensor belongs to
-        ``engine_inputs.request_ids[i]`` — the same row-order invariant
-        ``preprocess`` concatenated on the way in. ``video_output[i]`` is
-        ``[F, H, W, 3]``, exactly what ``postprocess`` consumes today;
-        ``clock[i:i+1]`` and each history row stay ``[1, ...]``, matching what
-        ``prepare_inputs`` builds for the next step.
+        ``engine_inputs.request_ids[i]``, the same row-order invariant
+        ``preprocess`` used going in.
         """
         out = self.forward(graph_walk, engine_inputs=engine_inputs, **kwargs)
         # Each value is a one-element list holding the batched tensor; index
@@ -598,12 +515,8 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     ) -> list[CudaGraphConfig]:
         """Both walks, as optional captures.
 
-        The DiT compiles its reference-shaped denoise/cache regions internally;
-        compiling this wrapper would fuse across their boundary. Prime is one
-        cache-only forward per request, but it is on the admission-to-first-frame
-        path and its inputs are the rollout template with ``noise`` renamed, so
-        the capture costs one static-input family and reuses the pool the rollout
-        graph already sized.
+        Prime's inputs are the rollout template with ``noise`` renamed, so it
+        reuses the pool the rollout graph already sized.
         """
         del tp_world_size  # no sharded nodes; the ring and the mask do not shard
         if not self.config.cuda_graph:
@@ -622,10 +535,8 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
                 "scroll": torch.zeros((1, 1, 1), dtype=dtype, device=device),
             }
             # The fused decode's histories, exactly as prepare_inputs builds
-            # them — this is what makes
-            # test_prepared_shapes_and_dtypes_are_the_capture_template_exactly
-            # hold. "clock" is deliberately absent from both: it is never read
-            # as an input (see prepare_inputs), only produced as an output.
+            # them. "clock" is absent: it is never read as an input, only
+            # produced as an output.
             tensor_inputs.update({
                 f"{DECODER_HISTORY_PREFIX}{idx}": value
                 for idx, value in enumerate(self._zero_histories(device))
@@ -635,26 +546,17 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
                 input_seq_len=self.config.tokens_per_frame,
             )
 
-        # Rollout listed first, but what actually orders capture is
-        # ``prepare_for_capture``'s ``(bs, num_tokens)`` sort, descending: the
-        # largest bucket (bs=step_batch_size) captures before every smaller one,
-        # sizing the shared graph pool once at its biggest allocation. Prime and
-        # rollout share the bucket set and, per bs, the same num_tokens, so each
-        # prime bucket ties the same-size rollout bucket on that key; the sort is
-        # stable, so rollout's earlier position here keeps it captured first at
-        # every tie, and prime reuses freed blocks all the way down.
+        # Rollout listed first: ``prepare_for_capture``'s ``(bs, num_tokens)``
+        # sort is descending and stable, so rollout captures first at every
+        # size tie with prime and sizes the shared graph pool at its biggest
+        # allocation; prime reuses freed blocks going down.
         batch_sizes = _rollout_capture_batch_sizes(self.config.step_batch_size)
         walks = [(ROLLOUT_WALK, "noise")]
         if self.config.capture_dit_prime:
-            # Prime captures the same geometric buckets as rollout. A prime batch
-            # of several requests admitted in one step replays the smallest
-            # bucket >= its size and pads the tail on the ring's scratch world
-            # (see ``RingKVManager.plan``), the same idiom rollout uses -- so the
-            # first multi-request prime replays a captured graph instead of
-            # falling to a runtime eager re-trace. ``caps_eager_batch_size`` stays
-            # the default True: a prime batch is capped at the largest captured
-            # bucket, which is ``step_batch_size``, exactly where admission caps
-            # it anyway.
+            # Prime captures the same geometric buckets as rollout, so a
+            # multi-request prime batch replays a captured graph instead of
+            # falling back to a runtime eager re-trace (see
+            # ``RingKVManager.plan``).
             walks.append((PRIME_WALK, "latent"))
         return [
             BatchedCudaGraphConfig(
@@ -684,14 +586,10 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         """Advance the ring clock by exactly one committed frame, and copy the
         fused decode's updated histories into the request's stable tensors.
 
-        Both walks commit — ``append_frame`` runs the cache pass alone and
-        ``generate_frame`` runs it after the four denoise passes — so both
-        advance. The clock advance is metadata only: no ``.item()``. The
-        history copy is a device ``copy_`` into the same fixed-address tensors
-        ``prepare_inputs`` reads back next call — no ``.item()``, no sync.
-        The clock lives on the host because it has to be readable *before* the
-        forward that uses it; the device tensor is derived from it in
-        ``prepare_inputs``, never the other way round.
+        Both walks commit, so both advance the clock. The clock advance is
+        metadata only, and the history copy is a device ``copy_`` into the
+        same fixed-address tensors ``prepare_inputs`` reads back next call --
+        neither syncs.
         """
         del inputs, kwargs
         state = self.request_state(request_id)
@@ -717,15 +615,10 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
     ) -> set[str]:
         """Stop the rollout loop after exactly ``num_steps`` iterations.
 
-        While iteration k (0-based) is being postprocessed the loop counter
-        still reads k, and a stop registered here ends the loop at the end of
-        that iteration — so N frames means firing at ``k == N - 1``, i.e.
-        ``k + 1 >= N``. Mirrors ``Wan22DitSubmodule.check_stop``; the ``>=``
-        rather than ``==`` keeps it firing if the deferred count ever reads past
-        N. The rollout node runs with async scheduling ON (see
-        ``WaypointModel``): an overshoot iteration this signal is too late to
-        stop is not a wasted forward, it is vetoed instead in
-        ``prepare_inputs`` before it ever commits garbage into the ring.
+        Iteration k (0-based) is still being postprocessed when the loop
+        counter reads k, so N frames means firing at ``k + 1 >= N``. Under
+        async scheduling an overshoot iteration this signal is too late to
+        stop is vetoed instead in ``prepare_inputs``.
         """
         del request_id, outputs
         if request_info.graph_walk != ROLLOUT_WALK:
@@ -737,15 +630,9 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         return set()
 
     def cleanup_request(self, request_id: str):
-        """Drop the request's clock. The ring is NOT reset here.
-
-        Releasing it is the engine's job — ``remove_request`` sweeps every
-        resource, and ``RingKVManager.remove_request`` is what drops the
-        ownership claim and zeroes the buffer. Doing it here as well would
-        double-free a claim the sweep is about to release, and doing it *only*
-        here would leave the ring held by a request the engine has already
-        forgotten.
-        """
+        """Drop the request's clock. The ring itself is released by the
+        engine's ``remove_request`` sweep (``RingKVManager.remove_request``),
+        not here."""
         super().cleanup_request(request_id)
 
 
@@ -757,8 +644,8 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
     """
 
     disable_torch_compile = True
-    # The dit node's statement: the dtype layout is settled at load, and an
-    # engine-level cast would round it underneath the AE.
+    # Dtype layout is settled at load; an engine-level cast would round it
+    # underneath the AE.
     disable_autocast = True
 
     def __init__(self, taehv: torch.nn.Module, config: WaypointConfig):
