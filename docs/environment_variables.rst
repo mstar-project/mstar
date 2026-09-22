@@ -136,6 +136,32 @@ model, so they are named for it.
      - ``1,2,4``
      - Comma-separated batch sizes to capture. Read only when
        ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
+   * - ``MSTAR_OMNIVOICE_MODEL_PATH``
+     - unset
+     - OmniVoice: load weights from this local directory instead of the
+       checkpoint the registry names. For serving a fine-tune of the same
+       architecture off a mounted volume, where the registry entry would
+       otherwise pull the public weights from the Hub.
+
+Serving (Python frontend)
+-------------------------
+
+Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_ROOT_PATH``
+     - ``""``
+     - Mount the app under a URL sub-path. Set it when an ingress routes the
+       deployment at a prefix and does not strip that prefix before the
+       request reaches the pod (Run:AI serves a workload at
+       ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
+       every route. Empty by default, so a direct deployment is unaffected.
 
 Serving (Rust frontend)
 -----------------------

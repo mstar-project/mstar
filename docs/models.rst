@@ -38,6 +38,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
        attention interleaved with full attention, plus a ViT tower.
+   * - ``omnivoice``
+     - ``k2-fsa/OmniVoice``
+     - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
+       backbone + audio codec. Clones a voice from a reference clip.
    * - ``qwen3_omni``
      - ``Qwen/Qwen3-Omni-30B-A3B-Instruct``
      - Omni-modal (text/image/audio/video in, text/audio out): Thinker + Talker + codec.
@@ -70,6 +74,7 @@ Notes
   ``process_prompt`` for the inputs it expects.
 - To add a new family, see :doc:`adding_models`.
 
+<<<<<<< HEAD
 Qwen3.5 (``qwen3_5_*``)
 -----------------------
 
@@ -95,6 +100,23 @@ is bf16 wherever FlashInfer's fused bf16 decode kernel applies (K = V = 128).
 ``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
 a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
 via ``extra_body``.
+=======
+OmniVoice notes
+~~~~~~~~~~~~~~~
+
+- Zero-shot only: there are no built-in speakers. Pass ``ref_audio`` with its
+  transcript in ``ref_text`` to clone a voice, or describe one in ``voice``.
+  ``ref_text`` is required alongside ``ref_audio``.
+- ``language`` takes either the name (``Vietnamese``) or the id (``vi``): a
+  name is resolved to the id the model was trained on before the prompt is
+  built, and an unrecognised value warns and falls back to language-agnostic
+  mode.
+- The ``omnivoice`` package is installed separately from git rather than by an
+  extra — see :doc:`installation`.
+- The backbone is not autoregressive: it fills a fixed canvas of eight codebook
+  rows over a few unmasking steps, so there is no KV cache and no per-token
+  sampling loop. Serve it with ``mstar serve omnivoice --gpus 0``.
+>>>>>>> main
 
 Qwen3-TTS notes
 ---------------

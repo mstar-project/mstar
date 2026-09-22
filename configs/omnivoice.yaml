@@ -1,0 +1,5 @@
+model: "omnivoice"
+max_seq_len: 8192
+node_groups:
+  - node_names: [ref_encoder, backbone, code2wav]
+    ranks: [0]
