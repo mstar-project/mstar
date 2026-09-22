@@ -69,6 +69,7 @@ class ZImageModel(Model):
         max_batch_size: int = 8,
         max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
+        async_scheduling: bool = False,
         **kwargs,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
@@ -90,6 +91,8 @@ class ZImageModel(Model):
         # largest output (pixels) a request may ask for; larger requests are rejected before scheduling
         self.max_image_area = int(max_image_area)
         self.vae_compile = bool(vae_compile)
+        # speculative scheduling of the image nodes, off by default (see Flux2KleinModel)
+        self.async_scheduling = bool(async_scheduling)
         self._snapshot = None
         self._config: ZImageConfig | None = None
         self.tokenizer = None
@@ -130,21 +133,21 @@ class ZImageModel(Model):
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
-            name="text_encoder", input_names=[TEXT_INPUTS], enable_async_scheduling=False,
+            name="text_encoder", input_names=[TEXT_INPUTS], enable_async_scheduling=self.async_scheduling,
             outputs=[GraphEdge(next_node=EMPTY_DESTINATION, name=TEXT_EMBEDS, persist=True)],
         )
         loop = Loop(
             name=DENOISE_LOOP,
             section=GraphNode(
                 name="dit", input_names=[TEXT_EMBEDS, LATENTS],
-                # lockstep scheduling so concurrent requests batch (see Flux2KleinModel)
-                outputs=[GraphEdge(next_node="dit", name=LATENTS)], enable_async_scheduling=False,
+                # lockstep by default so concurrent requests batch (see Flux2KleinModel.async_scheduling)
+                outputs=[GraphEdge(next_node="dit", name=LATENTS)], enable_async_scheduling=self.async_scheduling,
             ),
             max_iters=self.config.max_denoise_steps,
             outputs=[GraphEdge(next_node="vae_decoder", name=LATENTS)],
         )
         decoder = GraphNode(
-            name="vae_decoder", input_names=[LATENTS], enable_async_scheduling=False,
+            name="vae_decoder", input_names=[LATENTS], enable_async_scheduling=self.async_scheduling,
             outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=IMAGE_OUTPUT, output_modality="image")],
         )
         return {ENCODE_TEXT_WALK: encode_text, IMAGE_GEN_WALK: Sequential([loop, decoder])}
