@@ -303,5 +303,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                 capture_batch_sizes=list(self.capture_batch_sizes),
                 # uncaptured sizes / shapes run the eager batched path, so don't cap the batch
                 caps_eager_batch_size=False,
+                # every static input is row-leading ([tokens, features] or a per-batch scalar); a text
+                # embedding's hidden size can equal an edit bucket's token count (7680 for klein), which
+                # would otherwise be mistaken for the token axis
+                static_seq_dims={key: 0 for key in tensors},
             ))
         return configs
