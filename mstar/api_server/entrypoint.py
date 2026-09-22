@@ -814,7 +814,7 @@ api_server: APIServer | None = None
 # The router resolves the loaded model's adapter lazily per request, so models
 # without an adapter simply return a 404 there and keep working via /generate.
 from mstar.api_server.openai.router import router as openai_router  # noqa: E402
-from mstar.utils.procs import die_with_parent, graceful_sigterm
+from mstar.utils.procs import die_with_parent, graceful_sigterm  # noqa: E402
 
 app.include_router(openai_router)
 
