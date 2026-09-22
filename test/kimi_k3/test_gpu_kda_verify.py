@@ -60,7 +60,8 @@ def spec_of(pool):
 def test_fla_verify_matches_the_torch_reference():
     gen = torch.Generator(device=DEV).manual_seed(0)
     params = KDAParams(conv_weight=(torch.randn(P, W, device=DEV, generator=gen) * 0.3).to(torch.bfloat16),
-                       A_log=torch.randn(H, device=DEV, generator=gen), dt_bias=torch.randn(H * D, device=DEV, generator=gen) * 0.1,
+                       A_log=torch.randn(H, device=DEV, generator=gen),
+                       dt_bias=torch.randn(H * D, device=DEV, generator=gen) * 0.1,
                        lower_bound=-5.0, num_heads=H, head_dim=D, scale=D ** -0.5)
     rids = ["a", "b"]
     trees = {}
@@ -105,15 +106,18 @@ def test_fla_verify_matches_the_torch_reference():
             runner.plan(s)
             plan = attn.current_plan()
             assert plan.is_verify and plan.k1 == span
-            outs[name] = attn.run(*blk, pool.block("conv", 0), pool.block("state", 0), params, spec=spec_of(pool)).float()
+            outs[name] = attn.run(*blk, pool.block("conv", 0), pool.block("state", 0), params,
+                                  spec=spec_of(pool)).float()
             attn.set_prefix_len(spec_of(pool).length, torch.tensor(accepted, dtype=torch.int32, device=DEV))
             runner.commit(s)
             slots = plan.slot_ids_cpu
             states[name] = pool.block("state", 0)[slots].clone()
             wins[name] = pool.block("conv", 0)[slots].float().clone()
             lens[name] = pool.block("spec_len", 0)[slots, 0].tolist()
-        assert torch.allclose(outs["fla"], outs["torch"], atol=3e-2, rtol=3e-2), (outs["fla"] - outs["torch"]).abs().max()
-        assert torch.allclose(states["fla"], states["torch"], atol=1e-3, rtol=1e-3), (states["fla"] - states["torch"]).abs().max()
+        out_diff = (outs["fla"] - outs["torch"]).abs().max()
+        assert torch.allclose(outs["fla"], outs["torch"], atol=3e-2, rtol=3e-2), out_diff
+        state_diff = (states["fla"] - states["torch"]).abs().max()
+        assert torch.allclose(states["fla"], states["torch"], atol=1e-3, rtol=1e-3), state_diff
         assert torch.equal(wins["fla"], wins["torch"])
         assert lens["fla"] == lens["torch"] == ([a + 1 for a in accepted] if span > 1 else [0, 0]), lens
 
@@ -137,14 +141,16 @@ def test_checkpoint_kernel_matches_fla_on_plain_rows():
         beta=beta.view(1, n * t, H), A_log=A_log, dt_bias=dt_bias, initial_state=S0.clone(), scale=D ** -0.5,
         output_final_state=True, state_v_first=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True,
         use_gate_in_kernel=True, use_beta_sigmoid_in_kernel=True, lower_bound=-5.0)
-    # ours: slots in a pool of 5 (rows use slots 4, 1, 3), checkpoint after the last token for rows 0 and 2, never for row 1
+    # ours: slots in a pool of 5 (rows use slots 4, 1, 3), checkpoint after the last token for rows 0 and 2,
+    # never for row 1
     pool = torch.zeros(5, H, D, D, device=DEV)
     slots = torch.tensor([4, 1, 3], device=DEV, dtype=torch.int32)
     pool[slots.long()] = S0
     ckpt = torch.tensor([t - 1, -1, t - 1], device=DEV, dtype=torch.int32)
     o = kda_recurrent_checkpoint(q, k, v, g, beta, A_log, dt_bias, pool, slots, ckpt, cu, D ** -0.5, -5.0)
     assert torch.allclose(o.float(), o_ref.view(n * t, H, D).float(), atol=2e-2, rtol=2e-2)
-    assert torch.allclose(pool[4], S_ref[0], atol=1e-4, rtol=1e-4) and torch.allclose(pool[3], S_ref[2], atol=1e-4, rtol=1e-4)
+    assert torch.allclose(pool[4], S_ref[0], atol=1e-4, rtol=1e-4)
+    assert torch.allclose(pool[3], S_ref[2], atol=1e-4, rtol=1e-4)
     assert torch.equal(pool[1], S0[1])  # row 1 stored nothing
     # a mid-row checkpoint equals the state after that many tokens
     ckpt2 = torch.tensor([4, 4, 4], device=DEV, dtype=torch.int32)
@@ -153,7 +159,8 @@ def test_checkpoint_kernel_matches_fla_on_plain_rows():
     cu5 = torch.arange(n + 1, device=DEV, dtype=torch.int32) * 5
     take = torch.cat([torch.arange(i * t, i * t + 5, device=DEV) for i in range(n)])
     _, S5 = fused_recurrent_kda_fwd(
-        q=q[take].view(1, -1, H, D), k=k[take].view(1, -1, H, D), v=v[take].view(1, -1, H, D), g=g[take].view(1, -1, H, D),
+        q=q[take].view(1, -1, H, D), k=k[take].view(1, -1, H, D), v=v[take].view(1, -1, H, D),
+        g=g[take].view(1, -1, H, D),
         beta=beta[take].view(1, -1, H), A_log=A_log, dt_bias=dt_bias, initial_state=S0.clone(), scale=D ** -0.5,
         output_final_state=True, state_v_first=True, cu_seqlens=cu5, use_qk_l2norm_in_kernel=True,
         use_gate_in_kernel=True, use_beta_sigmoid_in_kernel=True, lower_bound=-5.0)
@@ -178,7 +185,8 @@ def test_checkpoint_kernel_block_only_output_matches_the_full_one():
     cu = torch.arange(n + 1, device=DEV, dtype=torch.int32) * (kp + k1)
     pool_a, pool_b = S0.clone(), S0.clone()
     full = kda_recurrent_checkpoint(q, k, v, g, beta, A_log, dt_bias, pool_a, slots, ckpt, cu, D ** -0.5, -5.0)
-    block = kda_recurrent_checkpoint(q, k, v, g, beta, A_log, dt_bias, pool_b, slots, ckpt, cu, D ** -0.5, -5.0, out_skip=kp)
+    block = kda_recurrent_checkpoint(q, k, v, g, beta, A_log, dt_bias, pool_b, slots, ckpt, cu, D ** -0.5, -5.0,
+                                     out_skip=kp)
     assert block.shape == (n * k1, H, D)
     assert torch.equal(block, full.view(n, kp + k1, H, D)[:, kp:].reshape(n * k1, H, D))
     assert torch.equal(pool_a, pool_b)
