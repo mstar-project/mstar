@@ -77,7 +77,8 @@ class KDAPlan:
         return self.cached("slots_long", lambda: self.slot_ids[: self.num_rows].to(torch.long))
 
     def state_mask(self, dtype: torch.dtype) -> torch.Tensor:
-        """``has_state`` as a ``[rows]`` factor in ``dtype``: 1 where the slot's state is read, 0 where it reads as zeros."""
+        """``has_state`` as a ``[rows]`` factor in ``dtype``: 1 where the slot's state is read, 0 where it reads
+        as zeros."""
         return self.cached(("mask", dtype), lambda: self.has_state[: self.num_rows].to(dtype))
 
     # host copies for reference kernels that loop over rows (a sync on CUDA; the fla kernels never ask)
