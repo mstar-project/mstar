@@ -214,3 +214,5 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
             param = getattr(self, name, None)
             if param is not None:
                 param.weight_loader = self._head_loader
+        # the rank's pad block, sized from its local head count
+        self._zero_gate_pad()

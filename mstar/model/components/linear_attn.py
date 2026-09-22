@@ -40,19 +40,24 @@ class GDNProjLayout(Enum):
     FUSED = "fused"
 
 
-# bf16 elements in the 16 bytes cutlass wants a tensor to start on
-_ALIGN = 8
+# bf16 elements in the 32 bytes FlashInfer's bf16 GDN decode kernel wants a
+# tensor to start on (its fp32 kernel is happy with 16, but the bf16 one is
+# the default whenever K = V = 128, and it checks on every call).
+_ALIGN = 16
 
 
 def gate_pad(num_v_heads: int) -> int:
     """Padding between the ``a`` and ``b`` blocks, in elements.
 
     The decode kernel takes ``a`` and ``b`` as raw slices of the fused
-    projection, and cutlass checks each one's data pointer for 16-byte
+    projection, and the kernel checks each one's data pointer for 32-byte
     alignment. ``a`` is fine — every block before it is a whole number of
     128-wide heads — but ``b`` starts one v-head count later, so it lands
-    mid-word whenever that count is not a multiple of 8. This block is what
-    pushes it back onto one; it is never loaded and never read.
+    mid-word whenever that count is not a multiple of 16. This block is what
+    pushes it back onto one; it is never loaded and never read. Under tensor
+    parallelism the count is the rank's share, which is why the pad is sized
+    per rank (16 v-heads at TP2 leaves 8, and 8 x 2 bytes is only half a
+    32-byte line).
     """
     return -num_v_heads % _ALIGN
 
@@ -158,6 +163,19 @@ class GatedDeltaNet(nn.Module):
         proj = getattr(self, "in_proj_fused", None)
         if proj is not None:
             proj.weight.weight_loader = self._fused_in_proj_loader
+        self._zero_gate_pad()
+
+    def _zero_gate_pad(self) -> None:
+        """The pad block is never loaded, so give it zeros rather than whatever
+        ``torch.empty`` left there: its output column is discarded, but NaNs
+        in a weight trip any finiteness check or quantization pass."""
+        proj = getattr(self, "in_proj_fused", None)
+        pad = self.in_proj_blocks[5]
+        if proj is None or pad == 0:
+            return
+        offset = sum(self.in_proj_blocks[:5])
+        with torch.no_grad():
+            proj.weight[offset:offset + pad].zero_()
 
     def _apply(self, fn, recurse: bool = True):
         """Keep the fp32 parameters fp32 through any ``.to(dtype)``.

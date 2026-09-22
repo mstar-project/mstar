@@ -101,6 +101,8 @@ GRIDS = [
 def towers():
     """Ours and HF's, same weights, fp32."""
     transformers = pytest.importorskip("transformers")
+    # the release that added Qwen3.5 is newer than pyproject's transformers floor
+    pytest.importorskip("transformers.models.qwen3_5")
     from transformers.models.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5VisionModel as HFVisionModel,
     )

@@ -61,8 +61,10 @@ def local_cpus_for_device(device: torch.device) -> set[int] | None:
 def pin_to_device_numa_node(device: torch.device) -> str | None:
     """Restrict this process to ``device``'s local CPUs.
 
-    Returns what it did, for logging, or None if it left affinity alone.
-    Set ``MSTAR_NUMA_PIN=0`` to disable.
+    Only acts when the process may still run on every online CPU; any prior
+    narrowing (an operator's `taskset`, a cgroup or Slurm cpuset) is left as
+    it is. Returns what it did, for logging, or None if it left affinity
+    alone. Set ``MSTAR_NUMA_PIN=0`` to disable.
     """
     if os.environ.get(_ENV, "1").lower() in ("0", "false", "no"):
         return None
@@ -74,9 +76,19 @@ def pin_to_device_numa_node(device: torch.device) -> str | None:
     except (AttributeError, OSError):
         return None
 
-    # Someone already narrowed us (taskset, numactl, a cgroup) — that is a
-    # deliberate choice about placement, so don't second-guess it.
-    if current <= local or not current - local:
+    # Someone already narrowed us (taskset, numactl, a cgroup, a Slurm cpuset)
+    # — that is a deliberate choice about placement, so don't second-guess it,
+    # even when the mask happens to straddle the GPU's node: cutting a
+    # sixteen-CPU allocation down to the eight on one socket leaves every
+    # worker thread fighting over those eight.
+    online = os.cpu_count() or len(current)
+    if len(current) < online:
+        logger.debug(
+            "NUMA: affinity already narrowed to %d of %d CPUs; leaving it alone",
+            len(current), online,
+        )
+        return None
+    if current <= local:
         return None
     target = current & local
     if not target:

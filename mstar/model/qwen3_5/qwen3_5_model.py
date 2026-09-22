@@ -102,6 +102,10 @@ def _as_hwc_uint8(image: torch.Tensor):
     """
     if image.dtype.is_floating_point:
         image = (image * 255.0).clamp(0, 255).to(torch.uint8)
+    if image.dim() == 3 and image.shape[0] == 4:
+        # a PNG with an alpha channel: the processor cannot infer the channel
+        # dim of a 4-channel tensor and refuses it, so drop alpha here
+        image = image[:3]
     if image.dim() == 3 and image.shape[0] in (1, 3):
         image = image.permute(1, 2, 0)
     return image.cpu().contiguous().numpy()
@@ -383,7 +387,18 @@ class Qwen3_5DenseModel(Model):
         text step by construction.
         """
         if prompt is None:
-            return {}
+            # An image-only chat message arrives with no text at all. That is a
+            # legitimate prompt (the template still frames the image inside a
+            # user turn), so render it with an empty text span. A request with
+            # neither text nor attachments has nothing to prefill, and saying so
+            # here reaches the client as a 400 rather than a swallowed error in
+            # the conductor and a request that never answers.
+            if not any(m != TEXT for m in input_modalities):
+                raise ValueError(
+                    "Qwen3.5 got a request with no text and no attachments; "
+                    "send a prompt, an image, or both"
+                )
+            prompt = ""
 
         parts = parts_from_modalities(
             input_modalities,
@@ -394,14 +409,15 @@ class Qwen3_5DenseModel(Model):
         if unsupported:
             # Video needs per-frame timestamp tokens and a `video_second_per_grid`
             # position scale that images do not; the tower would run, the
-            # positions would be wrong.
-            raise NotImplementedError(
+            # positions would be wrong. A ValueError so the server answers 400.
+            raise ValueError(
                 f"Qwen3.5 here has no {', '.join(sorted(unsupported))} path; "
                 "text and image attachments only"
             )
         raw_images = (tensors or {}).get("image_inputs", [])
-        if tensors is not None:
-            check_attachments(parts, {"image": len(raw_images)})
+        # always: a request naming an image it did not send would otherwise
+        # have the image quietly dropped from the schedule
+        check_attachments(parts, {"image": len(raw_images)})
 
         # The released Qwen3.5 checkpoints are chat/reasoning models — the base
         # ones carry a `-Base` suffix — so the raw completion form is wrong
@@ -650,7 +666,7 @@ class Qwen3_5DenseModel(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         model_kwargs = model_kwargs or {}
-        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
+        keys = ["temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos"]
         return {
             SAMPLER: SamplingReqConfig(
                 **{k: model_kwargs[k] for k in keys if k in model_kwargs}

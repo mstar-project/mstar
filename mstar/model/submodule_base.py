@@ -50,6 +50,14 @@ class BatchedModelOutput:
     check_stop_buffers: dict[str, torch.Tensor | NameToTensorList] | None = None
     # name -> [bs, ...] tensor, row i belonging to request i
     row_outputs: dict[str, torch.Tensor] | None = None
+    # The request each row of ``check_stop_buffers`` belongs to, in the order
+    # the forward ran them. Stamped by the engine, which is the only place that
+    # order is known for sure: the worker rewrites its own copy of the batch's
+    # request list between the forward and the stop check (dropping requests
+    # whose loops already stopped, and not necessarily in place), so slicing
+    # the rows by position against that list hands one request another's
+    # token. None when there are no row-addressed stop buffers.
+    row_request_ids: tuple[str, ...] | None = None
 
     @classmethod
     def coerce(cls, output: BatchedModelOutput | dict[str, Any]) -> BatchedModelOutput:
@@ -135,10 +143,18 @@ class BatchedModelOutput:
         other = self.coerce(other)
         self.per_rid_outputs.update(other.per_rid_outputs)
         self.packed_outputs.update(other.packed_outputs)
+        # Row-addressed buffers describe one forward. Merging two of them
+        # would leave rows from different forwards under one name, so the
+        # merged output keeps them only when exactly one side had any; the
+        # stop check then falls back to the per-rid outputs, which are always
+        # there.
         if other.check_stop_buffers is not None:
             if self.check_stop_buffers is None:
-                self.check_stop_buffers = {}
-            self.check_stop_buffers.update(other.check_stop_buffers)
+                self.check_stop_buffers = dict(other.check_stop_buffers)
+                self.row_request_ids = other.row_request_ids
+            else:
+                self.check_stop_buffers = None
+                self.row_request_ids = None
         if other.row_outputs is not None:
             if self.row_outputs is None:
                 self.row_outputs = {}

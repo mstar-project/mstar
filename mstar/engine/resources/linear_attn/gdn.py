@@ -26,7 +26,7 @@ from mstar.engine.resources.linear_attn.wrappers import (
     GDNWrapper,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
-from mstar.engine.resources.recurrent.pool import RecurrentAddressing
+from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentAddressing
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
@@ -195,6 +195,9 @@ class GDNManager(LinearAttnManager):
             tok = lease.bucket.num_tokens
 
         if key not in store:
+            # what the pool hands to rows that stand for no request; the conv
+            # kernels skip rows carrying it
+            null_slot_id = SINK_SLOT if self._has_sink else NO_SLOT
             if is_decode:
                 store[key] = GDNDecodeWrapper(
                     device=self._device,
@@ -203,6 +206,7 @@ class GDNManager(LinearAttnManager):
                     qk_l2norm=self.config.qk_l2norm,
                     bs=bs,
                     cuda_graph=lease is not None,
+                    null_slot_id=null_slot_id,
                 )
             else:
                 store[key] = GDNPrefillWrapper(
@@ -214,7 +218,8 @@ class GDNManager(LinearAttnManager):
                     bs=bs,
                     num_tokens=tok,
                     cuda_graph=lease is not None,
-                    has_sink_state=self._has_sink
+                    has_sink_state=self._has_sink,
+                    null_slot_id=null_slot_id,
                 )
         return store[key]
 
@@ -315,8 +320,8 @@ class GDNManager(LinearAttnManager):
         ``[conv_dim, kernel_size]``, and ``conv_layer`` this layer's
         ``[max_slots, conv_dim, width]`` view of the pool's conv block, updated
         in place. Splits like ``run``, on the same plan. Padding rows need
-        nothing special: at the sink they write there, and with the sink off
-        they carry -1, this kernel's own ``PAD_SLOT_ID``.
+        nothing special: they carry the pool's pad index (the sink, or -1 with
+        the sink off), and both conv kernels skip rows whose slot is that id.
         """
         return self.current_plan(label).run_conv(
             x=x, conv_layer=conv_layer, weight=weight, bias=bias,

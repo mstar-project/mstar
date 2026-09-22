@@ -386,6 +386,8 @@ class KVManager(AttentionResource):
                 self._preplan_marked = []
             for (from_label, to_label), extra in forks:
                 for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
                     # checked before the reservation, which is what creates it
                     if (
                         ctx.is_preplan
@@ -400,7 +402,12 @@ class KVManager(AttentionResource):
                         return AdmitOutcome(ok=False, reason=alloc_res.error)
 
             for segment in step.segments:
-                if segment.span == 0:
+                # A replay's padding rows reserve nothing: they run against
+                # SINK_PAGE (see `_sequence_views`). Handing them pages meant
+                # either keeping those resident per dummy name or, freed after
+                # each step, re-allocating them every padded step — and on a
+                # near-full arena that allocation failed and held the batch.
+                if segment.span == 0 or ctx.is_padding_row(segment.request_id):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 alloc_res = self._alloc(
@@ -418,6 +425,8 @@ class KVManager(AttentionResource):
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
+                if ctx.is_padding_row(segment.request_id):
+                    continue
                 stream = self._streams.get(
                     segment.request_id, {}
                 ).get(segment.label)
@@ -436,11 +445,23 @@ class KVManager(AttentionResource):
         self,
         segments: list[Segment],
         pending_forks: dict[tuple[str, str], tuple[int, int]] | None = None,
+        ctx: StepContext | None = None,
     ) -> list[SequenceView]:
         views = []
         page_size = self.kv_cache.page_size
         pending_forks = pending_forks or {}
         for s in segments:
+            if ctx is not None and ctx.is_padding_row(s.request_id):
+                # A padding row stands for no request. Its tokens read and
+                # write SINK_PAGE, which is held out of circulation for exactly
+                # this, so the row needs no pages of its own and its output is
+                # discarded by the engine.
+                views.append(SequenceView(
+                    request_id=s.request_id, label=s.label,
+                    page_idxs=[SINK_PAGE] if s.span > 0 else [],
+                    length=s.span, to_compute=s.span,
+                ))
+                continue
             stream = self._streams[s.request_id][s.label]
             stored_len, generation = pending_forks.get(
                 (s.request_id, s.label), (stream.stored_len, stream.generation)
@@ -567,6 +588,8 @@ class KVManager(AttentionResource):
     def _maybe_apply_forks(self, step: KVStep, ctx: StepContext):
         for (from_label, to_label) in step.pre_forks:
             for rid in ctx.padded_request_ids:
+                if ctx.is_padding_row(rid):
+                    continue
                 self._apply_fork(rid, from_label, to_label)
 
     def _pending_fork_state(
@@ -583,6 +606,8 @@ class KVManager(AttentionResource):
         with self._lock:
             for (from_label, to_label) in step.pre_forks:
                 for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
                     labels = self._streams.get(rid, {})
                     src = labels.get(from_label)
                     dst = labels.get(to_label)
@@ -630,7 +655,7 @@ class KVManager(AttentionResource):
         res = KVPlanOutputs(
             {
                 plan_label: self._plan_output(
-                    self._sequence_views(segments, pending)
+                    self._sequence_views(segments, pending, ctx)
                 )
                 for plan_label, segments in group_by_plan_label(
                     step.segments, step.combined_labels
@@ -676,6 +701,8 @@ class KVManager(AttentionResource):
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
             for segment in step.segments:
+                if ctx.is_padding_row(segment.request_id):
+                    continue  # ran against SINK_PAGE, holds nothing
                 stream = self._streams[segment.request_id][segment.label]
                 # cleared before the `step.commit` test: a step that keeps no
                 # tokens (image_gen, action_gen) still read these pages, and
@@ -701,6 +728,8 @@ class KVManager(AttentionResource):
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
                 for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
                     self._apply_fork(rid, from_label, to_label)
         # TODO: handle retention policy, free pages if not commit
 

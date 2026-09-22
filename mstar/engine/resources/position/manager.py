@@ -173,6 +173,13 @@ class RopeManager(PositionManager):
     def supports_preplan(self):
         return True
 
+    @property
+    def force_double_buffer(self):
+        # `_pinned_pos_ids_buffer` refills one pinned host buffer per slot and
+        # `_place` copies out of it non-blocking, so a slot must not be reused
+        # while that copy may still be queued. See `Resource.force_double_buffer`.
+        return True
+
     def clear_preplan(self):
         # `None` means the label had no counter before the staging, which is
         # not the same as having had 0: restoring 0 leaves behind a label the

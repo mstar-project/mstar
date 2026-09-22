@@ -21,6 +21,7 @@ Run directly for a report, or under pytest for the assertion:
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from mstar.engine.resources.base import EngineResourceInfo
@@ -46,6 +47,10 @@ from mstar.model.components.distributed import (
 from mstar.model.components.distributed.linear_attn import ParallelGatedDeltaNet
 from mstar.model.components.linear_attn import GDNProjLayout
 from mstar.model.components.norm import RMSNorm
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="captures CUDA graphs; needs a GPU"
+)
 
 GDN_STATE, LINEAR_ATTN = "gdn_state", "linear_attn"
 BUCKET_TOKENS = 32  # a capture bucket's token slots

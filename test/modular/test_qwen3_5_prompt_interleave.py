@@ -191,11 +191,38 @@ def test_empty_prompt_fails_legibly(model):
 
 
 def test_video_is_refused_rather_than_run_as_an_image(model):
-    with pytest.raises(NotImplementedError, match="video"):
+    # a ValueError, so the server answers 400 rather than 500
+    with pytest.raises(ValueError, match="video"):
         model.process_prompt(
             "What happens?", ["video", "text"], ["text"],
             tensors={"video_inputs": [an_image()]},
         )
+
+
+def test_image_only_message_renders_an_empty_text_span(model):
+    """A chat message with just an image arrives with no text at all; that is
+    still a prompt, so it must render (an empty span around the image) rather
+    than be dropped on the floor and time out at the client."""
+    out = model.process_prompt(
+        None, ["image"], ["text"], tensors={"image_inputs": [an_image()]},
+    )
+    assert len(out["pixel_values"]) == 1 and len(out["image_grid_thw"]) == 1
+    # the template's framing around the image: a span before it and one after
+    assert len(out["text_inputs"]) == 2
+
+
+def test_no_text_and_no_attachments_is_a_bad_request(model):
+    with pytest.raises(ValueError, match="no text and no attachments"):
+        model.process_prompt(None, ["text"], ["text"])
+
+
+def test_rgba_image_is_accepted(model):
+    torch.manual_seed(0)
+    rgba = torch.rand(4, 224, 224)
+    out = model.process_prompt(
+        "Describe.", ["image", "text"], ["text"], tensors={"image_inputs": [rgba]},
+    )
+    assert out["pixel_values"][0].shape[0] > 0
 
 
 def test_attachment_count_mismatch_is_caught(model):

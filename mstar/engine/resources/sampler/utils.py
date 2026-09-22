@@ -250,10 +250,17 @@ def _split_partials_kernel(
                 is_new, v_start + tl.argmax(scaled, axis=0).to(tl.int32), arg,
             )
         new_max = tl.maximum(run_max, block_max)
-        # rescale what we had, then fold this block in
-        run_sum = run_sum * tl.exp(run_max - new_max) + tl.sum(
-            tl.where(mask, tl.exp(scaled - new_max), 0.0)
+        # rescale what we had, then fold this block in. Both terms need care
+        # while no finite logit has been seen yet: `-inf - -inf` is NaN, so a
+        # chunk whose leading block is all -inf (a masked-out vocab region)
+        # would otherwise carry a NaN sum out of here, which the combine step
+        # turns into a 1e30 scale on the whole row. Until the running max is
+        # finite the sum is exactly zero, and a -inf logit contributes nothing.
+        rescale = tl.where(run_max == -float("inf"), 0.0, tl.exp(run_max - new_max))
+        terms = tl.where(
+            mask & (scaled > -float("inf")), tl.exp(scaled - new_max), 0.0
         )
+        run_sum = run_sum * rescale + tl.sum(terms)
         run_max = new_max
 
     base = row * part_stride_b + split
@@ -348,7 +355,16 @@ _SPLIT_MAX_BLOCK = 8192
 
 
 def _split_count(batch: int, vocab: int, device: torch.device) -> int:
-    """How many chunks to cut the vocab into, or 1 to keep the fused kernel."""
+    """How many chunks to cut the vocab into.
+
+    Note that this is the vocabulary's call alone: any vocab wider than one
+    chunk takes the split path, whatever the batch, so for every real LLM
+    vocabulary the fused kernel above is only reached from tests. The batch
+    is accepted so a future rule can use it (at a few hundred rows the fused
+    kernel already fills the machine and reads the logits three times where
+    the split reads them twice, so which wins there is a measurement, not a
+    given).
+    """
     del batch, device
     return max(1, -(-vocab // _SPLIT_CHUNK))
 

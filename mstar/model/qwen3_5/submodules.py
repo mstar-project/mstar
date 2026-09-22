@@ -74,12 +74,9 @@ logger = logging.getLogger(__name__)
 class LLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
-    # Capped, because every captured row holds a recurrent slot until the whole
-    # capture pass finishes: the runner keys its dummy rows per (config, slot),
-    # so the pool's high-water mark is
-    #   sum over configs of (num_slots x max capture bs)
-    # and at ~50 MiB a slot that is what sets `gdn_state.max_slots`, not the
-    # concurrency the deployment actually wants. See configs/qwen3_5.yaml.
+    # Capture rows and a replay's padding rows address the pool's sink and
+    # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
+    # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     # A merged walk holds a whole prompt, so these count text as well as image

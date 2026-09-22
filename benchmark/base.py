@@ -243,7 +243,7 @@ class Qwen3TTS(Model):
 
 
 class Qwen3_5_Dense(Model):
-    """Qwen3-TTS CustomVoice benchmark metadata for native M* requests."""
+    """Qwen3.5 dense (text + image in, text out) benchmark metadata."""
 
     DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
     def __init__(self, model_id: str | None = None):

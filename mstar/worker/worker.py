@@ -2228,7 +2228,10 @@ class Worker:
                 batch_N.batch.node_objects.pop(stopped_rid, None)
                 batch_N.batch.request_to_worker_graph.pop(stopped_rid, None)
                 batch_N.node_batch.per_request_info.pop(stopped_rid, None)
-        batch_N.node_batch.request_ids = list(valid_rids)
+        # keep the forward's order: other code walks this list positionally
+        batch_N.node_batch.request_ids = [
+            rid for rid in batch_N.node_batch.request_ids if rid in valid_rids
+        ]
         if not valid_rids:
             range_pop(synchronize=False)
             return
@@ -2521,11 +2524,13 @@ class Worker:
         the whole batch tensor instead pays one, and the per-rid views below
         are slices of pinned memory, so they cost nothing.
 
-        Row i belongs to ``request_ids[i]``, the same convention the engine
-        uses to map a captured graph's rows back to real requests. A padded
-        replay leaves extra rows past the real ones; they are simply not read.
+        Row i belongs to ``request_ids[i]``, which has to be the order the
+        forward ran the requests in (``BatchedModelOutput.row_request_ids``),
+        not this batch's current request list: by the time the stop check
+        runs, requests whose loops stopped a step ago have been dropped from
+        that list. A padded replay leaves extra rows past the real ones; they
+        are simply not read.
         """
-        rows = len(request_ids)
         host: dict[str, torch.Tensor] = {}
         with torch.cuda.stream(side):
             for index, (name, tensor) in enumerate(buffers.items()):
@@ -2539,6 +2544,14 @@ class Worker:
                 host[name] = buf
         side.synchronize()
 
+        return Worker._rows_to_per_rid(host, request_ids)
+
+    @staticmethod
+    def _rows_to_per_rid(
+        host: dict, request_ids: list[str],
+    ) -> dict[str, NameToTensorList]:
+        """Slice row-addressed buffers into the per-rid form ``check_stop``
+        reads: row i goes to ``request_ids[i]``."""
         out: dict[str, NameToTensorList] = {}
         for i, rid in enumerate(request_ids):
             per_rid: NameToTensorList = {}
@@ -2570,7 +2583,16 @@ class Worker:
         tensors here (e.g. activations), revisit.
         """
         source = outputs.get_check_stop_input()
+        # Rows of a batch-addressed buffer belong to the requests in the order
+        # the forward ran them, which the engine stamped on the output.
+        row_rids = (
+            list(outputs.row_request_ids)
+            if outputs.row_request_ids is not None else request_ids
+        )
         if not torch.cuda.is_available() or completion_event is None:
+            if outputs.check_stop_buffers is not None and row_rids is not None:
+                # host tensors already (a CPU device): only the re-keying
+                return Worker._rows_to_per_rid(outputs.check_stop_buffers, row_rids)
             return source
         if not source:
             return source
@@ -2580,9 +2602,9 @@ class Worker:
         side = self._d2h_stream
         side.wait_event(completion_event)
 
-        if outputs.check_stop_buffers is not None and request_ids is not None:
+        if outputs.check_stop_buffers is not None and row_rids is not None:
             return self._prematerialize_batched(
-                outputs.check_stop_buffers, side, request_ids,
+                outputs.check_stop_buffers, side, row_rids,
             )
 
         cpu_per_rid: dict = {}

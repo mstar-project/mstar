@@ -28,7 +28,8 @@ class GDNWrapper(ABC):
         qk_l2norm: bool=True,
         num_tokens: int | None=None,
         bs: int | None=None,
-        cuda_graph: bool=False
+        cuda_graph: bool=False,
+        null_slot_id: int = 0,
     ):
         if cuda_graph and (num_tokens is None or bs is None):
             # Every capacity below is `max(this layout, the bucket)`; without
@@ -38,6 +39,11 @@ class GDNWrapper(ABC):
                 f"bs to size static buffers; got {num_tokens} and {bs}"
             )
         self._pad_slot_id = pad_slot_id
+        # The slot the pool hands to rows that stand for no request (its sink,
+        # or -1 with the sink off). The conv kernels skip rows whose slot is
+        # this id; left at their default of 0 they would skip whichever real
+        # request holds slot 0 when the sink is off.
+        self._null_slot_id = null_slot_id
         self._max_num_tokens = num_tokens
         self._bs = bs
         self._cuda_graph = cuda_graph
@@ -100,6 +106,11 @@ class ConvMetadata:
     token_chunk_offset_ptr: torch.Tensor
 
 
+def _with_room(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """``t`` with ``rows`` zeroed rows appended along dim 0."""
+    return torch.cat((t, t.new_zeros((rows, *t.shape[1:]))), dim=0)
+
+
 class GDNPrefillWrapper(GDNWrapper):
     def __init__(
         self,
@@ -111,7 +122,8 @@ class GDNPrefillWrapper(GDNWrapper):
         num_tokens: int | None=None,
         bs: int | None=None,
         has_sink_state: bool = True,
-        cuda_graph: bool=False
+        cuda_graph: bool=False,
+        null_slot_id: int = 0,
     ):
         super().__init__(
             device=device,
@@ -120,7 +132,8 @@ class GDNPrefillWrapper(GDNWrapper):
             qk_l2norm=qk_l2norm,
             num_tokens=num_tokens,
             bs=bs,
-            cuda_graph=cuda_graph
+            cuda_graph=cuda_graph,
+            null_slot_id=null_slot_id,
         )
         self._has_sink_state = has_sink_state
         # What this arch's chunked kernel reads as its packed state; the
@@ -132,6 +145,7 @@ class GDNPrefillWrapper(GDNWrapper):
         self._cu_buffer: torch.Tensor | None = None
         self._mask: torch.Tensor | None = None
         self._plan_state: GDNPrefillPlan | None = None
+        self._plan_borrowed = 0
 
         # Conv buffers
         self._batch_ptr: torch.Tensor | None = None
@@ -215,9 +229,11 @@ class GDNPrefillWrapper(GDNWrapper):
         for span in spans:
             cu.append(cu[-1] + span)
 
+        # same dtype as the device buffer: a converting copy is staged through
+        # a pageable temporary and stops being asynchronous
         self._cu_buffer[: len(cu)].copy_(
             torch.tensor(
-                cu, dtype=torch.int32, pin_memory=torch.cuda.is_available()
+                cu, dtype=torch.int64, pin_memory=torch.cuda.is_available()
             ),
             non_blocking=True,
         )
@@ -226,7 +242,8 @@ class GDNPrefillWrapper(GDNWrapper):
         self, total_tokens: int
     ):
         if self._cuda_graph:
-            capacity = max(self._max_num_tokens, total_tokens)
+            # `+ _bs` covers the room `run` adds for the padding rows' tokens
+            capacity = max(self._max_num_tokens + self._bs, total_tokens)
         else:
             capacity = total_tokens
         if capacity > self._mask_capacity:
@@ -243,10 +260,18 @@ class GDNPrefillWrapper(GDNWrapper):
         slots: torch.Tensor,
         has_state: torch.Tensor,
     ):
+        # Before the fixup below: the tokens it hands the padding rows sit past
+        # the real ones, where the mask zeroes them.
+        self._plan_tokens = sum(spans)
+        self._plan_borrowed = sum(1 for span in spans if span == 0)
+        # A padding row covers no tokens of its own, and a zero-length segment
+        # deadlocks the chunked kernel, so give each one a token. `run` pads its
+        # buffers by `bs` so these are addressable however full the bucket is.
+        spans = [span or 1 for span in spans]
+
         self._plan_conv(spans)
         self._build_cu_buffer(spans)
 
-        self._plan_tokens = sum(spans)
         self._build_mask(self._plan_tokens)
         num_rows = len(spans)
         self._plan_state = GDNPrefillPlan(
@@ -276,6 +301,7 @@ class GDNPrefillWrapper(GDNWrapper):
             cache_indices=self._plan_state.slots,
             has_initial_state=self._plan_state.has_state,
             activation=activation,
+            null_block_id=self._null_slot_id,
             # precomputed off-stream: the kernel's own path syncs and copies
             # H2D inside its grid lambda, which capture forbids
             seqlens_cpu=self._seqlens_cpu,
@@ -336,6 +362,19 @@ class GDNPrefillWrapper(GDNWrapper):
             torch.zeros((), dtype=initial.dtype, device=initial.device),
         )
 
+        # One spare row per batch row, so the token `plan` hands each padding
+        # row is addressable even when the real batch fills the bucket exactly.
+        # Unconditional under capture: capture itself sees no padding rows, so
+        # branching on their count would bake the wrong shape into every replay.
+        real_len = q.shape[0]
+        rows = (
+            self._plan_state.num_rows if self._cuda_graph else self._plan_borrowed
+        )
+        if rows:
+            q, k, v, g, beta = (
+                _with_room(t, rows) for t in (q, k, v, g, beta)
+            )
+
         # Neutralise the bucket's padded tail before it reaches the kernel,
         # so inf values in the tail can't poison the result
         keep = self._plan_state.token_mask[: q.shape[0], None, None].bool()
@@ -373,7 +412,7 @@ class GDNPrefillWrapper(GDNWrapper):
             )
             final = torch.where(live.view(-1, 1, 1, 1), final, padded)
         state.index_copy_(0, addr, final.to(state.dtype))
-        return out
+        return out[:real_len]
 
 
 @dataclass(frozen=True)
@@ -392,7 +431,8 @@ class GDNDecodeWrapper(GDNWrapper):
         sm_scale: float | None=None,
         qk_l2norm: bool=True,
         bs: int | None=None,
-        cuda_graph: bool=False
+        cuda_graph: bool=False,
+        null_slot_id: int = 0,
     ):
         super().__init__(
             device=device,
@@ -401,7 +441,8 @@ class GDNDecodeWrapper(GDNWrapper):
             qk_l2norm=qk_l2norm,
             num_tokens=bs,
             bs=bs,
-            cuda_graph=cuda_graph
+            cuda_graph=cuda_graph,
+            null_slot_id=null_slot_id,
         )
 
         self._plan_state: GDNDecodePlan | None = None
@@ -433,6 +474,7 @@ class GDNDecodeWrapper(GDNWrapper):
             bias=bias,
             activation=activation,
             conv_state_indices=self._plan_state.slots,
+            null_block_id=self._null_slot_id,
         )
 
     def run(self, q, k, v, g, beta, state, a_log, dt_bias):

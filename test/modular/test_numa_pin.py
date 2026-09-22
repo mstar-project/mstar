@@ -70,3 +70,39 @@ def test_every_visible_device_resolves_to_one_node():
             continue
         assert cpus, f"cuda:{i} resolved to an empty CPU set"
         assert max(cpus) < total
+
+
+def _patch_topology(monkeypatch, *, local, current, online):
+    """Fake box: `local` CPUs next to cuda:0, `current` the process's mask."""
+    from mstar.utils import numa
+
+    calls: list[set[int]] = []
+    monkeypatch.setattr(numa, "local_cpus_for_device", lambda device: set(local))
+    monkeypatch.setattr(numa.os, "sched_getaffinity", lambda pid: set(current))
+    monkeypatch.setattr(numa.os, "sched_setaffinity", lambda pid, cpus: calls.append(set(cpus)))
+    monkeypatch.setattr(numa.os, "cpu_count", lambda: online)
+    monkeypatch.delenv("MSTAR_NUMA_PIN", raising=False)
+    return calls
+
+
+def test_pins_only_a_process_that_may_still_run_anywhere(monkeypatch):
+    calls = _patch_topology(monkeypatch, local=range(0, 8), current=range(0, 16), online=16)
+    assert pin_to_device_numa_node(torch.device("cuda", 0)) is not None
+    assert calls == [set(range(0, 8))]
+
+
+def test_a_cpuset_that_straddles_the_sockets_is_left_alone(monkeypatch):
+    """A Slurm or cgroup allocation of 8 of 16 CPUs, four on each socket: an
+    operator's placement, not ours to cut in half."""
+    calls = _patch_topology(
+        monkeypatch, local=range(0, 8), current={0, 1, 2, 3, 8, 9, 10, 11}, online=16,
+    )
+    assert pin_to_device_numa_node(torch.device("cuda", 0)) is None
+    assert calls == []
+
+
+def test_already_local_is_a_no_op(monkeypatch):
+    calls = _patch_topology(monkeypatch, local=range(0, 8), current=range(0, 16), online=16)
+    monkeypatch.setattr("mstar.utils.numa.os.sched_getaffinity", lambda pid: set(range(0, 4)))
+    assert pin_to_device_numa_node(torch.device("cuda", 0)) is None
+    assert calls == []
