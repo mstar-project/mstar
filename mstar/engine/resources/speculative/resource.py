@@ -31,7 +31,7 @@ from typing import NamedTuple
 import torch
 
 from mstar.engine.resources.base import EngineResourceInfo, Resource
-from mstar.engine.resources.speculative.config import SpecAccepted, SpecAcceptanceSpec, SpecStep
+from mstar.engine.resources.speculative.config import SpecAcceptanceSpec, SpecAccepted, SpecStep
 from mstar.engine.resources.step import StepContext
 
 logger = logging.getLogger(__name__)
