@@ -220,6 +220,8 @@ def main():
     ap.add_argument("--host", default="localhost")
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--model", required=True, help="model id the server expects in the request")
+    ap.add_argument("--route", default="/v1/images/generations",
+                    help="images route (FastVideo 0.2.1 serves only /v1/images)")
     ap.add_argument("--mode", choices=["latency", "throughput"], default="latency")
     ap.add_argument("--prompts", required=True, help="text file, one prompt per line")
     ap.add_argument("--size", default="1024x1024")
@@ -246,7 +248,7 @@ def main():
     prompts = [line.strip() for line in Path(args.prompts).read_text().splitlines() if line.strip()]
     if not prompts:
         raise SystemExit(f"no prompts in {args.prompts}")
-    url = f"http://{args.host}:{args.port}/v1/images/generations"
+    url = f"http://{args.host}:{args.port}{args.route}"
     print(f"=== {args.tag}: {url} model={args.model} size={args.size} steps={args.steps} mode={args.mode}", flush=True)
     result = run_latency(args, url, prompts) if args.mode == "latency" else run_throughput(args, url, prompts)
     result.update({
