@@ -19,7 +19,8 @@ def test_segments_load_and_project_like_separate_linears(world):
     w_g, w_b, w_f = torch.randn(8, k), torch.randn(4, k), torch.randn(6, k)
     x = torch.randn(3, k)
     for rank in range(world):
-        m = MergedParallelLinear(_group(rank, world), k, [("g", 8, COLUMN), ("b", 4, COLUMN), Segment("f_a", 6, REPLICATED)])
+        segments = [("g", 8, COLUMN), ("b", 4, COLUMN), Segment("f_a", 6, REPLICATED)]
+        m = MergedParallelLinear(_group(rank, world), k, segments)
         # segments start on 8-element boundaries (aligned views); the width covers them all
         assert all(off % 8 == 0 for off in m.offsets.values())
         assert m.weight.shape[0] >= 8 // world + 4 // world + 6 and m.weight.shape[0] % 8 == 0
@@ -44,7 +45,7 @@ def test_validation_and_loader_survive_apply():
     with pytest.raises(ValueError):
         MergedParallelLinear(_group(0, 2), 8, [("a", 4, COLUMN), ("a", 4, COLUMN)])
     with pytest.raises(ValueError):
-        MergedParallelLinear(_group(0, 2), 8, [("a", 4, "diagonal")]).weight_loader
+        MergedParallelLinear(_group(0, 2), 8, [("a", 4, "diagonal")])
     m = MergedParallelLinear(_group(1, 2), 8, [("a", 4, COLUMN), ("r", 3, REPLICATED)])
     with pytest.raises(ValueError):
         m.weight.weight_loader(m.weight, torch.zeros(4, 8))  # segment name required
@@ -53,5 +54,6 @@ def test_validation_and_loader_survive_apply():
     m = m.to(torch.bfloat16)  # _apply re-attaches the loader to the new parameter object
     assert m.weight.weight_loader is not None and m.weight.dtype == torch.bfloat16
     m.weight.weight_loader(m.weight, torch.ones(3, 8, dtype=torch.bfloat16), "r")
-    assert torch.equal(m.project(torch.ones(1, 8, dtype=torch.bfloat16))["r"], torch.full((1, 3), 8.0, dtype=torch.bfloat16))
+    replicated = m.project(torch.ones(1, 8, dtype=torch.bfloat16))["r"]
+    assert torch.equal(replicated, torch.full((1, 3), 8.0, dtype=torch.bfloat16))
     assert "r=3r" in repr(m)
