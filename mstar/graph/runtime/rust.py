@@ -25,7 +25,7 @@ from mstar.communication import wire
 from mstar.communication.tensor_store import TensorBookkeeping
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphSection, Loop
+from mstar.graph.base import GraphNode, GraphSection, Loop
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime import sharding
@@ -71,6 +71,15 @@ def _loops_with_registries(section: GraphSection) -> list[Loop]:
     return list(io.loops.values())
 
 
+def _member_nodes(lp: Loop) -> list[str]:
+    """Nodes this loop owns directly; ``section.get_nodes()`` recurses, so
+    every ancestor claimed its descendants and nested loops deadlocked."""
+    return [
+        name for name, entity in lp.inner_registry.managed_entities.items()
+        if isinstance(entity, GraphNode)
+    ]
+
+
 def _parent_loop_name(lp: Loop) -> str | None:
     """The enclosing loop, or None at the top level.
 
@@ -93,7 +102,6 @@ def worker_graph_args(worker_graph: WorkerGraph) -> dict:
     section = worker_graph.section
     nodes = section.get_nodes()
     loops = _loops_with_registries(section)
-    loop_names = {lp.name for lp in loops}
 
     return {
         "wg_id": worker_graph.worker_graph_id,
@@ -117,10 +125,7 @@ def worker_graph_args(worker_graph: WorkerGraph) -> dict:
                 "max_iters": lp.max_iters,
                 "parent": _parent_loop_name(lp),
                 # Directly-owned only: a node inside a child loop belongs there.
-                "member_nodes": [
-                    n for n in lp.section.get_nodes()
-                    if n not in loop_names
-                ],
+                "member_nodes": _member_nodes(lp),
                 "outputs": [_edge_args(section, e) for e in lp.outputs],
                 "accumulated": [
                     _edge_args(section, e) for e in lp.accumulated_outputs

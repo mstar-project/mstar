@@ -139,8 +139,19 @@ pub fn compile_one(
             loop_specs[p as usize].child_loops.push(i as LoopId);
         }
     }
+    // A node belongs to exactly one loop. Two claims used to resolve
+    // last-writer-wins, the outermost, and deadlocked nested loops.
     for (i, l) in loop_specs.iter().enumerate() {
         for &m in &l.member_nodes {
+            if let Some(prev) = node_specs[m as usize].loop_id {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "node {} is claimed by loops {} and {}; member_nodes must \
+                     list only the nodes a loop owns directly",
+                    it.name(node_specs[m as usize].name),
+                    it.name(loop_specs[prev as usize].name),
+                    it.name(l.name),
+                )));
+            }
             node_specs[m as usize].loop_id = Some(i as LoopId);
         }
     }

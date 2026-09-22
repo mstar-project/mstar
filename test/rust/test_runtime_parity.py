@@ -1335,3 +1335,184 @@ def test_removing_an_input_takes_streaming_readiness_back_down():
     assert sig.is_ready_for_streaming
     sig.remove("text")
     assert not sig.is_ready_for_streaming
+
+
+# --- nested loops ------------------------------------------------------------
+
+NESTED_NODES = {"denoiser", "refiner", "decoder"}
+NESTED_LOOPS = {"refine_loop", "denoise_loop"}
+
+
+def _nested_graph():
+    """``test/modular/test_graph.py::test_nested_loops``, which pins the
+    Python semantics."""
+    return Sequential(sections=[
+        Loop(
+            name="refine_loop", max_iters=2,
+            section=Sequential(sections=[
+                Loop(
+                    name="denoise_loop", max_iters=3,
+                    section=GraphNode(
+                        name="denoiser", input_names={"latents"},
+                        outputs=[GraphEdge(name="latents",
+                                           next_node="denoiser")],
+                    ),
+                    outputs=[GraphEdge(name="latents", next_node="refiner")],
+                ),
+                GraphNode(
+                    name="refiner", input_names={"latents"},
+                    outputs=[GraphEdge(name="latents", next_node="denoiser")],
+                ),
+            ]),
+            outputs=[GraphEdge(name="latents", next_node="decoder")],
+        ),
+        GraphNode(
+            name="decoder", input_names={"latents"},
+            outputs=[GraphEdge(name="image", next_node=EMIT_TO_CLIENT,
+                               output_modality="image")],
+        ),
+    ])
+
+
+@pytest.fixture(params=["python", "rust"])
+def nested(request):
+    wg = WorkerGraph(
+        section=_nested_graph(), graph_walks={WALK}, ranks=[0],
+        worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: NESTED_LOOPS},
+        all_wg_ids_to_nodes={WG_ID: NESTED_NODES},
+        node_to_partition=dict.fromkeys(NESTED_NODES, "default"),
+        sharding_config=_sharding(),
+    )
+    if request.param == "python":
+        book = PythonTensorBookkeeping()
+        tm = _StubTensorManager(book)
+        rt = PythonGraphRuntime(
+            tensor_manager=tm, communicator=None, **common,
+        )
+        return rt, book, tm.tensor_store
+    book = RustTensorBookkeeping()
+    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
+
+
+def test_a_loop_inside_a_loop_runs_every_iteration(nested):
+    """Every ancestor claimed its descendants' nodes, so the inner loop
+    never completed: one denoiser run, then a silent hang."""
+    rt, book, store = nested
+    rid = _admit(rt)
+    uuid = iter(range(1, 500))
+
+    def fresh():
+        u = next(uuid)
+        book.put_tensor(u, _info(u))
+        book.increment_ref(u, 1)  # the safety hold
+        return u
+
+    rt.ingest_inputs_batch(
+        ParallelList([rid], [_spec("latents", "denoiser", uuids=[fresh()])])
+    )
+    log = []
+    for _ in range(40):
+        ready = [r.node_name for r in rt.get_ready_nodes(set())]
+        if not ready:
+            break
+        node = ready[0]
+        rt.pop_rids(node, WALK, [rid])
+        log.append(node)
+        signals = rt.get_output_signals(node, WALK)
+        rt.complete_and_route_batch(
+            RouteInput(
+                partition="default", graph_walk=WALK, node_name=node,
+                output_signals=signals,
+                wg_ids=ParallelList([rid], [WG_ID]),
+                tensors=[fresh() for _ in signals],
+                num_tensors=[1] * len(signals),
+            ),
+            store,
+        )
+    assert log == [
+        "denoiser", "denoiser", "denoiser", "refiner",
+        "denoiser", "denoiser", "denoiser", "refiner",
+        "decoder",
+    ]
+
+
+def test_the_inner_loop_is_the_one_that_advances(nested):
+    """The counter the conductor reads: with the inner loop bypassed it
+    stayed at 0 while the outer one moved."""
+    rt, book, store = nested
+    rid = _admit(rt)
+    book.put_tensor(900, _info(900))
+    book.increment_ref(900, 1)
+    rt.ingest_inputs_batch(
+        ParallelList([rid], [_spec("latents", "denoiser", uuids=[900])])
+    )
+    rt.pop_rids("denoiser", WALK, [rid])
+    book.put_tensor(901, _info(901))
+    book.increment_ref(901, 1)
+    rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="denoiser",
+            output_signals=["latents"],
+            wg_ids=ParallelList([rid], [WG_ID]),
+            tensors=[901], num_tensors=[1],
+        ),
+        store,
+    )
+    assert rt.get_dynamic_loop_iters([rid], "default").values == [
+        {"denoise_loop": 1, "refine_loop": 0}
+    ]
+
+
+def test_speculation_names_the_innermost_enclosing_loop(nested):
+    """Callers read this loop's ``curr_iter`` / ``max_iters``, so naming the
+    outer one reads the wrong counters."""
+    rt, _book, _store = nested
+    rid = _admit(rt)
+    out = rt.speculate_node("denoiser", WALK, rid)
+    assert [(o.node_name, o.loop_name) for o in out] == [
+        ("denoiser", "denoise_loop")
+    ]
+
+
+# --- pop_rids honours the batch the caller committed to -----------------------
+
+def test_an_unchecked_pop_returns_every_rid_it_was_given(pair):
+    """``check_ready=False`` means readiness is already established. Rust
+    re-checked it and silently shortened the batch."""
+    rt, _book, _store = pair
+    rid = _admit(rt)
+    # Nothing ingested, so the node is not in the ready set.
+    popped = rt.pop_rids("prefill", WALK, [rid])
+    assert popped is not None
+    assert popped.wg_ids.keys == [rid]
+    assert popped.wg_ids.values == [WG_ID]
+    assert popped.input_edges == []
+    assert popped.input_edges_per_rid == [0]
+
+
+def test_a_checked_pop_still_refuses_a_rid_that_is_not_ready(pair):
+    """The other half of the contract, unchanged: verify every rid, pop all
+    or nothing."""
+    rt, _book, _store = pair
+    rid = _admit(rt)
+    assert rt.pop_rids("prefill", WALK, [rid], check_ready=True) is None
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    assert rt.pop_rids("prefill", WALK, [rid], check_ready=True) is not None
+
+
+def test_cleanup_then_push_back_still_pops(pair):
+    """The worker's order (worker.py:1934). A guard, not a reproducer: it
+    pins that ``push_back_node`` stays unconditional."""
+    rt, _book, _store = pair
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    rt.pop_rids("prefill", WALK, [rid])
+    rt.cleanup_consumed_inputs("prefill", [rid], [WG_ID])
+    rt.push_back_node("prefill", [rid], [WG_ID])
+    popped = rt.pop_rids("prefill", WALK, [rid])
+    assert popped is not None and popped.wg_ids.keys == [rid]

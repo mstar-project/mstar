@@ -1732,9 +1732,7 @@ impl GraphRuntime {
             let Some(state) = self.state_mut(wg, rid) else {
                 continue;
             };
-            if !state.take_for_schedule(node) {
-                continue;
-            }
+            state.take_for_schedule(node);
             let inputs = state.input_tensors(node, false);
             out.rids.push(rid);
             out.wg_ids.push(wg_id);

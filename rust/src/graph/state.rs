@@ -345,13 +345,11 @@ impl RequestState {
             .collect()
     }
 
-    pub fn take_for_schedule(&mut self, node: NodeId) -> bool {
-        if !self.is_ready(node) {
-            return false;
-        }
+    /// Unconditional, as Python's `pop_ready_nodes` is. Gating on readiness
+    /// dropped the rid from a batch the caller had already committed to.
+    pub fn take_for_schedule(&mut self, node: NodeId) {
         let (w, b) = Self::bit(node);
         self.ready[w] &= !(1 << b);
-        true
     }
 
     /// Undo `take_for_schedule`: put the node back in the ready set.

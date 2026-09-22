@@ -541,6 +541,8 @@ class Loop(GraphSection):
             # register_ingested_input before termination — cleaning those up is deferred
             # (they're harmless since reset_for_iter won't be called after the loop is done).
             self.inner_registry.clear()
+            # FIXME: cascades before the outputs below are populated, and
+            # discards the result; nested loops stall.
             self._managing_registry.mark_entity_complete(self.name)
             for edge in self.outputs:
                 edge.tensor_info = self._cached_outputs.get(edge.name, [])
