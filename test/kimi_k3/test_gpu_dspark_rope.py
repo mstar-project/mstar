@@ -26,7 +26,8 @@ def torch_apply(rope, x, positions):
 @pytest.mark.parametrize("pos_dtype", [torch.int64, torch.int32])
 def test_fused_rope_is_bit_identical(dtype, shape, pos_dtype):
     torch.manual_seed(0)
-    rope = YarnRotary(shape[-1], YarnParams(original_max_position_embeddings=2048, factor=4.0), max_positions=4096).to(DEV)
+    params = YarnParams(original_max_position_embeddings=2048, factor=4.0)
+    rope = YarnRotary(shape[-1], params, max_positions=4096).to(DEV)
     x = torch.randn(*shape, device=DEV).to(dtype)
     positions = torch.randint(0, 4096, (shape[0],), device=DEV, dtype=pos_dtype)
     want = torch_apply(rope, x, positions)
