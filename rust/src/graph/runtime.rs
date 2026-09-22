@@ -436,6 +436,7 @@ pub struct GraphRuntime {
                 modality: e.modality,
                 tensors: vec![],
                 persist_for_loop: false,
+                declined_local: false,
             })
             .collect();
         let state = self.state_mut(wg, rid)?;
@@ -618,7 +619,8 @@ pub struct GraphRuntime {
             .map(|e| RoutedEdge {
                 name: e.name, dest: e.dest, persist: e.persist,
                 new_token: e.new_token, streaming: e.streaming,
-                modality: e.modality, tensors: vec![], persist_for_loop: false,
+                modality: e.modality, tensors: vec![],
+                persist_for_loop: false, declined_local: false,
             })
             .collect();
         state.ingest_for_speculation(curr_node, &source_edges);
@@ -1736,7 +1738,7 @@ impl GraphRuntime {
             let Some(state) = self.state_mut(wg, rid) else {
                 continue;
             };
-            let (edges, _filtered, freed_inputs) = state.complete(node, &out_tensors);
+            let (mut edges, _filtered, freed_inputs) = state.complete(node, &out_tensors);
 
             // No group means singleton / non-TP, which is rank 0. The
             // conductor counts one report per request, so a rank wrongly
@@ -1850,6 +1852,13 @@ impl GraphRuntime {
                 ingested_locally.push(took);
             }
 
+            // A local consumer that refused the edge makes it remote, as
+            // Python's `leftover` branch does. Recorded here so the
+            // registration, the reference count and take_send_plan agree.
+            for (e, &took) in edges.iter_mut().zip(&ingested_locally) {
+                e.declined_local = !took && matches!(e.dest, Dest::Local(_));
+            }
+
             let mut new_token_seen: FxHashSet<Sym> = FxHashSet::default();
             for (e, &is_local) in edges.iter().zip(&ingested_locally) {
                 let idxs: Vec<usize> = e
@@ -1878,6 +1887,7 @@ impl GraphRuntime {
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
                 let remote = e.persist
+                    || e.declined_local
                     || (!is_local
                         && matches!(e.dest, Dest::External(_) | Dest::EmitToClient));
                 if remote {
@@ -1916,7 +1926,9 @@ impl GraphRuntime {
                         return 0;
                     }
                     match e.dest {
-                        // Already in local_counts.
+                        // Already in local_counts, unless it was refused --
+                        // then nothing counted it and it goes on the wire.
+                        Dest::Local(_) if e.declined_local => 1,
                         Dest::Local(_) | Dest::Empty => 0,
                         Dest::EmitToClient => 1,
                         // One reference per destination WORKER, minus this
@@ -2361,6 +2373,27 @@ impl GraphRuntime {
                             if mine && worker == me_sym {
                                 continue;
                             }
+                            plan.to_workers.push((
+                                rid,
+                                self.interner.name(worker).to_string(),
+                                name.clone(),
+                                self.interner.name(dest).to_string(),
+                                uuids.clone(),
+                                e.streaming,
+                            ));
+                        }
+                    }
+                    // Refused locally, so send it to the node's owner like
+                    // Python does. `mine` is not consulted: the point is that
+                    // our own copy did not take it.
+                    Dest::Local(d) if e.declined_local => {
+                        let dest = g.node(d).name;
+                        let workers = walk
+                            .and_then(|w| {
+                                self.info(rid)?.node_to_workers.get(&(dest, w)).cloned()
+                            })
+                            .unwrap_or_default();
+                        for worker in workers {
                             plan.to_workers.push((
                                 rid,
                                 self.interner.name(worker).to_string(),

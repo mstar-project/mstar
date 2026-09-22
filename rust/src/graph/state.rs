@@ -128,12 +128,17 @@ pub struct RoutedEdge {
     /// Python's `GraphEdge._persist_for_loop`: a loop's saved external input
     /// being re-injected; the tensor manager must not dereference it.
     pub persist_for_loop: bool,
+    /// A `Dest::Local` consumer refused the edge (its slots were full), so it
+    /// goes out on the wire instead -- staged, counted and sent like any
+    /// remote edge, as Python does.
+    pub declined_local: bool,
 }
 
 fn routed(e: &EdgeSpec, tensors: Vec<TensorRef>) -> RoutedEdge {
     RoutedEdge {
         name: e.name, dest: e.dest, persist: e.persist, new_token: e.new_token,
-        streaming: e.streaming, modality: e.modality, tensors, persist_for_loop: false,
+        streaming: e.streaming, modality: e.modality, tensors,
+        persist_for_loop: false, declined_local: false,
     }
 }
 
@@ -208,11 +213,40 @@ impl RequestState {
         let st = &self.nodes[id as usize];
         let live = !st.scheduled && !st.completed;
         let ready = st.cur.mask == spec.full_mask && live;
-        let streaming = !ready && live
-            && (st.cur.mask | spec.streaming_mask) == spec.full_mask;
         let (w, b) = Self::bit(id);
         if ready { self.ready[w] |= 1 << b } else { self.ready[w] &= !(1 << b) }
-        if streaming { self.ready_streaming[w] |= 1 << b } else { self.ready_streaming[w] &= !(1 << b) }
+    }
+
+    /// FIXME: bug-for-bug with Python, whose behaviour here is probably wrong.
+    /// `ReadySignals.update` sets this via an `issuperset` call that is a
+    /// tautology, and keeps it in a set a node-level clear does not touch --
+    /// so it is neither "only streaming inputs missing" nor derived state.
+    /// Mirrored because Python is the oracle; fix `mstar/graph/base.py` first.
+    fn note_ingested_for_streaming(&mut self, id: NodeId) {
+        let spec = self.graph.node(id);
+        let st = &self.nodes[id as usize];
+        // The mask alone, no liveness: Python's `ReadySignals.is_ready`.
+        let full = st.cur.mask == spec.full_mask;
+        let sched = st.scheduled;
+        let (w, b) = Self::bit(id);
+        if full {
+            self.ready_streaming[w] &= !(1 << b);
+        } else if !sched {
+            // Only the add is gated on _speculatively_scheduled, as in Python.
+            self.ready_streaming[w] |= 1 << b;
+        }
+    }
+
+    /// Back to seeded membership, for the two paths where Python rebuilds the
+    /// whole set: `reset_for_iter` and `clear`.
+    fn reseed_streaming_ready(&mut self, id: NodeId) {
+        let only = self.graph.node(id).only_streaming;
+        let (w, b) = Self::bit(id);
+        if only {
+            self.ready_streaming[w] |= 1 << b;
+        } else {
+            self.ready_streaming[w] &= !(1 << b);
+        }
     }
 
     // -- ingest --------------------------------------------------------------
@@ -240,6 +274,7 @@ impl RequestState {
         // via _managing_registry), then reaches the root's ready sets.
         self.record_external(node, name, &tensors);
         self.refresh_ready(node);
+        self.note_ingested_for_streaming(node);
         true
     }
 
@@ -532,7 +567,8 @@ impl RequestState {
         for (name, dest, t) in ext {
             out.push(RoutedEdge {
                 name, dest: Dest::Local(dest), persist: false, new_token: false,
-                streaming: false, modality: 0, tensors: t, persist_for_loop: true,
+                streaming: false, modality: 0, tensors: t,
+                persist_for_loop: true, declined_local: false,
             });
         }
     }
@@ -551,6 +587,7 @@ impl RequestState {
                 st.completed = false;
             }
             self.refresh_ready(n);
+            self.reseed_streaming_ready(n);
         }
         for &c in &lspec.child_loops {
             self.reset_subtree_for_iter(c);
@@ -569,6 +606,7 @@ impl RequestState {
         for &n in &lspec.member_nodes {
             self.nodes[n as usize].clear();
             self.refresh_ready(n);
+            self.reseed_streaming_ready(n);
         }
         for &c in &lspec.child_loops {
             self.clear_subtree(c);

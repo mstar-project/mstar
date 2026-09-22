@@ -182,6 +182,9 @@ class ReadySignals:
             return
         self.is_ready = self.input_names.issubset(self.ready_names)
         # ready once the only missing inputs are streaming ones (which arrive incrementally)
+        # FIXME: issuperset is a tautology here -- both operands are subsets
+        # of input_names -- so this is always True; the comment above describes
+        # issubset. Rust mirrors it deliberately (state.rs); fix both together.
         self.is_ready_for_streaming = self.is_ready or \
             self.is_ready_for_streaming or (
             self.input_names.issuperset(self.ready_names.union(self.streaming_inputs))
