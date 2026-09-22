@@ -33,6 +33,13 @@ class CudaGraphConfig(ABC):
         # (eager) batch size for the walk. Default True keeps the conservative
         # behavior: never batch beyond a captured graph size.
         caps_eager_batch_size: bool = True,
+        # static input key -> the dim of that tensor that grows with the bucket's
+        # token count (0 for row-leading tensors). The runner interns every
+        # static input into one shared buffer per config and reslices it along
+        # that dim; keys not listed here fall back to a size-matching guess,
+        # which misfires when a fixed dim (a hidden size) happens to equal the
+        # bucket's token count.
+        static_seq_dims: dict[str, int] | None = None,
     ):
         self.capture_graph_walk = capture_graph_walk
         self.replay_graph_walks = replay_graph_walks or [capture_graph_walk]
@@ -41,6 +48,7 @@ class CudaGraphConfig(ABC):
         self.capture_batch_sizes = capture_batch_sizes
         self.capture_forward_method = capture_forward_method
         self.caps_eager_batch_size = caps_eager_batch_size
+        self.static_seq_dims = dict(static_seq_dims or {})
 
     @abstractmethod
     def get_config_type(self) -> CudaGraphConfigType:
@@ -67,6 +75,7 @@ class BatchedCudaGraphConfig(CudaGraphConfig):
         capture_forward_method: str = "forward_batched",
         caps_eager_batch_size: bool = True,
         total_tokens_multiplier: int = 1,
+        static_seq_dims: dict[str, int] | None = None,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -76,6 +85,7 @@ class BatchedCudaGraphConfig(CudaGraphConfig):
             capture_batch_sizes=capture_batch_sizes,
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
+            static_seq_dims=static_seq_dims,
         )
         self.single_request_inputs = single_request_inputs
         # ``single_request_inputs.input_seq_len`` is also read per-label by the
