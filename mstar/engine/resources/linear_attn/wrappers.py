@@ -106,6 +106,11 @@ class ConvMetadata:
     token_chunk_offset_ptr: torch.Tensor
 
 
+def _with_room(t: torch.Tensor, rows: int) -> torch.Tensor:
+    """``t`` with ``rows`` zeroed rows appended along dim 0."""
+    return torch.cat((t, t.new_zeros((rows, *t.shape[1:]))), dim=0)
+
+
 class GDNPrefillWrapper(GDNWrapper):
     def __init__(
         self,
@@ -140,6 +145,7 @@ class GDNPrefillWrapper(GDNWrapper):
         self._cu_buffer: torch.Tensor | None = None
         self._mask: torch.Tensor | None = None
         self._plan_state: GDNPrefillPlan | None = None
+        self._plan_borrowed = 0
 
         # Conv buffers
         self._batch_ptr: torch.Tensor | None = None
@@ -236,7 +242,8 @@ class GDNPrefillWrapper(GDNWrapper):
         self, total_tokens: int
     ):
         if self._cuda_graph:
-            capacity = max(self._max_num_tokens, total_tokens)
+            # `+ _bs` covers the room `run` adds for the padding rows' tokens
+            capacity = max(self._max_num_tokens + self._bs, total_tokens)
         else:
             capacity = total_tokens
         if capacity > self._mask_capacity:
@@ -253,10 +260,18 @@ class GDNPrefillWrapper(GDNWrapper):
         slots: torch.Tensor,
         has_state: torch.Tensor,
     ):
+        # Before the fixup below: the tokens it hands the padding rows sit past
+        # the real ones, where the mask zeroes them.
+        self._plan_tokens = sum(spans)
+        self._plan_borrowed = sum(1 for span in spans if span == 0)
+        # A padding row covers no tokens of its own, and a zero-length segment
+        # deadlocks the chunked kernel, so give each one a token. `run` pads its
+        # buffers by `bs` so these are addressable however full the bucket is.
+        spans = [span or 1 for span in spans]
+
         self._plan_conv(spans)
         self._build_cu_buffer(spans)
 
-        self._plan_tokens = sum(spans)
         self._build_mask(self._plan_tokens)
         num_rows = len(spans)
         self._plan_state = GDNPrefillPlan(
@@ -347,6 +362,19 @@ class GDNPrefillWrapper(GDNWrapper):
             torch.zeros((), dtype=initial.dtype, device=initial.device),
         )
 
+        # One spare row per batch row, so the token `plan` hands each padding
+        # row is addressable even when the real batch fills the bucket exactly.
+        # Unconditional under capture: capture itself sees no padding rows, so
+        # branching on their count would bake the wrong shape into every replay.
+        real_len = q.shape[0]
+        rows = (
+            self._plan_state.num_rows if self._cuda_graph else self._plan_borrowed
+        )
+        if rows:
+            q, k, v, g, beta = (
+                _with_room(t, rows) for t in (q, k, v, g, beta)
+            )
+
         # Neutralise the bucket's padded tail before it reaches the kernel,
         # so inf values in the tail can't poison the result
         keep = self._plan_state.token_mask[: q.shape[0], None, None].bool()
@@ -384,7 +412,7 @@ class GDNPrefillWrapper(GDNWrapper):
             )
             final = torch.where(live.view(-1, 1, 1, 1), final, padded)
         state.index_copy_(0, addr, final.to(state.dtype))
-        return out
+        return out[:real_len]
 
 
 @dataclass(frozen=True)
