@@ -64,7 +64,9 @@ def test_verdicts_flow_from_stage_to_the_next_plan():
     assert res.verdicts_for(["b"])[0].accepted == 1
     # removal drops a pending verdict
     s4, ctx4 = step(["c"])
-    res.stage(torch.tensor([2], dtype=torch.int32)); res.commit(s4.get("spec_acceptance"), ctx4); res.remove_request("c")
+    res.stage(torch.tensor([2], dtype=torch.int32))
+    res.commit(s4.get("spec_acceptance"), ctx4)
+    res.remove_request("c")
     s5, ctx5 = step(["c"])
     assert res.plan(s5.get("spec_acceptance"), ctx5) == {}
 
@@ -113,11 +115,13 @@ def test_the_next_plan_may_run_before_the_outputs_are_read():
 def test_slot_buffers_are_copied_out_before_reuse():
     """Two capture slots alternate; a verdict read late must still be the one of its own step."""
     res = spec_resource()
-    res.ingest_request("a"); res.ingest_request("b")
+    res.ingest_request("a")
+    res.ingest_request("b")
     res.build_cuda_graph_buffers([], max_bs=4, max_seq_len=16)
 
     def run(rids, slot, accepted):
-        s = SubmoduleStep(segments=[Segment(r, "main", K + 1) for r in rids], steps={"spec_acceptance": SpecStep(verify=True)})
+        s = SubmoduleStep(segments=[Segment(r, "main", K + 1) for r in rids],
+                          steps={"spec_acceptance": SpecStep(verify=True)})
         ctx = StepContext(request_ids=list(rids), graph_walk="decode", slot=slot, capture=False)
         s.set_ctx(ctx)
         res._current_slot = slot
@@ -151,14 +155,16 @@ def test_kv_plan_takes_the_rejected_tail_back(monkeypatch):
     kv.ingest_request("a")
     # a verify step of k + 1 = 5 tokens: admit, plan, commit grow the stream by 5
     s, ctx = step(["a"])
-    s = SubmoduleStep(segments=s.segments, steps={"kv": KVStep()}); s.set_ctx(ctx)
+    s = SubmoduleStep(segments=s.segments, steps={"kv": KVStep()})
+    s.set_ctx(ctx)
     assert kv.admit(s.get("kv"), ctx).ok
     kv.plan(s.get("kv"), ctx)
     kv.commit(s.get("kv"), ctx)
     assert kv._streams["a"]["main"].stored_len == K + 1
     # the next step's plan runs after the spec resource published a's verdict: 1 of 4 drafts kept
     s2, ctx2 = step(["a"])
-    s2 = SubmoduleStep(segments=s2.segments, steps={"kv": KVStep()}); s2.set_ctx(ctx2)
+    s2 = SubmoduleStep(segments=s2.segments, steps={"kv": KVStep()})
+    s2.set_ctx(ctx2)
     assert kv.admit(s2.get("kv"), ctx2).ok
     ctx2.plan_results[SPEC_ACCEPTANCE] = {"a": SpecAccepted(accepted=1, rejected=3)}
     out = kv.plan(s2.get("kv"), ctx2)
@@ -169,7 +175,8 @@ def test_kv_plan_takes_the_rejected_tail_back(monkeypatch):
     assert kv._streams["a"]["main"].stored_len == 2 + K + 1
     # no verdict, no change
     s3, ctx3 = step(["a"])
-    s3 = SubmoduleStep(segments=s3.segments, steps={"kv": KVStep()}); s3.set_ctx(ctx3)
+    s3 = SubmoduleStep(segments=s3.segments, steps={"kv": KVStep()})
+    s3.set_ctx(ctx3)
     assert kv.admit(s3.get("kv"), ctx3).ok
     before = kv._streams["a"]["main"].stored_len
     kv.plan(s3.get("kv"), ctx3)
@@ -198,7 +205,8 @@ def test_staged_drafts_ride_along_for_a_trace():
 def test_a_shorter_block_settles_its_own_length():
     # a step of 2 drafts under a resource built for 4: the verdict carries 3 tokens and rejects 2 - accepted
     res = spec_resource()
-    s = SubmoduleStep(segments=[Segment("a", "main", 3)], steps={"spec_acceptance": SpecStep(verify=True, num_drafts=2)})
+    s = SubmoduleStep(segments=[Segment("a", "main", 3)],
+                      steps={"spec_acceptance": SpecStep(verify=True, num_drafts=2)})
     ctx = StepContext(request_ids=["a"], graph_walk="decode", slot=0, capture=False)
     s.set_ctx(ctx)
     res.plan(s.get("spec_acceptance"), ctx)
@@ -210,7 +218,8 @@ def test_a_shorter_block_settles_its_own_length():
     out = res.plan(s2.get("spec_acceptance"), ctx2)
     assert out["a"].accepted == 1 and out["a"].rejected == 1
     # an empty block (no drafts): one token, nothing to reject
-    s3 = SubmoduleStep(segments=[Segment("a", "main", 1)], steps={"spec_acceptance": SpecStep(verify=True, num_drafts=0)})
+    s3 = SubmoduleStep(segments=[Segment("a", "main", 1)],
+                       steps={"spec_acceptance": SpecStep(verify=True, num_drafts=0)})
     s3.set_ctx(ctx)
     res.plan(s3.get("spec_acceptance"), ctx)
     res.stage(torch.tensor([0], dtype=torch.int32), torch.tensor([[11]], dtype=torch.int32))
