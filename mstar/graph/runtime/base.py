@@ -207,6 +207,14 @@ class SendInput(NamedTuple):
 
 
 class GraphRuntime(ABC):
+    # Does this runtime snapshot the loop context itself, at route time?
+    #
+    # When it does, the caller must NOT gather it per rid and hand it back:
+    # the runtime already holds it interned, and the round trip costs a
+    # boundary crossing per rid on the way out plus a re-intern on the way
+    # back. ``SendInput.nested_loop_indices`` may then carry None.
+    provides_nested_loop_indices: bool = False
+
     # --------- Bookkeeping ----------
     @abstractmethod
     def set_node_metadata(

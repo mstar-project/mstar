@@ -2183,7 +2183,11 @@ class Worker:
             if rid not in valid_rids:
                 batch_N.batch.request_to_worker_graph.pop(rid, None)
 
-        per_req_nested_idxs = {
+        # One crossing per rid, so skipped entirely when the runtime
+        # snapshots the loop context itself.
+        per_req_nested_idxs = {} if (
+            self._graph_runtime.provides_nested_loop_indices
+        ) else {
             rid: self._graph_runtime.get_nested_loop_idxs_for_node(
                 rid, batch_N.partition, batch_N.node_name
             ) for rid in batch_N.node_batch.request_ids
@@ -2409,7 +2413,7 @@ class Worker:
             ),
             nested_loop_indices=ParallelList(
                 send_rids,
-                [per_req_nested_idxs[rid] for rid in send_rids],
+                [per_req_nested_idxs.get(rid) for rid in send_rids],
             ),
             stream_tokens_consumed=ParallelList(
                 send_rids,

@@ -203,6 +203,33 @@ pub struct GraphRuntime {
             .ok_or_else(|| PyValueError::new_err("unknown rid handle"))
     }
 
+    /// The loop context for a node, interned.
+    ///
+    /// `get_nested_loop_idxs_for_node` resolves the worker graph from a
+    /// partition name and hands back Strings for Python; this is the same
+    /// answer for a caller that already has the wg and is going to re-intern
+    /// them anyway.
+    fn nested_idxs_interned(
+        &self, wg: WgIndex, rid: u32, node: NodeId,
+    ) -> Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)> {
+        let state = self.state(wg, rid)?;
+        let g = self.g(wg);
+        let fwd = state.num_times_run;
+        // A node outside every loop has no context, only the pass index.
+        let Some(lid) = g.node(node).loop_id else {
+            return Some((vec![], vec![], fwd));
+        };
+        let order = g.loop_order(lid).into_iter().map(|l| g.lp(l).name).collect();
+        // Every loop in the graph, as Python's get_loop_indices returns.
+        let indices = g
+            .loops
+            .iter()
+            .enumerate()
+            .map(|(i, lp)| (lp.name, state.loop_iter(i as LoopId)))
+            .collect();
+        Some((order, indices, fwd))
+    }
+
     /// Descriptors for a set of uuids. A uuid whose descriptor is already gone
     /// is skipped -- a tensor can be collected before the frame naming it goes
     /// out.
@@ -220,6 +247,13 @@ pub struct GraphRuntime {
     /// whole thing, comes out unchanged.
     fn sliced_infos(&self, refs: &[TensorRef]) -> Vec<crate::tensors::TensorPointerInfo> {
         let bk = self.bookkeeping.lock().unwrap();
+        Self::sliced_infos_locked(&bk, refs)
+    }
+
+    /// The same, for a caller that already holds the guard.
+    fn sliced_infos_locked(
+        bk: &crate::tensors::Bookkeeping, refs: &[TensorRef],
+    ) -> Vec<crate::tensors::TensorPointerInfo> {
         refs.iter()
             .filter_map(|r| {
                 let mut i = bk.info_raw(r.uuid).cloned()?;
@@ -907,7 +941,9 @@ fn e_persist(edges: &[RoutedEdge], uuid: u64) -> bool {
 /// workers is several of these.
 pub struct WireEdge {
     pub rid: u32,
-    pub worker: String,
+    /// Interned, not a String: this is a grouping key and a dispatch target,
+    /// and `take_send_plan` builds one of these per edge per destination.
+    pub worker: Sym,
     pub signal: String,
     pub next_node: String,
     /// The REFS, not bare uuids: the fanout may have sliced them for this
@@ -934,6 +970,8 @@ pub struct SendPlan {
     pub emit: Vec<(u32, String, String, Vec<TensorRef>)>,
     /// (rid, finished worker graph ids, is_first_tp_rank)
     #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool)>,
+    /// The pre-completion loop context, snapshotted at route time.
+    pub nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
 }
 
 /// One `NestedLoopIndices` as Python hands it over.
@@ -990,6 +1028,13 @@ pub struct Completion {
     /// before `complete`, which clears the flag. A speculative batch has not
     /// really finished the partition, so it must not report it done.
     pub speculative: FxHashMap<u32, bool>,
+    /// Per rid: the loop context as it stood BEFORE this completion, which is
+    /// what the outgoing frames report. Captured here because `complete` and
+    /// `stop_loops` both advance loop state, so it cannot be re-derived at
+    /// send time -- and captured in RUST because the caller would otherwise
+    /// have to ask for it per rid, convert it to strings on the way out, and
+    /// hand it back to be re-interned.
+    pub nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
 }
 
 /// `SpeculationPrepInput`.
@@ -1838,6 +1883,8 @@ impl GraphRuntime {
         let mut speculative: FxHashMap<u32, bool> = FxHashMap::default();
         let mut staged: FxHashSet<u64> = FxHashSet::default();
         let mut sends_a_frame: FxHashSet<u32> = FxHashSet::default();
+        let mut nested_snapshot: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)> =
+            FxHashMap::default();
         let mut cursor = 0usize;
 
         for (i, &rid) in input.rids.iter().enumerate() {
@@ -1868,6 +1915,10 @@ impl GraphRuntime {
                 .map(|e| by_signal.get(&e.name).cloned().unwrap_or_default())
                 .collect();
 
+            // Before complete(), which advances the loop counters.
+            if let Some(idx) = self.nested_idxs_interned(wg, rid, node) {
+                nested_snapshot.insert(rid, idx);
+            }
             let Some(state) = self.state_mut(wg, rid) else {
                 continue;
             };
@@ -2221,6 +2272,7 @@ impl GraphRuntime {
                 completed_wgs,
                 first_tp_rank,
                 speculative,
+                nested: nested_snapshot,
             },
         );
         Ok(out)
@@ -2354,25 +2406,54 @@ impl GraphRuntime {
     /// encoded; `nested` is the loop context snapshotted BEFORE the completion
     /// that produced this batch, which the runtime cannot re-derive.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// Everything arrives struct-of-arrays -- a rid list beside a value list
+    /// -- because that is the shape `ParallelList` already holds it in.
+    /// Zipping them into tuples on the Python side just to unzip here is a
+    /// per-rid interpreted loop per argument, every forward pass.
     #[pyo3(signature = (
-        completion_id, request_infos, new_token_counts, nested,
-        stream_tokens_consumed, profiling,
+        completion_id, info_rids, request_infos,
+        ntc_rids, new_token_counts, nested_rids, nested,
+        consumed_rids, stream_tokens_consumed, prof_rids, profiling,
     ))]
     fn send_outputs(
         &mut self,
         completion_id: u64,
-        request_infos: Vec<(u32, Option<Vec<u8>>)>,
-        new_token_counts: Vec<(u32, Vec<(String, i64)>)>,
-        nested: Vec<(u32, Option<(Vec<String>, Vec<(String, u32)>, u32)>)>,
-        stream_tokens_consumed: Vec<(u32, Vec<(String, i64)>)>,
-        profiling: Vec<(u32, Option<Vec<u8>>)>,
+        info_rids: Vec<u32>,
+        request_infos: Vec<Option<Vec<u8>>>,
+        ntc_rids: Vec<u32>,
+        // Taken as dicts: PyO3 extracts them directly, so Python does not
+        // have to flatten each one to a list of pairs.
+        new_token_counts: Vec<FxHashMap<String, i64>>,
+        nested_rids: Vec<u32>,
+        nested: Vec<Option<(Vec<String>, Vec<(String, u32)>, u32)>>,
+        consumed_rids: Vec<u32>,
+        stream_tokens_consumed: Vec<FxHashMap<String, i64>>,
+        prof_rids: Vec<u32>,
+        profiling: Vec<Option<Vec<u8>>>,
     ) -> PyResult<()> {
+        let request_infos: Vec<(u32, Option<Vec<u8>>)> =
+            info_rids.into_iter().zip(request_infos).collect();
+        let new_token_counts: Vec<(u32, Vec<(String, i64)>)> = ntc_rids
+            .into_iter()
+            .zip(new_token_counts)
+            .map(|(r, m)| (r, m.into_iter().collect()))
+            .collect();
+        let nested: Vec<(u32, Option<(Vec<String>, Vec<(String, u32)>, u32)>)> =
+            nested_rids.into_iter().zip(nested).collect();
+        let stream_tokens_consumed: Vec<(u32, Vec<(String, i64)>)> = consumed_rids
+            .into_iter()
+            .zip(stream_tokens_consumed)
+            .map(|(r, m)| (r, m.into_iter().collect()))
+            .collect();
+        let profiling: Vec<(u32, Option<Vec<u8>>)> =
+            prof_rids.into_iter().zip(profiling).collect();
         let spec_flags = self
             .completions
             .get(&completion_id)
             .map(|c| c.speculative.clone())
             .unwrap_or_default();
-        let plan = self.take_send_plan(completion_id)?;
+        let mut plan = self.take_send_plan(completion_id)?;
         let partition = plan.partition.clone();
         let encoded: FxHashMap<u32, Option<Vec<u8>>> =
             request_infos.into_iter().collect();
@@ -2380,53 +2461,88 @@ impl GraphRuntime {
             profiling.into_iter().collect();
         let consumed: FxHashMap<u32, Vec<(String, i64)>> =
             stream_tokens_consumed.into_iter().collect();
-        let nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)> = nested
-            .into_iter()
-            .filter_map(|(rid, idx)| idx.map(|i| (rid, i)))
-            .map(|(rid, (order, idxs, fwd))| {
-                (
-                    rid,
+        // The route-time snapshot, unless the caller passed its own. Python's
+        // runtime still supplies them; the Rust path leaves the argument empty
+        // and lets the snapshot stand, which saves a per-rid crossing on the
+        // way out, a rebuild in the wrapper, and the re-interning here.
+        let nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)> = if nested
+            .is_empty()
+        {
+            std::mem::take(&mut plan.nested)
+        } else {
+            nested
+                .into_iter()
+                .filter_map(|(rid, idx)| idx.map(|i| (rid, i)))
+                .map(|(rid, (order, idxs, fwd))| {
                     (
-                        order.iter().map(|n| self.interner.intern(n)).collect(),
-                        idxs.iter()
-                            .map(|(n, i)| (self.interner.intern(n), *i))
-                            .collect(),
-                        fwd,
-                    ),
-                )
-            })
-            .collect();
+                        rid,
+                        (
+                            order.iter().map(|n| self.interner.intern(n)).collect(),
+                            idxs.iter()
+                                .map(|(n, i)| (self.interner.intern(n), *i))
+                                .collect(),
+                            fwd,
+                        ),
+                    )
+                })
+                .collect()
+        };
 
         // One frame per (request, worker): the plan is per edge, and a worker
         // taking several of a request's signals should see one message.
-        let mut grouped: Vec<((u32, String), Vec<frames::OutEdge>)> = Vec::new();
-        for w in plan.to_workers {
-            let infos = self.sliced_infos(&w.tensors);
-            let key = (w.rid, w.worker);
-            let edge = frames::OutEdge {
-                name: w.signal, next_node: w.next_node,
-                is_streaming: w.streaming, infos,
-                shard_dim: w.shard_dim, total_fanin: w.total_fanin,
-            };
-            match grouped.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, edges)) => edges.push(edge),
-                None => grouped.push((key, vec![edge])),
+        //
+        // Indexed rather than scanned. A Vec probed with `find` is
+        // O(edges x groups) with a String compare per probe, and both grow
+        // with the batch; the Vec stays only to keep frame order stable.
+        let mut grouped: Vec<((u32, Sym), Vec<frames::OutEdge>)> = Vec::new();
+        let mut at: FxHashMap<(u32, Sym), usize> = FxHashMap::default();
+        {
+            // One acquisition for every descriptor lookup in the batch, not
+            // one per edge. Released before the sends -- holding it across
+            // zmq would park the GPU and plan threads on our I/O.
+            let bk = self.bookkeeping.lock().unwrap();
+            for w in plan.to_workers {
+                let infos = Self::sliced_infos_locked(&bk, &w.tensors);
+                let key = (w.rid, w.worker);
+                let edge = frames::OutEdge {
+                    name: w.signal, next_node: w.next_node,
+                    is_streaming: w.streaming, infos,
+                    shard_dim: w.shard_dim, total_fanin: w.total_fanin,
+                };
+                match at.get(&key) {
+                    Some(&i) => grouped[i].1.push(edge),
+                    None => {
+                        at.insert(key, grouped.len());
+                        grouped.push((key, vec![edge]));
+                    }
+                }
             }
         }
-        for ((rid, worker), edges) in &grouped {
-            let request_id = self.rid_name(*rid)?;
-            let bytes = {
-                let bk = self.bookkeeping.lock().unwrap();
-                frames::InputSignals {
-                    request_id: &request_id,
-                    partition_name: &partition,
-                    edges,
-                    request_info_encoded: encoded
-                        .get(rid).and_then(|b| b.as_deref()),
-                }
-                .encode(bk.strings())
-            };
-            self.dispatch(worker, &bytes)?;
+        // Encoding is pure CPU, so it all happens under one more acquisition;
+        // the dispatches then run with nothing held.
+        let mut frames_out: Vec<(Sym, Vec<u8>)> = Vec::with_capacity(grouped.len());
+        {
+            let bk = self.bookkeeping.lock().unwrap();
+            for ((rid, worker), edges) in &grouped {
+                let request_id = self.rids.name(*rid).ok_or_else(|| {
+                    PyValueError::new_err(format!("unknown rid handle {rid}"))
+                })?;
+                frames_out.push((
+                    *worker,
+                    frames::InputSignals {
+                        request_id,
+                        partition_name: &partition,
+                        edges,
+                        request_info_encoded: encoded
+                            .get(rid).and_then(|b| b.as_deref()),
+                    }
+                    .encode(bk.strings()),
+                ));
+            }
+        }
+        for (worker, bytes) in &frames_out {
+            let name = self.interner.name(*worker).to_string();
+            self.dispatch(&name, bytes)?;
         }
 
         for (rid, signal, modality, refs) in plan.emit {
@@ -2566,6 +2682,7 @@ impl GraphRuntime {
         let g = self.graphs[c.wg as usize].clone();
         let mut plan = SendPlan {
             partition: c.partition.clone(),
+            nested: c.nested.clone(),
             ..Default::default()
         };
 
@@ -2637,7 +2754,7 @@ impl GraphRuntime {
                                 wire_shape(e.name, dest, e.streaming, worker);
                             plan.to_workers.push(WireEdge {
                                 rid,
-                                worker: self.interner.name(worker).to_string(),
+                                worker,
                                 signal: name.clone(),
                                 next_node: self.interner.name(dest).to_string(),
                                 tensors: e.tensors.clone(),
@@ -2662,7 +2779,7 @@ impl GraphRuntime {
                                 wire_shape(e.name, dest, e.streaming, worker);
                             plan.to_workers.push(WireEdge {
                                 rid,
-                                worker: self.interner.name(worker).to_string(),
+                                worker,
                                 signal: name.clone(),
                                 next_node: self.interner.name(dest).to_string(),
                                 tensors: e.tensors.clone(),

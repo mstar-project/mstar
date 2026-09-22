@@ -180,6 +180,8 @@ class RustGraphRuntime(GraphRuntime):
     strings, and Rust interns those on arrival.
     """
 
+    provides_nested_loop_indices = True
+
     def __init__(
         self,
         my_worker_id: str,
@@ -590,29 +592,38 @@ class RustGraphRuntime(GraphRuntime):
         # four comprehensions over the batch run before Rust sees anything, on
         # top of the four that built SendInput.
         _t0 = _time.perf_counter() if PHASE_PERIOD else 0.0
+        # Straight through as struct-of-arrays. `ParallelList` already holds
+        # keys and values as two flat lists -- which is the whole reason it
+        # exists -- so zipping them into tuples here only to have Rust unzip
+        # them is a per-rid interpreted loop per argument, per forward pass.
+        # The count dicts go over as dicts; PyO3 extracts them.
         args = dict(
             completion_id=input.completion_id,
+            info_rids=input.per_request_info.keys,
             request_infos=[
-                (rid, self._encoded_fwd_info(rid, info))
-                for rid, info in input.per_request_info
+                None if i is None else wire.encode_field(
+                    i, CurrentForwardPassInfo,
+                )
+                for i in input.per_request_info.values
             ],
-            new_token_counts=[
-                (rid, list((counts or {}).items()))
-                for rid, counts in input.new_token_counts
-            ],
-            nested=[
-                (rid, None if idx is None else (
-                    list(idx.loop_name_order),
-                    list(idx.loop_indices.items()),
-                    idx.wg_fwd_pass_idx,
-                ))
-                for rid, idx in input.nested_loop_indices
-            ],
-            stream_tokens_consumed=[
-                (rid, list((counts or {}).items()))
-                for rid, counts in (input.stream_tokens_consumed or [])
-            ],
-            profiling=list(input.profiling or []),
+            ntc_rids=input.new_token_counts.keys,
+            new_token_counts=input.new_token_counts.values,
+            # Empty: Rust snapshotted the loop context at route time, so
+            # gathering it per rid here only to have it re-interned there is
+            # a round trip for data the runtime already holds. A caller that
+            # does pass some still wins -- Rust prefers a non-empty list.
+            nested_rids=[],
+            nested=[],
+            consumed_rids=(
+                [] if input.stream_tokens_consumed is None
+                else input.stream_tokens_consumed.keys
+            ),
+            stream_tokens_consumed=(
+                [] if input.stream_tokens_consumed is None
+                else input.stream_tokens_consumed.values
+            ),
+            prof_rids=[] if input.profiling is None else input.profiling.keys,
+            profiling=[] if input.profiling is None else input.profiling.values,
         )
         if PHASE_PERIOD:
             _t1 = _time.perf_counter()

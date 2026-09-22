@@ -107,8 +107,35 @@ class _Mesh:
             nested=[], stream_tokens_consumed=[], profiling=[],
         )
         args.update(send_kwargs)
-        self.rt.send_outputs(completion_id=out.completion_id, **args)
+        _send(self.rt, out.completion_id, **args)
         return {peer: _collect(box) for peer, box in self.inboxes.items()}
+
+
+
+def _send(rt, completion_id, **aos):
+    """The runtime takes struct-of-arrays; these cases read better as pairs.
+
+    Splits the (rid, value) lists the tests write into the parallel rid/value
+    lists ``send_outputs`` wants, and hands the count payloads over as dicts.
+    """
+    def split(key):
+        pairs = aos.get(key) or ()
+        return [r for r, _ in pairs], [v for _, v in pairs]
+
+    info_rids, infos = split("request_infos")
+    ntc_rids, ntc = split("new_token_counts")
+    nested_rids, nested = split("nested")
+    con_rids, con = split("stream_tokens_consumed")
+    prof_rids, prof = split("profiling")
+    rt.send_outputs(
+        completion_id=completion_id,
+        info_rids=info_rids, request_infos=infos,
+        ntc_rids=ntc_rids, new_token_counts=[dict(c) for c in ntc],
+        nested_rids=nested_rids, nested=nested,
+        consumed_rids=con_rids,
+        stream_tokens_consumed=[dict(c) for c in con],
+        prof_rids=prof_rids, profiling=prof,
+    )
 
 
 def _collect(box, first_wait_ms=1000):
@@ -428,10 +455,7 @@ def _emit_mesh(tmp_path, tp_rank, shard_dim=None):
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
-    rt.send_outputs(
-        completion_id=out.completion_id, request_infos=[(rid, None)],
-        new_token_counts=[], nested=[], stream_tokens_consumed=[], profiling=[],
-    )
+    _send(rt, out.completion_id, request_infos=[(rid, None)])
     return _collect(inbox, first_wait_ms=300)
 
 
@@ -518,11 +542,7 @@ def _fanout_mesh(tmp_path, shard_dim=None):
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
-    rt.send_outputs(
-        completion_id=out.completion_id, request_infos=[(rid, None)],
-        new_token_counts=[], nested=[], stream_tokens_consumed=[],
-        profiling=[],
-    )
+    _send(rt, out.completion_id, request_infos=[(rid, None)])
     return book, {p: _collect(box, first_wait_ms=600) for p, box in boxes.items()}
 
 
@@ -600,11 +620,7 @@ def _gather_mesh(tmp_path, src_tp, dest_tp, my_rank=0, shard_dim=0):
         "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
         "tensors": [1], "num_tensors": [1],
     })
-    rt.send_outputs(
-        completion_id=out.completion_id, request_infos=[(rid, None)],
-        new_token_counts=[], nested=[], stream_tokens_consumed=[],
-        profiling=[],
-    )
+    _send(rt, out.completion_id, request_infos=[(rid, None)])
     return {p: _collect(box, first_wait_ms=600) for p, box in boxes.items()}
 
 
