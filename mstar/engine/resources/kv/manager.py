@@ -26,6 +26,7 @@ from mstar.engine.resources.kv.plan import (
     group_by_plan_label,
 )
 from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
+from mstar.engine.resources.speculative.config import SPEC_ACCEPTANCE
 from mstar.engine.resources.step import (
     ADMIT_OK,
     AdmitFailedReason,
@@ -36,7 +37,6 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
-from mstar.engine.resources.speculative.config import SPEC_ACCEPTANCE
 
 logger = logging.getLogger(__name__)
 
