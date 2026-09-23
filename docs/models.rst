@@ -206,8 +206,9 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   on the 106-frame demo clip): 23.6 ms per 80 ms tick with one session, 57 ms
   with 32 concurrent sessions, 74-80 ms with 64 (at the budget); every session
   received all its frames. Served audio is checked for intelligibility by
-  transcribing it (Whisper large-v3-turbo): MaskGIT sampling is knife-edge, so
-  attention-backend numerics change the waveform but not the words.
+  transcribing it (``test/nemotron_duplex/asr_check.py``, Whisper
+  large-v3-turbo): MaskGIT sampling is knife-edge, so attention-backend
+  numerics change the waveform but not the words.
 - The nano text tokenizer is read from the ``nano/`` folder of
   ``pipecat-ai/NVIDIA-NemotronLabs-VoiceChat-11B-Spark`` (the base checkpoint
   ships only the RNN-T tokenizer); prefetch both repositories on machines
