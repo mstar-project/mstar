@@ -2226,9 +2226,6 @@ impl GraphRuntime {
                 .iter()
                 .zip(&ingested_locally)
                 .map(|(e, &is_local)| {
-                    if e.persist {
-                        return 0;
-                    }
                     match e.dest {
                         // Already in local_counts, unless it was refused --
                         // then nothing counted it and it goes on the wire.
