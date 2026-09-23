@@ -400,6 +400,7 @@ class PythonGraphRuntime(GraphRuntime):
             wgio = self._queues[wg_id].per_request_queues.get(rid)
             if wgio is not None:
                 wgio.get_node(node_name).ready_signals.clear()
+                wgio.ready_node_names.discard(node_name)
         # ``clear`` dereferences through the tensor manager this runtime was
         # built with, which runs the teardown as it goes. Nothing is left for
         # the caller.
