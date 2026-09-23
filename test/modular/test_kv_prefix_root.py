@@ -282,6 +282,9 @@ def test_a_keyed_node_without_host_pages_is_warned_its_decode_can_hold(caplog):
         "a cache with nothing to offload opened without saying a full pool "
         "holds its decode until the requests time out"
     )
+    assert "max_concurrent_requests" in warnings[0], (
+        "the warning names one way out of a full pool and not the other"
+    )
 
 
 @pytest.mark.parametrize("overrides, model", [
