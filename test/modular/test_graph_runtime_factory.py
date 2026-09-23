@@ -9,6 +9,10 @@ The guards matter as much as the selection. The Rust runtime holds an Arc to
 the transport and a SHARE of the bookkeeper, so a mismatched communicator or
 bookkeeper is not a degraded mode -- it is a runtime that cannot send, or two
 views of the refcounts that drift apart with nothing raising.
+
+The flag is 0, 1 or AUTO, and AUTO is the default: Rust where the extension
+imports, Python where it does not. So the default is a property of the
+machine, and both halves of it need a case.
 """
 import sys
 
@@ -53,30 +57,56 @@ def _kwargs(communicator=None, bookkeeping=None):
     )
 
 
-def test_the_default_is_the_python_runtime(monkeypatch):
+def test_the_default_is_auto_and_takes_rust_where_it_is_built(monkeypatch):
+    """AUTO is the default: an unset flag means "whatever this machine has"."""
+    pytest.importorskip("mstar_rust")
     monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
+
+    from mstar.communication.rust_communicator import RustZMQCommunicator
+    from mstar.communication.tensor_store import RustTensorBookkeeping
+    from mstar.graph.runtime.rust import RustGraphRuntime
+
+    runtime = _make_graph_runtime(**_kwargs(
+        communicator=RustZMQCommunicator.__new__(RustZMQCommunicator),
+        bookkeeping=RustTensorBookkeeping(),
+    ))
+    assert isinstance(runtime, RustGraphRuntime)
+
+
+def test_the_default_falls_back_to_python_without_the_extension(monkeypatch):
+    """The other half of AUTO, and the one that keeps mstar runnable on a
+    machine that never ran maturin. A None entry in sys.modules makes the
+    import raise, which is what the probe sees when it is really absent."""
+    monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
+    monkeypatch.setitem(sys.modules, "mstar.graph.runtime.rust", None)
     assert isinstance(_make_graph_runtime(**_kwargs()), PythonGraphRuntime)
 
 
 def test_zero_is_the_python_runtime(monkeypatch):
+    """Explicit 0 pins Python even where the extension is built, so AUTO
+    cannot quietly move a worker onto a backend nobody asked for."""
     monkeypatch.setenv("MSTAR_RUST_GRAPH", "0")
     assert isinstance(_make_graph_runtime(**_kwargs()), PythonGraphRuntime)
 
 
-@pytest.mark.parametrize("value", ["AUTO", "auto", "1 ", "true", "yes", ""])
-def test_anything_other_than_0_or_1_is_refused(monkeypatch, value):
-    """No AUTO on purpose. Picking Rust up because the extension happened to
-    be installed would change how a worker behaves without anyone asking, and
-    falling back silently would hide a build that did not take."""
+@pytest.mark.parametrize("value", ["auto", "Auto", "1 ", "true", "yes", ""])
+def test_anything_other_than_0_1_or_auto_is_refused(monkeypatch, value):
+    """The three spellings are exact. A typo that fell back to a default would
+    hide a build that did not take -- which is the whole reason the flag is
+    read rather than inferred."""
     monkeypatch.setenv("MSTAR_RUST_GRAPH", value)
-    with pytest.raises(ValueError, match="must be 0 or 1"):
+    with pytest.raises(ValueError, match="must be 0, 1, or AUTO"):
         _make_graph_runtime(**_kwargs())
 
 
 def test_rust_refuses_the_pyzmq_communicator(monkeypatch):
+    """MSTAR_RUST_ZMQ=0 builds a pyzmq communicator, which the Rust runtime
+    cannot share. Caught on the communicator's TYPE rather than on the flag:
+    the flag says what the worker was asked to build, the type says what it
+    actually built, and only the second one can be shared."""
     monkeypatch.setenv("MSTAR_RUST_GRAPH", "1")
     monkeypatch.setenv("MSTAR_RUST_ZMQ", "0")
-    with pytest.raises(ValueError, match="MSTAR_RUST_ZMQ=0"):
+    with pytest.raises(ValueError, match="needs the Rust communicator"):
         _make_graph_runtime(**_kwargs())
 
 

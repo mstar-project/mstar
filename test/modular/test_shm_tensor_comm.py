@@ -429,10 +429,31 @@ def test_factory_returns_mooncake_for_rdma():
 # ---------------------------------------------------------------------------
 
 
+def _descriptor_fields(info):
+    """A descriptor as VALUES, not as an object.
+
+    ``dims``/``stride`` are declared ``list[int]`` but arrive as whatever the
+    producer had -- a ``torch.Size`` from ``tensor.shape``, a list back out of
+    the Rust bookkeeper, which copies the descriptor rather than keeping the
+    caller's object. Comparing the sequences directly would be testing which
+    backend is installed.
+    """
+    return (
+        tuple(info.dims), tuple(info.stride), info.dtype, info.nbytes,
+        info.address, info.uuid, info.offset,
+        info.shm_segment, info.shm_offset,
+    )
+
+
 def test_store_keeps_a_descriptor_for_every_uuid_it_holds(tmp_path):
     """Ingestion and routing carry uuids, so anything that has to put a
     descriptor back on the wire — a disaggregated loop re-emitting its
-    external inputs — has to be able to recover it from the uuid alone."""
+    external inputs — has to be able to recover it from the uuid alone.
+
+    Recover, not share: the Rust bookkeeper copies the descriptor in, so the
+    two are equal without being the same object, and a later in-place edit
+    reaches the store through ``update_info`` instead (see
+    ``test/rust/test_arena_transport.py``'s write-back cases)."""
     mgr = _make_manager(str(tmp_path), request_id="r1")
     infos = mgr.store_and_return_tensor_info(
         "r1", {"h": [torch.randn(4, 8)], "e": [torch.empty(0, 3)]},
@@ -441,23 +462,21 @@ def test_store_keeps_a_descriptor_for_every_uuid_it_holds(tmp_path):
         for info in info_list:
             got = mgr.tensor_store.get_info(info.uuid)
             assert got is not None, f"no descriptor kept for {name}"
-            # Same object, so the shm_segment register_for_send stamps on later
-            # is visible through both the edge and the store.
-            assert got is info
+            assert _descriptor_fields(got) == _descriptor_fields(info)
 
 
 def test_descriptor_survives_register_for_send(tmp_path):
-    """register_for_send edits the descriptor in place (shm_segment/offset);
-    the stored one must show those edits, not a stale snapshot."""
+    """Registering a tensor for sending must not lose or stale the stored
+    descriptor: the file transport writes the bytes out and leaves the
+    descriptor alone, so what the store holds afterwards still points at the
+    same tensor."""
     mgr = _make_manager(str(tmp_path), request_id="r1")
     infos = mgr.store_and_return_tensor_info("r1", {"h": [torch.randn(4, 8)]})
     info = infos["h"][0]
     mgr.register_for_send("r1", [info])
 
     stored = mgr.tensor_store.get_info(info.uuid)
-    assert stored.address == info.address
-    assert stored.nbytes == info.nbytes
-    assert stored.dims == info.dims
+    assert _descriptor_fields(stored) == _descriptor_fields(info)
 
 
 def test_descriptor_is_dropped_with_the_tensor(tmp_path):

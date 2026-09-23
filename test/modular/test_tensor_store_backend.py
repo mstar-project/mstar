@@ -5,6 +5,9 @@ Both are silent failures: the wrong backend makes MSTAR_RUST_GRAPH=1 refuse
 to start (the runtime holds a SHARE of this object, so the two must match),
 and an unguarded extension import makes the whole package unimportable
 wherever it is not built.
+
+The flag defaults to AUTO, so "which backend by default" is a property of the
+machine -- the last case here is the one that pins the no-extension half.
 """
 import importlib
 import sys
@@ -16,8 +19,17 @@ import pytest
 from mstar.communication.tensor_store import TensorStore
 
 
-def test_the_default_backend_is_python(monkeypatch):
+def test_the_default_backend_follows_the_resolved_runtime(monkeypatch):
+    """The two have to agree: the Rust runtime takes a SHARE of this object,
+    so an unset flag resolving to Rust in one place and Python in the other is
+    a worker that refuses to start."""
+    pytest.importorskip("mstar_rust", reason="extension not built")
     monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
+    assert type(TensorStore().bookkeeping).__name__ == "RustTensorBookkeeping"
+
+
+def test_zero_pins_the_python_backend(monkeypatch):
+    monkeypatch.setenv("MSTAR_RUST_GRAPH", "0")
     assert type(TensorStore().bookkeeping).__name__ == "PythonTensorBookkeeping"
 
 
@@ -33,8 +45,9 @@ def test_the_rust_graph_flag_selects_the_rust_backend(monkeypatch):
 def test_an_unrelated_flag_does_not_select_it(monkeypatch):
     # The bookkeeper is not worth taking on its own -- a descriptor is copied
     # in and rebuilt out, which the Python runtime pays for and gains nothing
-    # from. It follows MSTAR_RUST_GRAPH and nothing else.
-    monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
+    # from. It follows MSTAR_RUST_GRAPH and nothing else, so a 0 stays 0 no
+    # matter which other Rust-flavoured flag is set.
+    monkeypatch.setenv("MSTAR_RUST_GRAPH", "0")
     monkeypatch.setenv("MSTAR_SHM_ARENA", "1")
     monkeypatch.setenv("MSTAR_RUST_ZMQ", "1")
     assert type(TensorStore().bookkeeping).__name__ == "PythonTensorBookkeeping"

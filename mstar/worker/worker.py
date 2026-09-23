@@ -79,13 +79,12 @@ def _make_graph_runtime(
     **kwargs
 ) -> PythonGraphRuntime:
     """``MSTAR_RUST_GRAPH``: ``0`` Python, ``1`` Rust, ``AUTO`` (default,
-    Rust if installed, else Python).
+    Rust if the extension imports, else Python).
 
-    No ``AUTO``: picking the Rust runtime up silently would change how a
-    worker behaves merely because the extension happened to be installed, and
-    falling back silently would hide a build that did not take.
+    Only those three spellings; a typo raises rather than falling back, so a
+    build that did not take cannot read as a deliberate ``0``.
 
-    It requires the Rust communicator. The runtime sends WORKER_GRAPHS_DONE
+    Rust requires the Rust communicator. The runtime sends WORKER_GRAPHS_DONE
     and INPUT_SIGNALS itself, holding an Arc to the same transport rather than
     hopping back into Python for every message; with the pyzmq communicator
     there is no such object to share.
