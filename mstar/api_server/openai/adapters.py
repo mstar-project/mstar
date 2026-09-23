@@ -24,6 +24,7 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -36,6 +37,7 @@ if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __f
         ChatCompletionRequest,
         ImageGenerationRequest,
         SpeechRequest,
+        TranscriptionRequest,
         VideoGenerationRequest,
     )
 
@@ -50,6 +52,25 @@ class SubmitArgs:
     # Ordered text/attachment sequence. None from entrypoints with no ordering
     # to preserve, which keep the legacy attachments-then-text layout.
     prompt_parts: list[PromptPart] | None = None
+
+
+@dataclass
+class Transcript:
+    """A finished transcription as the serving layer reports it.
+
+    ``text`` is the clean transcript. ``language`` is an ISO-639-1 code when the
+    model reported one (detected or forced). ``segments`` / ``words`` carry
+    ``{"start", "end", "text"}`` / ``{"start", "end", "word"}`` in seconds when
+    the model emitted timestamps; empty otherwise. ``unfinished`` says the
+    output stopped inside a segment (a start timestamp with no end): the text
+    after the last closed segment is provisional, and a long-form driver
+    re-decodes that audio from the last segment end.
+    """
+    text: str
+    language: str | None = None
+    segments: list[dict] = field(default_factory=list)
+    words: list[dict] = field(default_factory=list)
+    unfinished: bool = False
 
 
 def flatten_messages(
@@ -184,6 +205,27 @@ class OpenAIAdapter:
     supports_images: bool = False   # POST /v1/images/generations and /v1/images/edits
     supports_videos: bool = False   # POST /v1/videos/generations
     supports_realtime: bool = False  # /v1/realtime (bidirectional speech WebSocket)
+    supports_transcriptions: bool = False  # POST /v1/audio/transcriptions
+    # Longest clip the model transcribes in one request; longer uploads are cut
+    # into windows of this length by the transcription route (None: unlimited).
+    max_audio_seconds: float | None = None
+    # How the windows of a long upload run: "sequential" feeds each window the
+    # previous transcript as ``initial_prompt`` (openai-whisper's carry-over),
+    # "parallel" submits them all at once. A request can override with
+    # ``long_form`` in extra_body.
+    long_form: str = "sequential"
+    # Sequential long form: decode every window with timestamps and start the
+    # next one where the last closed segment ended, instead of at a fixed
+    # boundary (openai-whisper's seek). Needs ``parse_transcript`` to report
+    # segments and ``unfinished``.
+    seeks_by_timestamps: bool = False
+    # Sequential long form: a window whose text compresses better than this
+    # (gzip bytes ratio) is a repetition loop; it is decoded again at rising
+    # temperatures (openai-whisper's fallback). None disables the check.
+    compression_ratio_threshold: float | None = 2.4
+    # Streaming transcription over /v1/realtime: the model must be able to
+    # continue a hypothesis it is handed (see ``realtime_step_request``).
+    supports_realtime_transcription: bool = False
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
@@ -201,6 +243,27 @@ class OpenAIAdapter:
 
     def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("image editing is not supported by this model")
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:  # noqa: ARG002
+        raise NotImplementedError("audio/transcriptions is not supported by this model")
+
+    def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:  # noqa: ARG002
+        """Structured view of a model's raw text stream. The default is plain
+        text; a model whose stream carries control tokens (Whisper's language
+        and timestamp tokens, an LLM decoder's tags) parses them here."""
+        return Transcript(text=text.strip())
+
+    def stream_delta(self, text: str) -> str:
+        """The client-facing part of one streamed text chunk. The default
+        passes it through; a model with control tokens strips them."""
+        return text
+
+    def realtime_step_request(self, req: TranscriptionRequest, audio_path: str, prefix: str) -> SubmitArgs:  # noqa: ARG002
+        """One streaming step: transcribe ``audio_path`` (everything heard so
+        far) continuing from ``prefix``, the stable part of the previous raw
+        hypothesis. Models that cannot continue a hypothesis leave this
+        unimplemented and stay off ``/v1/realtime``."""
+        raise NotImplementedError("realtime transcription is not supported by this model")
 
 
 class BagelAdapter(OpenAIAdapter):
@@ -506,6 +569,146 @@ class Wan22Adapter(OpenAIAdapter):
         )
 
 
+# Whisper-style control tokens: ``<|en|>`` (language), ``<|12.34|>`` (timestamp),
+# and the task/format markers. ASR models render the ones that carry
+# information (language, timestamps) into their text stream so the adapter can
+# lift them out here; everything else is dropped.
+_CONTROL_TOKEN = re.compile(r"<\|([^|<>]*)\|>")
+_TIMESTAMP = re.compile(r"^\d+\.\d{2}$")
+_LANGUAGE = re.compile(r"^[a-z]{2,3}$")
+# Whisper's word timings follow the transcript after this marker, one
+# ``<|start|> word <|end|>`` per word in the same timestamp vocabulary
+_WORDS_MARKER = "<|startoflm|>"
+
+
+def _transcription_kwargs(req: TranscriptionRequest) -> dict:
+    """Map the OpenAI transcription fields shared by every ASR model onto
+    ``model_kwargs``. ``language`` / ``temperature`` / ``seed`` pass through
+    under their own names; ``prompt`` becomes ``initial_prompt`` (the
+    conditioning text, named as faster-whisper does — ``prompt`` itself is
+    the request's text argument); a timestamped ``response_format`` or an
+    explicit granularity asks the model for timestamps."""
+    mk = _passthrough(req)
+    if req.language:
+        mk.setdefault("language", req.language)
+    if req.prompt:
+        mk.setdefault("initial_prompt", req.prompt)
+    if req.temperature is not None:
+        mk.setdefault("temperature", req.temperature)
+    if req.seed is not None:
+        mk.setdefault("seed", req.seed)
+    granularities = set(req.timestamp_granularities or ())
+    if "word" in granularities:
+        mk.setdefault("timestamps", "word")
+    elif granularities or req.response_format in ("verbose_json", "srt", "vtt"):
+        mk.setdefault("timestamps", "segment")
+    return mk
+
+
+class WhisperAdapter(OpenAIAdapter):
+    """Whisper (large-v3, large-v3-turbo): speech-to-text.
+
+    The transcript stream is Whisper's own token stream rendered as text:
+    a leading ``<|xx|>`` language token when the language was detected or
+    forced, and ``<|s.ss|>`` timestamp tokens around each segment when
+    timestamps were requested. ``parse_transcript`` lifts those into
+    :class:`Transcript`; ``stream_delta`` hides them from streaming clients.
+    """
+
+    supports_transcriptions = True
+    # Whisper hears one 30 s window; the route cuts longer uploads into them,
+    # each starting where the previous window's last segment closed.
+    max_audio_seconds = 30.0
+    seeks_by_timestamps = True
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        return SubmitArgs(
+            # Whisper is conditioned by its forced token prompt, not free text;
+            # ``prompt`` reaches the model as the ``initial_prompt`` kwarg
+            # (``<|startofprev|>`` context).
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=_transcription_kwargs(req),
+        )
+
+    def stream_delta(self, text: str) -> str:
+        if _WORDS_MARKER in text:
+            return ""  # the word timings arrive as one chunk after the transcript
+        return _CONTROL_TOKEN.sub("", text)
+
+    def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
+        text, _, timed_words = text.partition(_WORDS_MARKER)
+        language, segments, parts, unfinished = _parse_timestamped(text)
+        clean = " ".join(p.strip() for p in parts if p.strip())
+        for idx, seg in enumerate(segments):
+            seg["id"] = idx
+        words = [
+            {"word": seg["text"], "start": seg["start"], "end": seg["end"]}
+            for seg in _parse_timestamped(timed_words)[1]
+        ] if timed_words else []
+        return Transcript(
+            text=clean, language=language or req.language, segments=segments, words=words,
+            unfinished=unfinished,
+        )
+
+
+def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bool]:
+    """Walk Whisper's rendered stream: ``(language, closed segments, text
+    pieces in order, whether a segment was left open)``. A segment is the
+    text between a start and an end timestamp; text outside timestamps is
+    kept as is."""
+    language: str | None = None
+    segments: list[dict] = []
+    parts: list[str] = []
+    start: float | None = None
+    buffer: list[str] = []
+    cursor = 0
+    for match in _CONTROL_TOKEN.finditer(text):
+        span = text[cursor:match.start()]
+        cursor = match.end()
+        (buffer if start is not None else parts).append(span)
+        token = match.group(1)
+        if _TIMESTAMP.match(token):
+            stamp = float(token)
+            if start is None:
+                start = stamp
+            else:
+                segment_text = "".join(buffer).strip()
+                if segment_text:
+                    segments.append({"start": start, "end": stamp, "text": segment_text})
+                    parts.append(segment_text)
+                buffer = []
+                start = None
+        elif language is None and _LANGUAGE.match(token):
+            language = token
+    tail = text[cursor:]
+    (buffer if start is not None else parts).append(tail)
+    if start is not None and "".join(buffer).strip():
+        # an open segment at the end of the stream: keep its text, no end
+        parts.append("".join(buffer).strip())
+    return language, segments, parts, start is not None
+
+
+class HiggsAudioAdapter(OpenAIAdapter):
+    """Higgs-Audio v3 STT: an instruction-following LLM decoder, so the OpenAI
+    ``prompt`` is the transcription instruction (the model has a default)."""
+
+    supports_transcriptions = True
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        mk = _transcription_kwargs(req)
+        mk.pop("initial_prompt", None)
+        return SubmitArgs(
+            text=req.prompt or "",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
 # Only models with an OpenAI-standard surface are registered. Action/world-model
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
@@ -517,6 +720,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_droid": Cosmos3Adapter(),
     "cosmos3_super": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
+    "whisper_large": WhisperAdapter(),
+    "higgs_audio": HiggsAudioAdapter(),
 }
 
 
