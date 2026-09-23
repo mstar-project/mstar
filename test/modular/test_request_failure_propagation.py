@@ -184,6 +184,8 @@ def _api_server(messages):
     s._recently_completed_ttl = 15.0
     s.request_lock = threading.Lock()
     s.running = True
+    s.conductor_proc = None
+    s._liveness_interval_s = 0.5
     s.log_stats = False
     s.cleaned = []
     s.communicator = SimpleNamespace(
