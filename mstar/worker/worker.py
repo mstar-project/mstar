@@ -18,8 +18,11 @@ import torch
 from mstar.communication import wire
 from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
-from mstar.communication.tensor_store import TensorStore
-from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager, create_tensor_communication_manager
+from mstar.communication.tensors import (
+    NameToTensorList,
+    TensorCommunicationManager,
+    create_tensor_communication_manager,
+)
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
@@ -28,7 +31,6 @@ from mstar.engine.resources import AllocationFailed, StepContext
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import (
     GraphEdge,
-    TensorPointerInfo,
 )
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (

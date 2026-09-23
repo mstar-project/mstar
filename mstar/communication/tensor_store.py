@@ -15,7 +15,6 @@ teardown can find what to free.
 """
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
