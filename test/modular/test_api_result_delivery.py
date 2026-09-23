@@ -237,23 +237,28 @@ def test_delivery_active_reads_the_worker_state():
     assert pw.delivery_active("r", now - 15.0)
     pw.delivery.last_touch["r"] = now - 30.0
     assert not pw.delivery_active("r", now - 15.0)
-    pw.delivery.busy = True
+    pw.delivery.active = frozenset({"r"})
     assert pw.delivery_active("r", now - 15.0)
-    pw.delivery.busy = False
+    assert not pw.delivery_active("other", now - 15.0)
+    pw.delivery.active = frozenset()
     pw.delivery.forget("r")
     assert not pw.delivery_active("r", now - 15.0)
 
 
 class _ReadyTensorManager(_RecordingTensorManager):
-    """Every started read is ready on the next poll, with a tiny tensor."""
+    """Every started read is ready on the next poll, with a tiny tensor,
+    except for the requests in ``never_ready`` (a producer that never
+    delivers)."""
 
-    def __init__(self):
+    def __init__(self, never_ready=()):
         super().__init__()
         self.ready = {}
+        self.never_ready = set(never_ready)
 
     def start_read_tensors(self, request_id, graph_edges, graph_walk=None):
         super().start_read_tensors(request_id, graph_edges, graph_walk)
-        self.ready.setdefault(request_id, []).extend(graph_edges)
+        if request_id not in self.never_ready:
+            self.ready.setdefault(request_id, []).extend(graph_edges)
         return []
 
     def get_ready_tensors(self, graph_walk=None):
@@ -280,13 +285,16 @@ class _SlowPostprocessModel:
         return b"encoded"
 
 
-def test_worker_stays_busy_through_a_long_postprocess():
-    """The API server's backstop reads the worker's progress: busy for the
-    whole postprocess, the request touched, idle again once the chunk is
-    queued."""
+def test_a_long_postprocess_claims_the_requests_of_its_pass_only():
+    """The API server's backstop reads what the worker claimed: the request
+    being postprocessed and the one queued behind it in the same pass are
+    active for the whole postprocess, a request whose read never completes
+    is not, and nothing is claimed once the pass is over."""
     model = _SlowPostprocessModel()
-    tm = _ReadyTensorManager()
+    tm = _ReadyTensorManager(never_ready={"req-lost"})
     delivery = DeliveryProgress()
+    pw = object.__new__(PreprocessWorker)
+    pw.delivery = delivery
     stop = threading.Event()
     worker = PreprocessWorkerThread(
         in_queue=queue.Queue(),
@@ -303,31 +311,42 @@ def test_worker_stays_busy_through_a_long_postprocess():
         model=model,
         delivery=delivery,
     )
-    result = _result_tensors("req-slow")
-    result.graph_edge.tensor_info.append(TensorPointerInfo(
-        dims=[1], dtype="float32", nbytes=4, address=0, stride=[1],
-        uuid="u1", source_session_id="s", source_entity="worker_0",
-    ))
-    worker.result_tensor_queue.put(result)
+    for rid in ("req-slow", "req-behind", "req-lost"):
+        result = _result_tensors(rid)
+        result.graph_edge.tensor_info.append(TensorPointerInfo(
+            dims=[1], dtype="float32", nbytes=4, address=0, stride=[1],
+            uuid=f"u-{rid}", source_session_id="s", source_entity="worker_0",
+        ))
+        worker.result_tensor_queue.put(result)
 
     thread = threading.Thread(target=worker.run)
     thread.start()
     try:
         assert model.entered.wait(timeout=5), "postprocess never started"
-        touched = delivery.last_touch.get("req-slow")
-        assert touched is not None
+        # Every read started (and was touched) before the postprocess began.
+        assert tm.read_started == ["req-slow", "req-behind", "req-lost"]
+        started = delivery.last_touch["req-lost"]
+        since = time.time()
         for _ in range(20):
-            assert delivery.busy
+            assert pw.delivery_active("req-slow", since)
+            assert pw.delivery_active("req-behind", since)
+            assert not pw.delivery_active("req-lost", since)
             time.sleep(0.005)
+        assert pw.delivery_active("req-lost", started - 1.0)
         model.release.set()
-        chunk = worker.out_queue.get(timeout=5)
-        assert chunk.request_id == "req-slow"
-        assert chunk.data == b"encoded"
-        assert delivery.last_touch["req-slow"] >= touched
+        chunks = {}
+        for _ in range(2):
+            chunk = worker.out_queue.get(timeout=5)
+            chunks[chunk.request_id] = chunk.data
+        assert chunks == {"req-slow": b"encoded", "req-behind": b"encoded"}
         deadline = time.time() + 2.0
-        while delivery.busy and time.time() < deadline:
+        while delivery.active and time.time() < deadline:
             time.sleep(0.005)
-        assert not delivery.busy
+        assert delivery.active == frozenset()
+        assert delivery.last_touch["req-slow"] >= since
+        assert delivery.last_touch["req-behind"] >= since
+        assert delivery.last_touch["req-lost"] == started
+        assert not pw.delivery_active("req-lost", since)
     finally:
         model.release.set()
         stop.set()

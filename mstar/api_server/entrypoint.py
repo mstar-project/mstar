@@ -405,10 +405,12 @@ class APIServer:
                     rid, now - self._recently_completed_ttl,
                 )
             ):
-                # Nothing has moved this request's outputs for a whole TTL
-                # and the data worker is idle, so the chunks are not coming.
-                # A long read or postprocess (a video encode) is delivery in
-                # progress and holds the TTL instead of tripping it.
+                # The data worker is not working on this request's outputs
+                # and nothing has moved them for a whole TTL, so the chunks
+                # are not coming. A long read or postprocess (a video encode)
+                # of this request, or of one ahead of it in the same worker
+                # pass, holds the TTL instead of tripping it; other requests'
+                # work does not.
                 stale.append((rid, True, drained))
         for rid, lost_outputs, drained in stale:
             # only set the event when there are no more pending chunks
