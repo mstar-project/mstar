@@ -179,6 +179,7 @@ def _preprocess(inflight_reads=False):
     )
     wt.tensor_uuid_to_metadata_per_request = {}
     wt.request_model_kwargs = {}
+    wt._text_decode = {}
     wt.in_flight_requests = set()
     return wt
 

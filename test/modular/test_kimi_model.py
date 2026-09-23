@@ -237,3 +237,38 @@ def test_process_prompt_byte_mode_with_messages_raises():
         model.process_prompt(
             None, ["text"], ["text"], messages=[{"role": "user", "content": "hi"}],
         )
+
+
+# --- postprocess: special tokens kept, eos ids dropped ----------------------
+
+
+class _DecodeStubTokenizer:
+    """decode() echoes the ids as a marker string so the test can see exactly
+    what postprocess passed through (special tokens included)."""
+
+    def decode(self, ids, skip_special_tokens=False):
+        assert skip_special_tokens is False
+        return "".join(f"<{i}>" for i in ids)
+
+
+def _make_decode_model() -> KimiK2Model:
+    model = _make_model()
+    model._tokenizer_mode = "hf"
+    model._tokenizer = _DecodeStubTokenizer()
+    return model
+
+
+def test_postprocess_keeps_special_tokens_and_drops_eos_ids():
+    model = _make_decode_model()
+    model.config.eos_token_ids = [9]
+
+    out = model.postprocess(torch.tensor([9, 1, 2]), "text")
+
+    assert out == "<1><2>".encode("utf-8")
+
+
+def test_postprocess_byte_mode_unchanged():
+    model = _make_model()
+    model._tokenizer_mode = "byte"
+    out = model.postprocess(torch.tensor([65, 66]), "text")
+    assert out == b"AB"

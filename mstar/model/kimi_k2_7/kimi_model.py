@@ -372,7 +372,9 @@ class KimiK2Model(Model):
             if self._tokenizer_mode == "byte":
                 # Synthetic reduced models emit arbitrary byte ids; return raw bytes.
                 return bytes((t & 0xFF) for t in token_ids)
-            text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+            # Keeps <think>/tool-call markers (skip_special_tokens=False); eos ids are dropped.
+            new_ids = [t for t in token_ids if t not in self.config.eos_token_ids]
+            text = self.tokenizer.decode(new_ids, skip_special_tokens=False)
             return text.encode("utf-8")
         raise ValueError(f"Unsupported modality for Kimi-K2.7: {modality!r}")
 

@@ -227,6 +227,97 @@ def test_chat_stream(client_and_stub):
     assert lines[-1]["choices"][0]["finish_reason"] == "stop"
 
 
+def _kimi_reference_chunks():
+    from mstar.model.kimi_k2_7.output_parser import (
+        TOOL_ARG_START,
+        TOOL_CALL_END,
+        TOOL_CALL_START,
+        TOOL_SECTION_END,
+        TOOL_SECTION_START,
+    )
+
+    text = (
+        "<think>plan...</think>Answer"
+        + TOOL_SECTION_START
+        + TOOL_CALL_START + "functions.get_weather:0" + TOOL_ARG_START
+        + '{"city": "Tokyo"}' + TOOL_CALL_END
+        + TOOL_SECTION_END
+    )
+    # Split arbitrarily to exercise incremental feeding through the router.
+    mid = len(text) // 2
+    return [_Chunk("text", text[:mid].encode("utf-8")), _Chunk("text", text[mid:].encode("utf-8"))]
+
+
+def test_kimi_chat_non_streaming_reasoning_and_tool_calls(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "kimi_k2_7"
+    stub.next_chunks = _kimi_reference_chunks()
+    body = client.post(
+        "/v1/chat/completions",
+        json={"model": "kimi_k2_7", "messages": [{"role": "user", "content": "weather?"}]},
+    ).json()
+    message = body["choices"][0]["message"]
+    assert message["reasoning_content"] == "plan..."
+    assert message["content"] == "Answer"
+    assert message["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert message["tool_calls"][0]["function"]["arguments"] == '{"city": "Tokyo"}'
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_kimi_chat_stream_reasoning_and_tool_calls(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "kimi_k2_7"
+    stub.next_chunks = _kimi_reference_chunks()
+    text = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "kimi_k2_7",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "stream": True,
+        },
+    ).text
+    assert "[DONE]" in text
+    lines = [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
+    deltas = [l["choices"][0]["delta"] for l in lines]
+
+    assert deltas[0].get("role") == "assistant"
+    reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
+    assert reasoning == "plan..."
+    content = "".join(d.get("content", "") for d in deltas)
+    assert content == "Answer"
+    tool_call_deltas = [d for d in deltas if "tool_calls" in d]
+    assert tool_call_deltas[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert "id" not in tool_call_deltas[0]["tool_calls"][0] or tool_call_deltas[0]["tool_calls"][0]["id"]
+    args = "".join(
+        d["tool_calls"][0]["function"].get("arguments", "") for d in tool_call_deltas
+    )
+    assert args == '{"city": "Tokyo"}'
+    assert lines[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+    # header delta (has "id") must precede any argument-only delta.
+    header_idx = next(i for i, d in enumerate(tool_call_deltas) if "id" in d["tool_calls"][0])
+    arg_idx = next(
+        i for i, d in enumerate(tool_call_deltas)
+        if "id" not in d["tool_calls"][0] and d["tool_calls"][0]["function"].get("arguments")
+    )
+    assert header_idx < arg_idx
+
+
+def test_kimi_chat_no_tool_calls_finish_stop(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "kimi_k2_7"
+    stub.next_chunks = [_Chunk("text", b"<think>hmm</think>Hi there")]
+    body = client.post(
+        "/v1/chat/completions",
+        json={"model": "kimi_k2_7", "messages": [{"role": "user", "content": "hi"}]},
+    ).json()
+    message = body["choices"][0]["message"]
+    assert message["reasoning_content"] == "hmm"
+    assert message["content"] == "Hi there"
+    assert "tool_calls" not in message
+    assert body["choices"][0]["finish_reason"] == "stop"
+
+
 def test_unsupported_model_404(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "pi05"

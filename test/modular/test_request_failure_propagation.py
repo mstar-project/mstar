@@ -24,6 +24,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import torch
+
 from mstar.api_server.entrypoint import APIServer, PendingRequest
 from mstar.api_server.request_types import (
     APIServerMessage,
@@ -255,6 +257,7 @@ def _preprocess_thread(model):
     wt.request_model_kwargs = {}
     wt.tensor_uuid_to_metadata_per_request = {"r1": {"u1": {}}}
     wt.enable_prof = False
+    wt._text_decode = {}
     return wt
 
 
@@ -273,7 +276,7 @@ def test_output_postprocess_failure_becomes_an_error_chunk():
     )
     wt.tensor_manager = SimpleNamespace(
         get_ready_tensors=lambda: {"r1": [edge]},
-        get_tensor=lambda request_id, uuid: object(),
+        get_tensor=lambda request_id, uuid: torch.tensor([1], dtype=torch.long),
         dereference=lambda request_id, uuid: dereferenced.append(uuid),
     )
 
@@ -307,3 +310,87 @@ def test_result_transfer_failure_answers_for_every_queued_tensor():
         )
     assert wt.out_queue.qsize() == 2
     assert b"arena full" in wt.out_queue.get_nowait().data
+
+
+# ── data worker: incremental text decode ────────────────────────────────────
+
+
+class _TableTextModel:
+    """postprocess("text") decodes the full accumulated ids via a fixed
+    table, like a strict stub tokenizer; other modalities echo raw bytes."""
+
+    def __init__(self, table):
+        self.table = table
+
+    def postprocess(self, tensor, modality, request_kwargs=None):
+        if modality == "text":
+            return self.table[tuple(tensor.tolist())].encode("utf-8")
+        return tensor.numpy().tobytes()
+
+
+def _feed_tensor(wt, request_id, uuid, token_ids, modality="text", dereferenced=None):
+    edge = SimpleNamespace(
+        name=f"{modality}_output", tensor_info=[SimpleNamespace(uuid=uuid)],
+    )
+    wt.tensor_manager = SimpleNamespace(
+        get_ready_tensors=lambda: {request_id: [edge]},
+        get_tensor=lambda request_id, uuid: torch.tensor(token_ids, dtype=torch.long),
+        dereference=(lambda request_id, uuid: dereferenced.append(uuid))
+        if dereferenced is not None else (lambda request_id, uuid: None),
+        force_cleanup_request=lambda request_id: None,
+    )
+    wt.tensor_uuid_to_metadata_per_request.setdefault(request_id, {})[uuid] = {}
+    wt._process_read_tensors()
+
+
+def test_text_output_holds_back_incomplete_utf8_then_emits_full_char():
+    """A token can split a multi-byte codepoint; the worker must accumulate
+    across steps and only emit once the character decodes cleanly."""
+    table = {(): "", (1,): "�", (1, 2): "e"}
+    wt = _preprocess_thread(_TableTextModel(table))
+    wt.tensor_uuid_to_metadata_per_request = {}
+
+    _feed_tensor(wt, "r1", "u1", [1])
+    assert wt.out_queue.qsize() == 0
+
+    _feed_tensor(wt, "r1", "u2", [2])
+    assert wt.out_queue.get_nowait().data == b"e"
+
+
+def test_text_output_streams_ascii_one_chunk_per_token():
+    table = {(): "", (72,): "H", (72, 105): "Hi"}
+    wt = _preprocess_thread(_TableTextModel(table))
+    wt.tensor_uuid_to_metadata_per_request = {}
+
+    _feed_tensor(wt, "r1", "u1", [72])
+    assert wt.out_queue.get_nowait().data == b"H"
+
+    _feed_tensor(wt, "r1", "u2", [105])
+    assert wt.out_queue.get_nowait().data == b"i"
+
+
+def test_text_decode_state_cleared_on_cleanup():
+    """A reused request id must start fresh, not see a prior response's ids."""
+    table = {(): "", (1,): "�"}
+    wt = _preprocess_thread(_TableTextModel(table))
+    wt.tensor_uuid_to_metadata_per_request = {}
+    wt.in_flight_requests = set()
+    wt._draining_rids = set()
+    wt._reads_done_sent = set()
+
+    _feed_tensor(wt, "r1", "u1", [1])
+    assert "r1" in wt._text_decode
+
+    wt._hard_cleanup("r1")
+    assert "r1" not in wt._text_decode
+
+
+def test_non_text_modality_bypasses_text_accumulation():
+    table = {}
+    wt = _preprocess_thread(_TableTextModel(table))
+    wt.tensor_uuid_to_metadata_per_request = {}
+
+    _feed_tensor(wt, "r1", "u1", [1, 2, 3], modality="video")
+    chunk = wt.out_queue.get_nowait()
+    assert chunk.modality == "video"
+    assert wt._text_decode == {}

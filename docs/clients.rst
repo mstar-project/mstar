@@ -197,9 +197,14 @@ Per-model notes:
 - **Orpheus** — set the speaker with ``voice`` — one of ``tara`` (default), ``zoe``,
   ``zac``, ``jess``, ``leo``, ``mia``, ``julia``, ``leah`` (the ``available_voices`` list
   in the Orpheus config).
-- **Kimi-K2.7-Code** — text-only chat. The full message list (system prompt, prior
-  assistant turns, tool calls/results) is rendered with the checkpoint's own chat
-  template; ``tools``, ``tool_choice``, and ``chat_template_kwargs`` are passed straight
-  through to it. Parsing the model's reasoning/tool-call output back into
-  ``reasoning_content`` / ``tool_calls`` is not yet implemented, so responses come back as
-  plain assistant text.
+- **Kimi-K2.7-Code** — text-only chat, thinking-only, with native tool calls. The full
+  message list (system prompt, prior assistant turns, tool calls/results) is rendered
+  with the checkpoint's own chat template; ``tools``, ``tool_choice``, and
+  ``chat_template_kwargs`` are passed straight through to it. ``/v1/chat/completions``
+  (streaming and non-streaming) decodes the model's own ``<think>``/tool-call markers
+  and returns ``reasoning_content``, ``content``, and ``tool_calls`` per the OpenAI
+  schema, with ``finish_reason`` set to ``"tool_calls"`` when the response contains tool
+  calls and ``"stop"`` otherwise. Thinking is on by default; disable it by passing
+  ``chat_template_kwargs: {"thinking": false}`` (or ``enable_thinking: false``) in the
+  request. The native ``/generate`` route is unaffected by this parsing and returns the
+  raw decoded text, markers included.

@@ -18,6 +18,7 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
     args = adapter.chat_to_request(req, api.upload_dir)
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
+    parser = adapter.make_output_parser(req)
 
     api.submit_request(
         text=args.text,
@@ -31,12 +32,12 @@ async def create_chat_completion(api, model_name, adapter, req, raw_request=None
     )
 
     if req.stream:
-        return _stream(api, model_name, request_id, sample_rate)
+        return _stream(api, model_name, request_id, sample_rate, parser)
     chunks = await api.collect_results(request_id, raw_request)
-    return _build_response(model_name, request_id, chunks, sample_rate)
+    return _build_response(model_name, request_id, chunks, sample_rate, parser)
 
 
-def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
+def _build_response(model_name, request_id, chunks, sample_rate, parser=None) -> dict:
     text_parts: list[str] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
@@ -49,7 +50,19 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
             images.append(c.data)
 
     text = "".join(text_parts)
-    message: dict = {"role": "assistant", "content": text}
+    finish_reason = "stop"
+    if parser is None:
+        message: dict = {"role": "assistant", "content": text}
+    else:
+        from mstar.model.kimi_k2_7.output_parser import parse_full
+
+        parsed = parse_full(text, thinking=parser.thinking)
+        message = {"role": "assistant", "content": parsed["content"]}
+        if parsed["reasoning_content"] is not None:
+            message["reasoning_content"] = parsed["reasoning_content"]
+        if parsed["tool_calls"] is not None:
+            message["tool_calls"] = parsed["tool_calls"]
+            finish_reason = "tool_calls"
 
     if audio_pcm:
         wav = media_io.pcm16_to_wav_bytes(b"".join(audio_pcm), sample_rate)
@@ -72,12 +85,12 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 
-async def _stream(api, model_name, request_id, sample_rate):
+async def _stream(api, model_name, request_id, sample_rate, parser=None):
     created = now()
 
     def chunk(delta, finish=None) -> str:
@@ -92,11 +105,21 @@ async def _stream(api, model_name, request_id, sample_rate):
     yield chunk({"role": "assistant"})
     async for c in api.iter_result_chunks(request_id):
         if c.modality == "text":
-            yield chunk({"content": c.data.decode("utf-8", "replace")})
+            text = c.data.decode("utf-8", "replace")
+            if parser is None:
+                yield chunk({"content": text})
+            else:
+                for delta in parser.feed(text):
+                    yield chunk(delta)
         elif c.modality == "audio":
             # Streaming audio deltas are base64 16-bit PCM at the model rate.
             yield chunk({"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}})
         elif c.modality == "image":
             yield chunk({"content": media_io.png_to_data_url(c.data)})
-    yield chunk({}, finish="stop")
+    if parser is None:
+        yield chunk({}, finish="stop")
+    else:
+        for delta in parser.finish():
+            yield chunk(delta)
+        yield chunk({}, finish=parser.finish_reason)
     yield SSE_DONE

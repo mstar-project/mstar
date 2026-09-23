@@ -286,6 +286,8 @@ class PreprocessWorkerThread:
         # The request's model_kwargs, kept so output postprocessing can
         # honor per-request parameters (e.g. the video container fps).
         self.request_model_kwargs: dict[str, dict] = {}
+        # Text only: (accumulated token ids, utf-8 bytes emitted so far) per request; see _decode_text_incremental.
+        self._text_decode: dict[str, tuple[torch.Tensor, int]] = {}
 
         # Owned by PreprocessWorker (main thread); used only from this thread.
         self.communicator = communicator
@@ -468,6 +470,19 @@ class PreprocessWorkerThread:
             graph_edges=[result.graph_edge],
         )
 
+    def _decode_text_incremental(self, request_id: str, tensor: torch.Tensor) -> bytes:
+        # Re-decodes all accumulated ids every step (O(n^2)/response); holds back a trailing replacement char.
+        ids, emitted = self._text_decode.get(request_id, (tensor[:0], 0))
+        ids = torch.cat([ids, tensor])
+        full = self.model.postprocess(
+            ids, "text", request_kwargs=self.request_model_kwargs.get(request_id),
+        )
+        # surrogateescape keeps non-UTF-8 payloads (synthetic byte tokenizers) lossless.
+        text = full.decode("utf-8", "surrogateescape")
+        safe_upto = len(text.rstrip("�").encode("utf-8", "surrogateescape"))
+        self._text_decode[request_id] = (ids, safe_upto)
+        return full[emitted:safe_upto]
+
     def _process_read_tensors(self):
         did_work = False
         for request_id, graph_edges in self.tensor_manager.get_ready_tensors().items():
@@ -487,10 +502,13 @@ class PreprocessWorkerThread:
                             request_id=request_id,
                             uuid=tensor_info.uuid
                         )
-                        postprocessed = self.model.postprocess(
-                            tensor, modality,
-                            request_kwargs=self.request_model_kwargs.get(request_id),
-                        )
+                        if modality == "text" and self.model is not None:
+                            emit = self._decode_text_incremental(request_id, tensor)
+                        else:
+                            emit = self.model.postprocess(
+                                tensor, modality,
+                                request_kwargs=self.request_model_kwargs.get(request_id),
+                            )
 
                         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
                             tensor_info.uuid] or {}
@@ -504,12 +522,14 @@ class PreprocessWorkerThread:
                                 "num_channels": self.model.get_output_audio_channels("audio"),
                             }
 
-                        self.out_queue.put(ResultChunk(
-                            request_id=request_id,
-                            modality=modality,
-                            data=postprocessed,
-                            metadata=chunk_metadata,
-                        ))
+                        # Text can legitimately have nothing new yet (held back pending a full codepoint).
+                        if modality != "text" or emit:
+                            self.out_queue.put(ResultChunk(
+                                request_id=request_id,
+                                modality=modality,
+                                data=emit,
+                                metadata=chunk_metadata,
+                            ))
                     except Exception as exc:  # noqa: BLE001 — must reach the client
                         self._fail_request(
                             request_id, exc, f"{modality} output postprocessing",
@@ -599,6 +619,7 @@ class PreprocessWorkerThread:
         self.tensor_manager.force_cleanup_request(request_id)
         self.tensor_uuid_to_metadata_per_request.pop(request_id, None)
         self.request_model_kwargs.pop(request_id, None)
+        self._text_decode.pop(request_id, None)
         self.in_flight_requests.discard(request_id)
 
     def run(self):
@@ -656,6 +677,7 @@ class PreprocessWorkerThread:
                     if req_id in self.tensor_uuid_to_metadata_per_request:
                         del self.tensor_uuid_to_metadata_per_request[req_id]
                     self.request_model_kwargs.pop(req_id, None)
+                    self._text_decode.pop(req_id, None)
                     self.in_flight_requests.discard(req_id)
                 did_work = self._process_read_tensors() or did_work
                 # Reads may have just resolved; ACK any drains now free of them.
@@ -680,6 +702,7 @@ class PreprocessWorkerThread:
                         # input signals directly.
                         self.tensor_manager.force_cleanup_request(pre_input.request_id)
                         self.request_model_kwargs.pop(pre_input.request_id, None)
+                        self._text_decode.pop(pre_input.request_id, None)
                         self.in_flight_requests.discard(pre_input.request_id)
             except Exception:
                 logger.exception("PreprocessWorkerThread error")

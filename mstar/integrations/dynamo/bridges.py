@@ -187,6 +187,7 @@ class RequestBridge:
             body["modalities"] = ["text"]
         req = ChatCompletionRequest.model_validate(body)
         args = self.adapter.chat_to_request(req, self.server.upload_dir)
+        parser = self.adapter.make_output_parser(req)
         rid = self._submit(args, prefix="chatcmpl")
         created = int(time.time())
 
@@ -204,17 +205,24 @@ class RequestBridge:
         try:
             async for chunk in _stream_chunks(self.server, rid, context):
                 if chunk.modality == "text":
-                    yield envelope({
-                        "role": "assistant",
-                        "content": chunk.data.decode("utf-8", "replace"),
-                    })
+                    text = chunk.data.decode("utf-8", "replace")
+                    if parser is None:
+                        yield envelope({"role": "assistant", "content": text})
+                    else:
+                        for delta in parser.feed(text):
+                            yield envelope({"role": "assistant", **delta})
                 elif chunk.modality == "error":
                     raise RuntimeError(chunk.data.decode("utf-8", "replace"))
                 else:
                     dropped.add(chunk.modality)
             cancelled = _client_gone(context)
             if not cancelled:
-                yield envelope({"role": "assistant", "content": ""}, finish="stop")
+                if parser is None:
+                    yield envelope({"role": "assistant", "content": ""}, finish="stop")
+                else:
+                    for delta in parser.finish():
+                        yield envelope({"role": "assistant", **delta})
+                    yield envelope({"role": "assistant", "content": ""}, finish=parser.finish_reason)
         finally:
             self.server.abort_request(rid)
             if dropped:

@@ -290,6 +290,7 @@ def test_stopping_data_worker_drops_tracked_requests():
     wt.in_flight_requests = {"r1", "r2"}
     wt.tensor_uuid_to_metadata_per_request = {"r2": {}}
     wt.request_model_kwargs = {"r1": {}}
+    wt._text_decode = {}
     wt._draining_rids = {"r1"}
     wt._reads_done_sent = set()
 

@@ -435,6 +435,43 @@ def test_chat_forces_text_only_output(tmp_path):
     assert out[-1]["choices"][0]["finish_reason"] == "stop"
 
 
+def test_chat_kimi_streams_reasoning_and_tool_calls(tmp_path):
+    from mstar.model.kimi_k2_7.output_parser import (
+        TOOL_ARG_START,
+        TOOL_CALL_END,
+        TOOL_CALL_START,
+        TOOL_SECTION_END,
+        TOOL_SECTION_START,
+    )
+
+    text = (
+        "<think>plan...</think>Answer"
+        + TOOL_SECTION_START
+        + TOOL_CALL_START + "functions.get_weather:0" + TOOL_ARG_START
+        + '{"city": "Tokyo"}' + TOOL_CALL_END
+        + TOOL_SECTION_END
+    )
+    server = _FakeRealtimeServer([_chunk("text", text.encode("utf-8"))], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["kimi_k2_7"], "kimi_k2_7")
+
+    async def run():
+        return [out async for out in bridge.generate(
+            {"messages": [{"role": "user", "content": "weather?"}]}, _Ctx(),
+        )]
+
+    out = asyncio.run(run())
+    deltas = [o["choices"][0]["delta"] for o in out]
+    reasoning = "".join(d.get("reasoning_content", "") for d in deltas)
+    content = "".join(d.get("content", "") for d in deltas)
+    tool_call_deltas = [d for d in deltas if "tool_calls" in d]
+    assert reasoning == "plan..."
+    assert content == "Answer"
+    assert tool_call_deltas[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+    args = "".join(d["tool_calls"][0]["function"].get("arguments", "") for d in tool_call_deltas)
+    assert args == '{"city": "Tokyo"}'
+    assert out[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
 def test_images_cancel_before_first_chunk(tmp_path):
     # Media requests emit nothing until nearly done; a client that goes
     # away mid-generation must still cancel promptly.

@@ -186,6 +186,40 @@ def test_kimi_chat_rejects_image_parts(tmp_path):
         adapters.KimiAdapter().chat_to_request(req, tmp_path)
 
 
+def test_kimi_make_output_parser_defaults_to_thinking_enabled():
+    from mstar.model.kimi_k2_7.output_parser import KimiOutputParser
+
+    req = ChatCompletionRequest(model="kimi_k2_7", messages=[{"role": "user", "content": "hi"}])
+    parser = adapters.KimiAdapter().make_output_parser(req)
+    assert isinstance(parser, KimiOutputParser)
+    assert parser.thinking is True
+
+
+@pytest.mark.parametrize(
+    "chat_template_kwargs,expected",
+    [
+        ({"thinking": False}, False),
+        ({"enable_thinking": False}, False),
+        ({"thinking": True}, True),
+        ({"enable_thinking": True}, True),
+        ({}, True),
+    ],
+)
+def test_kimi_make_output_parser_honors_thinking_flag(chat_template_kwargs, expected):
+    req = ChatCompletionRequest(
+        model="kimi_k2_7",
+        messages=[{"role": "user", "content": "hi"}],
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    parser = adapters.KimiAdapter().make_output_parser(req)
+    assert parser.thinking is expected
+
+
+def test_base_adapter_make_output_parser_returns_none():
+    req = ChatCompletionRequest(model="bagel", messages=[{"role": "user", "content": "hi"}])
+    assert adapters.OpenAIAdapter().make_output_parser(req) is None
+
+
 def test_kimi_adapter_registered_chat_only():
     adapter = adapters.get_adapter("kimi_k2_7")
     assert adapter is not None

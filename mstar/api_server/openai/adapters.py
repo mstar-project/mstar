@@ -202,6 +202,10 @@ class OpenAIAdapter:
     def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("image editing is not supported by this model")
 
+    def make_output_parser(self, req: ChatCompletionRequest):  # noqa: ARG002
+        """streaming text parser for models with structured output; None means raw text"""
+        return None
+
 
 class BagelAdapter(OpenAIAdapter):
     """BAGEL: text chat (text out) + text-to-image / image editing.
@@ -456,13 +460,9 @@ class Cosmos3Adapter(OpenAIAdapter):
 class KimiAdapter(OpenAIAdapter):
     """Kimi-K2.7-Code: text-only chat via the checkpoint's own chat template.
 
-    Unlike ``flatten_messages`` (which collapses every turn into one string),
-    this keeps the full per-turn structure — system prompt, prior assistant
-    reasoning/tool_calls, tool results — and hands it to ``process_prompt``,
-    which applies the tokenizer's own ``apply_chat_template``. ``tools`` /
-    ``tool_choice`` / ``chat_template_kwargs`` arrive via ``_passthrough`` and
-    are forwarded to the template unchanged; parsing the model's own
-    thinking/tool-call output is a later phase.
+    Preserves per-turn structure (system prompt, prior reasoning/tool_calls, tool
+    results) for ``process_prompt``'s ``apply_chat_template`` call. ``make_output_parser``
+    decodes the model's thinking/tool-call markers; see ``mstar.model.kimi_k2_7.output_parser``.
     """
 
     supports_chat = True
@@ -490,6 +490,18 @@ class KimiAdapter(OpenAIAdapter):
             output_modalities=["text"],
             model_kwargs=mk,
         )
+
+    def make_output_parser(self, req: ChatCompletionRequest):
+        from mstar.model.kimi_k2_7.output_parser import KimiOutputParser
+
+        chat_template_kwargs = _passthrough(req).get("chat_template_kwargs") or {}
+        thinking = chat_template_kwargs.get("thinking")
+        enable_thinking = chat_template_kwargs.get("enable_thinking")
+        thinking_enabled = (
+            True if thinking is None and enable_thinking is None
+            else bool(thinking) or bool(enable_thinking)
+        )
+        return KimiOutputParser(thinking=thinking_enabled)
 
 
 class Wan22Adapter(OpenAIAdapter):
