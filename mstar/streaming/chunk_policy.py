@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 
 
 class ChunkPolicy(ABC):
@@ -150,3 +151,66 @@ class FixedChunkPolicy(ChunkPolicy):
 
     def continue_after_producer_done(self) -> bool:
         return self._continue_after_done
+
+
+class ScheduledLeftContextChunkPolicy(ChunkPolicy):
+    """Left-context chunking whose chunk sizes follow a ramp.
+
+    Streaming vocoders want the first audio out as early as possible and
+    larger chunks once the stream is running. Chunk ``k`` delivers
+    ``schedule[k]`` new items (``chunk`` once the schedule is exhausted) with
+    up to ``left_context`` already-delivered items in front of them, so a
+    causal decoder can warm up on frames it has processed before. Unlike
+    ``LeftContextChunkPolicy`` the first chunk may be smaller than the
+    context: the context is whatever has been delivered so far, capped.
+
+    Example (Qwen3-TTS, 12 Hz frames): ``schedule=(4, 8, 16)``, ``chunk=25``,
+    ``left_context=25`` pops windows of 4, 4+8, 12+16, 25+25, 25+25, ...
+    items and the first audio leaves after four frames instead of 300.
+
+    The consumer learns how many leading items of a window are context from
+    ``StreamChunk.context_items`` (the worker passes it along as
+    ``step_metadata["stream_chunks"][edge]["context_items"]``), so it can trim
+    the duplicated output without re-deriving this schedule.
+    """
+
+    def __init__(self, schedule: Sequence[int], chunk: int, left_context: int):
+        super().__init__()
+        if chunk <= 0 or any(size <= 0 for size in schedule) or left_context < 0:
+            raise ValueError("chunk sizes must be positive and left_context non-negative")
+        self._schedule = tuple(int(size) for size in schedule)
+        self._chunk = int(chunk)
+        self._left_context = int(left_context)
+        self._chunks_popped = 0
+        self._delivered = 0  # new items handed to the consumer so far
+
+    def _new_items(self) -> int:
+        if self._chunks_popped < len(self._schedule):
+            return self._schedule[self._chunks_popped]
+        return self._chunk
+
+    def _context(self) -> int:
+        return min(self._left_context, self._delivered)
+
+    def is_ready(self, buffer_len: int) -> bool:
+        return buffer_len >= self.window_size()
+
+    def window_size(self) -> int:
+        return self._context() + self._new_items()
+
+    def next_chunk_size(self, buffer_len: int) -> int:
+        # The buffer pointer sits ``context`` items before the first new item.
+        # After this pop it must sit ``next context`` items before the next
+        # chunk's first new item.
+        delivered_after = self._delivered + self._new_items()
+        next_context = min(self._left_context, delivered_after)
+        return (delivered_after - next_context) - (self._delivered - self._context())
+
+    def register_chunk(self, chunk_size: int):
+        super().register_chunk(chunk_size)
+        # A regular pop delivers exactly this chunk's new items. The only
+        # other caller is the terminal flush (producer done, window not
+        # full), after which no data-carrying chunk follows, so treating it
+        # the same keeps the bookkeeping trivially correct where it matters.
+        self._delivered += self._new_items()
+        self._chunks_popped += 1

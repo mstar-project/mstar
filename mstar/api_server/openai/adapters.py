@@ -185,6 +185,16 @@ class OpenAIAdapter:
     supports_videos: bool = False   # POST /v1/videos/generations
     supports_realtime: bool = False  # /v1/realtime (bidirectional speech WebSocket)
 
+    # ``/v1/audio/speech`` sentence chunking (``serving_speech``): inputs of at
+    # least ``speech_chunk_min_chars`` characters are split into sentence
+    # groups of about ``speech_chunk_max_chars`` and synthesized as ordered
+    # sub-requests. ``None`` keeps the whole text in one request unless the
+    # client sends ``sentence_chunking: true``.
+    speech_chunk_min_chars: int | None = None
+    speech_chunk_max_chars: int = 400
+    # sub-requests kept in flight ahead of the one being streamed
+    speech_chunk_lookahead: int = 2
+
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
         # emits text, whereas BAGEL chat is text-only.
@@ -325,7 +335,6 @@ class OrpheusAdapter(OpenAIAdapter):
         )
 
 
-
 class OmniVoiceAdapter(OpenAIAdapter):
     """OmniVoice: zero-shot TTS in three modes over one endpoint.
 
@@ -377,6 +386,61 @@ class OmniVoiceAdapter(OpenAIAdapter):
             text=req.input,
             file_paths=file_paths,
             input_modalities=input_modalities,
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
+class Qwen3TTSAdapter(OpenAIAdapter):
+    """Qwen3-TTS (CustomVoice / VoiceDesign / Base): text-to-speech, audio only.
+
+    ``voice`` selects a built-in speaker (CustomVoice). ``instructions`` (the
+    OpenAI field; ``instruct`` also accepted) carries the style or voice
+    description. Non-standard knobs travel through ``extra_body``:
+    ``language``, ``non_streaming_mode``, ``top_k``, ``repetition_penalty``,
+    the residual-group ``subtalker_*`` sampling, ``max_new_tokens``.
+    ``temperature`` / ``top_p`` / ``seed`` map onto the Talker sampler.
+
+    Inputs of 600+ characters are synthesized as ordered sentence chunks
+    (``serving_speech``): each Talker request stays near the lengths the
+    model was trained on and the chunks batch like independent requests.
+    Benchmark sentences (5-40 words) never reach the threshold.
+    """
+
+    supports_speech = True
+    speech_chunk_min_chars = 600
+    speech_chunk_max_chars = 400
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        if getattr(req, "voice", None):
+            mk["voice"] = req.voice
+        # OpenAI's field is ``instructions``; the model reads ``instruct``.
+        instructions = mk.pop("instructions", None)
+        if instructions:
+            mk.setdefault("instruct", instructions)
+        _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL, a
+        # local path or bare base64 (vLLM-Omni's field). It becomes the
+        # request's audio input for one request; ``ref_text`` and
+        # ``x_vector_only_mode`` ride along as model kwargs. Named, persisted
+        # voices come with the shared voice registry (engine/voice-registry).
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            if ref_audio.startswith(("data:", "http://", "https://")) or Path(ref_audio).suffix:
+                _, path = media_io.resolve_media_ref(ref_audio, upload_dir)
+            else:
+                _, path = media_io.save_base64(ref_audio, "wav", "audio", upload_dir)
+            return SubmitArgs(
+                text=req.input,
+                file_paths={"audio": [path]},
+                input_modalities=["audio", "text"],
+                output_modalities=["audio"],
+                model_kwargs=mk,
+            )
+        return SubmitArgs(
+            text=req.input,
+            input_modalities=["text"],
             output_modalities=["audio"],
             model_kwargs=mk,
         )
@@ -513,6 +577,10 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),
+    "qwen3_tts": Qwen3TTSAdapter(),
+    "qwen3_tts_1p7b": Qwen3TTSAdapter(),
+    "qwen3_tts_voicedesign": Qwen3TTSAdapter(),
+    "qwen3_tts_base": Qwen3TTSAdapter(),
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),
     "cosmos3_super": Cosmos3Adapter(),

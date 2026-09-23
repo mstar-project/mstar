@@ -32,6 +32,9 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
     "omnivoice": "omnivoice.yaml",
+    "qwen3_tts_1p7b": "qwen3tts_1p7b.yaml",
+    "qwen3_tts_voicedesign": "qwen3tts_voicedesign.yaml",
+    "qwen3_tts_base": "qwen3tts_base.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
@@ -112,13 +115,19 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model == "omnivoice":
         lines.append("    client.tts(\"Xin chào\", language=\"Vietnamese\").to_wav(\"out.wav\")")
         lines.append("    # clone a voice: ref_audio=\"ref.wav\", ref_text=\"<its transcript>\"")
-    if model in ("orpheus", "qwen3_omni", "qwen3_tts"):
+    if model in ("orpheus", "qwen3_omni", "qwen3_tts", "qwen3_tts_1p7b"):
         voice = {
             "orpheus": "tara",
             "qwen3_omni": "Ethan",
             "qwen3_tts": "Vivian",
+            "qwen3_tts_1p7b": "Vivian",
         }[model]
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
+    if model == "qwen3_tts_voicedesign":
+        lines.append("    client.tts(\"Hello there\", instruct=\"A calm, warm female voice\").to_wav(\"out.wav\")")
+    if model == "qwen3_tts_base":
+        lines.append("    client.tts(\"Hello there\", reference_audio=\"ref.wav\", "
+                     "ref_text=\"...\").to_wav(\"out.wav\")")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")

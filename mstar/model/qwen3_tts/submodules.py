@@ -4,7 +4,10 @@
 #
 # Two submodules cover the complete text-to-speech streaming pipeline:
 #   1. TalkerSubmodule (KV_CACHE engine)
-#      - Builds the official text/voice prefill sequence.
+#      - Builds the official prefill sequence for every 12 Hz variant:
+#        optional instruction turn, ChatML assistant role, codec language /
+#        speaker tags, then the text either whole (non-streaming layout) or
+#        one token per generated frame (streaming layout).
 #      - Maintains the Talker paged KV cache across 12 Hz decode steps.
 #      - Predicts codec group 0 with the Talker and groups 1-15 with the
 #        depth-wise CodePredictor.
@@ -13,20 +16,26 @@
 #        piecewise graph covering that loop on eager paths like prefill.
 #   2. CodecSubmodule (STATELESS engine)
 #      - Receives buffered codec frames from the Talker partition.
-#      - Pads variable final tails to fixed CUDA Graph capture shapes.
-#      - Runs the official speech-tokenizer decoder and trims overlap before
-#        emitting 24 kHz PCM.
+#      - Pads each window of the chunk ramp to its CUDA Graph capture bucket.
+#      - Runs the official speech-tokenizer decoder and trims overlap (and, for
+#        voice clones, the reference frames) before emitting 24 kHz PCM.
+#   3. RefEncoderSubmodule (no resources; Base voice clone only)
+#      - Turns one reference clip into the ECAPA x-vector that replaces the
+#        speaker tag and, for in-context cloning, into its codec frames.
 #
 # Engine-facing lifecycle:
 #   prepare_inputs -> preprocess -> forward/forward_batched
 #                  -> postprocess -> check_stop (Talker only)
 #
 # Streaming topology:
-#   Talker --[codec_tokens, LeftContextChunkPolicy(300, 25)]--> Codec
+#   Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((1, 3, 8, 16), 25, 25)]--> Codec
 # ---------------------------------------------------------------------------
 
 from __future__ import annotations
 
+import hashlib
+import logging
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -37,6 +46,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     CudaGraphConfig,
+    PackedCudaGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
@@ -45,11 +55,17 @@ from mstar.engine.cuda_graph_config import (
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.model.qwen3_tts.components.speaker_encoder import (
+    Qwen3TTSMelFrontEnd,
+    Qwen3TTSSpeakerEncoder,
+)
 from mstar.model.qwen3_tts.components.talker import (
     Qwen3TTSCodePredictor,
     Qwen3TTSTalkerModel,
 )
 from mstar.model.qwen3_tts.config import (
+    CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
+    CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
     CODE_PRED_SAMPLER,
     TALKER_ATTN,
     TALKER_KV,
@@ -62,6 +78,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     ModelInputsFromEngine,
     NodeInputs,
+    NodeSubmodule,
 )
 
 # the CodePredictor depth loop, as a piecewise capture region
@@ -70,6 +87,8 @@ DEPTH_LOOP_REGION = "code_predictor_loop"
 # ===========================================================================
 # 1. TalkerSubmodule - autoregressive 12 Hz codec-frame generation
 # ===========================================================================
+
+logger = logging.getLogger(__name__)
 
 
 class TalkerSubmodule(ARNodeSubmodule):
@@ -89,8 +108,13 @@ class TalkerSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
-    CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (151644, 77091, 198)
-    CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (151645, 198, 151644, 77091, 198)
+    # Prefill prompts are short (a sentence plus the ChatML frame, an optional
+    # instruction and speaker slot): a few token buckets cover them, and the
+    # eager alternative costs ~20 ms of launch overhead per request.
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+    CHATML_ASSISTANT_PREFIX_TOKEN_IDS = CHATML_ASSISTANT_PREFIX_TOKEN_IDS
+    CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = CHATML_ASSISTANT_SUFFIX_TOKEN_IDS
 
     def __init__(
         self,
@@ -200,27 +224,10 @@ class TalkerSubmodule(ARNodeSubmodule):
         bos, eos, pad = self._project_text(token_ids).to(dtype).chunk(3, dim=1)
         return bos, eos, pad
 
-    def _build_prefill(
-        self,
-        request_id: str,
-        text_ids: torch.Tensor,
-        speaker_id: int,
-        language_id: int,
-    ) -> torch.Tensor:
-        """Build the official mixed text/codec prefill embedding sequence.
-
-        The assistant-role prefix and codec conditioning tags enter the
-        one-shot prefill. Remaining prompt text is retained in per-request
-        state and added one token at a time to later recurrent codec embeds.
-        This aligns text progress with the 12 Hz acoustic generation steps.
-        """
-        text_ids = text_ids.to(device=self.get_device(), dtype=torch.long).view(1, -1)
-        expected_prefix = text_ids.new_tensor(
-            self.CHATML_ASSISTANT_PREFIX_TOKEN_IDS
-        )
-        expected_suffix = text_ids.new_tensor(
-            self.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS
-        )
+    def _validate_chatml(self, text_ids: torch.Tensor) -> tuple[int, int]:
+        """Check the fixed assistant-turn wrapper and return its (prefix, suffix) lengths."""
+        expected_prefix = text_ids.new_tensor(self.CHATML_ASSISTANT_PREFIX_TOKEN_IDS)
+        expected_suffix = text_ids.new_tensor(self.CHATML_ASSISTANT_SUFFIX_TOKEN_IDS)
         prefix_len = expected_prefix.numel()
         suffix_len = expected_suffix.numel()
         if text_ids.shape[1] < prefix_len + 1 + suffix_len:
@@ -240,6 +247,72 @@ class TalkerSubmodule(ARNodeSubmodule):
                 f"{expected_suffix.tolist()}, got "
                 f"{text_ids[0, -suffix_len:].tolist()}"
             )
+        return prefix_len, suffix_len
+
+    def _frame_embeds(self, codes: torch.Tensor) -> torch.Tensor:
+        """Sum of the 16 codec embeddings per frame, in the Talker width: ``[frames, D]``."""
+        embeds = self.model.model.codec_embedding(codes[:, 0])
+        tables = self.code_predictor.model.codec_embedding
+        for group in range(1, codes.shape[1]):
+            embeds = embeds + tables[group - 1](codes[:, group])
+        return embeds
+
+    def _build_prefill(
+        self,
+        request_id: str,
+        text_ids: torch.Tensor,
+        prompt_layout: torch.Tensor,
+        speaker_id: int,
+        language_id: int,
+        speaker_embed: torch.Tensor | None = None,
+        ref_codes: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Build the official mixed text/codec prefill embedding sequence.
+
+        ``text_ids`` concatenates an optional instruction turn, the assistant
+        turn and (voice clone) the reference transcript turn; ``prompt_layout``
+        is ``[instruct_len, text_len, stream_text, ref_text_len, ref_frames]``
+        and says where the splits are and how the text is fed. The layout
+        mirrors ``Qwen3TTSForConditionalGeneration.generate``:
+
+        * instruction (``<|im_start|>user ... <|im_end|>``) as plain projected
+          text embeddings (VoiceDesign, 1.7B CustomVoice style control);
+        * the assistant role, then the codec think/language tags, the speaker
+          (a built-in tag when ``speaker_id >= 0``, the reference x-vector
+          when ``speaker_embed`` is given, nothing for VoiceDesign) and the
+          codec PAD, all summed with TTS PAD / BOS text embeddings;
+        * ``ref_frames > 0`` (in-context clone): reference transcript + text
+          + TTS EOS over codec BOS + the reference frames' codec embeddings,
+          laid out per ``generate_icl_prompt``;
+        * otherwise ``stream_text == 0`` (the reference default for
+          CustomVoice and VoiceDesign): every text token plus TTS EOS enters
+          the prefill over codec PADs, closed by TTS PAD + codec BOS; decode
+          then adds TTS PAD to each frame;
+        * ``stream_text == 1`` (the reference default for Base): only the first
+          text token enters the prefill over codec BOS; the remaining tokens
+          plus TTS EOS are kept in per-request state and added one per frame.
+        """
+        text_ids = text_ids.to(device=self.get_device(), dtype=torch.long).view(1, -1)
+        layout = [int(v) for v in prompt_layout.tolist()]
+        instruct_len, text_len, stream_text = layout[:3]
+        ref_text_len, ref_frames = (layout[3], layout[4]) if len(layout) >= 5 else (0, 0)
+        instruct_ids = text_ids[:, :instruct_len]
+        assistant_end = text_ids.shape[1] - ref_text_len
+        assistant_ids = text_ids[:, instruct_len:assistant_end]
+        ref_text_ids = text_ids[:, assistant_end:]
+        prefix_len, suffix_len = self._validate_chatml(assistant_ids)
+        if assistant_ids.shape[1] != prefix_len + text_len + suffix_len:
+            raise ValueError(
+                "Qwen3-TTS prompt layout disagrees with the token stream: "
+                f"expected {prefix_len + text_len + suffix_len} assistant tokens, "
+                f"got {assistant_ids.shape[1]}"
+            )
+        if ref_frames > 0 and (ref_codes is None or ref_codes.shape[0] < ref_frames):
+            raise ValueError(
+                f"Qwen3-TTS in-context clone needs {ref_frames} reference frames, got "
+                f"{0 if ref_codes is None else ref_codes.shape[0]}"
+            )
+        text_tokens = assistant_ids[:, prefix_len:prefix_len + text_len]
 
         codec = self.talker_config
         codec_prefix = (
@@ -253,48 +326,91 @@ class TalkerSubmodule(ARNodeSubmodule):
             ]
         )
         codec_ids = torch.tensor(
-            [[*codec_prefix, speaker_id, codec.codec_pad_id, codec.codec_bos_id]],
+            [[*codec_prefix, codec.codec_pad_id, codec.codec_bos_id]],
             dtype=torch.long,
             device=self.get_device(),
         )
         codec_embeds = self.model.model.codec_embedding(codec_ids)
-        bos_embed, eos_embed, pad_embed = self._special_text_embeds(
-            codec_embeds.dtype
-        )
+        dtype = codec_embeds.dtype
+        # The speaker slot sits between the language tags and the codec PAD:
+        # a built-in speaker's codec embedding, or the reference x-vector.
+        speaker_vector = None
+        if speaker_id >= 0:
+            speaker_vector = self.model.model.codec_embedding(codec_ids.new_tensor([[speaker_id]]))
+        elif speaker_embed is not None:
+            speaker_vector = speaker_embed.to(device=self.get_device(), dtype=dtype).reshape(1, 1, -1)
+        if speaker_vector is not None:
+            split = len(codec_prefix)
+            codec_embeds = torch.cat(
+                [codec_embeds[:, :split], speaker_vector, codec_embeds[:, split:]], dim=1
+            )
+        bos_embed, eos_embed, pad_embed = self._special_text_embeds(dtype)
 
-        # Prefix layout mirrors the official CustomVoice generation helper:
-        # assistant role, language/voice codec tags, then first text token.
-        role_embed = self._project_text(
-            text_ids[:, :prefix_len]
-        ).to(codec_embeds.dtype)
+        def project(ids: torch.Tensor) -> torch.Tensor:
+            return self._project_text(ids).to(dtype)
+
+        # Tags: TTS PAD over every codec tag but the last, TTS BOS over the
+        # codec PAD; the codec BOS pairs with text (or the reference) below.
+        role_embed = project(assistant_ids[:, :prefix_len])
         tag_text = torch.cat([
             pad_embed.expand(-1, codec_embeds.shape[1] - 2, -1),
             bos_embed,
         ], dim=1)
-        tag_embed = tag_text + codec_embeds[:, :-1]
-        first_text = (
-            self._project_text(
-                text_ids[:, prefix_len:prefix_len + 1]
-            ).to(codec_embeds.dtype)
-            + codec_embeds[:, -1:]
-        )
-        prefill = torch.cat([role_embed, tag_embed, first_text], dim=1)
+        pieces = [role_embed, tag_text + codec_embeds[:, :-1]]
+        if instruct_len:
+            pieces.insert(0, project(instruct_ids))
+        empty_trailing = eos_embed[:, :0]
 
-        # The fixed five-token ChatML suffix is replaced by projected TTS EOS.
-        # Decode consumes this tensor by ``generation_step`` and uses PAD once
-        # the text condition has been exhausted.
-        trailing = torch.cat([
-            self._project_text(
-                text_ids[:, prefix_len + 1:-suffix_len]
-            ).to(codec_embeds.dtype),
-            eos_embed,
-        ], dim=1)
-        self.request_state(request_id).add_all(
+        if ref_frames > 0:
+            # ``<|im_start|>assistant\n{ref}<|im_end|>\n`` -> transcript tokens only.
+            ref_tokens = ref_text_ids[:, prefix_len:ref_text_ids.shape[1] - 2]
+            text_embed = torch.cat([project(torch.cat([ref_tokens, text_tokens], dim=1)), eos_embed], dim=1)
+            reference = ref_codes.to(device=self.get_device(), dtype=torch.long)[:ref_frames]
+            codec_embed = torch.cat(
+                [codec_embeds[:, -1:], self._frame_embeds(reference).to(dtype).unsqueeze(0)], dim=1
+            )
+            if not stream_text:
+                codec_pads = self.model.model.codec_embedding(
+                    codec_ids.new_full((1, text_embed.shape[1]), codec.codec_pad_id)
+                )
+                pieces += [text_embed + codec_pads, codec_embed + pad_embed]
+                trailing = empty_trailing
+            elif text_embed.shape[1] > codec_embed.shape[1]:
+                pieces.append(text_embed[:, :codec_embed.shape[1]] + codec_embed)
+                trailing = text_embed[:, codec_embed.shape[1]:]
+            else:
+                padded = torch.cat([
+                    text_embed,
+                    pad_embed.expand(-1, codec_embed.shape[1] - text_embed.shape[1], -1),
+                ], dim=1)
+                pieces.append(padded + codec_embed)
+                trailing = empty_trailing
+        elif stream_text:
+            pieces.append(project(text_tokens[:, :1]) + codec_embeds[:, -1:])
+            trailing = torch.cat([project(text_tokens[:, 1:]), eos_embed], dim=1)
+        else:
+            text_embed = torch.cat([project(text_tokens), eos_embed], dim=1)
+            codec_pads = self.model.model.codec_embedding(
+                codec_ids.new_full((1, text_embed.shape[1]), codec.codec_pad_id)
+            )
+            pieces.append(text_embed + codec_pads)
+            pieces.append(pad_embed + codec_embeds[:, -1:])
+            # Nothing left to feed: every frame adds TTS PAD (empty stream).
+            trailing = empty_trailing
+        prefill = torch.cat(pieces, dim=1)
+
+        state = self.request_state(request_id)
+        state.add_all(
             trailing_text_hidden=trailing.squeeze(0),
             tts_pad_embed=pad_embed[0, 0],
             generation_step=0,
             generated_frames=0,
         )
+        if ref_frames > 0:
+            # The codec warms up on the tail of the reference clip ahead of
+            # the generated frames (their audio is trimmed); see
+            # ``_codec_stream_items``.
+            state.add("reference_frames", reference)
         return prefill.squeeze(0)
 
     def prepare_inputs(
@@ -312,12 +428,15 @@ class TalkerSubmodule(ARNodeSubmodule):
         therefore prepare requests before admitting them to a micro-batch.
         """
         del kwargs
-        if graph_walk == "talker_prefill":
+        if graph_walk in ("talker_prefill", "talker_prefill_clone"):
             input_embeds = self._build_prefill(
                 fwd_info.request_id,
                 inputs["text_inputs"][0],
+                inputs["prompt_layout"][0],
                 int(inputs["speaker_id"][0].item()),
                 int(inputs["language_id"][0].item()),
+                speaker_embed=inputs["speaker_embed"][0] if "speaker_embed" in inputs else None,
+                ref_codes=inputs["ref_codes"][0] if "ref_codes" in inputs else None,
             )
             state = self.request_state(fwd_info.request_id)
         elif graph_walk == "talker_decode":
@@ -568,6 +687,23 @@ class TalkerSubmodule(ARNodeSubmodule):
         )
         return output["all_codes"], output["codec_embed_sum"]
 
+    def _codec_stream_items(self, graph_walk: str, request_id: str, frame: torch.Tensor) -> list[torch.Tensor]:
+        """Frames this step pushes into the codec stream, one item per frame.
+
+        The clone prefill leads with the tail of the reference clip's frames
+        so the codec warms up on the voice being cloned: only the last
+        ``left_context_frames`` matter, since that is all the context a
+        window ever carries, and every reference frame the stream carries
+        costs a codec pass whose audio ``CodecSubmodule`` then trims. Decode
+        steps (the captured path) always push exactly one frame.
+        """
+        if graph_walk != "talker_prefill_clone":
+            return [frame]
+        reference = self.request_state(request_id).get("reference_frames")
+        if reference is None:
+            return [frame]
+        return [*reference[-self.config.codec.left_context_frames:].unbind(0), frame]
+
     def forward(
         self,
         graph_walk: str,
@@ -577,11 +713,16 @@ class TalkerSubmodule(ARNodeSubmodule):
         suppress_eos: torch.Tensor,
         **kwargs: Any,
     ) -> NameToTensorList:
-        del graph_walk, kwargs
+        del kwargs
         output = self._run_frame(
             engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
-        return {name: [tensor] for name, tensor in output.items()}
+        request_id = engine_inputs.request_ids[0]
+        return {
+            "talker_input_embeds": [output["talker_input_embeds"]],
+            "codec_tokens": self._codec_stream_items(graph_walk, request_id, output["codec_tokens"][0]),
+            "new_token": [output["new_token"]],
+        }
 
     def forward_batched(
         self,
@@ -592,14 +733,14 @@ class TalkerSubmodule(ARNodeSubmodule):
         suppress_eos: torch.Tensor,
         **kwargs: Any,
     ) -> dict[str, NameToTensorList]:
-        del graph_walk, kwargs
+        del kwargs
         output = self._run_frame(
             engine_inputs, input_embeds, last_token_indices, suppress_eos
         )
         return {
             request_id: {
                 "talker_input_embeds": [output["talker_input_embeds"][i:i + 1]],
-                "codec_tokens": [output["codec_tokens"][i]],
+                "codec_tokens": self._codec_stream_items(graph_walk, request_id, output["codec_tokens"][i]),
                 "new_token": [output["new_token"][i]],
             }
             for i, request_id in enumerate(engine_inputs.request_ids)
@@ -623,7 +764,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         if "new_token" in outputs:
             outputs["layer0_codes"] = outputs.pop("new_token")
         elif "layer0_codes" not in outputs and "codec_tokens" in outputs:
-            codec_tokens = outputs["codec_tokens"][0]
+            codec_tokens = outputs["codec_tokens"][-1]
             outputs["layer0_codes"] = [codec_tokens.reshape(-1)[0]]
         if "layer0_codes" in outputs:
             state = self.request_state(request_id)
@@ -657,6 +798,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             not ignore_eos and token == self.talker_config.codec_eos_token_id
         )
         if reached_eos or generated >= max_tokens:
+            logger.debug("talker %s: stop after %d frames (eos=%s)", request_id, generated, reached_eos)
             return {"talker_decode_loop"}
         return set()
 
@@ -668,7 +810,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         together freely.
         """
         return (
-            batch.graph_walk in {"talker_prefill", "talker_decode"}
+            batch.graph_walk in {"talker_prefill", "talker_prefill_clone", "talker_decode"}
             and bool(model_inputs)
             and len(model_inputs) <= self.MAX_BATCH_SIZE
         )
@@ -680,16 +822,34 @@ class TalkerSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[CudaGraphConfig]:
-        """Capture fixed one-token Talker decode batches, including sampling.
+        """Capture fixed one-token Talker decode batches and packed prefills,
+        sampling included.
 
         Dynamic EOS suppression is carried by ``ARNodeInputs`` and packed into
         a graph input, so replay never consults capture-slot dummy request state.
-        Prefill remains eager because it is variable-length and runs once per
-        request.
+        Prefill replays a packed capture of the smallest token bucket that
+        holds the batch; the clone prefill stays eager because it also pushes
+        the reference clip's frames into the codec stream.
         """
         del tp_world_size
         dtype = self.model.model.codec_embedding.weight.dtype
-        return [BatchedCudaGraphConfig(
+        hidden = self.talker_config.hidden_size
+
+        def prefill_input(num_tokens: int) -> ARNodeInputs:
+            return ARNodeInputs(
+                input_embeds=torch.zeros(num_tokens, hidden, dtype=dtype, device=device),
+                input_seq_len=num_tokens,
+                tensor_inputs={"suppress_eos": torch.ones(1, dtype=torch.bool, device=device)},
+            )
+
+        prefill = PackedCudaGraphConfig(
+            capture_graph_walk="talker_prefill",
+            capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+            make_node_input=prefill_input,
+            capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+            compile=False,
+        )
+        return [prefill, BatchedCudaGraphConfig(
             capture_graph_walk="talker_decode",
             single_request_inputs=ARNodeInputs(
                 input_embeds=torch.zeros(
@@ -772,9 +932,9 @@ class TalkerSubmodule(ARNodeSubmodule):
     def can_use_cuda_graphs(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
-        """Replay the whole decode graph; sampling params are read from buffers,
-        so no request's settings can disqualify it."""
-        if batch.graph_walk != "talker_decode" or not self.can_batch(
+        """Replay the whole decode graph or a packed prefill; sampling params
+        are read from buffers, so no request's settings can disqualify it."""
+        if batch.graph_walk not in ("talker_decode", "talker_prefill") or not self.can_batch(
             batch, model_inputs
         ):
             return False
@@ -791,8 +951,15 @@ class CodecSubmodule(ARNodeSubmodule):
 
     The node runs on a stateless engine, but ``ARNodeInputs`` is reused as the
     typed container for fixed-length codec tensors. Per-request state stores
-    only how many non-padding frames arrived and whether a prior chunk was
-    emitted; the neural decoder itself has no cross-call state.
+    only the geometry of the latest window (how many frames are real, how
+    many of them are repeated context) and, for voice clones, how much
+    reference audio is still to be dropped; the neural decoder itself has no
+    cross-call state.
+
+    Windows follow the model's ``ScheduledLeftContextChunkPolicy``: a ramp of
+    small chunks, then ``chunk_frames`` new frames behind ``left_context_frames``
+    of context. Each distinct window size is a CUDA-graph bucket; a shorter
+    terminal flush is zero-padded up to the next bucket and trimmed after.
     """
 
     # fp32, uncompiled: what ``get_stateless_flavor`` used to buy on the old
@@ -800,27 +967,46 @@ class CodecSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     disable_autocast = True
 
-    # The official 114M-parameter decoder materializes large fixed-shape
-    # activations while CUDA graphs are captured.  Capturing bs=16 exhausts an
-    # H100 once Talker weights and the CodePredictor graphs are resident, so
-    # keep the safe ceiling at 8 until the decoder is ported to M*'s
-    # lighter-weight codec components.
-    MAX_BATCH_SIZE = 8
-    CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
+    # Windows are at most chunk + left_context frames (50 by default, 4 s of
+    # audio), so the decoder's activations stay small enough to capture
+    # batches of 32 next to the Talker; ``can_batch`` keeps the ceiling.
+    MAX_BATCH_SIZE = 32
+    CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
     def __init__(self, decoder: torch.nn.Module, config: Qwen3TTSModelConfig):
         super().__init__()
         self.decoder = decoder
         self.config = config
-        self.full_seq_len = (
-            config.codec.chunk_frames + config.codec.left_context_frames
-        )
+        self.windows = config.codec.codec_windows()
+        self.max_window = self.windows[-1]
         self.total_upsample = 1
         for factor in (
             *config.codec.upsample_rates,
             *config.codec.upsampling_ratios,
         ):
             self.total_upsample *= factor
+
+    def _codec_walks(self) -> list[str]:
+        """Walks this node runs: the clone walk exists only on Base checkpoints."""
+        walks = ["codec_chunk"]
+        if self.config.supports_reference_audio:
+            walks.append("codec_chunk_clone")
+        return walks
+
+    def _bucket(self, frames: int) -> int:
+        """Smallest captured window that holds ``frames`` (the terminal flush is shorter)."""
+        for window in self.windows:
+            if frames <= window:
+                return window
+        raise ValueError(
+            f"Codec chunk has {frames} frames, maximum is {self.max_window}"
+        )
+
+    @staticmethod
+    def _stream_chunk_meta(fwd_info: CurrentForwardPassInfo) -> dict[str, Any]:
+        """Geometry of this window from the stream buffer (offset, context, final)."""
+        step_metadata = getattr(fwd_info, "step_metadata", None) or {}
+        return step_metadata.get("stream_chunks", {}).get("codec_tokens", {})
 
     def prepare_inputs(
         self,
@@ -829,13 +1015,24 @@ class CodecSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> ARNodeInputs:
-        """Remove EOS frames and pad one stream chunk to its capture shape.
+        """Remove EOS frames and pad one stream window to its capture bucket.
 
         Input arrives as ``[frames, code_groups]``. The official decoder wants
-        ``[quantizers, frames]``; every request is padded to ``chunk + context``
-        so differently sized final tails can reuse the same CUDA Graph.
+        ``[quantizers, frames]``; every request is padded to the smallest
+        captured window that fits so the ramp's windows and the terminal tail
+        all replay CUDA graphs.
         """
         del graph_walk, kwargs
+        state = self.request_state(fwd_info.request_id)
+        if "ref_frames" in inputs and "skip_samples" not in state:
+            # Voice clone: the stream leads with the last ``left_context_frames``
+            # of the reference clip (all of it when shorter), whose audio the
+            # client must not hear.
+            ref_frames = int(inputs["ref_frames"][0].reshape(-1)[0].item())
+            state.add(
+                "skip_samples",
+                min(ref_frames, self.config.codec.left_context_frames) * self.total_upsample,
+            )
         codes = inputs["codec_tokens"][0].to(
             device=self.get_device(), dtype=torch.long
         )
@@ -845,28 +1042,33 @@ class CodecSubmodule(ARNodeSubmodule):
             raise ValueError(
                 f"Expected codec tokens with shape (frames, groups), got {codes.shape}"
             )
+        num_items = codes.shape[0]
         # EOS belongs to Talker loop control and is not a valid codec codebook
-        # index for waveform reconstruction.
+        # index for waveform reconstruction. It is only ever the last frame of
+        # a stream, so the leading context count is unaffected.
         codes = codes[
             codes[:, 0] != self.config.talker.codec_eos_token_id,
             :self.config.codec.num_quantizers,
         ]
-        original_frames = codes.shape[0]
-        if original_frames > self.full_seq_len:
-            raise ValueError(
-                f"Codec chunk has {original_frames} frames, maximum is "
-                f"{self.full_seq_len}"
-            )
-        if original_frames < self.full_seq_len:
-            codes = torch.nn.functional.pad(
-                codes,
-                (0, 0, 0, self.full_seq_len - original_frames),
-            )
-        self.request_state(fwd_info.request_id).add(
-            "latest_codec_frames", original_frames
+        frames = codes.shape[0]
+        meta = self._stream_chunk_meta(fwd_info)
+        context = int(meta.get("context_items", 0))
+        # The bucket is chosen from the window's item count (EOS included) so
+        # that ``cg_key_info``, which only sees the stream metadata, agrees.
+        bucket = self._bucket(max(int(meta.get("num_items", num_items)), 1))
+        if frames < bucket:
+            codes = torch.nn.functional.pad(codes, (0, 0, 0, bucket - frames))
+        logger.debug(
+            "codec %s: window items=%d context=%d frames=%d bucket=%d final=%s",
+            fwd_info.request_id, num_items, context, frames, bucket, meta.get("is_final"),
         )
+        state.add("codec_bucket", bucket)   # graph-key fallback when a caller has no stream metadata
+        # The window's geometry rides with this pass: under speculative
+        # scheduling the next window of the same request is prepared before
+        # this one is postprocessed, so request state would be overwritten.
         return ARNodeInputs(
             tensor_inputs={"codec_tokens": codes.t().contiguous()},
+            kwargs={"frames": frames, "context": min(context, frames)},
         )
 
     def preprocess(
@@ -875,11 +1077,20 @@ class CodecSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor]:
-        """Stack equal fixed-shape codec chunks into one continuous batch."""
+        """Stack the batch's windows, padded to its widest bucket.
+
+        Requests reach the codec at different points of the chunk ramp, so one
+        batch mixes windows. The decoder is causal, so trailing padding never
+        changes the frames in front of it; each request's ``postprocess`` keeps
+        only its own frames.
+        """
         del graph_walk, engine_inputs
+        windows = [item.tensor_inputs["codec_tokens"] for item in inputs]
+        width = max(window.shape[-1] for window in windows)
         return {
             "codec_tokens": torch.stack([
-                item.tensor_inputs["codec_tokens"] for item in inputs
+                torch.nn.functional.pad(window, (0, width - window.shape[-1]))
+                for window in windows
             ])
         }
 
@@ -895,8 +1106,9 @@ class CodecSubmodule(ARNodeSubmodule):
         codec_tokens: torch.Tensor,
         **kwargs: Any,
     ) -> NameToTensorList:
+        """One request's window (``[1, quantizers, frames]``) -> its ``[samples]`` audio."""
         del graph_walk, engine_inputs, kwargs
-        return {"audio_chunk": [self._decode(codec_tokens)]}
+        return {"audio_chunk": [self._decode(codec_tokens)[0]]}
 
     def forward_batched(
         self,
@@ -917,71 +1129,219 @@ class CodecSubmodule(ARNodeSubmodule):
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
+        inputs: ARNodeInputs | None = None,
         **kwargs: Any,
     ) -> None:
-        """Remove padded tail and duplicated left-context PCM before emission."""
+        """Drop padding, repeated-context audio and (clone) reference audio before emission.
+
+        ``inputs`` is this pass's ``prepare_inputs`` result (the engine hands it
+        back), which carries the window's frame and context counts.
+        """
         del request_info, kwargs
         if "audio_chunk" not in outputs:
             return
+        if inputs is None:
+            raise ValueError("codec postprocess needs the pass's inputs for its window geometry")
         state = self.request_state(request_id)
-        frames = int(state.get("latest_codec_frames", 0))
-        emitted = bool(state.get("codec_chunk_emitted", False))
-        # The first chunk has no overlap. Later stream chunks include old codec
-        # frames at the front, whose decoded samples must not be emitted twice.
-        left_context = self.config.codec.left_context_frames if emitted else 0
-        start = left_context * self.total_upsample
+        frames = int(inputs.kwargs["frames"])
+        context = int(inputs.kwargs["context"])
+        start = context * self.total_upsample
         end = frames * self.total_upsample
-        outputs["audio_chunk"][0] = outputs["audio_chunk"][0][start:end]
-        state.add("codec_chunk_emitted", True)
+        skip = int(state.get("skip_samples", 0))
+        if skip:
+            dropped = min(skip, max(end - start, 0))
+            start += dropped
+            state.add("skip_samples", skip - dropped)
+        audio = outputs["audio_chunk"][0].reshape(-1)   # one request's samples, whatever the batch shape
+        if audio.numel() < end:
+            raise ValueError(
+                f"codec produced {audio.numel()} samples for a window of {frames} frames "
+                f"({end} expected)"
+            )
+        outputs["audio_chunk"][0] = audio[start:end]
+        logger.debug(
+            "codec %s: emit frames %d..%d (%d samples)", request_id, context, frames, max(end - start, 0)
+        )
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        """Batch codec requests only when their decoder input shapes match."""
+        """Any mix of windows batches (``preprocess`` pads to the widest)."""
         del batch
-        return 0 < len(model_inputs) <= self.MAX_BATCH_SIZE and len({
-            item.tensor_inputs["codec_tokens"].shape for item in model_inputs
-        }) == 1
+        return 0 < len(model_inputs) <= self.MAX_BATCH_SIZE
 
     def max_batch_size(self, graph_walk: str) -> int:
         del graph_walk
         return self.MAX_BATCH_SIZE
 
+    def cg_key_info(
+        self,
+        graph_walk: str,
+        per_request_info: Mapping[str, CurrentForwardPassInfo],
+    ) -> Any:
+        """The widest window bucket in this batch, which ``preprocess`` pads to.
+
+        Derived from the stream metadata the worker attaches to each request
+        (available before ``prepare_inputs`` runs, so a pre-planned lease can
+        find its capture); the state written by ``prepare_inputs`` is the
+        fallback for callers without that metadata.
+        """
+        del graph_walk
+        buckets = set()
+        for request_id, fwd_info in per_request_info.items():
+            num_items = self._stream_chunk_meta(fwd_info).get("num_items")
+            if num_items is not None:
+                buckets.add(self._bucket(max(int(num_items), 1)))
+            else:
+                buckets.add(self.request_state(request_id).get("codec_bucket"))
+        buckets.discard(None)
+        return max(buckets) if buckets else None
+
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[CudaGraphConfig]:
-        """Capture fixed-length Codec batches for all scheduler buckets."""
+        """Capture every window of the chunk schedule for all batch buckets."""
         del tp_world_size
-        return [BatchedCudaGraphConfig(
-            capture_graph_walk="codec_chunk",
-            single_request_inputs=ARNodeInputs(
-                # 1, not full_seq_len: batched buckets match on bs, and this
-                # keeps the intern seq_len from aliasing the fixed trailing dims.
-                input_seq_len=1,
-                tensor_inputs={
-                    "codec_tokens": torch.zeros(
-                        self.config.codec.num_quantizers,
-                        self.full_seq_len,
-                        dtype=torch.long,
-                        device=device,
-                    )
-                },
-            ),
-            capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
-            compile=False,
-        )]
+        return [
+            BatchedCudaGraphConfig(
+                capture_graph_walk="codec_chunk",
+                replay_graph_walks=self._codec_walks(),
+                single_request_inputs=ARNodeInputs(
+                    # 1, not the window: batched buckets match on bs, and this
+                    # keeps the intern seq_len from aliasing the trailing dims.
+                    input_seq_len=1,
+                    tensor_inputs={
+                        "codec_tokens": torch.zeros(
+                            self.config.codec.num_quantizers,
+                            window,
+                            dtype=torch.long,
+                            device=device,
+                        )
+                    },
+                ),
+                additional_key_info=window,
+                capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
+                compile=False,
+            )
+            for window in self.windows
+        ]
 
     def can_use_cuda_graphs(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
         return (
-            batch.graph_walk == "codec_chunk"
+            batch.graph_walk in self._codec_walks()
             and self.can_batch(batch, model_inputs)
             and all(
                 item.tensor_inputs["codec_tokens"].shape
-                == (
-                    self.config.codec.num_quantizers,
-                    self.full_seq_len,
-                )
+                in {(self.config.codec.num_quantizers, window) for window in self.windows}
                 for item in model_inputs
             )
             and super().can_use_cuda_graphs(batch, model_inputs)
         )
+
+
+# ===========================================================================
+# 3. RefEncoderSubmodule - reference audio -> speaker conditioning (Base)
+# ===========================================================================
+
+
+class RefEncoderSubmodule(NodeSubmodule):
+    """Encode one reference clip into the Talker's voice conditioning.
+
+    Runs once per request, before the clone prefill, and owns no resources.
+    The x-vector comes from the ECAPA-TDNN encoder over a log-mel spectrogram
+    of the 24 kHz clip; for in-context cloning the codec encoder also turns
+    the clip into ``ref_frames`` 16-group frames. The node keeps the dtypes it
+    was built with (``disable_autocast``): the mel front end and the codec
+    encoder stay in float32, the speaker encoder runs in the Talker's dtype
+    as the reference does.
+
+    The same clip recurs: a voice is reused across a session, and every
+    sentence chunk of a long clone request carries it. The conditioning is
+    memoised by clip content, so the encoders run once per distinct clip and a
+    repeat costs the prefill alone.
+    """
+
+    disable_torch_compile = True
+    disable_autocast = True
+    CONDITIONING_CACHE_SIZE = 64
+
+    def __init__(
+        self,
+        speaker_encoder: Qwen3TTSSpeakerEncoder,
+        mel_front_end: Qwen3TTSMelFrontEnd,
+        codec_encoder: torch.nn.Module,
+        config: Qwen3TTSModelConfig,
+    ) -> None:
+        super().__init__()
+        self.speaker_encoder = speaker_encoder
+        self.mel_front_end = mel_front_end
+        self.codec_encoder = codec_encoder
+        self.config = config
+        # (clip digest, ref_frames) -> (speaker_embed, ref_codes), oldest first.
+        self._conditioning: OrderedDict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+
+    @staticmethod
+    def clip_digest(clip: torch.Tensor) -> str:
+        """Content key of a reference clip (its float32 samples)."""
+        samples = clip.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        return hashlib.blake2b(samples.numpy().tobytes(), digest_size=16).hexdigest()
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs: Any,
+    ) -> NodeInputs:
+        del graph_walk, fwd_info, kwargs
+        clip = inputs["audio_inputs"][0]
+        waveform = clip.to(device=self.get_device(), dtype=torch.float32)
+        if waveform.ndim > 1:
+            waveform = waveform.mean(dim=0) if waveform.shape[0] < waveform.shape[-1] else waveform.mean(dim=-1)
+        layout = inputs["prompt_layout"][0].tolist()
+        ref_frames = int(layout[4]) if len(layout) >= 5 else 0
+        return NodeInputs(
+            tensor_inputs={"waveform": waveform.reshape(-1)},
+            kwargs={"ref_frames": ref_frames, "clip_key": (self.clip_digest(clip), ref_frames)},
+        )
+
+    def forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        waveform: torch.Tensor,
+        ref_frames: int = 0,
+        clip_key: tuple[str, int] | None = None,
+        **kwargs: Any,
+    ) -> NameToTensorList:
+        del graph_walk, engine_inputs, kwargs
+        if clip_key is not None and clip_key in self._conditioning:
+            self._conditioning.move_to_end(clip_key)
+            speaker_embed, codes = self._conditioning[clip_key]
+            return {"speaker_embed": [speaker_embed], "ref_codes": [codes]}
+        device_type = waveform.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            mels = self.mel_front_end(waveform.unsqueeze(0))
+        encoder_dtype = next(self.speaker_encoder.parameters()).dtype
+        speaker_embed = self.speaker_encoder(mels.to(encoder_dtype))[0]
+
+        num_quantizers = self.config.codec.num_quantizers
+        if ref_frames > 0:
+            with torch.autocast(device_type=device_type, enabled=False):
+                encoded = self.codec_encoder.encode(
+                    input_values=waveform.view(1, 1, -1).float(), return_dict=True
+                )
+            codes = encoded.audio_codes[0, :num_quantizers, :ref_frames].t().contiguous().long()
+            if codes.shape[0] < ref_frames:
+                raise ValueError(
+                    f"codec encoder produced {codes.shape[0]} frames for a clip declared as {ref_frames}"
+                )
+        else:
+            # x-vector-only clone: no in-context frames. The edge still needs
+            # a tensor; the Talker ignores it because the layout says 0 frames.
+            codes = torch.zeros(1, num_quantizers, dtype=torch.long, device=waveform.device)
+        if clip_key is not None:
+            self._conditioning[clip_key] = (speaker_embed, codes)
+            while len(self._conditioning) > self.CONDITIONING_CACHE_SIZE:
+                self._conditioning.popitem(last=False)
+        return {"speaker_embed": [speaker_embed], "ref_codes": [codes]}

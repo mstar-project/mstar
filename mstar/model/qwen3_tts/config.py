@@ -1,9 +1,16 @@
-"""Checkpoint-backed configuration for Qwen3-TTS 12 Hz CustomVoice.
+"""Checkpoint-backed configuration for the Qwen3-TTS 12 Hz family.
+
+One dataclass tree serves every published 12 Hz checkpoint: the 0.6B and
+1.7B CustomVoice models (built-in speakers, optional style instruction on
+1.7B), VoiceDesign (voice described by an instruction) and Base (voice
+cloned from reference audio through an ECAPA-TDNN speaker encoder). Which
+paths a checkpoint supports is read from ``config.json``, never hard-coded.
 
 Qwen publishes configuration across three files rather than one monolithic
 object:
 
-* ``config.json``: Talker architecture, special IDs, speakers, and languages
+* ``config.json``: Talker architecture, special IDs, speakers, languages and
+  (Base only) the speaker encoder
 * ``generation_config.json``: main Talker and residual sampling defaults
 * ``speech_tokenizer/config.json``: neural audio decoder architecture/rates
 
@@ -24,6 +31,15 @@ TALKER_ATTN = "talker_attn"
 TALKER_POS = "talker_pos"
 TALKER_SAMPLER = "talker_sampler"
 CODE_PRED_SAMPLER = "code_predictor"
+
+# ---------------------------------------------------------------------------
+# Fixed ChatML wrapper of the assistant turn, as the Qwen2 tokenizer emits it:
+# ``<|im_start|>assistant\n`` ... ``<|im_end|>\n<|im_start|>assistant\n``.
+# The reference slices the text span as ``input_id[:, 3:-5]``; the API side
+# uses these to size the span and the Talker verifies them before prefill.
+# ---------------------------------------------------------------------------
+CHATML_ASSISTANT_PREFIX_TOKEN_IDS = (151644, 77091, 198)
+CHATML_ASSISTANT_SUFFIX_TOKEN_IDS = (151645, 198, 151644, 77091, 198)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -153,6 +169,46 @@ class Qwen3TTSTalkerConfig:
 
 
 @dataclass
+class Qwen3TTSSpeakerEncoderConfig:
+    """ECAPA-TDNN speaker encoder shipped with the Base checkpoint.
+
+    Defaults mirror ``Qwen3TTSSpeakerEncoderConfig`` in the reference
+    implementation; ``config.json`` only pins ``enc_dim`` (the Talker hidden
+    size the x-vector is added into) and the sample rate of the reference
+    audio.
+    """
+
+    mel_dim: int = 128
+    enc_dim: int = 1024
+    enc_channels: tuple[int, ...] = (512, 512, 512, 512, 1536)
+    enc_kernel_sizes: tuple[int, ...] = (5, 3, 3, 3, 1)
+    enc_dilations: tuple[int, ...] = (1, 2, 3, 4, 1)
+    enc_attention_channels: int = 128
+    enc_res2net_scale: int = 8
+    enc_se_channels: int = 128
+    sample_rate: int = 24000
+
+    # Mel front end used by the reference ``extract_speaker_embedding``.
+    n_fft: int = 1024
+    hop_size: int = 256
+    win_size: int = 1024
+    fmin: int = 0
+    fmax: int = 12000
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Qwen3TTSSpeakerEncoderConfig":
+        values = {
+            name: data[name]
+            for name in cls.__dataclass_fields__
+            if name in data
+        }
+        for name in ("enc_channels", "enc_kernel_sizes", "enc_dilations"):
+            if name in values:
+                values[name] = tuple(values[name])
+        return cls(**values)
+
+
+@dataclass
 class Qwen3TTSCodecConfig:
     """Official speech-tokenizer decoder plus M* streaming chunk controls."""
 
@@ -183,9 +239,22 @@ class Qwen3TTSCodecConfig:
     input_sample_rate: int = 24000
     output_sample_rate: int = 24000
     decode_upsample_rate: int = 1920
+    encode_downsample_rate: int = 1920
+    encoder_valid_num_quantizers: int = 16
+    # Raw Mimi encoder configuration (``encoder_config`` in the speech
+    # tokenizer's config.json); it is handed verbatim to the encoder that
+    # turns reference audio into codec frames for voice cloning.
+    encoder_config: dict[str, Any] = field(default_factory=dict)
 
-    # M* stream policy: 300 new 12 Hz frames with 25 frames of overlap.
-    chunk_frames: int = 300
+    # M* stream policy: the codec pops a ramp of small chunks first (the first
+    # frame alone, so first audio leaves one Talker step after prefill; the
+    # decoder is causal, so a frame's audio does not depend on how it was
+    # chunked), then ``chunk_frames`` new frames per call, each preceded by up
+    # to ``left_context_frames`` already decoded frames so the causal decoder
+    # warms up (the reference's own ``chunked_decode`` uses 25 frames of left
+    # context).
+    chunk_schedule: tuple[int, ...] = (1, 3, 8, 16)
+    chunk_frames: int = 25
     left_context_frames: int = 25
 
     @classmethod
@@ -202,10 +271,30 @@ class Qwen3TTSCodecConfig:
                 "input_sample_rate",
                 "output_sample_rate",
                 "decode_upsample_rate",
+                "encode_downsample_rate",
+                "encoder_valid_num_quantizers",
+                "encoder_config",
             )
             if name in data
         })
         return cls(**values)
+
+    def codec_windows(self) -> list[int]:
+        """Distinct window sizes (context + new frames) the chunk schedule produces.
+
+        These are the shapes the codec captures CUDA graphs for; a terminal
+        flush shorter than a window is padded up to the next one.
+        """
+        windows = set()
+        delivered = 0
+        for size in (*self.chunk_schedule, self.chunk_frames):
+            windows.add(min(self.left_context_frames, delivered) + size)
+            delivered += size
+        return sorted(windows)
+
+    def frames_for_samples(self, num_samples: int) -> int:
+        """Codec frames the encoder emits for ``num_samples`` of input audio."""
+        return -(-int(num_samples) // self.encode_downsample_rate)
 
     def decoder_kwargs(self) -> dict[str, Any]:
         """Arguments accepted by the official 12 Hz decoder config."""
@@ -213,6 +302,10 @@ class Qwen3TTSCodecConfig:
             "input_sample_rate",
             "output_sample_rate",
             "decode_upsample_rate",
+            "encode_downsample_rate",
+            "encoder_valid_num_quantizers",
+            "encoder_config",
+            "chunk_schedule",
             "chunk_frames",
             "left_context_frames",
         }
@@ -268,13 +361,28 @@ class Qwen3TTSModelConfig:
     tts_bos_token_id: int = 151672
     tts_eos_token_id: int = 151673
 
-    default_speaker: str = "vivian"
     default_language: str = "auto"
     talker: Qwen3TTSTalkerConfig = field(default_factory=Qwen3TTSTalkerConfig)
     codec: Qwen3TTSCodecConfig = field(default_factory=Qwen3TTSCodecConfig)
     generation: Qwen3TTSGenerationConfig = field(
         default_factory=Qwen3TTSGenerationConfig
     )
+    # Present only on Base checkpoints (``speaker_encoder_config`` in
+    # config.json); CustomVoice and VoiceDesign carry no speaker encoder.
+    speaker_encoder: Qwen3TTSSpeakerEncoderConfig | None = None
+
+    SUPPORTED_MODEL_TYPES = ("custom_voice", "voice_design", "base")
+
+    def __post_init__(self) -> None:
+        if self.tts_model_type not in self.SUPPORTED_MODEL_TYPES:
+            raise ValueError(
+                f"Unsupported Qwen3-TTS tts_model_type {self.tts_model_type!r}; "
+                f"supported: {', '.join(self.SUPPORTED_MODEL_TYPES)}"
+            )
+        if self.tts_model_type == "base" and self.speaker_encoder is None:
+            self.speaker_encoder = Qwen3TTSSpeakerEncoderConfig(
+                enc_dim=self.talker.hidden_size
+            )
 
     @property
     def code_predictor(self) -> Qwen3TTSCodePredictorConfig:
@@ -283,6 +391,62 @@ class Qwen3TTSModelConfig:
     @property
     def num_code_groups(self) -> int:
         return self.talker.num_code_groups
+
+    # -- Variant capabilities (all derived from the checkpoint metadata) ----
+
+    @property
+    def is_custom_voice(self) -> bool:
+        return self.tts_model_type == "custom_voice"
+
+    @property
+    def is_voice_design(self) -> bool:
+        return self.tts_model_type == "voice_design"
+
+    @property
+    def is_base(self) -> bool:
+        return self.tts_model_type == "base"
+
+    @property
+    def has_builtin_speakers(self) -> bool:
+        """CustomVoice ships named speakers; VoiceDesign and Base do not."""
+        return bool(self.talker.spk_id)
+
+    @property
+    def default_speaker(self) -> str | None:
+        """Speaker used when a request names none (``None`` = no speaker tag)."""
+        if not self.has_builtin_speakers:
+            return None
+        return "vivian" if "vivian" in self.talker.spk_id else sorted(self.talker.spk_id)[0]
+
+    @property
+    def supports_instruct(self) -> bool:
+        """Instruction text (style or voice description) in the prefill.
+
+        VoiceDesign is driven by it; the 1.7B CustomVoice accepts it for
+        style/emotion control. The reference silently drops instructions for
+        the 0.6B CustomVoice, which was not trained with them, so M* rejects
+        them there instead of ignoring the request field.
+        """
+        if self.is_voice_design:
+            return True
+        return self.is_custom_voice and self.tts_model_size != "0b6"
+
+    @property
+    def requires_instruct(self) -> bool:
+        return self.is_voice_design
+
+    @property
+    def supports_reference_audio(self) -> bool:
+        return self.is_base
+
+    @property
+    def default_non_streaming_mode(self) -> bool:
+        """Reference/vLLM-Omni/SGLang-Omni default text layout per variant.
+
+        CustomVoice and VoiceDesign place the whole text in the prefill;
+        Base (voice clone) feeds text one token per generated frame.
+        """
+        return not self.is_base
 
     @classmethod
     def from_pretrained(cls, model_dir: str | Path) -> "Qwen3TTSModelConfig":
@@ -315,4 +479,8 @@ class Qwen3TTSModelConfig:
             codec=Qwen3TTSCodecConfig.from_dict(codec_data),
             generation=Qwen3TTSGenerationConfig.from_dict(generation_data),
         )
+        if "speaker_encoder_config" in model_data:
+            values["speaker_encoder"] = Qwen3TTSSpeakerEncoderConfig.from_dict(
+                model_data["speaker_encoder_config"]
+            )
         return cls(**values)

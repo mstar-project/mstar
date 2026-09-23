@@ -74,6 +74,51 @@ def test_qwen3_speech_maps_talker_sampling(tmp_path):
     assert sa.model_kwargs["voice"] == "Ethan"
 
 
+def test_qwen3_tts_speech_maps_voice_instructions_and_extra_body(tmp_path):
+    req = SpeechRequest(
+        input="hello", voice="Vivian", instructions="speak slowly",
+        temperature=0.7, top_p=0.9, seed=3, language="English", non_streaming_mode=False,
+    )
+    sa = adapters.Qwen3TTSAdapter().speech_to_request(req, tmp_path)
+    assert sa.text == "hello"
+    assert sa.input_modalities == ["text"] and sa.output_modalities == ["audio"]
+    mk = sa.model_kwargs
+    assert mk["voice"] == "Vivian"
+    # OpenAI's ``instructions`` becomes the model's ``instruct`` (and only that).
+    assert mk["instruct"] == "speak slowly" and "instructions" not in mk
+    assert (mk["temperature"], mk["top_p"], mk["seed"]) == (0.7, 0.9, 3)
+    assert mk["language"] == "English" and mk["non_streaming_mode"] is False
+    assert "max_output_tokens" not in mk
+    for key in ("qwen3_tts", "qwen3_tts_1p7b", "qwen3_tts_voicedesign", "qwen3_tts_base"):
+        assert isinstance(adapters.get_adapter(key), adapters.Qwen3TTSAdapter)
+    # Long inputs are sentence-chunked by the speech handler; short ones are not.
+    assert adapters.Qwen3TTSAdapter.speech_chunk_min_chars == 600
+    assert adapters.Qwen3TTSAdapter.speech_chunk_max_chars == 400
+    assert adapters.OrpheusAdapter.speech_chunk_min_chars is None
+
+
+def test_qwen3_tts_speech_reference_audio_becomes_audio_input(tmp_path):
+    wav = base64.b64encode(b"RIFF....WAVEfmt ").decode()
+    req = SpeechRequest(
+        input="clone me", ref_audio=f"data:audio/wav;base64,{wav}", ref_text="reference words",
+        x_vector_only_mode=False,
+    )
+    sa = adapters.Qwen3TTSAdapter().speech_to_request(req, tmp_path)
+    assert sa.input_modalities == ["audio", "text"] and sa.output_modalities == ["audio"]
+    (path,) = sa.file_paths["audio"]
+    assert Path(path).is_file() and Path(path).read_bytes() == b"RIFF....WAVEfmt "
+    assert "ref_audio" not in sa.model_kwargs
+    assert sa.model_kwargs["ref_text"] == "reference words"
+    assert sa.model_kwargs["x_vector_only_mode"] is False
+
+    # Bare base64 (vLLM-Omni style) is accepted too.
+    sa = adapters.Qwen3TTSAdapter().speech_to_request(SpeechRequest(input="x", ref_audio=wav), tmp_path)
+    assert sa.input_modalities == ["audio", "text"] and sa.file_paths["audio"]
+    # No reference -> plain text request.
+    sa = adapters.Qwen3TTSAdapter().speech_to_request(SpeechRequest(input="x", voice="vivian"), tmp_path)
+    assert sa.input_modalities == ["text"] and sa.file_paths is None
+
+
 def test_chat_and_image_honor_seed(tmp_path):
     chat = ChatCompletionRequest(model="bagel", messages=[{"role": "user", "content": "x"}], seed=7)
     assert adapters.BagelAdapter().chat_to_request(chat, tmp_path).model_kwargs["seed"] == 7
