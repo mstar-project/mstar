@@ -230,6 +230,7 @@ def test_ttl_holds_while_the_worker_is_still_delivering():
 def test_delivery_active_reads_the_worker_state():
     pw = object.__new__(PreprocessWorker)
     pw.delivery = DeliveryProgress()
+    pw.per_request_reading_tensors = {}
     now = time.time()
 
     assert not pw.delivery_active("r", now - 15.0)
@@ -242,6 +243,15 @@ def test_delivery_active_reads_the_worker_state():
     assert not pw.delivery_active("other", now - 15.0)
     pw.delivery.active = frozenset()
     pw.delivery.forget("r")
+    assert not pw.delivery_active("r", now - 15.0)
+
+    # announced and the worker busy: held; announced and idle, or busy but
+    # never announced: not held
+    pw.per_request_reading_tensors["r"] = 1
+    pw.delivery.busy = True
+    assert pw.delivery_active("r", now - 15.0)
+    assert not pw.delivery_active("other", now - 15.0)
+    pw.delivery.busy = False
     assert not pw.delivery_active("r", now - 15.0)
 
 
@@ -289,12 +299,15 @@ def test_a_long_postprocess_claims_the_requests_of_its_pass_only():
     """The API server's backstop reads what the worker claimed: the request
     being postprocessed and the one queued behind it in the same pass are
     active for the whole postprocess, a request whose read never completes
-    is not, and nothing is claimed once the pass is over."""
+    is held only while the worker is busy, a request nothing announced is
+    not held at all, and nothing is claimed once the pass is over."""
     model = _SlowPostprocessModel()
     tm = _ReadyTensorManager(never_ready={"req-lost"})
     delivery = DeliveryProgress()
     pw = object.__new__(PreprocessWorker)
     pw.delivery = delivery
+    # what the API server's own bookkeeping says is announced and unread
+    pw.per_request_reading_tensors = {"req-lost": 1}
     stop = threading.Event()
     worker = PreprocessWorkerThread(
         in_queue=queue.Queue(),
@@ -328,9 +341,13 @@ def test_a_long_postprocess_claims_the_requests_of_its_pass_only():
         started = delivery.last_touch["req-lost"]
         since = time.time()
         for _ in range(20):
+            assert delivery.busy
             assert pw.delivery_active("req-slow", since)
             assert pw.delivery_active("req-behind", since)
-            assert not pw.delivery_active("req-lost", since)
+            # announced, so the busy worker holds it
+            assert pw.delivery_active("req-lost", since)
+            # never announced: nothing holds it
+            assert not pw.delivery_active("req-unannounced", since)
             time.sleep(0.005)
         assert pw.delivery_active("req-lost", started - 1.0)
         model.release.set()
@@ -346,6 +363,11 @@ def test_a_long_postprocess_claims_the_requests_of_its_pass_only():
         assert delivery.last_touch["req-slow"] >= since
         assert delivery.last_touch["req-behind"] >= since
         assert delivery.last_touch["req-lost"] == started
+        deadline = time.time() + 2.0
+        while delivery.busy and time.time() < deadline:
+            time.sleep(0.005)
+        # idle now: the announced read that never completes expires
+        assert not delivery.busy
         assert not pw.delivery_active("req-lost", since)
     finally:
         model.release.set()

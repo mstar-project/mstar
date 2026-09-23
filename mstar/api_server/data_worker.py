@@ -57,21 +57,22 @@ class DeliveryProgress:
     ``active`` is the set of requests whose ready tensors the worker's
     current pass is reading and postprocessing. It holds for the whole
     pass, so a long postprocess (a video encode) covers the request being
-    encoded and the requests queued behind it in the same pass, and only
-    those: a request whose chunks are lost is never claimed, so it still
-    expires while the worker is busy with other requests. ``last_touch``
-    is when the thread last moved each request's outputs (its read
-    started, or a pass finished its ready tensors). SHM reads complete
-    inside start_read_tensors, so a tensor is claimed in the pass that
-    read it, before that pass takes a preprocess item; on an async
-    transport a read that lands during a preprocess longer than the TTL
-    is not covered.
-    Written by the worker thread, read by the main thread: the set is
-    swapped whole and the dict gets plain item writes, no lock.
+    encoded and the requests queued behind it in the same pass.
+    ``last_touch`` is when each request's outputs last moved: announced,
+    read started, or a pass finished its ready tensors. ``busy`` is True
+    while the worker is inside a pass that found work; together with the
+    API server's own count of announced-but-unread tensors it covers a
+    request whose announce landed while the worker was deep in someone
+    else's encode or media preprocess. A request nothing announced is
+    never held by any of these, so a lost one expires on time however
+    busy the worker is.
+    Written by both threads: the set is swapped whole, the flag and the
+    dict get plain writes, no lock.
     """
 
     def __init__(self):
         self.active: frozenset[str] = frozenset()
+        self.busy = False
         self.last_touch: dict[str, float] = {}
 
     def touch(self, request_id: str) -> None:
@@ -190,6 +191,7 @@ class PreprocessWorker:
             "Data worker reading queue for request %s increased to length %d",
             input.request_id,  self.per_request_reading_tensors[input.request_id]
         )
+        self.delivery.touch(input.request_id)
         self.result_tensor_input_queue.put(input)
 
     def discard_result_tensors(self, input: ResultTensors):
@@ -205,12 +207,17 @@ class PreprocessWorker:
 
     def delivery_active(self, request_id: str, since: float) -> bool:
         """Whether this request's outputs may still be on their way: the
-        worker thread's current pass is working on them, or it moved them
-        after ``since`` (a ``time.time()`` value). Work on other requests
-        does not count."""
+        worker's current pass is working on them, they moved after
+        ``since`` (a ``time.time()`` value), or they are announced and the
+        worker is busy working towards them. A request that was never
+        announced is not held by other requests' work, so a lost one
+        expires on time. An announced read that never completes (an async
+        transport whose producer went away) is held only while the worker
+        is busy and expires once it idles."""
         return (
             request_id in self.delivery.active
             or self.delivery.last_touch.get(request_id, 0.0) > since
+            or (self.delivery.busy and self.has_pending_tensors(request_id))
         )
 
     def received_final_chunks(
@@ -661,6 +668,7 @@ class PreprocessWorkerThread:
     def run(self):
         while not self.stop_event.is_set():
             did_work = False
+            self.delivery.busy = True
             try:
                 did_work = self._process_messages()
                 # Output delivery is latency-sensitive: the API server holds a
@@ -742,6 +750,7 @@ class PreprocessWorkerThread:
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
 
+            self.delivery.busy = did_work
             if not did_work:
                 time.sleep(0.001)
 
