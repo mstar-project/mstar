@@ -566,6 +566,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-register-the-model">Step 1 — Register the model</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-implement-the-model-class">Step 2 — Implement the <code class="docutils literal notranslate"><span class="pre">Model</span></code> class</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#per-request-resource-parameters">Per-request resource parameters</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-request-prefix-reuse">Cross-request prefix reuse</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2a-declare-your-resources">Step 2a — Declare your resources</a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -817,6 +818,72 @@ through <code class="docutils literal notranslate"><span class="pre">SamplingReq
 across replays, so they stay per-request and remain safe under CUDA graphs.</p>
 </div>
 </section>
+<section id="cross-request-prefix-reuse">
+<h3>Cross-request prefix reuse<a class="headerlink" href="#cross-request-prefix-reuse" title="Link to this heading">#</a></h3>
+<p>Two requests that begin with the same tokens fill the same KV pages, and the second can
+attend the pages the first filled instead of recomputing them. A model opts in with two
+methods. Both have defaults, and a model that overrides neither is never cached. The
+deployment switch and the per-request opt-out are described under <strong>Resource overrides</strong>
+in <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>.</p>
+<dl>
+<dt><code class="docutils literal notranslate"><span class="pre">prefix_key_streams(self)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">dict[str,</span> <span class="pre">PrefixStream]]</span></code></dt><dd><p>Return <code class="docutils literal notranslate"><span class="pre">{resource_key:</span> <span class="pre">{label:</span> <span class="pre">PrefixStream}}</span></code>, one entry for each KV cache stream
+whose pages are keyed. A <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.base.PrefixStream</span></code> has four fields:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">tensor</span></code> names the request tensor that holds the stream’s token ids, as
+<code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> returns it.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">keyed_by</span></code> is <code class="docutils literal notranslate"><span class="pre">&quot;ids&quot;</span></code>: each page is keyed by its token ids, chained from the key
+of the page before it.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">walk</span></code> names the graph walk that writes the keyed span. Only this walk is probed
+for a match. If any walk other than <code class="docutils literal notranslate"><span class="pre">walk</span></code> and <code class="docutils literal notranslate"><span class="pre">decode_walk</span></code> writes into the
+stream, the stream stops being keyed.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">decode_walk</span></code> names the walk whose input is the token just sampled, so that the
+generated tokens are chained onto the prompt’s keys and a later request that
+re-sends the reply matches it too. <code class="docutils literal notranslate"><span class="pre">None</span></code> keys the prompt only.</p></li>
+</ul>
+<p>BAGEL keys the text walk of its LLM and the decode that follows it:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">return</span> <span class="p">{</span><span class="s2">"kv"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"main"</span><span class="p">:</span> <span class="n">PrefixStream</span><span class="p">(</span>
+    <span class="s2">"text_inputs"</span><span class="p">,</span> <span class="s2">"ids"</span><span class="p">,</span> <span class="s2">"prefill_text"</span><span class="p">,</span> <span class="s2">"decode"</span><span class="p">,</span>
+<span class="p">)}}</span>
+</pre></div>
+</div>
+<p>Orpheus keys its prompt walk and its decode walk:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">return</span> <span class="p">{</span>
+    <span class="n">KV_CACHE</span><span class="p">:</span> <span class="p">{</span><span class="s2">"main"</span><span class="p">:</span> <span class="n">PrefixStream</span><span class="p">(</span><span class="s2">"text_inputs"</span><span class="p">,</span> <span class="s2">"ids"</span><span class="p">,</span> <span class="s2">"prefill"</span><span class="p">,</span> <span class="s2">"decode"</span><span class="p">)},</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">checkpoint_path(self)</span> <span class="pre">-&gt;</span> <span class="pre">str</span> <span class="pre">|</span> <span class="pre">None</span></code></dt><dd><p>Return the local directory that holds the weights and <code class="docutils literal notranslate"><span class="pre">config.json</span></code>. The cache
+hashes the checkpoint’s safetensors index and config into the root of every key, so
+naming the checkpoint is what keeps two builds off each other’s pages. The default
+returns <code class="docutils literal notranslate"><span class="pre">None</span></code>, which leaves the weights out of the root. A model without a
+checkpoint therefore needs <code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code> set to use the cache at all. Without
+one, the engine keeps the cache shut and logs why.</p>
+</dd>
+</dl>
+<p>A model that declares a stream is checked at load time. Loading fails in three cases:</p>
+<ul class="simple">
+<li><p>A position resource over a keyed cache uses a scheme other than sequential. A page is
+reusable only where its tokens land at the positions they were written at. The message
+is <code class="docutils literal notranslate"><span class="pre">resource</span> <span class="pre">'&lt;key&gt;'</span> <span class="pre">places</span> <span class="pre">positions</span> <span class="pre">by</span> <span class="pre">&lt;scheme&gt;,</span> <span class="pre">but</span> <span class="pre">it</span> <span class="pre">sits</span> <span class="pre">over</span> <span class="pre">['&lt;kv</span> <span class="pre">key&gt;'],</span>
+<span class="pre">which</span> <span class="pre">the</span> <span class="pre">model</span> <span class="pre">keyed</span> <span class="pre">for</span> <span class="pre">prefix</span> <span class="pre">reuse;</span> <span class="pre">either</span> <span class="pre">drop</span> <span class="pre">the</span> <span class="pre">stream</span> <span class="pre">or</span> <span class="pre">give</span> <span class="pre">the</span> <span class="pre">resource</span> <span class="pre">a</span>
+<span class="pre">sequential</span> <span class="pre">scheme</span></code>.</p></li>
+<li><p>A resource on a keyed node does not set <code class="docutils literal notranslate"><span class="pre">prefix_skip_safe</span></code>. A hit takes the front of
+the request away from every resource on the node, including resources that never saw
+those tokens. The message is <code class="docutils literal notranslate"><span class="pre">resource</span> <span class="pre">'&lt;key&gt;'</span> <span class="pre">cannot</span> <span class="pre">serve</span> <span class="pre">a</span> <span class="pre">request</span> <span class="pre">whose</span> <span class="pre">prefix</span>
+<span class="pre">came</span> <span class="pre">from</span> <span class="pre">the</span> <span class="pre">cache,</span> <span class="pre">but</span> <span class="pre">it</span> <span class="pre">sits</span> <span class="pre">on</span> <span class="pre">['&lt;node&gt;'],</span> <span class="pre">which</span> <span class="pre">the</span> <span class="pre">model</span> <span class="pre">keyed</span> <span class="pre">for</span> <span class="pre">prefix</span>
+<span class="pre">reuse;</span> <span class="pre">either</span> <span class="pre">drop</span> <span class="pre">the</span> <span class="pre">stream</span> <span class="pre">or</span> <span class="pre">give</span> <span class="pre">the</span> <span class="pre">resource</span> <span class="pre">the</span> <span class="pre">prefix</span> <span class="pre">hooks</span></code>.</p></li>
+<li><p>A stream names a walk that the model does not run. The message is <code class="docutils literal notranslate"><span class="pre">&lt;Model&gt;</span> <span class="pre">keys</span>
+<span class="pre">'&lt;resource</span> <span class="pre">key&gt;'/'&lt;label&gt;'</span> <span class="pre">on</span> <span class="pre">['&lt;walk&gt;'],</span> <span class="pre">which</span> <span class="pre">it</span> <span class="pre">never</span> <span class="pre">runs;</span> <span class="pre">its</span> <span class="pre">walks</span> <span class="pre">are</span> <span class="pre">[...]</span></code>.</p></li>
+</ul>
+<p>Some requests stay uncached even when the model declares a stream. The engine checks each
+request’s inputs on the keyed walk and cuts a prefix only from inputs that the default
+<code class="docutils literal notranslate"><span class="pre">split_inputs</span></code> can slice. A request whose inputs carry <code class="docutils literal notranslate"><span class="pre">tensor_inputs</span></code>, <code class="docutils literal notranslate"><span class="pre">kwargs</span></code> or
+<code class="docutils literal notranslate"><span class="pre">resource_step_info</span></code> is never probed; BAGEL’s guided requests carry <code class="docutils literal notranslate"><span class="pre">requires_cfg</span></code>
+there. The keys stop at a prompt’s first input that is not a token, so a BAGEL prompt is
+keyed over its leading text only. A stream under a sliding window files pages only up to
+its protected prefix, which the window never releases.</p>
+</section>
 </section>
 <section id="step-2a-declare-your-resources">
 <span id="id1"></span><h2>Step 2a — Declare your resources<a class="headerlink" href="#step-2a-declare-your-resources" title="Link to this heading">#</a></h2>
@@ -853,9 +920,10 @@ that depends on nothing: it names no cache, because it has none.</p></li>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec(config=KVConfig(...))</span></code></p></td>
 <td><p>A paged KV cache. <code class="docutils literal notranslate"><span class="pre">KVConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">num_layers</span></code>, <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code>,
-<code class="docutils literal notranslate"><span class="pre">head_dim</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> and <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>. It also holds three fields that
-a deployment can tune: <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>, <code class="docutils literal notranslate"><span class="pre">page_size</span></code> and <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>
-(the number of pinned host pages used for offload; 0 disables offload).</p></td>
+<code class="docutils literal notranslate"><span class="pre">head_dim</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> and <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>. It also holds five fields that
+a deployment can tune: <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>, <code class="docutils literal notranslate"><span class="pre">page_size</span></code>, <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>
+(the number of pinned host pages used for offload; 0 disables offload),
+<code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> and <code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec(config=AttentionConfig(kv_cache=...))</span></code></p></td>
 <td><p>Self-attention planned over the named cache. <code class="docutils literal notranslate"><span class="pre">backend</span></code> selects
@@ -1748,7 +1816,8 @@ that a misspelled setting is never silently ignored:</p>
 </thead>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>, <code class="docutils literal notranslate"><span class="pre">page_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>, <code class="docutils literal notranslate"><span class="pre">page_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>,
+<code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code> / <code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> / <code class="docutils literal notranslate"><span class="pre">dense</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
@@ -2101,6 +2170,7 @@ uses them to decide when to run.</p>
       [ ] postprocess
       [ ] get_submodule
       [ ] (optional) get_request_resource_configs
+      [ ] (optional) prefix_key_streams + checkpoint_path   — cross-request prefix reuse
 [ ] mstar/model/registry.py                    — add to MODEL_REGISTRY (+ HF_MODELS)
 [ ] configs/&lt;your_model&gt;.yaml                  — node_groups → ranks (+ resources: overrides)
 [ ] (optional) async partitions if pipelined
@@ -2203,6 +2273,7 @@ for a full omni-modal model.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-1-register-the-model">Step 1 — Register the model</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2-implement-the-model-class">Step 2 — Implement the <code class="docutils literal notranslate"><span class="pre">Model</span></code> class</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#per-request-resource-parameters">Per-request resource parameters</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cross-request-prefix-reuse">Cross-request prefix reuse</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#step-2a-declare-your-resources">Step 2a — Declare your resources</a><ul class="pst-show_toc_level nav section-nav flex-column">

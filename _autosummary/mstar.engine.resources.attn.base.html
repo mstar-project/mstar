@@ -564,6 +564,8 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager"><code class="docutils literal notranslate"><span class="pre">AttentionManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.build"><code class="docutils literal notranslate"><span class="pre">AttentionManager.build()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.fingerprint"><code class="docutils literal notranslate"><span class="pre">AttentionManager.fingerprint()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">AttentionManager.prefix_skip_safe</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.requires_kv_write"><code class="docutils literal notranslate"><span class="pre">AttentionManager.requires_kv_write</span></code></a></li>
 </ul>
 </li>
@@ -635,6 +637,25 @@ backend in a spec does not load the other two.</p>
 </dd>
 </dl>
 </dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.AttentionManager.fingerprint">
+<span class="sig-name descname"><span class="pre">fingerprint</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/base.html#AttentionManager.fingerprint"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.base.AttentionManager.fingerprint" title="Link to this definition">#</a></dt>
+<dd><p>What this resource contributes to the prefix cache’s root.</p>
+<p>Everything a stored page depends on beyond its own tokens. None leaves
+the resource out of the root, which is right only where it cannot
+change what a page holds.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.base.AttentionManager.prefix_skip_safe">
+<span class="sig-name descname"><span class="pre">prefix_skip_safe</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.attn.base.AttentionManager.prefix_skip_safe" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.base.AttentionManager.requires_kv_write">
@@ -806,6 +827,8 @@ these outlive any single step.</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager"><code class="docutils literal notranslate"><span class="pre">AttentionManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.build"><code class="docutils literal notranslate"><span class="pre">AttentionManager.build()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.fingerprint"><code class="docutils literal notranslate"><span class="pre">AttentionManager.fingerprint()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">AttentionManager.prefix_skip_safe</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.base.AttentionManager.requires_kv_write"><code class="docutils literal notranslate"><span class="pre">AttentionManager.requires_kv_write</span></code></a></li>
 </ul>
 </li>

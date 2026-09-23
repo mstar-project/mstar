@@ -873,6 +873,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">FlashInferPrefillWrapper</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionResource</span><span class="p">,</span> <span class="n">EngineResourceInfo</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">fingerprint</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -880,10 +881,20 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="AttentionManager">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.AttentionManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AttentionManager</span><span class="p">(</span><span class="n">AttentionResource</span><span class="p">):</span>
+    <span class="n">prefix_skip_safe</span> <span class="o">=</span> <span class="kc">True</span>
+
     <span class="c1"># Remains abstract except for build; will build based</span>
     <span class="c1"># on the attention backend</span>
 
     <span class="c1"># Label / layer cursors come from `AttentionResource`; `run` resolves them.</span>
+
+<div class="viewcode-block" id="AttentionManager.fingerprint">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.AttentionManager.fingerprint">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">fingerprint</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+        <span class="c1"># the class, not the declared backend: `build` degrades dense to paged</span>
+        <span class="c1"># where the FA3 kernel is unusable, and the two do not agree bit for bit</span>
+        <span class="k">return</span> <span class="n">fingerprint</span><span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">)</span></div>
+
 
 <div class="viewcode-block" id="AttentionManager.build">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.AttentionManager.build">[docs]</a>

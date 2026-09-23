@@ -926,6 +926,30 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_split_pos_ids</span><span class="p">(</span>
+    <span class="n">pos_ids</span><span class="p">:</span> <span class="s2">"torch.Tensor | dict[str, torch.Tensor]"</span><span class="p">,</span>
+    <span class="n">input_seq_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">start</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">end</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+<span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Cut position ids on their trailing dim, per label where there are labels.</span>
+
+<span class="sd">    The trailing dim is the sequence one wherever it matches the walk's token</span>
+<span class="sd">    count, which covers both the plain ``(seq,)`` layout and the ``(3, seq)``</span>
+<span class="sd">    one mRoPE uses; anything else is a layout this cannot read.</span>
+<span class="sd">    """</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">pos_ids</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="n">label</span><span class="p">:</span> <span class="n">_split_pos_ids</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">input_seq_len</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">end</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">pos_ids</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+        <span class="p">}</span>
+    <span class="k">if</span> <span class="n">pos_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">!=</span> <span class="n">input_seq_len</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"custom position ids of shape </span><span class="si">{</span><span class="nb">tuple</span><span class="p">(</span><span class="n">pos_ids</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span><span class="si">}</span><span class="s2"> do not end "</span>
+            <span class="sa">f</span><span class="s2">"in this walk's </span><span class="si">{</span><span class="n">input_seq_len</span><span class="si">}</span><span class="s2"> tokens, so the sequence dim "</span>
+            <span class="s2">"cannot be told apart; override `split_inputs`"</span>
+        <span class="p">)</span>
+    <span class="k">return</span> <span class="n">pos_ids</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">start</span><span class="p">:</span><span class="n">end</span><span class="p">]</span>
+
+
 <div class="viewcode-block" id="ARNodeInputs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeInputs">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -1268,6 +1292,28 @@ window.runMermaid = runMermaid;</script>
         <span class="k">pass</span></div>
 
 
+<div class="viewcode-block" id="NodeSubmodule.split_inputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.split_inputs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">split_inputs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">fwd_info</span><span class="p">:</span> <span class="s2">"CurrentForwardPassInfo"</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="n">NodeInputs</span><span class="p">,</span>
+        <span class="n">start</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">end</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeInputs</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""This walk's inputs restricted to tokens ``[start, end)``.</span>
+
+<span class="sd">        ``inputs`` is the whole prompt, prepared once and sliced rather than</span>
+<span class="sd">        re-derived, so anything read out of a resource while preparing is read</span>
+<span class="sd">        once, before any part of it runs.</span>
+<span class="sd">        """</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> cannot serve part of a walk's tokens; "</span>
+            <span class="s2">"it has to override `split_inputs` to say how its inputs are cut"</span>
+        <span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="NodeSubmodule.preprocess">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.preprocess">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">preprocess</span><span class="p">(</span>
@@ -1575,6 +1621,49 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="ARNodeSubmodule">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ARNodeSubmodule</span><span class="p">(</span><span class="n">NodeSubmodule</span><span class="p">):</span>
+<div class="viewcode-block" id="ARNodeSubmodule.split_inputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.split_inputs">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">split_inputs</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">fwd_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="n">ARNodeInputs</span><span class="p">,</span>
+        <span class="n">start</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">end</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ARNodeInputs</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""This walk's inputs restricted to tokens ``[start, end)``.</span>
+
+<span class="sd">        Only the sequence-shaped fields are cut. ``tensor_inputs``, ``kwargs``</span>
+<span class="sd">        and ``resource_step_info`` are opaque here, so a submodule carrying any</span>
+<span class="sd">        of them says for itself how they are cut, or refuses to be cut at all.</span>
+<span class="sd">        """</span>
+        <span class="k">del</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">fwd_info</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"tensor_inputs"</span><span class="p">,</span> <span class="s2">"kwargs"</span><span class="p">,</span> <span class="s2">"resource_step_info"</span><span class="p">):</span>
+            <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> carries </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> into this walk, "</span>
+                    <span class="s2">"which cannot be cut without knowing what it holds; "</span>
+                    <span class="s2">"override `split_inputs`"</span>
+                <span class="p">)</span>
+        <span class="n">cut</span> <span class="o">=</span> <span class="n">replace</span><span class="p">(</span>
+            <span class="n">inputs</span><span class="p">,</span>
+            <span class="n">input_seq_len</span><span class="o">=</span><span class="n">end</span> <span class="o">-</span> <span class="n">start</span><span class="p">,</span>
+            <span class="n">input_ids</span><span class="o">=</span><span class="p">(</span>
+                <span class="kc">None</span> <span class="k">if</span> <span class="n">inputs</span><span class="o">.</span><span class="n">input_ids</span> <span class="ow">is</span> <span class="kc">None</span>
+                <span class="k">else</span> <span class="n">inputs</span><span class="o">.</span><span class="n">input_ids</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">end</span><span class="p">]</span>
+            <span class="p">),</span>
+            <span class="n">input_embeds</span><span class="o">=</span><span class="p">(</span>
+                <span class="kc">None</span> <span class="k">if</span> <span class="n">inputs</span><span class="o">.</span><span class="n">input_embeds</span> <span class="ow">is</span> <span class="kc">None</span>
+                <span class="k">else</span> <span class="n">inputs</span><span class="o">.</span><span class="n">input_embeds</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">end</span><span class="p">]</span>
+            <span class="p">),</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">inputs</span><span class="o">.</span><span class="n">custom_pos_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">cut</span><span class="o">.</span><span class="n">custom_pos_ids</span> <span class="o">=</span> <span class="n">_split_pos_ids</span><span class="p">(</span>
+                <span class="n">inputs</span><span class="o">.</span><span class="n">custom_pos_ids</span><span class="p">,</span> <span class="n">inputs</span><span class="o">.</span><span class="n">input_seq_len</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">end</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="n">cut</span></div>
+
+
 <div class="viewcode-block" id="ARNodeSubmodule.prepare_inputs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs">[docs]</a>
     <span class="nd">@abstractmethod</span>

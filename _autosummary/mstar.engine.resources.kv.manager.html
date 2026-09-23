@@ -51,7 +51,7 @@
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="mstar.engine.resources.kv.plan" href="mstar.engine.resources.kv.plan.html" />
-    <link rel="prev" title="mstar.engine.resources.kv.cpu_page_pool" href="mstar.engine.resources.kv.cpu_page_pool.html" />
+    <link rel="prev" title="mstar.engine.resources.kv.keys" href="mstar.engine.resources.kv.keys.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -568,7 +568,11 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream"><code class="docutils literal notranslate"><span class="pre">CacheStream</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.chain"><code class="docutils literal notranslate"><span class="pre">CacheStream.chain</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.converted"><code class="docutils literal notranslate"><span class="pre">CacheStream.converted</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.forget_chain"><code class="docutils literal notranslate"><span class="pre">CacheStream.forget_chain()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.generation"><code class="docutils literal notranslate"><span class="pre">CacheStream.generation</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.lease"><code class="docutils literal notranslate"><span class="pre">CacheStream.lease</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.offloaded"><code class="docutils literal notranslate"><span class="pre">CacheStream.offloaded</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.page_indices"><code class="docutils literal notranslate"><span class="pre">CacheStream.page_indices</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.position"><code class="docutils literal notranslate"><span class="pre">CacheStream.position</span></code></a></li>
@@ -594,12 +598,16 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager"><code class="docutils literal notranslate"><span class="pre">KVManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.admit"><code class="docutils literal notranslate"><span class="pre">KVManager.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">KVManager.admit_retrieve()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">KVManager.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.assert_pages_conserved"><code class="docutils literal notranslate"><span class="pre">KVManager.assert_pages_conserved()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build"><code class="docutils literal notranslate"><span class="pre">KVManager.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">KVManager.build_cuda_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.cleanup"><code class="docutils literal notranslate"><span class="pre">KVManager.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.clear_preplan"><code class="docutils literal notranslate"><span class="pre">KVManager.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.commit"><code class="docutils literal notranslate"><span class="pre">KVManager.commit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.enable_prefix_cache"><code class="docutils literal notranslate"><span class="pre">KVManager.enable_prefix_cache()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.extend_prefix_chain"><code class="docutils literal notranslate"><span class="pre">KVManager.extend_prefix_chain()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.fingerprint"><code class="docutils literal notranslate"><span class="pre">KVManager.fingerprint()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.get_offload_priority"><code class="docutils literal notranslate"><span class="pre">KVManager.get_offload_priority()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.ingest_request"><code class="docutils literal notranslate"><span class="pre">KVManager.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.is_offloaded"><code class="docutils literal notranslate"><span class="pre">KVManager.is_offloaded()</span></code></a></li>
@@ -607,6 +615,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.offload"><code class="docutils literal notranslate"><span class="pre">KVManager.offload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.plan"><code class="docutils literal notranslate"><span class="pre">KVManager.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.post_warmup_validate"><code class="docutils literal notranslate"><span class="pre">KVManager.post_warmup_validate()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">KVManager.prefix_skip_safe</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.publish"><code class="docutils literal notranslate"><span class="pre">KVManager.publish()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.read_kv"><code class="docutils literal notranslate"><span class="pre">KVManager.read_kv()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.reclaimable"><code class="docutils literal notranslate"><span class="pre">KVManager.reclaimable()</span></code></a></li>
@@ -614,6 +623,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.remove_request"><code class="docutils literal notranslate"><span class="pre">KVManager.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.reset_default_cursors"><code class="docutils literal notranslate"><span class="pre">KVManager.reset_default_cursors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.reset_request"><code class="docutils literal notranslate"><span class="pre">KVManager.reset_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">KVManager.resolve_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">KVManager.set_layer_idx()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.supports_eviction"><code class="docutils literal notranslate"><span class="pre">KVManager.supports_eviction</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.supports_preplan"><code class="docutils literal notranslate"><span class="pre">KVManager.supports_preplan</span></code></a></li>
@@ -647,6 +657,18 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.sealed"><code class="docutils literal notranslate"><span class="pre">PageArena.sealed</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain"><code class="docutils literal notranslate"><span class="pre">PrefixChain</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.covered_len"><code class="docutils literal notranslate"><span class="pre">PrefixChain.covered_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.cursor"><code class="docutils literal notranslate"><span class="pre">PrefixChain.cursor</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.extend"><code class="docutils literal notranslate"><span class="pre">PrefixChain.extend()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.keyed_pages"><code class="docutils literal notranslate"><span class="pre">PrefixChain.keyed_pages</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.keys"><code class="docutils literal notranslate"><span class="pre">PrefixChain.keys</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.pages_filled"><code class="docutils literal notranslate"><span class="pre">PrefixChain.pages_filled()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.reported"><code class="docutils literal notranslate"><span class="pre">PrefixChain.reported</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.seed"><code class="docutils literal notranslate"><span class="pre">PrefixChain.seed()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.unkeyed"><code class="docutils literal notranslate"><span class="pre">PrefixChain.unkeyed</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PublishedKVInfo"><code class="docutils literal notranslate"><span class="pre">PublishedKVInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PublishedKVInfo.build_for_rank"><code class="docutils literal notranslate"><span class="pre">PublishedKVInfo.build_for_rank()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PublishedKVInfo.get"><code class="docutils literal notranslate"><span class="pre">PublishedKVInfo.get()</span></code></a></li>
@@ -657,6 +679,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.RetentionPolicy"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.RetentionPolicy.context_budget"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy.context_budget</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.RetentionPolicy.protected_prefix"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy.protected_prefix</span></code></a></li>
 </ul>
 </li>
 </ul>
@@ -696,10 +719,13 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.PageArena" title="mstar.engine.resources.kv.manager.PageArena"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PageArena</span></code></a>(kv_cache, allocator)</p></td>
 <td><p>physical storage, free list, and per-page ownership</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.PublishedKVInfo" title="mstar.engine.resources.kv.manager.PublishedKVInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PublishedKVInfo</span></code></a>(info, dict[str, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.PrefixChain" title="mstar.engine.resources.kv.manager.PrefixChain"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PrefixChain</span></code></a>(keys, unkeyed, keyed_pages, ...)</p></td>
+<td><p>The keys that name a stream's pages, and how far the index holds them.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.PublishedKVInfo" title="mstar.engine.resources.kv.manager.PublishedKVInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PublishedKVInfo</span></code></a>(info, dict[str, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.RetentionPolicy" title="mstar.engine.resources.kv.manager.RetentionPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RetentionPolicy</span></code></a>(context_budget)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.RetentionPolicy" title="mstar.engine.resources.kv.manager.RetentionPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RetentionPolicy</span></code></a>(context_budget[, ...])</p></td>
 <td><p>fifo retention of <cite>context_budget</cite></p></td>
 </tr>
 </tbody>
@@ -731,7 +757,7 @@
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.CacheStream">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.manager.</span></span><span class="sig-name descname"><span class="pre">CacheStream</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">page_indices</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stored_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">released</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">retention</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">read_pending</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">read_future</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">read_error</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">offloaded</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">generation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step_in_flight</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#CacheStream"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.CacheStream" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.manager.</span></span><span class="sig-name descname"><span class="pre">CacheStream</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">page_indices</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stored_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">released</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">retention</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">read_pending</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">read_future</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">read_error</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chain</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lease</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">converted</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">offloaded</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">generation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step_in_flight</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#CacheStream"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.CacheStream" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>(request, label) cache stream metadata</p>
 <dl class="field-list simple">
@@ -745,6 +771,9 @@
 <li><p><strong>read_pending</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>read_future</strong> (<em>Future</em><em> | </em><em>None</em>)</p></li>
 <li><p><strong>read_error</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/exceptions.html#BaseException" title="(in Python v3.12)"><em>BaseException</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>chain</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.manager.PrefixChain" title="mstar.engine.resources.kv.manager.PrefixChain"><em>PrefixChain</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>lease</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>converted</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>offloaded</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>generation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>step_in_flight</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
@@ -752,8 +781,31 @@
 </dd>
 </dl>
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.CacheStream.chain">
+<span class="sig-name descname"><span class="pre">chain</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.engine.resources.kv.manager.PrefixChain" title="mstar.engine.resources.kv.manager.PrefixChain"><span class="pre">PrefixChain</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.CacheStream.chain" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.CacheStream.converted">
+<span class="sig-name descname"><span class="pre">converted</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.CacheStream.converted" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.CacheStream.forget_chain">
+<span class="sig-name descname"><span class="pre">forget_chain</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#CacheStream.forget_chain"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.CacheStream.forget_chain" title="Link to this definition">#</a></dt>
+<dd><p>Drop what the chain knows of this stream, for a run that starts over.</p>
+<p>Not part of <cite>reset</cite>, which an offload calls too: a reload brings the
+same tokens back, so the chain that describes them has to survive it.</p>
+</dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.CacheStream.generation">
 <span class="sig-name descname"><span class="pre">generation</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.CacheStream.generation" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.CacheStream.lease">
+<span class="sig-name descname"><span class="pre">lease</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.CacheStream.lease" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -924,6 +976,25 @@ Returns whether the retrieve has completed.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.apply_cached_prefix">
+<span class="sig-name descname"><span class="pre">apply_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">matched_len</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.apply_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.apply_cached_prefix" title="Link to this definition">#</a></dt>
+<dd><p>Cut this stream’s lease down to <code class="docutils literal notranslate"><span class="pre">matched_len</span></code>, the agreed length.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>matched_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.assert_pages_conserved">
 <span class="sig-name descname"><span class="pre">assert_pages_conserved</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.assert_pages_conserved"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.assert_pages_conserved" title="Link to this definition">#</a></dt>
 <dd><p>Check the owner counts against the streams holding the pages.</p>
@@ -988,6 +1059,57 @@ earlier call already sized.</p>
 <li><p><strong>step</strong> (<a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVStep" title="mstar.engine.resources.kv.config.KVStep"><em>KVStep</em></a>)</p></li>
 <li><p><strong>ctx</strong> (<a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.StepContext" title="mstar.engine.resources.step.StepContext"><em>StepContext</em></a>)</p></li>
 </ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.enable_prefix_cache">
+<span class="sig-name descname"><span class="pre">enable_prefix_cache</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">root</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.enable_prefix_cache"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.enable_prefix_cache" title="Link to this definition">#</a></dt>
+<dd><p>Open the index under <code class="docutils literal notranslate"><span class="pre">root</span></code>, the identity every key hangs from.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>root</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a>)</p></li>
+<li><p><strong>walks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.extend_prefix_chain">
+<span class="sig-name descname"><span class="pre">extend_prefix_chain</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.extend_prefix_chain"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.extend_prefix_chain" title="Link to this definition">#</a></dt>
+<dd><p>Key what this request generated, once a page of it exists.</p>
+<p>The ids come from the stop check’s host copy, which can land after their
+step commits, so a later commit indexes the page.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.fingerprint">
+<span class="sig-name descname"><span class="pre">fingerprint</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.fingerprint"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.fingerprint" title="Link to this definition">#</a></dt>
+<dd><p>What this resource contributes to the prefix cache’s root.</p>
+<p>Everything a stored page depends on beyond its own tokens. None leaves
+the resource out of the root, which is right only where it cannot
+change what a page holds.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1097,6 +1219,11 @@ that adds requests asymmetrically before <code class="docutils literal notransla
 needed on the success path.</p>
 </dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.prefix_skip_safe">
+<span class="sig-name descname"><span class="pre">prefix_skip_safe</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.prefix_skip_safe" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.publish">
 <span class="sig-name descname"><span class="pre">publish</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.publish"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.publish" title="Link to this definition">#</a></dt>
@@ -1186,6 +1313,27 @@ case, so the caller can evict further and try again.</p>
 <li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>free</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.resolve_cached_prefix">
+<span class="sig-name descname"><span class="pre">resolve_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.resolve_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.resolve_cached_prefix" title="Link to this definition">#</a></dt>
+<dd><p>Match this request’s prefix against the index and hold what matched.</p>
+<p>Answers the same length every time it is asked, and takes one reference
+however often that is: a probe is repeated whenever a step is prepared
+again.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a> | None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1441,6 +1589,104 @@ counts and seals need none of their own.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PrefixChain">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.manager.</span></span><span class="sig-name descname"><span class="pre">PrefixChain</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">keys</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">unkeyed</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keyed_pages</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">covered_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cursor</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reported</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#PrefixChain"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.PrefixChain" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>The keys that name a stream’s pages, and how far the index holds them.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>keys</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em>]</em>)</p></li>
+<li><p><strong>unkeyed</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>keyed_pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>covered_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>cursor</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>reported</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PrefixChain.covered_len">
+<span class="sig-name descname"><span class="pre">covered_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.PrefixChain.covered_len" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PrefixChain.cursor">
+<span class="sig-name descname"><span class="pre">cursor</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.PrefixChain.cursor" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PrefixChain.extend">
+<span class="sig-name descname"><span class="pre">extend</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#PrefixChain.extend"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.PrefixChain.extend" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PrefixChain.keyed_pages">
+<span class="sig-name descname"><span class="pre">keyed_pages</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.PrefixChain.keyed_pages" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PrefixChain.keys">
+<span class="sig-name descname"><span class="pre">keys</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><span class="pre">bytes</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.PrefixChain.keys" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PrefixChain.pages_filled">
+<span class="sig-name descname"><span class="pre">pages_filled</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">stored_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#PrefixChain.pages_filled"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.PrefixChain.pages_filled" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>stored_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PrefixChain.reported">
+<span class="sig-name descname"><span class="pre">reported</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.PrefixChain.reported" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PrefixChain.seed">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">seed</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">keys</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tail</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#PrefixChain.seed"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.PrefixChain.seed" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>keys</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em>]</em>)</p></li>
+<li><p><strong>tail</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.PrefixChain" title="mstar.engine.resources.kv.manager.PrefixChain"><em>PrefixChain</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PrefixChain.unkeyed">
+<span class="sig-name descname"><span class="pre">unkeyed</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.PrefixChain.unkeyed" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PublishedKVInfo">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.manager.</span></span><span class="sig-name descname"><span class="pre">PublishedKVInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">info</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dict[int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dict[str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mstar.engine.resources.kv.manager.KVSequenceInfo]]</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">world_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#PublishedKVInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.PublishedKVInfo" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.PublishedInfo" title="mstar.engine.resources.base.PublishedInfo"><code class="xref py py-class docutils literal notranslate"><span class="pre">PublishedInfo</span></code></a></p>
@@ -1503,17 +1749,25 @@ counts and seals need none of their own.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.RetentionPolicy">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.manager.</span></span><span class="sig-name descname"><span class="pre">RetentionPolicy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">context_budget</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#RetentionPolicy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.RetentionPolicy" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.manager.</span></span><span class="sig-name descname"><span class="pre">RetentionPolicy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">context_budget</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">protected_prefix</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#RetentionPolicy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.RetentionPolicy" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>fifo retention of <cite>context_budget</cite></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>context_budget</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>context_budget</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>protected_prefix</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.RetentionPolicy.context_budget">
 <span class="sig-name descname"><span class="pre">context_budget</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.RetentionPolicy.context_budget" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.RetentionPolicy.protected_prefix">
+<span class="sig-name descname"><span class="pre">protected_prefix</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.RetentionPolicy.protected_prefix" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1532,12 +1786,12 @@ counts and seals need none of their own.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.engine.resources.kv.cpu_page_pool.html"
+       href="mstar.engine.resources.kv.keys.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.engine.resources.kv.cpu_page_pool</p>
+        <p class="prev-next-title">mstar.engine.resources.kv.keys</p>
       </div>
     </a>
     <a class="right-next"
@@ -1573,7 +1827,11 @@ counts and seals need none of their own.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream"><code class="docutils literal notranslate"><span class="pre">CacheStream</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.chain"><code class="docutils literal notranslate"><span class="pre">CacheStream.chain</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.converted"><code class="docutils literal notranslate"><span class="pre">CacheStream.converted</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.forget_chain"><code class="docutils literal notranslate"><span class="pre">CacheStream.forget_chain()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.generation"><code class="docutils literal notranslate"><span class="pre">CacheStream.generation</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.lease"><code class="docutils literal notranslate"><span class="pre">CacheStream.lease</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.offloaded"><code class="docutils literal notranslate"><span class="pre">CacheStream.offloaded</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.page_indices"><code class="docutils literal notranslate"><span class="pre">CacheStream.page_indices</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.CacheStream.position"><code class="docutils literal notranslate"><span class="pre">CacheStream.position</span></code></a></li>
@@ -1599,12 +1857,16 @@ counts and seals need none of their own.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager"><code class="docutils literal notranslate"><span class="pre">KVManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.admit"><code class="docutils literal notranslate"><span class="pre">KVManager.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">KVManager.admit_retrieve()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">KVManager.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.assert_pages_conserved"><code class="docutils literal notranslate"><span class="pre">KVManager.assert_pages_conserved()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build"><code class="docutils literal notranslate"><span class="pre">KVManager.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">KVManager.build_cuda_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.cleanup"><code class="docutils literal notranslate"><span class="pre">KVManager.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.clear_preplan"><code class="docutils literal notranslate"><span class="pre">KVManager.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.commit"><code class="docutils literal notranslate"><span class="pre">KVManager.commit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.enable_prefix_cache"><code class="docutils literal notranslate"><span class="pre">KVManager.enable_prefix_cache()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.extend_prefix_chain"><code class="docutils literal notranslate"><span class="pre">KVManager.extend_prefix_chain()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.fingerprint"><code class="docutils literal notranslate"><span class="pre">KVManager.fingerprint()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.get_offload_priority"><code class="docutils literal notranslate"><span class="pre">KVManager.get_offload_priority()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.ingest_request"><code class="docutils literal notranslate"><span class="pre">KVManager.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.is_offloaded"><code class="docutils literal notranslate"><span class="pre">KVManager.is_offloaded()</span></code></a></li>
@@ -1612,6 +1874,7 @@ counts and seals need none of their own.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.offload"><code class="docutils literal notranslate"><span class="pre">KVManager.offload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.plan"><code class="docutils literal notranslate"><span class="pre">KVManager.plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.post_warmup_validate"><code class="docutils literal notranslate"><span class="pre">KVManager.post_warmup_validate()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">KVManager.prefix_skip_safe</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.publish"><code class="docutils literal notranslate"><span class="pre">KVManager.publish()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.read_kv"><code class="docutils literal notranslate"><span class="pre">KVManager.read_kv()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.reclaimable"><code class="docutils literal notranslate"><span class="pre">KVManager.reclaimable()</span></code></a></li>
@@ -1619,6 +1882,7 @@ counts and seals need none of their own.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.remove_request"><code class="docutils literal notranslate"><span class="pre">KVManager.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.reset_default_cursors"><code class="docutils literal notranslate"><span class="pre">KVManager.reset_default_cursors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.reset_request"><code class="docutils literal notranslate"><span class="pre">KVManager.reset_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">KVManager.resolve_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">KVManager.set_layer_idx()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.supports_eviction"><code class="docutils literal notranslate"><span class="pre">KVManager.supports_eviction</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.supports_preplan"><code class="docutils literal notranslate"><span class="pre">KVManager.supports_preplan</span></code></a></li>
@@ -1652,6 +1916,18 @@ counts and seals need none of their own.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.sealed"><code class="docutils literal notranslate"><span class="pre">PageArena.sealed</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain"><code class="docutils literal notranslate"><span class="pre">PrefixChain</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.covered_len"><code class="docutils literal notranslate"><span class="pre">PrefixChain.covered_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.cursor"><code class="docutils literal notranslate"><span class="pre">PrefixChain.cursor</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.extend"><code class="docutils literal notranslate"><span class="pre">PrefixChain.extend()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.keyed_pages"><code class="docutils literal notranslate"><span class="pre">PrefixChain.keyed_pages</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.keys"><code class="docutils literal notranslate"><span class="pre">PrefixChain.keys</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.pages_filled"><code class="docutils literal notranslate"><span class="pre">PrefixChain.pages_filled()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.reported"><code class="docutils literal notranslate"><span class="pre">PrefixChain.reported</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.seed"><code class="docutils literal notranslate"><span class="pre">PrefixChain.seed()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PrefixChain.unkeyed"><code class="docutils literal notranslate"><span class="pre">PrefixChain.unkeyed</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PublishedKVInfo"><code class="docutils literal notranslate"><span class="pre">PublishedKVInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PublishedKVInfo.build_for_rank"><code class="docutils literal notranslate"><span class="pre">PublishedKVInfo.build_for_rank()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PublishedKVInfo.get"><code class="docutils literal notranslate"><span class="pre">PublishedKVInfo.get()</span></code></a></li>
@@ -1662,6 +1938,7 @@ counts and seals need none of their own.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.RetentionPolicy"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.RetentionPolicy.context_budget"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy.context_budget</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.RetentionPolicy.protected_prefix"><code class="docutils literal notranslate"><span class="pre">RetentionPolicy.protected_prefix</span></code></a></li>
 </ul>
 </li>
 </ul>

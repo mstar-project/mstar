@@ -963,6 +963,52 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># no business sizing a resource it never plans against</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_node_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">))</span>
 
+<div class="viewcode-block" id="StepRunner.resolve_cached_prefix">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.resolve_cached_prefix">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resolve_cached_prefix</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The longest prefix every resource on ``node_name`` can serve.</span>
+
+<span class="sd">        The smallest answer wins, because a step is one span: a resource that</span>
+<span class="sd">        holds less than another has to be caught up by the tokens that run.</span>
+<span class="sd">        A resource with no opinion is not an answer of zero.</span>
+<span class="sd">        """</span>
+        <span class="n">matched</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">):</span>
+            <span class="n">answer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">resolve_cached_prefix</span><span class="p">(</span>
+                <span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">answer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="n">matched</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">answer</span> <span class="o">&lt;</span> <span class="n">matched</span><span class="p">):</span>
+                <span class="n">matched</span> <span class="o">=</span> <span class="n">answer</span>
+        <span class="k">return</span> <span class="n">matched</span> <span class="ow">or</span> <span class="mi">0</span></div>
+
+
+<div class="viewcode-block" id="StepRunner.apply_cached_prefix">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.apply_cached_prefix">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply_cached_prefix</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">,</span> <span class="n">matched_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Give every resource the agreed length, with the untrimmed inputs."""</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">apply_cached_prefix</span><span class="p">(</span>
+                <span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">matched_len</span><span class="p">,</span>
+            <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="StepRunner.extend_prefix_chains">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.extend_prefix_chains">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">extend_prefix_chains</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">outputs</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Offer this step's sampled tokens to the node's own resources."""</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_sweep</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_node_order</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">,</span> <span class="n">node_name</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">extend_prefix_chain</span><span class="p">(</span>
+                <span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">outputs</span><span class="p">,</span>
+            <span class="p">)</span></div>
+
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_check_preplan_deps</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""A pre-planning resource's dependencies must pre-plan too.</span>
 

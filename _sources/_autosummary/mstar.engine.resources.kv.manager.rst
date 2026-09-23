@@ -24,6 +24,7 @@ mstar.engine.resources.kv.manager
       KVPlanState
       KVSequenceInfo
       PageArena
+      PrefixChain
       PublishedKVInfo
       RetentionPolicy
    

@@ -30,7 +30,9 @@ mstar.engine.resources.kv
    cache
    config
    cpu_page_pool
+   keys
    manager
    plan
+   prefix_index
    transfer
 

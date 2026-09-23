@@ -572,6 +572,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.preprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.split_inputs()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.LazyRequestStates"><code class="docutils literal notranslate"><span class="pre">LazyRequestStates</span></code></a></li>
@@ -619,6 +620,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.preprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.unpack_packed_outputs()</span></code></a></li>
 </ul>
 </li>
@@ -765,6 +767,29 @@ dedicated fields.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a> | <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.split_inputs">
+<span class="sig-name descname"><span class="pre">split_inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fwd_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">end</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule.split_inputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.split_inputs" title="Link to this definition">#</a></dt>
+<dd><p>This walk’s inputs restricted to tokens <code class="docutils literal notranslate"><span class="pre">[start,</span> <span class="pre">end)</span></code>.</p>
+<p>Only the sequence-shaped fields are cut. <code class="docutils literal notranslate"><span class="pre">tensor_inputs</span></code>, <code class="docutils literal notranslate"><span class="pre">kwargs</span></code>
+and <code class="docutils literal notranslate"><span class="pre">resource_step_info</span></code> are opaque here, so a submodule carrying any
+of them says for itself how they are cut, or refuses to be cut at all.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>fwd_info</strong> (<a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference internal" href="#mstar.model.submodule_base.ARNodeInputs" title="mstar.model.submodule_base.ARNodeInputs"><em>ARNodeInputs</em></a>)</p></li>
+<li><p><strong>start</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>end</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.model.submodule_base.ARNodeInputs" title="mstar.model.submodule_base.ARNodeInputs"><em>ARNodeInputs</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1337,6 +1362,29 @@ that don’t need audio);</p></li>
 <dd></dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.split_inputs">
+<span class="sig-name descname"><span class="pre">split_inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fwd_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">end</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.split_inputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.split_inputs" title="Link to this definition">#</a></dt>
+<dd><p>This walk’s inputs restricted to tokens <code class="docutils literal notranslate"><span class="pre">[start,</span> <span class="pre">end)</span></code>.</p>
+<p><code class="docutils literal notranslate"><span class="pre">inputs</span></code> is the whole prompt, prepared once and sliced rather than
+re-derived, so anything read out of a resource while preparing is read
+once, before any part of it runs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>fwd_info</strong> (<a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a>)</p></li>
+<li><p><strong>start</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>end</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs">
 <span class="sig-name descname"><span class="pre">unpack_packed_outputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">static_output</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">real_seq_lens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_request_info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.unpack_packed_outputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs" title="Link to this definition">#</a></dt>
 <dd><p>Per-rid slicing for packed sentinels emitted by the captured graph.</p>
@@ -1530,6 +1578,7 @@ transfer yet.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.prepare_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.prepare_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.preprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.split_inputs()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.LazyRequestStates"><code class="docutils literal notranslate"><span class="pre">LazyRequestStates</span></code></a></li>
@@ -1577,6 +1626,7 @@ transfer yet.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.preprocess"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.preprocess()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_state"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_state()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.request_states"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.request_states</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.split_inputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.split_inputs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.unpack_packed_outputs"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.unpack_packed_outputs()</span></code></a></li>
 </ul>
 </li>

@@ -857,11 +857,12 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">has ownership of per-(request,label) position counter"""</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">CGSlotKey</span><span class="p">,</span> <span class="n">EngineResourceInfo</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">,</span> <span class="n">Resource</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">fingerprint</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVPlanOutputs</span><span class="p">,</span> <span class="n">SequenceView</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.position.config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">PosBackend</span><span class="p">,</span>
@@ -896,6 +897,9 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="PositionManager">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.PositionManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">PositionManager</span><span class="p">(</span><span class="n">Resource</span><span class="p">):</span>
+    <span class="c1"># only under a sequential scheme, which the load check enforces</span>
+    <span class="n">prefix_skip_safe</span> <span class="o">=</span> <span class="kc">True</span>
+
     <span class="c1"># NOTE: not an `AttentionResource`, so no label/layer cursors — this is</span>
     <span class="c1"># called once per step, not per layer. Layers reach `apply_qk` with the</span>
     <span class="c1"># label off `AttentionCallable.label`; make this one if that stops holding.</span>
@@ -964,6 +968,8 @@ window.runMermaid = runMermaid;</script>
 
         <span class="c1"># rid -&gt; label -&gt; next pos of stream</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_counters</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># rid -&gt; tokens the prefix cache matched, until `admit`</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_matched</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_static_pos_ids</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">CGSlotKey</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="c1"># plan label -&gt; ids of this step on device</span>
@@ -998,6 +1004,16 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
         <span class="k">return</span> <span class="n">buffer</span>
 
+<div class="viewcode-block" id="RopeManager.fingerprint">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.fingerprint">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">fingerprint</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+        <span class="c1"># every field, so a rope parameter nobody thought to list still</span>
+        <span class="c1"># invalidates what an older setting wrote</span>
+        <span class="k">return</span> <span class="n">fingerprint</span><span class="p">(</span><span class="o">*</span><span class="p">(</span>
+            <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="p">,</span> <span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">)</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="p">)</span>
+        <span class="p">))</span></div>
+
+
 <div class="viewcode-block" id="RopeManager.ingest_request">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.ingest_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">overrides</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
@@ -1008,13 +1024,51 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="RopeManager.remove_request">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.remove_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">remove_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_counters</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_counters</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_matched</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="RopeManager.reset_request">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.reset_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">reset_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">free</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_counters</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_counters</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_matched</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="RopeManager.apply_cached_prefix">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.apply_cached_prefix">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply_cached_prefix</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">matched_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Hold what the cache matched, until an admit seeds a counter with it."""</span>
+        <span class="k">del</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">inputs</span>
+        <span class="k">if</span> <span class="n">matched_len</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_matched</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="o">=</span> <span class="n">matched_len</span></div>
+
+
+<div class="viewcode-block" id="RopeManager.admit">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.RopeManager.admit">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="s2">"PositionStep"</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AdmitOutcome</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Start a matched prefix's counter past it, as a retrieved one does.</span>
+
+<span class="sd">        The skipped tokens sit at 0 through n-1, so a counter left at 0 would write over them.</span>
+<span class="sd">        """</span>
+        <span class="k">del</span> <span class="n">ctx</span>
+        <span class="c1"># taken by the step it was held for: a label the request writes later</span>
+        <span class="c1"># has no cached prefix of its own</span>
+        <span class="n">seeds</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_matched</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">()</span>
+            <span class="k">if</span> <span class="n">segment</span><span class="o">.</span><span class="n">request_id</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_matched</span>
+        <span class="p">}</span>
+        <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">():</span>
+            <span class="n">matched</span> <span class="o">=</span> <span class="n">seeds</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">matched</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="n">counters</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_counters</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="p">{})</span>
+            <span class="k">if</span> <span class="n">matched</span> <span class="o">&gt;</span> <span class="n">counters</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">,</span> <span class="mi">0</span><span class="p">):</span>
+                <span class="n">counters</span><span class="p">[</span><span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">matched</span>
+        <span class="k">return</span> <span class="n">ADMIT_OK</span></div>
 
 
 <div class="viewcode-block" id="RopeManager.publish">

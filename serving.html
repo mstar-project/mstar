@@ -816,7 +816,11 @@ scoped to specific <code class="docutils literal notranslate"><span class="pre">
 <td><p><em>(optional)</em> Per-resource overrides, keyed by the model’s resource names (see
 below).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code></p></td>
+<td><p><em>(optional)</em> How many requests run at once. Requests past the cap wait in the
+conductor’s queue.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code></p></td>
 <td><p><em>(optional)</em> Server-init model parameters (see below).</p></td>
 </tr>
 </tbody>
@@ -830,7 +834,8 @@ samplers that its nodes need. Each declaration has a <code class="docutils liter
 them by that name:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">resources</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">kv_cache</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">max_num_pages</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w">      </span><span class="c1"># also: page_size, max_seq_len, cpu_offload_pages</span>
+<span class="w">    </span><span class="nt">max_num_pages</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w">      </span><span class="c1"># also: page_size, max_seq_len, cpu_offload_pages,</span>
+<span class="w">                             </span><span class="c1"># prefix_cache, prefix_cache_salt</span>
 <span class="w">  </span><span class="nt">talker_attn</span><span class="p">:</span>
 <span class="w">    </span><span class="nt">flashinfer_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fa2</span><span class="w">  </span><span class="c1"># also: backend (flashinfer / dense)</span>
 <span class="w">  </span><span class="nt">vit_attn</span><span class="p">:</span><span class="w">                  </span><span class="c1"># a cacheless (ragged) attention resource</span>
@@ -842,6 +847,16 @@ its encoder context, can therefore size each one separately. If a block names a 
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level <code class="docutils literal notranslate"><span class="pre">kv_cache:</span></code> block is
 no longer read. It raises an error with a message describing the migration.</p>
+<p><code class="docutils literal notranslate"><span class="pre">prefix_cache:</span> <span class="pre">false</span></code> turns cross-request prefix reuse off for that cache, and
+<code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code> keeps two otherwise identical deployments off each other’s
+cached pages. A single request opts out by sending <code class="docutils literal notranslate"><span class="pre">prefix_cache=False</span></code>, which
+travels with its other <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>.</p>
+<p>A cached prompt no longer reserves its pages, so the pool no longer limits how many
+requests are admitted. It has to hold the decode of every request allowed to run at once,
+and a decode step that finds no free page holds its requests until they time out. Two
+settings prevent that. <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> caps how many requests run at once, and
+the pool’s pages divided by the pages one request needs, prompt and output together, is a
+safe value. <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code> gives a full pool a request to move to the host.</p>
 <p><strong>Single GPU.</strong> Everything on rank 0:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"bagel"</span>
 <span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32768</span>

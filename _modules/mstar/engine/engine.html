@@ -860,7 +860,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Mapping</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -885,6 +886,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">SubmoduleStep</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">EngineResourceInfo</span><span class="p">,</span> <span class="n">build_resource</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">fingerprint</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.transfer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TransferEngineInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">resolve_spec_dependencies</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
@@ -893,6 +895,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">AdmitOutcome</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">ARNodeInputs</span><span class="p">,</span>
     <span class="n">LazyRequestStates</span><span class="p">,</span>
     <span class="n">ModelInputsFromEngine</span><span class="p">,</span>
     <span class="n">NodeInputs</span><span class="p">,</span>
@@ -901,6 +904,9 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.profile.worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">ExecTimings</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">mark</span><span class="p">,</span> <span class="n">range_pop</span><span class="p">,</span> <span class="n">range_push</span>
 
+<span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Model</span>
+
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 <span class="c1"># Block the GPU thread on its step's outputs before returning (1-step launch</span>
@@ -908,6 +914,30 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># GPU(N+1)/postprocess(N) overlap. Enable only where 2 steps overflow the CUDA</span>
 <span class="c1"># launch queue and block a launch (machine/driver dependent).</span>
 <span class="n">_ENGINE_STEP_SYNC</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_ENGINE_STEP_SYNC"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span>
+
+
+<div class="viewcode-block" id="checkpoint_identity">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.checkpoint_identity">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">checkpoint_identity</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Name the weights a cached page was produced under, without reading them.</span>
+
+<span class="sd">    A checkpoint with no safetensors index falls back to its shard names and</span>
+<span class="sd">    sizes, which catches a replaced shard but not one edited in place at the</span>
+<span class="sd">    same length.</span>
+<span class="sd">    """</span>
+    <span class="n">root</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+    <span class="n">index</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"model.safetensors.index.json"</span>
+    <span class="n">parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">object</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">if</span> <span class="n">index</span><span class="o">.</span><span class="n">is_file</span><span class="p">():</span>
+        <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">index</span><span class="o">.</span><span class="n">read_bytes</span><span class="p">())</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">shard</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">root</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="s2">"*.safetensors"</span><span class="p">)):</span>
+            <span class="n">parts</span> <span class="o">+=</span> <span class="p">[</span><span class="n">shard</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">shard</span><span class="o">.</span><span class="n">stat</span><span class="p">()</span><span class="o">.</span><span class="n">st_size</span><span class="p">]</span>
+    <span class="n">config</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"config.json"</span>
+    <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">is_file</span><span class="p">():</span>
+        <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">read_bytes</span><span class="p">())</span>
+    <span class="k">return</span> <span class="n">fingerprint</span><span class="p">(</span><span class="o">*</span><span class="n">parts</span><span class="p">)</span></div>
+
 
 
 <div class="viewcode-block" id="SubmoduleManagement">
@@ -1190,6 +1220,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
         <span class="n">transfer_engine_info</span><span class="p">:</span> <span class="n">TransferEngineInfo</span><span class="p">,</span>
         <span class="n">kv_cache_type</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">model</span><span class="p">:</span> <span class="s2">"Model | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
         <span class="k">if</span> <span class="n">kv_cache_type</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -1234,6 +1265,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">node_resources</span><span class="o">=</span><span class="p">{</span><span class="n">n</span><span class="p">:</span> <span class="n">node_to_resources</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="p">[])</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">node_names</span><span class="p">},</span>
             <span class="n">enable_nvtx</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_enable_nvtx</span><span class="p">,</span>
         <span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_open_prefix_caches</span><span class="p">(</span><span class="n">specs_by_key</span><span class="p">,</span> <span class="n">model</span><span class="p">)</span>
 
         <span class="k">for</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">submodule</span> <span class="ow">in</span> <span class="n">submodules</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="c1"># Inference only. `exec` is under no_grad, but `prepare_inputs` and</span>
@@ -1386,6 +1419,64 @@ window.runMermaid = runMermaid;</script>
             <span class="n">runners</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">runner</span>
         <span class="k">return</span> <span class="n">runners</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_open_prefix_caches</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs_by_key</span><span class="p">,</span> <span class="n">model</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Root each resource's cache in the weights, the preprocessing, and the</span>
+<span class="sd">        config of every resource its pages were planned against."""</span>
+        <span class="n">checkpoint</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">checkpoint_path</span><span class="p">()</span> <span class="k">if</span> <span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">shared</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">checkpoint_identity</span><span class="p">(</span><span class="n">checkpoint</span><span class="p">)</span> <span class="k">if</span> <span class="n">checkpoint</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="sa">b</span><span class="s2">""</span><span class="p">,</span>
+            <span class="n">model</span><span class="o">.</span><span class="n">preprocess_fingerprint</span><span class="p">()</span> <span class="k">if</span> <span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="s2">""</span><span class="p">,</span>
+        <span class="p">]</span>
+        <span class="n">declared</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">prefix_key_streams</span><span class="p">()</span> <span class="k">if</span> <span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_model</span> <span class="o">=</span> <span class="nb">type</span><span class="p">(</span><span class="n">model</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span>
+        <span class="c1"># node -&gt; the walks a probe may run on: the keyed walk of every stream</span>
+        <span class="c1"># declared on a cache the node uses</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_walks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">by_label</span> <span class="ow">in</span> <span class="n">declared</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">for</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">specs_by_key</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">nodes</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_walks</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="nb">set</span><span class="p">())</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
+                    <span class="n">stream</span><span class="o">.</span><span class="n">walk</span> <span class="k">for</span> <span class="n">stream</span> <span class="ow">in</span> <span class="n">by_label</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+                <span class="p">)</span>
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">resource</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">checkpoint</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">declared</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">):</span>
+                <span class="n">config</span> <span class="o">=</span> <span class="n">specs_by_key</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">config</span>
+                <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">prefix_cache</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">config</span><span class="o">.</span><span class="n">prefix_cache_salt</span><span class="p">:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                        <span class="s2">"KV </span><span class="si">%s</span><span class="s2">: prefix cache off: </span><span class="si">%s</span><span class="s2"> names no checkpoint, so "</span>
+                        <span class="s2">"builds that differ only in their weights cannot be "</span>
+                        <span class="s2">"told apart; set prefix_cache_salt to enable it"</span><span class="p">,</span>
+                        <span class="n">key</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_model</span><span class="p">,</span>
+                    <span class="p">)</span>
+                    <span class="k">continue</span>
+            <span class="c1"># its own, then its dependents' in key order, so the root does not</span>
+            <span class="c1"># move with the order the engine happened to build them in</span>
+            <span class="n">parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">resource</span><span class="o">.</span><span class="n">fingerprint</span><span class="p">()]</span>
+            <span class="k">for</span> <span class="n">other</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">specs_by_key</span><span class="p">):</span>
+                <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">specs_by_key</span><span class="p">[</span><span class="n">other</span><span class="p">]</span><span class="o">.</span><span class="n">depends_on</span><span class="p">():</span>
+                    <span class="n">built</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">other</span><span class="p">)</span>
+                    <span class="n">mark</span> <span class="o">=</span> <span class="n">built</span><span class="o">.</span><span class="n">fingerprint</span><span class="p">()</span> <span class="k">if</span> <span class="n">built</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+                    <span class="k">if</span> <span class="n">mark</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">mark</span><span class="p">)</span>
+            <span class="n">opened</span> <span class="o">=</span> <span class="n">resource</span><span class="o">.</span><span class="n">enable_prefix_cache</span><span class="p">(</span><span class="n">fingerprint</span><span class="p">(</span><span class="o">*</span><span class="n">shared</span><span class="p">,</span> <span class="o">*</span><span class="n">parts</span><span class="p">),</span> <span class="p">{</span>
+                <span class="n">label</span><span class="p">:</span> <span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">walk</span><span class="p">,</span> <span class="n">stream</span><span class="o">.</span><span class="n">decode_walk</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">stream</span> <span class="ow">in</span> <span class="n">declared</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+            <span class="p">})</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">opened</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">declared</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">):</span>
+                <span class="k">continue</span>
+            <span class="n">nodes</span> <span class="o">=</span> <span class="s2">", "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="nb">sorted</span><span class="p">(</span><span class="n">specs_by_key</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">nodes</span><span class="p">))</span>
+            <span class="k">for</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">declared</span><span class="p">[</span><span class="n">key</span><span class="p">]:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">"KV </span><span class="si">%s</span><span class="s2">: prefix cache open for </span><span class="si">%s</span><span class="s2"> on </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">nodes</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">resource</span><span class="o">.</span><span class="n">supports_eviction</span><span class="p">:</span>
+                <span class="c1"># a hit allocates only the prompt's tail, so admission no longer</span>
+                <span class="c1"># bounds how many requests decode at once</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">"KV </span><span class="si">%s</span><span class="s2">: prefix cache on with cpu_offload_pages 0: a decode "</span>
+                    <span class="s2">"step that finds nothing to evict holds its requests until "</span>
+                    <span class="s2">"they time out. max_concurrent_requests caps how many run "</span>
+                    <span class="s2">"at once, and cpu_offload_pages gives the worker a victim"</span><span class="p">,</span>
+                    <span class="n">key</span><span class="p">,</span>
+                <span class="p">)</span>
+
 <div class="viewcode-block" id="Engine.prepare_inputs">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine.prepare_inputs">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">prepare_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">:</span> <span class="n">ExecutingBatch</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1415,6 +1506,8 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">inputs</span><span class="o">=</span><span class="n">batch</span><span class="o">.</span><span class="n">per_request_input_tensors</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{}),</span>
                     <span class="n">resources</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_submodules</span><span class="p">[</span><span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">resources</span><span class="p">,</span>
                 <span class="p">)</span>
+                <span class="k">if</span> <span class="n">req_inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">req_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_skip_cached_prefix</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">req_inputs</span><span class="p">)</span>
             <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">error</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span>
                     <span class="s2">"prepare_inputs failed for request </span><span class="si">%s</span><span class="s2"> (node=</span><span class="si">%s</span><span class="s2">, walk=</span><span class="si">%s</span><span class="s2">)"</span><span class="p">,</span>
@@ -1431,6 +1524,49 @@ window.runMermaid = runMermaid;</script>
         <span class="n">batch</span><span class="o">.</span><span class="n">drop_rids</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">skipped_rids</span> <span class="o">|</span> <span class="n">batch</span><span class="o">.</span><span class="n">failed_requests</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
         <span class="n">batch</span><span class="o">.</span><span class="n">running_batched</span> <span class="o">=</span> <span class="n">submodule</span><span class="o">.</span><span class="n">can_batch</span><span class="p">(</span>
             <span class="n">batch</span><span class="o">=</span><span class="n">batch</span><span class="p">,</span> <span class="n">model_inputs</span><span class="o">=</span><span class="n">node_inputs</span>
+        <span class="p">)</span>
+
+<div class="viewcode-block" id="Engine.extend_prefix_chains">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine.extend_prefix_chains">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">extend_prefix_chains</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">:</span> <span class="n">ExecutingBatch</span><span class="p">,</span> <span class="n">outputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NameToTensorList</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Key what this step generated, from the stop check's host copy."""</span>
+        <span class="n">walk</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">step_context</span><span class="o">.</span><span class="n">graph_walk</span>
+        <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">batch</span><span class="o">.</span><span class="n">request_ids</span><span class="p">:</span>
+            <span class="n">per_rid</span> <span class="o">=</span> <span class="n">outputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">per_rid</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_runner</span><span class="o">.</span><span class="n">extend_prefix_chains</span><span class="p">(</span>
+                    <span class="n">rid</span><span class="p">,</span> <span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="p">,</span> <span class="n">walk</span><span class="p">,</span> <span class="n">per_rid</span><span class="p">,</span>
+                <span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_skip_cached_prefix</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">:</span> <span class="n">ExecutingBatch</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">inputs</span><span class="p">:</span> <span class="n">NodeInputs</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeInputs</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Cut the leading tokens this node's resources already hold.</span>
+
+<span class="sd">        Only the keyed walk is probed, and only when `split_inputs` can cut its</span>
+<span class="sd">        inputs; a guided walk writes two labels from one input, so it is skipped.</span>
+<span class="sd">        """</span>
+        <span class="n">walk</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">step_context</span><span class="o">.</span><span class="n">graph_walk</span>
+        <span class="k">if</span> <span class="n">walk</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_walks</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="p">,</span> <span class="p">()):</span>
+            <span class="k">return</span> <span class="n">inputs</span>
+        <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">ARNodeInputs</span><span class="p">)</span> <span class="ow">and</span> <span class="n">inputs</span><span class="o">.</span><span class="n">custom_pos_ids</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">,</span> <span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_prefix_model</span><span class="si">}</span><span class="s2"> keys the </span><span class="si">{</span><span class="n">walk</span><span class="si">!r}</span><span class="s2"> walk of </span><span class="si">{</span><span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="si">}</span><span class="s2"> "</span>
+            <span class="s2">"for prefix reuse, but that walk places positions of its own"</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">inputs</span><span class="o">.</span><span class="n">tensor_inputs</span> <span class="ow">or</span> <span class="n">inputs</span><span class="o">.</span><span class="n">kwargs</span> <span class="ow">or</span> <span class="n">inputs</span><span class="o">.</span><span class="n">resource_step_info</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">inputs</span>
+        <span class="n">matched</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_runner</span><span class="o">.</span><span class="n">resolve_cached_prefix</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="p">,</span> <span class="n">walk</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_runner</span><span class="o">.</span><span class="n">apply_cached_prefix</span><span class="p">(</span>
+            <span class="n">rid</span><span class="p">,</span> <span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="p">,</span> <span class="n">walk</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">matched</span><span class="p">,</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">matched</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">inputs</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodules</span><span class="p">[</span><span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">submodule</span><span class="o">.</span><span class="n">split_inputs</span><span class="p">(</span>
+            <span class="n">walk</span><span class="p">,</span> <span class="n">batch</span><span class="o">.</span><span class="n">per_request_info</span><span class="p">[</span><span class="n">rid</span><span class="p">],</span> <span class="n">inputs</span><span class="p">,</span>
+            <span class="n">matched</span><span class="p">,</span> <span class="n">inputs</span><span class="o">.</span><span class="n">input_seq_len</span><span class="p">,</span>
         <span class="p">)</span>
 
 <div class="viewcode-block" id="Engine.exec">

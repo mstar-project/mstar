@@ -892,6 +892,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">layout</span><span class="p">:</span> <span class="n">KVLayout</span> <span class="o">=</span> <span class="n">KVLayout</span><span class="o">.</span><span class="n">NHD</span>
     <span class="c1"># pages of pinned host memory to keep for offloading; 0 disables it</span>
     <span class="n">cpu_offload_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># folded into the root, not checked at match time</span>
+    <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
+    <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -929,6 +932,33 @@ window.runMermaid = runMermaid;</script>
     <span class="n">needed_labels</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">needed_labels_per_node</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="n">needed_labels_per_node_walk</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+    <span class="c1"># label -&gt; one key per page, from the preprocess worker</span>
+    <span class="n">prefix_keys</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># label -&gt; prompt tokens past the last whole page, keyed once generation fills it</span>
+    <span class="n">prefix_tail</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># label -&gt; the output tensor its sampled ids arrive in, if the stream keys generation</span>
+    <span class="n">prefix_decode</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="KVReqConfig.apply_conductor_config">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVReqConfig.apply_conductor_config">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply_conductor_config</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">prefix_keys</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">prefix_tail</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">prefix_decode</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="k">if</span> <span class="n">prefix_keys</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">prefix_keys</span> <span class="o">=</span> <span class="n">prefix_keys</span>
+        <span class="k">if</span> <span class="n">prefix_tail</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">prefix_tail</span> <span class="o">=</span> <span class="n">prefix_tail</span>
+        <span class="k">if</span> <span class="n">prefix_decode</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">prefix_decode</span> <span class="o">=</span> <span class="n">prefix_decode</span>
+        <span class="k">if</span> <span class="n">prefix_cache</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">prefix_cache</span> <span class="o">=</span> <span class="n">prefix_cache</span></div>
+
 
 <div class="viewcode-block" id="KVReqConfig.get_labels">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVReqConfig.get_labels">[docs]</a>
@@ -964,6 +994,8 @@ window.runMermaid = runMermaid;</script>
         <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">cpu_offload_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">"""How much cache this deployment gets, and how it is cut up."""</span>
         <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="p">(</span>
@@ -971,6 +1003,8 @@ window.runMermaid = runMermaid;</script>
             <span class="p">(</span><span class="s2">"page_size"</span><span class="p">,</span> <span class="n">page_size</span><span class="p">),</span>
             <span class="p">(</span><span class="s2">"max_seq_len"</span><span class="p">,</span> <span class="n">max_seq_len</span><span class="p">),</span>
             <span class="p">(</span><span class="s2">"cpu_offload_pages"</span><span class="p">,</span> <span class="n">cpu_offload_pages</span><span class="p">),</span>
+            <span class="p">(</span><span class="s2">"prefix_cache_salt"</span><span class="p">,</span> <span class="n">prefix_cache_salt</span><span class="p">),</span>
+            <span class="p">(</span><span class="s2">"prefix_cache"</span><span class="p">,</span> <span class="n">prefix_cache</span><span class="p">),</span>
         <span class="p">):</span>
             <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span></div>

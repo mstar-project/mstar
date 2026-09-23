@@ -570,6 +570,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.evictable"><code class="docutils literal notranslate"><span class="pre">Engine.evictable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.exec"><code class="docutils literal notranslate"><span class="pre">Engine.exec()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.exec_and_postprocess"><code class="docutils literal notranslate"><span class="pre">Engine.exec_and_postprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.extend_prefix_chains"><code class="docutils literal notranslate"><span class="pre">Engine.extend_prefix_chains()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.finalize_batch"><code class="docutils literal notranslate"><span class="pre">Engine.finalize_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.get_max_batch_size"><code class="docutils literal notranslate"><span class="pre">Engine.get_max_batch_size()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.is_offloaded"><code class="docutils literal notranslate"><span class="pre">Engine.is_offloaded()</span></code></a></li>
@@ -638,6 +639,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.SubmoduleManagement.submodule"><code class="docutils literal notranslate"><span class="pre">SubmoduleManagement.submodule</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.checkpoint_identity"><code class="docutils literal notranslate"><span class="pre">checkpoint_identity()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -651,6 +653,15 @@
                   
   <section id="module-mstar.engine.engine">
 <span id="mstar-engine-engine"></span><h1>mstar.engine.engine<a class="headerlink" href="#module-mstar.engine.engine" title="Link to this heading">#</a></h1>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.engine.checkpoint_identity" title="mstar.engine.engine.checkpoint_identity"><code class="xref py py-obj docutils literal notranslate"><span class="pre">checkpoint_identity</span></code></a>(path)</p></td>
+<td><p>Name the weights a cached page was produced under, without reading them.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -810,6 +821,23 @@ place those itself.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.engine.Engine.extend_prefix_chains">
+<span class="sig-name descname"><span class="pre">extend_prefix_chains</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/engine.html#Engine.extend_prefix_chains"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.engine.Engine.extend_prefix_chains" title="Link to this definition">#</a></dt>
+<dd><p>Key what this step generated, from the stop check’s host copy.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>batch</strong> (<a class="reference internal" href="#mstar.engine.engine.ExecutingBatch" title="mstar.engine.engine.ExecutingBatch"><em>ExecutingBatch</em></a>)</p></li>
+<li><p><strong>outputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a><em>]</em><em>]</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.engine.Engine.finalize_batch">
 <span class="sig-name descname"><span class="pre">finalize_batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/engine.html#Engine.finalize_batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.engine.Engine.finalize_batch" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -859,7 +887,7 @@ other batch instead of running back to back.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.engine.Engine.load_model">
-<span class="sig-name descname"><span class="pre">load_model</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">submodules</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">specs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">parallel_groups</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">transfer_engine_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache_type</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/engine.html#Engine.load_model"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.engine.Engine.load_model" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">load_model</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">submodules</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">specs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">parallel_groups</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">transfer_engine_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache_type</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/engine.html#Engine.load_model"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.engine.Engine.load_model" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -868,6 +896,7 @@ other batch instead of running back to back.</p>
 <li><p><strong>parallel_groups</strong> (<em>WorkerParallelGroups</em>)</p></li>
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>)</p></li>
 <li><p><strong>transfer_engine_info</strong> (<a class="reference internal" href="mstar.engine.resources.kv.transfer.html#mstar.engine.resources.kv.transfer.TransferEngineInfo" title="mstar.engine.resources.kv.transfer.TransferEngineInfo"><em>TransferEngineInfo</em></a>)</p></li>
+<li><p><strong>model</strong> (<em>Model</em><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -1437,6 +1466,23 @@ so a lease-time write would race the replay reading <code class="docutils litera
 
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.engine.checkpoint_identity">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.engine.</span></span><span class="sig-name descname"><span class="pre">checkpoint_identity</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/engine.html#checkpoint_identity"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.engine.checkpoint_identity" title="Link to this definition">#</a></dt>
+<dd><p>Name the weights a cached page was produced under, without reading them.</p>
+<p>A checkpoint with no safetensors index falls back to its shard names and
+sizes, which catches a replaced shard but not one edited in place at the
+same length.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/pathlib.html#pathlib.Path" title="(in Python v3.12)"><em>Path</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -1494,6 +1540,7 @@ so a lease-time write would race the replay reading <code class="docutils litera
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.evictable"><code class="docutils literal notranslate"><span class="pre">Engine.evictable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.exec"><code class="docutils literal notranslate"><span class="pre">Engine.exec()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.exec_and_postprocess"><code class="docutils literal notranslate"><span class="pre">Engine.exec_and_postprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.extend_prefix_chains"><code class="docutils literal notranslate"><span class="pre">Engine.extend_prefix_chains()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.finalize_batch"><code class="docutils literal notranslate"><span class="pre">Engine.finalize_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.get_max_batch_size"><code class="docutils literal notranslate"><span class="pre">Engine.get_max_batch_size()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.Engine.is_offloaded"><code class="docutils literal notranslate"><span class="pre">Engine.is_offloaded()</span></code></a></li>
@@ -1562,6 +1609,7 @@ so a lease-time write would race the replay reading <code class="docutils litera
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.SubmoduleManagement.submodule"><code class="docutils literal notranslate"><span class="pre">SubmoduleManagement.submodule</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.engine.checkpoint_identity"><code class="docutils literal notranslate"><span class="pre">checkpoint_identity()</span></code></a></li>
 </ul>
   </nav></div>
 

@@ -872,6 +872,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.cache</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVCache</span><span class="p">,</span> <span class="n">PageAllocator</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVConfig</span><span class="p">,</span> <span class="n">KVReqConfig</span><span class="p">,</span> <span class="n">KVSpec</span><span class="p">,</span> <span class="n">KVStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.cpu_page_pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">CPUPagePool</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">fingerprint</span><span class="p">,</span> <span class="n">page_key</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">SINK_PAGE</span><span class="p">,</span>
     <span class="n">KVPlanOutput</span><span class="p">,</span>
@@ -881,6 +882,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">build_paged_indptrs</span><span class="p">,</span>
     <span class="n">group_by_plan_label</span><span class="p">,</span>
 <span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.prefix_index</span><span class="w"> </span><span class="kn">import</span> <span class="n">PrefixIndex</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.transfer</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVTransferManager</span><span class="p">,</span> <span class="n">TransferEngineInfo</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">ADMIT_OK</span><span class="p">,</span>
@@ -980,7 +982,67 @@ window.runMermaid = runMermaid;</script>
 <span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">RetentionPolicy</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""fifo retention of `context_budget`"""</span>
-    <span class="n">context_budget</span><span class="p">:</span> <span class="nb">int</span></div>
+    <span class="n">context_budget</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># front tokens the window never releases; only pages within them are indexed</span>
+    <span class="n">protected_prefix</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span></div>
+
+
+
+<div class="viewcode-block" id="PrefixChain">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.PrefixChain">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PrefixChain</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The keys that name a stream's pages, and how far the index holds them."""</span>
+    <span class="c1"># one key per page of this stream's prompt, from the preprocess worker</span>
+    <span class="n">keys</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span>
+    <span class="c1"># tokens not yet keyed: the prompt tail, then sampled ids, until a page fills</span>
+    <span class="n">unkeyed</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span>
+    <span class="c1"># keys naming a whole page; the prompt's last key names a partial one until generation fills it</span>
+    <span class="n">keyed_pages</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># tokens the chain accounts for: its prompt, and every token sampled since</span>
+    <span class="n">covered_len</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="c1"># how many of this stream's pages the index already holds</span>
+    <span class="n">cursor</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># set once this stream has been reported, so a request that is admitted</span>
+    <span class="c1"># again (a refused admit, a second partition) is still one line</span>
+    <span class="n">reported</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+<div class="viewcode-block" id="PrefixChain.seed">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.PrefixChain.seed">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">seed</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">keys</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">],</span> <span class="n">tail</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PrefixChain"</span><span class="p">:</span>
+        <span class="n">keyed_pages</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">keys</span><span class="p">)</span> <span class="o">-</span> <span class="p">(</span><span class="mi">1</span> <span class="k">if</span> <span class="n">tail</span> <span class="k">else</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span>
+            <span class="n">keys</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">keys</span><span class="p">),</span> <span class="n">unkeyed</span><span class="o">=</span><span class="n">tail</span><span class="p">,</span> <span class="n">keyed_pages</span><span class="o">=</span><span class="n">keyed_pages</span><span class="p">,</span>
+            <span class="n">covered_len</span><span class="o">=</span><span class="n">keyed_pages</span> <span class="o">*</span> <span class="n">page_size</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="n">tail</span><span class="p">),</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="PrefixChain.extend">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.PrefixChain.extend">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">extend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">unkeyed</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">tokens</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">covered_len</span> <span class="o">+=</span> <span class="nb">len</span><span class="p">(</span><span class="n">tokens</span><span class="p">)</span>
+        <span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">unkeyed</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">page_size</span><span class="p">:</span>
+            <span class="n">whole</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">keyed_pages</span>
+            <span class="n">key</span> <span class="o">=</span> <span class="n">page_key</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">keys</span><span class="p">[</span><span class="n">whole</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]</span> <span class="k">if</span> <span class="n">whole</span> <span class="k">else</span> <span class="sa">b</span><span class="s2">""</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">unkeyed</span><span class="p">[:</span><span class="n">page_size</span><span class="p">],</span>
+            <span class="p">)</span>
+            <span class="c1"># overwrites the partial key the prompt left here, if any</span>
+            <span class="k">if</span> <span class="n">whole</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">keys</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">keys</span><span class="p">[</span><span class="n">whole</span><span class="p">]</span> <span class="o">=</span> <span class="n">key</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">keys</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">keyed_pages</span> <span class="o">=</span> <span class="n">whole</span> <span class="o">+</span> <span class="mi">1</span>
+            <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">unkeyed</span><span class="p">[:</span><span class="n">page_size</span><span class="p">]</span></div>
+
+
+<div class="viewcode-block" id="PrefixChain.pages_filled">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.PrefixChain.pages_filled">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pages_filled</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stored_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="n">stored_len</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">keyed_pages</span><span class="p">)</span></div>
+</div>
 
 
 
@@ -999,6 +1061,13 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># a failed retrieve, latched: the future is consumed once, but every later</span>
     <span class="c1"># readiness check has to keep reporting the stream as unusable</span>
     <span class="n">read_error</span><span class="p">:</span> <span class="ne">BaseException</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># None while the stream is unkeyed, and once its keys stop describing it</span>
+    <span class="n">chain</span><span class="p">:</span> <span class="n">PrefixChain</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># pages the index matched for this stream and is holding for it, from the</span>
+    <span class="c1"># probe until `admit` converts them onto `page_indices`</span>
+    <span class="n">lease</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># set at conversion, cleared at `commit`, so a refused admit's re-probe answers the same</span>
+    <span class="n">converted</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">offloaded</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">generation</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
 
@@ -1018,6 +1087,17 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">if</span> <span class="n">freed</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">page_indices</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="CacheStream.forget_chain">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.CacheStream.forget_chain">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forget_chain</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Drop what the chain knows of this stream, for a run that starts over.</span>
+
+<span class="sd">        Not part of `reset`, which an offload calls too: a reload brings the</span>
+<span class="sd">        same tokens back, so the chain that describes them has to survive it.</span>
+<span class="sd">        """</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">chain</span> <span class="o">=</span> <span class="kc">None</span></div>
 </div>
 
 
@@ -1133,6 +1213,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="KVManager">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">KVManager</span><span class="p">(</span><span class="n">AttentionResource</span><span class="p">):</span>
+    <span class="n">prefix_skip_safe</span> <span class="o">=</span> <span class="kc">True</span>
+
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">cfg</span><span class="p">:</span> <span class="n">KVConfig</span><span class="p">,</span>
@@ -1169,6 +1251,17 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">LabelToStream</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KVReqConfig</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># its entity id is the worker id, and one worker is one copy of a node</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_replica</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">transfer_engine_info</span><span class="o">.</span><span class="n">my_entity_id</span>
+            <span class="k">if</span> <span class="n">transfer_engine_info</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_root</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_index</span><span class="p">:</span> <span class="n">PrefixIndex</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># label -&gt; the walks its keys describe; a label not here is not gated</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_walks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># nodes already warned that a declared stream reached them unkeyed</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_warned_unkeyed</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_rank</span> <span class="o">=</span> <span class="n">joint_comm_group</span><span class="o">.</span><span class="n">rank</span> <span class="k">if</span> <span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_world_size</span> <span class="o">=</span> <span class="n">joint_comm_group</span><span class="o">.</span><span class="n">world_size</span> <span class="k">if</span> <span class="n">joint_comm_group</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">1</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_comm_group</span> <span class="o">=</span> <span class="n">joint_comm_group</span>
@@ -1236,6 +1329,288 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
         <span class="k">return</span> <span class="n">state</span>
 
+<div class="viewcode-block" id="KVManager.enable_prefix_cache">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.enable_prefix_cache">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">enable_prefix_cache</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">root</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">walks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Open the index under ``root``, the identity every key hangs from."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_walks</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">label</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">(</span><span class="n">walk</span> <span class="k">for</span> <span class="n">walk</span> <span class="ow">in</span> <span class="n">named</span> <span class="k">if</span> <span class="n">walk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">named</span> <span class="ow">in</span> <span class="p">(</span><span class="n">walks</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+        <span class="p">}</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">prefix_cache</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_world_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="s2">"KV </span><span class="si">%s</span><span class="s2">: prefix cache off at world size </span><span class="si">%d</span><span class="s2">: the ranks index "</span>
+                <span class="s2">"independently and would match different lengths"</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_world_size</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_prefix_root</span> <span class="o">=</span> <span class="n">root</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="o">=</span> <span class="n">PrefixIndex</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="p">)</span>
+        <span class="k">return</span> <span class="kc">True</span></div>
+
+
+<div class="viewcode-block" id="KVManager.resolve_cached_prefix">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.resolve_cached_prefix">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">resolve_cached_prefix</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Match this request's prefix against the index and hold what matched.</span>
+
+<span class="sd">        Answers the same length every time it is asked, and takes one reference</span>
+<span class="sd">        however often that is: a probe is repeated whenever a step is prepared</span>
+<span class="sd">        again.</span>
+<span class="sd">        """</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_label</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_warn_unkeyed</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span>
+                <span class="k">return</span> <span class="kc">None</span>
+            <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ensure_label</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">converted</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span>
+            <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">lease</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
+            <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">offloaded</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">read_pending</span><span class="p">:</span>
+                <span class="k">return</span> <span class="kc">None</span>
+            <span class="n">keys</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">keys</span><span class="p">)</span>
+        <span class="c1"># outside the lock: one SHA-256 per page, and admit, commit and remove would wait on it</span>
+        <span class="n">rooted</span> <span class="o">=</span> <span class="p">[</span><span class="n">fingerprint</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_prefix_root</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">]</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">stream</span><span class="p">:</span>
+                <span class="k">return</span> <span class="kc">None</span>
+            <span class="c1"># one key short, so a fully cached prompt still leaves a token to run</span>
+            <span class="n">matched</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span><span class="o">.</span><span class="n">lookup</span><span class="p">(</span><span class="n">rooted</span><span class="p">)[:</span><span class="nb">len</span><span class="p">(</span><span class="n">rooted</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">matched</span><span class="p">:</span>
+                <span class="k">return</span> <span class="kc">None</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">retain</span><span class="p">(</span><span class="n">matched</span><span class="p">)</span>
+            <span class="n">stream</span><span class="o">.</span><span class="n">lease</span> <span class="o">=</span> <span class="n">matched</span>
+            <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="n">matched</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span></div>
+
+
+<div class="viewcode-block" id="KVManager.apply_cached_prefix">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.apply_cached_prefix">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply_cached_prefix</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">matched_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Cut this stream's lease down to ``matched_len``, the agreed length."""</span>
+        <span class="k">del</span> <span class="n">inputs</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_label</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">return</span>
+            <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">stream</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">lease</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span><span class="p">:</span>
+                <span class="k">return</span>
+            <span class="n">keep</span> <span class="o">=</span> <span class="n">matched_len</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
+            <span class="k">if</span> <span class="n">keep</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">lease</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">lease</span><span class="p">[</span><span class="n">keep</span><span class="p">:])</span>
+                <span class="n">stream</span><span class="o">.</span><span class="n">lease</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">lease</span><span class="p">[:</span><span class="n">keep</span><span class="p">]</span> <span class="ow">or</span> <span class="kc">None</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_index_filled_pages</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">segment</span><span class="p">:</span> <span class="n">Segment</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">CacheStream</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Offer every page this commit filled to the index.</span>
+
+<span class="sd">        Only whole pages, because the tail is still being written into and a</span>
+<span class="sd">        second owner would be reading bytes that are still moving. A dummy or</span>
+<span class="sd">        padded row is left out: its pages hold whatever the capture wrote.</span>
+<span class="sd">        """</span>
+        <span class="n">chain</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">chain</span>
+        <span class="k">if</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="kc">None</span>
+            <span class="ow">or</span> <span class="n">ctx</span><span class="o">.</span><span class="n">capture</span>
+            <span class="ow">or</span> <span class="n">segment</span><span class="o">.</span><span class="n">request_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">ctx</span><span class="o">.</span><span class="n">request_ids</span>
+            <span class="ow">or</span> <span class="n">chain</span> <span class="ow">is</span> <span class="kc">None</span>
+        <span class="p">):</span>
+            <span class="k">return</span>
+        <span class="n">walks</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_walks</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">walks</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">ctx</span><span class="o">.</span><span class="n">graph_walk</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">walks</span><span class="p">:</span>
+            <span class="c1"># another walk wrote this span (an edit's image, say), which the keys do not describe</span>
+            <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">return</span>
+        <span class="c1"># what was here before this write, not after: a decode step can commit</span>
+        <span class="c1"># before the token it writes is read back and counted</span>
+        <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">released</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">-</span> <span class="n">segment</span><span class="o">.</span><span class="n">span</span> <span class="o">&gt;</span> <span class="n">chain</span><span class="o">.</span><span class="n">covered_len</span><span class="p">:</span>
+            <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">return</span>
+        <span class="n">filled</span> <span class="o">=</span> <span class="n">chain</span><span class="o">.</span><span class="n">pages_filled</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">retention</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">filled</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span>
+                <span class="n">filled</span><span class="p">,</span> <span class="n">stream</span><span class="o">.</span><span class="n">retention</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
+            <span class="p">)</span>
+        <span class="c1"># the parent by key: after a lost race or a reload this stream holds a copy</span>
+        <span class="n">parent</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_index</span><span class="o">.</span><span class="n">page_for</span><span class="p">(</span>
+                <span class="n">fingerprint</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_prefix_root</span><span class="p">,</span> <span class="n">chain</span><span class="o">.</span><span class="n">keys</span><span class="p">[</span><span class="n">chain</span><span class="o">.</span><span class="n">cursor</span> <span class="o">-</span> <span class="mi">1</span><span class="p">])</span>
+            <span class="p">)</span>
+            <span class="k">if</span> <span class="n">chain</span><span class="o">.</span><span class="n">cursor</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="p">)</span>
+        <span class="k">while</span> <span class="n">chain</span><span class="o">.</span><span class="n">cursor</span> <span class="o">&lt;</span> <span class="n">filled</span><span class="p">:</span>
+            <span class="n">key</span> <span class="o">=</span> <span class="n">fingerprint</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_prefix_root</span><span class="p">,</span> <span class="n">chain</span><span class="o">.</span><span class="n">keys</span><span class="p">[</span><span class="n">chain</span><span class="o">.</span><span class="n">cursor</span><span class="p">])</span>
+            <span class="n">page</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">[</span><span class="n">chain</span><span class="o">.</span><span class="n">cursor</span><span class="p">]</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span><span class="o">.</span><span class="n">insert</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">page</span><span class="p">,</span> <span class="n">parent</span><span class="p">):</span>
+                <span class="c1"># another request filled this page first and its copy is the</span>
+                <span class="c1"># one the index names; ours stays private to this stream</span>
+                <span class="n">page</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span><span class="o">.</span><span class="n">page_for</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+            <span class="n">parent</span> <span class="o">=</span> <span class="n">page</span>
+            <span class="n">chain</span><span class="o">.</span><span class="n">cursor</span> <span class="o">+=</span> <span class="mi">1</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_report_admission</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">segment</span><span class="p">:</span> <span class="n">Segment</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">CacheStream</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""One line per request that a declared stream admitted."""</span>
+        <span class="c1"># silent where the cache is closed: the keys are still on the stream,</span>
+        <span class="c1"># and a line saying nothing matched would read as a miss</span>
+        <span class="n">chain</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">chain</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">chain</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">chain</span><span class="o">.</span><span class="n">reported</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">chain</span><span class="o">.</span><span class="n">reported</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="n">matched</span> <span class="o">=</span> <span class="n">chain</span><span class="o">.</span><span class="n">cursor</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+            <span class="s2">"KV </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">/</span><span class="si">%s</span><span class="s2"> matched </span><span class="si">%d</span><span class="s2"> of its </span><span class="si">%d</span><span class="s2"> pages, whole prompt already "</span>
+            <span class="s2">"cached </span><span class="si">%s</span><span class="s2">, replica </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">,</span>
+            <span class="n">matched</span><span class="p">,</span> <span class="n">chain</span><span class="o">.</span><span class="n">keyed_pages</span><span class="p">,</span>
+            <span class="nb">bool</span><span class="p">(</span><span class="n">matched</span><span class="p">)</span> <span class="ow">and</span> <span class="n">matched</span> <span class="o">==</span> <span class="n">chain</span><span class="o">.</span><span class="n">keyed_pages</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_replica</span><span class="p">,</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_take_local_match</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">CacheStream</span><span class="p">,</span> <span class="n">published_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">rooted</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Take what this cache already holds of a stream about to be read in.</span>
+
+<span class="sd">        The pages a prefill rank published are often pages this rank wrote for</span>
+<span class="sd">        an earlier request, and moving them again costs a transfer to arrive at</span>
+<span class="sd">        bytes that are already here. Converted onto the stream rather than</span>
+<span class="sd">        leased: the read is issued under this same lock, so nothing can come</span>
+<span class="sd">        between the two.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="kc">None</span>
+            <span class="ow">or</span> <span class="ow">not</span> <span class="n">rooted</span>
+            <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span>
+            <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">offloaded</span>
+            <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="ow">is</span> <span class="kc">None</span>
+        <span class="p">):</span>
+            <span class="k">return</span>
+        <span class="c1"># never past what the other side published, and only whole pages</span>
+        <span class="n">matched</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span><span class="o">.</span><span class="n">lookup</span><span class="p">(</span><span class="n">rooted</span><span class="p">)[</span>
+            <span class="p">:</span><span class="n">published_len</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
+        <span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">matched</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">retain</span><span class="p">(</span><span class="n">matched</span><span class="p">)</span>
+        <span class="c1"># `stored_len` is 0, so any pages the stream holds are empty</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">matched</span><span class="p">)</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">matched</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">cursor</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">matched</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_warn_unkeyed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Say once per node that a stream the model declared arrived with no keys.</span>
+
+<span class="sd">        Nothing else would: an unkeyed request is served in full and never</span>
+<span class="sd">        reported, so the cache stays empty while every other line looks healthy.</span>
+<span class="sd">        """</span>
+        <span class="n">overrides</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="k">if</span> <span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="kc">None</span>
+            <span class="ow">or</span> <span class="n">node_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_warned_unkeyed</span>
+            <span class="ow">or</span> <span class="n">overrides</span> <span class="ow">is</span> <span class="kc">None</span>
+            <span class="ow">or</span> <span class="ow">not</span> <span class="n">overrides</span><span class="o">.</span><span class="n">prefix_cache</span>
+        <span class="p">):</span>
+            <span class="k">return</span>
+        <span class="n">keys</span> <span class="o">=</span> <span class="n">overrides</span><span class="o">.</span><span class="n">prefix_keys</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">overrides</span><span class="o">.</span><span class="n">get_labels</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">graph_walk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_walks</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="p">())</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">keys</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_warned_unkeyed</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">node_name</span><span class="p">)</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">"KV </span><span class="si">%s</span><span class="s2">: requests reach </span><span class="si">%s</span><span class="s2"> with no keys for </span><span class="si">%s</span><span class="s2">, which the "</span>
+                    <span class="s2">"model declared for prefix reuse, so nothing will be cached"</span><span class="p">,</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span>
+                <span class="p">)</span>
+                <span class="k">return</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_keyed_label</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The one label this request keyed on this node and walk, if any.</span>
+
+<span class="sd">        Under `_lock`: `remove_request` drops ``rid``'s overrides on another</span>
+<span class="sd">        thread, and a label read outside it can name a stream already gone.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">overrides</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">overrides</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">overrides</span><span class="o">.</span><span class="n">prefix_cache</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">keys</span> <span class="o">=</span> <span class="n">overrides</span><span class="o">.</span><span class="n">prefix_keys</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">overrides</span><span class="o">.</span><span class="n">get_labels</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">keys</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">):</span>
+                <span class="k">return</span> <span class="n">label</span>
+        <span class="k">return</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_seed_keys</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">CacheStream</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Put this request's chain for ``label`` on its stream."""</span>
+        <span class="n">overrides</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">overrides</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">overrides</span><span class="o">.</span><span class="n">prefix_cache</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">keys</span> <span class="o">=</span> <span class="p">(</span><span class="n">overrides</span><span class="o">.</span><span class="n">prefix_keys</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">keys</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">tail</span> <span class="o">=</span> <span class="nb">list</span><span class="p">((</span><span class="n">overrides</span><span class="o">.</span><span class="n">prefix_tail</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span> <span class="ow">or</span> <span class="p">())</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="o">=</span> <span class="n">PrefixChain</span><span class="o">.</span><span class="n">seed</span><span class="p">(</span><span class="n">keys</span><span class="p">,</span> <span class="n">tail</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span>
+
+<div class="viewcode-block" id="KVManager.extend_prefix_chain">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.extend_prefix_chain">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">extend_prefix_chain</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">outputs</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Key what this request generated, once a page of it exists.</span>
+
+<span class="sd">        The ids come from the stop check's host copy, which can land after their</span>
+<span class="sd">        step commits, so a later commit indexes the page.</span>
+<span class="sd">        """</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keyed_label</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">return</span>
+            <span class="n">tensor</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span><span class="o">.</span><span class="n">prefix_decode</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+            <span class="n">sampled</span> <span class="o">=</span> <span class="n">outputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">tensor</span><span class="p">)</span> <span class="k">if</span> <span class="n">tensor</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">sampled</span><span class="p">:</span>
+                <span class="k">return</span>
+            <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">stream</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">unkeyed</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">return</span>
+            <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">released</span><span class="p">:</span>
+                <span class="c1"># past a front release `page_indices[k]` is no longer page k of</span>
+                <span class="c1"># the chain, and nothing here can say which page a key names</span>
+                <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="k">return</span>
+            <span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">sampled</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_release_lease</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">CacheStream</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Give back a lease `admit` never converted; a converted one is released</span>
+<span class="sd">        with `page_indices`."""</span>
+        <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">lease</span><span class="p">)</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">lease</span> <span class="o">=</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="KVManager.fingerprint">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.fingerprint">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">fingerprint</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">fingerprint</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">layout</span><span class="o">.</span><span class="n">value</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache</span><span class="o">.</span><span class="n">tensor</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_world_size</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">prefix_cache_salt</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="KVManager.ingest_request">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.ingest_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">overrides</span><span class="p">:</span> <span class="n">KVReqConfig</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
@@ -1250,7 +1625,10 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># that had already filled them, and the request's publish info then</span>
             <span class="c1"># named more tokens than the stream held.</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{</span><span class="s2">"main"</span><span class="p">:</span> <span class="n">CacheStream</span><span class="p">()})</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">overrides</span><span class="p">)</span></div>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">overrides</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">stream</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_seed_keys</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">stream</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="KVManager.admit_retrieve">
@@ -1274,7 +1652,16 @@ window.runMermaid = runMermaid;</script>
                     <span class="sa">f</span><span class="s2">"local </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_world_size</span><span class="si">}</span><span class="s2">)"</span>
                 <span class="p">),</span>
             <span class="p">)</span>
-        <span class="n">needed_labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span><span class="o">.</span><span class="n">get_labels</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span>
+        <span class="n">overrides</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span>
+        <span class="n">needed_labels</span> <span class="o">=</span> <span class="n">overrides</span><span class="o">.</span><span class="n">get_labels</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">)</span>
+        <span class="n">rooted</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">overrides</span><span class="o">.</span><span class="n">prefix_cache</span><span class="p">:</span>
+            <span class="c1"># hashed here, as `resolve_cached_prefix` hashes outside its lock</span>
+            <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">keys</span> <span class="ow">in</span> <span class="p">(</span><span class="n">overrides</span><span class="o">.</span><span class="n">prefix_keys</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="k">if</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">needed_labels</span> <span class="ow">and</span> <span class="n">keys</span><span class="p">:</span>
+                    <span class="n">rooted</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span>
+                        <span class="n">fingerprint</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_prefix_root</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span>
+                    <span class="p">]</span>
         <span class="c1"># one critical section: reading stored_len, comparing to published, and</span>
         <span class="c1"># firing the retrieve must be atomic against a concurrent commit/reset</span>
         <span class="c1"># (both non-blocking inside, so holding the lock is safe)</span>
@@ -1290,11 +1677,16 @@ window.runMermaid = runMermaid;</script>
                     <span class="k">return</span> <span class="n">AdmitOutcome</span><span class="p">(</span><span class="n">ok</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">ready</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
                 <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ensure_label</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span>
+                <span class="n">own</span> <span class="o">=</span> <span class="n">seq_info</span><span class="o">.</span><span class="n">latest_kv_transfer_info</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">_own_transfer_info</span><span class="p">()</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">own</span> <span class="ow">and</span> <span class="n">stream</span><span class="o">.</span><span class="n">chain</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="c1"># another rank sampled the token after this record, so the pending tail is one behind</span>
+                    <span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">unkeyed</span> <span class="o">=</span> <span class="kc">None</span>
                 <span class="n">new_len</span> <span class="o">=</span> <span class="n">seq_info</span><span class="o">.</span><span class="n">seq_len</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_take_local_match</span><span class="p">(</span><span class="n">stream</span><span class="p">,</span> <span class="n">new_len</span><span class="p">,</span> <span class="n">rooted</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">))</span>
                 <span class="n">old_len</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span>
                 <span class="k">if</span> <span class="n">new_len</span> <span class="o">&lt;=</span> <span class="n">old_len</span><span class="p">:</span>
                     <span class="k">continue</span>
-                <span class="k">if</span> <span class="n">seq_info</span><span class="o">.</span><span class="n">latest_kv_transfer_info</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">_own_transfer_info</span><span class="p">():</span>
+                <span class="k">if</span> <span class="n">own</span><span class="p">:</span>
                     <span class="c1"># This shouldn't happen: the pages already ARE in this cache;</span>
                     <span class="c1"># opening our own IPC handle raises `invalid device context`</span>
                     <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
@@ -1348,6 +1740,31 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># one critical section so the read-of-stored_len then alloc is atomic</span>
         <span class="c1"># against a concurrent reset/remove/commit on another thread</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="c1"># before the fork loop and the segment loop, both of which size</span>
+            <span class="c1"># off `stored_len`: a pre-fork target has to cover the whole prefix</span>
+            <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">:</span>
+                <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                    <span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="p">{},</span>
+                <span class="p">)</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">stream</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">continue</span>
+                <span class="k">if</span> <span class="p">(</span>
+                    <span class="n">stream</span><span class="o">.</span><span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                    <span class="ow">and</span> <span class="ow">not</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span>
+                    <span class="ow">and</span> <span class="ow">not</span> <span class="n">stream</span><span class="o">.</span><span class="n">offloaded</span>
+                    <span class="ow">and</span> <span class="ow">not</span> <span class="n">stream</span><span class="o">.</span><span class="n">read_pending</span>
+                <span class="p">):</span>
+                    <span class="c1"># drop the empty pages a refused batch admit left, before taking the lease</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span>
+                    <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">lease</span><span class="p">)</span>
+                    <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">=</span> <span class="p">(</span>
+                        <span class="nb">len</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">lease</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
+                    <span class="p">)</span>
+                    <span class="c1"># they came out of the index, so they are already in it</span>
+                    <span class="n">stream</span><span class="o">.</span><span class="n">chain</span><span class="o">.</span><span class="n">cursor</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">lease</span><span class="p">)</span>
+                    <span class="n">stream</span><span class="o">.</span><span class="n">lease</span> <span class="o">=</span> <span class="kc">None</span>
+                    <span class="n">stream</span><span class="o">.</span><span class="n">converted</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_report_admission</span><span class="p">(</span><span class="n">segment</span><span class="p">,</span> <span class="n">stream</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">:</span>
                 <span class="c1"># a preplan that was promoted or abandoned already cleared</span>
                 <span class="c1"># these; reset anyway so a refused admit can't leave stale</span>
@@ -1635,6 +2052,9 @@ window.runMermaid = runMermaid;</script>
                         <span class="p">)</span>
                         <span class="k">continue</span>
                     <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">+=</span> <span class="n">segment</span><span class="o">.</span><span class="n">span</span>
+                    <span class="c1"># committed, so there is no refused admit left for a re-probe to answer</span>
+                    <span class="n">stream</span><span class="o">.</span><span class="n">converted</span> <span class="o">=</span> <span class="kc">False</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_index_filled_pages</span><span class="p">(</span><span class="n">segment</span><span class="p">,</span> <span class="n">stream</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
                     <span class="c1"># so a claim taken in a window the mark misses still fails</span>
                     <span class="c1"># `_commit_offload`'s generation guard</span>
                     <span class="n">stream</span><span class="o">.</span><span class="n">generation</span> <span class="o">+=</span> <span class="mi">1</span>
@@ -1822,6 +2242,10 @@ window.runMermaid = runMermaid;</script>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
             <span class="n">labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span><span class="o">.</span><span class="n">labels</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
             <span class="n">needed</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span><span class="o">.</span><span class="n">num_pages</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">)</span> <span class="k">for</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">labels</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">needed</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_free</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="c1"># as `_alloc` does: once the pool is all cached pages, nothing</span>
+                <span class="c1"># else would ever free one for this request to come back to</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_index</span><span class="o">.</span><span class="n">evict</span><span class="p">(</span><span class="n">needed</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_free</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">needed</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_free</span><span class="p">:</span>
                 <span class="k">return</span> <span class="kc">False</span>
             <span class="k">for</span> <span class="n">label</span> <span class="ow">in</span> <span class="n">labels</span><span class="p">:</span>
@@ -1910,10 +2334,18 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># a rewind would put the next write on the stream's first page,</span>
                 <span class="c1"># over a sealed one its other owners still read. drop the pages</span>
                 <span class="c1"># and let the next write allocate; `free` asks for the same</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_release_lease</span><span class="p">(</span><span class="n">stream</span><span class="p">)</span>
+                <span class="c1"># here, not in `CacheStream.reset`: an offload resets the stream</span>
+                <span class="c1"># too, and the probe after its reload still owes the same length</span>
+                <span class="n">stream</span><span class="o">.</span><span class="n">converted</span> <span class="o">=</span> <span class="kc">False</span>
                 <span class="n">drop</span> <span class="o">=</span> <span class="n">free</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">any_sealed</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">drop</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span>
                 <span class="n">stream</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">freed</span><span class="o">=</span><span class="n">drop</span><span class="p">)</span>
+                <span class="c1"># a stale cursor or generated key would misfile what the rerun writes</span>
+                <span class="n">stream</span><span class="o">.</span><span class="n">forget_chain</span><span class="p">()</span>
+            <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">stream</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_seed_keys</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">stream</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">_DEBUG_ASSERTS</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">assert_pages_conserved</span><span class="p">()</span></div>
 
@@ -1930,6 +2362,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">rid</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">:</span>
                 <span class="k">for</span> <span class="n">stream</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_release_lease</span><span class="p">(</span><span class="n">stream</span><span class="p">)</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span><span class="o">.</span><span class="n">remove_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
@@ -1966,10 +2399,17 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># past that</span>
             <span class="n">refs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="n">SINK_PAGE</span><span class="p">:</span> <span class="mi">1</span><span class="p">}</span>
             <span class="n">frontier</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span><span class="o">.</span><span class="n">pages</span><span class="p">():</span>
+                    <span class="n">refs</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="n">refs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
             <span class="k">for</span> <span class="n">streams</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
                 <span class="k">for</span> <span class="n">stream</span> <span class="ow">in</span> <span class="n">streams</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
                     <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">:</span>
                         <span class="n">refs</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="n">refs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
+                    <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="c1"># held for a stream `admit` has not converted yet</span>
+                        <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">stream</span><span class="o">.</span><span class="n">lease</span><span class="p">:</span>
+                            <span class="n">refs</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="n">refs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
                     <span class="n">full</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
                     <span class="n">frontier</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">[</span><span class="n">full</span><span class="p">:])</span>
 
@@ -2040,6 +2480,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_ensure_label</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">CacheStream</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">label</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="n">rid</span><span class="p">]:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="n">rid</span><span class="p">][</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">CacheStream</span><span class="p">()</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_seed_keys</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="n">rid</span><span class="p">][</span><span class="n">label</span><span class="p">])</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="n">rid</span><span class="p">][</span><span class="n">label</span><span class="p">]</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_check_ready</span><span class="p">(</span>
@@ -2134,6 +2575,15 @@ window.runMermaid = runMermaid;</script>
                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">to_stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span><span class="si">}</span><span class="s2"> pages but its source "</span>
                 <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">from_label</span><span class="si">}</span><span class="s2"> needs </span><span class="si">{</span><span class="n">n</span><span class="si">}</span><span class="s2">; _reserve_fork under-reserved"</span>
             <span class="p">)</span>
+            <span class="n">shared</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">page</span> <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">to_stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">[:</span><span class="n">n</span><span class="p">]</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">1</span>
+            <span class="p">]</span>
+            <span class="k">assert</span> <span class="ow">not</span> <span class="n">shared</span><span class="p">,</span> <span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"fork target </span><span class="si">{</span><span class="n">rid</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">to_label</span><span class="si">}</span><span class="s2"> would be written over pages "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">shared</span><span class="si">}</span><span class="s2">, which another owner still reads; a fork target "</span>
+                <span class="s2">"cannot be a stream the index holds"</span>
+            <span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">copy_pages</span><span class="p">(</span>
                 <span class="n">from_stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">[:</span><span class="n">n</span><span class="p">],</span> <span class="n">to_stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">[:</span><span class="n">n</span><span class="p">],</span>
             <span class="p">)</span>
@@ -2156,6 +2606,11 @@ window.runMermaid = runMermaid;</script>
             <span class="n">num_new_pages</span> <span class="o">=</span> <span class="n">num_pages_needed</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">num_new_pages</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
                 <span class="n">new_pages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">acquire</span><span class="p">(</span><span class="n">num_new_pages</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">new_pages</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_index</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="c1"># cached pages are the only ones that can be given back</span>
+                    <span class="c1"># without failing a request that is already running</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_index</span><span class="o">.</span><span class="n">evict</span><span class="p">(</span><span class="n">num_new_pages</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_free</span><span class="p">)</span>
+                    <span class="n">new_pages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">acquire</span><span class="p">(</span><span class="n">num_new_pages</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">new_pages</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="n">pages_short</span> <span class="o">=</span> <span class="n">num_new_pages</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_free</span>
                     <span class="k">return</span> <span class="n">AllocResult</span><span class="p">(</span>

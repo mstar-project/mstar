@@ -7,7 +7,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>mstar.engine.resources.attn.flashinfer &#8212; M* v0.2.1 Documentation</title>
+    <title>mstar.engine.resources.kv.keys &#8212; M* v0.2.1 Documentation</title>
   
   
   
@@ -403,7 +403,7 @@ mermaid.initialize(
 
 window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/engine/resources/attn/flashinfer';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/mstar/engine/resources/kv/keys';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../../../../../genindex.html" />
     <link rel="search" title="Search" href="../../../../../search.html" />
@@ -775,7 +775,7 @@ window.runMermaid = runMermaid;</script>
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/engine/resources/attn/flashinfer.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_modules/mstar/engine/resources/kv/keys.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -852,264 +852,79 @@ window.runMermaid = runMermaid;</script>
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <h1>Source code for mstar.engine.resources.attn.flashinfer</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""Paged attention through FlashInfer's prefill/decode wrappers."""</span>
+  <h1>Source code for mstar.engine.resources.kv.keys</h1><div class="highlight"><pre>
+<span></span><span class="sd">"""Page keys for cross-request prefix reuse.</span>
 
-<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="sd">A key commits to the whole prefix below it: the previous key, this page's token</span>
+<span class="sd">ids, and a digest for each input in the span that is not a token. One match</span>
+<span class="sd">confirms every page under it, and a new root leaves every old key unreachable.</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.base</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
-    <span class="n">AttentionManager</span><span class="p">,</span>
-    <span class="n">AttentionWrapper</span><span class="p">,</span>
-    <span class="n">EagerSlotKey</span><span class="p">,</span>
-    <span class="n">WorkspacePool</span><span class="p">,</span>
-<span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.wrappers</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
-    <span class="n">FlashInferDecodeWrapper</span><span class="p">,</span>
-    <span class="n">FlashInferPrefillWrapper</span><span class="p">,</span>
-<span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">CGSlotKey</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVConfig</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVPlanOutputs</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">StepContext</span>
+<span class="sd">The encoding is canonical because one process builds these keys and another</span>
+<span class="sd">matches them: fixed-width little-endian ints, and a length prefix on every</span>
+<span class="sd">variable-length field so that no two different spans encode alike.</span>
+<span class="sd">"""</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
+
+<span class="c1"># 4 bytes a token, not 8: a full page of 128 then hashes 512 bytes</span>
+<span class="n">_TOKEN_BYTES</span> <span class="o">=</span> <span class="mi">4</span>
+<span class="n">_LEN_BYTES</span> <span class="o">=</span> <span class="mi">4</span>
 
 
-<div class="viewcode-block" id="FlashInferManager">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">FlashInferManager</span><span class="p">(</span><span class="n">AttentionManager</span><span class="p">):</span>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span>
-        <span class="n">kv_cache</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-        <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
-        <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
-        <span class="n">kv_config</span><span class="p">:</span> <span class="n">KVConfig</span><span class="p">,</span>
-        <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="o">=</span><span class="s2">"auto"</span><span class="p">,</span>
-    <span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span> <span class="o">=</span> <span class="n">kv_cache</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">device</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span> <span class="o">=</span> <span class="n">dtype</span>
-
-        <span class="c1"># label to plan state</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-
-        <span class="c1"># persistent, because constructing one allocates FlashInfer's own</span>
-        <span class="c1"># workspaces and is far from free per step</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">EagerSlotKey</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">CGSlotKey</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">AttentionWrapper</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span> <span class="o">=</span> <span class="n">kv_config</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
-            <span class="n">num_qo_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span>
-            <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
-            <span class="n">head_dim</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
-            <span class="n">page_size</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span>
-            <span class="n">max_num_pages</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">max_num_pages</span><span class="p">,</span>
-            <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
-            <span class="n">backend</span><span class="o">=</span><span class="n">backend</span>
-        <span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span> <span class="o">=</span> <span class="n">WorkspacePool</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
-
-<div class="viewcode-block" id="FlashInferManager.depends_on">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.depends_on">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">depends_on</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="k">return</span> <span class="p">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span><span class="p">}</span></div>
+<span class="k">def</span><span class="w"> </span><span class="nf">_field</span><span class="p">(</span><span class="n">payload</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+    <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span><span class="o">.</span><span class="n">to_bytes</span><span class="p">(</span><span class="n">_LEN_BYTES</span><span class="p">,</span> <span class="s2">"little"</span><span class="p">)</span> <span class="o">+</span> <span class="n">payload</span>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_cg_wrapper</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">num_rows</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AttentionWrapper</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""The captured-graph wrapper for one (bucket, slot, label).</span>
+<div class="viewcode-block" id="fingerprint">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.keys.html#mstar.engine.resources.kv.keys.fingerprint">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">fingerprint</span><span class="p">(</span><span class="o">*</span><span class="n">fields</span><span class="p">:</span> <span class="nb">object</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""SHA-256 over ``fields``, in the encoding page keys use.</span>
 
-<span class="sd">        Built on the first plan for that key rather than up front: which labels</span>
-<span class="sd">        a walk plans under is the step's to declare, and the first plan for a</span>
-<span class="sd">        bucket runs during capture, before the graph is recorded, so the wrapper</span>
-<span class="sd">        is just as persistent either way.</span>
-
-<span class="sd">        ``num_rows`` is the qo_indptr row count this label actually plans —</span>
-<span class="sd">        the FlashInfer batch_size for CUDA-graph mode, which must stay fixed</span>
-<span class="sd">        for the wrapper's lifetime. It equals ``bucket.bs`` (one row per</span>
-<span class="sd">        request) for an ordinary label, but a label that combines several</span>
-<span class="sd">        source labels into one plan (e.g. cond+uncond batched CFG) always</span>
-<span class="sd">        contributes several rows per request; using ``bucket.bs`` there</span>
-<span class="sd">        under-allocates the wrapper's fixed buffers and every later plan()</span>
-<span class="sd">        call overruns them with a "runtime batch size" mismatch.</span>
-<span class="sd">        """</span>
-        <span class="n">key</span> <span class="o">=</span> <span class="n">CGSlotKey</span><span class="p">(</span><span class="n">bucket</span><span class="o">=</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="n">label</span><span class="p">)</span>
-        <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">wrapper</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">wrapper</span>
-
-        <span class="n">bucket</span> <span class="o">=</span> <span class="n">lease</span><span class="o">.</span><span class="n">bucket</span>
-        <span class="n">buffer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">)</span>
-        <span class="c1"># per row, not per pool: rows that matched one cached prefix all name</span>
-        <span class="c1"># its pages, so a step can name more page ids than the pool holds</span>
-        <span class="n">kv_kwargs</span> <span class="o">=</span> <span class="p">{</span>
-            <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span><span class="p">,</span>
-            <span class="s2">"max_num_pages"</span><span class="p">:</span> <span class="n">num_rows</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span><span class="o">.</span><span class="n">max_num_pages</span><span class="p">,</span>
-        <span class="p">}</span>
-        <span class="k">if</span> <span class="n">bucket</span><span class="o">.</span><span class="n">bs</span> <span class="o">==</span> <span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">:</span>
-            <span class="n">wrapper</span> <span class="o">=</span> <span class="n">FlashInferDecodeWrapper</span><span class="p">(</span>
-                <span class="n">workspace_buffer</span><span class="o">=</span><span class="n">buffer</span><span class="p">,</span>
-                <span class="n">batch_size</span><span class="o">=</span><span class="n">num_rows</span><span class="p">,</span>
-                <span class="n">use_cuda_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                <span class="o">**</span><span class="n">kv_kwargs</span><span class="p">,</span>
-            <span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">wrapper</span> <span class="o">=</span> <span class="n">FlashInferPrefillWrapper</span><span class="p">(</span>
-                <span class="n">workspace_buffer</span><span class="o">=</span><span class="n">buffer</span><span class="p">,</span>
-                <span class="n">batch_size</span><span class="o">=</span><span class="n">num_rows</span><span class="p">,</span>
-                <span class="n">max_total_tokens</span><span class="o">=</span><span class="n">bucket</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span>
-                <span class="n">use_cuda_graph</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                <span class="o">**</span><span class="n">kv_kwargs</span><span class="p">,</span>
-            <span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_cg_plan_states</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
-        <span class="k">return</span> <span class="n">wrapper</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">_eager_wrapper</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">is_decode</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AttentionWrapper</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""The persistent eager wrapper for one (label, kind, slot).</span>
-
-<span class="sd">        Takes the workspace this slot's captured wrappers already hold: the</span>
-<span class="sd">        two never run at once, since the pipeline retires step N before the</span>
-<span class="sd">        host stages N+2 and a slot repeats no sooner than that.</span>
-<span class="sd">        """</span>
-        <span class="n">key</span> <span class="o">=</span> <span class="n">EagerSlotKey</span><span class="p">(</span><span class="n">label</span><span class="o">=</span><span class="n">label</span><span class="p">,</span> <span class="n">slot</span><span class="o">=</span><span class="n">slot</span><span class="p">,</span> <span class="n">is_decode</span><span class="o">=</span><span class="n">is_decode</span><span class="p">)</span>
-        <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">wrapper</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">cls</span> <span class="o">=</span> <span class="n">FlashInferDecodeWrapper</span> <span class="k">if</span> <span class="n">is_decode</span> <span class="k">else</span> <span class="n">FlashInferPrefillWrapper</span>
-            <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_plan_states</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span>
-                <span class="n">workspace_buffer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspaces</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">slot</span><span class="p">),</span>
-                <span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span><span class="p">,</span>
-            <span class="p">)</span>
-        <span class="k">return</span> <span class="n">wrapper</span>
-
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">supports_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="k">return</span> <span class="kc">True</span>
-
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">force_double_buffer</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="c1"># FlashInfer's plan stages the schedule into a pinned buffer it holds</span>
-        <span class="c1"># per wrapper and H2Ds it on the stream (scheduler.cuh's</span>
-        <span class="c1"># cudaMemcpyAsync out of page_locked_int_workspace_buffer), so one</span>
-        <span class="c1"># wrapper per slot is what keeps plan(N+1) off step N's queued copy.</span>
-        <span class="k">return</span> <span class="kc">True</span>
-
-<div class="viewcode-block" id="FlashInferManager.plan">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.plan">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">reset_default_cursors</span><span class="p">()</span>
-        <span class="n">lease</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span>
-        <span class="k">assert</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span> <span class="ow">or</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="p">(</span>
-            <span class="s2">"preplan requires a cuda graph step: an eager wrapper shares its "</span>
-            <span class="s2">"workspace with the captured one on the same slot"</span>
-        <span class="p">)</span>
-        <span class="k">assert</span> <span class="ow">not</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="ow">and</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">),</span> <span class="p">(</span>
-            <span class="s2">"attention preplan is already pending; clear_preplan before "</span>
-            <span class="s2">"planning a different step ahead"</span>
-        <span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span><span class="p">:</span>
-            <span class="c1"># the wrappers were planned a step early against this same step's</span>
-            <span class="c1"># KV plan; nothing left to do but promote them</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="o">=</span> <span class="p">{}</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
-            <span class="k">return</span>
-
-        <span class="n">plan_outputs</span><span class="p">:</span> <span class="n">KVPlanOutputs</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">plan_results</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span><span class="p">)</span>
-        <span class="k">assert</span> <span class="n">plan_outputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"Attention Manager expected plan result from </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_kv_cache_name</span><span class="si">}</span><span class="s2">"</span>
-
-        <span class="c1"># a preplan leases a different cg slot, so its wrappers and workspaces</span>
-        <span class="c1"># are disjoint from the ones the in-flight forward reads</span>
-        <span class="n">plan_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span> <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span>
-
-        <span class="n">plan_states</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
-        <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">kv_out</span> <span class="ow">in</span> <span class="n">plan_outputs</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-            <span class="n">indptrs</span> <span class="o">=</span> <span class="n">kv_out</span><span class="o">.</span><span class="n">cpu_indptrs</span>
-            <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">num_rows</span> <span class="o">=</span> <span class="n">indptrs</span><span class="o">.</span><span class="n">qo_indptr</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span>
-                <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cg_wrapper</span><span class="p">(</span><span class="n">lease</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">num_rows</span><span class="p">)</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="n">is_decode</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span>
-                    <span class="n">indptrs</span><span class="o">.</span><span class="n">qo_indptr</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="n">indptrs</span><span class="o">.</span><span class="n">qo_indptr</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span>
-                <span class="p">)</span>
-                <span class="n">wrapper</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_eager_wrapper</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="n">is_decode</span><span class="p">,</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot</span><span class="p">)</span>
-
-            <span class="c1"># TODO: cache the latest plan state</span>
-            <span class="n">wrapper</span><span class="o">.</span><span class="n">plan</span><span class="p">(</span>
-                <span class="n">causal</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">causal</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_dtype</span><span class="p">,</span>
-                <span class="o">**</span><span class="n">indptrs</span><span class="o">.</span><span class="n">to_kwargs_dict</span><span class="p">()</span>
-            <span class="p">)</span>
-            <span class="n">plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">wrapper</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span></div>
+<span class="sd">    Used for process constants, so changing one makes every older key unreachable.</span>
+<span class="sd">    """</span>
+    <span class="n">hasher</span> <span class="o">=</span> <span class="n">hashlib</span><span class="o">.</span><span class="n">sha256</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">field</span> <span class="ow">in</span> <span class="n">fields</span><span class="p">:</span>
+        <span class="n">payload</span> <span class="o">=</span> <span class="n">field</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">field</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">)</span> <span class="k">else</span> <span class="nb">str</span><span class="p">(</span><span class="n">field</span><span class="p">)</span><span class="o">.</span><span class="n">encode</span><span class="p">()</span>
+        <span class="n">hasher</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">_field</span><span class="p">(</span><span class="n">payload</span><span class="p">))</span>
+    <span class="k">return</span> <span class="n">hasher</span><span class="o">.</span><span class="n">digest</span><span class="p">()</span></div>
 
 
-<div class="viewcode-block" id="FlashInferManager.clear_preplan">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.clear_preplan">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">clear_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="c1"># rebind rather than clear: a consumed preplan dict is the live one</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="o">=</span> <span class="p">{}</span></div>
+
+<div class="viewcode-block" id="page_key">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.keys.html#mstar.engine.resources.kv.keys.page_key">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">page_key</span><span class="p">(</span>
+    <span class="n">prev</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">tokens</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">digests</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+    <span class="n">hasher</span> <span class="o">=</span> <span class="n">hashlib</span><span class="o">.</span><span class="n">sha256</span><span class="p">()</span>
+    <span class="n">hasher</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">_field</span><span class="p">(</span><span class="n">prev</span><span class="p">))</span>
+    <span class="n">hasher</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">_field</span><span class="p">(</span><span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span>
+        <span class="n">token</span><span class="o">.</span><span class="n">to_bytes</span><span class="p">(</span><span class="n">_TOKEN_BYTES</span><span class="p">,</span> <span class="s2">"little"</span><span class="p">)</span> <span class="k">for</span> <span class="n">token</span> <span class="ow">in</span> <span class="n">tokens</span>
+    <span class="p">)))</span>
+    <span class="n">hasher</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">_field</span><span class="p">(</span><span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">_field</span><span class="p">(</span><span class="n">digest</span><span class="p">)</span> <span class="k">for</span> <span class="n">digest</span> <span class="ow">in</span> <span class="n">digests</span><span class="p">)))</span>
+    <span class="k">return</span> <span class="n">hasher</span><span class="o">.</span><span class="n">digest</span><span class="p">()</span></div>
 
 
-    <span class="c1">### Submodule-level functionality</span>
-<div class="viewcode-block" id="FlashInferManager.qo_indptr_buf">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.qo_indptr_buf">[docs]</a>
-    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">qo_indptr_buf</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="o">=</span><span class="s2">"main"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">if</span> <span class="n">label</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">:</span>
-            <span class="k">return</span>
-        <span class="c1"># decode wrappers never set one</span>
-        <span class="k">return</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">],</span> <span class="s2">"_qo_indptr_buf"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
 
+<div class="viewcode-block" id="chain">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.keys.html#mstar.engine.resources.kv.keys.chain">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">chain</span><span class="p">(</span>
+    <span class="n">pages_of_tokens</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
+    <span class="n">digests_by_page</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">root</span><span class="p">:</span> <span class="nb">bytes</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">""</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Key every page of one stream, folding each key into the next.</span>
 
-<div class="viewcode-block" id="FlashInferManager.select_last_hidden">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.select_last_hidden">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">select_last_hidden</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">hidden</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="o">=</span><span class="s2">"main"</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""</span>
-<span class="sd">        Select last token of the hidden vector per request, used for sampling</span>
-<span class="sd">        from prefill.</span>
-<span class="sd">        """</span>
-        <span class="n">qo_indptr_buf</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">qo_indptr_buf</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
-        <span class="n">last_token_indices</span> <span class="o">=</span> <span class="p">(</span><span class="n">qo_indptr_buf</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">long</span><span class="p">()</span>
-        <span class="k">return</span> <span class="n">hidden</span><span class="o">.</span><span class="n">index_select</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">last_token_indices</span><span class="p">)</span></div>
-
-
-<div class="viewcode-block" id="FlashInferManager.run">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.run">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">kv_cache_layer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">v</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">layer_idx</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-        <span class="c1"># `k`/`v`/`layer_idx` are the dense backend's; here the K/V is already</span>
-        <span class="c1"># in the pages (the layer wrote it through the KV resource) and the</span>
-        <span class="c1"># planned wrapper carries the layout. Accepted and ignored so one</span>
-        <span class="c1"># layer body serves either backend — see `requires_kv_write`.</span>
-        <span class="k">del</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">layer_idx</span>
-        <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_default_label</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_attend</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span> <span class="n">kv_cache_layer</span><span class="p">)</span></div>
-
-
-    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">_attend</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">kv_cache_layer</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-        <span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span><span class="p">[</span><span class="n">label</span><span class="p">]</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">kv_cache_layer</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">o</span><span class="o">.</span><span class="n">dtype</span> <span class="o">!=</span> <span class="n">q</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
-            <span class="n">o</span> <span class="o">=</span> <span class="n">o</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">o</span></div>
-
+<span class="sd">    ``digests_by_page`` is keyed by the page holding an item's first</span>
+<span class="sd">    placeholder, so an item spanning pages is hashed once.</span>
+<span class="sd">    """</span>
+    <span class="n">digests_by_page</span> <span class="o">=</span> <span class="n">digests_by_page</span> <span class="ow">or</span> <span class="p">{}</span>
+    <span class="n">keys</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">prev</span> <span class="o">=</span> <span class="n">root</span>
+    <span class="k">for</span> <span class="n">index</span><span class="p">,</span> <span class="n">tokens</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">pages_of_tokens</span><span class="p">):</span>
+        <span class="n">prev</span> <span class="o">=</span> <span class="n">page_key</span><span class="p">(</span><span class="n">prev</span><span class="p">,</span> <span class="n">tokens</span><span class="p">,</span> <span class="n">digests_by_page</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="p">()))</span>
+        <span class="n">keys</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">prev</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">keys</span></div>
 
 </pre></div>
 
