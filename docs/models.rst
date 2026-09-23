@@ -226,7 +226,8 @@ Chatterbox notes
   intelligibility guard; ``node_breakdown.py`` turns a served run's
   ``--log-stats`` profiles into a per-node time table; ``profile_s3gen.py``
   micro-benchmarks the flow estimator, solve, encoder, vocoder and watermark
-  by precision, eager vs. CUDA graph).
+  by precision, eager vs. CUDA graph; ``gpu_util.py`` summarises
+  ``nvidia-smi dmon`` samples taken during runs).
 
 Cosmos3 environment requirements
 --------------------------------
