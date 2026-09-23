@@ -1,6 +1,5 @@
-import torch
+from mstar.engine.torch_config import apply_torch_config
 
-torch._dynamo.config.recompile_limit = 84
-torch._dynamo.config.allow_unspec_int_on_nn_module = True
-torch._dynamo.config.specialize_int = False
-torch.set_float32_matmul_precision('high')
+# Reaches only the importing thread. Threads that compile later apply it
+# themselves; see mstar/engine/torch_config.py.
+apply_torch_config()

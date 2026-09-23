@@ -282,3 +282,25 @@ Worker scheduling
        ``remove_request``, check the KV page bookkeeping (free list, owner
        counts, seals) against the streams holding the pages. Walks every
        live stream; tests and debugging only.
+
+Compilation
+-----------
+
+Read by the engine on each worker (``mstar/engine/torch_config.py``).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_RECOMPILE_LIMIT``
+     - ``84``
+     - Dynamo's recompile limit: how many compiled variants one function may
+       keep before dynamo runs it eagerly. CUDA graph capture compiles one
+       variant per captured shape, so a model that captures many shapes may
+       need more. The value is clamped to [8, 1024]. Raise it when the logs
+       show ``hit config.recompile_limit``. Lower it to make a function that
+       keeps recompiling fall back to eager sooner. The worker applies it on
+       every thread that compiles.
