@@ -165,9 +165,10 @@ def test_add_new_request_skips_draining_rid():
 # ── preprocess worker ───────────────────────────────────────────────────────
 
 def _preprocess(inflight_reads=False):
-    from mstar.api_server.data_worker import PreprocessWorkerThread
+    from mstar.api_server.data_worker import DeliveryProgress, PreprocessWorkerThread
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    wt.delivery = DeliveryProgress()
     wt._draining_rids = set()
     wt._reads_done_sent = set()
     wt.sent = []

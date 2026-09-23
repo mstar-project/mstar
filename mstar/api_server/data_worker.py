@@ -50,6 +50,38 @@ def _preprocess_loop(**kwargs):
 NameToLoopIndices = dict[str, NestedLoopIndices]
 
 
+class DeliveryProgress:
+    """What the API server can see of output delivery while it decides
+    whether a finished request's chunks are still coming.
+
+    ``active`` is the set of requests whose ready tensors the worker's
+    current pass is reading and postprocessing. It holds for the whole
+    pass, so a long postprocess (a video encode) covers the request being
+    encoded and the requests queued behind it in the same pass.
+    ``last_touch`` is when each request's outputs last moved: announced,
+    read started, or a pass finished its ready tensors. ``busy`` is True
+    while the worker is inside a pass that found work; together with the
+    API server's own count of announced-but-unread tensors it covers a
+    request whose announce landed while the worker was deep in someone
+    else's encode or media preprocess. A request nothing announced is
+    never held by any of these, so a lost one expires on time however
+    busy the worker is.
+    Written by both threads: the set is swapped whole, the flag and the
+    dict get plain writes, no lock.
+    """
+
+    def __init__(self):
+        self.active: frozenset[str] = frozenset()
+        self.busy = False
+        self.last_touch: dict[str, float] = {}
+
+    def touch(self, request_id: str) -> None:
+        self.last_touch[request_id] = time.time()
+
+    def forget(self, request_id: str) -> None:
+        self.last_touch.pop(request_id, None)
+
+
 class PreprocessWorker:
     def __init__(
         self,
@@ -69,6 +101,7 @@ class PreprocessWorker:
         self.output_queue = queue.Queue()
         self.profile_queue = queue.Queue()
         self.stop_event = threading.Event()
+        self.delivery = DeliveryProgress()
 
         self.per_request_reading_tensors = {}
         self.output_loop_idxs: dict[str, NameToLoopIndices] = {}
@@ -108,7 +141,8 @@ class PreprocessWorker:
                 communicator=self.communicator,
                 tensor_manager=self.tensor_manager,
                 model=model,
-                enable_prof=enable_prof
+                enable_prof=enable_prof,
+                delivery=self.delivery,
             )
         )
         self.thread.start()
@@ -157,6 +191,7 @@ class PreprocessWorker:
             "Data worker reading queue for request %s increased to length %d",
             input.request_id,  self.per_request_reading_tensors[input.request_id]
         )
+        self.delivery.touch(input.request_id)
         self.result_tensor_input_queue.put(input)
 
     def discard_result_tensors(self, input: ResultTensors):
@@ -169,6 +204,21 @@ class PreprocessWorker:
 
     def has_pending_tensors(self, request_id: str):
         return self.per_request_reading_tensors.get(request_id, 0) > 0
+
+    def delivery_active(self, request_id: str, since: float) -> bool:
+        """Whether this request's outputs may still be on their way: the
+        worker's current pass is working on them, they moved after
+        ``since`` (a ``time.time()`` value), or they are announced and the
+        worker is busy working towards them. A request that was never
+        announced is not held by other requests' work, so a lost one
+        expires on time. An announced read that never completes (an async
+        transport whose producer went away) is held only while the worker
+        is busy and expires once it idles."""
+        return (
+            request_id in self.delivery.active
+            or self.delivery.last_touch.get(request_id, 0.0) > since
+            or (self.delivery.busy and self.has_pending_tensors(request_id))
+        )
 
     def received_final_chunks(
         self, request_id: str,
@@ -260,7 +310,8 @@ class PreprocessWorkerThread:
         tensor_manager,
         device: str = "cpu",
         model: Model | None = None,
-        enable_prof: bool=False
+        enable_prof: bool=False,
+        delivery: DeliveryProgress | None = None,
     ):
         self.in_queue = in_queue
         self.result_tensor_queue = result_tensor_queue
@@ -280,6 +331,7 @@ class PreprocessWorkerThread:
         self.device = device
         self.model = model
         self.enable_prof = enable_prof
+        self.delivery = delivery if delivery is not None else DeliveryProgress()
 
         self.in_flight_requests = set()
         self.tensor_uuid_to_metadata_per_request = {}
@@ -452,6 +504,7 @@ class PreprocessWorkerThread:
             request_id=result.request_id,
             graph_edges=[result.graph_edge],
         )
+        self.delivery.touch(result.request_id)
         if result.request_id not in self.tensor_uuid_to_metadata_per_request:
             self.tensor_uuid_to_metadata_per_request[result.request_id] = {}
         for tensor_info in result.graph_edge.tensor_info:
@@ -469,9 +522,19 @@ class PreprocessWorkerThread:
         )
 
     def _process_read_tensors(self):
-        did_work = False
-        for request_id, graph_edges in self.tensor_manager.get_ready_tensors().items():
-            did_work = True
+        ready = self.tensor_manager.get_ready_tensors()
+        # Claim every request of this pass up front: the one whose tensor is
+        # being postprocessed and the ones waiting behind it on this thread
+        # are all delivery in progress to the API server's backstop.
+        self.delivery.active = frozenset(ready)
+        try:
+            self._deliver_ready_tensors(ready)
+        finally:
+            self.delivery.active = frozenset()
+        return bool(ready)
+
+    def _deliver_ready_tensors(self, ready: dict[str, list]):
+        for request_id, graph_edges in ready.items():
             for graph_edge in graph_edges:
                 modality = graph_edge.name.replace("_output", "")
 
@@ -521,7 +584,7 @@ class PreprocessWorkerThread:
                         request_id=request_id,
                         uuid=tensor_info.uuid
                     )
-        return did_work
+            self.delivery.touch(request_id)
 
     def _process_messages(self):
         did_work = False
@@ -600,10 +663,12 @@ class PreprocessWorkerThread:
         self.tensor_uuid_to_metadata_per_request.pop(request_id, None)
         self.request_model_kwargs.pop(request_id, None)
         self.in_flight_requests.discard(request_id)
+        self.delivery.forget(request_id)
 
     def run(self):
         while not self.stop_event.is_set():
             did_work = False
+            self.delivery.busy = True
             try:
                 did_work = self._process_messages()
                 # Output delivery is latency-sensitive: the API server holds a
@@ -657,6 +722,7 @@ class PreprocessWorkerThread:
                         del self.tensor_uuid_to_metadata_per_request[req_id]
                     self.request_model_kwargs.pop(req_id, None)
                     self.in_flight_requests.discard(req_id)
+                    self.delivery.forget(req_id)
                 did_work = self._process_read_tensors() or did_work
                 # Reads may have just resolved; ACK any drains now free of them.
                 for rid in list(self._draining_rids):
@@ -684,6 +750,7 @@ class PreprocessWorkerThread:
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
 
+            self.delivery.busy = did_work
             if not did_work:
                 time.sleep(0.001)
 

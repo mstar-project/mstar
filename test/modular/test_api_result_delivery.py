@@ -14,10 +14,16 @@ import queue
 import threading
 import time
 
-from mstar.api_server.data_worker import PreprocessWorkerThread
+import torch
+
+from mstar.api_server.data_worker import (
+    DeliveryProgress,
+    PreprocessWorker,
+    PreprocessWorkerThread,
+)
 from mstar.api_server.entrypoint import APIServer, PendingRequest
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
-from mstar.graph.base import GraphEdge
+from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 
 
@@ -45,6 +51,9 @@ class _RecordingTensorManager:
         pass
 
     def ack_unread_tensors(self, request_id, graph_edges):
+        pass
+
+    def force_cleanup_request(self, request_id):
         pass
 
 
@@ -128,14 +137,18 @@ def test_result_reads_drain_ahead_of_preprocess():
 
 
 class _StubPreprocessWorker:
-    def __init__(self, pending=False, final=True):
+    def __init__(self, pending=False, final=True, active=False):
         self.pending = pending
         self.final = final
+        self.active = active
         self.cleaned = []
         self.drained_flags = []
 
     def has_pending_tensors(self, rid):
         return self.pending
+
+    def delivery_active(self, rid, since):
+        return self.active
 
     def received_final_chunks(self, rid, final_outputs):
         return self.final
@@ -185,6 +198,182 @@ def test_ttl_expiry_with_undelivered_chunks_fails_request():
     # Chunks were still pending, so reads may be in flight: the READS_DONE ACK
     # must be gated on them rather than sent outright.
     assert pw.drained_flags == [False]
+
+
+def test_ttl_holds_while_the_worker_is_still_delivering():
+    """A read or postprocess that outlives the TTL (a video encode on the
+    data worker's single thread) is delivery in progress, not a lost chunk:
+    the request stays open until the worker goes quiet, then the TTL
+    applies as before."""
+    pw = _StubPreprocessWorker(pending=True, final=False, active=True)
+    server = _api_server_stub(pw)
+    req = _pending_request()
+    server.pending_requests["r5"] = req
+    server.recently_completed["r5"] = time.time() - 20.0
+
+    server._prune_recently_completed()
+
+    assert not req.event.is_set()
+    assert req.error is None
+    assert "r5" in server.recently_completed
+    assert pw.cleaned == []
+
+    pw.active = False
+    server._prune_recently_completed()
+
+    assert req.event.is_set()
+    assert req.error_status == 500
+    assert pw.cleaned == ["r5"]
+    assert pw.drained_flags == [False]
+
+
+def test_delivery_active_reads_the_worker_state():
+    pw = object.__new__(PreprocessWorker)
+    pw.delivery = DeliveryProgress()
+    pw.per_request_reading_tensors = {}
+    now = time.time()
+
+    assert not pw.delivery_active("r", now - 15.0)
+    pw.delivery.touch("r")
+    assert pw.delivery_active("r", now - 15.0)
+    pw.delivery.last_touch["r"] = now - 30.0
+    assert not pw.delivery_active("r", now - 15.0)
+    pw.delivery.active = frozenset({"r"})
+    assert pw.delivery_active("r", now - 15.0)
+    assert not pw.delivery_active("other", now - 15.0)
+    pw.delivery.active = frozenset()
+    pw.delivery.forget("r")
+    assert not pw.delivery_active("r", now - 15.0)
+
+    # announced and the worker busy: held; announced and idle, or busy but
+    # never announced: not held
+    pw.per_request_reading_tensors["r"] = 1
+    pw.delivery.busy = True
+    assert pw.delivery_active("r", now - 15.0)
+    assert not pw.delivery_active("other", now - 15.0)
+    pw.delivery.busy = False
+    assert not pw.delivery_active("r", now - 15.0)
+
+
+class _ReadyTensorManager(_RecordingTensorManager):
+    """Every started read is ready on the next poll, with a tiny tensor,
+    except for the requests in ``never_ready`` (a producer that never
+    delivers)."""
+
+    def __init__(self, never_ready=()):
+        super().__init__()
+        self.ready = {}
+        self.never_ready = set(never_ready)
+
+    def start_read_tensors(self, request_id, graph_edges, graph_walk=None):
+        super().start_read_tensors(request_id, graph_edges, graph_walk)
+        if request_id not in self.never_ready:
+            self.ready.setdefault(request_id, []).extend(graph_edges)
+        return []
+
+    def get_ready_tensors(self, graph_walk=None):
+        ready, self.ready = self.ready, {}
+        return ready
+
+    def get_tensor(self, request_id, uuid):
+        return torch.zeros(1)
+
+    def dereference(self, request_id, uuid, n=1):
+        pass
+
+
+class _SlowPostprocessModel:
+    """postprocess blocks until released, like a cold video encode."""
+
+    def __init__(self):
+        self.release = threading.Event()
+        self.entered = threading.Event()
+
+    def postprocess(self, tensor, modality, request_kwargs=None):
+        self.entered.set()
+        assert self.release.wait(timeout=10)
+        return b"encoded"
+
+
+def test_a_long_postprocess_claims_the_requests_of_its_pass_only():
+    """The API server's backstop reads what the worker claimed: the request
+    being postprocessed and the one queued behind it in the same pass are
+    active for the whole postprocess, a request whose read never completes
+    is held only while the worker is busy, a request nothing announced is
+    not held at all, and nothing is claimed once the pass is over."""
+    model = _SlowPostprocessModel()
+    tm = _ReadyTensorManager(never_ready={"req-lost"})
+    delivery = DeliveryProgress()
+    pw = object.__new__(PreprocessWorker)
+    pw.delivery = delivery
+    # what the API server's own bookkeeping says is announced and unread
+    pw.per_request_reading_tensors = {"req-lost": 1}
+    stop = threading.Event()
+    worker = PreprocessWorkerThread(
+        in_queue=queue.Queue(),
+        result_tensor_queue=queue.Queue(),
+        out_queue=queue.Queue(),
+        profile_queue=queue.Queue(),
+        cleanup_request_queue=queue.Queue(),
+        abort_request_queue=queue.Queue(),
+        reads_done_queue=queue.Queue(),
+        discard_tensor_queue=queue.Queue(),
+        stop_event=stop,
+        communicator=_RecordingCommunicator(),
+        tensor_manager=tm,
+        model=model,
+        delivery=delivery,
+    )
+    for rid in ("req-slow", "req-behind", "req-lost"):
+        result = _result_tensors(rid)
+        result.graph_edge.tensor_info.append(TensorPointerInfo(
+            dims=[1], dtype="float32", nbytes=4, address=0, stride=[1],
+            uuid=f"u-{rid}", source_session_id="s", source_entity="worker_0",
+        ))
+        worker.result_tensor_queue.put(result)
+
+    thread = threading.Thread(target=worker.run)
+    thread.start()
+    try:
+        assert model.entered.wait(timeout=5), "postprocess never started"
+        # Every read started (and was touched) before the postprocess began.
+        assert tm.read_started == ["req-slow", "req-behind", "req-lost"]
+        started = delivery.last_touch["req-lost"]
+        since = time.time()
+        for _ in range(20):
+            assert delivery.busy
+            assert pw.delivery_active("req-slow", since)
+            assert pw.delivery_active("req-behind", since)
+            # announced, so the busy worker holds it
+            assert pw.delivery_active("req-lost", since)
+            # never announced: nothing holds it
+            assert not pw.delivery_active("req-unannounced", since)
+            time.sleep(0.005)
+        assert pw.delivery_active("req-lost", started - 1.0)
+        model.release.set()
+        chunks = {}
+        for _ in range(2):
+            chunk = worker.out_queue.get(timeout=5)
+            chunks[chunk.request_id] = chunk.data
+        assert chunks == {"req-slow": b"encoded", "req-behind": b"encoded"}
+        deadline = time.time() + 2.0
+        while delivery.active and time.time() < deadline:
+            time.sleep(0.005)
+        assert delivery.active == frozenset()
+        assert delivery.last_touch["req-slow"] >= since
+        assert delivery.last_touch["req-behind"] >= since
+        assert delivery.last_touch["req-lost"] == started
+        deadline = time.time() + 2.0
+        while delivery.busy and time.time() < deadline:
+            time.sleep(0.005)
+        # idle now: the announced read that never completes expires
+        assert not delivery.busy
+        assert not pw.delivery_active("req-lost", since)
+    finally:
+        model.release.set()
+        stop.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
 
 
 def test_drained_completion_stays_successful():
