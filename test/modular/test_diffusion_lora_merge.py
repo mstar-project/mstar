@@ -21,6 +21,7 @@ from mstar.model.components.diffusion.lora import (  # noqa: E402
     apply_loras,
     merge_lora,
     normalize_lora_state_dict,
+    sidecar_default_alpha,
 )
 from mstar.model.components.linear import FusedColumnLinear  # noqa: E402
 from mstar.model.loader.base import StackedParamRule  # noqa: E402
@@ -206,3 +207,44 @@ def test_error_paths(model):
     })
     with pytest.raises(ValueError, match="does not match"):
         merge_lora(model, wide, remap, RULES)
+
+
+def test_sidecar_config_sets_the_default_alpha_like_peft(model, tmp_path):
+    """An adapter without alpha keys takes PEFT's scaling from the config next to it (rsLoRA: alpha / sqrt(r))."""
+    import json
+    import math
+
+    from safetensors.torch import save_file
+
+    gen = torch.Generator().manual_seed(5)
+    a, b = lora_pair(gen)
+    key = "transformer_blocks.0.attn.to_out.0.lora_{}.weight"
+    weights = {key.format("A"): a, key.format("B"): b}
+    cases = {  # directory -> (config, expected factor for scale 1)
+        "plain": ({"lora_rank": RANK, "lora_alpha": 2 * RANK}, 2.0),
+        "rslora": ({"r": RANK, "lora_alpha": 2 * RANK, "use_rslora": True}, 2 * RANK / math.sqrt(RANK)),
+        "adapter_config": (None, 3.0),  # adapter_config.json wins over config.json
+        "none": (None, 1.0),  # no config: lora_alpha = r
+    }
+    (tmp_path / "adapter_config").mkdir()
+    (tmp_path / "adapter_config" / "adapter_config.json").write_text(json.dumps({"r": RANK, "lora_alpha": 3 * RANK}))
+    (tmp_path / "adapter_config" / "config.json").write_text(json.dumps({"lora_alpha": 99}))
+    for name, (config, factor) in cases.items():
+        d = tmp_path / name
+        d.mkdir(exist_ok=True)
+        if config is not None:
+            (d / "config.json").write_text(json.dumps(config))
+        save_file(weights, d / "pytorch_lora_weights.safetensors")
+        rule = sidecar_default_alpha(str(d / "pytorch_lora_weights.safetensors"))
+        assert (rule is None) == (name == "none")
+        before = model.blocks[0].out.weight.detach().clone()
+        apply_loras(model, [LoraSpec.parse(str(d / "pytorch_lora_weights.safetensors"))], remap, RULES)
+        torch.testing.assert_close(model.blocks[0].out.weight, expected(before, a, b, factor), rtol=0, atol=0)
+    # an explicit alpha key in the weights still wins over the sidecar
+    d = tmp_path / "explicit"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({"lora_alpha": 2 * RANK, "use_rslora": True}))
+    save_file({**weights, "transformer_blocks.0.attn.to_out.0.alpha": torch.tensor(float(RANK))}, d / "w.safetensors")
+    before = model.blocks[0].out.weight.detach().clone()
+    apply_loras(model, [LoraSpec.parse(str(d / "w.safetensors"))], remap, RULES)
+    torch.testing.assert_close(model.blocks[0].out.weight, expected(before, a, b, 1.0), rtol=0, atol=0)
