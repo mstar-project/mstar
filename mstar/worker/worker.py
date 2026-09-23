@@ -1308,7 +1308,7 @@ class Worker:
         """
         if self.device.type != "cpu" and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
-        apply_torch_config()  # dynamo config is per-thread (#167)
+        apply_torch_config()
 
     @contextmanager
     def _span(self, name: str):
