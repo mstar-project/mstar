@@ -683,7 +683,10 @@ class PreprocessWorkerThread:
         self.in_flight_requests.discard(request_id)
 
     def run(self):
-        warm_up_model(self.model)
+        # A thread told to stop before it starts (teardown tests build one with
+        # only its queues) has nothing to warm up.
+        if not self.stop_event.is_set():
+            warm_up_model(getattr(self, "model", None))
         while not self.stop_event.is_set():
             did_work = False
             try:
