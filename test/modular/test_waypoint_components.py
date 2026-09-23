@@ -1,28 +1,24 @@
 """Component-level contract tests for the Waypoint-1.5 port: the ring geometry
 its config implies, OrthoRoPE and the small layers.
 
-The bar is the reference implementation at ``world_engine/src/``, not "the code
-does what the code does". Every failure mode this file guards against is silent:
-a wrong ring slot, a re-derived bucket count and a permuted controller concat all
-produce plausible video and raise nothing. So the assertions are exact wherever
-the reference is exact (bitwise for the compaction A/B, for the RoPE angle
-tables, for the ring bytes after a frozen pass) and never widened to accommodate
-the implementation.
+Reference is ``world_engine/src/``. Failure modes here are silent (wrong ring
+slot, re-derived bucket count, permuted controller concat all produce plausible
+video and raise nothing), so assertions are exact wherever the reference is
+exact (bitwise for the compaction A/B, the RoPE angle tables, the ring bytes
+after a frozen pass).
 
-**The ring and the kernel are engine resources now**, imported below from
-``mstar.engine.resources``. Their own contracts -- ownership, the capture
-lifecycle, the ``visible`` aliasing hazard, the eager-``flex_attention`` trap --
-are pinned next door in ``test_ring_kv_resource.py`` and
-``test_flex_attention_resource.py``. What stays here is the half those files
-cannot see: that *Waypoint's config* produces the geometry the checkpoint was
-trained against, and that the ring arithmetic matches the reference's tables.
+The ring and kernel are engine resources (``mstar.engine.resources``); their own
+contracts -- ownership, capture lifecycle, the ``visible`` aliasing hazard, the
+eager-``flex_attention`` trap -- are pinned in ``test_ring_kv_resource.py`` and
+``test_flex_attention_resource.py``. This file covers that *Waypoint's config*
+produces the geometry the checkpoint was trained against, and that the ring
+arithmetic matches the reference's tables.
 
-CPU-only and checkpoint-free by construction. Numeric work runs on a reduced but
-structurally identical config (4 layers / 128 tokens per frame / d_head 32, one
-global layer at stride 8); the real 720P config is used only where the assertion
-is about geometry rather than activations. ``torch.compile(flex_attention)``
-works on CPU in torch 2.9, which is what makes the compaction A/B runnable
-without a GPU -- it costs a few seconds of inductor time on first use.
+CPU-only and checkpoint-free. Numeric work runs on a reduced but structurally
+identical config (4 layers / 128 tokens per frame / d_head 32, one global layer
+at stride 8); the real 720P config is used only for geometry assertions.
+``torch.compile(flex_attention)`` works on CPU in torch 2.9, which is what makes
+the compaction A/B runnable without a GPU.
 """
 
 import dataclasses
@@ -72,14 +68,14 @@ TPF = 128  # tokens per frame in the reduced config == one sparse block
 
 
 def reduced_config(**overrides) -> WaypointConfig:
-    """A 4-layer / 128-token-per-frame Waypoint whose *structure* is the 720P
-    model's: one global layer (index 3) at stride 8, one non-global period, GQA
-    live at 2 query heads over 1 KV head, controller fusion on ``i % 3 == 0``.
+    """A 4-layer / 128-token-per-frame Waypoint whose *structure* matches 720P:
+    one global layer (index 3) at stride 8, GQA at 2 query heads over 1 KV head,
+    controller fusion on ``i % 3 == 0``.
 
     Only the sizes shrink. ``global_window // global_pinned_dilation == 4``
     addressable slots against a 32-frame reference allocation keeps the 8x
-    over-allocation the compaction deviation is about, while letting a test wrap the
-    global ring in 32 frames instead of 128.
+    over-allocation the compaction deviation is about, while letting a test wrap
+    the global ring in 32 frames instead of 128.
     """
     base = {
         "n_layers": 4,
@@ -122,14 +118,11 @@ def visible_blocks(block_mask) -> set[int]:
 
 
 def ring_kv_spec(config: WaypointConfig, *, num_sessions: int = 1) -> KVSpec:
-    """The ``RingKVConfig`` a ``WaypointConfig``'s geometry implies -- which is
-    the bridge under test in most of section 3.
+    """The ``RingKVConfig`` a ``WaypointConfig``'s geometry implies.
 
-    Hand-rolled because the model does not declare its specs yet; when
-    ``WaypointModel`` grows a ``get_node_resources`` this becomes a call to it.
-    Every field is read off the config rather than restated, so a geometry
-    change cannot leave these tests measuring a ring the model no longer asks
-    for.
+    Hand-rolled because the model does not declare its specs yet. Every field is
+    read off the config rather than restated, so a geometry change cannot leave
+    these tests measuring a ring the model no longer asks for.
     """
     return KVSpec(
         resource_key="kv",
@@ -186,27 +179,16 @@ def waypoint_resources(config: WaypointConfig):
 
 # ---------------------------------------------------------------------------
 # 1. The BlockMask's shape
-#
-# The trap itself -- eager `flex_attention` ignoring a no-op `mask_mod` and
-# blending every unwritten ring slot in -- is pinned at its owner in
-# `test_flex_attention_resource.py`, along with the compiled-path regression
-# guard and `make_block_mask`'s alignment checks. What stays here is the half
-# those numeric tests cannot establish about themselves: the mask's structure,
-# and the all-visible control that makes their divergence attributable to the
-# mask rather than to the two kernels merely computing softmax differently.
 # ---------------------------------------------------------------------------
 
 
 def test_block_mask_is_full_blocks_only_and_carries_a_noop_mask_mod():
-    """The whole trap follows from this: visibility is in the index lists and
-    nowhere else, so anything that re-derives the mask from ``mask_mod`` sees
-    "everything visible".
+    """Visibility lives in the index lists, not ``mask_mod``: anything that
+    re-derives the mask from ``mask_mod`` sees "everything visible".
 
-    Note the exact shape of the fact: ``make_block_mask`` passes
-    ``mask_mod=None``, and ``BlockMask.from_kv_blocks`` substitutes
-    ``flex_attention.noop_mask``. The hazard is often stated as the BlockMask
-    "carrying ``mask_mod=None``"; what it carries is the noop, which is the
-    same hazard.
+    ``make_block_mask`` passes ``mask_mod=None``; ``BlockMask.from_kv_blocks``
+    substitutes ``flex_attention.noop_mask`` for it, which carries the same
+    hazard.
     """
     written = torch.zeros(5 * BLOCK, dtype=torch.bool)
     written[0 * BLOCK : 1 * BLOCK] = True  # one committed frame
@@ -225,20 +207,14 @@ def test_block_mask_is_full_blocks_only_and_carries_a_noop_mask_mod():
 
 
 def test_a_fully_visible_ring_makes_eager_and_compiled_agree():
-    """The control for the eager-flex trap, and the reason the divergence next
-    door is a diagnosis rather than an observation.
-
-    ``test_eager_flex_attention_does_not_honour_the_block_mask`` shows the two
-    kernels disagreeing on a partly-hidden row. On its own that is also what
-    two kernels with different softmax numerics would look like. Take the mask
-    out -- same q/k/v, every block visible -- and they agree to ~1e-07, which
-    leaves the mask as the only thing the disagreement can be attributed to.
-    Delete this and the ~1e-01 next door stops meaning "eager ignored the mask".
+    """Control for the eager-flex trap pinned in
+    ``test_flex_attention_resource.py``: with every block visible, eager and
+    compiled agree to ~1e-07, which is what makes the divergence there
+    attributable to the mask rather than to differing softmax numerics.
 
     The all-visible row has to be built by hand: a live Waypoint ring never
     emits one. The slot the current frame is about to overwrite is always
-    hidden (see ``test_mask_hides_the_slot_this_frame_is_about_to_overwrite``),
-    so the steady state is capacity minus exactly one block, forever.
+    hidden (see ``test_mask_hides_the_slot_this_frame_is_about_to_overwrite``).
     """
     config = reduced_config()
     capacity = config.kv_capacity(0)
@@ -275,11 +251,10 @@ def test_a_fully_visible_ring_makes_eager_and_compiled_agree():
 
 
 def make_cache(*, ring_frames: int, ring_buckets: int, dilation: int) -> LayerRingCache:
-    """One world, because this section is about the ring *algorithm* — which
-    slot a frame lands in, which slot it hides — and that is per world and
-    identical at any ``num_sessions``. The folded layout and its isolation are
-    pinned where they belong, in ``test_ring_kv_resource.py``; driving them
-    again here would only make these tests slower to read."""
+    """One world: this section is about the ring *algorithm* -- which slot a
+    frame lands in, which slot it hides -- which is per world and identical at
+    any ``num_sessions``. The folded layout and its isolation are pinned in
+    ``test_ring_kv_resource.py``."""
     return LayerRingCache(
         num_sessions=1,
         n_kv_heads=1,
@@ -296,12 +271,10 @@ def make_cache(*, ring_frames: int, ring_buckets: int, dilation: int) -> LayerRi
 def upsert(cache: LayerRingCache, kv, frame_pos, *, commit: bool, world: int = 0):
     """``LayerRingCache.upsert`` with the world index spelled out.
 
-    Not a default on ``upsert`` itself, deliberately. ``session_idx`` is a ``[1]``
-    int64 *device* tensor on the forward path and never a Python int — a host
-    int is folded into the graph at capture and every replay then serves the
-    capture-time world, silently. A default argument is exactly how a caller
-    ends up not thinking about which world it writes, so the cache takes it
-    positionally and this helper is the only place the zero is written down.
+    Not a default on ``upsert`` itself: ``session_idx`` is a ``[1]`` int64
+    *device* tensor on the forward path, never a Python int -- a host int gets
+    folded into the graph at capture and every replay then silently serves the
+    capture-time world. This helper is the only place the zero is written down.
     """
     return cache.upsert(kv, frame_pos, commit, torch.tensor([world], dtype=torch.int64))
 
@@ -316,9 +289,8 @@ def upsert(cache: LayerRingCache, kv, frame_pos, *, commit: bool, world: int = 0
     ],
 )
 def test_ring_slot_rotation(kind, dilation, frames, expected_slots):
-    """Global commits land on frames 0, 8, 16, ... in slots
-    0, 1, 2, ...; local slots cycle 0..15. The slot holds the frame index that
-    last wrote it, so the expected list is the whole history at once."""
+    """The slot holds the frame index that last wrote it, so ``expected_slots``
+    doubles as the whole write history."""
     cache = make_cache(ring_frames=16, ring_buckets=16, dilation=dilation)
     for f in frames:
         upsert(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), commit=True)
@@ -351,12 +323,11 @@ def test_frozen_passes_leave_the_ring_byte_identical():
 
 
 def test_mask_hides_the_slot_this_frame_is_about_to_overwrite():
-    """And it applies on frozen passes too, so all five passes of a frame see
+    """Applies on frozen passes too, so all five passes of a frame see
     byte-identical KV.
 
-    Asserted through ``make_block_mask`` rather than on the ``visible`` row
-    directly: the row is what ``upsert`` returns now, but what the kernel reads
-    is the block list built from it, and this is the only place the two are
+    Asserted through ``make_block_mask``, not the raw ``visible`` row: the
+    kernel reads the block list built from it, and this is where the two are
     checked to agree over a whole 4+1 frame."""
     cache = make_cache(ring_frames=4, ring_buckets=4, dilation=1)
     for f in range(4):
@@ -374,10 +345,9 @@ def test_mask_hides_the_slot_this_frame_is_about_to_overwrite():
 
 
 def test_upsert_batches_two_worlds_like_two_sequential_calls():
-    """``upsert`` at B=2 (one row each for worlds 0 and 1) is bit-exact to
-    running the same two frames one world at a time: the row dimension is
-    folded into the token dim by ``session_base``, so a batched call must not
-    touch a row that is not its own."""
+    """``upsert`` at B=2 (one row each for worlds 0 and 1) is bit-exact to two
+    sequential single-world calls: ``session_base`` folds the row dim into the
+    token dim, so a batched call must not touch a row that isn't its own."""
     def new_cache() -> LayerRingCache:
         return LayerRingCache(
             num_sessions=2, n_kv_heads=1, ring_frames=4, ring_buckets=4,
@@ -450,18 +420,15 @@ def floor_bucket_upsert(cache: LayerRingCache, kv, frame_pos, commit: bool):
 
 @pytest.mark.parametrize("dilation", [1, 8])
 def test_bucket_round_up_is_faithful_but_currently_unobservable(dilation):
-    """Flooring instead of rounding up is said to "rotate the entire history by
-    one slot". **That consequence does not hold** for any geometry this
-    checkpoint uses, and this test pins the real behaviour rather than the
-    claim.
+    """Flooring instead of rounding up is claimed to "rotate the entire history
+    by one slot"; that does not hold for any geometry this checkpoint uses, and
+    this test pins the real behaviour over the claim.
 
     ``ceil`` and ``floor`` agree on every committing frame
-    (``(8j + 7) // 8 == 8j // 8 == j``) and at ``dilation == 1`` they are equal
-    outright. They differ only where ``write_step`` is False -- and there
-    ``ring_idx`` feeds nothing but ``mask_written[ring_idx] &= ~write_step``,
-    which is the identity, and ``torch.where(write_step, ring_idx, current_idx)``
-    picks the scratch index. So the ``+ dilation - 1`` is faithfully ported and
-    harmless, but it is not load-bearing.
+    (``(8j + 7) // 8 == 8j // 8 == j``), and outright at ``dilation == 1``. They
+    differ only where ``write_step`` is False, where ``ring_idx`` feeds only the
+    identity op ``mask_written[ring_idx] &= ~write_step`` -- so ``+ dilation - 1``
+    is faithfully ported but not load-bearing.
     """
     ceil_cache = make_cache(ring_frames=4, ring_buckets=4, dilation=dilation)
     floor_cache = make_cache(ring_frames=4, ring_buckets=4, dilation=dilation)
@@ -505,16 +472,15 @@ def test_reset_restores_a_fresh_ring():
 
 
 def test_ring_state_is_a_deep_copy_and_is_specific_to_the_compaction_setting():
-    """The Waypoint half of the state round trip: a state saved from a compacted
-    deployment must not load into a ``full_global_ring`` one.
+    """A state saved from a compacted deployment must not load into a
+    ``full_global_ring`` one -- the compaction flag is part of a state's
+    identity.
 
-    The geometries differ only on the global layers (5 frames vs 33 here), so
-    every local layer would copy cleanly and only layer 3 would fail -- and if
-    the guard were a bare ``copy_`` instead of a shape check, a run where the
-    dims happened to broadcast would restore a silently replicated frame. The
-    generic clone/copy_/layer-count guarantees are pinned in
-    ``test_ring_kv_resource.py``; what is here is that the compaction flag is
-    part of a state's identity.
+    Geometries differ only on the global layers (5 vs 33 frames here), so only
+    layer 3 would fail; a bare ``copy_`` instead of a shape check would let dims
+    broadcast and silently restore a replicated frame. Generic
+    clone/copy_/layer-count guarantees are pinned in
+    ``test_ring_kv_resource.py``.
     """
     config = reduced_config()
     kv = ring_manager(config)
@@ -580,10 +546,9 @@ def test_720p_ring_geometry_matches_the_contract_table():
 
 
 def test_ring_buckets_is_an_input_not_a_derivation():
-    """The trap. The reference computes
-    ``num_buckets = (L // tpf) // dilation``. Against the compacted ring that
-    yields 2, not 16 -- a global layer would retain 2 frames instead of 16, with
-    no shape error and no exception."""
+    """The trap: the reference derives ``num_buckets = (L // tpf) // dilation``,
+    which against the compacted ring yields 2, not 16 -- a global layer would
+    silently retain 2 frames instead of 16."""
     config = waypoint_1_5_1b_720p()
     global_layer = 3
     reference_derivation = config.ring_frames(global_layer) // config.pinned_dilation(global_layer)
@@ -638,14 +603,13 @@ def drive_ring(config: WaypointConfig, n_frames: int, seed: int = 7) -> list[tor
 
 
 def test_compacted_and_full_global_rings_are_bitwise_identical():
-    """``from_kv_blocks`` derives the visited list
-    from a *stable* descending argsort truncated to the visited count, so
-    dropping never-written blocks changes neither which blocks are attended nor
-    the order they accumulate in. Bit-equality is therefore the correct bar and
-    an ``allclose`` here would be hiding a real difference.
+    """``from_kv_blocks`` derives the visited list from a *stable* descending
+    argsort truncated to the visited count, so dropping never-written blocks
+    changes neither which blocks are attended nor their accumulation order --
+    bit-equality is the correct bar here, not ``allclose``.
 
     36 frames wraps the global ring's 4 addressable slots (stride 8) more than
-    once and the local rings nine times over.
+    once, and the local rings nine times over.
     """
     compacted = reduced_config()
     full = dataclasses.replace(compacted, full_global_ring=True)
@@ -707,9 +671,8 @@ def test_ortho_rope_angles_match_the_reference_construction_bitwise():
 
 
 def test_the_bands_count_rotation_pairs_and_cover_every_head_dim():
-    """``d_xy = d_head // 8`` and ``d_t = d_head // 4`` count rotation PAIRS.
-    8 + 8 + 16 = 32 pairs = 64 dims -- nothing is unrotated. (An earlier
-    reading of this had the top half untouched.)"""
+    """``d_xy = d_head // 8`` and ``d_t = d_head // 4`` count rotation PAIRS:
+    8 + 8 + 16 = 32 pairs = 64 dims -- nothing is unrotated."""
     config = waypoint_1_5_1b_720p()
     d_head = config.d_head
     d_xy, d_t = d_head // 8, d_head // 4
@@ -933,10 +896,9 @@ def test_noise_conditioner_fourier_features_and_fp32_island():
 
 
 def test_noise_conditioner_must_stay_fp32_to_serve_fp32_sigma():
-    """Why ``FP32_MODULE_PATHS`` exists at all: after the global bf16 cast the
-    module's own body still upcasts sigma to fp32, so a bf16 ``mlp`` cannot
-    consume it. The failure is loud here, which is the good case -- the point of
-    the pin is that the fp32 island is not optional."""
+    """Why ``FP32_MODULE_PATHS`` exists: after the global bf16 cast the module
+    still upcasts sigma to fp32, so a bf16 ``mlp`` can't consume it. The failure
+    is loud here -- the fp32 island is not optional."""
     cond = NoiseConditioner(16).to(torch.bfloat16)
     with pytest.raises(RuntimeError):
         cond(torch.tensor([[1.0]]))

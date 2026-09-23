@@ -1,27 +1,22 @@
 """Contract tests for the Waypoint-1.5 DiT block and the 4+1 per-frame driver.
 
-The bar is the reference implementation at ``world_engine/src/``. The failure
-modes covered here all produce plausible video and raise nothing: a
-denoise pass that commits to the ring, a value residual threaded the wrong way
-round, a missing ``.clone()`` between the two passes of a frame, an fp32 island
-that came back bf16, or a derived RoPE table left as whatever ``to_empty``
-happened to allocate.
+Reference is ``world_engine/src/``. Failure modes here all produce plausible
+video and raise nothing: a denoise pass that commits to the ring, a value
+residual threaded the wrong way round, a missing ``.clone()`` between the two
+passes of a frame, an fp32 island that came back bf16, or a derived RoPE table
+left as whatever ``to_empty`` happened to allocate.
 
-Sections: the 4+1 pass structure, the 720P structural facts, fp32 islands and
-the meta build, value-residual ordering, and ``cond_proj`` tying across
-``to_empty``.
-
-The model owns no cache. Everything below drives the DiT against the two engine
-resources it is bound to -- ``RingKVManager`` and ``FlexAttentionManager``, built
-here directly rather than through an engine -- so the ring geometry, the
-visibility rows and the attention numerics are the served ones and a test can
-assert on what the model *did* without changing what it computed.
+The model owns no cache: tests drive the DiT against the two engine resources
+it is bound to -- ``RingKVManager`` and ``FlexAttentionManager``, built here
+directly rather than through an engine -- so the ring geometry, the visibility
+rows and the attention numerics are the served ones and a test can assert on
+what the model *did* without changing what it computed.
 
 CPU-only and checkpoint-free. The real 720P config is used only for structural
-assertions, which are cheap because the module is built on ``torch.device("meta")``
-and never materialized -- a real 720P bf16 build is ~2.6 GB. Anything that runs
-tensors through the model uses a reduced but structurally identical config
-(4 layers, one global at stride 8, controller fusion on ``i % 3 == 0``, GQA live).
+assertions, built on ``torch.device("meta")`` and never materialized -- a real
+720P bf16 build is ~2.6 GB. Anything that runs tensors through the model uses a
+reduced but structurally identical config (4 layers, one global at stride 8,
+controller fusion on ``i % 3 == 0``, GQA live).
 """
 
 import sys
@@ -74,11 +69,9 @@ def reduced_config(**overrides) -> WaypointConfig:
 def ring_kv_spec(config: WaypointConfig, *, num_sessions: int = 1) -> KVSpec:
     """The ``RingKVConfig`` a ``WaypointConfig``'s geometry implies.
 
-    Hand-rolled here because the model does not declare its specs yet; when
-    ``WaypointModel`` grows a ``get_node_resources``, this becomes a call to it
-    and the duplication goes away. Every field is read off the config rather
-    than restated, so a geometry change cannot leave the tests measuring a ring
-    the model no longer asks for.
+    Hand-rolled because the model does not declare its specs yet. Every field
+    is read off the config rather than restated, so a geometry change cannot
+    leave the tests measuring a ring the model no longer asks for.
     """
     return KVSpec(
         resource_key="kv",
@@ -103,13 +96,10 @@ def ring_kv_spec(config: WaypointConfig, *, num_sessions: int = 1) -> KVSpec:
 
 
 def build_resources(config: WaypointConfig, dtype: torch.dtype = torch.float32):
-    """The two resources the DiT calls, built the way the engine builds them.
-
-    Through ``Resource.build(spec, info)`` and ``AttentionManager.build``'s
-    factory, not the constructors: the spec is what picks ``RingKVManager`` over
-    the paged one and what cross-checks the flex backend against a ring config,
-    and a test that bypassed it would be driving a pairing the engine would
-    refuse.
+    """The two resources the DiT calls, built the way the engine builds them:
+    through ``Resource.build(spec, info)``/``AttentionManager.build``, not the
+    constructors, so the spec picks ``RingKVManager`` over the paged one and
+    cross-checks the flex backend against the ring config.
     """
     kv_spec = ring_kv_spec(config)
     cpu = torch.device("cpu")
@@ -126,12 +116,12 @@ def build_resources(config: WaypointConfig, dtype: torch.dtype = torch.float32):
 
 
 class DitNode(NodeSubmodule):
-    """Stands in for the node submodule that will own the DiT.
+    """Stands in for the node submodule that will own the DiT (structural
+    parity with phase 6: the DiT is a child of the node, not the node itself).
 
-    Structural parity with phase 6, where the DiT is a child of the node rather
-    than the node itself. ``bind_node_resources`` walks ``self.modules()`` and
-    skips ``self``, so binding through the node is what the real submodule does;
-    the 24 attention layers are the only consumers either way.
+    ``bind_node_resources`` walks ``self.modules()`` and skips ``self``, so
+    binding through the node is what the real submodule does; the 24 attention
+    layers are the only consumers either way.
     """
 
     def __init__(self, dit: WaypointDiT):
@@ -156,12 +146,9 @@ def bind_resources_on(dit: WaypointDiT, kv, attn) -> DitNode:
 class RecordingRingKV:
     """A real ``RingKVManager`` with every model-facing call logged.
 
-    Delegation rather than a stub: the ring geometry, the visibility rows and
-    (through the attention resource it is paired with) the numerics stay real,
-    so a test can assert on what the model *did* without changing what it
-    computed. Only the KV side is spied on -- the attention resource is passed
-    through untouched, because nothing here needs to know what the kernel was
-    handed, only what was committed to the world state.
+    Delegation, not a stub: ring geometry, visibility rows and (via the paired
+    attention resource) the numerics stay real. Only the KV side is spied on;
+    attention passes through untouched.
     """
 
     def __init__(self, config: WaypointConfig, dtype: torch.dtype = torch.float32):
@@ -219,8 +206,8 @@ class RecordingRingKV:
 
     def passes(self) -> list[list[dict]]:
         """The upsert log regrouped into forwards: one entry per layer, in
-        layer order, per pass. A misgrouping means the model did not visit every
-        layer exactly once per forward, which the assertion below catches."""
+        layer order, per pass. A misgrouping means the model skipped or
+        repeated a layer."""
         n = self.config.n_layers
         assert len(self.upserts) % n == 0, f"{len(self.upserts)} upserts is not a whole number of passes"
         grouped = [self.upserts[i : i + n] for i in range(0, len(self.upserts), n)]
@@ -365,15 +352,13 @@ def test_config_rejects_unsupported_checkpoint_variants():
 
 
 def test_binding_the_node_reaches_every_layer_and_the_driver_holds_nothing():
-    """The attention layers are the *only* consumers of either resource.
+    """The attention layers are the *only* consumers of either resource; the
+    driver holds neither (``commit`` arrives as an argument).
 
-    The driver holds neither: it decides which pass commits and passes that
-    down as an argument, so there is no handle on it to leave unbound. That is
-    what removes the half-bind trap this test used to guard -- binding on the
-    DiT itself, which ``bind_node_resources`` cannot reach (it walks
-    ``self.modules()`` and skips ``self``), used to leave ``dit.kv`` at None and
-    raise nothing until four Euler steps into a frame. Asserted rather than
-    assumed, because a future handle on the driver would silently bring it back.
+    Binding on the DiT itself would silently fail: ``bind_node_resources``
+    walks ``self.modules()`` and skips ``self``, so ``dit.kv`` would stay None
+    and raise nothing until four Euler steps into a frame. Asserted rather than
+    assumed, since a future handle on the driver would bring the trap back.
     """
     config = reduced_config()
     with torch.device("meta"):
@@ -442,25 +427,21 @@ def test_generate_frame_is_four_frozen_denoise_passes_then_one_commit():
 
     passes = kv.passes()
     assert len(passes) == 5, "a generated frame costs exactly five forwards"
-    # Per pass, not per resource: `commit` arrives as an argument on every one
-    # of the n_layers upserts, so a single-element set per pass is also the
-    # assertion that no layer disagreed with the driver about which pass it was.
+    # Per pass, not per resource: a single-element set per pass also asserts no
+    # layer disagreed with the driver about which pass it was.
     commit_per_pass = [{u["commit"] for u in group} for group in passes]
     assert commit_per_pass == [{False}, {False}, {False}, {False}, {True}]
     # All five passes of a frame share one ring clock.
     assert {u["frame_pos"] for u in kv.upserts} == {0}
-    # ...and nothing else on the resource. Dropping the world and snapshotting
-    # it belong to the request lifecycle a level up; a driver that reset between
-    # frames would be starting a new rollout every frame, silently.
+    # ...and nothing else on the resource: dropping/snapshotting the world is a
+    # level up; resetting between frames would silently start a new rollout.
     assert (kv.resets, kv.states) == (0, [])
 
 
 def test_cond_head_cache_is_bit_exact_and_replaces_the_live_projection():
     """``materialize_runtime_tables`` folds every block's six cond_proj GEMMs
-    into a per-sigma gather. The cache is a pure precompute of the same M=1
-    projection ``forward`` runs, so a cached frame must match a live one
-    bit-for-bit -- two seed-identical DiTs over fresh (empty) rings, one
-    materialized and one not, must return the same latent."""
+    into a per-sigma gather -- a pure precompute of the same M=1 projection
+    ``forward`` runs, so a cached frame must match a live one bit-for-bit."""
     config = reduced_config()
     noise, mouse, button, scroll = frame_inputs(config)
     fp = torch.tensor([0], dtype=torch.int64)
@@ -507,13 +488,12 @@ def test_the_ring_only_moves_on_the_committing_pass():
 
 
 def test_generate_frame_clones_the_denoised_latent():
-    """``x0 = self._denoise_pass(...).clone()`` -- the
-    ``.clone()`` is load-bearing. Both passes run inside one CUDA-graph capture,
-    so the cache pass allocates from the graph's private pool, and the denoise
-    pass's output buffer is a block in that pool that nothing downstream holds:
-    the cache pass's first allocation can land on it and stomp the latent it is
-    supposed to be reading, with the address baked into the graph. The copy must
-    land in caller-owned memory, i.e. outside the compiled region.
+    """``x0 = self._denoise_pass(...).clone()`` -- the ``.clone()`` is
+    load-bearing. Both passes run inside one CUDA-graph capture, so the denoise
+    pass's output buffer is a block in the graph's private pool that nothing
+    downstream holds: the cache pass's first allocation can land on it and
+    stomp the latent, with the address baked into the graph. The copy must land
+    in caller-owned memory, outside the compiled region.
     """
     config = reduced_config()
     dit, _kv = bound_dit(config)
@@ -593,14 +573,13 @@ def test_sigma_schedule_is_built_in_the_latent_dtype():
 
 
 class CaptureKV:
-    """Records the exact ``(k, v)`` handed to the ring and hands them straight
-    back, so a test can inspect what would have been stored forever.
+    """Records the exact ``(k, v)`` handed to the ring and returns them
+    unchanged, so a test can inspect what would have been stored.
 
-    Deliberately NOT a ``RingKVManager``, unlike ``RecordingRingKV`` above: what
-    these tests read is the frame the layer *submitted*, and a real ring returns
-    the whole capacity with that frame scattered into a slot the test would then
-    have to find. Returning ``(k, v, None)`` keeps the KV the layer built and
-    the KV the kernel sees the same tensor.
+    Not a ``RingKVManager``: a real ring returns the whole capacity with the
+    frame scattered into a slot the test would have to find. Returning
+    ``(k, v, None)`` keeps the submitted tensor and the tensor the kernel sees
+    identical.
     """
 
     def __init__(self):
@@ -615,10 +594,8 @@ class CaptureKV:
 
 
 class DenseAttn:
-    """The attention half of the pair above: plain SDPA over whatever
-    ``CaptureKV`` returned. ``visible`` is ``None`` and ignored -- there is no
-    ring here to be visible into, and these tests are about what enters the
-    cache, not about the mask."""
+    """Plain SDPA over whatever ``CaptureKV`` returned. ``visible`` is ``None``
+    and ignored: these tests are about what enters the cache, not the mask."""
 
     requires_kv_write = False
 
@@ -762,7 +739,7 @@ def test_fp32_module_paths_is_exactly_the_noise_conditioner():
 def test_cast_serving_dtypes_leaves_one_fp32_island_on_720p():
     """bf16 everywhere, then the islands back to fp32 -- run on
     the **meta** module so storage is later allocated directly in the serving
-    dtype. Nothing is materialized here; a real 720P build is ~2.6 GB."""
+    dtype."""
     with torch.device("meta"):
         dit = WaypointDiT(waypoint_1_5_1b_720p())
     assert dit.cast_serving_dtypes() is dit

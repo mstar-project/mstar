@@ -6,32 +6,31 @@ real API server, conductor process and GPU worker -- then sends a seed frame and
 an action script through ``MStarClient`` and consumes typed ``VideoFrameChunk``
 objects from the stream.
 
-By default the request is sent twice, under *different* ids and one explicit
-``model_kwargs.seed``, so the two rollouts draw the same noise. Identical bytes
-the second time are what shows the first request left nothing behind: with
-``num_sessions: 1`` a leaked world fails the second admission outright, and a
-leaked ``ChunkedStreamingTAEHV`` in ``PerRequestState.kwargs`` would resume the
-first rollout's stream and change the pixels.
+By default the request is sent twice, under different ids and one explicit
+``model_kwargs.seed``, so both rollouts draw the same noise. Identical bytes the
+second time show the first request left nothing behind: with ``num_sessions: 1``
+a leaked world fails the second admission outright, and a leaked
+``ChunkedStreamingTAEHV`` in ``PerRequestState.kwargs`` would resume the first
+rollout's stream and change the pixels.
 
-The ids have to differ. A worker defers ``REMOVE_REQUEST`` while a step is in
-flight and keys the deferral on the rid alone, so reusing an id lets the first
-request's teardown land on the second and drop its in-flight reads.
+The ids must differ: a worker defers ``REMOVE_REQUEST`` while a step is in
+flight and keys the deferral on the rid alone, so a reused id lets the first
+request's teardown drop the second's in-flight reads.
 
-``--concurrent-waves`` switches to the N-stream isolation gate, N = ``--worlds``:
+``--concurrent-waves`` switches to the N-stream isolation gate (N = ``--worlds``):
 N distinct solo baselines are replayed concurrently through separate SDK
-clients, then checked byte-for-byte across repeated world reuse. Optional
-memory sampling tracks only the server process group and excludes the first
-concurrent wave as allocator warmup.
+clients, then checked byte-for-byte across repeated world reuse. Optional memory
+sampling tracks only the server process group and excludes the first wave as
+allocator warmup.
 
-Deployment details that the checked-in config cannot carry are supplied here
-rather than edited into it:
+Deployment details the checked-in config cannot carry are supplied here instead:
 
   * Local mode adds ``model_kwargs.checkpoint_dir`` / ``ae_path``. Hub mode
-    deliberately omits both, exercising the registry's variant-to-repository
-    mapping, and can forward ``--cache-dir`` to Hugging Face.
-  * a 16:9 seed. ``WaypointModel.load_image`` decodes without resizing and
-    ``_seed_clip`` refuses any other ratio, so the shipped 1927x1080 asset is
-    resized to the selected variant's output geometry first.
+    omits both, exercising the registry's variant-to-repository mapping, and
+    can forward ``--cache-dir`` to Hugging Face.
+  * A 16:9 seed: ``WaypointModel.load_image`` decodes without resizing and
+    ``_seed_clip`` refuses any other ratio, so the shipped asset is resized to
+    the selected variant's output geometry first.
 
     CUDA_VISIBLE_DEVICES=2 python3 test/waypoint/serve_rollout.py \
         --variant 720p --steps 8 --worlds 2 --concurrent-waves 4 \
@@ -146,9 +145,9 @@ def _run_config(
         "variant": variant.model_variant,
         "step_batch_size": batch,
     }
-    # Hub mode passes None for these and must not inherit a local override from
-    # the base config: omitting checkpoint_dir is what exercises the registry's
-    # variant -> repository selection.
+    # Hub mode must not inherit checkpoint_dir/ae_path from the base config --
+    # omitting both is what exercises the registry's variant -> repository
+    # selection.
     model_kwargs.pop("checkpoint_dir", None)
     model_kwargs.pop("ae_path", None)
     if checkpoint_dir is not None:
@@ -182,8 +181,8 @@ def _seed_png(source: Path, variant: Variant, out: Path) -> Path:
 def _actions(num_steps: int) -> list[dict]:
     """A scripted pan with a button held, so the run is not the idle world.
 
-    There is exactly one action row per generated latent step. Prime uses its
-    own internal idle action, so it does not consume action row zero.
+    One action row per generated latent step; prime uses its own internal
+    idle action and does not consume row zero.
     """
     return [
         {"mouse": [12.0 if i % 2 else -12.0, 0.0], "buttons": [0] if i % 4 == 0 else [], "scroll": 0.0}
@@ -295,10 +294,9 @@ def _pixel_diff_summary(actual: bytes, expected: bytes, chunk_size: int) -> str:
     )
 
 
-# measured 2026-09-17, 360p, 16 steps: a 1-bf16-ulp noise perturbation of a
-# solo run gives PSNR 45.6->43.4 dB over the first 4 frames and 29 dB by frame
-# 15; floors sit ~5 dB and ~4 dB under that envelope. Provisional: one
-# calibration, one variant.
+# Calibrated from a 1-bf16-ulp noise perturbation of a 360p/16-step solo run:
+# PSNR fell 45.6->43.4 dB over the first 4 frames and to 29 dB by frame 15;
+# floors sit ~5 dB and ~4 dB under that. Provisional: one calibration, one variant.
 EARLY_PSNR_FLOOR_DB = 38.0
 LATE_PSNR_FLOOR_DB = 25.0
 
@@ -469,8 +467,8 @@ def _check(
     if len(chunks) != expected:
         failures.append(f"expected {expected} video chunks, got {len(chunks)}")
 
-    # The SDK validates each payload against its own metadata. Keep the expected
-    # variant geometry and frame sequence as independent end-to-end assertions.
+    # The SDK already validates each payload against its own metadata; check
+    # geometry and frame sequence here too as independent end-to-end assertions.
     size = 4 * height * width * 3
     wrong = [i for i, chunk in enumerate(chunks) if len(chunk.data) != size]
     if wrong:

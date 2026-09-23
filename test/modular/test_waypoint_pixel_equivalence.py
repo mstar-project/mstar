@@ -56,10 +56,8 @@ from mstar.model.waypoint.components.taehv import ChunkedStreamingTAEHV, load_ta
 from mstar.model.waypoint.config import waypoint_1_5_1b_720p
 
 AE_CHECKPOINT = Path(os.environ.get("WAYPOINT_AE_CHECKPOINT", CHECKPOINT.parent / "taehv1_5"))
-# The oracle's seed image, cached by test/waypoint/record_oracle.py. The digest
-# is what makes the oracle comparisons below mean anything: a different image is
-# a different world, and the port would then be compared against a recording of
-# something else.
+# The oracle's seed image, cached by record_oracle.py. Its digest matters: a
+# different image means the port is compared against a recording of some other world.
 SEED_IMAGE = Path(os.environ.get("WAYPOINT_SEED_IMAGE", CHECKPOINT.parent / "seed/default.jpg"))
 SEED_SHA256 = "c61c9393311d7281f793d86329dca343e12c93bf0409980a186eb39269cf6862"
 

@@ -1,21 +1,15 @@
 """GPU gates for the Waypoint port: fullgraph capture, compiled/eager parity,
 CUDA-graph replay, rollout isolation, and the BlockMask rebuild cost.
 
-Checkpoint-free -- the weights are random and every claim here is a
-self-consistency one. The geometry is reduced (4 layers, 128 tokens per frame)
-but structurally identical to 720P: one global layer at a dilated stride,
-controller fusion on ``i % 3 == 0``, GQA live, and local/global rings of
-*different* capacity so a layer-indexing mistake cannot hide behind a uniform
-buffer.
+Checkpoint-free -- weights are random and every claim is a self-consistency
+one. The geometry is reduced (4 layers, 128 tokens per frame) but structurally
+identical to 720P: one global layer at a dilated stride, controller fusion on
+``i % 3 == 0``, GQA live, and local/global rings of *different* capacity so a
+layer-indexing mistake can't hide behind a uniform buffer.
 
-Two facts drive the shape of this file:
-
-  * ``compile_regions()`` is an optional execution mode, with all runtime tables
-    materialized first when selected. Planned masks are staged at fixed addresses
-    outside the compiled region and outside CUDA-graph replay.
-  * There is no eager reference mode. Both sides of every comparison run with
-    the ``flex_attention_masked`` compile on, because eager ``flex_attention``
-    ignores the no-op ``mask_mod`` and reads unwritten ring slots.
+There is no eager reference mode: both sides of every comparison run with the
+``flex_attention_masked`` compile on, because eager ``flex_attention`` ignores
+the no-op ``mask_mod`` and reads unwritten ring slots.
 
 Set ``WAYPOINT_GPU_TESTS=0`` to skip; a full run is a few minutes, most of it
 ``torch.compile``.
@@ -142,8 +136,7 @@ def build(config: WaypointConfig, *, seed: int = 0, num_sessions: int = 1):
     weights, wired to a real ring and a real flex backend on the GPU.
 
     Parameters are filled from a CPU generator so two builds at the same seed
-    are bit-identical, which is what lets a test compare two independent
-    instances.
+    are bit-identical, letting a test compare two independent instances.
     """
     with torch.device("meta"):
         dit = WaypointDiT(config)
@@ -288,14 +281,9 @@ def test_compile_regions_holds_under_fullgraph():
     """``fullgraph=True`` on both regions, which is what makes capture possible
     at all -- a break here would leave the driver un-capturable.
 
-    Derived tables are explicitly materialized after weight loading and before
-    compilation, matching the serving lifecycle. No eager model frame mutates
-    initialization state before the compiled call.
-
-    ``torch._dynamo.config.capture_scalar_outputs`` is deliberately NOT set.
-    The reference sets it as a documented graph-break fix; this port compiles
-    clean without it, and setting it here would hide a future break behind an
-    unbacked symint.
+    ``torch._dynamo.config.capture_scalar_outputs`` is deliberately NOT set:
+    this port compiles clean without it, and setting it here would hide a
+    future break behind an unbacked symint.
     """
     config = gpu_config()
     dit, kv, attn = build(config)
@@ -325,10 +313,9 @@ def test_compile_regions_holds_under_fullgraph():
 
 
 def test_flex_attention_is_bit_exact_in_and_out_of_a_compiled_region():
-    """The attention kernel does not change when the caller is traced into the
-    same graph. This is the floor of the A.2 ladder: it makes any compiled/eager
-    difference in a frame attributable to the pointwise chains around
-    attention rather than to the kernel the ring is read through.
+    """The floor of the A.2 ladder: the attention kernel itself doesn't change
+    under tracing, so any compiled/eager frame difference is attributable to
+    the pointwise chains around it, not the kernel the ring is read through.
     """
     gen = torch.Generator(device="cpu").manual_seed(7)
     q = torch.randn(1, 2, 128, 32, generator=gen).to(DEVICE, DTYPE)
@@ -351,10 +338,9 @@ def test_flex_attention_is_bit_exact_in_and_out_of_a_compiled_region():
 
 def test_the_gemms_are_bit_exact_compiled_vs_eager():
     """Second rung: ``nn.Linear`` lowers to the same cuBLAS call either way, so
-    the projections are not the source of the drift either. What is left is the
-    fused pointwise chains -- ``rms_norm`` into RoPE, adaLN into the residual --
-    where inductor keeps the intermediate in fp32 across a fusion while eager
-    round-trips it through bf16.
+    the drift is in the fused pointwise chains -- ``rms_norm`` into RoPE,
+    adaLN into the residual -- where inductor keeps the intermediate in fp32
+    across a fusion while eager round-trips it through bf16.
     """
     gen = torch.Generator(device="cpu").manual_seed(11)
     x = torch.randn(1, 128, 64, generator=gen).to(DEVICE, DTYPE)
@@ -385,21 +371,16 @@ def test_the_gemms_are_bit_exact_compiled_vs_eager():
 
 
 def test_compiled_matches_eager_to_four_bf16_ulp_of_peak():
-    """NOT bit-exact, and the two rungs above say why: inductor's fp32-carrying
-    pointwise fusions. The gap is a fixed handful of bf16 quanta, and the bound
-    below is measured, not chosen -- worst 2.35 ulp of the frame peak over 120
-    frame comparisons spanning six weight/noise seeds, so ``COMPILE_TOL_ULP``
-    sits at 4 with ~1.7x headroom.
+    """NOT bit-exact: inductor's fp32-carrying pointwise fusions leave a fixed
+    handful of bf16 quanta of drift. The bound is measured, not chosen --
+    worst 2.35 ulp of peak over 120 frame comparisons across six seeds, so
+    ``COMPILE_TOL_ULP`` sits at 4 with ~1.7x headroom.
 
-    Run over the full rollout because the interesting claim is that the gap does
-    not compound even though the ring feeds itself: the deviation at frame 19 is
-    the same size as at frame 0 (measured 3.4e-3 to 6.4e-3 of peak either way),
-    which a per-frame bound over 20 self-feeding frames is what catches.
+    Run over the full rollout to check the gap doesn't compound even though
+    the ring feeds itself: frame 19's deviation is the same size as frame 0's.
 
-    Both sides run the pinned ``flex_attention_masked`` compile; this model has
-    no eager reference mode. What stays exact is the structure: the two runs
-    write the same ring slots and hide the same ones, and a visibility row that
-    differed would be a slot bug rather than a rounding one.
+    Ring-slot visibility is checked separately since a mismatch there would
+    be a slot bug, not a rounding one.
     """
     config = gpu_config()
     frames = ROLLOUT_FRAMES
@@ -535,10 +516,9 @@ def replay_frame(captured, rid: str, frame: int, stream: str) -> torch.Tensor:
 
 
 def eager_frame(captured, rid: str, frame: int, stream: str) -> torch.Tensor:
-    """The same frame through the same compiled regions, uncaptured. This is the
-    control A.3 needs: compiled/eager parity is A.2's subject, so replaying must
-    be compared against the code the graph was captured from, not against a
-    differently-fused build of it."""
+    """The same frame through the same compiled regions, uncaptured: the
+    control A.3 needs, since replaying must be compared against the code the
+    graph was captured from, not a differently-fused build of it."""
     admit_frame(captured["kv"], rid, frame, captured["attn"])
     mouse, button, scroll = captured["controls"]
     with torch.no_grad():
@@ -612,13 +592,12 @@ def test_capture_replays_fixed_address_planned_masks(captured):
 
 
 def test_replay_matches_the_uncaptured_regions_over_two_ring_wraps(captured):
-    """The gate capture exists for: 20 frames of replay against 20 frames of
-    the same compiled code, bit-exact on the emitted latents AND on the ring --
-    the ring is the world state, and a latent check alone would pass on a
-    rollout whose history had quietly gone somewhere else.
+    """20 frames of replay against 20 frames of the same compiled code,
+    bit-exact on the emitted latents AND on the ring -- a latent check alone
+    would pass on a rollout whose history had quietly gone somewhere else.
 
-    Long enough to wrap both rings twice, so a slot that was only ever appended
-    to has to be overwritten and read back.
+    Long enough to wrap both rings twice, so a slot that was only ever
+    appended to has to be overwritten and read back.
     """
     config = captured["config"]
     kv = captured["kv"]
@@ -655,14 +634,14 @@ def test_replay_matches_the_uncaptured_regions_over_two_ring_wraps(captured):
 
 
 def test_a_second_rollout_starts_from_nothing(captured):
-    """Two rollouts in one process on the same fixed ring. The second is fed the
-    identical noise and must produce the identical frames -- so it saw neither
-    the first rollout's history nor the capture warmup's, both of which are
-    still physically in the buffer until something zeroes them.
+    """Two rollouts in one process on the same fixed ring: the second is fed
+    identical noise and must produce identical frames, so it saw neither the
+    first rollout's history nor the capture warmup's, both still physically
+    in the buffer until something zeroes them.
 
     ``post_warmup_validate`` is asserted to raise on the dirty ring the first
-    rollout leaves behind: a scrub that silently did nothing would make the
-    comparison vacuous, and this is what distinguishes the two.
+    rollout leaves behind -- a scrub that silently did nothing would make the
+    comparison below vacuous.
     """
     kv = captured["kv"]
     frames = 8
@@ -698,8 +677,8 @@ def test_two_worlds_interleaved_match_the_same_rollouts_run_alone(captured):
 
     Nothing physical separates the worlds -- they share one buffer per layer,
     folded into the token dimension -- so the whole isolation mechanism is the
-    visibility row, and a leak is silent. Both rollouts go through the *same*
-    captured graph, which is also the claim that ``session_idx`` is read at replay
+    visibility row, and a leak is silent. Both go through the *same* captured
+    graph, which is also the claim that ``session_idx`` is read at replay
     rather than baked at capture.
     """
     kv = captured["kv"]
@@ -744,16 +723,13 @@ def test_two_worlds_interleaved_match_the_same_rollouts_run_alone(captured):
 
 
 def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
-    """B=2 across two worlds, 8 frames each, matches the identical rollouts run
-    one row (B=1) at a time -- the row-order invariant BATCH-001 rests on.
+    """B=2 across two worlds, 8 frames each, matches the identical rollouts
+    run one row (B=1) at a time.
 
-    Same weights for both halves: run B=1 alternating first and snapshot every
-    frame and both rings, then scrub and run the same two streams again as a
-    genuinely batched B=2 forward per frame. A batched GEMM may pick a
-    different cuBLAS kernel at M=2T than at M=T, so that cross-run comparison
-    is bounded in bf16 ulp rather than exact -- but two rows of the SAME
-    batched call fed literally identical inputs share one kernel launch and
-    must be bit-exact.
+    A batched GEMM may pick a different cuBLAS kernel at M=2T than at M=T, so
+    the B=1-vs-B=2 comparison is bounded in bf16 ulp rather than exact -- but
+    two rows of the SAME batched call fed identical inputs share one kernel
+    launch and must be bit-exact.
     """
     config = gpu_config()
     frames = 8
@@ -817,9 +793,8 @@ def test_batched_step_matches_the_same_rollouts_run_one_row_at_a_time():
             )
         assert_worlds_equal(solo_ring[rid], batch_ring[rid], f"world {rid}, batched vs alone")
 
-    # Two rows of the SAME batched call, fed literally identical inputs (same
-    # noise, same frame, same controls): must be bit-exact -- nothing about a
-    # row's own math may read another row's data or depend on its batch position.
+    # Two rows of the SAME batched call, fed identical inputs: must be
+    # bit-exact, or a row is reading another row's data or batch position.
     for rid in ("id0", "id1"):
         kv.ingest_request(rid)
     identical_frames = [("id0", 0), ("id1", 0)]
@@ -882,14 +857,11 @@ def test_prime_replay_matches_the_uncaptured_prime(captured):
 
 
 def test_the_prime_graph_returns_its_own_static_input_buffer(captured):
-    """Prime's output aliases its input, and that is the contract downstream.
-
-    ``append_frame`` hands the settled latent straight back, so the captured
-    output is the captured input buffer. The consumer -- the VAE decoder, next
-    in the same ``Sequential`` -- must therefore copy before the following prime
-    stages over it, which it does: the engine stages every captured node's
-    inputs through ``copy_``. Pinned here so adding a ``.clone()`` to
-    ``append_frame`` is a decision and not an accident.
+    """Prime's output aliases its input, and that is the contract downstream:
+    ``append_frame`` hands the settled latent straight back, so the consumer
+    must copy before the next prime stages over it (the engine does, via
+    ``copy_``). Pinned here so adding a ``.clone()`` to ``append_frame`` is a
+    decision, not an accident.
     """
     assert captured["prime_out"].data_ptr() == captured["latent"].data_ptr()
 
@@ -949,15 +921,14 @@ def test_prime_then_rollout_through_both_graphs_matches_eager(captured):
 
 
 def test_block_mask_rebuild_cost_at_720p(record_property):
-    """A measurement, not a bound. ``FlexAttentionManager.attend`` rebuilds the
-    mask on every call -- 24 layers x 5 passes = 120 times per frame -- and the
-    note there asks for a number before anyone caches it.
+    """A measurement, not a bound: ``FlexAttentionManager.attend`` rebuilds
+    the mask on every call (24 layers x 5 passes = 120 times per frame).
 
-    Reported for the eager path, where the rebuild is host work. Under the
-    compiled regions it is traced into the graph instead, so a captured replay
-    pays device time and no host time at all. The block-alignment ``torch.equal``
-    is timed separately because it is a full sync and it is also what blocks
-    capture; ``torch.compiler.is_compiling()`` is what switches it off.
+    Reported for the eager path, where the rebuild is host work; under the
+    compiled regions it is traced into the graph instead, so a captured
+    replay pays device time and no host time at all. The block-alignment
+    ``torch.equal`` is timed separately since it's a full sync and also what
+    blocks capture; ``torch.compiler.is_compiling()`` switches it off.
     """
     config = waypoint_1_5_1b_720p()
     kv_len = config.kv_capacity(0)
@@ -1012,15 +983,15 @@ def test_block_mask_rebuild_cost_at_720p(record_property):
 
 
 def test_the_fp32_island_is_pinned_against_the_engine_matmul_precision():
-    """``mstar/engine/__init__.py`` sets ``float32_matmul_precision`` process-wide
-    (the reference sets ``medium``), and ``NoiseConditioner`` is a deliberate
-    fp32 island -- so the setting decides what "fp32" means there.
+    """``mstar/engine/__init__.py`` sets ``float32_matmul_precision``
+    process-wide, and ``NoiseConditioner`` is a deliberate fp32 island -- so
+    the setting decides what "fp32" means there. Pinned here so a change to
+    the engine default fails loudly.
 
-    Pinned here so a change to the engine default fails loudly. The second half
-    is the reason it does not bite *today*: the model serves B == N == 1, so the
-    island's matmuls are ``[1, 512] @ [512, 8192]`` -- a GEMV, which uses no
-    tensor cores and is bit-identical under every setting. From N >= 2 the
-    setting reaches it, which is what a future batched step would walk into.
+    It doesn't bite *today*: the model serves B == N == 1, so the island's
+    matmuls are ``[1, 512] @ [512, 8192]`` -- a GEMV, bit-identical under
+    every setting. From N >= 2 the setting reaches it, which a future batched
+    step would walk into.
     """
     assert torch.get_float32_matmul_precision() == "high"
 

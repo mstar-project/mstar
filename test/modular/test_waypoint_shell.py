@@ -1,39 +1,18 @@
 """Contract tests for the Waypoint serving shell: the model, its node
 submodule, and the resources it declares.
 
-Nothing here runs the DiT. The 4+1 driver, the ring numerics and the weight
-remap have their own suites; what is under test here is the *shell* — the
-handful of declarations and host-side hooks that sit between the engine and a
-model that already works, every one of which fails silently when it is wrong:
+Not the DiT, the ring numerics, or the weight remap -- those have their own
+suites. What's under test is the shell layer between the engine and a working
+model: ring geometry, frame_pos rank, the ``_seq_dim`` collision, noise
+statelessness, the off-by-one stop, admit-queue sizing, resource binding, and
+decode ordering -- each of which fails silently when it is wrong.
 
-  * a ring geometry summarized instead of copied (a global layer served with a
-    local layer's stride still produces smooth video, of the wrong world),
-  * a rank-0 ``frame_pos`` (``_intern_static_buffer`` reads
-    ``stored.shape[0]``),
-  * a per-step tensor whose shape happens to carry ``tokens_per_frame``
-    (``_seq_dim`` hoists the matching dim to the front of a shared static
-    buffer),
-  * noise drawn from an advancing generator instead of ``(seed, frame_pos)``
-    (a resumed rollout diverges from the one it resumed),
-  * an off-by-one stop that runs one frame past the request and commits it,
-  * a deployment whose ``max_concurrent_requests`` is unset or larger than the
-    ring's world pool, which is the *only* thing keeping arrivals inside a pool
-    that fails terminally when it is overrun,
-  * a resource that never reaches the 24 attention layers,
-  * a latent that reaches the streaming decoder twice, out of order, or not at
-    all -- the prime walk skipping its decode is the version of this the port
-    nearly shipped.
-
-CPU-only, checkpoint-free, and no engine. The real 720P config is used
-throughout, because the numbers that collide are that config's numbers; the DiT
-behind the submodule is built on ``torch.device("meta")`` and never
-materialized, since a real 720P bf16 build is ~2.6 GB and none of these
-assertions touch a weight. The two places that need a value read back go around
-it: the noise draw takes an explicit device (which is why that helper takes
-one), and the frame-clock test runs over ``_HostOnlyDit``, since what it
-asserts is host bookkeeping the DiT is not part of. The VAE section is the
-third: it runs on the 360P config and a fake ``taehv`` package, for the reasons
-given there.
+CPU-only, checkpoint-free, no engine. Uses the real 720P config since its
+numbers are the ones that collide; the DiT is built on ``torch.device("meta")``
+and never materialized (a real 720P bf16 build is ~2.6 GB). Two exceptions read
+a value back: the noise draw takes an explicit device, and the frame-clock
+tests run over ``_HostOnlyDit``. The VAE section runs on the 360P config with a
+fake ``taehv`` package.
 """
 
 import dataclasses
@@ -101,16 +80,12 @@ def submodule(config):
     """The real submodule over a meta-built DiT.
 
     Meta, not a stub: ``bind_node_resources`` walking ``self.modules()`` and
-    ``self.dit.dtype`` surviving ``cast_serving_dtypes`` are exactly two of the
-    things under test, and a stub would assert them against itself. Meta also
-    keeps ``prepare_inputs``' shapes and dtypes honest -- they are computed the
-    same way on meta as on cuda -- while allocating nothing.
+    ``self.dit.dtype`` surviving ``cast_serving_dtypes`` are under test here,
+    and a stub would assert them against itself. Meta also keeps
+    ``prepare_inputs``' shapes/dtypes honest while allocating nothing.
 
-    The taehv here is the same fake used by the VAE section below (defined
-    later in this module; fixtures resolve names at call time, so the forward
-    reference is fine): the fused decode only needs its structural facts
-    (nine MemBlock histories, ``frames_to_trim``) to build shapes, not real
-    weights.
+    ``_FakeTaehv`` (defined later; fixtures resolve names at call time) only
+    needs its structural facts to build shapes, not real weights.
     """
     with torch.device("meta"):
         dit = WaypointDiT(config)
@@ -119,14 +94,12 @@ def submodule(config):
 
 
 class _HostOnlyDit(torch.nn.Module):
-    """Stands in for the DiT in the tests that need to read a value back.
+    """Stands in for the DiT in tests that need to read a value back.
 
-    ``prepare_inputs`` touches the DiT for exactly one thing -- ``.dtype`` --
-    and ``get_device`` for one parameter, so what those tests exercise is the
-    submodule's host-side bookkeeping and nothing else. The meta build above
-    cannot be read back (``.item()`` raises on a meta tensor) and materializing
-    720P to assert on a frame counter is 2.6 GB; a stub is the honest third
-    option, and it is confined to the two tests that say so.
+    ``prepare_inputs`` only touches the DiT for ``.dtype`` and ``get_device``
+    for one parameter, so this exercises host-side bookkeeping only. The meta
+    build above can't be read back (``.item()`` raises on a meta tensor), and
+    materializing 720P just to read a frame counter isn't worth the memory.
     """
 
     def __init__(self, dtype: torch.dtype = torch.bfloat16):
@@ -198,8 +171,7 @@ def test_declares_exactly_the_ring_and_the_flex_attention_over_it(model):
 
     assert isinstance(specs[0].config, RingKVConfig)
     # FLEX, not the FLASHINFER default: a paged kernel reassociates the
-    # accumulation over the KV blocks, and bit-exactness against the reference
-    # is the only correctness signal this model has.
+    # accumulation over KV blocks, breaking bit-exactness against the reference.
     assert specs[1].config.backend is AttnBackend.FLEX
     assert specs[1].config.kv_cache == KV_RESOURCE
 
@@ -215,9 +187,8 @@ def test_ring_geometry_is_copied_from_the_config_layer_for_layer(model, config):
     assert ring.num_qo_heads == config.n_heads
     assert ring.head_dim == config.d_head
     assert ring.tokens_per_frame == config.tokens_per_frame
-    # One world declared here, because sizing is a deployment question and
-    # `apply_yaml_overrides` runs after this hook. What is pinned is the
-    # *default*: a node that never says otherwise serves one session.
+    # Sizing is a deployment question (`apply_yaml_overrides` runs after this
+    # hook); what's pinned here is the *default* of one session.
     assert ring.num_sessions == 1
 
     assert len(ring.layers) == config.n_layers
@@ -266,12 +237,10 @@ def test_attention_resolves_after_the_cache_it_names(model):
 
 
 def test_prime_encodes_commits_and_initializes_decoder_without_emitting(model):
-    """The seed frame advances decoder state through the dit's fused decode.
-    Encoding it and dropping the latent would prime the world correctly and
-    still corrupt every emitted frame: the functional decoder spends its first
-    call on ``frames_to_trim`` of temporal memory, so the first *rollout* frame
-    would pay for it and the whole stream would sit one priming short of the
-    world it came from. Silently."""
+    """Encoding the seed and dropping the latent would prime the ring but not
+    the decoder: the functional decoder spends its first call on
+    ``frames_to_trim`` of temporal memory, so the first rollout frame would
+    silently pay for it instead."""
     walks = model.get_graph_walk_graphs()
     assert set(walks) == {PRIME_WALK, ROLLOUT_WALK}
     assert model.nodes == [DIT_NODE, VAE_ENCODER_NODE]
@@ -309,11 +278,9 @@ def test_the_rollout_loop_decodes_and_emits_every_iteration(model, config):
         ("clock", DIT_NODE), ("video_output", EMIT_TO_CLIENT),
     }
     assert rollout.accumulated_outputs == []
-    # The "clock" self loop-back is what makes the dit a same-node
-    # speculation target (see the test below); async scheduling can now
-    # dispatch iteration N+1 while N is still running. An overshoot iteration
-    # is vetoed host-side in WaypointDitSubmodule.prepare_inputs, not
-    # prevented by keeping this off.
+    # The "clock" self loop-back makes the dit a same-node speculation target
+    # (see below), so async scheduling can dispatch iteration N+1 before N
+    # finishes; overshoot is vetoed host-side in prepare_inputs, not by this.
     assert dit.enable_async_scheduling is True
     # The controller streams stay loop-external; "clock" is the only
     # loop-back, or the conductor would try to re-inject it every walk step.
@@ -324,14 +291,10 @@ def test_the_rollout_loop_decodes_and_emits_every_iteration(model, config):
 
 
 def test_the_clock_loop_back_makes_dit_a_same_node_speculation_target(model):
-    """The generic readiness fix (``GraphNode.is_ready_for_speculation``,
-    ``Worker._get_input_tensors``) only pays off if the graph actually gives
-    the dit a self-edge to speculate on. Once the loop-external controller
-    streams are ready and the "clock" loop-back has been ingested (empty, as
-    ``WaypointModel._walk_inputs`` sends it for iteration 0),
-    ``ingest_for_speculation`` must propose the dit as ready for its own next
-    iteration -- exactly the wan22-shaped case F3/Step 1 fixed, now over the
-    real Waypoint graph.
+    """``ingest_for_speculation`` must propose the dit as ready for its own
+    next iteration once the loop-external streams are ready and the empty
+    "clock" loop-back (iteration 0) has been ingested -- the self-edge this
+    graph shape depends on for speculation to fire at all.
     """
     rollout = model.get_graph_walk_graphs()[ROLLOUT_WALK]
     wgio = WorkerGraphIO(rollout)
@@ -347,18 +310,15 @@ def test_the_clock_loop_back_makes_dit_a_same_node_speculation_target(model):
 
 
 def test_the_rollout_loop_closes_after_exactly_num_steps_frames(model):
-    """Driven through ``WorkerGraphIO``: what is under test is the loop's own
-    iteration/finish-signal bookkeeping for the new single-node shape, not the
-    order two nodes run in (there is only one node now, so nothing can decode
-    a frame twice, skip one, or take one out of turn -- that guarantee moved
-    into the dit's own forward being one atomic step).
+    """Driven through ``WorkerGraphIO``: exercises the loop's own
+    iteration/finish-signal bookkeeping, not node ordering (there's only one
+    node, so nothing can decode a frame twice or skip one).
 
-    ``register_loop_finish_signal`` is what ``WaypointDitSubmodule.check_stop``
-    does; it fires during postprocess of the loop's last iteration, so the
-    frame that iteration produced must still be emitted before the loop
-    reports done. The actual overshoot guard for a speculative iteration
-    dispatched before that signal lands is a *separate* mechanism -- the
-    host-side veto in ``prepare_inputs`` -- checked below.
+    ``register_loop_finish_signal`` (what ``check_stop`` calls) fires during
+    postprocess of the loop's last iteration, so that iteration's frame must
+    still be emitted before the loop reports done. The overshoot guard for a
+    speculative iteration dispatched before the signal lands is separate --
+    the host-side veto in ``prepare_inputs``, checked below.
     """
     num_steps = 3
     rollout = model.get_graph_walk_graphs()[ROLLOUT_WALK]
@@ -374,10 +334,8 @@ def test_the_rollout_loop_closes_after_exactly_num_steps_frames(model):
         if step == num_steps - 1:
             wgio.register_loop_finish_signal(ROLLOUT_LOOP_NAME)  # what check_stop does
         completion = wgio.mark_node_complete(DIT_NODE)
-        # ``WorkerGraphIO.mark_node_complete`` has already stripped anything in
-        # ``completion.filtered_signals`` (e.g. the "clock" loop-back, once the
-        # final iteration's completion filters it out) from ``output_edges``;
-        # what is left to route is exactly the caller's job.
+        # mark_node_complete already stripped filtered_signals (e.g. the final
+        # iteration's "clock" loop-back) from output_edges; the rest is ours to route.
         for edge in completion.output_edges:
             if edge.next_node == EMIT_TO_CLIENT:
                 emitted.append(edge.name)
@@ -389,10 +347,9 @@ def test_the_rollout_loop_closes_after_exactly_num_steps_frames(model):
 
 
 def test_the_overshoot_veto_fires_only_past_num_steps(submodule):
-    """The other half of the guarantee above: a speculative iteration built
-    from the state the last real one left behind must never reach a forward
-    once the request's ``num_steps`` is spent, and must never fire during
-    prime (which has no ``rollout_step`` to overshoot).
+    """The other half of the guarantee above: a speculative iteration must
+    never reach a forward once ``num_steps`` is spent, and never fires
+    during prime (no ``rollout_step`` to overshoot).
     """
     num_steps = 3
     rid = "overshoot"
@@ -435,10 +392,9 @@ def test_the_overshoot_veto_fires_only_past_num_steps(submodule):
 
 @pytest.mark.parametrize("walk", [PRIME_WALK, ROLLOUT_WALK])
 def test_no_prepared_tensor_is_rank_zero(submodule, config, walk):
-    """A 0-dim tensor reaches ``_intern_static_buffer``, which
-    reads ``stored.shape[0]``, and the worker's output fanout reads
-    ``dims[0]`` -- both IndexError at capture, i.e. at warmup, far from the
-    line that made the tensor."""
+    """A 0-dim tensor reaches ``_intern_static_buffer`` (reads
+    ``stored.shape[0]``) and the worker's output fanout (reads ``dims[0]``)
+    -- both IndexError at capture/warmup, far from the line that made it."""
     inputs = _controller_stream(config, frames=4)
     inputs["latent"] = [torch.zeros((1, 1, *config.latent_shape))]
     node_inputs = submodule.prepare_inputs(walk, _fwd_info(graph_walk=walk), inputs)
@@ -457,24 +413,14 @@ def test_no_prepared_tensor_is_rank_zero(submodule, config, walk):
 def test_no_prepared_tensor_carries_tokens_per_frame_in_its_shape(
     submodule, config, walk
 ):
-    """``CudaGraphRunner._seq_dim`` finds the dim equal to
-    ``input_seq_len`` and hoists it to the front of a shared static buffer; a
-    tensor that carries that number for an unrelated reason gets silently
-    transposed under replay.
+    """``CudaGraphRunner._seq_dim`` finds the dim equal to ``input_seq_len``
+    and hoists it to the front of a shared static buffer; a tensor carrying
+    that number for an unrelated reason gets silently transposed under replay.
 
-    ``input_seq_len`` is honestly ``tokens_per_frame`` (512) -- the scheduler is
-    told the real token count -- so the burden falls here. At 720P nothing
-    collides, but the margin is thin: a 256-token-per-frame variant would put
-    ``button``'s ``n_buttons = 256`` straight into the crosshairs.
-
-    With ``step_batch_size > 1`` the runner's per-bucket count is
-    ``bs * tokens_per_frame``, and 360p at bs=2 does hit ``n_buttons``. That
-    case is handled on the runner side instead: ``_capture_one`` passes the
-    bucket's own batch size alongside its token count, so ``_seq_dim`` checks
-    dim 0 against both before it ever scans for a coincidental match, and
-    ``button`` shares its buffer like any other per-row tensor (see
-    ``test_cuda_graph_capture.py``, which also covers the case of a caller
-    that can't supply a batch size — that one is still a hard failure).
+    At 720P nothing collides, but the margin is thin: a 256-token-per-frame
+    variant would put ``button``'s ``n_buttons=256`` in the crosshairs. With
+    ``step_batch_size > 1``, 360p at bs=2 does collide with ``n_buttons``;
+    that case is handled runner-side instead (see ``test_cuda_graph_capture.py``).
     """
     inputs = _controller_stream(config, frames=4)
     inputs["latent"] = [torch.zeros((1, 1, *config.latent_shape))]
@@ -489,11 +435,10 @@ def test_no_prepared_tensor_carries_tokens_per_frame_in_its_shape(
 
 
 def test_prepared_shapes_and_dtypes_are_the_capture_template_exactly(submodule, config):
-    """``_capture_one`` bakes the config's template and replay re-stages only
-    what ``preprocess`` returned into it. A key, shape or dtype that differs
-    between the two is either a stale-address read or a silent eager fallback,
-    depending on which way it differs -- so they are asserted against each
-    other rather than against a literal."""
+    """``_capture_one`` bakes the config's template; replay re-stages only
+    what ``preprocess`` returns into it. A mismatched key, shape, or dtype is
+    either a stale-address read or a silent eager fallback -- asserted
+    against each other rather than a literal for that reason."""
     templates = {
         cfg.capture_graph_walk: cfg.single_request_inputs
         for cfg in submodule.get_cuda_graph_configs(torch.device("meta"))
@@ -522,10 +467,10 @@ def test_prepared_shapes_and_dtypes_are_the_capture_template_exactly(submodule, 
 
 
 def test_noise_is_a_pure_function_of_seed_and_frame_pos(submodule):
-    """Nothing about the draw may depend on how many
-    frames have already been drawn: a generator advanced in place accumulates
-    state that ``get_state`` does not serialize, so a resumed rollout would
-    diverge from the one it resumed and no assertion anywhere would fire."""
+    """The draw must not depend on how many frames were drawn before it: a
+    generator advanced in place accumulates state ``get_state`` doesn't
+    serialize, so a resumed rollout would silently diverge from the one it
+    resumed."""
     device, dtype = torch.device("cpu"), torch.float32
     first = submodule._frame_noise(4242, 7, device, dtype)
     # Two intervening draws: if the helper carried a generator, these would
@@ -546,9 +491,9 @@ def test_noise_differs_across_frames_and_across_seeds(submodule, config):
             # noise and the video stops evolving.
             assert not torch.equal(frames[a], frames[b]), f"frames {a} and {b} match"
 
-    # Adjacent seeds must not share frame k. `seed + frame_pos` would make seeds
-    # 0 and 1 agree on every frame but the first, which reads as a broken
-    # sampler rather than as a seed collision -- hence the splitmix finalizer.
+    # Adjacent seeds must not share frame k: `seed + frame_pos` would make
+    # seeds 0 and 1 agree on every frame but the first (hence the splitmix
+    # finalizer).
     assert not torch.equal(
         submodule._frame_noise(0, 3, device, dtype),
         submodule._frame_noise(1, 3, device, dtype),
@@ -606,13 +551,13 @@ def test_prime_is_idle_and_rollout_zero_receives_action_zero(
 def test_declare_step_carries_the_same_clock_prepare_inputs_reads(
     host_submodule, config
 ):
-    """One source for the clock, not two. `RingKVManager.admit` checks the
-    declared frame against the one its `commit` last recorded, so a step that
-    declared a *different* number from the one the forward runs at would refuse
-    valid frames and pass desynced ones -- the check inverted.
+    """One source for the clock, not two: `RingKVManager.admit` checks the
+    declared frame against `commit`'s last-recorded one, so a mismatch would
+    refuse valid frames and pass desynced ones -- the check inverted.
 
-    Read on the host, off `PerRequestState`: the `frame_pos` in `NodeInputs` is
-    a `[1]` device tensor by then and reading it back would be a sync per step.
+    Read on the host, off `PerRequestState`, rather than off `NodeInputs`'
+    `frame_pos` (a `[1]` device tensor by then, so reading it back would sync
+    every step).
     """
     rid = "declare"
     host_submodule.request_states.pop(rid, None)
@@ -644,17 +589,10 @@ def test_declare_step_carries_the_same_clock_prepare_inputs_reads(
 
 
 def test_declare_step_names_a_clock_for_every_request_in_the_batch(host_submodule):
-    """No batch shape declines to answer.
-
-    The singular ``frame_pos: int | None`` this replaces returned ``None``
-    whenever the batch was not one request, and ``RingKVManager``'s continuity
-    check — the only thing standing between a stalled clock and a world quietly
-    rewriting its own history — then did nothing for that step. The reasoning
-    was that ``admit`` refuses such a batch anyway, which was true and is still
-    true; the problem is that it made the check's coverage depend on a second,
-    unrelated refusal staying in place. It does not any more: a batch this
-    submodule cannot serve is refused for *being a batch*, with every clock in
-    it still named.
+    """No batch shape declines to answer: ``RingKVManager``'s continuity check
+    -- the only thing standing between a stalled clock and a world quietly
+    rewriting its own history -- must get a clock for every request in the
+    batch, not just batches of one.
 
     The clocks below are genuinely different, so a declaration that broadcast
     one request's frame across the batch fails here rather than passing on a
@@ -744,20 +682,17 @@ def test_get_worker_graphs_refuses_a_deployment_with_no_admit_queue(
 ):
     """The pool is finite, and this is the primary gate on it.
 
-    The conductor only forms a FIFO admit queue when ``max_concurrent_requests``
-    is set: it drains ``waiting_queue`` while ``len(self.requests) <
-    max_concurrent_requests``, so an unset value admits every request on arrival
-    and everything past the Nth dies terminally at ``RingKVManager.admit`` —
-    which sees the batch far too late to queue it.
+    The conductor only forms a FIFO admit queue when
+    ``max_concurrent_requests`` is set; unset, every request is admitted on
+    arrival and anything past the Nth dies terminally at
+    ``RingKVManager.admit``, too late to queue.
 
-    ``max_batch_size = 1`` does not cover this and never did. It caps how many
-    requests share one *step*; N admitted rollouts alternating steps is now the
-    intended shape, but it says nothing about how many may exist at once, which
-    is the thing the world pool bounds.
+    ``max_batch_size = 1`` doesn't cover this -- it caps requests per step,
+    not how many may exist at once.
 
-    ``True`` is in the list because ``isinstance(True, int)`` is ``True`` in
-    Python: a YAML ``max_concurrent_requests: true`` would otherwise read as the
-    number 1 and silently serialize a node sized for eight.
+    ``True`` is in the parametrize list because ``isinstance(True, int)`` is
+    ``True`` in Python, so ``max_concurrent_requests: true`` would otherwise
+    silently read as 1.
     """
     extra = {} if limit is None else {"max_concurrent_requests": limit}
     path = _write_config(tmp_path, f"reject_{limit}.yaml", **extra)
@@ -783,14 +718,14 @@ def test_get_worker_graphs_refuses_invalid_world_pool_size(
 def test_get_worker_graphs_refuses_more_arrivals_than_worlds(
     model, tmp_path, limit, worlds
 ):
-    """A queue longer than the pool is not a queue, it is a delayed failure: the
-    conductor admits ``limit`` requests, the ring hands out ``num_sessions``, and
-    the difference is a set of requests that reach ``admit`` and die there with
-    an ``AdmitRuntimeError`` that no retry, eviction or reload can clear.
+    """A queue longer than the pool is a delayed failure: the conductor admits
+    ``limit`` requests, the ring hands out ``num_sessions``, and the
+    difference dies at ``admit`` with an ``AdmitRuntimeError`` no retry,
+    eviction, or reload can clear.
 
-    The ``worlds=None`` case is the one a deployment writes by accident: raising
-    ``max_concurrent_requests`` without touching ``resources`` at all, which is
-    the shape every pre-pool config already has.
+    ``worlds=None`` is the accidental case: raising
+    ``max_concurrent_requests`` without touching ``resources``, the shape
+    every pre-pool config already has.
     """
     extra = {"max_concurrent_requests": limit}
     if worlds is not None:
@@ -823,13 +758,12 @@ def test_get_worker_graphs_accepts_a_deployment_inside_its_pool(
 
 
 def test_the_shipped_config_serializes_both_nodes_onto_one_rank(model):
-    """``configs/waypoint.yaml`` is the deployment and has to pass its own gate.
+    """``configs/waypoint.yaml`` is the deployment and must pass its own gate.
 
     Both nodes in one group, on rank 0: a node missing from ``node_groups``
-    has no rank to run on and the split fails there. There is no decoder node
-    left to put a worker boundary in front of -- its decode is fused into the
-    dit's own forward -- so a rank split inside the rollout loop is no longer
-    even expressible.
+    has no rank to run on. There's no decoder node to put a worker boundary
+    in front of -- decode is fused into the dit's forward -- so a rank split
+    inside the rollout loop isn't expressible any more.
     """
     path = pathlib.Path(__file__).resolve().parents[2] / "configs" / "waypoint.yaml"
 
@@ -845,10 +779,9 @@ def test_the_shipped_config_serializes_both_nodes_onto_one_rank(model):
 def test_get_worker_graphs_warns_about_worlds_no_request_can_reach(
     model, tmp_path, caplog
 ):
-    """Legal, and only wasteful — so a warning and not a refusal. Each
-    unreachable world is ~816 MiB of ring at 720P that is allocated, zeroed,
-    and never written, which is worth a line in the log rather than a failed
-    boot: the deployment still serves correctly."""
+    """Legal, only wasteful -- a warning, not a refusal. Each unreachable
+    world is ~816 MiB of ring at 720P allocated and never written, worth a
+    log line rather than a failed boot."""
     path = _write_config(
         tmp_path, "underused.yaml", max_concurrent_requests=2, **_sessions(8)
     )
@@ -865,11 +798,10 @@ def test_get_worker_graphs_warns_about_worlds_no_request_can_reach(
 
 
 def test_bind_reaches_the_dit_and_all_twenty_four_attention_layers(submodule):
-    """One bind on the submodule has to reach every caller: the 24 attention
-    layers hold their own references and call ``upsert``/``attend`` directly.
-    Anything left unbound raises ``NoneType has no attribute ...`` mid-forward
-    -- or, if warmup gets there first, inside a capture, where it poisons the
-    graph instead of failing a request."""
+    """One bind has to reach every caller: the 24 attention layers hold their
+    own references and call ``upsert``/``attend`` directly. Anything left
+    unbound raises mid-forward -- or, during warmup, poisons the capture
+    instead of failing a request."""
     kv, attn = object(), object()
     submodule.bind_node_resources({KV_RESOURCE: kv, ATTN_RESOURCE: attn})
 
@@ -885,30 +817,25 @@ def test_bind_reaches_the_dit_and_all_twenty_four_attention_layers(submodule):
 def test_the_submodule_owns_the_dit_and_is_not_the_dit(submodule):
     """The structural reason the test above can pass at all.
 
-    ``NodeSubmodule.bind_node_resources`` walks ``self.modules()`` but skips
-    ``self`` (``submodule_base.py``: ``if bind is not None and module is not
-    self``). A submodule that *is* the DiT -- by subclassing it, or by defining
-    ``bind_resources`` on itself -- would therefore never be visited, and
-    anything the root came to need would sit unbound.
-
-    Nothing on the DiT root needs a resource today (``commit`` is threaded down
-    as an argument), so this is a structural guard rather than a live bug: it
-    keeps the walk able to reach the root if that ever changes.
+    ``bind_node_resources`` walks ``self.modules()`` but skips ``self``; a
+    submodule that *is* the DiT would never be visited, leaving the root
+    unbound. Nothing on the root needs a resource today, so this is a guard
+    against that changing, not a live bug.
     """
     assert not isinstance(submodule, WaypointDiT)
     assert isinstance(submodule.dit, WaypointDiT) and submodule.dit is not submodule
-    # The DiT has to be a *child module*, not a plain attribute -- self.modules()
+    # The DiT must be a *child module*, not a plain attribute -- self.modules()
     # is the only thing the walk follows.
     assert any(m is submodule.dit for m in submodule.modules())
-    # And the submodule must not answer bind_resources itself: the walk would
-    # skip it, so defining one is a method that never runs.
+    # The submodule itself must not define bind_resources: the walk skips
+    # self, so one would never run.
     assert getattr(type(submodule), "bind_resources", None) is None
 
 
 def test_binding_without_a_declared_resource_fails_at_bind(submodule):
-    """Not mid-forward. The layers resolve with ``.get`` -- correct for a layer,
-    which may sit on a node owning only some resources -- so the node is the
-    frame that still knows which keys it declared and can name the missing one.
+    """Not mid-forward: layers resolve with ``.get`` (correct, since a layer
+    may sit on a node owning only some resources), so the node is what still
+    knows which keys it declared and can name the missing one.
     """
     for partial in ({ATTN_RESOURCE: object()}, {KV_RESOURCE: object()}, {}):
         with pytest.raises(KeyError):
@@ -934,10 +861,9 @@ def test_max_batch_size_is_step_batch_size_for_both_walks(config):
 
 
 def test_dit_can_batch_is_true(submodule):
-    """The eager path must batch too. A captured lease replays batched
-    regardless, but with ``can_batch`` False a graphs-off (or uncaptured-shape)
-    multi-row step falls to one forward per request instead of a single batched
-    forward -- the one place the port used to diverge from the other models."""
+    """The eager path must batch too: a captured lease replays batched
+    regardless, but with ``can_batch`` False a graphs-off (or
+    uncaptured-shape) multi-row step falls back to one forward per request."""
     assert submodule.can_batch(batch=None, model_inputs=[]) is True
 
 
@@ -950,9 +876,8 @@ def test_both_dit_walks_are_optional_captures(submodule, config):
     """Prime and rollout both capture; the declaration order is capture order."""
     configs = submodule.get_cuda_graph_configs(torch.device("meta"))
     # Rollout first: the two share one graph pool and rollout's five forwards
-    # are a superset of prime's one, so rollout sizes the pool. The runner's
-    # largest-first sort is stable and both specs are (1, tokens_per_frame),
-    # so this list order is the order they are captured in.
+    # are a superset of prime's one, so rollout sizes the pool; the runner's
+    # largest-first sort is stable given both specs are (1, tokens_per_frame).
     assert [cfg.capture_graph_walk for cfg in configs] == [ROLLOUT_WALK, PRIME_WALK]
     for cfg in configs:
         assert cfg.compile is False
@@ -965,8 +890,7 @@ def test_both_dit_walks_are_optional_captures(submodule, config):
 
     rollout_cfg, prime_cfg = configs
     # Both walks' captured buckets are a real ceiling on the eager batch size:
-    # prime now captures the same buckets rollout does, so a prime batch bigger
-    # than the largest captured bucket is refused, not run eager.
+    # a prime batch bigger than the largest captured bucket is refused, not run eager.
     assert rollout_cfg.caps_eager_batch_size is True
     assert prime_cfg.caps_eager_batch_size is True
 
@@ -1133,11 +1057,11 @@ def encoder(taehv_weights, ae_config):
 class _FakeDit(torch.nn.Module):
     """Stands in for the DiT in the fused-decode tests below.
 
-    What is under test there is TAEHV history bookkeeping riding along inside
-    ``WaypointDitSubmodule`` -- isolation across requests, fixed addresses
-    across walks, cleanup -- not the denoiser, so this returns a deterministic
-    latent shaped like the real one instead of running 24 attention layers on
-    CPU. The real DiT has its own coverage above and in ``test_waypoint_dit.py``.
+    What's under test there is TAEHV history bookkeeping inside
+    ``WaypointDitSubmodule`` -- isolation, fixed addresses, cleanup -- not the
+    denoiser, so this returns a deterministic latent instead of running 24
+    attention layers on CPU (real DiT coverage is above and in
+    ``test_waypoint_dit.py``).
     """
 
     def __init__(self, config: WaypointConfig, dtype: torch.dtype = torch.bfloat16):
@@ -1161,9 +1085,8 @@ class _FakeDit(torch.nn.Module):
 @pytest.fixture
 def decoder(taehv_weights, ae_config):
     """A ``WaypointDitSubmodule`` over a fake dit: the fused node under test,
-    minus the denoiser. Named ``decoder`` still, because every test below
-    exercises the TAEHV history half of this node, the half the standalone
-    decoder node used to own."""
+    minus the denoiser. Named ``decoder`` because every test below exercises
+    the TAEHV history half of this node."""
     return WaypointDitSubmodule(_FakeDit(ae_config), taehv_weights, ae_config)
 
 
@@ -1184,11 +1107,10 @@ def _decode(
     decoder, *, request_id="r0", graph_walk=ROLLOUT_WALK,
     seed_latent: torch.Tensor | None = None, num_steps: int = 8,
 ):
-    """Drive the fused submodule through one real step of its own
-    ``prepare_inputs`` / ``forward`` / ``postprocess`` cycle -- the same
-    sequence the engine runs -- rather than poking ``taehv`` directly, since
-    what several tests below check is that this cycle seeds, threads and
-    advances the nine histories correctly across requests and walks.
+    """Drive the fused submodule through one real
+    ``prepare_inputs``/``forward``/``postprocess`` cycle -- the same sequence
+    the engine runs -- rather than poking ``taehv`` directly, since several
+    tests below check that this cycle threads the nine histories correctly.
     """
     info = _fwd_info(request_id, graph_walk=graph_walk, num_steps=num_steps)
     if graph_walk == PRIME_WALK:
@@ -1279,10 +1201,9 @@ def test_forward_batched_hands_each_request_its_own_row(decoder, monkeypatch):
 def test_decode_latent_batches_rows_independently(taehv_weights, ae_config):
     """``decode_latent`` at B=2 equals two independent B=1 calls, row for row.
 
-    MemBlock and TGrow (``_FakeTaehv``'s decoder) are convs/reshapes that never
-    mix across the batch dim, so nothing here should make row 1 depend on row
-    0's latent -- the property the batched engine path now relies on.
-    """
+    MemBlock and TGrow (``_FakeTaehv``'s decoder) are convs/reshapes that
+    never mix across the batch dim, so row 1 must not depend on row 0's
+    latent -- the property the batched engine path relies on."""
     latent_shape = (1, ae_config.channels, *ae_config.latent_shape[1:])
     generator = torch.Generator().manual_seed(7)
     latents = [
@@ -1339,9 +1260,8 @@ def test_fused_decode_histories_are_isolated_interleaved_and_cleaned_up(decoder,
     before_b = {
         key: value.clone() for key, value in decoder.request_state("b").tensors.items()
     }
-    # A generous num_steps: what is under test is address/isolation stability
-    # across interleaved requests, not the overshoot veto (covered on its own
-    # above), so nothing here should be able to trip it.
+    # A generous num_steps: what's under test is address/isolation stability
+    # across interleaved requests, not the overshoot veto (covered above).
     for _ in range(20):
         _decode(decoder, request_id="a", graph_walk=ROLLOUT_WALK, num_steps=100)
         _decode(decoder, request_id="b", graph_walk=ROLLOUT_WALK, num_steps=100)
@@ -1393,9 +1313,8 @@ def test_ae_graphs_are_compiled_for_capture_but_remain_optional(encoder, decoder
 
     # The fused dit+decode node compiles its own two reference-shaped regions
     # (WaypointDiT.compile_regions, gated by config.compile_dit); letting the
-    # engine also compile this wrapper would fuse across that boundary (see
-    # test_both_dit_walks_are_optional_captures), so its captures stay
-    # uncompiled regardless.
+    # engine also compile this wrapper would fuse across that boundary, so its
+    # captures stay uncompiled regardless.
     assert fused_configs
     assert all(cfg.compile is False for cfg in fused_configs)
     assert decoder.disable_torch_compile is True
@@ -1527,11 +1446,11 @@ def test_process_prompt_rejects_invalid_action_values(model, action, message):
 
 
 def test_the_seed_clip_is_one_latent_frame_of_uint8_rgb(model, config):
-    """``image_inputs`` is what the vae_encoder node consumes, and the streaming
-    encoder emits one latent per ``temporal_compression`` frames: a short clip
-    would buffer and return nothing, a long one would encode twice and leave the
-    second latent unclaimed. Checked here, at the API boundary, so a malformed
-    request is a 400 rather than a rollout that dies on a worker."""
+    """The streaming encoder emits one latent per ``temporal_compression``
+    frames: a short clip would buffer and return nothing, a long one would
+    encode twice and leave the second latent unclaimed. Checked at the API
+    boundary, so a malformed request is a 400 rather than a rollout that dies
+    on a worker."""
     n = config.temporal_compression
     frame = torch.zeros((720, 1280, 3), dtype=torch.uint8)
 

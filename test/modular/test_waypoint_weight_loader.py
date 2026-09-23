@@ -8,8 +8,7 @@ world_model.py::load_state_dict``).
 Everything runs on CPU with no checkpoint and no GPU.
 
 Why that bar and not a looser one: almost every way this loader can be wrong is
-*shape-legal*. Of the sixteen known failure modes, nine are silent — a q/k/v
-fusion built as ``cat([q, v, k])``, an
+*shape-legal* and silent — a q/k/v fusion built as ``cat([q, v, k])``, an
 ``fc1_x``/``fc1_c`` merge in the wrong column order, ``attn``/``mlp`` cond_proj
 slots swapped, an ``unpatchify`` permute dropped. Each of those loads without an
 exception and produces plausible video. So the synthetic tensors are
@@ -30,7 +29,8 @@ the shipped loader and that all four reproduced before the fix:
   resolved statically) failed with 24 unloaded ``cond_head.bias_in``.
   The reference falls back to it (``world_model.py:386-389``).
 * **F4** — shape validation ran before the drop filter, so a ``.cond_heads.`` key
-  ending in ``.k_proj.weight`` raised a GQA error about a key T12 discards.
+  ending in ``.k_proj.weight`` raised a GQA error about a key the loader
+  drops unconditionally.
 
 Nothing here needs the 2.6 GB of a real bf16 build: the parameter census is read
 off the **meta** module (``numel()`` needs no storage) and every load test uses a
@@ -68,13 +68,13 @@ pytest.importorskip("safetensors", reason="safetensors not installed")
 from safetensors.torch import save_file  # noqa: E402
 
 # ``NoiseConditioner``'s Fourier width is a constructor default, not a config
-# field, and it is the in-dim of denoise_step_emb.mlp.fc1 (PARAM_TREE row 1).
+# field, and it is the in-dim of denoise_step_emb.mlp.fc1.
 FOURIER_DIM = 512
 
 LEGACY = "legacy"
 CANONICAL = "canonical"
 
-# The three T4 spellings, in the reference's precedence order (last wins).
+# The three ``bias_in`` spellings, in the reference's precedence order (last wins).
 BIAS_IN_KEYS = {
     "attn": "attn_cond_head.bias_in",
     "mlp": "mlp_cond_head.bias_in",
@@ -86,10 +86,10 @@ def tiny_config() -> WaypointConfig:
     """A structurally faithful 4-layer Waypoint.
 
     Everything the loader reasons about is preserved: GQA with unequal q/kv rows
-    (128 vs 64, so a q/k swap raises and a k/v swap does not — S11/S11b), a 2x2
-    patch, ctrl layers at ``i % 3 == 0`` = {0, 3}, and ``d_model=128`` so the
-    retired ``[:, :64]`` cond_proj probe covers only half a matrix and F2's
-    regression test has somewhere to hide.
+    (128 vs 64, so a q/k swap raises but a k/v swap does not), a 2x2 patch, ctrl
+    layers at ``i % 3 == 0`` = {0, 3}, and ``d_model=128`` so the retired
+    ``[:, :64]`` cond_proj probe covers only half a matrix and F2's regression
+    test has somewhere to hide.
     """
     return WaypointConfig(
         n_layers=4,
@@ -145,10 +145,10 @@ def synthetic_checkpoint(
 
     ``spelling=LEGACY`` writes the keys the reference's transforms exist to
     rewrite; ``CANONICAL`` writes the already-post-transform names that the
-    reference's ``pop``/``setdefault`` pairs also accept (PARAM_TREE section
-    3.5) — including a pre-fused ``qkv_proj`` and ``ctrl_mlpfusion.mlp.fc1``,
-    which exercise ``_SliceShardLoader``'s ``loaded_shard_id is None`` path.
-    Which one the real file uses is section 10.1's open question, so both load.
+    reference's ``pop``/``setdefault`` pairs also accept — including a
+    pre-fused ``qkv_proj`` and ``ctrl_mlpfusion.mlp.fc1``, which exercise
+    ``_SliceShardLoader``'s ``loaded_shard_id is None`` path. Which one the
+    real file uses is unresolved, so both load.
 
     The expected dict is built from the reference's own formulas
     (``world_model.py:372-405`` and ``patch_model.py:110-112``), restated here
@@ -180,14 +180,14 @@ def synthetic_checkpoint(
     ):
         expected[leaf] = src(leaf, shape)
 
-    # T10: in the file, never in the port's tree.
+    # In the file, never in the port's tree.
     src("ctrl_cfg.null_emb", (1, 1, D))
 
     if legacy:
-        # T1: [D, C, ph, pw] conv kernel -> [C*ph*pw, D] Linear weight.
+        # [D, C, ph, pw] conv kernel -> [C*ph*pw, D] Linear weight.
         weight = src("unpatchify.weight", (D, C, ph, pw))
         expected["unpatchify.weight"] = weight.permute(1, 2, 3, 0).reshape(-1, D)
-        # T2: one bias per latent channel, repeated across the patch.
+        # One bias per latent channel, repeated across the patch.
         bias = src("unpatchify.bias", (C,))
         expected["unpatchify.bias"] = bias[:, None, None].expand(-1, ph, pw).reshape(-1)
     else:
@@ -200,7 +200,7 @@ def synthetic_checkpoint(
         p, q = f"{prefix}{i}.", f"blocks.{i}."
 
         if legacy:
-            # T11 (port-side): cat([q, k, v], dim=0), q first, along the rows.
+            # cat([q, k, v], dim=0), q first, along the rows.
             shards = [
                 src(p + "attn.q_proj.weight", (q_rows, D)),
                 src(p + "attn.k_proj.weight", (kv_rows, D)),
@@ -213,24 +213,24 @@ def synthetic_checkpoint(
             )
 
         expected[q + "attn.out_proj.weight"] = src(p + "attn.out_proj.weight", (D, D))
-        expected[q + "attn.v_lamb"] = src(p + "attn.v_lamb", ())  # rank 0, not [1] (S13)
+        expected[q + "attn.v_lamb"] = src(p + "attn.v_lamb", ())  # rank 0, not [1]
 
-        # T3: an explicit five-name allowlist in the reference; only fc1/fc2 exist.
+        # An explicit five-name allowlist in the reference; only fc1/fc2 exist.
         mlp_prefix = "dit_mlp." if legacy else "mlp."
         for leaf, shape in (("fc1.weight", (ffn, D)), ("fc2.weight", (D, ffn))):
             expected[q + "mlp." + leaf] = src(p + mlp_prefix + leaf, shape)
 
-        # T4: up to three spellings, one target.
+        # Up to three spellings, one target.
         for which in bias_in:
             src(p + BIAS_IN_KEYS[which], (D,))
         if bias_in:
             winner = max(bias_in, key=lambda w: list(BIAS_IN_KEYS).index(w))
             expected[q + "cond_head.bias_in"] = state[p + BIAS_IN_KEYS[winner]]
 
-        # T5/T6: attn head -> slots 0..2 (attention branch), mlp head -> 3..5
-        # (MLP branch). T9 keeps only COND_PROJ_SOURCE_BLOCK's set; the other
-        # blocks' keys are in the file (the file is not deduplicated) and carry
-        # the same values, which is what _CondProjTieCheck verifies.
+        # attn head -> slots 0..2 (attention branch), mlp head -> 3..5 (MLP
+        # branch). Only COND_PROJ_SOURCE_BLOCK's set is kept; the other blocks'
+        # keys are in the file (the file is not deduplicated) and carry the
+        # same values, which is what _CondProjTieCheck verifies.
         for j in range(3):
             if legacy:
                 attn = src(p + f"attn_cond_head.cond_proj.{j}.weight", (D, D))
@@ -245,11 +245,11 @@ def synthetic_checkpoint(
         if i not in config.ctrl_layers:
             continue
         if legacy:
-            # T7: cat([fc1_x, fc1_c], dim=1) -- x first, along the INPUT axis.
+            # cat([fc1_x, fc1_c], dim=1) -- x first, along the INPUT axis.
             x = src(p + "ctrl_mlpfusion.fc1_x.weight", (D, D))
             c = src(p + "ctrl_mlpfusion.fc1_c.weight", (D, D))
             expected[q + "ctrl_mlpfusion.mlp.fc1.weight"] = torch.cat((x, c), dim=1)
-            # T8: a plain rename, guarded separately from T7's both-halves guard.
+            # A plain rename, guarded separately from the fc1 fusion's both-halves guard.
             expected[q + "ctrl_mlpfusion.mlp.fc2.weight"] = src(
                 p + "ctrl_mlpfusion.fc2.weight", (D, D)
             )
@@ -261,9 +261,9 @@ def synthetic_checkpoint(
                 p + "ctrl_mlpfusion.mlp.fc2.weight", (D, D)
             )
 
-    # The tie: every block stores the same six matrices (PARAM_TREE section 5.2
-    # proves the file is not deduplicated). Applied last so it overwrites the
-    # per-block values generated above.
+    # The tie: every block stores the same six matrices (the file is not
+    # deduplicated). Applied last so it overwrites the per-block values
+    # generated above.
     for i in range(config.n_layers):
         if i == COND_PROJ_SOURCE_BLOCK:
             continue
@@ -303,13 +303,9 @@ def build_from(tmp_path: Path, state: dict[str, torch.Tensor], config: WaypointC
 def test_parameter_census_matches_the_720p_checkpoint():
     """174 tensors / 1,281,958,040 resident / 1,860,771,992 stored.
 
-    These are PARAM_TREE section 5.2's numbers, less the 2,048 of
-    ``ctrl_cfg.null_emb`` that T10 drops, and they are the arithmetic behind
-    "1.28B resident, 1.86B stored, 3.72 GB on disk". A change in any of the
-    three means the module tree stopped being the checkpoint's tree.
-
-    Read off the meta module: ``numel()`` and ``state_dict()`` need no storage,
-    so this costs nothing even though the same build with real memory is 2.6 GB.
+    Less the 2,048 of ``ctrl_cfg.null_emb`` (dropped, unused), this is the
+    arithmetic behind "1.28B resident, 1.86B stored, 3.72 GB on disk". A change
+    in any of the three means the module tree stopped being the checkpoint's tree.
     """
     with torch.device("meta"):
         dit = WaypointDiT(WaypointConfig())
@@ -354,8 +350,8 @@ def test_cond_proj_tie_lifecycle_across_to_empty():
 
     dit.retie_cond_proj()
     assert n_cond_proj(dit) == 6
-    # The surviving names are the owner block's; T9 drops keys for every other
-    # block on exactly that assumption.
+    # The surviving names are the owner block's; the loader drops keys for
+    # every other block on exactly that assumption.
     assert all(
         name.startswith(f"blocks.{COND_PROJ_SOURCE_BLOCK}.cond_head.cond_proj.")
         for name, _ in dit.named_parameters()
@@ -378,7 +374,7 @@ def test_build_waypoint_dit_leaves_cond_proj_tied(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 3. T0-T12 round trip, both key spellings
+# 3. Full key-remapping round trip, both key spellings
 # ---------------------------------------------------------------------------
 
 
@@ -387,10 +383,10 @@ def test_every_parameter_equals_its_checkpoint_source(tmp_path, spelling):
     """Every one of the loaded parameters, compared by value against an
     independent transcription of the reference's transforms.
 
-    This is the round trip for T0-T12 at once: a name that does not appear in
-    ``expected`` is a transform this test does not know about, and a value that
-    differs is a transform applied wrongly. Both spellings run because
-    PARAM_TREE section 10.1 could not establish which one the shipped file uses.
+    This is the round trip for every remapping transform at once: a name that
+    does not appear in ``expected`` is a transform this test does not know
+    about, and a value that differs is a transform applied wrongly. Both
+    spellings run because it's unresolved which one the shipped file uses.
     """
     config = tiny_config()
     state, expected = synthetic_checkpoint(config, spelling=spelling)
@@ -411,12 +407,12 @@ def test_every_parameter_equals_its_checkpoint_source(tmp_path, spelling):
 
 
 def test_qkv_row_ranges(tmp_path):
-    """q = rows [0:2048], k = [2048:3072], v = [3072:4096] (PARAM_TREE section 7).
+    """q = rows [0:2048], k = [2048:3072], v = [3072:4096].
 
     Explicit because this is where a swap is invisible: GQA makes q taller than
-    k and v, so a q/k swap raises on the slice shape (S11b) but a **k/v swap
-    does not** — both are ``[n_kv_heads*d_head, d_model]``, the load is clean,
-    and attention output is meaningless but well-scaled (S11).
+    k and v, so a q/k swap raises on the slice shape but a **k/v swap does
+    not** — both are ``[n_kv_heads*d_head, d_model]``, the load is clean, and
+    attention output is meaningless but well-scaled.
     """
     config = tiny_config()
     state, _ = synthetic_checkpoint(config, spelling=LEGACY)
@@ -441,12 +437,12 @@ def test_qkv_row_ranges(tmp_path):
 
 
 def test_fc1_column_halves(tmp_path):
-    """``fc1_x`` = columns [0:D], ``fc1_c`` = [D:2D] (PARAM_TREE section 4.7).
+    """``fc1_x`` = columns [0:D], ``fc1_c`` = [D:2D].
 
     Explicit for the same reason as the qkv ranges, and worse: the merge is on
     **dim 1**, both halves are ``[D, D]``, so ``cat((c, x))`` keeps the shape
     exactly and applies controller conditioning to tokens and token content to
-    the controller vector (S7). ``MLPFusion.forward``'s ``chunk(2, dim=1)`` takes
+    the controller vector. ``MLPFusion.forward``'s ``chunk(2, dim=1)`` takes
     the low columns as the token half, which is what fixes the order.
     """
     config = tiny_config()
@@ -471,8 +467,8 @@ def test_cond_proj_slots_follow_the_half_head_names(tmp_path):
     """attn head -> slots 0-2, mlp head -> 3-5, and not the reverse.
 
     ``CondHead.forward`` is unpacked as ``s0, b0, g0, s1, b1, g1``; 0-2 drive the
-    attention sublayer and 3-5 the MLP. All six are ``[D, D]``, so swapping T5
-    and T6 is mechanically invisible and numerically catastrophic.
+    attention sublayer and 3-5 the MLP. All six are ``[D, D]``, so swapping the
+    two heads' slots is mechanically invisible and numerically catastrophic.
     """
     config = tiny_config()
     state, _ = synthetic_checkpoint(config, spelling=LEGACY)
@@ -489,31 +485,31 @@ def test_cond_proj_slots_follow_the_half_head_names(tmp_path):
 @pytest.mark.parametrize(
     "key,expected",
     [
-        # T0: both the checkpoint's two-level prefix and the collapsed one.
+        # Both the checkpoint's two-level prefix and the collapsed one.
         ("transformer.blocks.5.attn.out_proj.weight", "blocks.5.attn.out_proj.weight"),
         ("blocks.5.attn.out_proj.weight", "blocks.5.attn.out_proj.weight"),
-        # T3, five-name allowlist (only fc1/fc2 exist under moe=False).
+        # Five-name allowlist (only fc1/fc2 exist under moe=False).
         ("transformer.blocks.5.dit_mlp.fc1.weight", "blocks.5.mlp.fc1.weight"),
         ("transformer.blocks.5.dit_mlp.fc2.weight", "blocks.5.mlp.fc2.weight"),
-        # T4: all three spellings share one target; precedence is settled by the
+        # All three spellings share one target; precedence is settled by the
         # loader, not here (this function is deliberately not injective).
         ("transformer.blocks.0.attn_cond_head.bias_in", "blocks.0.cond_head.bias_in"),
         ("transformer.blocks.0.mlp_cond_head.bias_in", "blocks.0.cond_head.bias_in"),
         ("transformer.blocks.0.cond_head.bias_in", "blocks.0.cond_head.bias_in"),
-        # T5 / T6: identity for attn, +3 for mlp.
+        # Identity for attn, +3 for mlp.
         ("transformer.blocks.0.attn_cond_head.cond_proj.2.weight", "blocks.0.cond_head.cond_proj.2.weight"),
         ("transformer.blocks.0.mlp_cond_head.cond_proj.0.weight", "blocks.0.cond_head.cond_proj.3.weight"),
         ("transformer.blocks.0.mlp_cond_head.cond_proj.2.weight", "blocks.0.cond_head.cond_proj.5.weight"),
-        # T8: guarded on fc2 alone, separately from T7.
+        # Guarded on fc2 alone, separately from the fc1 fusion.
         ("transformer.blocks.3.ctrl_mlpfusion.fc2.weight", "blocks.3.ctrl_mlpfusion.mlp.fc2.weight"),
-        # T9: every block but the owner is dropped, both spellings.
+        # Every block but the owner is dropped, both spellings.
         ("transformer.blocks.7.attn_cond_head.cond_proj.2.weight", None),
         ("transformer.blocks.7.cond_head.cond_proj.5.weight", None),
-        # T10 / T12.
+        # Unconditional drops.
         ("ctrl_cfg.null_emb", None),
         ("transformer.blocks.0.cond_heads.0.weight", None),
         ("transformer.blocks.0.cond_heads.0.k_proj.weight", None),
-        # T7 / T11 are fan-ins: the remapper leaves them for the stacked rules.
+        # Fan-ins: the remapper leaves them for the stacked rules.
         ("transformer.blocks.2.attn.q_proj.weight", "blocks.2.attn.q_proj.weight"),
         ("transformer.blocks.0.ctrl_mlpfusion.fc1_x.weight", "blocks.0.ctrl_mlpfusion.fc1_x.weight"),
         # Top level is identity.
@@ -572,7 +568,7 @@ def test_missing_fc1_shard_raises(tmp_path, shard_key):
 
 
 def test_named_parameters_check_alone_cannot_see_a_missing_shard(tmp_path):
-    """Why the ``(target, shard_id)`` tally exists at all — S11d.
+    """Why the ``(target, shard_id)`` tally exists at all.
 
     ``load_weights_into`` returns *target* names, and q, k and v share one
     target, so a ``k_proj`` missing from every layer leaves
@@ -608,12 +604,12 @@ def test_named_parameters_check_alone_cannot_see_a_missing_shard(tmp_path):
 
 
 def test_intended_drops_load_cleanly(tmp_path):
-    """T10 and T12 are silent by design; everything else is loud.
+    """The unconditional drops are silent by design; everything else is loud.
 
     ``.cond_heads.`` (note the plural) is the reference's unconditional filter,
     and ``ctrl_cfg.null_emb`` is a training-time CFG tensor with no call site.
     Both must be dropped *explicitly* — leaving them unmatched would work by
-    accident and put a hole in the unexpected-key accounting (S10).
+    accident and put a hole in the unexpected-key accounting.
     """
     config = tiny_config()
     state, expected = synthetic_checkpoint(config)
@@ -629,7 +625,7 @@ def test_intended_drops_load_cleanly(tmp_path):
     "key",
     [
         "transformer.blocks.0.attn.gate_proj.weight",  # gated_attn=False
-        "transformer.blocks.0.dit_mlp.router.weight",  # moe=False; T3 renames it, nothing owns it
+        "transformer.blocks.0.dit_mlp.router.weight",  # moe=False; renamed, but nothing owns it
         "prompt_cfg.null_emb",  # prompt_conditioning=None
         "transformer.blocks.0.cond_head.who_knows",
         "some.entirely.new.key",
@@ -645,10 +641,10 @@ def test_unknown_key_raises(tmp_path, key):
 
 
 def test_wrong_n_kv_heads_is_caught_by_the_shard_shape(tmp_path):
-    """PARAM_TREE section 10.4: ``n_kv_heads`` was transcribed from a config.yaml
-    nobody has read, and the reference's default is ``n_heads``. A wrong value
-    reshapes GQA attention without erroring anywhere downstream, so the loader
-    checks it against the tensors actually in the file."""
+    """``n_kv_heads`` was transcribed from a config.yaml nobody has read, and
+    the reference's default is ``n_heads``. A wrong value reshapes GQA
+    attention without erroring anywhere downstream, so the loader checks it
+    against the tensors actually in the file."""
     config = tiny_config()
     state, _ = synthetic_checkpoint(config)
     wrong = tiny_config()
@@ -777,7 +773,7 @@ def test_f3_no_bias_in_at_all_still_raises(tmp_path):
 
 
 def test_f4_dropped_keys_are_not_shape_validated(tmp_path):
-    """T12 drops ``.cond_heads.`` unconditionally, including keys whose suffix
+    """``.cond_heads.`` is dropped unconditionally, including keys whose suffix
     the GQA/patch validators recognize.
 
     Validation used to run on the raw stream, before any drop, so these three
