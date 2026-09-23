@@ -257,12 +257,32 @@ class ConditionalDecoder(nn.Module):
 
 
 class CausalConditionalCFM(nn.Module):
-    """Euler integration of the estimator from noise to mel."""
+    """Euler integration of the estimator from noise to mel.
+
+    The estimator may run in a lower precision than the solve: ``set_estimator_dtype``
+    converts its weights and the solve casts each step's inputs to that dtype
+    while the integrated state ``x`` and the Euler update stay in the solve's
+    own dtype (float32 as served). With the estimator in float32 nothing is
+    cast and the solve is the reference's, bit for bit.
+    """
 
     def __init__(self, config: S3GenCFMConfig, estimator: ConditionalDecoder):
         super().__init__()
         self.config = config
         self.estimator = estimator
+        self.estimator_dtype: torch.dtype | None = None
+
+    def set_estimator_dtype(self, dtype: torch.dtype | None) -> None:
+        """Run the estimator in ``dtype`` (None = the solve's dtype)."""
+        self.estimator_dtype = dtype
+        if dtype is not None:
+            self.estimator.to(dtype)
+
+    def _cast(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        dtype = self.estimator_dtype
+        if dtype is None:
+            return tensors
+        return tuple(t.to(dtype) for t in tensors)
 
     def time_grid(self, n_timesteps: int, device: torch.device, dtype: torch.dtype, meanflow: bool) -> torch.Tensor:
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=device, dtype=dtype)
@@ -289,9 +309,10 @@ class CausalConditionalCFM(nn.Module):
         spks_in = torch.cat([spks, torch.zeros_like(spks)], dim=0)
         cond_in = torch.cat([cond, torch.zeros_like(cond)], dim=0)
         mask_in = torch.cat([mask, mask], dim=0)
+        mu_in, spks_in, cond_in, mask_in = self._cast(mu_in, spks_in, cond_in, mask_in)
         for t, r in zip(t_span[:-1], t_span[1:], strict=True):
-            t_in = t.expand(2 * b)
-            dxdt = self.estimator(torch.cat([x, x], dim=0), mask_in, mu_in, t_in, spks_in, cond_in)
+            x_in, t_in = self._cast(torch.cat([x, x], dim=0), t.expand(2 * b))
+            dxdt = self.estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in).to(x.dtype)
             dxdt, cfg_dxdt = dxdt.split([b, b], dim=0)
             dxdt = (1.0 + rate) * dxdt - rate * cfg_dxdt
             x = x + (r - t) * dxdt
@@ -310,7 +331,9 @@ class CausalConditionalCFM(nn.Module):
         x = noise
         b = mu.shape[0]
         t_span = self.time_grid(n_timesteps, mu.device, mu.dtype, meanflow=True)
+        mask_in, mu_in, spks_in, cond_in = self._cast(mask, mu, spks, cond)
         for t, r in zip(t_span[:-1], t_span[1:], strict=True):
-            dxdt = self.estimator(x, mask, mu, t.expand(b), spks, cond, r=r.expand(b))
+            x_in, t_in, r_in = self._cast(x, t.expand(b), r.expand(b))
+            dxdt = self.estimator(x_in, mask_in, mu_in, t_in, spks_in, cond_in, r=r_in).to(x.dtype)
             x = x + (r - t) * dxdt
         return x
