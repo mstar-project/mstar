@@ -241,10 +241,9 @@ def ports(reference):
     sigma LUT is a fp32 GEMM whose result depends on
     ``float32_matmul_precision``, and the reference fixture is what sets it.
     """
-    # This harness decomposes the reference's five passes in Python so it can
-    # compare every intermediate. Keep the port's outer driver eager too;
-    # Keep outer compilation off so this test isolates numerical compatibility;
-    # compilation and CUDA graph selection have separate execution-mode gates.
+    # compile_dit=False: compilation and CUDA graph selection have separate
+    # execution-mode gates, so keeping the port eager here isolates numerical
+    # compatibility.
     default = replace(waypoint_1_5_1b_720p(), compile_dit=False)
     exact = replace(default, reference_compat=False)
     return {False: _build_port(exact), True: _build_port(default)}

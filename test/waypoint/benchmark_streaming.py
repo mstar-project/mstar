@@ -384,9 +384,8 @@ def _run_concurrent_wave(
     """Run ``len(request_ids)`` streams together, each opening only once every
     thread has built its request body (mirrors serve_rollout._concurrent_rollouts).
 
-    Returns (per-stream (metrics, failures) in ``request_ids`` order, wave
-    start, wave end) on the driver's own wall clock, for cross-stream
-    aggregate timing that does not require touching _stream_metrics.
+    Returns per-stream (metrics, failures) in ``request_ids`` order, plus wave
+    start/end on the driver's own wall clock (for cross-stream aggregate timing).
     """
     barrier = threading.Barrier(len(request_ids) + 1)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(request_ids)) as executor:
@@ -429,9 +428,8 @@ def _stream_is_realtime(metrics: dict) -> bool:
 
 
 def _concurrent_aggregate(per_stream: Sequence[dict], *, aggregate_fps: float | None, server: dict) -> dict:
-    """Cross-stream realtime summary built from each stream's _measure_stream
-    metrics dict (unmodified _stream_metrics output) plus the already-parsed
-    server-side rollout cadence."""
+    """Cross-stream realtime summary from each stream's _measure_stream metrics
+    plus the already-parsed server-side rollout cadence."""
     ttff_ms = [
         metrics["time_to_first_frame_seconds"] * 1000.0
         for metrics in per_stream
@@ -498,10 +496,9 @@ def _concurrent_aggregate(per_stream: Sequence[dict], *, aggregate_fps: float | 
 
 
 def _dit_step_timestamps(log_text: str, request_ids: set[str]) -> list[float]:
-    """Wall-clock seconds (from each line's %(asctime)s prefix) of every
-    rollout DiT step whose batch includes at least one of ``request_ids``, in
-    log order. Same marker/parsing as serve_rollout._dit_schedule, extended
-    with the timestamp that function does not keep."""
+    """Wall-clock seconds (from each line's %(asctime)s prefix) of every rollout
+    DiT step whose batch includes a request_id, in log order. Same marker as
+    serve_rollout._dit_schedule, extended with the timestamp it discards."""
     marker = "Executing: dit graph_walk=rollout "
     timestamps = []
     for line in log_text.splitlines():
@@ -557,10 +554,9 @@ def _run_concurrent_phase(
     sampler: rollout.MemorySampler,
     startup_seconds: float,
 ) -> tuple[dict, list[str]]:
-    """N-stream concurrent phase: a discarded warmup wave (captures/compiles
-    the batch-``streams`` CUDA graph bucket), then a measured wave whose
-    per-stream metrics and server-side rollout cadence decide whether every
-    stream stayed realtime under batch-``streams`` scheduling."""
+    """N-stream concurrent phase: a discarded warmup wave (compiles the
+    batch-``streams`` CUDA graph bucket), then a measured wave whose per-stream
+    metrics and server-side cadence decide whether every stream stayed realtime."""
     failures: list[str] = []
 
     warmup_ids = [f"{request_id_prefix}-concurrent-warmup-{i}" for i in range(streams)]

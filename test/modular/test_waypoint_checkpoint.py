@@ -351,10 +351,9 @@ def test_model_resolves_variant_artifacts_before_first_module_allocation(
 
     model.get_submodule(DIT_NODE)
 
-    # The dit's fused decode needs TAEHV weights too now (Step 2): allocation
-    # still runs first, and the AE load trails it rather than gating it, since
-    # ``_taehv_weights`` is evaluated as part of the same return statement,
-    # after ``build_waypoint_dit`` already ran.
+    # AE load trails allocation rather than gating it: ``_taehv_weights`` is
+    # evaluated as part of the same return statement, after
+    # ``build_waypoint_dit`` already ran.
     assert [entry[0] for entry in calls] == [
         "runtime", "waypoint", "taehv", "allocate", "load_taehv",
     ]

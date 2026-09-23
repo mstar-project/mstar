@@ -1,78 +1,35 @@
 #!/usr/bin/env python3
 """Record the world_engine golden-reference oracle for Waypoint-1.5-1B.
 
-Runs **only** ``world_engine`` — importing any mstar module is a hard error — so
-the artifact owes nothing to the code it will be used to judge.
+Runs **only** ``world_engine`` (importing any mstar module is a hard error) so the
+artifact owes nothing to the code it will judge.
 
-    <out-dir>/frames/frame_000.pt ... frame_NNN.pt   per-frame tensors (below)
-    <out-dir>/ring/ring_000.pt ...                   full KV ring at selected frames
-    <out-dir>/metadata.json                          resolved numerics + params
+    <out-dir>/frames/frame_NNN.pt   per-step tensors: dit_out (per-pass DiT output),
+                                    latent (x0), pixels, noise_f32/noise_bf16,
+                                    committed_kv (tail KV slice), ring (written mask
+                                    + per-bucket sum-of-squares)
+    <out-dir>/ring/ring_NNN.pt      full KV ring at ``--ring-snapshot-frames``
+    <out-dir>/metadata.json         resolved numerics + params
 
-Each ``frame_*.pt`` holds one engine step = one latent frame:
+``committed_kv`` plus the ring digest localize a mismatch to a layer and slot
+without dumping the 2.2 GB ring every frame. ``latent``/``pixels``/``committed_kv``/
+``ring`` come unmodified from the reference's compiled regions and are bit-exact
+targets. ``dit_out`` is a diagnostic, not bit-exact: the driver is two
+``@torch.compile(fullgraph=True)`` regions (compile is correctness — an eager
+``flex_attention`` pass would attend over unwritten ring slots), so exposing per-pass
+output from inside them shifts the result ~1 bf16 ULP; it is instead recorded from
+separate frozen passes that leave the ring alone (``--verify-shadow`` checks this).
 
-    dit_out       the DiT output of every pass: 4 non-committing denoise passes
-                  at sigma 1.0/0.9/0.75/0.3, then the committing pass at sigma 0
-                  (frame 0 is the seed and has only the committing pass)
-    latent        x0, the emitted latent after the Euler steps
-    pixels        the 4 raw frames the streaming VAE decoded from it
-    noise_f32     the CPU fp32 draw, and noise_bf16, the device tensor actually fed
-    committed_kv  per layer, the tail KV slice this frame committed
-    ring          per layer, the `written` mask and per-bucket sum-of-squares
+Nothing here is reproducible across processes (~1 bf16 ULP at layer 0, compounded
+over 24 layers), so ``repro/`` re-records the opening frames to measure that floor.
 
-``committed_kv`` plus the ring digest localize a mismatch to a layer, and the
-digest's per-bucket resolution localizes it to a ring slot, without writing the
-2.2 GB full ring every frame. Full rings are written for ``--ring-snapshot-frames``.
-
-``latent``, ``pixels``, ``committed_kv`` and ``ring`` come from the reference's
-own compiled regions, called unmodified, and are bit-exact targets. ``dit_out``
-is not: see Execution.
-
-Execution
----------
-The reference's driver is two ``@torch.compile(fullgraph=True, dynamic=False)``
-regions, and the compile is correctness, not throughput — eager ``flex_attention``
-ignores a ``BlockMask``'s block index lists, and the mask carries a no-op
-``mask_mod``, so an eager pass attends over unwritten ring slots. Nothing here
-may call ``engine.model(...)`` directly.
-
-That makes the per-pass DiT output unobservable where it is produced: adding it as
-an output of ``_denoise_pass``, or splitting that region into five, changes
-inductor's fusion and moves the result by about one bf16 ULP, which then compounds
-through the ring. So state comes from the reference driver untouched, and
-``dit_out`` comes from separate frozen passes run first — ``upsert`` only writes
-the ring when unfrozen, which ``--verify-shadow`` checks on every run. Treat
-``dit_out`` as a per-pass diagnostic recorded under a stated decomposition.
-
-Nothing recorded here is a bit-exact target. The reference driver is deterministic
-within a process and not across them: two processes running it alone disagree by
-one bf16 ULP at layer 0, which 24 layers compound. ``repro/`` is a second
-independent recording of the opening frames so that floor can be measured rather
-than assumed. See ``reproducibility`` in the metadata.
-
-Numerics
---------
-An oracle is only a reference if it is recorded under the same numerics as the
-serving process, and only comparable against the torch build it was recorded on.
-
-Two settings disagree here: mstar sets ``float32_matmul_precision('high')``
-process-wide (``mstar/engine/__init__.py``), ``world_engine`` sets ``'medium'`` at
-import. This records under **'high'**, the serving value, for the reason above —
-and, because that is a deviation from the reference as shipped, it also measures
-what the deviation costs. The only fp32 matmul in the patched inference path is
-``NoiseConditioner.mlp`` (a ``NoCastModule``, so it survives the bf16 cast), and
-after ``patch_cached_noise_conditioning`` it runs once per sigma level to build a
-LUT that is then rounded to bf16. ``matmul_precision_calibration`` in the metadata
-is that LUT evaluated both ways, so Phase 9 has the number instead of an argument.
-
-Noise is an input, not model behaviour, and the reference draws it unseeded
-(``torch.randn(..., device=cuda, dtype=bf16)``), which no oracle can reproduce.
-The port now draws the same way — bf16 straight onto the device, but from a
-seeded per-frame ``Generator`` (``mstar/model/waypoint/submodules.py::_frame_noise``).
-This recorder instead draws fp32 from a seeded CPU generator, casts, and injects
-that tensor into both sides, so the substitution stays device-independent and
-re-recordable regardless of how the port draws — which is what lets
-``--ring-snapshot-frames`` be narrowed by default. It saves both tensors and
-records the substitution.
+Numerics — an oracle is valid only under the numerics it was recorded with and the
+torch build it ran on. This records under ``float32_matmul_precision('high')`` (the
+mstar serving value, not world_engine's shipped 'medium'); the only fp32 matmul in
+the patched path is ``NoiseConditioner.mlp``, and ``matmul_precision_calibration``
+in the metadata reports the 'high'-vs-'medium' cost. Noise is injected as a seeded
+fp32 CPU draw cast to bf16, fed to both sides, so it is device-independent and
+re-recordable.
 
 Usage:
 
@@ -174,14 +131,10 @@ def describe_patches(model) -> dict:
 def calibrate_matmul_precision(ckpt_dir: str, d_model: int, sigmas, device) -> dict:
     """Measure what 'high' (mstar) vs 'medium' (world_engine) costs on this build.
 
-    Two probes. The model probe is the only fp32 matmul in the patched inference
-    path: NoiseConditioner.mlp, which is a NoCastModule and so stays fp32 through
-    the bf16 cast, and which patch_cached_noise_conditioning evaluates once per
-    sigma level to build a LUT it then rounds to bf16. The control probe is a
-    plain fp32 GEMM, and it is what makes a zero in the model probe readable — a
-    'high' vs 'highest' difference proves the flag is live and the instrument
-    works, so a 'high' vs 'medium' zero is a fact about the build, not a broken
-    measurement.
+    Two probes: the model probe (NoiseConditioner.mlp, the only fp32 matmul in
+    the patched path) and a control probe (a plain fp32 GEMM) that proves the
+    precision flag is live, so a zero model gap reads as a fact about the
+    build rather than a broken measurement.
     """
     from safetensors.torch import load_file
     from src.model.nn import NoiseConditioner
