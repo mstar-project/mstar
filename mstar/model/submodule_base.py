@@ -62,6 +62,30 @@ class StackingMethod(Enum):
     CAT = "cat"
 
 
+def _split_pos_ids(
+    pos_ids: "torch.Tensor | dict[str, torch.Tensor]",
+    input_seq_len: int, start: int, end: int,
+):
+    """Cut position ids on their trailing dim, per label where there are labels.
+
+    The trailing dim is the sequence one wherever it matches the walk's token
+    count, which covers both the plain ``(seq,)`` layout and the ``(3, seq)``
+    one mRoPE uses; anything else is a layout this cannot read.
+    """
+    if isinstance(pos_ids, dict):
+        return {
+            label: _split_pos_ids(value, input_seq_len, start, end)
+            for label, value in pos_ids.items()
+        }
+    if pos_ids.shape[-1] != input_seq_len:
+        raise NotImplementedError(
+            f"custom position ids of shape {tuple(pos_ids.shape)} do not end "
+            f"in this walk's {input_seq_len} tokens, so the sequence dim "
+            "cannot be told apart; override `split_inputs`"
+        )
+    return pos_ids[..., start:end]
+
+
 @dataclass
 class ARNodeInputs(NodeInputs):
     """
@@ -360,6 +384,25 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> NodeInputs:
         pass
 
+    def split_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: "CurrentForwardPassInfo",
+        inputs: NodeInputs,
+        start: int,
+        end: int,
+    ) -> NodeInputs:
+        """This walk's inputs restricted to tokens ``[start, end)``.
+
+        ``inputs`` is the whole prompt, prepared once and sliced rather than
+        re-derived, so anything read out of a resource while preparing is read
+        once, before any part of it runs.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot serve part of a walk's tokens; "
+            "it has to override `split_inputs` to say how its inputs are cut"
+        )
+
     def preprocess(
         self,
         graph_walk: str,
@@ -619,6 +662,46 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
 
 class ARNodeSubmodule(NodeSubmodule):
+    def split_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: ARNodeInputs,
+        start: int,
+        end: int,
+    ) -> ARNodeInputs:
+        """This walk's inputs restricted to tokens ``[start, end)``.
+
+        Only the sequence-shaped fields are cut. ``tensor_inputs``, ``kwargs``
+        and ``resource_step_info`` are opaque here, so a submodule carrying any
+        of them says for itself how they are cut, or refuses to be cut at all.
+        """
+        del graph_walk, fwd_info
+        for name in ("tensor_inputs", "kwargs", "resource_step_info"):
+            if getattr(inputs, name):
+                raise NotImplementedError(
+                    f"{type(self).__name__} carries {name} into this walk, "
+                    "which cannot be cut without knowing what it holds; "
+                    "override `split_inputs`"
+                )
+        cut = replace(
+            inputs,
+            input_seq_len=end - start,
+            input_ids=(
+                None if inputs.input_ids is None
+                else inputs.input_ids[start:end]
+            ),
+            input_embeds=(
+                None if inputs.input_embeds is None
+                else inputs.input_embeds[start:end]
+            ),
+        )
+        if inputs.custom_pos_ids is not None:
+            cut.custom_pos_ids = _split_pos_ids(
+                inputs.custom_pos_ids, inputs.input_seq_len, start, end,
+            )
+        return cut
+
     @abstractmethod
     def prepare_inputs(
         self,

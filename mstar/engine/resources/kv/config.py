@@ -32,6 +32,9 @@ class KVConfig:
     layout: KVLayout = KVLayout.NHD
     # pages of pinned host memory to keep for offloading; 0 disables it
     cpu_offload_pages: int = 0
+    # folded into the root, not checked at match time
+    prefix_cache_salt: str = ""
+    prefix_cache: bool = True
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -63,6 +66,30 @@ class KVReqConfig(ResourceReqConfig):
     needed_labels: list[str] | None = None
     needed_labels_per_node: dict[str, list[str]] = field(default_factory=dict)
     needed_labels_per_node_walk: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    # label -> one key per page, from the preprocess worker
+    prefix_keys: dict[str, list[bytes]] | None = None
+    # label -> prompt tokens past the last whole page, keyed once generation fills it
+    prefix_tail: dict[str, list[int]] | None = None
+    # label -> the output tensor its sampled ids arrive in, if the stream keys generation
+    prefix_decode: dict[str, str] | None = None
+    prefix_cache: bool = True
+
+    def apply_conductor_config(
+        self,
+        prefix_keys: dict[str, list[bytes]] | None=None,
+        prefix_tail: dict[str, list[int]] | None=None,
+        prefix_decode: dict[str, str] | None=None,
+        prefix_cache: bool | None=None,
+        **kwargs,
+    ):
+        if prefix_keys is not None:
+            self.prefix_keys = prefix_keys
+        if prefix_tail is not None:
+            self.prefix_tail = prefix_tail
+        if prefix_decode is not None:
+            self.prefix_decode = prefix_decode
+        if prefix_cache is not None:
+            self.prefix_cache = prefix_cache
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
@@ -90,6 +117,8 @@ class KVSpec(NodeResourceSpec):
         page_size: int | None = None,
         max_seq_len: int | None = None,
         cpu_offload_pages: int | None = None,
+        prefix_cache_salt: str | None = None,
+        prefix_cache: bool | None = None,
     ):
         """How much cache this deployment gets, and how it is cut up."""
         for name, value in (
@@ -97,6 +126,8 @@ class KVSpec(NodeResourceSpec):
             ("page_size", page_size),
             ("max_seq_len", max_seq_len),
             ("cpu_offload_pages", cpu_offload_pages),
+            ("prefix_cache_salt", prefix_cache_salt),
+            ("prefix_cache", prefix_cache),
         ):
             if value is not None:
                 setattr(self.config, name, value)

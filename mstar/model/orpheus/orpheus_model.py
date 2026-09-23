@@ -42,7 +42,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, PrefixStream
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import SlidingWindowChunkPolicy
@@ -349,6 +349,17 @@ class OrpheusModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: resources
     # -------------------------------------------------------------------
+
+    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+        """The LLM's prompt is its token ids, and so is every step after it."""
+        return {
+            KV_CACHE: {"main": PrefixStream("text_inputs", "ids", "prefill", "decode")},
+        }
+
+    def checkpoint_path(self) -> str:
+        return _resolve_local_hf_snapshot(
+            self.model_path_hf, cache_dir=self.cache_dir,
+        )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         kv_config = KVConfig(
