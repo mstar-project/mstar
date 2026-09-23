@@ -1619,6 +1619,63 @@ context segments have a non-zero span in the prefill step that writes them, and 
 0 in every later step. The ``commit`` in the prefill step converts the reservation into
 resident pages that the later steps read.
 
+Worked example: an image DiT on the diffusion scaffold
+------------------------------------------------------
+
+Flow-matching image and video transformers (FLUX-family DiTs, Z-Image, Wan-style
+video) share one graph shape, so M* ships it as a scaffold in
+``mstar/model/components/diffusion/``; a model adds only its exact component
+ports, its checkpoint remap and a few hooks.
+
+Graph and Walks::
+
+    text_encoder ──text_embeds──▶ Loop("denoise_loop", dit) ──latents──▶ vae_decoder ──▶ EMIT image
+    vae_encoder  ──ref_latents──▶ (image_edit only)
+
+    encode_text  : text_inputs  -> text_embeds  (persist)
+    encode_image : image_inputs -> ref_latents  (persist)
+    image_gen    : Sequential[Loop(dit) -> vae_decoder]
+    image_edit   : image_gen with ref_latents as an extra Loop input
+
+``latents`` is the only loop-back edge; every other input is re-injected each
+iteration. The step index is the engine's loop counter
+(``fwd_info.dynamic_loop_iter_counts``), so there is no host sync per step.
+
+The ``dit`` node subclasses ``DenoiseLoopSubmodule`` (``denoise_loop.py``), which owns
+the engine contract — seeded initial noise, per-request schedules, equal-shape request
+batching (``can_batch``), stacked ``forward_batched``, ``check_stop`` at the request's own
+step count, the ragged-attention ``declare_step`` and one CUDA-graph bucket per latent
+shape with the Euler update inside the graph — and asks the model for:
+
+.. code-block:: python
+
+    class MyDenoise(DenoiseLoopSubmodule):
+        def shape_key_for(self, fwd_info): ...        # hashable: latent grid, text length, ...
+        def schedule_for(self, fwd_info, key): ...    # FlowMatchSchedule (flow_match.py)
+        def seed_latents(self, fwd_info, key, gen): ...  # [L, C] initial noise, seeded
+        def request_inputs(self, fwd_info, inputs, key): ...  # per-row conditioning tensors
+        def num_tokens(self, key): ...                # image tokens for the attention step
+        def capture_request_inputs(self, key, device): ...   # dummy rows for graph capture
+        def denoise(self, engine_inputs, key, latents, timestep, sigma, sigma_next, **cond): ...
+        # optional: extra attention spans (a refiner over the image tokens alone, ...)
+        def attention_segments(self, key): return (("main", self.num_tokens(key)),)
+
+Every span a layer attends over must be declared with its own label (default: one
+``"main"`` segment per request); ``ragged_for(label)`` hands that span's kernel to the
+layers, which fall back to SDPA when no ragged resource is bound.
+
+Shared pieces to build the components from: ``flow_match.py`` (shift schedules and the
+exact Euler step), ``rope.py`` (multi-axis rotary embeddings), ``attention.py`` (joint
+attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under graphs),
+``text_encoder.py`` (native Qwen3 hidden-state taps), ``autoencoder_kl.py`` (the KL VAE
+family), ``image_io.py`` (latent packing, PNG) and ``lora.py`` (static LoRA merge at load,
+also into fused ``q``/``k``/``v`` shards via ``FusedColumnLinear.shard_slice``).
+
+On the API side ``DiffusionImageAdapter`` (``mstar/api_server/openai/adapters.py``) serves
+``/v1/images/generations`` and ``/v1/images/edits`` for any such model (``size`` becomes
+``width``/``height``, ``seed`` and other knobs pass through); register it under the
+model's registry key. The SDK exposes ``generate_image`` and ``edit_image``.
+
 Advanced: async partitions and streaming
 ----------------------------------------
 

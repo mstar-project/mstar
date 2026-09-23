@@ -11,6 +11,7 @@ for audio helpers) — no torch / CUDA.
     print(client.chat("Hello!").text)
     client.tts("Hi there", voice="tara").to_wav("out.wav")
     open("cat.png", "wb").write(client.generate_image("a cat in a hat"))
+    open("edit.png", "wb").write(client.edit_image("make it a watercolor", "cat.png"))
 """
 
 from __future__ import annotations
@@ -139,6 +140,17 @@ class MStarClient:
             raise RuntimeError("Server returned no image output")
         return res.images[0]
 
+    def edit_image(self, prompt: str, image, **model_kwargs) -> bytes:
+        """Return PNG bytes for an image-editing request: ``image`` (a path, raw
+        bytes or a ``(filename, bytes)`` tuple, or a list of them for multi-reference
+        models) plus the edit instruction (e.g. BAGEL)."""
+        res = self.generate(
+            text=prompt, images=image, output_modalities=("image",), **model_kwargs,
+        )
+        if not res.images:
+            raise RuntimeError("Server returned no image output")
+        return res.images[0]
+
     def tts(self, text: str, *, voice: str | None = None, **model_kwargs) -> AudioBuffer:
         """Text-to-speech. Returns an :class:`AudioBuffer` (``.to_wav(path)``)."""
         res = self.generate(text=text, output_modalities=("audio",), voice=voice, **model_kwargs)
@@ -162,8 +174,10 @@ class MStarClient:
         for kind, items in (("images", images), ("audio", audio), ("video", video)):
             if not items:
                 continue
-            if isinstance(items, (str, bytes, bytearray, Path)):
-                items = [items]
+            if isinstance(items, (str, bytes, bytearray, Path)) or (
+                isinstance(items, tuple) and len(items) == 2 and isinstance(items[0], str)
+            ):
+                items = [items]  # one path, one blob, or one (filename, bytes) pair
             for i, item in enumerate(items):
                 fname, blob = self._coerce_file(kind, i, item)
                 files.append(("files", (fname, blob)))
