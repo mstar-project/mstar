@@ -1,6 +1,7 @@
 """HF DeepSeek-V3 checkpoint loading for the Kimi-K2.7 module tree."""
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterable
 from pathlib import Path
@@ -13,6 +14,8 @@ from mstar.model.loader.base import StackedParamRule
 
 if TYPE_CHECKING:
     from mstar.model.components.quantization import CompressedTensorsQuantConfig
+
+logger = logging.getLogger(__name__)
 
 # Keep the expert index attached while remapping both bf16 and packed sub-keys.
 _EXPERT_RE = re.compile(
@@ -119,14 +122,23 @@ def load_kimi_hf_weights(
         raise ValueError("packed_experts=True requires a quant_config")
 
     restore_router_bias_fp32(module)
-    return load_hf_weights(
+    unmatched: list[str] = []
+    loaded = load_hf_weights(
         module,
         weights,
         stacked_params=build_kimi_stacked_params(
             n_routed_experts, packed_experts=packed_experts,
         ),
         name_remapper=kimi_name_remapper,
+        unmatched=unmatched,
     )
+    if unmatched:
+        logger.info(
+            "load_kimi_hf_weights: %d checkpoint key(s) mapped to no parameter "
+            "(e.g. vision_tower/mm_projector components not in the text backbone)",
+            len(unmatched),
+        )
+    return loaded
 
 
 def load_weights(

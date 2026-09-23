@@ -2,11 +2,20 @@ import sys
 
 sys.path.insert(0, ".")
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
-from mstar.engine.resources import AttentionSpec, KVSpec, PositionSpec, SamplerSpec
+import pytest
+import torch
+
+from mstar.conductor.request_info import (
+    CurrentForwardConductorMetadata,
+    CurrentForwardPassInfo,
+)
+from mstar.engine.resources import (
+    AttentionSpec, KVSpec, PositionSpec, SamplerSpec, SamplingReqConfig,
+)
 from mstar.graph.base import Loop
-from mstar.model.kimi_k2_7.config import KimiK2Config
+from mstar.model.kimi_k2_7.config import SAMPLER, KimiK2Config
 from mstar.model.kimi_k2_7.kimi_model import KimiK2Model
+from mstar.model.kimi_k2_7.submodules import KimiLLMSubmodule
 
 
 def _make_model() -> KimiK2Model:
@@ -92,3 +101,139 @@ def test_kimi_get_submodule_is_dummy_mode():
     model = _make_model()
     assert getattr(model, "model_path_hf", None) is None
     assert model.get_submodule("LLM") is None
+
+
+def test_check_stop_matches_any_token_in_eos_token_ids():
+    config = KimiK2Config.reduced()
+    config.eos_token_ids = [5, 9]
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    submodule = KimiLLMSubmodule(language_model=language_model, config=config)
+
+    info = CurrentForwardPassInfo(
+        request_id="r0", graph_walk="decode", fwd_index=0, random_seed=0,
+        max_tokens=100,
+        resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=False)},
+    )
+
+    assert submodule.check_stop(
+        "r0", info, {"new_token": [torch.tensor([5])]}
+    ) == {"decode_loop"}
+    assert submodule.check_stop(
+        "r0", info, {"new_token": [torch.tensor([9])]}
+    ) == {"decode_loop"}
+    assert submodule.check_stop(
+        "r0", info, {"new_token": [torch.tensor([7])]}
+    ) == set()
+
+
+# --- process_prompt chat-template path (Phase B) ---------------------------
+
+
+class _StubTokenizer:
+    """Records apply_chat_template / plain-call args; no HF IO."""
+
+    def __init__(self, encoded):
+        self._encoded = encoded
+        self.chat_calls = []
+        self.plain_calls = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.chat_calls.append((messages, kwargs))
+        return self._encoded
+
+    def __call__(self, prompt, return_tensors=None):
+        self.plain_calls.append((prompt, return_tensors))
+
+        class _Enc:
+            input_ids = torch.tensor([[1, 2, 3]])
+
+        return _Enc()
+
+
+def _make_chat_model(tokenizer, tokenizer_mode="hf") -> KimiK2Model:
+    model = _make_model()
+    model._tokenizer_mode = tokenizer_mode
+    model._tokenizer = tokenizer
+    return model
+
+
+def test_process_prompt_messages_tensor_return():
+    tok = _StubTokenizer(torch.tensor([[1, 2, 3]]))
+    model = _make_chat_model(tok)
+    messages = [{"role": "user", "content": "hi"}]
+
+    result = model.process_prompt(
+        None, ["text"], ["text"],
+        messages=messages, tools=[{"type": "function"}],
+        chat_template_kwargs={"k": "v"},
+    )
+
+    assert len(tok.chat_calls) == 1
+    called_messages, kwargs = tok.chat_calls[0]
+    assert called_messages == messages
+    assert kwargs["tools"] == [{"type": "function"}]
+    assert kwargs["add_generation_prompt"] is True
+    assert kwargs["tokenize"] is True
+    assert kwargs["return_tensors"] == "pt"
+    assert kwargs["k"] == "v"
+
+    ids = result["text_inputs"][0]
+    assert torch.equal(ids, torch.tensor([1, 2, 3]))
+    assert ids.dtype == torch.long
+    assert ids.ndim == 1
+
+
+def test_process_prompt_messages_dict_return_shape():
+    tok = _StubTokenizer({"input_ids": torch.tensor([[4, 5]])})
+    model = _make_chat_model(tok)
+
+    result = model.process_prompt(
+        None, ["text"], ["text"], messages=[{"role": "user", "content": "hi"}],
+    )
+
+    ids = result["text_inputs"][0]
+    assert torch.equal(ids, torch.tensor([4, 5]))
+    assert ids.dtype == torch.long
+    assert ids.ndim == 1
+
+
+def test_process_prompt_tool_choice_none_drops_tools():
+    tok = _StubTokenizer(torch.tensor([[1]]))
+    model = _make_chat_model(tok)
+
+    model.process_prompt(
+        None, ["text"], ["text"],
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"type": "function"}], tool_choice="none",
+    )
+
+    _, kwargs = tok.chat_calls[0]
+    assert kwargs["tools"] is None
+
+
+def test_process_prompt_plain_string_path_unchanged():
+    tok = _StubTokenizer(torch.tensor([[9]]))
+    model = _make_chat_model(tok)
+
+    result = model.process_prompt("hello", ["text"], ["text"])
+
+    assert len(tok.chat_calls) == 0
+    assert len(tok.plain_calls) == 1
+    called_prompt, return_tensors = tok.plain_calls[0]
+    assert called_prompt == "hello"
+    assert return_tensors == "pt"
+    assert torch.equal(result["text_inputs"][0], torch.tensor([1, 2, 3]))
+
+
+def test_process_prompt_no_prompt_no_messages_returns_empty():
+    model = _make_chat_model(_StubTokenizer(torch.tensor([[1]])))
+    assert model.process_prompt(None, ["text"], ["text"]) == {}
+
+
+def test_process_prompt_byte_mode_with_messages_raises():
+    model = _make_chat_model(_StubTokenizer(torch.tensor([[1]])), tokenizer_mode="byte")
+    with pytest.raises(ValueError, match="byte"):
+        model.process_prompt(
+            None, ["text"], ["text"], messages=[{"role": "user", "content": "hi"}],
+        )

@@ -104,20 +104,47 @@ class CompressedTensorsQuantConfig:
         if not quant:
             return None
         groups = quant.get("config_groups") or {}
-        weights: dict = {}
+        top_format = quant.get("format", "pack-quantized")
         if groups:
-            first = next(iter(groups.values()))
-            weights = (first or {}).get("weights") or {}
-        strategy = weights.get("strategy", "group")
-        group_size = weights.get("group_size")
-        if group_size is None:
-            group_size = -1 if strategy == "channel" else 32
+            agreed = None
+            for name, group in groups.items():
+                group = group or {}
+                # compressed-tensors puts `format` either per-group or once at the
+                # top level; a group without its own falls back to the top-level one.
+                group_format = group.get("format") or top_format
+                if group_format != "pack-quantized":
+                    raise ValueError(
+                        f"compressed-tensors config group {name!r} has format="
+                        f"{group_format!r}; mstar only supports 'pack-quantized' "
+                        "(INT4 W4A16)."
+                    )
+                w = group.get("weights") or {}
+                strategy = w.get("strategy", "group")
+                group_size = w.get("group_size")
+                if group_size is None:
+                    group_size = -1 if strategy == "channel" else 32
+                spec = (
+                    int(w.get("num_bits", 4)), int(group_size),
+                    bool(w.get("symmetric", True)), str(strategy),
+                )
+                if agreed is None:
+                    agreed = spec
+                elif spec != agreed:
+                    raise ValueError(
+                        f"compressed-tensors config_groups disagree: group {name!r} "
+                        f"has (num_bits, group_size, symmetric, strategy)={spec}, "
+                        f"expected {agreed} from an earlier group. Mixed-precision "
+                        "checkpoints are not supported."
+                    )
+            num_bits, group_size, symmetric, strategy = agreed
+        else:
+            num_bits, group_size, symmetric, strategy = 4, 32, True, "group"
         return cls(
-            num_bits=int(weights.get("num_bits", 4)),
-            group_size=int(group_size),
-            symmetric=bool(weights.get("symmetric", True)),
-            strategy=str(strategy),
-            quant_format=str(quant.get("format", "pack-quantized")),
+            num_bits=num_bits,
+            group_size=group_size,
+            symmetric=symmetric,
+            strategy=strategy,
+            quant_format=str(top_format),
             quant_method=str(quant.get("quant_method", "compressed-tensors")),
             ignore=tuple(quant.get("ignore", []) or []),
         )

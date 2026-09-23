@@ -100,6 +100,7 @@ def load_weights_into(
     stacked_params: list[StackedParamRule] | None = None,
     name_remapper: Callable[[str], str | None] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
+    unmatched: list[str] | None = None,
 ) -> set[str]:
     """Walk a ``(name, tensor)`` stream and load each into the matching
     parameter of ``module``.
@@ -116,6 +117,8 @@ def load_weights_into(
             ``None`` to drop the key entirely.
         skip_predicate: optional ``(name) -> bool``; returning ``True``
             skips the key. Applied before ``name_remapper``.
+        unmatched: optional list to append (remapped) checkpoint keys
+            that matched no parameter, for callers that want to report them.
 
     Returns: set of parameter paths that received a tensor.
     """
@@ -137,6 +140,8 @@ def load_weights_into(
             # Not an error: the checkpoint may carry extra keys (lm_head
             # ties, kv-scale, etc.). Caller can verify completeness via
             # the returned set.
+            if unmatched is not None:
+                unmatched.append(name)
             continue
 
         _dispatch_loader(params_dict[target], tensor, shard_id)
@@ -183,6 +188,7 @@ def load_hf_weights(
     stacked_params: list[StackedParamRule] | None = None,
     name_remapper: Callable[[str], str | None] | None = None,
     extra_skip_fragments: tuple[str, ...] = (),
+    unmatched: list[str] | None = None,
 ) -> set[str]:
     """Convenience wrapper for HF-style checkpoint loading.
 
@@ -201,6 +207,7 @@ def load_hf_weights(
         stacked_params=stacked_params,
         name_remapper=name_remapper,
         skip_predicate=skip,
+        unmatched=unmatched,
     )
 
 

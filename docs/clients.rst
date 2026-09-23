@@ -159,7 +159,7 @@ Endpoints and model coverage:
      - all
      - Lists the served model.
    * - ``POST /v1/chat/completions``
-     - ``bagel``, ``qwen3_omni``
+     - ``bagel``, ``qwen3_omni``, ``kimi_k2_7``
      - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.
    * - ``POST /v1/audio/speech``
      - ``orpheus``, ``qwen3_omni``
@@ -197,3 +197,9 @@ Per-model notes:
 - **Orpheus** — set the speaker with ``voice`` — one of ``tara`` (default), ``zoe``,
   ``zac``, ``jess``, ``leo``, ``mia``, ``julia``, ``leah`` (the ``available_voices`` list
   in the Orpheus config).
+- **Kimi-K2.7-Code** — text-only chat. The full message list (system prompt, prior
+  assistant turns, tool calls/results) is rendered with the checkpoint's own chat
+  template; ``tools``, ``tool_choice``, and ``chat_template_kwargs`` are passed straight
+  through to it. Parsing the model's reasoning/tool-call output back into
+  ``reasoning_content`` / ``tool_calls`` is not yet implemented, so responses come back as
+  plain assistant text.

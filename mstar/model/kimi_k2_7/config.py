@@ -1,15 +1,40 @@
 """Kimi-K2.7 text config, using the DeepSeek-V3 architecture fields."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+import logging
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 from mstar.model.components.quantization import CompressedTensorsQuantConfig
+
+logger = logging.getLogger(__name__)
 
 # Resource keys the model declares and the layers resolve against.
 KV_CACHE = "kv_cache"
 ATTN = "attn"
 SAMPLER = "sampler"
 ROPE = "rope"
+
+_CHECKPOINT_CONFIG_FIELDS = (
+    "vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers",
+    "num_attention_heads", "rms_norm_eps", "max_position_embeddings",
+    "tie_word_embeddings", "hidden_act", "q_lora_rank", "kv_lora_rank",
+    "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "n_routed_experts",
+    "n_shared_experts", "num_experts_per_tok", "moe_intermediate_size",
+    "n_group", "topk_group", "routed_scaling_factor", "scoring_func",
+    "topk_method", "norm_topk_prob", "first_k_dense_replace", "moe_layer_freq",
+    "rope_theta", "rope_scaling", "bos_token_id", "eos_token_id", "pad_token_id",
+    "num_nextn_predict_layers",
+)
+
+
+def _quant_raw_from_config_dict(raw: dict) -> dict | None:
+    """The compressed-tensors sub-dict, wherever a flat or Kimi-K2.5
+    ``text_config``-nested config.json puts it."""
+    return raw.get("quantization_config") or (raw.get("text_config") or {}).get(
+        "quantization_config"
+    )
 
 
 @dataclass
@@ -62,6 +87,9 @@ class KimiK2Config:
     bos_token_id: int = 163584
     eos_token_id: int = 163586
     pad_token_id: int = 163839
+    # generation_config.json's eos_token_id may be an int or a list; check_stop
+    # matches against this list. Defaults to [eos_token_id].
+    eos_token_ids: list[int] = field(default_factory=lambda: [163586])
     temperature: float = 1.0
     top_p: float = 1.0
     repetition_penalty: float = 1.0
@@ -175,3 +203,74 @@ class KimiK2Config:
         cfg = cls()
         cfg.moe_in_kernel_dequant = True
         return cfg
+
+    @classmethod
+    def from_checkpoint(
+        cls, source: str | Path, base: "KimiK2Config | None" = None
+    ) -> "KimiK2Config":
+        """Override ``base`` (or the dataclass defaults) with a checkpoint
+        directory's ``config.json`` / ``generation_config.json``.
+
+        Handles both flat DeepSeek-V3-style config.json (fields at the top
+        level) and Kimi-K2.5-style (text fields under ``text_config``). Falls
+        back to ``base`` unchanged, with a warning, if ``config.json`` is
+        missing. Fields absent from the checkpoint keep ``base``'s value.
+        """
+        base = base if base is not None else cls()
+        config_json = Path(source) / "config.json"
+        if not config_json.is_file():
+            logger.warning(
+                "KimiK2Config.from_checkpoint: no config.json in %s; using "
+                "defaults.", source,
+            )
+            return base
+
+        with open(config_json) as f:
+            raw = json.load(f)
+        text_raw = raw.get("text_config") or raw
+        overrides = {
+            k: v for k, v in text_raw.items() if k in _CHECKPOINT_CONFIG_FIELDS
+        }
+
+        if overrides.get("tie_word_embeddings"):
+            raise ValueError(
+                "Kimi-K2.7 checkpoint declares tie_word_embeddings=True; "
+                "mstar's lm_head is a separate parameter and weight tying is "
+                "not implemented."
+            )
+        hidden_act = overrides.get("hidden_act")
+        if hidden_act is not None and hidden_act != "silu":
+            raise ValueError(
+                f"Kimi-K2.7 checkpoint declares hidden_act={hidden_act!r}; "
+                "only 'silu' is implemented."
+            )
+
+        if base.quantization_config is None:
+            quant = CompressedTensorsQuantConfig.from_hf_config_dict(
+                _quant_raw_from_config_dict(raw)
+            )
+            if quant is not None:
+                overrides["quantization_config"] = quant
+
+        config_eos = overrides.get("eos_token_id", base.eos_token_id)
+        if isinstance(config_eos, list):
+            overrides["eos_token_ids"] = list(config_eos)
+            if config_eos:
+                overrides["eos_token_id"] = config_eos[0]
+        else:
+            overrides["eos_token_ids"] = [config_eos]
+        gen_json = Path(source) / "generation_config.json"
+        if gen_json.is_file():
+            with open(gen_json) as f:
+                gen_raw = json.load(f)
+            gen_eos = gen_raw.get("eos_token_id")
+            if gen_eos is not None:
+                overrides["eos_token_ids"] = (
+                    list(gen_eos) if isinstance(gen_eos, list) else [gen_eos]
+                )
+            if "temperature" in gen_raw:
+                overrides["temperature"] = gen_raw["temperature"]
+            if "top_p" in gen_raw:
+                overrides["top_p"] = gen_raw["top_p"]
+
+        return replace(base, **overrides)

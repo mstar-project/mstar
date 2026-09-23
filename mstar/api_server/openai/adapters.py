@@ -453,6 +453,45 @@ class Cosmos3Adapter(OpenAIAdapter):
         )
 
 
+class KimiAdapter(OpenAIAdapter):
+    """Kimi-K2.7-Code: text-only chat via the checkpoint's own chat template.
+
+    Unlike ``flatten_messages`` (which collapses every turn into one string),
+    this keeps the full per-turn structure — system prompt, prior assistant
+    reasoning/tool_calls, tool results — and hands it to ``process_prompt``,
+    which applies the tokenizer's own ``apply_chat_template``. ``tools`` /
+    ``tool_choice`` / ``chat_template_kwargs`` arrive via ``_passthrough`` and
+    are forwarded to the template unchanged; parsing the model's own
+    thinking/tool-call output is a later phase.
+    """
+
+    supports_chat = True
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        messages = []
+        for m in req.messages:
+            dumped = m.model_dump(exclude_none=True)
+            content = dumped.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if part.get("type") != "text":
+                        raise ValueError(
+                            "Kimi-K2.7 serving is text-only; image/audio "
+                            "message parts are not supported yet"
+                        )
+            messages.append(dumped)
+
+        mk = _passthrough(req)
+        _apply_sampling(req, mk)
+        mk["messages"] = messages
+        return SubmitArgs(
+            text=None,
+            input_modalities=["text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
 class Wan22Adapter(OpenAIAdapter):
     """Wan2.2-TI2V-5B: text/image-to-video generation (video only).
 
@@ -510,6 +549,7 @@ class Wan22Adapter(OpenAIAdapter):
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "bagel": BagelAdapter(),
+    "kimi_k2_7": KimiAdapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),

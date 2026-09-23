@@ -51,6 +51,38 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
     return str(Path(local_dir))
 
 
+def _resolve_checkpoint_config_dir(path: str, cache_dir: str | None = None) -> str | None:
+    """Local directory holding ``config.json`` (and, if present,
+    ``generation_config.json``) for ``path``, without pulling the full
+    (multi-hundred-GB) checkpoint snapshot just to read two small JSON files."""
+    from pathlib import Path
+
+    if not path:
+        return None
+    if Path(path).is_dir():
+        return str(path)
+
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError
+
+    try:
+        config_path = hf_hub_download(
+            repo_id=path, filename="config.json", cache_dir=cache_dir,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Error downloading config.json for %r from huggingface: %s", path, e,
+        )
+        return None
+    try:
+        hf_hub_download(
+            repo_id=path, filename="generation_config.json", cache_dir=cache_dir,
+        )
+    except EntryNotFoundError:
+        pass  # optional file — not every checkpoint ships one
+    return str(Path(config_path).parent)
+
+
 class KimiK2Model(Model):
     def __init__(
         self,
@@ -70,10 +102,20 @@ class KimiK2Model(Model):
             self.config = KimiK2Config.reduced_quantized()
         elif self._config_variant == "reduced_quantized_inkernel":
             self.config = KimiK2Config.reduced_quantized_inkernel()
+        elif self._config_variant == "reduced_marlin":
+            self.config = KimiK2Config.reduced_marlin()
         elif self._config_variant == "k27_code":
             self.config = KimiK2Config.k27_code()
         else:
             self.config = KimiK2Config()
+        if self._config_variant in ("full", "k27_code"):
+            # Every process that builds this model (API server, conductor,
+            # worker) must agree on the checkpoint's config before anything
+            # reads it (e.g. get_node_resources() for the KV cache shape),
+            # so this runs here rather than lazily in _create_submodule.
+            config_dir = _resolve_checkpoint_config_dir(model_path_hf, cache_dir=cache_dir)
+            if config_dir is not None:
+                self.config = KimiK2Config.from_checkpoint(config_dir, base=self.config)
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
@@ -282,6 +324,32 @@ class KimiK2Model(Model):
         tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
+        messages = kwargs.get("messages")
+        if messages is not None:
+            if self._tokenizer_mode == "byte":
+                raise ValueError(
+                    "Kimi-K2.7 byte tokenizer_mode is synthetic-only and does "
+                    "not support chat-template messages."
+                )
+            tools = kwargs.get("tools")
+            if kwargs.get("tool_choice") == "none":
+                tools = None
+            encoded = self.tokenizer.apply_chat_template(
+                messages,
+                tools=tools,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+                **(kwargs.get("chat_template_kwargs") or {}),
+            )
+            # transformers versions differ: a tensor/list of ids directly, or a
+            # dict/BatchEncoding carrying "input_ids".
+            if isinstance(encoded, (torch.Tensor, list, tuple)):
+                input_ids = encoded
+            else:
+                input_ids = encoded["input_ids"]
+            input_ids = torch.as_tensor(input_ids).reshape(-1).long()
+            return {"text_inputs": [input_ids]}
         if prompt is None:
             return {}
         if self._tokenizer_mode == "byte":
@@ -347,6 +415,8 @@ class KimiK2Model(Model):
             )
             return None
 
+        # self.config is already final (resolved in __init__ for full/k27_code);
+        # this is a no-op for those variants and unchanged behavior for reduced*.
         self._maybe_apply_checkpoint_quant_config(source)
 
         from mstar.model.kimi_k2_7.components.causal_lm import KimiForCausalLM
@@ -358,7 +428,16 @@ class KimiK2Model(Model):
         if autocast_dtype is not None:
             language_model = language_model.to(autocast_dtype)
         language_model.to_empty(device=device)
-        load_weights(language_model, source, device=device)
+        loaded = load_weights(language_model, source, device=device)
+        expected = set(dict(language_model.named_parameters()).keys())
+        missing = sorted(expected - loaded)
+        if missing:
+            shown = missing[:20]
+            more = f" (+{len(missing) - 20} more)" if len(missing) > 20 else ""
+            raise RuntimeError(
+                f"KimiK2Model: {len(missing)} parameter(s) were not loaded from "
+                f"checkpoint {source!r}: {shown}{more}"
+            )
         from mstar.model.components.quantization import process_weights_after_loading
 
         process_weights_after_loading(language_model, torch.device(device))
@@ -382,6 +461,7 @@ class KimiK2Model(Model):
         from pathlib import Path
 
         from mstar.model.components.quantization import CompressedTensorsQuantConfig
+        from mstar.model.kimi_k2_7.config import _quant_raw_from_config_dict
 
         if self.config.quantization_config is not None:
             return
@@ -394,10 +474,9 @@ class KimiK2Model(Model):
         except (OSError, ValueError) as e:  # unreadable / malformed — stay bf16
             logger.warning("KimiK2Model: could not read %s: %s", config_json, e)
             return
-        quant_raw = raw.get("quantization_config") or (
-            raw.get("text_config") or {}
-        ).get("quantization_config")
-        quant = CompressedTensorsQuantConfig.from_hf_config_dict(quant_raw)
+        quant = CompressedTensorsQuantConfig.from_hf_config_dict(
+            _quant_raw_from_config_dict(raw)
+        )
         if quant is not None:
             logger.info(
                 "KimiK2Model: compressed-tensors checkpoint (%d-bit, group_size=%d) "

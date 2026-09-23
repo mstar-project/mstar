@@ -196,3 +196,61 @@ def test_quant_config_from_hf_dict():
     assert cfg.ignore == ("lm_head", "re:.*gate$")
     assert CompressedTensorsQuantConfig.from_hf_config_dict(None) is None
     assert CompressedTensorsQuantConfig.from_hf_config_dict({}) is None
+
+
+def _group(num_bits=4, group_size=32, symmetric=True, strategy="group", format=None):
+    weights = {
+        "num_bits": num_bits, "group_size": group_size,
+        "symmetric": symmetric, "strategy": strategy, "type": "int",
+    }
+    group = {"weights": weights, "targets": ["Linear"]}
+    if format is not None:
+        group["format"] = format
+    return group
+
+
+def test_quant_config_multi_group_agreement():
+    raw = {
+        "format": "pack-quantized",
+        "config_groups": {
+            "group_0": _group(),
+            "group_1": _group(),
+        },
+    }
+    cfg = CompressedTensorsQuantConfig.from_hf_config_dict(raw)
+    assert cfg.num_bits == 4
+    assert cfg.group_size == 32
+    assert cfg.symmetric is True
+    assert cfg.strategy == "group"
+
+
+def test_quant_config_multi_group_disagreement_raises():
+    raw = {
+        "format": "pack-quantized",
+        "config_groups": {
+            "group_0": _group(num_bits=4),
+            "group_1": _group(num_bits=8),
+        },
+    }
+    with pytest.raises(ValueError, match="disagree"):
+        CompressedTensorsQuantConfig.from_hf_config_dict(raw)
+
+
+def test_quant_config_wrong_format_raises():
+    raw = {
+        "format": "float-quantized",
+        "config_groups": {"group_0": _group()},
+    }
+    with pytest.raises(ValueError, match="pack-quantized"):
+        CompressedTensorsQuantConfig.from_hf_config_dict(raw)
+
+
+def test_quant_config_per_group_format_overrides_top_level():
+    # A group with its own (unsupported) format is rejected even though the
+    # top-level format is fine.
+    raw = {
+        "format": "pack-quantized",
+        "config_groups": {"group_0": _group(format="float-quantized")},
+    }
+    with pytest.raises(ValueError, match="pack-quantized"):
+        CompressedTensorsQuantConfig.from_hf_config_dict(raw)

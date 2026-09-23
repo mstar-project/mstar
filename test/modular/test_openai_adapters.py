@@ -133,4 +133,63 @@ def test_bagel_image_edit(tmp_path):
 def test_registry():
     assert {"bagel", "qwen3_omni", "orpheus"} <= set(adapters.ADAPTER_REGISTRY)
     assert adapters.get_adapter("pi05") is None
+
+
+def test_kimi_chat_preserves_message_structure_and_tool_fields(tmp_path):
+    req = ChatCompletionRequest(
+        model="kimi_k2_7",
+        messages=[
+            {"role": "system", "content": "be helpful"},
+            {"role": "user", "content": "what's the weather?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "let me check the weather tool",
+                "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "72F and sunny"},
+        ],
+        tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        tool_choice="auto",
+        chat_template_kwargs={"x": 1},
+        temperature=0.7,
+        foo=1,
+    )
+    sa = adapters.KimiAdapter().chat_to_request(req, tmp_path)
+
+    assert sa.text is None
+    assert sa.output_modalities == ["text"]
+    msgs = sa.model_kwargs["messages"]
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool"]
+    assert msgs[2]["reasoning_content"] == "let me check the weather tool"
+    assert msgs[2]["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert msgs[3]["tool_call_id"] == "call_1"
+    assert sa.model_kwargs["tools"] == [{"type": "function", "function": {"name": "get_weather"}}]
+    assert sa.model_kwargs["tool_choice"] == "auto"
+    assert sa.model_kwargs["chat_template_kwargs"] == {"x": 1}
+    assert sa.model_kwargs["foo"] == 1
+    assert sa.model_kwargs["temperature"] == 0.7
+
+
+def test_kimi_chat_rejects_image_parts(tmp_path):
+    req = ChatCompletionRequest(
+        model="kimi_k2_7",
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+        ]}],
+    )
+    with pytest.raises(ValueError, match="text-only"):
+        adapters.KimiAdapter().chat_to_request(req, tmp_path)
+
+
+def test_kimi_adapter_registered_chat_only():
+    adapter = adapters.get_adapter("kimi_k2_7")
+    assert adapter is not None
+    assert adapter.supports_chat is True
+    assert adapter.supports_speech is False
+    assert adapter.supports_images is False
     assert adapters.get_adapter("bagel").supports_chat
