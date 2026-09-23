@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
@@ -39,18 +40,56 @@ from mstar.engine.resources.step import (
 
 logger = logging.getLogger(__name__)
 
+# Off by default: `assert_pages_conserved` walks every stream of every live
+# request after each admit, commit, reset and remove.
+_DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
+
 
 @dataclass
 class PageArena:
-    """physical storage and free list management"""
+    """physical storage, free list, and per-page ownership
+
+    A page goes back to the allocator when its last owner releases it, not its
+    first. A sealed page is never written again, so a second owner may read it;
+    freeing clears the seal. Every caller holds the manager's `_lock`, so the
+    counts and seals need none of their own.
+    """
     kv_cache: KVCache
     allocator: PageAllocator
+    num_owners: list[int] = field(init=False, repr=False)
+    sealed: list[bool] = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self.num_owners = [0] * self.allocator.max_num_pages
+        self.sealed = [False] * self.allocator.max_num_pages
 
     def acquire(self, n: int) -> list[int] | None:
-        return self.allocator.try_allocate(n)
+        pages = self.allocator.try_allocate(n)
+        if pages is not None:
+            for page in pages:
+                self.num_owners[page] = 1
+        return pages
+
+    def retain(self, pages: list[int]) -> None:
+        for page in pages:
+            self.num_owners[page] += 1
+
+    def seal(self, pages: list[int]) -> None:
+        for page in pages:
+            self.sealed[page] = True
+
+    def any_sealed(self, pages: list[int]) -> bool:
+        return any(self.sealed[page] for page in pages)
 
     def release(self, pages: list[int]) -> None:
-        return self.allocator.free(pages)
+        freed = []
+        for page in pages:
+            assert self.num_owners[page] > 0, f"page {page} released with no owner"
+            self.num_owners[page] -= 1
+            if self.num_owners[page] == 0:
+                self.sealed[page] = False
+                freed.append(page)
+        self.allocator.free(freed)
 
     def copy_pages(self, src: list[int], dst: list[int]) -> None:
         self.kv_cache.copy_pages(src, dst)
@@ -431,6 +470,8 @@ class KVManager(AttentionResource):
                     self._preplan_marked.append(
                         (segment.request_id, segment.label)
                     )
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
         # TODO: apply retention policy
 
         return ADMIT_OK
@@ -665,6 +706,8 @@ class KVManager(AttentionResource):
             for (from_label, to_label) in step.post_forks:
                 for rid in ctx.padded_request_ids:
                     self._apply_fork(rid, from_label, to_label)
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
         # TODO: handle retention policy, free pages if not commit
 
     # Eviction
@@ -906,9 +949,15 @@ class KVManager(AttentionResource):
                 wait([stream.read_future])
         with self._lock:
             for stream in self._streams.get(rid, {}).values():
-                if free:
+                # a rewind would put the next write on the stream's first page,
+                # over a sealed one its other owners still read. drop the pages
+                # and let the next write allocate; `free` asks for the same
+                drop = free or self._arena.any_sealed(stream.page_indices)
+                if drop:
                     self._arena.release(stream.page_indices)
-                stream.reset(freed=free)
+                stream.reset(freed=drop)
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
 
     def remove_request(self, rid: str):
         streams = self._streams.get(rid)
@@ -925,6 +974,64 @@ class KVManager(AttentionResource):
                 self._cpu_pool.remove_request(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
+
+    def assert_pages_conserved(self) -> None:
+        """Check the owner counts against the streams holding the pages.
+
+        Each assertion names the rule it checks. Host pages are not covered:
+        `CPUPagePool` keeps no counts.
+        """
+        with self._lock:
+            arena = self._arena
+            free = list(arena.allocator.free_pages.queue)
+            owned = [
+                page for page in range(self.config.max_num_pages)
+                if arena.num_owners[page] > 0
+            ]
+            both = sorted(set(free) & set(owned))
+            assert not both, f"pages both free and owned: {both}"
+            assert len(free) + len(owned) == self.config.max_num_pages, (
+                f"{self.config.max_num_pages} pages in the pool, but "
+                f"{len(free)} free and {len(owned)} owned"
+            )
+
+            # the sink belongs to no request, so count it by hand. `frontier`
+            # is the page each stream is still writing into, plus any it holds
+            # past that
+            refs: dict[int, int] = {SINK_PAGE: 1}
+            frontier: set[int] = set()
+            for streams in self._streams.values():
+                for stream in streams.values():
+                    for page in stream.page_indices:
+                        refs[page] = refs.get(page, 0) + 1
+                    full = stream.stored_len // self.config.page_size
+                    frontier.update(stream.page_indices[full:])
+
+            counts = {page: arena.num_owners[page] for page in owned}
+            assert counts == refs, (
+                "owner counts disagree with the streams naming the pages: "
+                + ", ".join(
+                    f"page {page} owned {counts.get(page, 0)}, "
+                    f"named {refs.get(page, 0)}"
+                    for page in sorted(set(counts) | set(refs))
+                    if counts.get(page, 0) != refs.get(page, 0)
+                )
+            )
+
+            unsealed = [
+                page for page in owned
+                if arena.num_owners[page] > 1 and not arena.sealed[page]
+            ]
+            assert not unsealed, f"pages shared before they were sealed: {unsealed}"
+
+            crowded = sorted(
+                page for page in frontier if arena.num_owners[page] != 1
+            )
+            assert not crowded, (
+                f"pages still being written into, but not owned alone: {crowded}"
+            )
 
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank
