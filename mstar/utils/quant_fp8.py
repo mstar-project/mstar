@@ -65,7 +65,9 @@ def per_token_group_quant_fp8(
     stream capture still records it.  Remove when the toolchain bug is fixed.
     """
     assert x.dim() == 2 and x.is_contiguous()
-    assert x.shape[-1] % group_size == 0, f"last dim {x.shape[-1]} must be a multiple of group_size {group_size}"
+    assert x.shape[-1] % group_size == 0, (
+        f"last dim {x.shape[-1]} must be a multiple of group_size {group_size}"
+    )
 
     M, K = x.shape
     finfo = torch.finfo(FP8_DTYPE)

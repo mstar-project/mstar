@@ -96,7 +96,7 @@ def _reference(x, w1_fp8, w2_fp8, w1_s, w2_s, topk_weights, topk_ids):
     return final
 
 
-@pytest.mark.parametrize("num_tokens", [8, 3])  # M > E and M <= E config branches
+@pytest.mark.parametrize("num_tokens", [8, 3, 32])  # M > E, M <= E, M > 16 config branches
 def test_fp8_fused_matches_reference_dispatch(num_tokens):
     from mstar.utils.fused_moe.runner import fused_experts_fp8
 

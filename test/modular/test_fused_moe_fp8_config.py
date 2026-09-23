@@ -239,14 +239,17 @@ def test_fused_experts_fp8_decode_tiles_per_launch(fp8_fakes):
     assert up["compute_type"] == down["compute_type"] == "tl:torch.bfloat16"
 
 
-def test_fused_experts_fp8_above_decode_threshold_uses_default_tiles(fp8_fakes):
+def test_fused_experts_fp8_above_decode_threshold_uses_block_fp8_tiles(fp8_fakes):
     launches, _, _ = fp8_fakes
     x, w1, w2, w1_s, w2_s, topk_weights, topk_ids = _fp8_inputs(tokens=17)
     runner.fused_experts_fp8(x, w1, w2, w1_s, w2_s, topk_weights, topk_ids, block_size=BLOCK)
 
     up, down = launches
-    # M=17 > E=8 picks the large-batch branch; only BLOCK_SIZE_K is overridden.
-    expected = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 8}
+    # M=17 > E=8 keeps the large-batch BLOCK_SIZE_M; the rest is vLLM's block-fp8 default.
+    expected = {
+        "BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32,
+        "num_warps": 4, "num_stages": 3,
+    }
     assert up["config"] == expected and down["config"] == expected
     assert up["config"] is not down["config"]
 
