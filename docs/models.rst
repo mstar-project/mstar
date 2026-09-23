@@ -140,9 +140,23 @@ Chatterbox notes
 ----------------
 
 - ``pip install -e '.[chatterbox]'`` then ``mstar serve chatterbox --gpus 0``
-  (``chatterbox_turbo`` for the distilled Turbo checkpoint). Both variants are
-  one model class; the variant follows the registry key or ``model_kwargs:
+  (``chatterbox_turbo`` for the distilled Turbo checkpoint,
+  ``chatterbox_multilingual`` for the 23-language one). All variants are one
+  model class; the variant follows the registry key or ``model_kwargs:
   variant``.
+- Multilingual: the same graph, S3Gen and voice encoder as the English model
+  with the ``t3_mtl23ls_v2`` T3 weights (a 2454-token grapheme vocabulary)
+  and a language token in front of the text. Requests pass ``language_id``
+  in ``extra_body`` (``ar da de el en es fi fr he hi it ja ko ms nl no pl pt
+  ru sv sw tr zh``; the deployment's ``model_kwargs: default_language``, ``en``
+  by default, applies when a request gives none). The text is lower-cased and
+  NFKD-normalised, Korean is decomposed into jamo and Chinese spelled as
+  Cangjie codes from the checkpoint's table; Japanese kana reading, Hebrew
+  diacritics and Russian stress marks use the same optional packages as the
+  reference (``pip install -e '.[chatterbox_multilingual]'`` brings
+  ``pykakasi`` and the Chinese word segmenter; ``dicta_onnx`` and
+  ``russian_text_stresser`` are installed separately) and are skipped with a
+  warning when a package is missing, as the reference does.
 - Requests: ``/v1/audio/speech`` with ``input``, ``voice`` (``default`` = the
   voice shipped in the checkpoint, or a preset name resolved under the
   deployment's ``model_kwargs: voices_dir``), and in ``extra_body``
