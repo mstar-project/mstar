@@ -2774,6 +2774,12 @@ class Worker:
         phase_iter = [0]
         _phase_record = self._phase_record
 
+        # Requests in flight per iteration over the window. Reported beside
+        # the timings because it is what separates ramp-up, steady state and
+        # drain: a phase mean averaged across those is not a measurement of
+        # anything. ``benchmark/worker_phases`` segments on it.
+        phase_bs: list[int] = []
+
         def _phase_flush() -> None:
             if phase_period <= 0 or phase_iter[0] % phase_period != 0:
                 return
@@ -2788,11 +2794,13 @@ class Worker:
                 p95 = vs[min(n - 1, int(n * 0.95))] * 1000
                 mean = (sum(vs) / n) * 1000
                 parts.append(f"{name}: p50={p50:.2f}ms p95={p95:.2f}ms mean={mean:.2f}ms n={n}")
+            bs = (sum(phase_bs) / len(phase_bs)) if phase_bs else 0.0
             logger.info(
-                "Worker %s phase-timing iter=%d: %s",
-                self.worker_id, phase_iter[0], " | ".join(parts),
+                "Worker %s phase-timing iter=%d bs=%.2f: %s",
+                self.worker_id, phase_iter[0], bs, " | ".join(parts),
             )
             phase_buf.clear()
+            phase_bs.clear()
 
         # Reset per iteration (not just where they're first used) so the
         # error handler below sees only this iteration's work — a stale
@@ -3098,6 +3106,7 @@ class Worker:
                         consecutive_spec_steps += 1
                     if phase_period:
                         _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                        phase_bs.append(len(spec_pending.batch.request_to_worker_graph))
                         phase_iter[0] += 1
                         _phase_flush()
                     _set_pending(spec_pending)
@@ -3164,6 +3173,7 @@ class Worker:
                 # make the flush period mean something other than iterations.
                 if phase_period:
                     _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                    phase_bs.append(len(batch.request_to_worker_graph))
                     phase_iter[0] += 1
                     _phase_flush()
             except Exception as e:
