@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 21, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 23, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -575,6 +575,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.can_run"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.can_run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.config_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.config_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.declare_inputs_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.declare_inputs_for()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.dropped_buckets"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.dropped_buckets</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.lease_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.max_batch_size_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.max_batch_size_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.pad_inputs"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.pad_inputs()</span></code></a></li>
@@ -612,6 +613,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.NUM_WARMUP"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.NUM_WARMUP</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.any_graphs"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.any_graphs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.can_run"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.can_run()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.dropped_shapes"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.dropped_shapes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_before_step"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.lease_before_step</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_slot"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.lease_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.prepare_for_capture"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.prepare_for_capture()</span></code></a></li>
@@ -643,7 +645,9 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.agree_across_ranks"><code class="docutils literal notranslate"><span class="pre">agree_across_ranks()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.autocast_scope"><code class="docutils literal notranslate"><span class="pre">autocast_scope()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.capture_into_graph"><code class="docutils literal notranslate"><span class="pre">capture_into_graph()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.dummy_metadata"><code class="docutils literal notranslate"><span class="pre">dummy_metadata()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.fail_if_graphs_required"><code class="docutils literal notranslate"><span class="pre">fail_if_graphs_required()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -666,8 +670,14 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.autocast_scope" title="mstar.engine.cuda_graph_runner.autocast_scope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">autocast_scope</span></code></a>(dtype[, device_type])</p></td>
 <td><p>A forward's autocast scope; <code class="docutils literal notranslate"><span class="pre">None</span></code> (<code class="docutils literal notranslate"><span class="pre">disable_autocast</span></code>) runs the submodule in its own dtype and shuts out any ambient autocast.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.dummy_metadata" title="mstar.engine.cuda_graph_runner.dummy_metadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_metadata</span></code></a>(rids, graph_walk)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.capture_into_graph" title="mstar.engine.cuda_graph_runner.capture_into_graph"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_into_graph</span></code></a>(run, pool, device, ...)</p></td>
+<td><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> into a new CUDA graph allocated from <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.dummy_metadata" title="mstar.engine.cuda_graph_runner.dummy_metadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_metadata</span></code></a>(rids, graph_walk)</p></td>
 <td><p>Stand-in request info for padding rows, which have no real request.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.fail_if_graphs_required" title="mstar.engine.cuda_graph_runner.fail_if_graphs_required"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fail_if_graphs_required</span></code></a>(missing)</p></td>
+<td><p>MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup failure, for deployments that would rather not come up than serve the eager path at 10-20x the latency.</p></td>
 </tr>
 </tbody>
 </table>
@@ -816,6 +826,11 @@ passes it to <code class="docutils literal notranslate"><span class="pre">prepro
 </dd>
 </dl>
 </dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.CudaGraphRunner.dropped_buckets">
+<span class="sig-name descname"><span class="pre">dropped_buckets</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.BucketKey" title="mstar.engine.resources.step.BucketKey"><span class="pre">BucketKey</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.dropped_buckets" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot">
@@ -1258,6 +1273,11 @@ and the captured graph reads them at fixed addresses.</p>
 </dl>
 </dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.dropped_shapes">
+<span class="sig-name descname"><span class="pre">dropped_shapes</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.dropped_shapes" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_before_step">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">lease_before_step</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_before_step" title="Link to this definition">#</a></dt>
@@ -1509,6 +1529,24 @@ submodule in its own dtype and shuts out any ambient autocast.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.capture_into_graph">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_runner.</span></span><span class="sig-name descname"><span class="pre">capture_into_graph</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#capture_into_graph"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.capture_into_graph" title="Link to this definition">#</a></dt>
+<dd><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> into a new CUDA graph allocated from <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p>
+<p>Returns the graph and what <code class="docutils literal notranslate"><span class="pre">run</span></code> returned. A capture that fails part
+way leaves two things behind that would sink every later capture on the
+same pool: the caching allocator keeps routing this thread’s allocations
+into the pool (the next capture_begin fails with “already recording to
+mempool_id”), and torch.cuda.graph never switches the thread back off its
+capture stream. Undo both before re-raising, so the buckets after a
+failed one still capture and the thread keeps running on the stream it
+came in on.</p>
+<p>A torch.compile’d forward that would recompile inside the capture is
+failed up front with the guard that broke: dynamo saves the CUDA RNG state
+before it compiles, which CUDA refuses during capture, so such a capture
+cannot succeed and would otherwise die with an unrelated error.</p>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.dummy_metadata">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_runner.</span></span><span class="sig-name descname"><span class="pre">dummy_metadata</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#dummy_metadata"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.dummy_metadata" title="Link to this definition">#</a></dt>
 <dd><p>Stand-in request info for padding rows, which have no real request.</p>
@@ -1521,6 +1559,22 @@ submodule in its own dtype and shuts out any ambient autocast.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><em>CurrentForwardPassInfo</em></a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.fail_if_graphs_required">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_runner.</span></span><span class="sig-name descname"><span class="pre">fail_if_graphs_required</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">missing</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#fail_if_graphs_required"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.fail_if_graphs_required" title="Link to this definition">#</a></dt>
+<dd><p>MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
+failure, for deployments that would rather not come up than serve the
+eager path at 10-20x the latency.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>missing</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1587,6 +1641,7 @@ submodule in its own dtype and shuts out any ambient autocast.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.can_run"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.can_run()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.config_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.config_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.declare_inputs_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.declare_inputs_for()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.dropped_buckets"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.dropped_buckets</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.lease_slot"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.lease_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.max_batch_size_for"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.max_batch_size_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.CudaGraphRunner.pad_inputs"><code class="docutils literal notranslate"><span class="pre">CudaGraphRunner.pad_inputs()</span></code></a></li>
@@ -1624,6 +1679,7 @@ submodule in its own dtype and shuts out any ambient autocast.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.NUM_WARMUP"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.NUM_WARMUP</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.any_graphs"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.any_graphs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.can_run"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.can_run()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.dropped_shapes"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.dropped_shapes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_before_step"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.lease_before_step</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.lease_slot"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.lease_slot()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner.prepare_for_capture"><code class="docutils literal notranslate"><span class="pre">PiecewiseCudaGraphRunner.prepare_for_capture()</span></code></a></li>
@@ -1655,7 +1711,9 @@ submodule in its own dtype and shuts out any ambient autocast.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.agree_across_ranks"><code class="docutils literal notranslate"><span class="pre">agree_across_ranks()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.autocast_scope"><code class="docutils literal notranslate"><span class="pre">autocast_scope()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.capture_into_graph"><code class="docutils literal notranslate"><span class="pre">capture_into_graph()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.dummy_metadata"><code class="docutils literal notranslate"><span class="pre">dummy_metadata()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.fail_if_graphs_required"><code class="docutils literal notranslate"><span class="pre">fail_if_graphs_required()</span></code></a></li>
 </ul>
   </nav></div>
 
@@ -1689,7 +1747,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 21, 2026.
+  Last updated on Sep 23, 2026.
   <br/>
 </p>
   </div>

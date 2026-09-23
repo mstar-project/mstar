@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 21, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 23, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -854,6 +854,7 @@ window.runMermaid = runMermaid;</script>
                   
   <h1>Source code for mstar.engine.cuda_graph_runner</h1><div class="highlight"><pre>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">replace</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">NamedTuple</span>
@@ -934,6 +935,71 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span>
     <span class="p">}</span></div>
 
+
+
+<div class="viewcode-block" id="capture_into_graph">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.capture_into_graph">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">capture_into_graph</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Capture ``run`` into a new CUDA graph allocated from ``pool``.</span>
+
+<span class="sd">    Returns the graph and what ``run`` returned. A capture that fails part</span>
+<span class="sd">    way leaves two things behind that would sink every later capture on the</span>
+<span class="sd">    same pool: the caching allocator keeps routing this thread's allocations</span>
+<span class="sd">    into the pool (the next capture_begin fails with "already recording to</span>
+<span class="sd">    mempool_id"), and torch.cuda.graph never switches the thread back off its</span>
+<span class="sd">    capture stream. Undo both before re-raising, so the buckets after a</span>
+<span class="sd">    failed one still capture and the thread keeps running on the stream it</span>
+<span class="sd">    came in on.</span>
+
+<span class="sd">    A torch.compile'd forward that would recompile inside the capture is</span>
+<span class="sd">    failed up front with the guard that broke: dynamo saves the CUDA RNG state</span>
+<span class="sd">    before it compiles, which CUDA refuses during capture, so such a capture</span>
+<span class="sd">    cannot succeed and would otherwise die with an unrelated error.</span>
+<span class="sd">    """</span>
+    <span class="n">prev_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">graph</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">()</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">set_stance</span><span class="p">(</span><span class="s2">"fail_on_recompile"</span><span class="p">),</span> \
+                <span class="n">autocast_scope</span><span class="p">(</span><span class="n">autocast_dtype</span><span class="p">):</span>
+            <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph</span><span class="p">(</span><span class="n">graph</span><span class="p">,</span> <span class="n">pool</span><span class="o">=</span><span class="n">pool</span><span class="p">):</span>
+                <span class="n">output</span> <span class="o">=</span> <span class="n">run</span><span class="p">()</span>
+    <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_stream</span><span class="p">(</span><span class="n">prev_stream</span><span class="p">)</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+        <span class="n">_stop_recording_to_pool</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">pool</span><span class="p">)</span>
+        <span class="k">raise</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">graph</span><span class="p">,</span> <span class="n">output</span></div>
+
+
+
+<div class="viewcode-block" id="fail_if_graphs_required">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.fail_if_graphs_required">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">fail_if_graphs_required</span><span class="p">(</span><span class="n">missing</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup</span>
+<span class="sd">    failure, for deployments that would rather not come up than serve the</span>
+<span class="sd">    eager path at 10-20x the latency."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">missing</span> <span class="ow">or</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_REQUIRE_CUDA_GRAPHS"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">!=</span> <span class="s2">"1"</span><span class="p">:</span>
+        <span class="k">return</span>
+    <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+        <span class="s2">"CUDA graph capture failed for "</span> <span class="o">+</span> <span class="s2">", "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">missing</span><span class="p">)</span>
+        <span class="o">+</span> <span class="s2">" and MSTAR_REQUIRE_CUDA_GRAPHS=1"</span>
+    <span class="p">)</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_stop_recording_to_pool</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">pool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">end</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="p">,</span> <span class="s2">"_cuda_endAllocateToPool"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">end</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span>
+    <span class="n">index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">index</span>
+    <span class="k">if</span> <span class="n">index</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">index</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_device</span><span class="p">()</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">end</span><span class="p">(</span><span class="n">index</span><span class="p">,</span> <span class="n">pool</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">RuntimeError</span><span class="p">:</span>
+        <span class="c1"># the capture failed before the allocator started recording</span>
+        <span class="k">pass</span>
 
 
 <div class="viewcode-block" id="DummyRowPool">
@@ -1066,6 +1132,8 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_buckets</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">,</span> <span class="n">CudaGraphBucket</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># buckets that failed to capture (here or on a peer rank) and run eagerly</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dropped_buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">BucketKey</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="c1"># set by prepare_for_capture; capture reuses it rather than re-deriving</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_prepared_slot_specs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">CGSlotSpec</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -1197,7 +1265,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">try</span><span class="p">:</span>
                 <span class="n">slot</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_one</span><span class="p">(</span><span class="n">spec</span><span class="p">)</span>
             <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
                     <span class="s2">"Failed to capture CUDA graph for </span><span class="si">%s</span><span class="s2">: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span> <span class="n">spec</span><span class="p">,</span> <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span>
                 <span class="p">)</span>
@@ -1213,7 +1281,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">agreed</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_buckets_captured_everywhere</span><span class="p">(</span><span class="n">slot_specs</span><span class="p">,</span> <span class="n">captured</span><span class="p">)</span>
         <span class="k">for</span> <span class="n">bucket_key</span><span class="p">,</span> <span class="n">slots</span> <span class="ow">in</span> <span class="n">captured</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">if</span> <span class="n">bucket_key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">agreed</span><span class="p">:</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
                     <span class="s2">"Dropping CUDA graph bucket </span><span class="si">%s</span><span class="s2"> for </span><span class="si">%s</span><span class="s2">: captured </span><span class="si">%d</span><span class="s2"> of </span><span class="si">%d</span><span class="s2"> "</span>
                     <span class="s2">"slots here, or fewer on another rank"</span><span class="p">,</span>
                     <span class="n">bucket_key</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">slots</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">_num_slots</span><span class="p">,</span>
@@ -1229,10 +1297,26 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">declare_inputs_for</span><span class="p">(</span><span class="n">SlotLease</span><span class="p">(</span><span class="n">slot</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">bucket</span><span class="o">=</span><span class="n">bucket_key</span><span class="p">))</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">release_all</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_report_dropped</span><span class="p">(</span>
+            <span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">bucket</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">slot_specs</span> <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">slot</span> <span class="o">==</span> <span class="mi">0</span><span class="p">],</span> <span class="n">agreed</span>
+        <span class="p">)</span>
 
         <span class="n">mem_after</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">memory_allocated</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_log_memory</span><span class="p">(</span><span class="n">mem_before</span><span class="p">,</span> <span class="n">mem_after</span><span class="p">)</span></div>
 
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_report_dropped</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">wanted</span><span class="p">:</span> <span class="nb">list</span><span class="p">,</span> <span class="n">kept</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Say loudly which buckets run eagerly. A dropped bucket is a silent</span>
+<span class="sd">        10-20x latency cliff otherwise, and one failure used to take every</span>
+<span class="sd">        later bucket with it."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dropped_buckets</span> <span class="o">=</span> <span class="p">[</span><span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">wanted</span> <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">kept</span><span class="p">]</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_buckets</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+                <span class="s2">"CudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: captured </span><span class="si">%d</span><span class="s2"> of </span><span class="si">%d</span><span class="s2"> buckets; these run "</span>
+                <span class="s2">"eagerly: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_submodule_name</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">wanted</span><span class="p">)</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dropped_buckets</span><span class="p">),</span>
+                <span class="nb">len</span><span class="p">(</span><span class="n">wanted</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_buckets</span><span class="p">,</span>
+            <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_buckets_captured_everywhere</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -1364,11 +1448,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">prepare</span><span class="p">()</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
-            <span class="n">graph</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">()</span>
-            <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">):</span>
-                <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph</span><span class="p">(</span><span class="n">graph</span><span class="p">,</span> <span class="n">pool</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">):</span>
-                    <span class="n">output</span> <span class="o">=</span> <span class="n">run_forward</span><span class="p">()</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+            <span class="n">graph</span><span class="p">,</span> <span class="n">output</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span>
+                <span class="n">run_forward</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+            <span class="p">)</span>
 
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_slot_from_capture</span><span class="p">(</span>
                 <span class="n">output</span><span class="o">=</span><span class="n">output</span><span class="p">,</span>
@@ -1892,6 +1974,8 @@ window.runMermaid = runMermaid;</script>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">PiecewiseGraphKey</span><span class="p">,</span> <span class="n">PiecewiseGraphData</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># (bs, total_tokens) shapes that failed to capture and run eagerly</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span> <span class="o">=</span> <span class="n">DummyRowPool</span><span class="p">(</span>
             <span class="n">prefix</span><span class="o">=</span><span class="sa">f</span><span class="s2">"pw_</span><span class="si">{</span><span class="n">label</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">step_runner</span><span class="o">=</span><span class="n">step_runner</span><span class="p">,</span> <span class="n">resources</span><span class="o">=</span><span class="n">resources</span><span class="p">,</span>
         <span class="p">)</span>
@@ -2007,7 +2091,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_capture_one</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="n">slot</span><span class="p">)</span>
                 <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
                     <span class="n">shape_captured</span> <span class="o">=</span> <span class="kc">False</span>
-                    <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
                         <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: failed to capture bs=</span><span class="si">%d</span><span class="s2"> "</span>
                         <span class="s2">"total_tokens=</span><span class="si">%d</span><span class="s2"> slot=</span><span class="si">%d</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span>
                         <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">slot</span><span class="p">,</span> <span class="n">exc_info</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
@@ -2036,11 +2120,19 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">),</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
             <span class="p">]</span>
             <span class="k">if</span> <span class="n">dropped</span><span class="p">:</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
                     <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: dropping bs=</span><span class="si">%d</span><span class="s2"> total_tokens=</span><span class="si">%d</span><span class="s2"> "</span>
                     <span class="s2">"slots=</span><span class="si">%s</span><span class="s2">, not captured on every rank / for every slot"</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">,</span> <span class="n">dropped</span><span class="p">,</span>
-                <span class="p">)</span></div>
+                <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">,</span> <span class="n">shape</span><span class="o">.</span><span class="n">total_tokens</span><span class="p">))</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
+                <span class="s2">"PiecewiseCudaGraphRunner[</span><span class="si">%s</span><span class="s2">]: captured </span><span class="si">%d</span><span class="s2"> of </span><span class="si">%d</span><span class="s2"> shapes; these "</span>
+                <span class="s2">"run eagerly: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_label</span><span class="p">,</span>
+                <span class="nb">len</span><span class="p">(</span><span class="n">ordered</span><span class="p">)</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span><span class="p">),</span> <span class="nb">len</span><span class="p">(</span><span class="n">ordered</span><span class="p">),</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span><span class="p">,</span>
+            <span class="p">)</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_capture_one</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -2075,11 +2167,10 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
-            <span class="n">graph</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">()</span>
-            <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">):</span>
-                <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph</span><span class="p">(</span><span class="n">graph</span><span class="p">,</span> <span class="n">pool</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">):</span>
-                    <span class="n">static_outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_normalize_output</span><span class="p">(</span><span class="n">run_fn</span><span class="p">())</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+            <span class="n">graph</span><span class="p">,</span> <span class="n">raw_outputs</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span>
+                <span class="n">run_fn</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="n">static_outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_normalize_output</span><span class="p">(</span><span class="n">raw_outputs</span><span class="p">)</span>
         <span class="k">finally</span><span class="p">:</span>
             <span class="c1"># pages stay with the dummy streams: replay's padding rows address</span>
             <span class="c1"># the same ids, so their plan finds the storage already resident</span>
@@ -2359,7 +2450,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 21, 2026.
+  Last updated on Sep 23, 2026.
   <br/>
 </p>
   </div>

@@ -15,7 +15,9 @@ mstar.engine.cuda\_graph\_runner
    
       agree_across_ranks
       autocast_scope
+      capture_into_graph
       dummy_metadata
+      fail_if_graphs_required
    
    
 
