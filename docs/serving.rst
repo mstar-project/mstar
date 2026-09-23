@@ -179,6 +179,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
+   * - ``max_concurrent_requests``
+     - *(optional)* How many requests run at once. Requests past the cap wait in the
+       conductor's queue.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
 
@@ -213,9 +216,11 @@ cached pages. A single request opts out by sending ``prefix_cache=False``, which
 travels with its other ``model_kwargs``.
 
 A cached prompt no longer reserves its pages, so the pool no longer limits how many
-requests are admitted: it has to hold the decode of every request allowed to run at once.
-Set ``cpu_offload_pages`` so a full pool has a request to move to the host; without it, a
-decode step that finds no free page holds its requests until they time out.
+requests are admitted. It has to hold the decode of every request allowed to run at once,
+and a decode step that finds no free page holds its requests until they time out. Two
+settings prevent that. ``max_concurrent_requests`` caps how many requests run at once, and
+the pool's pages divided by the pages one request needs, prompt and output together, is a
+safe value. ``cpu_offload_pages`` gives a full pool a request to move to the host.
 
 **Single GPU.** Everything on rank 0:
 

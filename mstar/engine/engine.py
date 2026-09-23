@@ -573,7 +573,8 @@ class Engine:
                 logger.warning(
                     "KV %s: prefix cache on with cpu_offload_pages 0: a decode "
                     "step that finds nothing to evict holds its requests until "
-                    "they time out; cpu_offload_pages gives the worker a victim",
+                    "they time out. max_concurrent_requests caps how many run "
+                    "at once, and cpu_offload_pages gives the worker a victim",
                     key,
                 )
 
