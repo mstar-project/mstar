@@ -70,6 +70,9 @@ class _StubTensorManager:
     def dereference(self, uuid, n=1):
         self.tensor_store.dereference(uuid, n=n)
 
+    def dereference_batch_uniform(self, uuids, n=1):
+        self.tensor_store.dereference_batch_uniform(uuids, n=n)
+
     def increment_ref(self, uuid, n=1):
         self.tensor_store.increment_ref(uuid, n=n)
 
@@ -145,6 +148,18 @@ def _spec(signal, node, uuids=()):
         signal=signal, next_node=node, uuids=list(uuids),
         is_final_streaming_chunk=False,
     )
+
+
+def _released(book, uuid) -> bool:
+    """The reference is gone, however the runtime got there.
+
+    Python dereferences through the tensor manager, which tears the tensor
+    down as it goes and leaves a collectable record. Rust hands the uuid back
+    for the caller to tear down and drops the record in the same pass, and an
+    untracked uuid is never "collectable" -- so can_gc alone reads as a leak
+    on one side and a release on the other.
+    """
+    return not book.is_tracked(uuid) or book.can_gc(uuid)
 
 
 def _ready(rt):
@@ -331,11 +346,52 @@ def test_cleanup_agrees(pair):
         ParallelList([rid], [_spec("prompt", "prefill", uuids=[5])])
     )
     rt.cleanup_consumed_inputs("prefill", [rid], [WG_ID])
-    assert book.can_gc(5), "the consumed input was dereferenced"
+    assert _released(book, 5), "the consumed input was dereferenced"
     # And the slot is free again.
     assert rt.ingest_inputs_batch(
         ParallelList([rid], [_spec("prompt", "prefill")]), can_buffer=False
     ) == []
+
+
+# --- who reclaims a freed input ----------------------------------------------
+#
+# Dropping the last reference is half of it. The shm file, the arena slot and
+# the registered memory belong to the tensor manager, and the two runtimes
+# reach it differently -- so the contract is "tell the caller what it still
+# has to tear down", and only one of them has anything to say.
+
+def _consume_one_input(rt, book, uuid=7):
+    rid = _admit(rt)
+    book.put_tensor(uuid, _info(uuid))
+    book.increment_ref(uuid, 1)
+    book.set_mem_registered(uuid, True)
+    rt.ingest_inputs_batch(
+        ParallelList([rid], [_spec("prompt", "prefill", uuids=[uuid])])
+    )
+    rt.pop_rids("prefill", WALK, [rid])
+    return rt.cleanup_consumed_inputs("prefill", [rid], [WG_ID])
+
+
+def test_rust_names_the_inputs_it_freed():
+    """It holds the bookkeeper, not the manager, so a tensor it frees is
+    reclaimed by nobody unless it says which ones. That is what left a
+    consumed input's shm file sitting until the request was torn down."""
+    rt, book, _store = _rust()
+    freed = _consume_one_input(rt, book)
+
+    assert freed.uuids == [7]
+    assert freed.registered == [True], "the teardown has to know to unregister"
+    assert not book.is_tracked(7), "forgotten in the same pass, not a second one"
+
+
+def test_python_tears_a_freed_input_down_in_place():
+    """It was built with the tensor manager and dereferences through it, so
+    the teardown already ran and the caller is owed nothing."""
+    rt, book, _store = _python()
+    freed = _consume_one_input(rt, book)
+
+    assert freed == ([], [])
+    assert book.can_gc(7), "still released, just by the other route"
 
 
 # --- stale handles -----------------------------------------------------------
@@ -457,7 +513,42 @@ def test_an_input_is_released_whichever_order_runs(pair, cleanup_first):
         route()
         cleanup()
 
-    assert book.can_gc(100), "the consumed input leaked a reference"
+    assert _released(book, 100), "the consumed input leaked a reference"
+
+
+@pytest.mark.parametrize("cleanup_first", [True, False])
+def test_whoever_frees_a_consumed_input_names_it(pair, cleanup_first):
+    """Releasing it is half the job -- see the section below. Whichever call
+    got there first has to be the one that reports it, or the completion path
+    reclaims nothing on the order this very test says is supported."""
+    rt, book, store = pair
+    rid = _admit(rt)
+    book.put_tensor(100, _info(100))
+    book.increment_ref(100, 1)
+    rt.ingest_inputs_batch(
+        ParallelList([rid], [_spec("prompt", "prefill", uuids=[100])])
+    )
+    rt.pop_rids("prefill", WALK, [rid])
+
+    def cleanup():
+        return list(rt.cleanup_consumed_inputs("prefill", [rid], [WG_ID]).uuids)
+
+    def route():
+        out = rt.complete_and_route_batch(
+            RouteInput(
+                partition="default", graph_walk=WALK, node_name="prefill",
+                output_signals=[], wg_ids=ParallelList([rid], [WG_ID]),
+                tensors=[], num_tensors=[],
+            ),
+            store,
+        )
+        return list(out.freed_inputs.uuids)
+
+    named = cleanup() + route() if cleanup_first else route() + cleanup()
+
+    # Python tears it down in place through the tensor manager and names
+    # nothing; Rust cannot, so it must.
+    assert named == ([] if hasattr(rt, "_queues") else [100])
 
 
 def test_removal_purges_routing_parked_for_a_send_that_never_ran(pair):

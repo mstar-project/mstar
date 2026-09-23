@@ -872,9 +872,11 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 self._wake_q.put(None)
                 self._wake_q = None
 
-    def _cleanup_by_uuid(self, uuid: int):
+    def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
         # Grandparent cleanup (refcounts): skip the file manager's unlink.
-        super(SharedMemoryCommunicationManager, self)._cleanup_by_uuid(uuid)
+        super(SharedMemoryCommunicationManager, self)._cleanup_by_uuid(
+            uuid, registered,
+        )
         self._arena_ts.pop(uuid, None)
         if (loc := self._arena_locs.pop(uuid, None)) is not None:
             self._arena.free(*loc)

@@ -190,6 +190,42 @@ def test_batch_forms_match_the_single_ones(bk):
     assert [i.uuid if i else None for i in infos] == [1, 2, None]
 
 
+def test_dereference_batch_uniform_reports_what_it_freed(bk):
+    """The whole point of the batched form: the caller learns which tensors
+    became collectable without asking per uuid, and gets mem_registered with
+    them -- the flag a teardown still needs after the record is gone."""
+    bk.put_tensor_batch([1, 2, 3], [_info(1), _info(2), _info(3)])
+    bk.increment_ref_batch([1, 2, 3], [1, 2, 1])
+    bk.set_mem_registered(3, True)
+
+    collectable, registered = bk.dereference_batch_uniform([1, 2, 3], 1)
+    assert collectable == [1, 3], "2 still holds a reference"
+    assert registered == [False, True]
+    # No cleanup: the records are still there, exactly as can_gc reports them.
+    assert bk.is_tracked(1) and bk.can_gc(1)
+
+
+def test_dereference_batch_uniform_skips_persisted_and_untracked(bk):
+    bk.put_tensor_batch([1, 2], [_info(1), _info(2)])
+    bk.increment_ref_batch([1, 2], [1, 1])
+    bk.set_persist(2, True)
+
+    collectable, _ = bk.dereference_batch_uniform([1, 2, 99], 1)
+    assert collectable == [1], "the conductor still needs 2, and 99 is not ours"
+
+
+def test_dereference_batch_uniform_cleans_up_in_the_same_pass(bk):
+    """``cleanup`` is what saves the second crossing to forget each one."""
+    bk.put_tensor_batch([1, 2], [_info(1), _info(2)])
+    bk.increment_ref_batch([1, 2], [1, 2])
+
+    collectable, _ = bk.dereference_batch_uniform([1, 2], 1, True)
+    assert collectable == [1]
+    assert not bk.is_tracked(1), "the freed record should be gone"
+    assert bk.get_info(1) is None, "and its descriptor with it"
+    assert bk.is_tracked(2), "the held one must survive"
+
+
 def test_update_info_batch_rebinds_each(bk):
     bk.put_tensor_batch([1, 2], [_info(1), _info(2)])
     bk.update_info_batch(
@@ -236,6 +272,28 @@ def test_tensor_store_works_over_either_backend(bk):
     assert store.remove_request(5) == [1]
     assert not store.check_uuid_presence(1)
     assert store.get_info(1) is None, "teardown must drop the descriptor too"
+
+
+def test_the_store_does_not_forget_twice(bk):
+    """``dereference_batch_uniform(cleanup=True)`` already dropped the record,
+    so the teardown that follows must not cross again to drop it. Harmless if
+    it does -- forget is idempotent -- but it is the crossing the batched form
+    exists to remove."""
+    store = TensorStore(bookkeeping=bk)
+    store.put_tensor(rid=5, uuid=1, tensor=torch.randn(4, 8), info=_info(1))
+    store.increment_ref(1, 1)
+
+    forgets = []
+    real_forget = bk.forget_tensor
+    bk.forget_tensor = lambda uuid: (forgets.append(uuid), real_forget(uuid))[1]
+
+    collectable, _ = store.dereference_batch_uniform([1], cleanup=True)
+    assert collectable == [1]
+    store.remove_tensor(1)  # what the caller's per-uuid teardown ends in
+
+    assert forgets == [], "the bookkeeper was asked to forget it twice"
+    assert not store.check_uuid_presence(1)
+    assert store.get_info(1) is None
 
 
 # --- sharing with GraphRuntime ----------------------------------------------

@@ -521,8 +521,10 @@ class PreprocessWorkerThread:
             did_work = True
             if message.message_type == WorkerMessageType.TENSOR_RECEIVED:
                 body: TensorReceived = message.body
-                for (uuid, ref_cnt) in body.successful_tensors.items():
-                    self.tensor_manager.dereference(uuid, n=ref_cnt)
+                self.tensor_manager.dereference_batch(
+                    list(body.successful_tensors),
+                    list(body.successful_tensors.values()),
+                )
             elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
                 body: UnpersistTensors = message.body
                 for (uuid, ref_cnt) in body.uuid_to_ref_count.items():

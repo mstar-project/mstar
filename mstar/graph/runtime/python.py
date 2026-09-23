@@ -19,6 +19,7 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime import sharding
 from mstar.graph.runtime.base import (
     EdgeSpec,
+    FreedTensors,
     GraphRuntime,
     ParallelList,
     PendingLoopStop,
@@ -394,11 +395,15 @@ class PythonGraphRuntime(GraphRuntime):
 
     def cleanup_consumed_inputs(
         self, node_name: str, rids: list[int], wg_ids: list[int],
-    ):
+    ) -> FreedTensors:
         for rid, wg_id in zip(rids, wg_ids, strict=True):
             wgio = self._queues[wg_id].per_request_queues.get(rid)
             if wgio is not None:
                 wgio.get_node(node_name).ready_signals.clear()
+        # ``clear`` dereferences through the tensor manager this runtime was
+        # built with, which runs the teardown as it goes. Nothing is left for
+        # the caller.
+        return FreedTensors.none()
 
     def mark_stream_partition_done(self, rid: int, partition: str):
         info = self._request_info.get(rid)

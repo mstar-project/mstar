@@ -194,6 +194,31 @@ def test_cleanup_unlinks_file():
         assert not os.path.isfile(path)
 
 
+def test_cleanup_collectable_reclaims_what_a_runtime_already_freed():
+    """A graph runtime behind the contract dereferences inside the bookkeeper
+    it shares, so nothing here ever sees the count hit zero. It hands the
+    uuids back instead -- and until that path existed, a consumed input's shm
+    file sat until the whole request was torn down."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir, request_id="req1")
+        info = mgr.store_and_return_tensor_info(
+            "req1", {"out": [torch.randn(4, 8)]}
+        )["out"][0]
+        mgr.register_for_send("req1", [info])
+        path = os.path.join(tmpdir, f"mstar_worker_0_{info.uuid}")
+        assert os.path.isfile(path)
+
+        # Exactly what cleanup_consumed_inputs does and returns.
+        freed = mgr.tensor_store.bookkeeping.dereference_batch_uniform(
+            [info.uuid], 1, True,
+        )
+        assert freed[0] == [info.uuid]
+        mgr.cleanup_collectable(*freed)
+
+        assert not os.path.isfile(path), "the shm file outlived the tensor"
+        assert not mgr.tensor_store.check_uuid_presence(info.uuid)
+
+
 def test_local_tensor_skips_shm():
     """When source_entity == my_entity_id, no SHM file I/O should occur."""
     with tempfile.TemporaryDirectory() as tmpdir:

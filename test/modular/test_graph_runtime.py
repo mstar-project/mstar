@@ -55,6 +55,13 @@ class StubTensorManager:
         key = (request_id, uuid)
         self.refs[key] = self.refs.get(key, 0) - n
 
+    def dereference_batch_uniform(self, uuids: list[str], n: int = 1):
+        """What ``ReadySignals.clear`` and the loop caches call now: the
+        whole set in one crossing, with no request id."""
+        for uuid in uuids:
+            key = ("", uuid)
+            self.refs[key] = self.refs.get(key, 0) - n
+
 
 def _fwd_info(graph_walk: str, partition: str = "default", fwd_index: int = 0):
     return CurrentForwardPassInfo(

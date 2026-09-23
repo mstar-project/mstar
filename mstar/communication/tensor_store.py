@@ -16,6 +16,7 @@ teardown can find what to free.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 import torch
@@ -206,9 +207,42 @@ class TensorBookkeeping(ABC):
     def dereference(self, uuid: int, n: int = 1):
         pass
 
-    def dereference_batch(self, uuids: list[int], counts: list[int]):
-        for uuid, n in zip(uuids, counts, strict=True):
+    def dereference_batch(
+        self, uuids: list[int], counts: list[int], cleanup: bool = False,
+    ) -> tuple[list[int], list[bool]]:
+        """Drop ``counts[i]`` references from ``uuids[i]``, answering the gc
+        question in the same pass.
+
+        Returns the uuids that became collectable and whether each was
+        registered for remote reads -- the one flag a teardown still needs
+        after ``cleanup`` has dropped the record. Per uuid the caller would
+        otherwise pay a crossing each for the decrement, ``can_gc``,
+        ``is_registered`` and ``forget_tensor``.
+        """
+        return self._drop_refs(zip(uuids, counts, strict=True), cleanup)
+
+    def dereference_batch_uniform(
+        self, uuids: list[int], n: int = 1, cleanup: bool = False,
+    ) -> tuple[list[int], list[bool]]:
+        """``dereference_batch`` for a uniform count, which is what a node's
+        consumed inputs and a streamed output batch always are."""
+        return self._drop_refs(((uuid, n) for uuid in uuids), cleanup)
+
+    def _drop_refs(
+        self, refs: Iterable[tuple[int, int]], cleanup: bool,
+    ) -> tuple[list[int], list[bool]]:
+        collectable: list[int] = []
+        registered: list[bool] = []
+        for uuid, n in refs:
             self.dereference(uuid, n)
+            if not self.can_gc(uuid):
+                continue
+            collectable.append(uuid)
+            registered.append(self.is_registered(uuid))
+        if cleanup:
+            for uuid in collectable:
+                self.forget_tensor(uuid)
+        return collectable, registered
 
     # -- flags --------------------------------------------------------------
 
@@ -275,6 +309,28 @@ class PythonTensorBookkeeping(TensorBookkeeping):
         if info is None:
             return
         info.ref_cnt -= n
+
+    def _drop_refs(
+        self, refs: Iterable[tuple[int, int]], cleanup: bool,
+    ) -> tuple[list[int], list[bool]]:
+        """One record lookup per uuid, where the generic version above pays
+        one per question it asks."""
+        collectable: list[int] = []
+        registered: list[bool] = []
+        for uuid, n in refs:
+            info = self._ref_info.get(uuid)
+            if info is None:
+                continue
+            info.ref_cnt -= n
+            if info.ref_cnt > 0 or info.persist:
+                continue
+            collectable.append(uuid)
+            registered.append(info.mem_registered)
+        if cleanup:
+            for uuid in collectable:
+                self._ref_info.pop(uuid, None)
+                self._tensor_info.pop(uuid, None)
+        return collectable, registered
 
     def set_persist(self, uuid: int, persist: bool):
         info = self._ref_info.get(uuid)
@@ -447,8 +503,15 @@ class RustTensorBookkeeping(TensorBookkeeping):
     def dereference(self, uuid: int, n: int = 1):
         self._rust.dereference(uuid, n)
 
-    def dereference_batch(self, uuids: list[int], counts: list[int]):
-        self._rust.dereference_batch(uuids, counts)
+    def dereference_batch(
+        self, uuids: list[int], counts: list[int], cleanup: bool = False,
+    ) -> tuple[list[int], list[bool]]:
+        return self._rust.dereference_batch(uuids, counts, cleanup)
+
+    def dereference_batch_uniform(
+        self, uuids: list[int], n: int = 1, cleanup: bool = False,
+    ) -> tuple[list[int], list[bool]]:
+        return self._rust.dereference_batch_uniform(uuids, n, cleanup)
 
     # -- flags --------------------------------------------------------------
 
@@ -504,6 +567,11 @@ class TensorStore:
         # a new uuid), so ownership is not derivable from the uuid alone.
         self._rid_to_uuids: dict[Rid, set[int]] = {}
         self._uuid_to_rid: dict[int, Rid] = {}
+        # Uuids a batched dereference already dropped from the bookkeeper. The
+        # caller still runs its own per-uuid teardown afterwards, and that ends
+        # in ``remove_tensor``; without this it would cross again to forget a
+        # record that is already gone.
+        self._forgotten: set[int] = set()
         self.bookkeeping = bookkeeping or _build_tensor_bookkeeping()
 
     # -- tensors ------------------------------------------------------------
@@ -583,9 +651,12 @@ class TensorStore:
         return uuid in self._tensors
 
     def remove_tensor(self, uuid: int):
+        forgotten = uuid in self._forgotten
+        self._forgotten.discard(uuid)
         if self._tensors.pop(uuid, None) is None:
             return
-        self.bookkeeping.forget_tensor(uuid)
+        if not forgotten:
+            self.bookkeeping.forget_tensor(uuid)
         rid = self._uuid_to_rid.pop(uuid, None)
         if rid is not None:
             owned = self._rid_to_uuids.get(rid)
@@ -604,6 +675,9 @@ class TensorStore:
         for uuid in uuids:
             self._tensors.pop(uuid, None)
             self._uuid_to_rid.pop(uuid, None)
+            if uuid in self._forgotten:
+                self._forgotten.discard(uuid)
+                continue
             self.bookkeeping.forget_tensor(uuid)
         return uuids
 
@@ -646,8 +720,45 @@ class TensorStore:
     def increment_ref_batch(self, uuids: list[int], counts: list[int]):
         self.bookkeeping.increment_ref_batch(uuids, counts)
 
+    def dereference_batch(
+        self, uuids: list[int], counts: list[int], cleanup: bool = False,
+    ) -> tuple[list[int], list[bool]]:
+        """``dereference_batch_uniform`` where the count differs per uuid --
+        an ack that covers several reads of the same tensor, say."""
+        return self._collected(
+            self.bookkeeping.dereference_batch(uuids, counts, cleanup), cleanup
+        )
+
     def dereference(self, uuid: int, n: int = 1):
         self.bookkeeping.dereference(uuid, n)
+
+    def dereference_batch_uniform(
+        self, uuids: list[int], n: int = 1, cleanup: bool = False,
+    ) -> tuple[list[int], list[bool]]:
+        """The uuids that became collectable, and whether each was registered.
+
+        ``cleanup`` forgets them in the bookkeeper as part of the same call;
+        the tensors themselves stay here until the caller's teardown removes
+        them, which is what ``_forgotten`` covers.
+        """
+        return self._collected(
+            self.bookkeeping.dereference_batch_uniform(uuids, n, cleanup),
+            cleanup,
+        )
+
+    def _collected(
+        self, result: tuple[list[int], list[bool]], cleanup: bool,
+    ) -> tuple[list[int], list[bool]]:
+        if cleanup:
+            self.mark_forgotten(result[0])
+        return result
+
+    def mark_forgotten(self, uuids: list[int]):
+        """These records are already gone from the bookkeeper, so the teardown
+        that follows must not cross again to drop them. For a caller that went
+        to the bookkeeper directly -- the Rust runtime releasing a node's
+        consumed inputs holds a share of it and never comes through here."""
+        self._forgotten.update(uuids)
 
     def set_metadata(
         self, uuid: int,

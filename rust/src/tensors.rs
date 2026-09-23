@@ -428,16 +428,59 @@ impl Bookkeeping {
         &mut self,
         uuids: Vec<u64>,
         counts: Vec<i64>,
-    ) -> PyResult<()> {
+        cleanup: bool,
+    ) -> PyResult<(Vec<u64>, Vec<bool>)> {
         if uuids.len() != counts.len() {
             return Err(PyValueError::new_err(
                 "dereference_batch: uuids and counts must be the same length",
             ));
         }
-        for (uuid, n) in uuids.into_iter().zip(counts) {
-            self.dereference(uuid, n);
+        Ok(self.drop_refs(uuids.into_iter().zip(counts), cleanup))
+    }
+
+    /// Drop `n` references from every uuid and report which became
+    /// collectable, with the `mem_registered` flag of each.
+    ///
+    /// The per-uuid path costs three crossings -- the decrement, the `can_gc`
+    /// test, and the `forget_tensor` inside the caller's teardown -- plus a
+    /// fourth for `is_registered` on anything it does free. Here the batch is
+    /// one crossing: `cleanup` drops the entries too, and the flag rides back
+    /// because forgetting the entry takes it with it and the teardown still
+    /// has to know whether to unregister the memory.
+    fn dereference_batch_uniform(
+        &mut self,
+        uuids: Vec<u64>,
+        n: i64,
+        cleanup: bool,
+    ) -> (Vec<u64>, Vec<bool>) {
+        self.drop_refs(uuids.into_iter().map(|u| (u, n)), cleanup)
+    }
+
+    /// The shared half of the two batched dereferences, and what the graph
+    /// runtime releases consumed inputs through.
+    pub fn drop_refs(
+        &mut self,
+        refs: impl Iterator<Item = (u64, i64)>,
+        cleanup: bool,
+    ) -> (Vec<u64>, Vec<bool>) {
+        let mut collectable: Vec<u64> = Vec::new();
+        let mut registered: Vec<bool> = Vec::new();
+        for (uuid, n) in refs {
+            let Some(e) = self.entry(uuid) else { continue };
+            e.ref_count -= n;
+            // can_gc, without the second crossing to ask it.
+            if e.ref_count > 0 || e.persist {
+                continue;
+            }
+            registered.push(e.mem_registered);
+            collectable.push(uuid);
         }
-        Ok(())
+        if cleanup {
+            for &uuid in &collectable {
+                self.forget_tensor(uuid);
+            }
+        }
+        (collectable, registered)
     }
 
     pub fn set_persist(&mut self, uuid: u64, persist: bool) {
@@ -615,10 +658,23 @@ impl TensorBookkeeping {
         self.inner.lock().unwrap().dereference(uuid, n)
     }
 
+    #[pyo3(signature = (uuids, counts, cleanup=false))]
     fn dereference_batch(
-        &self, uuids: Vec<u64>, counts: Vec<i64>,
-    ) -> PyResult<()> {
-        self.inner.lock().unwrap().dereference_batch(uuids, counts)
+        &self, uuids: Vec<u64>, counts: Vec<i64>, cleanup: bool,
+    ) -> PyResult<(Vec<u64>, Vec<bool>)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .dereference_batch(uuids, counts, cleanup)
+    }
+
+    fn dereference_batch_uniform(
+        &self, uuids: Vec<u64>, n: i64, cleanup: bool,
+    ) -> (Vec<u64>, Vec<bool>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .dereference_batch_uniform(uuids, n, cleanup)
     }
 
     fn set_persist(&self, uuid: u64, persist: bool) {

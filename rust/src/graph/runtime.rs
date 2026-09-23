@@ -983,7 +983,6 @@ pub struct RouteArg {
     #[pyo3(item)] node_name: String,
     #[pyo3(item)] output_signals: Vec<String>,
     #[pyo3(item)] rids: Vec<u32>,
-    #[pyo3(item)] wg_ids: Vec<u32>,
     #[pyo3(item)] tensors: Vec<u64>,
     #[pyo3(item)] num_tensors: Vec<usize>,
 }
@@ -997,6 +996,11 @@ pub struct RouteOut {
     #[pyo3(get)] pub register_rids: Vec<u32>,
     #[pyo3(get)] pub new_token_output_idxs: Vec<usize>,
     #[pyo3(get)] pub local_streaming_tensor_idxs: Vec<usize>,
+    /// Consumed inputs the completion itself dropped to zero, with each one's
+    /// `mem_registered` flag -- empty in the normal order, where
+    /// `cleanup_consumed_inputs` has already taken them.
+    #[pyo3(get)] pub freed_input_uuids: Vec<u64>,
+    #[pyo3(get)] pub freed_input_registered: Vec<bool>,
     /// Rids this completion will actually build a frame for. The caller skips
     /// preparing `per_request_info` for everyone else -- that payload is
     /// re-encoded every pass (it is mutated in place, so it cannot be
@@ -1612,9 +1616,16 @@ impl GraphRuntime {
 
     /// Release the inputs the just-executed node consumed, dereferencing them
     /// in the bookkeeper the store shares.
+    ///
+    /// Returns the ones that hit zero, with each one's `mem_registered` flag,
+    /// because the rest of their teardown -- the shm file, the arena slot,
+    /// the memory unregistration -- lives on the tensor manager, which is
+    /// Python. Dropping them here and saying nothing is what left a consumed
+    /// input's shm file sitting until the request was torn down: the Python
+    /// runtime dereferences through the manager and reclaims as it goes.
     fn cleanup_consumed_inputs(
         &mut self, node_name: &str, rids: Vec<u32>, wg_ids: Vec<u32>,
-    ) -> PyResult<()> {
+    ) -> PyResult<(Vec<u64>, Vec<bool>)> {
         if rids.len() != wg_ids.len() {
             return Err(PyValueError::new_err(
                 "cleanup_consumed_inputs: rids and wg_ids must be the same length",
@@ -1628,13 +1639,11 @@ impl GraphRuntime {
                 freed.extend(state.clear_consumed_inputs(node));
             }
         }
-        if !freed.is_empty() {
-            let mut bk = self.bookkeeping.lock().unwrap();
-            for uuid in freed {
-                bk.dereference(uuid, 1);
-            }
+        if freed.is_empty() {
+            return Ok((vec![], vec![]));
         }
-        Ok(())
+        let mut bk = self.bookkeeping.lock().unwrap();
+        Ok(bk.drop_refs(freed.into_iter().map(|u| (u, 1)), true))
     }
 
     // --------- Scheduling ----------
@@ -2205,12 +2214,16 @@ impl GraphRuntime {
             }
 
             // Inputs the completion cleared. Dereferenced here so the result
-            // does not depend on whether cleanup_consumed_inputs ran first.
+            // does not depend on whether cleanup_consumed_inputs ran first --
+            // and reported for the same reason that call reports its own: the
+            // teardown of anything that hit zero is the tensor manager's, and
+            // this side cannot reach it.
             if !freed_inputs.is_empty() {
                 let mut bk = self.bookkeeping.lock().unwrap();
-                for uuid in &freed_inputs {
-                    bk.dereference(*uuid, 1);
-                }
+                let (uuids, registered) =
+                    bk.drop_refs(freed_inputs.into_iter().map(|u| (u, 1)), true);
+                out.freed_input_uuids.extend(uuids);
+                out.freed_input_registered.extend(registered);
             }
 
             // How many references each edge really represents. Python counts

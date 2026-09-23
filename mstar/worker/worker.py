@@ -729,8 +729,12 @@ class Worker:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
         # Uuids are global, so a late ack needs no rid lookup and works even
         # after the request is gone.
-        for (uuid, ref_cnt) in body.successful_tensors.items():
-            self.tensor_manager.dereference(uuid, n=ref_cnt)
+        # One crossing for the ack: a reader confirms a whole edge at a time,
+        # and the count differs per uuid (an edge read by several consumers).
+        self.tensor_manager.dereference_batch(
+            list(body.successful_tensors),
+            list(body.successful_tensors.values()),
+        )
 
     def _process_new_inputs(self, body: InputSignals) -> None:
         # Draining for teardown: don't start new reads for this rid. The
@@ -899,7 +903,10 @@ class Worker:
             tensor = self.tensor_manager.get_tensor(info.uuid)
 
             stream_buf.put(info.uuid, tensor.clone())
-            self.tensor_manager.dereference(info.uuid)
+        # After the loop: one crossing for the edge rather than one per tensor.
+        self.tensor_manager.dereference_batch_uniform(
+            [info.uuid for info in edge.tensor_info]
+        )
 
     def _pop_streaming_edge(
         self, sbuf: StreamBuffer, edge_name: str, rid: str
@@ -1713,8 +1720,6 @@ class Worker:
 
         # sample node and RID to see which node we will be speculating
         # (TODO: refine this to be, e.g., a majority vote)
-
-        # TODO FIX
         rid = next(iter(batch_N.request_to_worker_graph))
 
         # The runtime applies the async/TP-async eligibility filter; the
@@ -2140,14 +2145,6 @@ class Worker:
     def _clear_speculative_flag(self, batch: ScheduledBatch) -> None:
         self._set_speculative_flag(batch, False)
 
-    def _cleanup_consumed_inputs(self, batch: ScheduledBatch) -> None:
-        """Free input tensors that were consumed by the just-executed node."""
-        rids = list(batch.request_to_worker_graph)
-        self._graph_runtime.cleanup_consumed_inputs(
-            batch.node_name, rids,
-            [batch.request_to_worker_graph[r] for r in rids],
-        )
-
 
     def _postprocess_batch(
         self, batch_N: PendingBatch,
@@ -2155,7 +2152,17 @@ class Worker:
     ):
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
-        self._cleanup_consumed_inputs(batch_N.batch)
+
+        rids = list(batch_N.batch.request_to_worker_graph)
+        # What the runtime dereferenced to zero and cannot reclaim itself: a
+        # runtime behind the contract has the bookkeeper, not the shm files or
+        # the registered memory.
+        self.tensor_manager.cleanup_collectable(
+            *self._graph_runtime.cleanup_consumed_inputs(
+                batch_N.batch.node_name, rids,
+                [batch_N.batch.request_to_worker_graph[r] for r in rids],
+            )
+        )
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.pending_loop_stops", synchronize=False)
@@ -2213,11 +2220,6 @@ class Worker:
 
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
-        #
-        # Timed on its own because it dominates postprocess_batch and is NOT
-        # CPU work -- it is the GPU wait, parked here rather than in
-        # await_gpu. Lumped in, postprocess_batch reads as ~65% of the
-        # iteration and looks like CPU overhead worth optimising.
         if self.device.type != "cpu" and batch_N.batch.request_to_worker_graph:
             if batch_N.node_batch.completion_event is not None:
                 with self._span("worker.postprocess.event_sync"):
@@ -2344,6 +2346,11 @@ class Worker:
                 "worker.postprocess.route", _time.perf_counter() - _t_route,
             )
 
+        # Normally empty: cleanup_consumed_inputs ran above and took them. Not
+        # empty if a completion ever precedes it, and then nobody else will.
+        if route_output.freed_inputs.uuids:
+            self.tensor_manager.cleanup_collectable(*route_output.freed_inputs)
+
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
@@ -2380,7 +2387,11 @@ class Worker:
             stream_buf.pre_read_register(uuid)
             tensor = self.tensor_manager.get_tensor(uuid)
             stream_buf.put(uuid, tensor.clone())
-            self.tensor_manager.dereference(uuid)
+        # After the loop: one crossing for the batch rather than one per
+        # streamed tensor.
+        self.tensor_manager.dereference_batch_uniform(
+            [flat_uuids[idx] for idx in route_output.local_streaming_tensor_idxs]
+        )
 
         send_rids = list(rids)
         # numel() needs the tensors, so the counting stays on this side.

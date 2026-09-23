@@ -31,6 +31,7 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime import sharding
 from mstar.graph.runtime.base import (
     EdgeSpec,
+    FreedTensors,
     GraphRuntime,
     ParallelList,
     PopRidsOutput,
@@ -384,8 +385,10 @@ class RustGraphRuntime(GraphRuntime):
 
     def cleanup_consumed_inputs(
         self, node_name: str, rids: list[int], wg_ids: list[int],
-    ):
-        self._rust.cleanup_consumed_inputs(node_name, rids, wg_ids)
+    ) -> FreedTensors:
+        return FreedTensors(
+            *self._rust.cleanup_consumed_inputs(node_name, rids, wg_ids)
+        )
 
     # --------- Scheduling ----------
 
@@ -521,7 +524,6 @@ class RustGraphRuntime(GraphRuntime):
             "node_name": input.node_name,
             "output_signals": list(input.output_signals),
             "rids": list(input.wg_ids.keys),
-            "wg_ids": list(input.wg_ids.values),
             "tensors": list(input.tensors),
             "num_tensors": list(input.num_tensors),
         })
@@ -532,6 +534,9 @@ class RustGraphRuntime(GraphRuntime):
             new_token_output_idxs=out.new_token_output_idxs,
             local_streaming_tensor_idxs=out.local_streaming_tensor_idxs,
             rids_needing_request_info=frozenset(out.rids_needing_request_info),
+            freed_inputs=FreedTensors(
+                out.freed_input_uuids, out.freed_input_registered,
+            ),
         )
 
     def stop_loops_batched(

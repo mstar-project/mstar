@@ -814,12 +814,24 @@ class TensorCommunicationManager(ABC):
                 if info.uuid in actual_counts:
                     actual_counts[info.uuid] += 1
 
+        up_uuids: list[int] = []
+        up_counts: list[int] = []
+        down_uuids: list[int] = []
+        down_counts: list[int] = []
         for uuid, count in actual_counts.items():
             delta = count - 1  # subtract the safety hold of 1
             if delta > 0:
-                self.tensor_store.increment_ref(uuid, n=delta)
+                up_uuids.append(uuid)
+                up_counts.append(delta)
             elif delta < 0:
-                self.dereference(uuid, n=-delta)
+                down_uuids.append(uuid)
+                down_counts.append(-delta)
+        # Two crossings for a node's whole output batch rather than one per
+        # tensor: this settles every output of every request in the batch.
+        if up_uuids:
+            self.tensor_store.increment_ref_batch(up_uuids, up_counts)
+        if down_uuids:
+            self.dereference_batch(down_uuids, down_counts)
 
     # ---- abstract: transport-specific ----
 
@@ -880,7 +892,10 @@ class TensorCommunicationManager(ABC):
     ) -> list[Future]:
         ...
 
-    def _cleanup_by_uuid(self, uuid: int):
+    def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
+        """``registered`` is the transport's ``mem_registered`` flag, passed in
+        by a batched dereference that has already dropped the record it lives
+        on. ``None`` means the record is still there -- ask the store."""
         self.uuid_to_shard_dim.pop(uuid, None)
         self.uuid_to_edge_name.pop(uuid, None)
 
@@ -1006,8 +1021,9 @@ class TensorCommunicationManager(ABC):
                     # Release the "+1 for graph-node usage" ref now that the
                     # tensor data has been copied into the buffer; the standard
                     # GC path drops the registered memory when refcount hits 0.
-                    for info in edge.tensor_info:
-                        self.dereference(info.uuid, 1)
+                    self.dereference_batch_uniform(
+                        [info.uuid for info in edge.tensor_info]
+                    )
 
                     if buf.is_done():
                         consolidated = buf.consolidate()
@@ -1090,6 +1106,38 @@ class TensorCommunicationManager(ABC):
         self.tensor_store.dereference(uuid, n=n)
         if self.tensor_store.can_gc(uuid):
             self._cleanup_by_uuid(uuid)
+
+    def dereference_batch_uniform(self, uuids: list[int], n: int = 1):
+        """``dereference`` for a batch, in one crossing into the bookkeeper.
+
+        Per uuid the loop above pays one crossing for the decrement and one
+        for ``can_gc``, plus ``is_registered`` and ``forget_tensor`` on
+        anything it frees. Here the bookkeeper does all four and hands back
+        only what became collectable, leaving this side the part it cannot
+        do: the shm files, the arena slots and the memory unregistration.
+        """
+        self.cleanup_collectable(
+            *self.tensor_store.dereference_batch_uniform(uuids, n=n, cleanup=True)
+        )
+
+    def dereference_batch(self, uuids: list[int], counts: list[int]):
+        """``dereference_batch_uniform`` where the count differs per uuid: a
+        TENSOR_RECEIVED ack covers as many reads as the edge fanned out to."""
+        self.cleanup_collectable(
+            *self.tensor_store.dereference_batch(uuids, counts, cleanup=True)
+        )
+
+    def cleanup_collectable(
+        self, collectable: list[int], registered: list[bool],
+    ):
+        """Transport-side teardown for tensors the bookkeeper has already
+        dereferenced to zero and forgotten -- what a batched dereference, or
+        the graph runtime releasing a node's consumed inputs, hands back."""
+        if not collectable:
+            return
+        self.tensor_store.mark_forgotten(collectable)
+        for uuid, was_registered in zip(collectable, registered, strict=True):
+            self._cleanup_by_uuid(uuid, registered=was_registered)
 
     def increment_ref(self, uuid: int, n: int = 1):
         self.tensor_store.increment_ref(uuid, n=n)
@@ -1239,14 +1287,15 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             self._record_tx(rid, uuid, tensor.nbytes, 0.0)
         self.tensor_store.set_metadata(uuid, mem_registered=True)
 
-    def _cleanup_by_uuid(self, uuid: int):
-        super()._cleanup_by_uuid(uuid)
+    def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
+        super()._cleanup_by_uuid(uuid, registered)
         logger.debug("Deleting tensor uuid %s", uuid)
         if not self.tensor_store.check_uuid_presence(uuid):
             logger.warning("Trying to cleanup tensor %s, but uuid not found", uuid)
             return
-        if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP) \
-                and self.tensor_store.is_registered(uuid):
+        if registered is None:
+            registered = self.tensor_store.is_registered(uuid)
+        if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP) and registered:
             ret_value = self.transfer_engine.unregister_memory(
                 self.tensor_store.get_tensor(uuid).data_ptr()
             )
@@ -1521,8 +1570,8 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
             torch.cuda.default_stream(self.device).wait_stream(self._h2d_stream)
         return []
 
-    def _cleanup_by_uuid(self, uuid: int):
-        super()._cleanup_by_uuid(uuid)
+    def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
+        super()._cleanup_by_uuid(uuid, registered)
         logger.debug("SHM: cleaning up tensor uuid %s", uuid)
         if not self.tensor_store.check_uuid_presence(uuid):
             logger.warning("SHM: cleanup tensor %s, uuid not found", uuid)
