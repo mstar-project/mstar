@@ -39,7 +39,7 @@ from torch.nn.attention.flex_attention import (
 
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttnBackend
-from mstar.engine.resources.attn.flex import flex_attention_masked, make_block_mask
+from mstar.engine.resources.attn.flex import _MASK_MOD, flex_attention_masked, make_block_mask
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import (
     KVSpec,
@@ -182,13 +182,13 @@ def waypoint_resources(config: WaypointConfig):
 # ---------------------------------------------------------------------------
 
 
-def test_block_mask_is_full_blocks_only_and_carries_a_noop_mask_mod():
+def test_block_mask_is_full_blocks_only_and_carries_an_all_visible_mask_mod():
     """Visibility lives in the index lists, not ``mask_mod``: anything that
     re-derives the mask from ``mask_mod`` sees "everything visible".
 
-    ``make_block_mask`` passes ``mask_mod=None``; ``BlockMask.from_kv_blocks``
-    substitutes ``flex_attention.noop_mask`` for it, which carries the same
-    hazard.
+    Under FLASH ``make_block_mask`` passes ``_flash_mask_mod`` (true for every
+    kv index); under TRITON it passes ``None`` and ``BlockMask.from_kv_blocks``
+    substitutes ``flex_attention.noop_mask``. Both carry the same hazard.
     """
     written = torch.zeros(5 * BLOCK, dtype=torch.bool)
     written[0 * BLOCK : 1 * BLOCK] = True  # one committed frame
@@ -196,7 +196,7 @@ def test_block_mask_is_full_blocks_only_and_carries_a_noop_mask_mod():
 
     bm = make_block_mask(TPF, written.numel(), written)
 
-    assert bm.mask_mod is noop_mask, "a non-noop mask_mod would change the trap's shape"
+    assert bm.mask_mod is (_MASK_MOD or noop_mask), "a different mask_mod would change the trap's shape"
     assert bm.seq_lengths == (TPF, written.numel())
     # Zero partial blocks: "any token written" and "all tokens written" coincide
     # because writes are whole frames.

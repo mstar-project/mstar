@@ -254,6 +254,7 @@ def test_data_worker_emits_complete_metadata_and_monotonic_frame_indices():
         "second": torch.arange(72, dtype=torch.uint8).reshape(4, 2, 3, 3),
     }
     worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    worker.enable_nvtx = False
     worker.tensor_manager = _ReadyTensorManager({"request": tensors})
     worker.model = _FrameModel()
     worker.out_queue = queue.Queue()
@@ -284,6 +285,7 @@ def test_data_worker_tracks_interleaved_frame_indices_per_request():
         "request-b": {"b-first": frame},
     }
     worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    worker.enable_nvtx = False
     worker.tensor_manager = _ReadyTensorManager(tensors)
     worker.tensor_manager.ready = {
         "request-a": {"a-first": frame},
@@ -323,6 +325,7 @@ def test_data_worker_reorders_async_completions_before_frame_emission():
     second = torch.ones((4, 2, 3, 3), dtype=torch.uint8)
     tensors = {"request": {"first": first, "second": second}}
     worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    worker.enable_nvtx = False
     worker.tensor_manager = _ReadyTensorManager(tensors)
     worker.tensor_manager.ready = {}
     worker.model = _FrameModel()
@@ -365,6 +368,7 @@ def test_data_worker_reorders_async_completions_before_frame_emission():
 
 def test_data_worker_cleanup_drops_all_frame_protocol_state():
     worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    worker.enable_nvtx = False
     worker.tensor_manager = _ReadyTensorManager({})
     worker.tensor_uuid_to_metadata_per_request = {
         "reused": {"old": {"producer": "decoder"}},
@@ -375,6 +379,7 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
         "other": {"world": "keep"},
     }
     worker.request_output_frame_indices = {"reused": 24, "other": 8}
+    worker.in_flight_requests = {"reused", "other"}
     _set_output_order_state(worker, {
         "reused": {"old": object()},
         "other": {"keep": object()},
@@ -395,6 +400,7 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     worker.model = SimpleNamespace(process_prompt=lambda *args, **kwargs: {})
     worker.device = "cpu"
     worker.enable_prof = False
+    worker._prefix_streams = {}
     worker.communicator = SimpleNamespace(send=lambda *args: None)
     worker._process_input(
         PreprocessInput(
@@ -752,7 +758,7 @@ def test_waypoint_emits_only_generated_raw_frame_chunks():
     walks = model.get_graph_walk_graphs()
 
     assert walks[PRIME_WALK].sections[-1].outputs == []
-    edge = walks[ROLLOUT_WALK].section.sections[-1].outputs[0]
+    edge = walks[ROLLOUT_WALK].section.outputs[-1]
     assert edge.output_modality == "video_frame"
     assert model.get_output_frame_rate() == 60.0
 
