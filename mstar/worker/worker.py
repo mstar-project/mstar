@@ -9,7 +9,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from time import sleep
 
@@ -974,7 +974,15 @@ class Worker:
                 if edge._final_stream_chunk:
                     final_stream_rids.add(request_id)
             per_request_inputs[request_id] = tensors
-            per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+            info = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+            # the loop counters this step runs at: the shared info still reads
+            # the ones of the request's last step
+            info.dynamic_loop_iter_counts.update(
+                self.worker_graphs_manager.get_dynamic_loop_iters(
+                    request_id, partition=batch_partition,
+                )
+            )
+            per_request_info[request_id] = info
 
         return self._make_executing_batch(
             node_name=batch.node_name,
@@ -1582,8 +1590,15 @@ class Worker:
     def _get_input_tensors(
         self, rid: str, node: GraphNode, check_next_iter: bool
     ) -> NameToTensorList:
-        inputs = node.ready_next_iter.ready_inputs if check_next_iter \
-            else node.ready_signals.ready_inputs
+        if check_next_iter:
+            inputs = dict(node.ready_next_iter.ready_inputs)
+            # the loop re-injects its external inputs every iteration; the copy
+            # in the current slot is the one the next iteration will see
+            for input_name, edge in node.ready_signals.ready_inputs.items():
+                if edge._persist_for_loop and input_name not in inputs:
+                    inputs[input_name] = edge
+        else:
+            inputs = node.ready_signals.ready_inputs
         tensors = {}
         for input_name, edge in inputs.items():
             tensors[input_name] = [
@@ -1678,6 +1693,38 @@ class Worker:
             node.ready_next_iter.remove(edge.name)
             self._return_speculative_streaming_edge(rid, edge)
 
+    def _speculative_fwd_info(
+        self,
+        rid: str,
+        partition: str,
+        spec_node_info: SpeculativeNodeInfo,
+        *,
+        continuing: bool,
+    ) -> CurrentForwardPassInfo:
+        """The step context a speculative batch runs ``rid`` under.
+
+        The request's shared info is refreshed as each batch is built, so while
+        iteration k of a loop is in flight it reads k, and stays there until the
+        step lands. A speculative next iteration that ran under it would take k
+        again: a denoise step would run the same sigma twice, and the overshoot
+        past the last step would never be vetoed. So the speculative batch gets a
+        view of its own, with the counters it will run at: one past the in-flight
+        iteration for a continuing rid on a new iteration of its loop, and the
+        loops' current indices otherwise (a fresh rid's loop already advanced when
+        its last step routed). The mutable per-request tables are shared, so what
+        an engine records on the view is seen by later steps; the in-flight batch
+        keeps the shared info, so its stop check still reads k.
+        """
+        info = self.worker_graphs_manager.get_fwd_info(rid, partition)
+        counts = dict(info.dynamic_loop_iter_counts)
+        counts.update(
+            self.worker_graphs_manager.get_dynamic_loop_iters(rid, partition=partition)
+        )
+        if continuing and spec_node_info.is_new_loop_iter:
+            loop = spec_node_info.loop_name
+            counts[loop] = counts.get(loop, 0) + 1
+        return replace(info, dynamic_loop_iter_counts=counts)
+
     def _assemble_speculation(
         self,
         pending: PendingBatch,
@@ -1709,7 +1756,9 @@ class Worker:
             request_ids=request_ids,
             per_request_input_tensors=per_request_inputs,
             per_request_info={
-                rid: self.worker_graphs_manager.get_fwd_info(rid, pending.partition)
+                rid: self._speculative_fwd_info(
+                    rid, pending.partition, spec_node_info, continuing=rid in continuing,
+                )
                 for rid in request_ids
             },
             final_stream_rids={
@@ -3108,13 +3157,6 @@ class Worker:
                     range_push("worker.build_node_batch", synchronize=False)
                 node_batch = self._build_executing_batch(batch)
                 batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
-
-                for request_id, req_info in node_batch.per_request_info.items():
-                    req_info.dynamic_loop_iter_counts.update(
-                        self.worker_graphs_manager.get_dynamic_loop_iters(
-                            request_id, partition=batch_partition,
-                        )
-                    )
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 
