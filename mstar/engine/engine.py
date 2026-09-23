@@ -16,6 +16,7 @@ from mstar.engine.cuda_graph_runner import (
     CudaGraphRunner,
     PiecewiseCudaGraphRunner,
     autocast_scope,
+    fail_if_graphs_required,
 )
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -439,6 +440,17 @@ class Engine:
                 if pw_runner.any_graphs:
                     captured[label] = pw_runner
             submodule_mgmt.piecewise_runners = captured
+
+        fail_if_graphs_required([
+            f"{node_name} {key}"
+            for node_name, runner in cg_runners.items()
+            for key in runner.dropped_buckets
+        ] + [
+            f"{node_name} {label} bs={bs} total_tokens={tokens}"
+            for node_name, runners in piecewise.items()
+            for label, runner in runners.items()
+            for bs, tokens in runner.dropped_shapes
+        ])
 
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
