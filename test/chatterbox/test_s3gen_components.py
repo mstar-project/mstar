@@ -233,6 +233,32 @@ def test_frame_bucketed_rows_match_exact_length(pair):
         assert diff < 1e-3
 
 
+def test_low_precision_estimator_stays_close_to_float32(pair):
+    """A bfloat16 estimator under the float32 Euler state must give the same
+    mel up to rounding: the mixed-precision loop casts per step and back."""
+    import copy
+
+    from mstar.model.chatterbox.components.s3gen import FlowRow
+
+    variant, (ref, mine, ref_dict, mine_ref, n_steps) = pair
+    tokens = _tokens(mine_ref)[0]
+    noise = torch.randn(
+        1, 80, 2 * (mine_ref.num_prompt_tokens + tokens.numel()), generator=torch.Generator().manual_seed(5),
+    )
+    rows = [FlowRow(tokens=tokens, ref=mine_ref, finalize=True, noise=noise)]
+    exact = mine.tokens_to_mel_rows(rows, n_timesteps=n_steps)[0]
+    low = copy.deepcopy(mine)
+    low.decoder.set_estimator_dtype(torch.bfloat16)
+    assert low.decoder.estimator.final_proj.weight.dtype == torch.bfloat16
+    got = low.tokens_to_mel_rows(rows, n_timesteps=n_steps)[0]
+    assert got.dtype == torch.float32 and got.shape == exact.shape
+    a, b = exact.flatten() - exact.mean(), got.flatten() - got.mean()
+    corr = float((a * b).sum() / (a.norm() * b.norm()))
+    diff = (got - exact).abs().max().item()
+    print(f"[{variant}] bf16 estimator vs fp32: max diff {diff:.3f}, log-mel corr {corr:.5f}")
+    assert corr > 0.999 and diff < 1.0
+
+
 def test_embed_reference_matches(pair):
     variant, (ref, mine, _, _, _) = pair
     sr = 24000
