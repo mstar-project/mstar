@@ -9,61 +9,6 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.utils.containers import ParallelList
 
-#
-# NOTE:
-# (1) rids will be interned once at ingestion, then even in the Python code
-# will be referred to by their integer handle. When being sent to other workers,
-# then the handle will be dereferenced to the actual uuid string.
-#
-# (2) TensorStore stays Python and keeps dict[uuid, Tensor]. A separate
-# bookkeeper -- metadata plus ref_cnt / persist / mem_registered -- is what
-# gets a Rust backend, so Rust never sees a tensor and never has to drop a
-# Python object. Because the bookkeeper holds the metadata, the routing call
-# only needs uuid handles.
-#
-# (3) per-partition info will also probably eventually be ported into the
-# GraphRuntime so that we don't have to do a hop to Python for everything
-# involving the per-request info. For a first step, it can just be passed
-# in as a msgpack-encoded blob. Some parts will be immediately ported over,
-# like the pending persist signals.
-# msgpack is self-describing, so "opaque" only means opaque to Python's type
-# system -- Rust can still read the handful of keys it needs out of the blob
-# (graph_walk, partition_name, resource_publish_info, fwd_index) without
-# owning the type.
-#
-# (4) pending loops stops and stop loop idxs will also be owned by Rust, with
-# an API to query them in the speculative path (if needed)
-#
-# (5) WORKER_GRAPHS_DONE is built and sent by Rust. Splitting it out would be
-# the worst of both: Python would need persist_signals as
-# dict[str, list[TensorPointerInfo]], output_loop_indices and
-# output_signal_names handed back per request, which is the per-rid object
-# construction the batching exists to avoid. The fields Rust cannot derive are
-# small and come in on SendInput:
-#   - rx_info / tx_info / graph_timings are populated only under enable_prof
-#     (all three call sites are inside `if self.enable_prof:`), so in
-#     production they are empty -- hence one optional `profiling` field.
-#   - stream_tokens_consumed comes from StreamBuffer._consumed.
-#   - partition_done is derived from the pass's final_stream_rids.
-# The worker->conductor edge already speaks typed msgpack
-# (mstar.communication.wire), as do all the others, so there is no codec
-# prerequisite left here.
-#
-# (7) Request handles are recycled, which string rids effectively were not.
-# Anything keyed by a handle must be purged when the request is removed, or a
-# stale entry silently attaches to whichever request next gets that handle.
-# The ones that exist today: MicroScheduler.{failed_rids, admit_errors,
-# held_until, backlog, pending_tp_follow_count} (via clear_rid),
-# Worker._last_active / _pending_removes / _pending_loop_stops, and the tensor
-# manager's per-request maps. clear_rid covers the scheduler set; the rest are
-# worth auditing as part of the refactor.
-#
-# (6) Rust sends directly: RawZmqCommunicator::send takes &self with its peer
-# table behind a Mutex, so the runtime can hold an Arc to the same instance
-# the Python communicator wraps. The receive side should decode and ingest in
-# Rust too, or peer edges become Python objects again on arrival.
-#
-
 
 class SpeculationOutput(NamedTuple):
     node_name: str
@@ -572,18 +517,3 @@ class GraphRuntime(ABC):
         """
         pass
 
-
-#
-# The output path is then four crossings per forward pass, each O(1) in batch
-# size:
-#
-#   uuids = tensor_store.store_batch(...)        # Rust mints handles + records
-#   out   = runtime.complete_and_route_batch(..) # route, refcount, persist
-#   locs  = <stage arena in Python>              # .contiguous() / host.copy_()
-#   runtime.send_outputs(.., shm_locs=locs)      # peers, api server, conductor
-#
-# Step 3 stays Python because it is torch; the reservation inside it is already
-# Rust (SegmentedShmArena). With Rust owning mem_registered it also decides
-# WHAT needs registering, so the dedup-by-uuid and skip-if-registered logic
-# moves with the store.
-#

@@ -16,9 +16,10 @@ from time import sleep
 import torch
 
 from mstar.communication import wire
-from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
-from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
+from mstar.communication.tensor_store import TensorStore
+from mstar.communication.tensors import NameToTensorList, TensorCommunicationManager, create_tensor_communication_manager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
@@ -39,6 +40,7 @@ from mstar.graph.runtime.base import (
     SpeculationPrepInput,
 )
 from mstar.graph.runtime.python import PythonGraphRuntime
+from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
 from mstar.profile.worker import WorkerProfileInfo
@@ -71,8 +73,13 @@ from mstar.worker.node_manager_utils import RequestStateManager
 logger = logging.getLogger(__name__)
 
 
-def _make_graph_runtime(**kwargs) -> PythonGraphRuntime:
-    """``MSTAR_RUST_GRAPH``: ``0`` (default) Python, ``1`` Rust.
+def _make_graph_runtime(
+    communicator: BaseCommunicator,
+    tensor_manager: TensorCommunicationManager,
+    **kwargs
+) -> PythonGraphRuntime:
+    """``MSTAR_RUST_GRAPH``: ``0`` Python, ``1`` Rust, ``AUTO`` (default,
+    Rust if installed, else Python).
 
     No ``AUTO``: picking the Rust runtime up silently would change how a
     worker behaves merely because the extension happened to be installed, and
@@ -83,28 +90,22 @@ def _make_graph_runtime(**kwargs) -> PythonGraphRuntime:
     hopping back into Python for every message; with the pyzmq communicator
     there is no such object to share.
     """
-    choice = os.getenv("MSTAR_RUST_GRAPH", "0")
-    if choice not in ("0", "1"):
-        raise ValueError(f"MSTAR_RUST_GRAPH must be 0 or 1; got {choice!r}")
-    if choice == "0":
-        return PythonGraphRuntime(**kwargs)
-
-    if os.getenv("MSTAR_RUST_ZMQ", "AUTO").upper() == "0":
-        raise ValueError(
-            "MSTAR_RUST_GRAPH=1 needs the Rust communicator, but "
-            "MSTAR_RUST_ZMQ=0 forces pyzmq. The graph runtime sends from "
-            "Rust and has to share the transport."
+    choice = resolve_graph_runtime_type(log=True)
+    if choice == GraphRuntimeType.PYTHON:
+        return PythonGraphRuntime(
+            communicator=communicator,
+            tensor_manager=tensor_manager,
+            **kwargs
         )
+
     from mstar.communication.rust_communicator import RustZMQCommunicator
     from mstar.graph.runtime.rust import RustGraphRuntime
 
-    communicator = kwargs.get("communicator")
     if not isinstance(communicator, RustZMQCommunicator):
         raise ValueError(
             "MSTAR_RUST_GRAPH=1 needs the Rust communicator, but this worker "
             f"built a {type(communicator).__name__}. Set MSTAR_RUST_ZMQ=1."
         )
-    tensor_manager = kwargs["tensor_manager"]
     bookkeeping = tensor_manager.tensor_store.bookkeeping
     if not hasattr(bookkeeping, "_rust"):
         raise ValueError(

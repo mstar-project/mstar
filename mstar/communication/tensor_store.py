@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.graph.base import TensorPointerInfo
+from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.utils.containers import ParallelList
 
 NameToTensorList = dict[str, list[torch.Tensor]]
@@ -450,7 +451,8 @@ def _build_tensor_bookkeeping() -> TensorBookkeeping:
     in and rebuilt on the way out, which the Python runtime pays for and gets
     nothing back -- the saving is in the crossings the Rust runtime avoids.
     """
-    if os.environ.get("MSTAR_RUST_GRAPH", "0") == "1":
+    choice = resolve_graph_runtime_type(log=True)
+    if choice == GraphRuntimeType.RUST:
         return RustTensorBookkeeping()
     return PythonTensorBookkeeping()
 

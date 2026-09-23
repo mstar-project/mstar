@@ -2023,7 +2023,14 @@ impl GraphRuntime {
             let mut local_counts: FxHashMap<u64, i64> = FxHashMap::default();
             let mut ingested_locally: Vec<bool> = Vec::with_capacity(edges.len());
             for e in &edges {
-                let target = match e.dest {
+                // Post-fanout, an edge belongs to exactly ONE worker. A peer's
+                // copy still names a node this worker runs, so resolving it by
+                // name alone ingests the peer's tensors here too -- filling the
+                // next-iteration slot and starving the real loop-back edge.
+                // Python pops its own id out of the fanout and wires the rest.
+                let target = if e.worker.is_some_and(|w| w != me_sym) {
+                    None
+                } else { match e.dest {
                     Dest::Local(d) => Some((wg, d)),
                     // A streaming destination is local when THIS WORKER runs
                     // it at all -- Python resolves the fanout with
@@ -2048,7 +2055,7 @@ impl GraphRuntime {
                             g2.by_name.get(&name).copied().map(|d| (owner, d))
                         }),
                     _ => None,
-                };
+                }};
                 let mut took = false;
                 if let Some((owner, d)) = target {
                     if e.streaming {
