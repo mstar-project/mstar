@@ -62,7 +62,7 @@ omnivoice = []
 
 dev = [
     "ruff<=0.16",
-    "pytest",
+    "pytest>=8.2",
 ]
 
 # Optional: non-WAV audio containers (mp3/flac/...) for the OpenAI audio API
@@ -221,7 +221,7 @@ asr = [
 
 all = [
     "ruff",
-    "pytest",
+    "pytest>=8.2",
     "soundfile",
     "av",
     "diffusers>=0.39",

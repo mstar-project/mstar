@@ -18,8 +18,8 @@ jobs:
       - name: Run Ruff
         # Use GitHub’s annotation format so lint errors show inline
         run: ruff check --output-format=github .
-  # Small CPU-only engine/resource suite; keep the file list explicit because
-  # other modular tests import GPU backends during collection.
+  # The CPU-only engine/resource suite is listed in test/cpu-core.txt; other
+  # modular tests import GPU backends during collection.
   cpu-core:
     name: CPU Core
     runs-on: ubuntu-latest
@@ -50,12 +50,7 @@ jobs:
         run: |
           python -m pytest -q -ra --strict-markers --durations=20 \
             --junitxml=cpu-core.xml \
-            test/modular/test_graph_io.py \
-            test/modular/test_resource_runner.py \
-            test/modular/test_admit_failure_handling.py \
-            test/modular/test_micro_scheduler.py \
-            test/modular/test_worker_drain.py \
-            test/modular/test_ragged_attention_cpu.py
+            @test/cpu-core.txt
       - name: Upload CPU core test report
         if: always()
         uses: actions/upload-artifact@v4

@@ -26,7 +26,8 @@ on a GitHub-hosted Ubuntu runner whenever a PR targeting `main` is opened,
 updated, or reopened. It needs no GPU or model weights. New updates cancel an
 older CPU Core run for the same PR.
 
-To reproduce the job in a clean Linux environment with Python 3.12:
+To reproduce the job in a clean Linux environment with Python 3.12, run from
+the repository root:
 
 ```bash
 python -m pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
@@ -36,15 +37,16 @@ python -m pip check
 HF_HUB_OFFLINE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 python -m pytest -q -ra --strict-markers --durations=20 \
   --junitxml=cpu-core.xml \
-  test/modular/test_graph_io.py \
-  test/modular/test_resource_runner.py \
-  test/modular/test_admit_failure_handling.py \
-  test/modular/test_micro_scheduler.py \
-  test/modular/test_worker_drain.py \
-  test/modular/test_ragged_attention_cpu.py
+  @test/cpu-core.txt
 ```
 
-Keep the file list explicit: other modules under `test/modular/` require GPU
+CI and local runs share the test list in [test/cpu-core.txt](test/cpu-core.txt).
+To add a CPU-only module, add its repository-relative path on a new line in that
+file after checking that it runs without a GPU or model downloads. New test
+cases inside a listed module are included automatically. The `@file` syntax
+requires pytest 8.2 or newer, installed by the `dev` extra.
+
+Keep the selection explicit: other modules under `test/modular/` require GPU
 backends during collection. `test_ragged_attention_cpu.py` contains the padding
 validation checks; the GPU attention and capture tests remain in
 `test_ragged_attention.py`. CI prints the slowest tests and saves the JUnit report
