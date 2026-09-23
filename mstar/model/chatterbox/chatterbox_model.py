@@ -121,6 +121,9 @@ class ChatterboxModel(Model):
         s3gen_compile: bool | None = None,
         s3gen_compile_mode: str | None = None,
         s3gen_frame_bucket: int | None = None,
+        s3gen_graphs: bool | None = None,
+        s3gen_estimator_dtype: str | None = None,
+        t3_prefill_graphs: bool | None = None,
         t3_dtype: str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -161,6 +164,20 @@ class ChatterboxModel(Model):
             self.config.s3gen_compile_mode = str(s3gen_compile_mode)
         if s3gen_frame_bucket is not None:
             self.config.s3gen_frame_bucket = int(s3gen_frame_bucket)
+        if s3gen_graphs is not None:
+            self.config.s3gen_graphs = bool(s3gen_graphs)
+        if s3gen_estimator_dtype is not None:
+            self.config.s3gen_estimator_dtype = str(s3gen_estimator_dtype)
+        if t3_prefill_graphs is not None:
+            self.config.t3_prefill_graphs = bool(t3_prefill_graphs)
+        self._s3gen_estimator_dtype = _parse_dtype(self.config.s3gen_estimator_dtype)
+        if self.config.s3gen_graphs:
+            if self.config.s3gen_compile:
+                raise ValueError("s3gen_graphs and s3gen_compile are alternatives; enable one of them")
+            if self.config.s3gen_frame_bucket <= 0:
+                # graphs are per shape: without a bucket every chunk length
+                # would be a capture of its own
+                self.config.s3gen_frame_bucket = 64
         self.voices_dir = Path(voices_dir) if voices_dir else None
         self.local_dir = resolve_snapshot(model_path_hf, cache_dir)
         self.tokenizer = self._build_text_tokenizer()
@@ -743,6 +760,9 @@ class ChatterboxModel(Model):
             iter_weights(self._weights_path(self.config.s3gen_weights), device=device),
         )
         s3gen.eval()
+        if self._s3gen_estimator_dtype != torch.float32:
+            # after load_weights: the checkpoint is float32
+            s3gen.decoder.set_estimator_dtype(self._s3gen_estimator_dtype)
         if self.config.s3gen_compile:
             # after load_weights: the compiled wrapper renames parameters
             s3gen.decoder.estimator = torch.compile(
@@ -754,9 +774,62 @@ class ChatterboxModel(Model):
             prompt_feat=gen["prompt_feat"].to(device),
             embedding=gen["embedding"].to(device),
         )
+        if self.config.s3gen_graphs:
+            solver = s3gen.enable_graphs()
+            if torch.device(device).type == "cuda":
+                self._warm_solve_graphs(s3gen, solver, builtin.prompt_feat.shape[1])
         return S3GenSubmodule(
             s3gen.eval(), self._s3_tokenizer(device), self.config,
             builtin_voice=builtin, watermarker=self._watermarker(device),
+        )
+
+    def _graph_warmup_frames(self, prompt_frames: int) -> list[int]:
+        """Solve lengths (bucketed) the streaming chunks of the built-in voice
+        produce: prompt + 2 x (left context + chunk + look-ahead) for every
+        chunk size of the ramp. Other voices and whole-utterance solves are
+        captured on first use."""
+        cfg = self.config
+        if cfg.stream_chunk_tokens <= 0:
+            return []  # whole-utterance solves: one shape per utterance length
+        chunks = {cfg.stream_first_chunk_tokens}
+        size = cfg.stream_chunk_tokens
+        cap = max(cfg.stream_max_chunk_tokens, size)
+        while size and size <= cap:
+            chunks.add(size)
+            nxt = int(size * cfg.stream_chunk_growth) if cfg.stream_chunk_growth > 1 else cap + 1
+            if nxt <= size:
+                break
+            size = nxt
+        chunks.add(cap)
+        ratio = cfg.s3gen.token_mel_ratio
+        lookahead = cfg.s3gen.encoder.pre_lookahead_len
+        bucket = cfg.s3gen_frame_bucket
+        frames = set()
+        for chunk in chunks:
+            if chunk <= 0:
+                continue
+            total = prompt_frames + ratio * (cfg.stream_context_tokens + chunk + lookahead)
+            frames.add(-(-total // bucket) * bucket)
+        return sorted(frames)
+
+    def _warm_solve_graphs(self, s3gen, solver, prompt_frames: int) -> None:
+        frames = self._graph_warmup_frames(prompt_frames)
+        if not frames:
+            return
+        longest = max(frames)
+        n_mel = self.config.s3gen.output_size
+        device, dtype = s3gen.device, s3gen.dtype
+        gen = torch.Generator(device=device).manual_seed(0)
+        example = {
+            "mu": torch.randn(1, n_mel, longest, device=device, dtype=dtype, generator=gen),
+            "mask": torch.ones(1, 1, longest, device=device, dtype=dtype),
+            "spks": torch.randn(1, n_mel, device=device, dtype=dtype, generator=gen),
+            "cond": torch.zeros(1, n_mel, longest, device=device, dtype=dtype),
+            "noise": torch.randn(1, n_mel, longest, device=device, dtype=dtype, generator=gen),
+        }
+        captured = solver.warmup(frames, self.config.generation.n_cfm_timesteps, example)
+        logger.info(
+            "S3Gen: captured %d flow-solve graphs for %s frames x rows %s", captured, frames, list(solver.rows),
         )
 
     def _watermarker(self, device: str):
