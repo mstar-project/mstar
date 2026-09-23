@@ -995,24 +995,39 @@ class Worker:
         final_stream_rids: set[str] = set()
         batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
+        request_ids: list[str] = []
         for request_id, node in batch.node_objects.items():
             tensors = {}
             ready_inputs = node.ready_signals.ready_inputs
-            for input_name, edge in ready_inputs.items():
-                tensors[input_name] = [
-                    self.tensor_manager.get_tensor(
-                        request_id=request_id, uuid=info.uuid
-                    ) for info in edge.tensor_info
-                ]
+            try:
+                for input_name, edge in ready_inputs.items():
+                    tensors[input_name] = [
+                        self.tensor_manager.get_tensor(
+                            request_id=request_id, uuid=info.uuid
+                        ) for info in edge.tensor_info
+                    ]
+                fwd_info = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+            except KeyError:
+                # The request was cancelled (its tensors and graph state
+                # dropped) after this batch was scheduled. It has no step to
+                # run any more; the others in the batch still do, so leave it
+                # out rather than failing them all with it.
+                logger.warning(
+                    "Worker %s: request %s was dropped before its %s step ran; leaving it out of the batch",
+                    self.worker_id, request_id, batch.node_name,
+                )
+                continue
+            for edge in ready_inputs.values():
                 if edge._final_stream_chunk:
                     final_stream_rids.add(request_id)
             per_request_inputs[request_id] = tensors
-            per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+            per_request_info[request_id] = fwd_info
+            request_ids.append(request_id)
 
         return self._make_executing_batch(
             node_name=batch.node_name,
             graph_walk=batch.graph_walk,
-            request_ids=list(batch.node_objects.keys()),
+            request_ids=request_ids,
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
             final_stream_rids=final_stream_rids,
