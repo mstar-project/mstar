@@ -59,6 +59,18 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
+   * - ``flux2_klein``
+     - ``black-forest-labs/FLUX.2-klein-4B``
+     - FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
+       image editing; Qwen3-4B hidden-state text encoder + FLUX.2 VAE. Apache-2.0.
+   * - ``flux2_klein_9b``
+     - ``black-forest-labs/FLUX.2-klein-9B``
+     - FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
+       the FLUX Non-Commercial License; check it before deploying.
+   * - ``z_image_turbo``
+     - ``Tongyi-MAI/Z-Image-Turbo``
+     - Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
+       encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.
 
 Notes
 -----
@@ -258,3 +270,70 @@ Requests are therefore independent and the loop is resumable across ranks.
 ``torch.compile``, no CUDA-graph capture, no continuous batching, no component
 offload, and the VAE decode is always tiled (which bounds its workspace so the
 untiled conv3d cannot OOM a 32 GiB card).
+
+FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
+-----------------------------------------------------
+
+Text-to-image and reference-image editing on the step-distilled **FLUX.2 [klein]**
+checkpoints. Four stateless nodes: a native Qwen3 encoder that runs only the 27 layers
+whose hidden states the DiT consumes (taps 9/18/27 concatenated), the rectified-flow
+transformer as the body of a ``denoise_loop`` (one Euler step per iteration, 4 by
+default, no classifier-free guidance), the FLUX.2 VAE encode of reference images and
+the VAE decode. All of them are exact ports; the CPU suite pins them bit-for-bit against
+the diffusers modules on tiny random configs and the GPU suite compares real-weight
+trajectories and PSNR against a recorded pipeline run
+(``test/flux2_klein/record_oracle.py``).
+
+Serve on one GPU and generate::
+
+   mstar serve flux2_klein --gpus 0
+   python - <<'PY'
+   from mstar import MStarClient
+   client = MStarClient("http://localhost:8000")
+   png = client.generate_image("a cat holding a sign that says hello world", width=1024, height=1024, seed=0)
+   open("cat.png", "wb").write(png)
+   open("edit.png", "wb").write(client.edit_image("make it a watercolor painting", "cat.png", seed=1))
+   PY
+
+The OpenAI routes are ``POST /v1/images/generations`` (``size`` as ``WxH``, ``seed``,
+``n``; ``num_inference_steps`` through ``extra_body``) and ``POST /v1/images/edits``
+(multipart ``image`` + ``prompt``; up to four reference images are concatenated as
+conditioning tokens, in order).
+
+Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
+``attention_backend`` (``sdpa``, the default: the reference kernel, cuDNN on an H100,
+measured as fast as FlashInfer in the served path; ``flashinfer``: the DiT's joint
+attention runs on the engine's ragged FlashInfer resource, also CUDA-graph replayable),
+``compile`` (``torch.compile`` of the transformer, one trace per shape) with
+``compile_eager_rounding`` (inductor rounds intermediates where eager PyTorch does and fuses
+no FMAs) and ``compile_exact_ops`` (``true``, or a list of op classes among ``norms`` and
+``activations``: those modules stay on the eager kernels inside the compiled forward, so inductor
+only fuses the chains around the GEMMs and attention; each excluded module is a graph break: the
+norms alone make the transformer exact (the shipped ``[norms]`` costs klein-4B 4% of its B=1
+latency, 0.371 vs 0.356 s; excluding the activations too adds cost and nothing else) while Z-Image's
+180 norms per step cost 45%, so it ships ``false``; the
+compiled transformer is then bit-exact with the eager one — measured on klein-4B and 9B — where
+the plain compile, even with eager rounding, lands at a median 35 to 38 dB PSNR from the eager
+path over the 100 protocol prompts, because a 4- or 8-step distilled sampler amplifies the last
+bit of inductor's own reductions and activation decompositions), ``cuda_graph`` with
+``capture_sizes`` / ``capture_batch_sizes`` (the denoise step, Euler update included, is captured
+per listed ``[height, width]`` and batch size; other shapes run the eager batched path),
+``max_batch_size``, and ``vae_compile`` (``torch.compile`` of the VAE decode with inductor
+autotuning: 89 to 29 ms at 1024² on an H100; its fused reductions move the image by about 55 dB
+PSNR from the eager decode on every prompt, and the autotuner may pick other conv kernels in
+another server process, so set it to ``false`` for bit-exact, repeatable output; the parity
+suite runs with it off; the compiled decode is warmed at load for the ``capture_sizes`` grids
+and the decode batch sizes, and any other latent shape decodes eagerly rather than paying a
+40 to 100 s autotune inside a request). With the klein defaults every served image is within 53 dB of the eager
+path on all 100 protocol prompts, and with ``vae_compile: false`` it is bit-exact. Z-Image ships
+the plain compile (``compile_exact_ops: false``: 0.86 s at B=1, a median 34 dB from the eager path)
+because keeping its 180 norms per step eager costs 45% (1.25 s); ``compile_exact_ops: [norms]``
+turns it into the reference-faithful mode (at least 55.9 dB on every prompt). For scale, the served
+images of the other engines are 10 to 16 dB from the diffusers reference for the same seeds.
+``max_image_area`` (pixels, default 2048²) bounds the output size a request may ask for:
+larger requests are rejected with a 400 before scheduling instead of occupying the worker
+for minutes (an 8192² request means 262k tokens of quadratic attention).
+Requests at the same output size batch across users in every node, including the
+text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the
+transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or
+BFL-layout safetensors), so a styled deployment runs at the base model's speed.

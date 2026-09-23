@@ -7,6 +7,8 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
+    "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
@@ -17,6 +19,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
     "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
+    "z_image_turbo": ("mstar.model.z_image.z_image_model", "ZImageModel"),
 }
 
 HF_MODELS: dict[str, dict] = {
@@ -32,6 +35,11 @@ HF_MODELS: dict[str, dict] = {
     # hidden / 25600 intermediate) load from the checkpoint's config.json, so it
     # needs tensor parallelism (it does not fit on one GPU).
     "cosmos3_super": {"model_path_hf": "nvidia/Cosmos3-Super"},
+    # FLUX.2 [klein]: step-distilled rectified-flow text-to-image + multi-reference
+    # editing (Qwen3 hidden-state text encoder, FLUX.2 VAE). 4B is Apache-2.0; 9B is
+    # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.
+    "flux2_klein": {"model_path_hf": "black-forest-labs/FLUX.2-klein-4B"},
+    "flux2_klein_9b": {"model_path_hf": "black-forest-labs/FLUX.2-klein-9B"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
@@ -62,6 +70,9 @@ HF_MODELS: dict[str, dict] = {
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
+    # Z-Image-Turbo: 8-step distilled single-stream flow DiT (Qwen3-4B caption encoder,
+    # FLUX.1 VAE), text-to-image only. Apache-2.0.
+    "z_image_turbo": {"model_path_hf": "Tongyi-MAI/Z-Image-Turbo"},
 }
 
 

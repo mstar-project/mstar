@@ -1,0 +1,36 @@
+model: "z_image_turbo"
+
+# Z-Image-Turbo (6B single-stream flow DiT, Qwen3-4B captions, FLUX.1 VAE), single GPU.
+# max_seq_len only satisfies the conductor's config check (prompts are truncated to 512).
+max_seq_len: 512
+
+model_kwargs:
+  # sdpa (cuDNN on H100) served as fast as FlashInfer FA3 (0.349 vs 0.355 s at B=1) and is the
+  # reference kernel; flashinfer stays available
+  attention_backend: sdpa
+  compile: true
+  # inductor rounds intermediates where eager PyTorch does (and fuses no FMAs); on its own the compiled
+  # transformer still lands at a median 34.4 dB from the eager path over the 100 protocol prompts (78 of 100 below 40 dB)
+  compile_eager_rounding: true
+  # compile_exact_ops keeps op classes on the eager kernels inside the compiled forward. On Z-Image the cost is the
+  # 180 norm graph breaks per step: [norms] (or true) is >= 55.9 dB from the eager path on all 100 protocol prompts but
+  # runs 1.25 s / 0.80 images/s at B=1 / concurrency 8 against 0.86 s / 1.17 for the plain compile (SGLang 0.86 s), and
+  # [activations] buys nothing (median 34.9 dB). Default: the fast plain compile; set [norms] for reference-faithful output.
+  compile_exact_ops: false
+  cuda_graph: true
+  capture_sizes: [[1024, 1024]]
+  # captions are padded to multiples of 32 tokens; graphs are captured for these lengths
+  capture_caption_lengths: [32, 64]
+  capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
+  max_batch_size: 8
+  # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
+  # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
+  vae_compile: true
+
+node_groups:
+  - node_names: [text_encoder]
+    ranks: [0]
+  - node_names: [vae_decoder]
+    ranks: [0]
+  - node_names: [dit]
+    ranks: [0]

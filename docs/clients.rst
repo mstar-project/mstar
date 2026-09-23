@@ -105,7 +105,10 @@ Convenience wrappers:
    * - ``chat(prompt, *, images=None, audio=None, output_modalities=("text",), stream=False, **kw)``
      - Text generation (and, with ``output_modalities=("text", "audio")``, speech).
    * - ``generate_image(prompt, **kw)``
-     - PNG ``bytes`` (e.g. BAGEL text-to-image).
+     - PNG ``bytes`` (e.g. BAGEL, FLUX.2 klein text-to-image).
+   * - ``edit_image(prompt, image, **kw)``
+     - PNG ``bytes`` for an edit of ``image`` (a path, bytes, or a list of them for
+       multi-reference models).
    * - ``tts(text, *, voice=None, **kw)``
      - An ``AudioBuffer`` (``.to_wav(path)``, ``.to_numpy()``, ``len(...)`` samples).
    * - ``stream(**kw)``
@@ -189,6 +192,10 @@ Per-model notes:
 
 - **BAGEL** — chat returns text only; use ``/v1/images/generations`` and
   ``/v1/images/edits`` for image output.
+- **FLUX.2 klein / Z-Image** — ``/v1/images/generations`` (and ``/v1/images/edits`` for
+  klein) only: ``size`` as ``WxH`` (multiples of 16); ``seed``; ``num_inference_steps``,
+  ``output_format`` (``png`` default, ``jpeg``, ``webp``), ``output_compression`` (JPEG /
+  WebP quality) and ``png_compress_level`` (0-9, default 1) via ``extra_body``.
 - **Qwen3-Omni** — text sampling uses ``thinker_*`` keys, speech uses ``talker_*``, and the
   residual codec groups use ``code_predictor_*``; set the speaker with ``voice`` (default
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
