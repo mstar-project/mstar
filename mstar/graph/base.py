@@ -74,6 +74,12 @@ class GraphEdge:
     # set on a synthetic streaming-input edge carrying the final chunk, so the
     # consuming pass (not the earlier ingest) reports the partition done
     _final_stream_chunk: bool = field(default=False)
+    # set on a synthetic streaming-input edge: where the chunk starts in the
+    # stream and how many of its leading items were delivered before (context);
+    # None on every other edge
+    _stream_chunk_offset: int | None = field(default=None)
+    _stream_chunk_context: int | None = field(default=None)
+    _stream_chunk_items: int | None = field(default=None)
 
     # Set for sharded configurations
     _total_fanin: int = 1
@@ -90,6 +96,9 @@ class GraphEdge:
             output_modality=self.output_modality,
             _persist_for_loop=self._persist_for_loop,
             _final_stream_chunk=self._final_stream_chunk,
+            _stream_chunk_offset=self._stream_chunk_offset,
+            _stream_chunk_context=self._stream_chunk_context,
+            _stream_chunk_items=self._stream_chunk_items,
         )
 
 
