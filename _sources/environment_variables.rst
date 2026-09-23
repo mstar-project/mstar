@@ -276,3 +276,9 @@ Worker scheduling
      - ``0``
      - ``N > 0``: every N iterations log per-phase p50/p95/mean of the
        worker main loop (speculate, await_gpu, submit_spec, ...).
+   * - ``MSTAR_KV_DEBUG_ASSERTS``
+     - ``0``
+     - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
+       ``remove_request``, check the KV page bookkeeping (free list, owner
+       counts, seals) against the streams holding the pages. Walks every
+       live stream; tests and debugging only.

@@ -924,6 +924,13 @@ actually ready right now; <code class="docutils literal notranslate"><span class
 <td><p><code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>: every N iterations log per-phase p50/p95/mean of the
 worker main loop (speculate, await_gpu, submit_spec, …).</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_DEBUG_ASSERTS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code>: after every <code class="docutils literal notranslate"><span class="pre">admit</span></code>, <code class="docutils literal notranslate"><span class="pre">commit</span></code>, <code class="docutils literal notranslate"><span class="pre">reset_request</span></code> and
+<code class="docutils literal notranslate"><span class="pre">remove_request</span></code>, check the KV page bookkeeping (free list, owner
+counts, seals) against the streams holding the pages. Walks every
+live stream; tests and debugging only.</p></td>
+</tr>
 </tbody>
 </table>
 </div>

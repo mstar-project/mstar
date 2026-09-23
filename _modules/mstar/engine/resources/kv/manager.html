@@ -854,6 +854,7 @@ window.runMermaid = runMermaid;</script>
                   
   <h1>Source code for mstar.engine.resources.kv.manager</h1><div class="highlight"><pre>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">Future</span><span class="p">,</span> <span class="n">wait</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
@@ -894,25 +895,72 @@ window.runMermaid = runMermaid;</script>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
+<span class="c1"># Off by default: `assert_pages_conserved` walks every stream of every live</span>
+<span class="c1"># request after each admit, commit, reset and remove.</span>
+<span class="n">_DEBUG_ASSERTS</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_KV_DEBUG_ASSERTS"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span>
+
 
 <div class="viewcode-block" id="PageArena">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.PageArena">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">PageArena</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""physical storage and free list management"""</span>
+<span class="w">    </span><span class="sd">"""physical storage, free list, and per-page ownership</span>
+
+<span class="sd">    A page goes back to the allocator when its last owner releases it, not its</span>
+<span class="sd">    first. A sealed page is never written again, so a second owner may read it;</span>
+<span class="sd">    freeing clears the seal. Every caller holds the manager's `_lock`, so the</span>
+<span class="sd">    counts and seals need none of their own.</span>
+<span class="sd">    """</span>
     <span class="n">kv_cache</span><span class="p">:</span> <span class="n">KVCache</span>
     <span class="n">allocator</span><span class="p">:</span> <span class="n">PageAllocator</span>
+    <span class="n">num_owners</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">sealed</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">num_owners</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">allocator</span><span class="o">.</span><span class="n">max_num_pages</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sealed</span> <span class="o">=</span> <span class="p">[</span><span class="kc">False</span><span class="p">]</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">allocator</span><span class="o">.</span><span class="n">max_num_pages</span>
 
 <div class="viewcode-block" id="PageArena.acquire">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.PageArena.acquire">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">acquire</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">n</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">allocator</span><span class="o">.</span><span class="n">try_allocate</span><span class="p">(</span><span class="n">n</span><span class="p">)</span></div>
+        <span class="n">pages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">allocator</span><span class="o">.</span><span class="n">try_allocate</span><span class="p">(</span><span class="n">n</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">pages</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">pages</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>
+        <span class="k">return</span> <span class="n">pages</span></div>
+
+
+<div class="viewcode-block" id="PageArena.retain">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.PageArena.retain">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">retain</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">pages</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">+=</span> <span class="mi">1</span></div>
+
+
+<div class="viewcode-block" id="PageArena.seal">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.PageArena.seal">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">seal</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">pages</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">sealed</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span></div>
+
+
+<div class="viewcode-block" id="PageArena.any_sealed">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.PageArena.any_sealed">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">any_sealed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">sealed</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">pages</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PageArena.release">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.PageArena.release">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">release</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pages</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">allocator</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="n">pages</span><span class="p">)</span></div>
+        <span class="n">freed</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">pages</span><span class="p">:</span>
+            <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"page </span><span class="si">{</span><span class="n">page</span><span class="si">}</span><span class="s2"> released with no owner"</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">-=</span> <span class="mi">1</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">sealed</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="kc">False</span>
+                <span class="n">freed</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">page</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">allocator</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="n">freed</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="PageArena.copy_pages">
@@ -1350,6 +1398,8 @@ window.runMermaid = runMermaid;</script>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_marked</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
                         <span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">)</span>
                     <span class="p">)</span>
+            <span class="k">if</span> <span class="n">_DEBUG_ASSERTS</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">assert_pages_conserved</span><span class="p">()</span>
         <span class="c1"># TODO: apply retention policy</span>
 
         <span class="k">return</span> <span class="n">ADMIT_OK</span></div>
@@ -1592,7 +1642,9 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># spans above are counted</span>
             <span class="k">for</span> <span class="p">(</span><span class="n">from_label</span><span class="p">,</span> <span class="n">to_label</span><span class="p">)</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">post_forks</span><span class="p">:</span>
                 <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">ctx</span><span class="o">.</span><span class="n">padded_request_ids</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_apply_fork</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">from_label</span><span class="p">,</span> <span class="n">to_label</span><span class="p">)</span></div>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_apply_fork</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">from_label</span><span class="p">,</span> <span class="n">to_label</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">_DEBUG_ASSERTS</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">assert_pages_conserved</span><span class="p">()</span></div>
 
         <span class="c1"># TODO: handle retention policy, free pages if not commit</span>
 
@@ -1855,9 +1907,15 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">wait</span><span class="p">([</span><span class="n">stream</span><span class="o">.</span><span class="n">read_future</span><span class="p">])</span>
         <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">stream</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
-                <span class="k">if</span> <span class="n">free</span><span class="p">:</span>
+                <span class="c1"># a rewind would put the next write on the stream's first page,</span>
+                <span class="c1"># over a sealed one its other owners still read. drop the pages</span>
+                <span class="c1"># and let the next write allocate; `free` asks for the same</span>
+                <span class="n">drop</span> <span class="o">=</span> <span class="n">free</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">any_sealed</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">drop</span><span class="p">:</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">)</span>
-                <span class="n">stream</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">freed</span><span class="o">=</span><span class="n">free</span><span class="p">)</span></div>
+                <span class="n">stream</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">freed</span><span class="o">=</span><span class="n">drop</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">_DEBUG_ASSERTS</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">assert_pages_conserved</span><span class="p">()</span></div>
 
 
 <div class="viewcode-block" id="KVManager.remove_request">
@@ -1876,7 +1934,68 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_cpu_pool</span><span class="o">.</span><span class="n">remove_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span></div>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_overrides</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">_DEBUG_ASSERTS</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">assert_pages_conserved</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="KVManager.assert_pages_conserved">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.assert_pages_conserved">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">assert_pages_conserved</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Check the owner counts against the streams holding the pages.</span>
+
+<span class="sd">        Each assertion names the rule it checks. Host pages are not covered:</span>
+<span class="sd">        `CPUPagePool` keeps no counts.</span>
+<span class="sd">        """</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="n">arena</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span>
+            <span class="n">free</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">arena</span><span class="o">.</span><span class="n">allocator</span><span class="o">.</span><span class="n">free_pages</span><span class="o">.</span><span class="n">queue</span><span class="p">)</span>
+            <span class="n">owned</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">page</span> <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_num_pages</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">0</span>
+            <span class="p">]</span>
+            <span class="n">both</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">free</span><span class="p">)</span> <span class="o">&amp;</span> <span class="nb">set</span><span class="p">(</span><span class="n">owned</span><span class="p">))</span>
+            <span class="k">assert</span> <span class="ow">not</span> <span class="n">both</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"pages both free and owned: </span><span class="si">{</span><span class="n">both</span><span class="si">}</span><span class="s2">"</span>
+            <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">free</span><span class="p">)</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="n">owned</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_num_pages</span><span class="p">,</span> <span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_num_pages</span><span class="si">}</span><span class="s2"> pages in the pool, but "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">free</span><span class="p">)</span><span class="si">}</span><span class="s2"> free and </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">owned</span><span class="p">)</span><span class="si">}</span><span class="s2"> owned"</span>
+            <span class="p">)</span>
+
+            <span class="c1"># the sink belongs to no request, so count it by hand. `frontier`</span>
+            <span class="c1"># is the page each stream is still writing into, plus any it holds</span>
+            <span class="c1"># past that</span>
+            <span class="n">refs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span><span class="n">SINK_PAGE</span><span class="p">:</span> <span class="mi">1</span><span class="p">}</span>
+            <span class="n">frontier</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+            <span class="k">for</span> <span class="n">streams</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+                <span class="k">for</span> <span class="n">stream</span> <span class="ow">in</span> <span class="n">streams</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
+                    <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">:</span>
+                        <span class="n">refs</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">=</span> <span class="n">refs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
+                    <span class="n">full</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
+                    <span class="n">frontier</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">[</span><span class="n">full</span><span class="p">:])</span>
+
+            <span class="n">counts</span> <span class="o">=</span> <span class="p">{</span><span class="n">page</span><span class="p">:</span> <span class="n">arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">owned</span><span class="p">}</span>
+            <span class="k">assert</span> <span class="n">counts</span> <span class="o">==</span> <span class="n">refs</span><span class="p">,</span> <span class="p">(</span>
+                <span class="s2">"owner counts disagree with the streams naming the pages: "</span>
+                <span class="o">+</span> <span class="s2">", "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"page </span><span class="si">{</span><span class="n">page</span><span class="si">}</span><span class="s2"> owned </span><span class="si">{</span><span class="n">counts</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">page</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="si">}</span><span class="s2">, "</span>
+                    <span class="sa">f</span><span class="s2">"named </span><span class="si">{</span><span class="n">refs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">page</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+                    <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">counts</span><span class="p">)</span> <span class="o">|</span> <span class="nb">set</span><span class="p">(</span><span class="n">refs</span><span class="p">))</span>
+                    <span class="k">if</span> <span class="n">counts</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">!=</span> <span class="n">refs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">page</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+                <span class="p">)</span>
+            <span class="p">)</span>
+
+            <span class="n">unsealed</span> <span class="o">=</span> <span class="p">[</span>
+                <span class="n">page</span> <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">owned</span>
+                <span class="k">if</span> <span class="n">arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">arena</span><span class="o">.</span><span class="n">sealed</span><span class="p">[</span><span class="n">page</span><span class="p">]</span>
+            <span class="p">]</span>
+            <span class="k">assert</span> <span class="ow">not</span> <span class="n">unsealed</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"pages shared before they were sealed: </span><span class="si">{</span><span class="n">unsealed</span><span class="si">}</span><span class="s2">"</span>
+
+            <span class="n">crowded</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span>
+                <span class="n">page</span> <span class="k">for</span> <span class="n">page</span> <span class="ow">in</span> <span class="n">frontier</span> <span class="k">if</span> <span class="n">arena</span><span class="o">.</span><span class="n">num_owners</span><span class="p">[</span><span class="n">page</span><span class="p">]</span> <span class="o">!=</span> <span class="mi">1</span>
+            <span class="p">)</span>
+            <span class="k">assert</span> <span class="ow">not</span> <span class="n">crowded</span><span class="p">,</span> <span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"pages still being written into, but not owned alone: </span><span class="si">{</span><span class="n">crowded</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="KVManager.post_warmup_validate">

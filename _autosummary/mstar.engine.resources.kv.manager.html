@@ -594,6 +594,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager"><code class="docutils literal notranslate"><span class="pre">KVManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.admit"><code class="docutils literal notranslate"><span class="pre">KVManager.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">KVManager.admit_retrieve()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.assert_pages_conserved"><code class="docutils literal notranslate"><span class="pre">KVManager.assert_pages_conserved()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build"><code class="docutils literal notranslate"><span class="pre">KVManager.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">KVManager.build_cuda_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.cleanup"><code class="docutils literal notranslate"><span class="pre">KVManager.cleanup()</span></code></a></li>
@@ -635,10 +636,15 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena"><code class="docutils literal notranslate"><span class="pre">PageArena</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.acquire"><code class="docutils literal notranslate"><span class="pre">PageArena.acquire()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.allocator"><code class="docutils literal notranslate"><span class="pre">PageArena.allocator</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.any_sealed"><code class="docutils literal notranslate"><span class="pre">PageArena.any_sealed()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.copy_pages"><code class="docutils literal notranslate"><span class="pre">PageArena.copy_pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.kv_cache"><code class="docutils literal notranslate"><span class="pre">PageArena.kv_cache</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.num_free"><code class="docutils literal notranslate"><span class="pre">PageArena.num_free</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.num_owners"><code class="docutils literal notranslate"><span class="pre">PageArena.num_owners</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.release"><code class="docutils literal notranslate"><span class="pre">PageArena.release()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.retain"><code class="docutils literal notranslate"><span class="pre">PageArena.retain()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.seal"><code class="docutils literal notranslate"><span class="pre">PageArena.seal()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.sealed"><code class="docutils literal notranslate"><span class="pre">PageArena.sealed</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PublishedKVInfo"><code class="docutils literal notranslate"><span class="pre">PublishedKVInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -688,7 +694,7 @@
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.PageArena" title="mstar.engine.resources.kv.manager.PageArena"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PageArena</span></code></a>(kv_cache, allocator)</p></td>
-<td><p>physical storage and free list management</p></td>
+<td><p>physical storage, free list, and per-page ownership</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.manager.PublishedKVInfo" title="mstar.engine.resources.kv.manager.PublishedKVInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">PublishedKVInfo</span></code></a>(info, dict[str, ...)</p></td>
 <td><p></p></td>
@@ -913,6 +919,19 @@ Returns whether the retrieve has completed.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.AdmitOutcome" title="mstar.engine.resources.step.AdmitOutcome"><em>AdmitOutcome</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.KVManager.assert_pages_conserved">
+<span class="sig-name descname"><span class="pre">assert_pages_conserved</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#KVManager.assert_pages_conserved"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.KVManager.assert_pages_conserved" title="Link to this definition">#</a></dt>
+<dd><p>Check the owner counts against the streams holding the pages.</p>
+<p>Each assertion names the rule it checks. Host pages are not covered:
+<cite>CPUPagePool</cite> keeps no counts.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1300,7 +1319,11 @@ packed prefill pays it, over the real gap not the whole buffer.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PageArena">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.manager.</span></span><span class="sig-name descname"><span class="pre">PageArena</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv_cache</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">allocator</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#PageArena"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.PageArena" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>physical storage and free list management</p>
+<p>physical storage, free list, and per-page ownership</p>
+<p>A page goes back to the allocator when its last owner releases it, not its
+first. A sealed page is never written again, so a second owner may read it;
+freeing clears the seal. Every caller holds the manager’s <cite>_lock</cite>, so the
+counts and seals need none of their own.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1328,6 +1351,19 @@ packed prefill pays it, over the real gap not the whole buffer.</p>
 <dd></dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PageArena.any_sealed">
+<span class="sig-name descname"><span class="pre">any_sealed</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pages</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#PageArena.any_sealed"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.PageArena.any_sealed" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PageArena.copy_pages">
 <span class="sig-name descname"><span class="pre">copy_pages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">src</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dst</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#PageArena.copy_pages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.PageArena.copy_pages" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -1353,6 +1389,11 @@ packed prefill pays it, over the real gap not the whole buffer.</p>
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">num_free</span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.PageArena.num_free" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PageArena.num_owners">
+<span class="sig-name descname"><span class="pre">num_owners</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.PageArena.num_owners" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PageArena.release">
 <span class="sig-name descname"><span class="pre">release</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pages</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#PageArena.release"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.PageArena.release" title="Link to this definition">#</a></dt>
@@ -1365,6 +1406,37 @@ packed prefill pays it, over the real gap not the whole buffer.</p>
 </dd>
 </dl>
 </dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PageArena.retain">
+<span class="sig-name descname"><span class="pre">retain</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pages</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#PageArena.retain"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.PageArena.retain" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PageArena.seal">
+<span class="sig-name descname"><span class="pre">seal</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pages</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/manager.html#PageArena.seal"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.manager.PageArena.seal" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.manager.PageArena.sealed">
+<span class="sig-name descname"><span class="pre">sealed</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.kv.manager.PageArena.sealed" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
 
 </dd></dl>
 
@@ -1527,6 +1599,7 @@ packed prefill pays it, over the real gap not the whole buffer.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager"><code class="docutils literal notranslate"><span class="pre">KVManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.admit"><code class="docutils literal notranslate"><span class="pre">KVManager.admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">KVManager.admit_retrieve()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.assert_pages_conserved"><code class="docutils literal notranslate"><span class="pre">KVManager.assert_pages_conserved()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build"><code class="docutils literal notranslate"><span class="pre">KVManager.build()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">KVManager.build_cuda_graph_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.KVManager.cleanup"><code class="docutils literal notranslate"><span class="pre">KVManager.cleanup()</span></code></a></li>
@@ -1568,10 +1641,15 @@ packed prefill pays it, over the real gap not the whole buffer.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena"><code class="docutils literal notranslate"><span class="pre">PageArena</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.acquire"><code class="docutils literal notranslate"><span class="pre">PageArena.acquire()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.allocator"><code class="docutils literal notranslate"><span class="pre">PageArena.allocator</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.any_sealed"><code class="docutils literal notranslate"><span class="pre">PageArena.any_sealed()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.copy_pages"><code class="docutils literal notranslate"><span class="pre">PageArena.copy_pages()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.kv_cache"><code class="docutils literal notranslate"><span class="pre">PageArena.kv_cache</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.num_free"><code class="docutils literal notranslate"><span class="pre">PageArena.num_free</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.num_owners"><code class="docutils literal notranslate"><span class="pre">PageArena.num_owners</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.release"><code class="docutils literal notranslate"><span class="pre">PageArena.release()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.retain"><code class="docutils literal notranslate"><span class="pre">PageArena.retain()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.seal"><code class="docutils literal notranslate"><span class="pre">PageArena.seal()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PageArena.sealed"><code class="docutils literal notranslate"><span class="pre">PageArena.sealed</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.manager.PublishedKVInfo"><code class="docutils literal notranslate"><span class="pre">PublishedKVInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
