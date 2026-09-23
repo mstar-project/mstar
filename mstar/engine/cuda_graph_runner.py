@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, NamedTuple
@@ -70,6 +71,65 @@ def dummy_metadata(
             max_tokens=1,
         ) for rid in rids
     }
+
+
+def capture_into_graph(run, pool, device, autocast_dtype):
+    """Capture ``run`` into a new CUDA graph allocated from ``pool``.
+
+    Returns the graph and what ``run`` returned. A capture that fails part
+    way leaves two things behind that would sink every later capture on the
+    same pool: the caching allocator keeps routing this thread's allocations
+    into the pool (the next capture_begin fails with "already recording to
+    mempool_id"), and torch.cuda.graph never switches the thread back off its
+    capture stream. Undo both before re-raising, so the buckets after a
+    failed one still capture and the thread keeps running on the stream it
+    came in on.
+
+    A torch.compile'd forward that would recompile inside the capture is
+    failed up front with the guard that broke: dynamo saves the CUDA RNG state
+    before it compiles, which CUDA refuses during capture, so such a capture
+    cannot succeed and would otherwise die with an unrelated error.
+    """
+    prev_stream = torch.cuda.current_stream(device)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.compiler.set_stance("fail_on_recompile"), \
+                autocast_scope(autocast_dtype):
+            with torch.cuda.graph(graph, pool=pool):
+                output = run()
+    except BaseException:
+        torch.cuda.set_stream(prev_stream)
+        torch.cuda.synchronize(device)
+        _stop_recording_to_pool(device, pool)
+        raise
+    torch.cuda.synchronize(device)
+    return graph, output
+
+
+def fail_if_graphs_required(missing: list[str]) -> None:
+    """MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
+    failure, for deployments that would rather not come up than serve the
+    eager path at 10-20x the latency."""
+    if not missing or os.environ.get("MSTAR_REQUIRE_CUDA_GRAPHS", "0") != "1":
+        return
+    raise RuntimeError(
+        "CUDA graph capture failed for " + ", ".join(missing)
+        + " and MSTAR_REQUIRE_CUDA_GRAPHS=1"
+    )
+
+
+def _stop_recording_to_pool(device, pool) -> None:
+    end = getattr(torch._C, "_cuda_endAllocateToPool", None)
+    if end is None:
+        return
+    index = torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    try:
+        end(index, pool)
+    except RuntimeError:
+        # the capture failed before the allocator started recording
+        pass
 
 
 class DummyRowPool:
@@ -179,6 +239,8 @@ class CudaGraphRunner:
         self._buckets: dict[BucketKey, CudaGraphBucket] = {}
 
         self._memory_pool = None
+        # buckets that failed to capture (here or on a peer rank) and run eagerly
+        self.dropped_buckets: list[BucketKey] = []
         # set by prepare_for_capture; capture reuses it rather than re-deriving
         self._prepared_slot_specs: list[CGSlotSpec] | None = None
 
@@ -305,7 +367,7 @@ class CudaGraphRunner:
             try:
                 slot = self._capture_one(spec)
             except Exception:
-                logger.warning(
+                logger.error(
                     "Failed to capture CUDA graph for %s: %s",
                     self._submodule_name, spec, exc_info=True
                 )
@@ -321,7 +383,7 @@ class CudaGraphRunner:
         agreed = self._buckets_captured_everywhere(slot_specs, captured)
         for bucket_key, slots in captured.items():
             if bucket_key not in agreed:
-                logger.warning(
+                logger.error(
                     "Dropping CUDA graph bucket %s for %s: captured %d of %d "
                     "slots here, or fewer on another rank",
                     bucket_key, self._submodule_name, len(slots), self._num_slots,
@@ -337,9 +399,25 @@ class CudaGraphRunner:
                 self.declare_inputs_for(SlotLease(slot=0, bucket=bucket_key))
 
         self._dummy_rows.release_all()
+        self._report_dropped(
+            [spec.bucket for spec in slot_specs if spec.slot == 0], agreed
+        )
 
         mem_after = torch.cuda.memory_allocated(self._device)
         self._log_memory(mem_before, mem_after)
+
+    def _report_dropped(self, wanted: list, kept) -> None:
+        """Say loudly which buckets run eagerly. A dropped bucket is a silent
+        10-20x latency cliff otherwise, and one failure used to take every
+        later bucket with it."""
+        self.dropped_buckets = [key for key in wanted if key not in kept]
+        if self.dropped_buckets:
+            logger.error(
+                "CudaGraphRunner[%s]: captured %d of %d buckets; these run "
+                "eagerly: %s",
+                self._submodule_name, len(wanted) - len(self.dropped_buckets),
+                len(wanted), self.dropped_buckets,
+            )
 
     def _buckets_captured_everywhere(
         self,
@@ -471,13 +549,9 @@ class CudaGraphRunner:
                 prepare()
             torch.cuda.synchronize()
 
-            graph = torch.cuda.CUDAGraph()
-            with autocast_scope(self._autocast_dtype):
-                with torch.cuda.graph(graph, pool=self._memory_pool):
-                    output = BatchedModelOutput.coerce(
-                        run_forward()
-                    )
-            torch.cuda.synchronize()
+            graph, output = capture_into_graph(
+                run_forward, self._memory_pool, self._device, self._autocast_dtype,
+            )
 
             return self._build_slot_from_capture(
                 output=output,
@@ -944,6 +1018,8 @@ class PiecewiseCudaGraphRunner:
 
         self._graphs: dict[PiecewiseGraphKey, PiecewiseGraphData] = {}
         self._memory_pool = None
+        # (bs, total_tokens) shapes that failed to capture and run eagerly
+        self.dropped_shapes: list[tuple[int, int]] = []
         self._dummy_rows = DummyRowPool(
             prefix=f"pw_{label}", step_runner=step_runner, resources=resources,
         )
@@ -1051,7 +1127,7 @@ class PiecewiseCudaGraphRunner:
                     self._capture_one(shape, slot)
                 except Exception:
                     shape_captured = False
-                    logger.warning(
+                    logger.error(
                         "PiecewiseCudaGraphRunner[%s]: failed to capture bs=%d "
                         "total_tokens=%d slot=%d", self._label, shape.bs,
                         shape.total_tokens, slot, exc_info=True,
@@ -1080,11 +1156,19 @@ class PiecewiseCudaGraphRunner:
                 ), None) is not None
             ]
             if dropped:
-                logger.warning(
+                logger.error(
                     "PiecewiseCudaGraphRunner[%s]: dropping bs=%d total_tokens=%d "
                     "slots=%s, not captured on every rank / for every slot",
                     self._label, shape.bs, shape.total_tokens, dropped,
                 )
+            self.dropped_shapes.append((shape.bs, shape.total_tokens))
+        if self.dropped_shapes:
+            logger.error(
+                "PiecewiseCudaGraphRunner[%s]: captured %d of %d shapes; these "
+                "run eagerly: %s", self._label,
+                len(ordered) - len(self.dropped_shapes), len(ordered),
+                self.dropped_shapes,
+            )
 
     def _capture_one(self, shape: PiecewiseCaptureShape, slot: int) -> None:
         dummy_rids = self._dummy_rows.ensure(
@@ -1118,11 +1202,10 @@ class PiecewiseCudaGraphRunner:
                 self._plan(step, shape)
             torch.cuda.synchronize()
 
-            graph = torch.cuda.CUDAGraph()
-            with autocast_scope(self._autocast_dtype):
-                with torch.cuda.graph(graph, pool=self._memory_pool):
-                    static_outputs = self._normalize_output(run_fn())
-            torch.cuda.synchronize()
+            graph, raw_outputs = capture_into_graph(
+                run_fn, self._memory_pool, self._device, self._autocast_dtype,
+            )
+            static_outputs = self._normalize_output(raw_outputs)
         finally:
             # pages stay with the dummy streams: replay's padding rows address
             # the same ids, so their plan finds the storage already resident

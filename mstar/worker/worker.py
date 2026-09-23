@@ -65,6 +65,10 @@ from mstar.worker.node_manager_utils import (
 
 logger = logging.getLogger(__name__)
 
+# seconds between "no offload possible" lines for one node and walk: a hold is
+# retried every backoff, and a line per retry buries the rest of the log
+_HOLD_LOG_INTERVAL = 5.0
+
 
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
     """``MSTAR_TP_ASYNC_SCHED``: ``0``/empty off, ``1`` every parallel node,
@@ -337,6 +341,8 @@ class Worker:
         # CPU offloading: LRU tracking and eviction policy
         self._last_active: dict[tuple[str, str], float] = {}  # (request_id, node_name) -> monotonic timestamp
         self.eviction_policy = EvictionPolicy.LRU
+        # (node, walk) -> when its last hold was logged, and the holds since
+        self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -1519,10 +1525,17 @@ class Worker:
             )
         else:
             self.scheduler.hold_requests(list(batch_ids))
+            key = (batch.node_name, batch.graph_walk)
+            now = _time.monotonic()
+            last, unlogged = self._hold_logged.get(key, (None, 0))
+            if last is not None and now - last < _HOLD_LOG_INTERVAL:
+                self._hold_logged[key] = (last, unlogged + 1)
+                return
+            self._hold_logged[key] = (now, 0)
             logger.warning(
                 "OOM on node=%s walk=%s: no offload possible, "
-                "holding %d requests",
-                batch.node_name, batch.graph_walk, len(batch_ids),
+                "holding %d requests (%d earlier holds not logged)",
+                batch.node_name, batch.graph_walk, len(batch_ids), unlogged,
             )
 
     # ------------------------------------------------------------------
@@ -2303,6 +2316,8 @@ class Worker:
         )
         _pp_stage("prematerialize")
         stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs)
+        # the same host copy, before stops, so a request ending here still indexes its pages
+        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs)
         if batch_N.node_batch.failed_requests:
             # A rid whose stop check raised has no trustworthy stop decision:
             # routing it would either run its loop forever or end it early.

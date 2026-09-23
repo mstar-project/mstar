@@ -48,8 +48,9 @@ non-zero. The API server polls the conductor the same way. If it exits before th
 are ready, the server never binds. If it exits while serving, pending requests get a 503,
 new ones are refused, the HTTP server stops and the process exits non-zero. Each worker
 also watches its parent and exits if the conductor is gone, so a conductor that is killed
-outright cannot leave workers behind holding GPU memory. SIGINT and SIGTERM shutdowns are
-unaffected.
+outright cannot leave workers behind holding GPU memory. The conductor watches the API
+server the same way, so an API server that is killed outright takes the whole deployment
+down with it. SIGINT and SIGTERM shutdowns are unaffected.
 
 Core design principles
 ----------------------
