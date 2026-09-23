@@ -173,6 +173,11 @@ chatterbox = [
     "torchcodec",
     "transformers",
 ]
+chatterbox_multilingual = [
+    # Chatterbox Multilingual's Japanese kana reading and Chinese word segmentation
+    "pykakasi==2.3.0",
+    "spacy-pkuseg",
+]
 
 orpheus = [
     "einops",
