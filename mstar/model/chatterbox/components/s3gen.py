@@ -30,6 +30,7 @@ from torch import nn
 from mstar.model.chatterbox.components.audio import MelSpectrogram24k, kaldi_fbank_80
 from mstar.model.chatterbox.components.s3gen_cfm import CausalConditionalCFM, ConditionalDecoder
 from mstar.model.chatterbox.components.s3gen_flow import FlowTokenEncoder, lengths_to_mask
+from mstar.model.chatterbox.components.s3gen_graphs import SolveGraphs
 from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator
 from mstar.model.chatterbox.components.s3gen_xvector import CAMPPlus
 from mstar.model.chatterbox.config import S3GenConfig
@@ -81,6 +82,8 @@ class S3Gen(nn.Module):
             config.cfm, ConditionalDecoder(config.estimator, meanflow=config.meanflow),
         )
         self.vocoder = HiFTGenerator(config.hift)
+        # optional CUDA-graph replay of whole solves (``enable_graphs``)
+        self.solver: SolveGraphs | None = None
 
         n_trim = config.trim_fade_frames
         trim_fade = torch.zeros(2 * n_trim)
@@ -90,6 +93,29 @@ class S3Gen(nn.Module):
     @property
     def dtype(self) -> torch.dtype:
         return self.flow_encoder.encoder_proj.weight.dtype
+
+    # ------------------------------------------------------------------
+    # Flow solve dispatch
+    # ------------------------------------------------------------------
+
+    def solve(
+        self, mu: torch.Tensor, mask: torch.Tensor, spks: torch.Tensor, cond: torch.Tensor,
+        noise: torch.Tensor, n_timesteps: int,
+    ) -> torch.Tensor:
+        """The decoder's Euler solve for this variant (mean flow or CFG)."""
+        if self.config.meanflow:
+            return self.decoder.solve_meanflow(mu, mask, spks, cond, noise, n_timesteps)
+        return self.decoder.solve(mu, mask, spks, cond, noise, n_timesteps)
+
+    def _run_solve(self, mu, mask, spks, cond, noise, n_timesteps: int) -> torch.Tensor:
+        if self.solver is not None:
+            return self.solver(mu, mask, spks, cond, noise, n_timesteps)
+        return self.solve(mu, mask, spks, cond, noise, n_timesteps)
+
+    def enable_graphs(self, rows: Sequence[int] = (1, 2, 4, 8), max_graphs: int = 64) -> "SolveGraphs":
+        """Replay whole flow solves from CUDA graphs, one per (rows, frames, steps)."""
+        self.solver = SolveGraphs(self.solve, rows=rows, max_graphs=max_graphs)
+        return self.solver
 
     @property
     def device(self) -> torch.device:
@@ -191,10 +217,7 @@ class S3Gen(nn.Module):
             noise = self._draw_noise(batch, mel_prompt, total - mel_prompt, generator)
         elif noise.shape[-1] != total:
             noise = noise[:, :, :total]
-        if self.config.meanflow:
-            mel = self.decoder.solve_meanflow(mu, mask, spk, cond, noise, n_timesteps)
-        else:
-            mel = self.decoder.solve(mu, mask, spk, cond, noise, n_timesteps)
+        mel = self._run_solve(mu, mask, spk, cond, noise, n_timesteps)
         return mel[:, :, mel_prompt:]
 
     @torch.no_grad()
@@ -245,10 +268,7 @@ class S3Gen(nn.Module):
             else:
                 noise[i, :, :valid] = self._draw_noise(1, mel_prompt, valid - mel_prompt, row.generator)[0]
         mask = lengths_to_mask(h_lens, total).unsqueeze(1).to(mu.dtype)
-        if self.config.meanflow:
-            mel = self.decoder.solve_meanflow(mu, mask, spk, cond, noise, n_timesteps)
-        else:
-            mel = self.decoder.solve(mu, mask, spk, cond, noise, n_timesteps)
+        mel = self._run_solve(mu, mask, spk, cond, noise, n_timesteps)
         return [
             mel[i : i + 1, :, ref.num_prompt_tokens * ratio : int(h_lens[i])]
             for i, ref in enumerate(refs)
