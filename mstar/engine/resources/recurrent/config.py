@@ -171,6 +171,91 @@ class DeltaNetGeometry(RecurrentGeometry):
         )
 
 
+@dataclass(frozen=True)
+class Mamba2Geometry(RecurrentGeometry):
+    """Head geometry of a Mamba-2 (SSD) layer: Nemotron-H, NVIDIA's Nemotron
+    Nano/VoiceChat backbones, Mamba-Codestral.
+
+    Two blocks, like the delta-net family: an ``[H, P, N]`` SSM state per head
+    (fp32 by default: it is an exponentially decayed running sum over the whole
+    session, and the reference keeps it in fp32) and the conv window over the
+    ``[x | B | C]`` projection, every tap but the current token's.
+
+    ``n_groups`` is the number of ``B``/``C`` groups shared by ``H`` heads. It
+    is a shape fact (``conv_dim = H * P + 2 * n_groups * N``), so it is
+    recoverable from the blocks and ``from_blocks`` inverts ``to_blocks``.
+    """
+
+    num_heads: int
+    head_dim: int
+    state_size: int
+    n_groups: int
+    conv_kernel_size: int
+
+    @property
+    def d_inner(self) -> int:
+        return self.num_heads * self.head_dim
+
+    @property
+    def conv_dim(self) -> int:
+        """The depthwise conv runs over ``[x | B | C]`` concatenated."""
+        return self.d_inner + 2 * self.n_groups * self.state_size
+
+    def to_blocks(
+        self,
+        state_dtype: torch.dtype = torch.float32,
+        conv_dtype: torch.dtype = torch.bfloat16,
+    ) -> dict[str, RecurrentBlockConfig]:
+        """Pool blocks for this geometry; head counts pre-sharding (heads and
+        the conv channels both shard on their leading axis)."""
+        return {
+            "ssm": RecurrentBlockConfig(
+                shape=(self.num_heads, self.head_dim, self.state_size),
+                dtype=state_dtype,
+                shard_dims=(0,),
+            ),
+            "conv": RecurrentBlockConfig(
+                shape=(self.conv_dim, self.conv_kernel_size - 1),
+                dtype=conv_dtype,
+                shard_dims=(0,),
+            ),
+        }
+
+    @classmethod
+    def from_blocks(
+        cls, blocks: dict[str, RecurrentBlockConfig],
+    ) -> "Mamba2Geometry":
+        """Recover the geometry from block shapes (sharded ones too, since
+        every axis involved shards). Raises on shapes that are not a Mamba-2's,
+        which is the check that a pool and the resource planning against it
+        were built for the same model."""
+        for name in ("ssm", "conv"):
+            if name not in blocks:
+                raise ValueError(
+                    f"not a Mamba-2 state pool: no {name!r} block, got {sorted(blocks)}"
+                )
+        ssm, conv = blocks["ssm"].shape, blocks["conv"].shape
+        if len(ssm) != 3:
+            raise ValueError(f"Mamba-2 'ssm' block must be [H, P, N], got {ssm}")
+        if len(conv) != 2:
+            raise ValueError(f"Mamba-2 'conv' block must be [conv_dim, width], got {conv}")
+        num_heads, head_dim, state_size = ssm
+        conv_dim, width = conv
+        bc_span = conv_dim - num_heads * head_dim
+        if bc_span <= 0 or bc_span % (2 * state_size):
+            raise ValueError(
+                f"conv block {conv} does not match ssm block {ssm}: [x|B|C] over "
+                f"{num_heads}x{head_dim} leaves {bc_span} for 2 x n_groups x {state_size}"
+            )
+        return cls(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            state_size=state_size,
+            n_groups=bc_span // (2 * state_size),
+            conv_kernel_size=width + 1,
+        )
+
+
 @dataclass
 class RecurrentStateConfig:
     # The total number of recurrent layers, not total transformer layers
