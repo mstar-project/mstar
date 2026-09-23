@@ -317,6 +317,14 @@ class GraphNode(GraphSection):
             loop_back=loop_back
         )
 
+    def persisted_input_names(self) -> set[str]:
+        """Inputs the enclosing loop re-injects every iteration (``_persist_for_loop``):
+        a denoise step's text conditioning, say. They only reappear in ``ready_next_iter``
+        once the iteration completes, but they are as good as ready for the next one."""
+        return {
+            name for name, edge in self.ready_signals.ready_inputs.items() if edge._persist_for_loop
+        }
+
     def is_ready_for_speculation(
         self, check_next_iter: bool=False,
         allow_streaming: bool=True
@@ -327,6 +335,7 @@ class GraphNode(GraphSection):
         if check_next_iter:
             return needed_inputs.issubset(
                 self.ready_next_iter.ready_names | self.speculative_signals.ready_names
+                | self.persisted_input_names()
             )
         return needed_inputs.issubset(
             self.ready_signals.ready_names | self.speculative_signals.ready_names
