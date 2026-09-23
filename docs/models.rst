@@ -50,9 +50,23 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``vjepa2_ac``
      - ``vjepa2-ac-vitg``
      - V-JEPA 2-AC encoder + action-conditioned predictor.
-   * - ``whisper_large`` *(Beta)*
+   * - ``whisper_large_v3_turbo``
+     - ``openai/whisper-large-v3-turbo``
+     - Whisper ASR: batched, CUDA-graph-captured audio encoder + paged-KV
+       decoder with write-once cross-attention; language detection, forced
+       language/task, ``initial_prompt`` context; ``/v1/audio/transcriptions``.
+       The 4-decoder-layer distillation of large-v3; same class as below.
+   * - ``whisper_large``
      - ``openai/whisper-large-v3``
-     - Encoder-decoder ASR (audio in, transcript out). Beta / un-optimized.
+     - Whisper large-v3 (32 decoder layers) on the same scaffold.
+   * - ``qwen3_asr``
+     - ``Qwen/Qwen3-ASR-1.7B``
+     - Qwen3-ASR: AuT audio encoder (8 s attention windows, ragged attention)
+       + dense Qwen3 decoder; up to 20 min of audio per request, 30 languages
+       (detected or forced), ``/v1/audio/transcriptions``.
+   * - ``qwen3_asr_realtime``
+     - ``Qwen/Qwen3-ASR-0.6B``
+     - The 0.6B Qwen3-ASR checkpoint trained for chunked streaming; same class.
    * - ``higgs_audio`` *(Beta)*
      - ``bosonai/higgs-audio-v3-stt``
      - Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.

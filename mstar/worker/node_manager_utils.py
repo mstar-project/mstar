@@ -1,5 +1,5 @@
 import logging
-from copy import deepcopy
+import pickle
 from dataclasses import dataclass, field
 
 from mstar.communication.tensors import TensorCommunicationManager
@@ -97,7 +97,15 @@ class WorkerGraphQueues:
         """
         Initialize queues for a new request
         """
-        section_copy = deepcopy(self.worker_graph.section)
+        # Every request gets its own copy of the graph. Unpickling a cached
+        # dump is several times cheaper than deepcopy for these small trees
+        # and preserves shared references the same way.
+        blob = getattr(self, "_section_blob", None)
+        if blob is None:
+            blob = self._section_blob = pickle.dumps(
+                self.worker_graph.section, protocol=pickle.HIGHEST_PROTOCOL
+            )
+        section_copy = pickle.loads(blob)
         queue = WorkerGraphIO(section_copy, wg_id=self.worker_graph_id)
         queue.register_communication_info(
             self.tensor_manager, request_id
@@ -425,6 +433,11 @@ class WorkerGraphsManager:
         for edge in non_streaming_outputs:
             wg_id = self.walk_node_to_worker_graph_id.get((graph_walk, edge.next_node))
             if wg_id is not None and wg_id in self.queues:
+                if edge.next_node == node_name and not self._node_reads(wg_id, request_id, edge):
+                    # A loop-back the node never reads. It only feeds the
+                    # loop's accumulated outputs, cached when the node
+                    # completed, so there is nothing to route.
+                    continue
                 fanout = sharding_config.fanout_graph_edges(
                     edge, source_node=node_name,
                     source_graph_walk=graph_walk,
@@ -705,8 +718,19 @@ class WorkerGraphsManager:
             self, request_id: str,
             signals: list[GraphEdge]
         ):
-        """Extend the pending persist signals for a request."""
-        self.per_request_info[request_id].pending_persist_signals.extend(signals)
+        """Extend the pending persist signals for a request.
+
+        Snapshots, because a node's output edges are reused step after step
+        and their tensor_info is replaced on the next step.
+        """
+        self.per_request_info[request_id].pending_persist_signals.extend(
+            edge.clone() for edge in signals
+        )
+
+    def _node_reads(self, wg_id: str, request_id: str, edge: GraphEdge) -> bool:
+        wgio = self.queues[wg_id].per_request_queues.get(request_id)
+        node = wgio.nodes.get(edge.next_node) if wgio is not None else None
+        return node is None or edge.name in node.input_names
 
     def buffer_new_token_counts(
         self, request_id: str, counts: dict[str, int]
@@ -732,7 +756,10 @@ class WorkerGraphsManager:
         info.pending_persist_signals = []
         result: dict[str, list[TensorPointerInfo]] = {}
         for edge in signals:
-            result[edge.name] = edge.tensor_info
+            # A loop persists the same name once per iteration before one
+            # WORKER_GRAPHS_DONE goes out. Keep every tensor, in order. The
+            # conductor extends by name across messages the same way.
+            result.setdefault(edge.name, []).extend(edge.tensor_info)
         return result
 
     def flush_new_token_counts(self, request_id: str) -> dict[str, int]:

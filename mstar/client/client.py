@@ -146,6 +146,23 @@ class MStarClient:
             raise RuntimeError("Server returned no audio output")
         return res.audio
 
+    def transcribe(self, audio, *, language: str | None = None, text: str = "", **model_kwargs) -> str:
+        """Speech-to-text. ``audio`` is a path, raw bytes, or a ``(filename,
+        bytes)`` tuple; ``language`` is an ISO-639-1 code (``None`` lets a
+        model that can detect the language do so). Model knobs such as
+        ``prompt`` or ``timestamps`` pass through as ``model_kwargs``."""
+        res = self.generate(
+            text=text,
+            audio=audio,
+            input_modalities=("audio", "text"),
+            output_modalities=("text",),
+            language=language,
+            **model_kwargs,
+        )
+        if res.text is None:
+            raise RuntimeError("Server returned no transcript")
+        return res.text
+
     def health(self) -> bool:
         try:
             r = self._session.get(f"{self.base_url}/health", timeout=10)
