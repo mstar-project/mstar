@@ -930,13 +930,6 @@ pub struct PopRidsOut {
     #[pyo3(get)] pub output_signals: Vec<String>,
 }
 
-/// Whether any edge carrying this uuid is a persist signal.
-fn e_persist(edges: &[RoutedEdge], uuid: u64) -> bool {
-    edges
-        .iter()
-        .any(|e| e.persist && e.tensors.iter().any(|t| t.uuid == uuid))
-}
-
 /// One edge, bound for one worker. Post-fanout, so a signal read by several
 /// workers is several of these.
 pub struct WireEdge {
@@ -1019,6 +1012,13 @@ pub struct Completion {
     pub node_name: String,
     pub wg: WgIndex,
     pub routing: FxHashMap<u32, Vec<RoutedEdge>>,
+    /// Per rid: the persist signals, taken BEFORE the fanout, as Python's
+    /// `to_conductor` is. Persist is orthogonal to routing: every rank reports
+    /// its own copy, unsliced, whatever the fanout decided. Kept apart because
+    /// a persist edge bound for EMPTY_DESTINATION has no sharding group, so on
+    /// a rank other than 0 the replicated fanout drops it -- and with it the
+    /// conductor's only record that this rank produced the signal.
+    pub persist: FxHashMap<u32, Vec<(Sym, Vec<TensorRef>)>>,
     pub completed_wgs: FxHashMap<u32, Vec<u32>>,
     /// Per rid: is this rank the TP group's rank 0 for the completed node?
     /// Computed at completion, not at send: the conductor counts one report
@@ -1876,6 +1876,8 @@ impl GraphRuntime {
 
         let mut out = RouteOut::default();
         let mut routing: FxHashMap<u32, Vec<RoutedEdge>> = FxHashMap::default();
+        let mut persist: FxHashMap<u32, Vec<(Sym, Vec<TensorRef>)>> =
+            FxHashMap::default();
         let mut completed_wgs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
         let mut first_tp_rank: FxHashMap<u32, bool> = FxHashMap::default();
         let mut speculative: FxHashMap<u32, bool> = FxHashMap::default();
@@ -1927,6 +1929,32 @@ impl GraphRuntime {
             // Before complete(), which clears the flag.
             let was_speculative = state.is_spec_scheduled(node);
             let (pre_shard_edges, _filtered, freed_inputs) = state.complete(node, &out_tensors);
+            // Both taken before the fanout, as Python takes `to_conductor`
+            // and `new_token_outputs` off the node's own outputs. A rank other
+            // than 0 loses these edges in the replicated fanout -- their
+            // destination (EMPTY_DESTINATION) has no sharding group -- and
+            // reporting them is not the fanout's business anyway.
+            let persist_pre: Vec<(Sym, Vec<TensorRef>)> = pre_shard_edges
+                .iter()
+                .filter(|e| e.persist)
+                .map(|e| (e.name, e.tensors.clone()))
+                .collect();
+            {
+                // First edge of a signal name wins, as in Python's
+                // _count_new_tokens: one output routed twice is two edges
+                // over the SAME tensors.
+                let mut seen: FxHashSet<Sym> = FxHashSet::default();
+                for e in pre_shard_edges.iter().filter(|e| e.new_token) {
+                    if !seen.insert(e.name) {
+                        continue;
+                    }
+                    out.new_token_output_idxs.extend(
+                        e.tensors
+                            .iter()
+                            .filter_map(|t| uuid_to_idx.get(&t.uuid).copied()),
+                    );
+                }
+            }
             let me_sym = self.shard.me;
             let mut edges = if let Some(info) = &self.requests[rid as usize] {
                 if let Some(sharding) = &info.shard {
@@ -2128,20 +2156,25 @@ impl GraphRuntime {
                 e.declined_local = !took && matches!(e.dest, Dest::Local(_));
             }
 
-            let mut new_token_seen: FxHashSet<Sym> = FxHashSet::default();
+            // Staged before the routed edges, so a persist signal is
+            // registered for a remote read whether or not the fanout kept an
+            // edge for it -- Python stages `routing.persist` unconditionally.
+            for (_name, tensors) in &persist_pre {
+                for t in tensors {
+                    let Some(&idx) = uuid_to_idx.get(&t.uuid) else { continue };
+                    if staged.insert(t.uuid) {
+                        out.register_tensor_idxs.push(idx);
+                        out.register_rids.push(rid);
+                    }
+                }
+            }
+
             for (e, &is_local) in edges.iter().zip(&ingested_locally) {
                 let idxs: Vec<usize> = e
                     .tensors
                     .iter()
                     .filter_map(|t| uuid_to_idx.get(&t.uuid).copied())
                     .collect();
-                // First edge of a signal name wins, as in Python's
-                // _count_new_tokens ("don't double-count new tokens"). One
-                // output routed to two destinations is two edges carrying the
-                // SAME tensors, so without this the caller sums each twice.
-                if e.new_token && new_token_seen.insert(e.name) {
-                    out.new_token_output_idxs.extend(&idxs);
-                }
                 // `is_local`, not Dest::Local: the consumer is just as local
                 // when it lives in a SIBLING worker graph on this worker, which
                 // compiles to External (Orpheus streams new_token from the LLM
@@ -2244,7 +2277,13 @@ impl GraphRuntime {
                         count += refs
                             * e.tensors.iter().filter(|t| t.uuid == uuid).count() as i64;
                     }
-                    if e_persist(&edges, uuid) {
+                    // Pre-fanout: a rank whose persist edge the fanout
+                    // dropped still holds the tensor for the conductor, and
+                    // an unmarked one is dereferenced to zero right here.
+                    if persist_pre
+                        .iter()
+                        .any(|(_, ts)| ts.iter().any(|t| t.uuid == uuid))
+                    {
                         bk.set_persist(uuid, true);
                     }
                     let delta = count - 1;
@@ -2257,6 +2296,7 @@ impl GraphRuntime {
             }
 
             routing.insert(rid, edges);
+            persist.insert(rid, persist_pre);
         }
 
         // A wg can finish without this node routing anything for that rid, so
@@ -2278,6 +2318,7 @@ impl GraphRuntime {
                 node_name: input.node_name.clone(),
                 wg,
                 routing,
+                persist,
                 completed_wgs,
                 first_tp_rank,
                 speculative,
@@ -2696,6 +2737,18 @@ impl GraphRuntime {
         };
 
         let src_node = self.interner.get(&c.node_name);
+        // Every rank reports its own persist signals, unsliced: the conductor
+        // merges them per source rank and fans them back out, which is how a
+        // rank other than 0 ever gets the next walk's inputs.
+        for (&rid, signals) in &c.persist {
+            for (name, tensors) in signals {
+                plan.persist.push((
+                    rid,
+                    self.interner.name(*name).to_string(),
+                    tensors.iter().map(|t| t.uuid).collect(),
+                ));
+            }
+        }
         for (rid, edges) in c.routing {
             let walk = self.interner.get(&c.graph_walk);
             // What the receiver needs to put a sharded arrival back together.
@@ -2719,11 +2772,7 @@ impl GraphRuntime {
                 }
             };
             for e in edges {
-                let uuids: Vec<u64> = e.tensors.iter().map(|t| t.uuid).collect();
                 let name = self.interner.name(e.name).to_string();
-                if e.persist {
-                    plan.persist.push((rid, name.clone(), uuids.clone()));
-                }
                 match e.dest {
                     Dest::EmitToClient => plan.emit.push((
                         rid,

@@ -1516,3 +1516,132 @@ def test_cleanup_then_push_back_still_pops(pair):
     rt.push_back_node("prefill", [rid], [WG_ID])
     popped = rt.pop_rids("prefill", WALK, [rid])
     assert popped is not None and popped.wg_ids.keys == [rid]
+
+
+# --- a peer's post-fanout copy is not ingested here ---------------------------
+#
+# cosmos3_nano_tp2's shape: a tp1 node group on rank 0 feeding a tp2 group on
+# both ranks. Rank 0 runs BOTH, so the fanout's peer copy names a node this
+# worker also owns -- and resolving it by name alone ingests the peer's
+# tensors here too.
+
+TP_WALK = "decode"
+PEER = "worker_1"
+
+
+def _tp_graphs():
+    """`src` alone; `dit` looping in a SIBLING worker graph, as separate node
+    groups compile to separate graphs."""
+    return [
+        WorkerGraph(
+            section=Sequential(sections=[GraphNode(
+                name="src", input_names={"prompt"},
+                outputs=[GraphEdge(name="latent", next_node="dit")],
+            )]),
+            graph_walks={TP_WALK}, ranks=[0], worker_graph_id=0,
+        ),
+        WorkerGraph(
+            section=Sequential(sections=[Loop(
+                name="dit_loop",
+                section=GraphNode(
+                    name="dit", input_names={"latent"},
+                    outputs=[GraphEdge(name="latent", next_node="dit")],
+                ),
+                outputs=[GraphEdge(name="latent", next_node="")],
+                max_iters=3,
+            )]),
+            graph_walks={TP_WALK}, ranks=[0, 1], worker_graph_id=1,
+        ),
+    ]
+
+
+def _tp_sharding():
+    groups = [
+        ShardingGroup(nodes={"src"}, tp_size=1),
+        ShardingGroup(nodes={"dit"}, tp_size=2),
+    ]
+    for group in groups:
+        group._tp_rank = 0  # this worker leads both
+    return ShardingConfig(
+        groups=groups, tp_enabled_nodes={"dit"}, shard_dim={},
+    )
+
+
+_TP_COMMON = dict(
+    all_wg_ids_to_graph_walks={0: {TP_WALK}, 1: {TP_WALK}},
+    all_wg_ids_to_dyn_loops={0: set(), 1: set()},
+    all_wg_ids_to_nodes={0: {"src"}, 1: {"dit"}},
+    node_to_partition={"src": "default", "dit": "default"},
+)
+
+
+def _tp_pair(kind):
+    book = PythonTensorBookkeeping() if kind == "python" \
+        else RustTensorBookkeeping()
+    tm = _StubTensorManager(book)
+    if kind == "python":
+        rt = PythonGraphRuntime(
+            my_worker_id=WORKER, my_worker_graphs=_tp_graphs(),
+            sharding_config=_tp_sharding(), tensor_manager=tm,
+            communicator=None, **_TP_COMMON,
+        )
+    else:
+        rt = rust_runtime.RustGraphRuntime(
+            my_worker_id=WORKER, my_worker_graphs=_tp_graphs(),
+            sharding_config=_tp_sharding(), bookkeeping=book, **_TP_COMMON,
+        )
+    rt.set_node_metadata({"dit"}, {"dit"}, set())
+    return rt, book, tm.tensor_store
+
+
+@pytest.fixture(params=["python", "rust"])
+def tp_pair(request):
+    return _tp_pair(request.param)
+
+
+def _drive_tp(rt, book, store, steps=8):
+    """Run whatever is ready until nothing is, logging what each step ate."""
+    rid = rt.add_request(
+        request_id="r1", partition="default", graph_walk=TP_WALK,
+        partition_worker_graph_ids=[0, 1],
+        worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER, PEER]]),
+    )
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "src")]))
+
+    log, uuid = [], 0
+    for _ in range(steps):
+        ready = _ready(rt)
+        if not ready:
+            log.append("idle")
+            break
+        node, walk, _rids = ready[0]
+        wg_id = rt.get_worker_graph_id_for_node(node, walk)
+        popped = rt.pop_rids(node, walk, [rid], check_ready=True)
+        assert popped is not None, f"{node} went unschedulable"
+        log.append((node, [(e.signal, tuple(e.uuids)) for e in popped.input_edges]))
+        rt.cleanup_consumed_inputs(node, [rid], [wg_id])
+        uuid += 1
+        store.put_tensor(rid, uuid, torch.zeros(4), _info(uuid))
+        book.increment_ref(uuid, 1)
+        rt.complete_and_route_batch(RouteInput(
+            partition="default", graph_walk=walk, node_name=node,
+            output_signals=("latent",), wg_ids=ParallelList([rid], [wg_id]),
+            tensors=[uuid], num_tensors=[1],
+        ), store)
+    return log
+
+
+def test_a_peers_copy_does_not_feed_this_ranks_node(tp_pair):
+    """The regression: rank 0 ingested the fanout copy addressed to rank 1 as
+    well as its own, filling `dit`'s next-iteration slot. The real loop-back
+    edge was then refused, and iteration 2 ran on the STALE latent -- one
+    rank's dit fed from a tensor the other rank never saw, which is a TP
+    group that never steps together again."""
+    rt, book, store = tp_pair
+    assert _drive_tp(rt, book, store) == [
+        ("src", [("prompt", ())]),
+        ("dit", [("latent", (1,))]),
+        ("dit", [("latent", (2,))]),
+        ("dit", [("latent", (3,))]),
+        "idle",
+    ]

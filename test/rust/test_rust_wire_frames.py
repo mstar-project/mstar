@@ -469,6 +469,67 @@ def test_a_replicated_result_is_emitted_by_rank_0_only(tmp_path):
     assert _emit_mesh(tmp_path / "r1", tp_rank=1) == []
 
 
+def _persist_mesh(tmp_path, tp_rank):
+    """One node persisting to EMPTY_DESTINATION, inside a TP group of two."""
+    book = RustTensorBookkeeping()
+    comm = ZmqCommunicator(ME, str(tmp_path))
+    inbox = ZmqCommunicator("conductor", str(tmp_path))
+    wg = {"wg_id": WG_ID, "graph_walks": [WALK],
+          "nodes": [_node("only", ["prompt"], [("out", "", True)])],
+          "loops": []}
+    rt = GraphRuntime(
+        worker_graphs=[wg], remote_worker_graphs=[],
+        sharding={
+            "groups": [{"nodes": ["only"], "tp_size": 2,
+                        "graph_walks": None, "tp_rank": tp_rank}],
+            "shard_dim": [], "tp_enabled_nodes": [], "sp_enabled_nodes": [],
+        },
+        bookkeeping=book._rust, me=ME, communicator=comm,
+    )
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [ME, PEER], [2])
+    info = TensorPointerInfo(
+        dims=[2, 3], dtype=torch.bfloat16, nbytes=12, address=1,
+        stride=[3, 1], uuid=1, source_session_id="h:1", source_entity=ME,
+    )
+    book.put_tensor(1, info)
+    book.increment_ref(1, 1)
+    rt.ingest_inputs_batch([rid], [{
+        "signal": "prompt", "next_node": "only", "uuids": [],
+        "is_final_streaming_chunk": False,
+    }])
+    rt.pop_rids("only", WALK, [rid])
+    out = rt.complete_and_route_batch({
+        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "output_signals": ["out"], "rids": [rid], "wg_ids": [WG_ID],
+        "tensors": [1], "num_tensors": [1],
+    })
+    _send(rt, out.completion_id, request_infos=[(rid, None)])
+    return book, info, _collect(inbox, first_wait_ms=300)
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_every_rank_reports_its_own_persist_signal(tp_rank, tmp_path):
+    """Persist is NOT the fanout's business -- Python takes `to_conductor`
+    straight off the node's outputs, before any of it.
+
+    EMPTY_DESTINATION has no sharding group, so the replicated fanout gives it
+    a pseudo-worker and emits it from rank 0 alone. Reading persist off the
+    routed edges therefore loses every other rank's copy -- and the conductor
+    fans the next walk's inputs back out PER SOURCE RANK, so a rank that never
+    reported has nothing sent to it, never becomes ready, and sits on a
+    ScheduleTPNode it can never pop (Orpheus tp2, prefill -> decode)."""
+    _book, info, got = _persist_mesh(tmp_path, tp_rank=tp_rank)
+    assert [m.body.persist_signals for m in got] == [{"out": [info]}]
+
+
+def test_a_persist_signal_is_held_alive_on_every_rank(tmp_path):
+    """The marker goes with the report. Taken off the routed edges it is not
+    set on a rank whose persist edge the fanout dropped, and the settle from
+    the safety hold then frees a tensor the conductor is about to ask for."""
+    book, _info, _got = _persist_mesh(tmp_path, tp_rank=1)
+    assert not book._rust.can_gc(1), "rank 1's persisted tensor was collected"
+
+
 def test_a_sharded_result_is_emitted_by_every_rank(tmp_path):
     """The opposite case: each rank holds a different slice, so each sends
     its own -- gating on rank 0 there would drop half the output."""
