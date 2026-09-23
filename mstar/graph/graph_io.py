@@ -117,6 +117,11 @@ class WorkerGraphIO:
             if edge.next_node not in self.nodes:
                 continue # TODO: cross-worker-graph speculation
             node = self.nodes[edge.next_node]
+            if edge.name not in node.input_names:
+                # A loop-back the node never reads. It only feeds the loop's
+                # accumulated outputs, and GraphNode.ingest_input declines it
+                # the same way on the regular path.
+                continue
             node.speculative_signals.update(edge)
             self._nodes_with_speculative_inputs.add(node.name)
             dest_nodes.add(node.name)

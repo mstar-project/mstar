@@ -709,6 +709,25 @@ class Conductor:
                 )
                 for dest_worker, sliced_edge in fanout.items():
                     inputs_per_worker[dest_worker].append(sliced_edge)
+        # Groups that differ only by the walk or node that produced them (a
+        # transcript persisted across two walks) come back as several edges
+        # of one name. The consumer takes a repeated name as the next loop
+        # iteration's input, so merge them here, in order. TP fan-in edges
+        # stay apart, the consumer consolidates those by source rank.
+        for dest_worker, edges in inputs_per_worker.items():
+            merged: list[GraphEdge] = []
+            first_by_key: dict[tuple[str, str], GraphEdge] = {}
+            for edge in edges:
+                first = first_by_key.get((edge.name, edge.next_node))
+                if (
+                    first is not None and edge.tensor_info and first.tensor_info
+                    and edge._total_fanin == 1 and first._total_fanin == 1
+                ):
+                    first.tensor_info = first.tensor_info + edge.tensor_info
+                    continue
+                first_by_key.setdefault((edge.name, edge.next_node), edge)
+                merged.append(edge)
+            inputs_per_worker[dest_worker] = merged
         return inputs_per_worker
 
     def _update_persist_ref_counts(

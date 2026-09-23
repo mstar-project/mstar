@@ -176,6 +176,8 @@ class Worker:
         # record into it too; run() owns the periodic flush.
         self._phase_period = PHASE_PERIOD
         self._phase_buf = phase_buffer()
+        # request id -> whether any of its nodes runs on another worker
+        self._remote_workers_by_rid: dict[str, bool] = {}
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
@@ -483,6 +485,8 @@ class Worker:
 
 
     def _remove_request(self, body: RemoveRequest) -> None:
+        if getattr(self, "_remote_workers_by_rid", None):
+            self._remote_workers_by_rid.pop(body.request_id, None)
         if self.is_tp_follower and body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF):
             return # wait for removal message from TP rank 0 to avoid race conditions
 
@@ -1072,6 +1076,22 @@ class Worker:
     # ------------------------------------------------------------------
     # Output handling
     # ------------------------------------------------------------------
+    def _has_remote_workers(self, request_id: str) -> bool:
+        """Whether any node of this request runs on another worker."""
+        known = self._remote_workers_by_rid.get(request_id)
+        if known is not None:
+            return known
+        info = self.worker_graphs_manager.per_request_info.get(request_id)
+        if info is None:
+            return True
+        known = any(
+            worker != self.worker_id
+            for workers in info.node_to_workers.values()
+            for worker in workers
+        )
+        self._remote_workers_by_rid[request_id] = known
+        return known
+
     def _register_outputs(
         self,
         batch: ScheduledBatch,
@@ -1086,8 +1106,14 @@ class Worker:
         for request_id, _node in batch.node_objects.items():
             routing = routing_per_request[request_id]
             infos_by_uuid = {}
+            # A persisted tensor is read through the transport only by another
+            # worker. Its producer serves later walks from its own store, so
+            # with a single worker the copy is never opened. Skipping it saves
+            # a D2H copy and a write per tensor and per step (3.8 MB per
+            # request for Whisper's encoder states).
+            persist_edges = routing.persist if self._has_remote_workers(request_id) else []
             for edge in (
-                routing.persist +
+                persist_edges +
                 sum(routing.to_workers.values(), start=[]) +
                 routing.emit_to_client +
                 sum(routing.streaming_to_workers.values(), start=[])
