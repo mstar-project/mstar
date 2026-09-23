@@ -255,6 +255,20 @@ def test_conductor_process_target_watches_the_api_server():
     assert watch_at < source.index("get_model_class")
 
 
+def test_conductor_process_target_rearms_sigint_before_watching():
+    """An inherited SIGINT ignore would make the watchdog's graceful stop a
+    no-op, so the handler is installed before the watchdog starts."""
+    import inspect
+
+    from mstar.api_server import entrypoint
+
+    source = inspect.getsource(entrypoint._conductor_process_target)
+    install_at = source.index(
+        "signal.signal(signal.SIGINT, signal.default_int_handler)"
+    )
+    assert install_at < source.index("watch_parent(")
+
+
 def test_worker_without_a_multiprocessing_parent_keeps_running():
     # A test process has no multiprocessing parent, so the watchdog is a no-op.
     assert _exit_when_orphaned("worker_0") is None
