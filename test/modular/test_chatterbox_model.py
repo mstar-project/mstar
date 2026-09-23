@@ -973,7 +973,8 @@ def _solve_graphs_on_cpu(solve=_fake_solve, **kwargs) -> SolveGraphs:
     graphs = SolveGraphs(solve, **kwargs)
     graphs._capturable = lambda mu: True
 
-    def record(run):
+    def record(run, device):
+        del device
         out = run()
         return _FakeGraph(run, out), out
 
@@ -1010,6 +1011,21 @@ def test_solve_graphs_pad_rows_reuse_shapes_and_match_eager():
     graphs(**_solve_inputs(1, 32, 4), n_timesteps=2)
     graphs(**_solve_inputs(1, 16, 5), n_timesteps=3)
     assert graphs.captures == 3 and set(graphs.keys()) == {(4, 16, 2), (1, 32, 2), (1, 16, 3)}
+
+
+def test_solve_graphs_fall_back_to_eager_when_a_capture_fails(caplog):
+    graphs = _solve_graphs_on_cpu(rows=(1,))
+
+    def failing(run, device):
+        raise RuntimeError("operation not permitted when stream is capturing")
+
+    graphs._record = failing
+    a = _solve_inputs(1, 8, 0)
+    with caplog.at_level("WARNING"):
+        assert torch.equal(graphs(**a, n_timesteps=2), _fake_solve(**a, n_timesteps=2))
+    assert graphs.disabled and graphs.captures == 0 and "eagerly" in caplog.text
+    assert graphs.warmup([8, 16], n_timesteps=2, example=_solve_inputs(1, 16, 0)) == 0
+    assert torch.equal(graphs(**a, n_timesteps=2), _fake_solve(**a, n_timesteps=2))  # still served
 
 
 def test_solve_graphs_drop_the_least_recently_used_shape():
