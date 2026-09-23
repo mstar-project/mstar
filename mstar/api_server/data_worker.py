@@ -25,7 +25,10 @@ from mstar.api_server.request_types import (
 )
 from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
-from mstar.model.base import Model
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.keys import chain
+from mstar.engine.resources.spec import apply_yaml_overrides
+from mstar.model.base import Model, ProcessPromptOutput
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils import profiler
 from mstar.utils.ipc_format import (
@@ -90,6 +93,17 @@ def _preprocess_loop(**kwargs):
     worker.run()
 
 
+def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
+    """Page size per KV resource, after this deployment's YAML has been applied."""
+    specs = model.get_node_resources()
+    apply_yaml_overrides(specs, model_config)
+    return {
+        spec.resource_key: spec.config.page_size
+        for spec in specs
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
+    }
+
+
 NameToLoopIndices = dict[str, NestedLoopIndices]
 
 
@@ -103,6 +117,7 @@ class PreprocessWorker:
         tcp_transfer_device="",
         enable_prof: bool=False,
         enable_nvtx: bool=False,
+        model_config: dict | None = None,
     ):
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -154,6 +169,7 @@ class PreprocessWorker:
                 model=model,
                 enable_prof=enable_prof,
                 enable_nvtx=enable_nvtx,
+                model_config=model_config,
             )
         )
         self.thread.start()
@@ -307,7 +323,18 @@ class PreprocessWorkerThread:
         model: Model | None = None,
         enable_prof: bool=False,
         enable_nvtx: bool=False,
+        model_config: dict | None = None,
     ):
+        # keying a stream needs the deployment's page size as well as the
+        # model's declaration, so a worker built without a config keys no stream
+        self._prefix_streams = (
+            model.prefix_key_streams()
+            if model is not None and model_config else {}
+        )
+        # resolved as the worker does at load, so both split a prompt into the same pages
+        self._prefix_page_sizes = (
+            _kv_page_sizes(model, model_config) if self._prefix_streams else {}
+        )
         self.in_queue = in_queue
         self.result_tensor_queue = result_tensor_queue
         self.cleanup_request_queue = cleanup_request_queue
@@ -421,6 +448,11 @@ class PreprocessWorkerThread:
         # image_grid_thw, audio_features, audio_seqlens from the raw tensors
         # loaded above).  process_prompt receives the raw multimodal tensors
         # and returns any additional tensors to merge into the final dict.
+        model_kwargs = dict(input.model_kwargs or {})
+        # only this worker keys a prompt: a client that sent its own could name
+        # another request's pages and be served that request's KV
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode"):
+            model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -429,10 +461,21 @@ class PreprocessWorkerThread:
                 tensors=tensors,
                 input_metadata=input_metadata,
                 prompt_parts=input.prompt_parts,
-                **(input.model_kwargs or {}),
+                **model_kwargs,
             )
+            if isinstance(prompt_tensors, ProcessPromptOutput):
+                model_kwargs.update(prompt_tensors.metadata)
+                prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
+            # after the update: the chain keys the tensors the request will
+            # actually be prefilled with
+            prefix_keys, prefix_tail, prefix_decode = self._prefix_keys(tensors)
+            if prefix_keys:
+                model_kwargs["prefix_keys"] = prefix_keys
+                model_kwargs["prefix_tail"] = prefix_tail
+                if prefix_decode:
+                    model_kwargs["prefix_decode"] = prefix_decode
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
             byte_data = input.text.encode("utf-8")
@@ -457,7 +500,7 @@ class PreprocessWorkerThread:
                 input.request_id, info.uuid, persist=True
             )
 
-        self.request_model_kwargs[input.request_id] = input.model_kwargs or {}
+        self.request_model_kwargs[input.request_id] = model_kwargs
         self.request_output_frame_indices[input.request_id] = 0
         self.tensor_uuid_to_output_order_per_request[input.request_id] = {}
         self.request_next_output_sequence[input.request_id] = 0
@@ -471,7 +514,7 @@ class PreprocessWorkerThread:
                 initial_input_modalities=input.input_modalities,
                 initial_output_modalities=input.output_modalities,
                 input_metadata=input_metadata,
-                model_kwargs=input.model_kwargs
+                model_kwargs=model_kwargs
             ),
         )
         self.communicator.send("conductor", msg)
@@ -487,6 +530,33 @@ class PreprocessWorkerThread:
                 preprocess_finish_time=time.perf_counter(),
                 inputs=self._summarize_inputs(input),
             ))
+
+    def _prefix_keys(self, tensors: dict) -> tuple[dict, dict, dict]:
+        """Key each page of every declared stream, by resource and label.
+
+        Returns the keys, the prompt tail past the last whole page, and the output
+        tensor each stream's sampled ids arrive in. The keys are unrooted.
+        """
+        keys: dict[str, dict[str, list[bytes]]] = {}
+        tails: dict[str, dict[str, list[int]]] = {}
+        decode: dict[str, dict[str, str]] = {}
+        for resource_key, by_label in self._prefix_streams.items():
+            page_size = self._prefix_page_sizes[resource_key]
+            for label, stream in by_label.items():
+                ids = tensors.get(stream.tensor)
+                if stream.keyed_by != "ids" or not ids:
+                    continue
+                flat = ids[0].flatten().tolist()
+                pages = [
+                    flat[at:at + page_size]
+                    for at in range(0, len(flat), page_size)
+                ]
+                keys.setdefault(resource_key, {})[label] = chain(pages)
+                whole = len(flat) // page_size
+                tails.setdefault(resource_key, {})[label] = flat[whole * page_size:]
+                if stream.decode_walk is not None:
+                    decode.setdefault(resource_key, {})[label] = stream.tensor
+        return keys, tails, decode
 
     @staticmethod
     def _summarize_inputs(input: PreprocessInput) -> list[InputInfo]:

@@ -228,6 +228,7 @@ class APIServer:
         log_stats: bool = False,
         log_stats_file: str | None = None,
         enable_nvtx: bool = False,
+        model_config: dict | None = None,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -254,6 +255,7 @@ class APIServer:
 
         self.preprocess_worker = PreprocessWorker(
             model=model,
+            model_config=model_config,
             hostname=hostname,
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
@@ -889,9 +891,14 @@ class APIServer:
 # FastAPI application
 # ------------------------------------------------------------------
 
+# Behind an ingress that serves the app under a sub-path -- Run:AI routes a
+# workload at /<project>/<job-name>/ and does NOT strip the prefix before it
+# reaches the pod -- FastAPI has to be told, or every route 404s on a path it
+# considers unknown. Empty by default, so a direct deployment is unaffected.
 app = FastAPI(
     title="mstar API",
     description="Multimodal Inference API",
+    root_path=os.environ.get("MSTAR_ROOT_PATH", ""),
 )
 app.add_middleware(
     CORSMiddleware,
@@ -1190,6 +1197,7 @@ def main(argv: list[str] | None = None):
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
         model_name=model_name,
+        model_config=config,
         tcp_transfer_device=args.tcp_transfer_device,
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,

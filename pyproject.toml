@@ -49,6 +49,17 @@ mstar = "mstar.cli.main:main"
 mstar-serve = "mstar.api_server.entrypoint:main"
 
 [project.optional-dependencies]
+# OmniVoice reuses the reference package for weight loading, the rule-based
+# duration estimator, language/instruct validation and the pydub silence
+# trim; mstar owns the graph.
+#
+# Deliberately not pinned here: the PyPI release has no
+# `omnivoice.models.omnivoice_flashinfer`, which is the forward this graph
+# calls, so it has to come from git. A direct URL in requires_dist would make
+# PyPI reject the mstar upload, so it is an install step instead — see
+# docs/installation.rst, same as flash-attn.
+omnivoice = []
+
 dev = [
     "ruff<=0.16",
     "pytest",
@@ -255,6 +266,9 @@ all = [
     # flash-attn-4 (waypoint's default flex attention backend) is also installed
     # separately, see docs/installation.rst.
     "jiwer",
+    # omnivoice is intentionally omitted for the same reason as flash-attn: it
+    # has to come from git, which PyPI will not accept in requires_dist.
+    # See docs/installation.rst.
 ]
 
 [tool.setuptools.packages.find]

@@ -86,6 +86,54 @@ class Resource(ABC):
     def depends_on(self) -> set[str]:
         return set()
 
+    # stays correct when a hit skips the front of a request; required of every resource on a keyed node
+    prefix_skip_safe: bool = False
+
+    def enable_prefix_cache(
+        self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
+    ) -> bool:
+        """Open whatever this resource keeps across requests, under ``root``;
+        True if anything opened.
+
+        ``walks`` names, per label, the walk that writes the keyed span and the
+        one that decodes after it.
+        """
+        return False
+
+    def resolve_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+    ) -> int | None:
+        """How many of this request's leading tokens this resource already holds.
+
+        None leaves the length to other resources; 0 means nothing can be skipped.
+        """
+        return None
+
+    def apply_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+        inputs: Any, matched_len: int,
+    ) -> None:
+        """Take on the length every resource agreed to skip.
+
+        The inputs are untrimmed, so a resource that needs the tokens being
+        skipped can still read them.
+        """
+        return
+
+    def extend_prefix_chain(
+        self, rid: str, node_name: str, graph_walk: str, outputs: Any,
+    ) -> None:
+        """Take this step's sampled tokens, so what was generated can be keyed."""
+        return
+
+    def fingerprint(self) -> bytes | None:
+        """What this resource contributes to the prefix cache's root.
+
+        Everything a stored page depends on beyond its own tokens. None leaves
+        the resource out of the root, which is right only where it cannot
+        change what a page holds.
+        """
+        return None
 
     # Request lifecycle
 
