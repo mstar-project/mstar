@@ -18,11 +18,16 @@ recently used graph is dropped past ``max_graphs``.
 
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
 import torch
+
+from mstar.engine.cuda_graph_runner import capture_into_graph
+
+logger = logging.getLogger(__name__)
 
 Solve = Callable[..., torch.Tensor]  # (mu, mask, spks, cond, noise, n_timesteps) -> mel
 
@@ -40,7 +45,9 @@ class SolveGraphs:
     ``solve`` takes ``(mu, mask, spks, cond, noise, n_timesteps)`` (batch first,
     mel frames last) and returns the solved mel; it must not draw random
     numbers or synchronise. ``rows`` are the row counts captured; a batch
-    beyond the largest runs eagerly. Off the GPU everything runs eagerly.
+    beyond the largest runs eagerly. Off the GPU everything runs eagerly, and
+    a capture that fails (logged once) turns the solver off for good rather
+    than failing the request: the eager solve is always there.
     """
 
     INPUTS = ("mu", "mask", "spks", "cond", "noise")
@@ -57,6 +64,7 @@ class SolveGraphs:
         self._pool = None
         self.captures = 0
         self.replays = 0
+        self.disabled = False
 
     # -- shape bookkeeping ---------------------------------------------------
 
@@ -81,13 +89,19 @@ class SolveGraphs:
     ) -> torch.Tensor:
         batch, _, frames = mu.shape
         rows = self.rows_for(batch)
-        if rows is None or not self._capturable(mu):
+        if rows is None or self.disabled or not self._capturable(mu):
             return self._solve(mu, mask, spks, cond, noise, n_timesteps)
         key = (rows, int(frames), int(n_timesteps))
         entry = self._graphs.get(key)
         inputs = dict(zip(self.INPUTS, (mu, mask, spks, cond, noise), strict=True))
         if entry is None:
-            entry = self._capture(key, inputs)
+            try:
+                entry = self._capture(key, inputs)
+            except Exception:
+                logger.warning("S3Gen: capturing the flow solve for shape %s failed; solving eagerly from now on",
+                               key, exc_info=True)
+                self.disabled = True
+                return self._solve(mu, mask, spks, cond, noise, n_timesteps)
         else:
             self._graphs.move_to_end(key)
         self._load(entry, inputs, batch)
@@ -103,12 +117,17 @@ class SolveGraphs:
         for f in sorted(set(int(x) for x in frames)):
             for rows in self.rows:
                 key = (rows, f, int(n_timesteps))
-                if key in self._graphs:
+                if key in self._graphs or self.disabled:
                     continue
                 inputs = {
                     name: (t[:1] if name == "spks" else t[:1, :, :f]) for name, t in example.items()
                 }
-                self._capture(key, inputs)
+                try:
+                    self._capture(key, inputs)
+                except Exception:
+                    logger.warning("S3Gen: capturing the flow solve for shape %s failed; graphs stay off",
+                                   key, exc_info=True)
+                    self.disabled = True
         return self.captures - before
 
     # -- internals -----------------------------------------------------------
@@ -140,24 +159,25 @@ class SolveGraphs:
                 static["mu"], static["mask"], static["spks"], static["cond"], static["noise"], n_timesteps,
             )
 
-        graph, output = self._record(run)
+        graph, output = self._record(run, static["mu"].device)
         entry = _Entry(graph=graph, inputs=static, output=output)
         self._graphs[key] = entry
         self.captures += 1
         return entry
 
-    def _record(self, run: Callable[[], torch.Tensor]):
-        """Warm ``run`` up on a side stream (cuBLAS/cuDNN pick their kernels),
-        then capture it into the shared pool."""
-        if self._pool is None:
-            self._pool = torch.cuda.graph_pool_handle()
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(2):
-                run()
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._pool):
-            output = run()
-        return graph, output
+    def _record(self, run: Callable[[], torch.Tensor], device: torch.device):
+        """Warm ``run`` up on a side stream (cuBLAS/cuDNN pick their kernels;
+        twice before the very first capture), then capture it into the shared
+        pool with the engine's capture helper, which undoes a failed capture's
+        allocator and stream state."""
+        with torch.cuda.device(device):
+            if self._pool is None:
+                self._pool = torch.cuda.graph_pool_handle()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2 if self.captures == 0 else 1):
+                    run()
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize(device)
+            return capture_into_graph(run, self._pool, device, autocast_dtype=None)
