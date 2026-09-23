@@ -11,6 +11,7 @@ import torch
 import yaml
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, PackedCudaGraphConfig
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
@@ -26,6 +27,7 @@ from mstar.model.chatterbox.chatterbox_model import (
     ChatterboxModel,
     voice_key_for,
 )
+from mstar.model.chatterbox.components.s3gen_graphs import SolveGraphs
 from mstar.model.chatterbox.config import (
     CFG_LABEL,
     COND_LABEL,
@@ -543,17 +545,49 @@ def test_t3_batches_only_one_guidance_mode_and_captures_both():
     assert sub.cg_key_info("decode", {"a": _fwd_info("a", 0.5), "b": _fwd_info("b", 0.0)}) is None
 
     configs = sub.get_cuda_graph_configs(torch.device("cpu"))
-    keys = {c.additional_key_info: c for c in configs}
+    batched = [c for c in configs if isinstance(c, BatchedCudaGraphConfig)]
+    keys = {c.additional_key_info: c for c in batched}
     assert set(keys) == {True, False}
     assert keys[True].total_tokens_multiplier == 2 and keys[False].total_tokens_multiplier == 1
     assert keys[True].single_request_inputs.resource_step_info is True
     assert keys[True].capture_batch_sizes == [1, 2, 4, 8, 16, 32]
-    assert all(c.capture_graph_walk == "decode" for c in configs)
+    assert all(c.capture_graph_walk == "decode" for c in batched)
 
     turbo = _t3_submodule("turbo")
-    turbo_cfgs = turbo.get_cuda_graph_configs(torch.device("cpu"))
+    turbo_cfgs = [c for c in turbo.get_cuda_graph_configs(torch.device("cpu")) if isinstance(c, BatchedCudaGraphConfig)]
     assert [c.additional_key_info for c in turbo_cfgs] == [False]
     assert turbo.cg_key_info("decode", {"a": _fwd_info("a", 0.5)}) is False
+
+
+def test_t3_prefill_is_captured_as_packed_graphs_for_both_guidance_modes():
+    """Prefill replays packed captures (token buckets x small batch sizes) under
+    both prefill walks; the stand-in inputs carry the guidance branch's second
+    embedding row set like ``prepare_inputs`` does. The knob turns it off."""
+    sub = _t3_submodule()
+    packed = [c for c in sub.get_cuda_graph_configs(torch.device("cpu")) if isinstance(c, PackedCudaGraphConfig)]
+    assert {c.additional_key_info for c in packed} == {True, False}
+    for cfg in packed:
+        assert cfg.capture_graph_walk == "prefill"
+        assert cfg.replay_graph_walks == ["prefill", "prefill_voice"]
+        assert cfg.capture_token_lengths == T3Submodule.PREFILL_TOKEN_BUCKETS
+        assert cfg.capture_batch_sizes == T3Submodule.PREFILL_CAPTURE_BATCH_SIZES
+        assert cfg.caps_eager_batch_size is False and cfg.compile is False
+        stand_in = cfg.make_node_input(7)
+        assert stand_in.input_seq_len == 7
+        assert stand_in.input_embeds.shape == (7, sub.t3.hidden_size)
+        assert stand_in.resource_step_info is cfg.additional_key_info
+        assert ("uncond_embeds" in stand_in.tensor_inputs) is cfg.additional_key_info
+        assert float(stand_in.tensor_inputs["cfg_weight"]) == (0.5 if cfg.additional_key_info else 0.0)
+    prefill = ExecutingBatch(
+        node_name="T3", step_context=_step_context("prefill_voice", ["a"]),
+        per_request_input_tensors={}, per_request_info={},
+    )
+    inputs = [sub.prepare_inputs("prefill", _fwd_info("a"), {TEXT_INPUTS: [torch.tensor([255, 0])]})]
+    assert sub.can_use_cuda_graphs(prefill, inputs)
+
+    sub.config.t3_prefill_graphs = False
+    assert not any(isinstance(c, PackedCudaGraphConfig) for c in sub.get_cuda_graph_configs(torch.device("cpu")))
+    assert not sub.can_use_cuda_graphs(prefill, inputs)
 
 
 def test_sampler_min_p_goes_through_the_resource():
@@ -886,6 +920,136 @@ def test_streaming_and_compile_knobs_reach_the_config():
     )
     assert model.config.stream_context_tokens == 25 and model.config.s3gen_compile is True
     assert _make_model().config.s3gen_compile is False
+
+
+def test_graph_and_precision_knobs_reach_the_config():
+    model = ChatterboxModel(
+        model_path_hf="ResembleAI/chatterbox", variant="chatterbox",
+        s3gen_graphs=True, s3gen_estimator_dtype="bfloat16", t3_prefill_graphs=False,
+    )
+    assert model.config.s3gen_graphs is True
+    assert model.config.s3gen_frame_bucket == 64  # graphs need a bucket; 0 becomes the default one
+    assert model._s3gen_estimator_dtype == torch.bfloat16
+    assert model.config.t3_prefill_graphs is False
+    with pytest.raises(ValueError, match="alternatives"):
+        ChatterboxModel(
+            model_path_hf="ResembleAI/chatterbox", variant="chatterbox", s3gen_graphs=True, s3gen_compile=True,
+        )
+    default = _make_model().config
+    assert default.s3gen_graphs is False and default.s3gen_estimator_dtype == "float32"
+    assert default.t3_prefill_graphs is True and default.s3gen_frame_bucket == 0
+
+
+def test_graph_warmup_covers_the_built_in_voice_chunk_shapes():
+    """One bucketed solve length per chunk size of the ramp: prompt frames plus
+    2 x (left context + chunk + look-ahead), rounded up to the frame bucket."""
+    model = _make_model()
+    model.config.s3gen_frame_bucket = 64
+    # 314 prompt frames; chunks 15 / 50 / 100 / 200 with 25 context and 3 look-ahead tokens
+    assert ChatterboxModel._graph_warmup_frames(model, 314) == [448, 512, 576, 832]
+    model.config.stream_chunk_tokens = 0  # whole-utterance mode: every utterance length is its own shape
+    assert ChatterboxModel._graph_warmup_frames(model, 314) == []
+
+
+# ---------------------------------------------------------------------------
+# SolveGraphs: shape keys, row padding, reuse and eviction (no CUDA: a stand-in
+# graph re-runs the solve on the static buffers when replayed)
+# ---------------------------------------------------------------------------
+
+
+class _FakeGraph:
+    def __init__(self, run, output):
+        self.run, self.output = run, output
+
+    def replay(self):
+        self.output.copy_(self.run())
+
+
+def _fake_solve(mu, mask, spks, cond, noise, n_timesteps):
+    return (2 * mu + noise + spks[:, :, None] + cond) * mask * n_timesteps
+
+
+def _solve_graphs_on_cpu(solve=_fake_solve, **kwargs) -> SolveGraphs:
+    graphs = SolveGraphs(solve, **kwargs)
+    graphs._capturable = lambda mu: True
+
+    def record(run):
+        out = run()
+        return _FakeGraph(run, out), out
+
+    graphs._record = record
+    return graphs
+
+
+def _solve_inputs(batch: int, frames: int, seed: int) -> dict:
+    g = torch.Generator().manual_seed(seed)
+    return {
+        "mu": torch.randn(batch, 3, frames, generator=g), "mask": torch.ones(batch, 1, frames),
+        "spks": torch.randn(batch, 3, generator=g), "cond": torch.randn(batch, 3, frames, generator=g),
+        "noise": torch.randn(batch, 3, frames, generator=g),
+    }
+
+
+def test_solve_graphs_pad_rows_reuse_shapes_and_match_eager():
+    seen = []
+
+    def solve(mu, mask, spks, cond, noise, n_timesteps):
+        seen.append(mu.shape[0])
+        return _fake_solve(mu, mask, spks, cond, noise, n_timesteps)
+
+    graphs = _solve_graphs_on_cpu(solve, rows=(1, 2, 4), max_graphs=8)
+    a = _solve_inputs(3, 16, 1)
+    assert torch.equal(graphs(**a, n_timesteps=2), _fake_solve(**a, n_timesteps=2))
+    assert graphs.keys() == [(4, 16, 2)] and graphs.captures == 1 and seen[-1] == 4  # 3 rows padded to 4
+    b = _solve_inputs(4, 16, 2)
+    assert torch.equal(graphs(**b, n_timesteps=2), _fake_solve(**b, n_timesteps=2))
+    assert graphs.captures == 1 and graphs.replays == 2  # same shape, replayed
+    c = _solve_inputs(5, 16, 3)  # more rows than captured: eager
+    assert torch.equal(graphs(**c, n_timesteps=2), _fake_solve(**c, n_timesteps=2))
+    assert graphs.captures == 1 and graphs.replays == 2
+    graphs(**_solve_inputs(1, 32, 4), n_timesteps=2)
+    graphs(**_solve_inputs(1, 16, 5), n_timesteps=3)
+    assert graphs.captures == 3 and set(graphs.keys()) == {(4, 16, 2), (1, 32, 2), (1, 16, 3)}
+
+
+def test_solve_graphs_drop_the_least_recently_used_shape():
+    graphs = _solve_graphs_on_cpu(rows=(1,), max_graphs=2)
+    for frames in (8, 16):
+        graphs(**_solve_inputs(1, frames, 0), n_timesteps=1)
+    graphs(**_solve_inputs(1, 8, 0), n_timesteps=1)  # 8 is recent again, 16 is the oldest
+    graphs(**_solve_inputs(1, 24, 0), n_timesteps=1)
+    assert graphs.keys() == [(1, 8, 1), (1, 24, 1)]
+
+
+def test_solve_graphs_warmup_captures_the_grid_once():
+    graphs = _solve_graphs_on_cpu(rows=(1, 2))
+    example = _solve_inputs(1, 64, 0)
+    assert graphs.warmup([32, 64], n_timesteps=2, example=example) == 4
+    assert set(graphs.keys()) == {(1, 32, 2), (2, 32, 2), (1, 64, 2), (2, 64, 2)}
+    assert graphs.warmup([32], n_timesteps=2, example=example) == 0
+    out = graphs(**_solve_inputs(2, 32, 1), n_timesteps=2)
+    assert out.shape == (2, 3, 32) and graphs.captures == 4
+
+
+def test_s3gen_solves_go_through_the_solver_when_enabled():
+    """``S3Gen.enable_graphs`` routes both the single and the batched path
+    through the solver; without it the decoder is called directly."""
+    from mstar.model.chatterbox.components.s3gen import S3Gen
+
+    s3gen = object.__new__(S3Gen)
+    s3gen.config = SimpleNamespace(meanflow=False)
+    calls = []
+    s3gen.decoder = SimpleNamespace(
+        solve=lambda *a: calls.append(("decoder", a[-1])) or a[0],
+        solve_meanflow=lambda *a: calls.append(("meanflow", a[-1])) or a[0],
+    )
+    s3gen.solver = None
+    mu = torch.zeros(1, 2, 4)
+    S3Gen._run_solve(s3gen, mu, mu, mu, mu, mu, 3)
+    assert calls == [("decoder", 3)]
+    s3gen.solver = lambda *a: calls.append(("graphs", a[-1])) or a[0]
+    S3Gen._run_solve(s3gen, mu, mu, mu, mu, mu, 5)
+    assert calls[-1] == ("graphs", 5)
 
 
 def test_s3gen_node_advertises_its_batch_size_to_the_scheduler():
