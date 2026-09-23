@@ -561,17 +561,17 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         )
 
     def _stage_one(
-        self, rid: int, info_arg: TensorPointerInfo,
-        stamped: list[TensorPointerInfo],
+        self, rid: int, uuid: int,
+        info_arg: TensorPointerInfo | None,
+        placements: list[tuple[int, str, int]],
     ) -> bool:
         """Stage one tensor into the arena. Returns whether a D2H was queued.
 
         The caller owns the CUDA sync, the ``_d2h_ctx`` context and the
         trailing stream sync, so a batch pays for each of those once -- and
-        the writeback of ``stamped``, which is why the stamped descriptors are
-        collected here rather than stored one at a time.
+        the writeback of ``placements``, which is why they are collected here
+        rather than stored one at a time.
         """
-        uuid = info_arg.uuid
         if self.tensor_store.is_registered(uuid):
             return False
         tensor = self.tensor_store.get_tensor(uuid)
@@ -623,15 +623,23 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             self._arena.free(seg, off)
             raise
         seg_name = self._arena.segment_name(seg)
-        info_arg.shm_segment = seg_name
-        info_arg.shm_offset = off
+        # Still stamped in place when the caller handed one in: that contract
+        # is relied on (test_descriptor_survives_register_for_send). The
+        # uuid-driven path has no caller object and needs none.
+        if info_arg is not None:
+            info_arg.shm_segment = seg_name
+            info_arg.shm_offset = off
         # The store must learn the segment, not just the caller's object. With
         # the Python bookkeeper those are the same object and this is a
         # re-assign; with the Rust one the descriptor was COPIED in, so without
         # this the stamp dies on a throwaway and the tensor ships with
         # shm_segment=None -- which the consumer reads as "spilled to a file"
         # and goes looking for a file that was never written.
-        stamped.append(info_arg)
+        #
+        # Only the two fields travel, not the descriptor: rebuilding one for
+        # Python and marshalling it back costs ~3.5us per tensor to write two
+        # integers the store already holds.
+        placements.append((uuid, seg_name, off))
         self.tensor_store.set_metadata(uuid, mem_registered=True)
         if self.enable_prof:
             self._record_tx(rid, uuid, nbytes, time.perf_counter() - t0)
@@ -639,11 +647,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                      uuid, seg_name, off, nbytes)
         return queued
 
-    def _write_back(self, stamped: list[TensorPointerInfo]):
+    def _write_back(self, placements: list[tuple[int, str, int]]):
         """One crossing for the batch, not one per tensor."""
-        if stamped:
-            self.tensor_store.update_info_batch(
-                [i.uuid for i in stamped], stamped
+        if placements:
+            self.tensor_store.set_shm_placement(
+                [p[0] for p in placements],
+                [p[1] for p in placements],
+                [p[2] for p in placements],
             )
 
     def register_for_send(
@@ -653,12 +663,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         if not skip_cuda_sync and torch.cuda.is_available():
             torch.cuda.default_stream().synchronize()
         queued = False
-        stamped: list[TensorPointerInfo] = []
+        placements: list[tuple[int, str, int]] = []
         self._maybe_log_stats()
         with self._d2h_ctx():
             for info_arg in tensor_infos:
-                queued |= self._stage_one(rid, info_arg, stamped)
-        self._write_back(stamped)
+                queued |= self._stage_one(
+                    rid, info_arg.uuid, info_arg, placements)
+        self._write_back(placements)
         if queued and self._d2h_stream is not None:
             # The control message referencing these bytes is sent after we
             # return; the consumer must never observe a partial copy.
@@ -679,13 +690,35 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         if not skip_cuda_sync and torch.cuda.is_available():
             torch.cuda.default_stream().synchronize()
         queued = False
-        stamped: list[TensorPointerInfo] = []
+        placements: list[tuple[int, str, int]] = []
         self._maybe_log_stats()
         with self._d2h_ctx():
             for rid, tensor_infos in per_request:
                 for info_arg in tensor_infos:
-                    queued |= self._stage_one(rid, info_arg, stamped)
-        self._write_back(stamped)
+                    queued |= self._stage_one(
+                        rid, info_arg.uuid, info_arg, placements)
+        self._write_back(placements)
+        if queued and self._d2h_stream is not None:
+            self._d2h_stream.synchronize()
+
+    def register_for_send_uuids(
+        self,
+        per_request: ParallelList[int, list[int]],
+        skip_cuda_sync: bool = False,
+    ):
+        """Uuid-driven staging: no descriptor is rebuilt to be read for its
+        uuid, and placement goes back as two columns rather than a whole
+        descriptor. Same one-pass/one-sync structure as the batch form."""
+        if not skip_cuda_sync and torch.cuda.is_available():
+            torch.cuda.default_stream().synchronize()
+        queued = False
+        placements: list[tuple[int, str, int]] = []
+        self._maybe_log_stats()
+        with self._d2h_ctx():
+            for rid, uuids in per_request:
+                for uuid in uuids:
+                    queued |= self._stage_one(rid, uuid, None, placements)
+        self._write_back(placements)
         if queued and self._d2h_stream is not None:
             self._d2h_stream.synchronize()
 

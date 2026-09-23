@@ -1278,22 +1278,24 @@ class Worker:
         """Stage the tensors the runtime says remote consumers will read.
 
         The runtime already deduped by uuid and dropped anything registered,
-        so this is a straight translation from indices back to descriptors.
+        so this is a straight translation from indices back to uuids.
         """
-        per_rid: dict[int, list[TensorPointerInfo]] = {}
+        # Uuids, not descriptors: registration only ever reads ``uuid`` off
+        # them and takes the tensor from the store, so rebuilding a descriptor
+        # here would cost ~2.2us each under the Rust bookkeeper to hand back
+        # something we already have.
+        per_rid: dict[int, list[int]] = {}
         for idx, rid in zip(
             route_output.register_tensor_idxs,
             route_output.register_rids,
             strict=True,
         ):
-            info = self.tensor_manager.tensor_store.get_info(flat_uuids[idx])
-            if info is not None:
-                per_rid.setdefault(rid, []).append(info)
+            per_rid.setdefault(rid, []).append(flat_uuids[idx])
         if not per_rid:
             return
         # One staging pass for the batch: the arena override collapses B
         # host-blocking D2H stream syncs into one.
-        self.tensor_manager.register_for_send_batch(
+        self.tensor_manager.register_for_send_uuids(
             ParallelList(list(per_rid), list(per_rid.values())),
             skip_cuda_sync=True,
         )
@@ -2343,7 +2345,8 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
-        self._register_outputs(route_output, flat_uuids)
+        with self._span("worker.postprocess.register_outputs"):
+            self._register_outputs(route_output, flat_uuids)
 
         # send outputs
         if self.enable_nvtx:
@@ -3151,6 +3154,18 @@ class Worker:
                     future=future,
                     tp_seq=fallthrough_tp_seq,
                 ))
+                # Same accounting as the speculative path above. Without it a
+                # workload that never speculates -- image generation is one --
+                # flushes nothing, so MSTAR_PHASE_TIMING silently reports no
+                # breakdown at all, and the shared sample buffer (cleared only
+                # by _phase_flush) grows for the life of the run. The idle
+                # `batch is None` spin above is deliberately NOT counted:
+                # it is a wait, and counting it would both skew iter_total and
+                # make the flush period mean something other than iterations.
+                if phase_period:
+                    _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                    phase_iter[0] += 1
+                    _phase_flush()
             except Exception as e:
                 self._handle_main_loop_error(e, (pending, spec_pending), batch)
                 # Follower: a head from a step that raised must not sit at the

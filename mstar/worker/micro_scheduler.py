@@ -15,6 +15,14 @@ from mstar.worker.node_manager_utils import RequestStateManager
 
 logger = logging.getLogger(__name__)
 
+# A rid a TP follower is told about but has already removed. Wire messages
+# carry string rids, so a head from the leader can name a request this rank
+# tore down; ``tp_rids`` maps those to this sentinel and ``pop_ready_rids``
+# reads it as not-ready. No request ever owns it, and it is deliberately NOT
+# tolerated anywhere else -- an unknown rid off the wire is expected, an
+# unknown rid from local state is a bug and should still raise.
+REMOVED_RID = -1
+
 
 @dataclass
 class ReadyNodeEntry:
@@ -145,6 +153,7 @@ class MicroScheduler:
         # Defaults to the identity so a scheduler driven directly with string
         # rids (tests) behaves exactly as it did before interning.
         self.rid_of: Callable[[str], int | None] = lambda r: r
+        self._warned_removed_rid = False
         self.sched_type = sched_type
 
         # RIDs that have failed but have not gone through the cleanup procedure;
@@ -206,13 +215,14 @@ class MicroScheduler:
 
     def tp_rids(self, message: ScheduleTPNode) -> list[int]:
         """``ScheduleTPNode`` crosses the wire, so its rids are strings. A rid
-        this rank has already removed maps to -1, which no request ever owns, so
-        it reads as not-ready exactly as an unknown string rid used to."""
+        this rank has already removed maps to ``REMOVED_RID``, which no request
+        ever owns, so it reads as not-ready exactly as an unknown string rid
+        used to."""
         # Resolved once per rid, not twice: this runs several times per pass on
         # a follower, and each call is a boundary crossing under the Rust
         # runtime.
         return [
-            -1 if (handle := self.rid_of(r)) is None else handle
+            REMOVED_RID if (handle := self.rid_of(r)) is None else handle
             for r in message.request_ids
         ]
 
@@ -267,6 +277,26 @@ class MicroScheduler:
         # is all-or-nothing too, so one not-ready rid leaves the set intact.
         node_partition = request_state.get_partition_for_node(node_name)
         for rid in rids:
+            # ``tp_rids`` hands us REMOVED_RID for a request this rank has
+            # already torn down. There is no forward-pass state to ask about,
+            # and popping is all-or-none, so the whole set waits -- the same
+            # answer an unresolvable rid has always been meant to give.
+            # ``get_fwd_info`` indexes rather than gets, so asking it would
+            # raise KeyError and kill the follower's main loop.
+            if rid == REMOVED_RID:
+                # Warned once: deferring is correct for a rid that is merely
+                # gone, but if the head can NEVER be satisfied the follower
+                # waits here forever, and a silent stall is far harder to
+                # diagnose than the KeyError this replaced.
+                if not self._warned_removed_rid:
+                    self._warned_removed_rid = True
+                    logger.warning(
+                        "Node %s walk %s: a TP head names a request this rank "
+                        "has already removed; deferring the batch. If the "
+                        "follower stops making progress, this is why.",
+                        node_name, graph_walk,
+                    )
+                return None
             fwd_info = request_state.get_fwd_info(rid, node_partition)
             if not self._check_ready(node_name, rid, fwd_info):
                 return None

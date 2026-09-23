@@ -292,6 +292,43 @@ impl Bookkeeping {
         Ok(())
     }
 
+    /// Stamp arena placement onto descriptors already held here.
+    ///
+    /// `register_for_send` only changes `shm_segment` and `shm_offset`, but
+    /// the descriptor round trip to do it is not cheap: rebuilding each one
+    /// for Python costs ~2.2us (15 attribute crossings plus the dataclass)
+    /// and marshalling it back another ~1.3us -- ~3.5us per tensor to write
+    /// two fields this side already owns. Segments are interned, so a batch
+    /// staged into one segment interns one string.
+    ///
+    /// An untracked uuid is skipped, matching every other mutator here: a
+    /// late stamp for a tensor already collected is benign.
+    fn set_shm_placement(
+        &mut self,
+        uuids: Vec<u64>,
+        segments: Vec<Option<String>>,
+        offsets: Vec<i64>,
+    ) -> PyResult<()> {
+        let n = uuids.len();
+        if segments.len() != n || offsets.len() != n {
+            return Err(PyValueError::new_err(
+                "set_shm_placement: uuids, segments and offsets must have \
+                 the same length",
+            ));
+        }
+        for i in 0..n {
+            let seg = match &segments[i] {
+                Some(name) => Some(self.strings.intern(name)),
+                None => None,
+            };
+            if let Some(info) = self.tensor_info.get_mut(&uuids[i]) {
+                info.shm_segment = seg;
+                info.shm_offset = offsets[i];
+            }
+        }
+        Ok(())
+    }
+
     /// Rebind a descriptor without touching its refcount. Needed where the
     /// tensor lands before its final descriptor exists: a slice re-points an
     /// arriving info at a freshly minted uuid, and a fan-in consolidation
@@ -519,6 +556,15 @@ impl TensorBookkeeping {
             source_session_id, source_entity, source_node_name,
             source_graph_walk,
         )
+    }
+
+    fn set_shm_placement(
+        &self,
+        uuids: Vec<u64>,
+        segments: Vec<Option<String>>,
+        offsets: Vec<i64>,
+    ) -> PyResult<()> {
+        self.inner.lock().unwrap().set_shm_placement(uuids, segments, offsets)
     }
 
     fn update_info(&self, uuid: u64, info: TensorInfoArg) {

@@ -504,6 +504,11 @@ class TensorCommunicationManager(ABC):
         extra_uuids: list[int] = []
         extra_rids: list[int] = []
         extra_canonicals: list[torch.Tensor] = []
+        # Kept apart from ``infos`` rather than appended to it: the unrouted
+        # columns are concatenated AFTER every request's routed ones, so an
+        # interleaved ``infos`` would pair each uuid with another tensor's
+        # descriptor. See the assembly below.
+        extra_infos: list[TensorPointerInfo] = []
 
         columnar = self.tensor_store.has_put_tensor_batch_columns
         infos: list[TensorPointerInfo] = []
@@ -576,7 +581,7 @@ class TensorCommunicationManager(ABC):
                 self._mint_unrouted(
                     rid, tensors, signals, cfg, source_tp_size, source_tp_rank,
                     node_name, graph_walk, extra_uuids, extra_rids,
-                    extra_canonicals, infos if not columnar else None,
+                    extra_canonicals, None if columnar else extra_infos,
                 )
 
         store_uuids = flat_uuids + extra_uuids if extra_uuids else flat_uuids
@@ -584,6 +589,9 @@ class TensorCommunicationManager(ABC):
         store_tensors = (
             canonicals + extra_canonicals if extra_uuids else canonicals
         )
+        # Same concatenation order as the columns above -- all routed, then
+        # all unrouted -- so descriptor i still describes uuid i.
+        store_infos = infos + extra_infos if extra_infos else infos
         if columnar:
             columns.add_tensors_canonical(store_uuids, store_tensors)
             self.tensor_store.put_tensor_batch_columns(
@@ -591,7 +599,7 @@ class TensorCommunicationManager(ABC):
             )
         else:
             self.tensor_store.put_tensor_batch_multi(
-                store_rids, store_uuids, store_tensors, infos,
+                store_rids, store_uuids, store_tensors, store_infos,
             )
         return StoredOutputs(flat_uuids, flat_rids, signal_idxs, num_tensors)
 
@@ -754,6 +762,36 @@ class TensorCommunicationManager(ABC):
         for rid, tensor_infos in per_request:
             self.register_for_send(
                 rid=rid, tensor_infos=tensor_infos,
+                skip_cuda_sync=True,  # done once above
+            )
+
+    def register_for_send_uuids(
+        self,
+        per_request: ParallelList[int, list[int]],
+        skip_cuda_sync: bool = False,
+    ):
+        """``register_for_send_batch`` given uuids instead of descriptors.
+
+        Every implementation reads exactly one field off a descriptor here --
+        ``uuid`` -- and takes the tensor itself from the store. Under the Rust
+        bookkeeper, rebuilding a descriptor so the callee can read its uuid
+        costs ~2.2us each (15 attribute crossings plus the dataclass), and the
+        caller already has the uuids.
+
+        This default resolves and delegates, so a backend that has not been
+        taught uuids keeps working unchanged; the arena overrides it.
+        """
+        if not skip_cuda_sync and torch.cuda.is_available():
+            torch.cuda.default_stream().synchronize()
+        pairs = []
+        for rid, uuids in per_request:
+            infos = [i for i in self.tensor_store.get_info_batch(uuids)
+                     if i is not None]
+            if infos:
+                pairs.append((rid, infos))
+        if pairs:
+            self.register_for_send_batch(
+                ParallelList([p[0] for p in pairs], [p[1] for p in pairs]),
                 skip_cuda_sync=True,  # done once above
             )
 
@@ -1157,33 +1195,49 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         if not skip_cuda_sync:
             torch.cuda.default_stream().synchronize()
         for info in tensor_infos:
-            uuid = info.uuid
-            already_registered = self.tensor_store.is_registered(uuid)
-            if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
-                if already_registered:
-                    continue
-                logger.debug("Registering %s for send", uuid)
-                tensor = self.tensor_store.get_tensor(uuid
-                )
-                t0 = time.perf_counter()
-                ret_value = self.transfer_engine.register_memory(
-                    tensor.data_ptr(), tensor.nbytes
-                )
-                if ret_value != 0:
-                    raise RuntimeError(
-                        f"Mooncake memory registration failed for request id {rid}, uuid {uuid}."
-                    )
-                if self.enable_prof:
-                    # RDMA: the receiver does the actual read, so the sender-side
-                    # cost is the memory-pinning (register) time.
-                    self._record_tx(
-                        rid, uuid, tensor.nbytes, time.perf_counter() - t0
-                    )
-            elif self.enable_prof and not already_registered:
-                tensor = self.tensor_store.get_tensor(uuid)
-                self._record_tx(rid, uuid, tensor.nbytes, 0.0)
-            self.tensor_store.set_metadata(uuid, mem_registered=True
+            self._register_one(rid, info.uuid)
+
+    def register_for_send_uuids(
+        self,
+        per_request: ParallelList[int, list[int]],
+        skip_cuda_sync: bool = False,
+    ):
+        """Uuid-driven form. Registration here reads nothing off a descriptor
+        but the uuid -- the tensor itself comes from the store -- so taking
+        uuids avoids rebuilding one per tensor."""
+        if not skip_cuda_sync:
+            torch.cuda.default_stream().synchronize()
+        for rid, uuids in per_request:
+            for uuid in uuids:
+                self._register_one(rid, uuid)
+
+    def _register_one(self, rid: int, uuid: int) -> None:
+        """Pin one tensor for remote reads. The caller owns the CUDA sync."""
+        already_registered = self.tensor_store.is_registered(uuid)
+        if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
+            if already_registered:
+                return
+            logger.debug("Registering %s for send", uuid)
+            tensor = self.tensor_store.get_tensor(uuid)
+            t0 = time.perf_counter()
+            ret_value = self.transfer_engine.register_memory(
+                tensor.data_ptr(), tensor.nbytes
             )
+            if ret_value != 0:
+                raise RuntimeError(
+                    f"Mooncake memory registration failed for request id "
+                    f"{rid}, uuid {uuid}."
+                )
+            if self.enable_prof:
+                # RDMA: the receiver does the actual read, so the sender-side
+                # cost is the memory-pinning (register) time.
+                self._record_tx(
+                    rid, uuid, tensor.nbytes, time.perf_counter() - t0
+                )
+        elif self.enable_prof and not already_registered:
+            tensor = self.tensor_store.get_tensor(uuid)
+            self._record_tx(rid, uuid, tensor.nbytes, 0.0)
+        self.tensor_store.set_metadata(uuid, mem_registered=True)
 
     def _cleanup_by_uuid(self, uuid: int):
         super()._cleanup_by_uuid(uuid)
@@ -1365,23 +1419,44 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         )
         with ctx:
             for info in tensor_infos:
-                uuid = info.uuid
-                if self.tensor_store.is_registered(uuid):
-                    continue
-                tensor = self.tensor_store.get_tensor(uuid)
-                t0 = time.perf_counter()
-                data = _serialize_tensor(tensor)
-                path = self._shm_path(self.my_entity_id, uuid)
-                with open(path, "wb") as f:
-                    f.write(data)
-                self._shm_files[uuid] = path
-                self.tensor_store.set_metadata(uuid, mem_registered=True)
-                if self.enable_prof:
-                    # SHM: the serialize + file write IS the send work.
-                    self._record_tx(
-                        rid, uuid, len(data), time.perf_counter() - t0
-                    )
-                logger.debug("SHM: wrote tensor %s to %s (%d bytes)", uuid, path, len(data))
+                self._write_one(rid, info.uuid)
+
+    def register_for_send_uuids(
+        self,
+        per_request: ParallelList[int, list[int]],
+        skip_cuda_sync: bool = False,
+    ):
+        """Uuid-driven form. This path reads nothing off a descriptor but the
+        uuid, so taking uuids avoids rebuilding one per tensor."""
+        if not skip_cuda_sync and torch.cuda.is_available():
+            torch.cuda.default_stream().synchronize()
+        ctx = (
+            torch.cuda.stream(self._d2h_stream)
+            if self._d2h_stream is not None
+            else _nullcontext()
+        )
+        with ctx:
+            for rid, uuids in per_request:
+                for uuid in uuids:
+                    self._write_one(rid, uuid)
+
+    def _write_one(self, rid: int, uuid: int) -> None:
+        """Serialize one tensor to its per-uuid file. The caller owns the
+        CUDA sync and the copy-stream context."""
+        if self.tensor_store.is_registered(uuid):
+            return
+        tensor = self.tensor_store.get_tensor(uuid)
+        t0 = time.perf_counter()
+        data = _serialize_tensor(tensor)
+        path = self._shm_path(self.my_entity_id, uuid)
+        with open(path, "wb") as f:
+            f.write(data)
+        self._shm_files[uuid] = path
+        self.tensor_store.set_metadata(uuid, mem_registered=True)
+        if self.enable_prof:
+            # SHM: the serialize + file write IS the send work.
+            self._record_tx(rid, uuid, len(data), time.perf_counter() - t0)
+        logger.debug("SHM: wrote tensor %s to %s (%d bytes)", uuid, path, len(data))
 
     def start_read_tensors(
         self, rid: int, graph_edges: list[GraphEdge],

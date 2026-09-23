@@ -140,6 +140,26 @@ class TensorBookkeeping(ABC):
         for uuid, info in zip(uuids, infos, strict=True):
             self.update_info(uuid, info)
 
+    def set_shm_placement(
+        self, uuids: list[int], segments: list[str | None],
+        offsets: list[int],
+    ):
+        """Stamp arena placement onto descriptors already held.
+
+        ``register_for_send`` changes only these two fields. The default
+        reads-modifies-writes, which is free for a backend that stores the
+        descriptor by reference; a backend that marshals per tensor should
+        override, because the round trip there costs far more than the two
+        fields are worth.
+        """
+        for uuid, seg, off in zip(uuids, segments, offsets, strict=True):
+            info = self.get_info(uuid)
+            if info is None:
+                continue
+            info.shm_segment = seg
+            info.shm_offset = off
+            self.update_info(uuid, info)
+
     @abstractmethod
     def get_info(self, uuid: int) -> TensorPointerInfo | None:
         """The descriptor a peer needs to read this tensor.
@@ -307,7 +327,11 @@ def _to_rust(info: TensorPointerInfo) -> dict:
 
 def _from_rust(out) -> TensorPointerInfo:
     return TensorPointerInfo(
-        dims=out.dims,
+        # tuple(), like stride below: Rust hands back a list, but the Python
+        # bookkeeper stores what the producer built -- a torch.Size, which is
+        # a tuple subclass. A list never compares equal to either, so leaving
+        # it would make the same descriptor unequal across backends.
+        dims=tuple(out.dims),
         dtype=_dtype_from_name(out.dtype),
         nbytes=out.nbytes,
         address=out.address,
@@ -385,6 +409,14 @@ class RustTensorBookkeeping(TensorBookkeeping):
         self, uuids: list[int], infos: list[TensorPointerInfo]
     ):
         self._rust.update_info_batch(uuids, [_to_rust(i) for i in infos])
+
+    def set_shm_placement(
+        self, uuids: list[int], segments: list[str | None],
+        offsets: list[int],
+    ):
+        # One crossing, primitives only -- no descriptor is rebuilt for
+        # Python and none is marshalled back.
+        self._rust.set_shm_placement(uuids, segments, offsets)
 
     def get_info(self, uuid: int) -> TensorPointerInfo | None:
         out = self._rust.get_info(uuid)
@@ -587,6 +619,11 @@ class TensorStore:
     def get_info(self, uuid: int) -> TensorPointerInfo | None:
         return self.bookkeeping.get_info(uuid)
 
+    def get_info_batch(
+        self, uuids: list[int]
+    ) -> list[TensorPointerInfo | None]:
+        return self.bookkeeping.get_info_batch(uuids)
+
     def update_info(self, uuid: int, info: TensorPointerInfo):
         self.bookkeeping.update_info(uuid, info)
 
@@ -600,6 +637,12 @@ class TensorStore:
 
     def increment_ref_batch_uniform(self, uuids: list[int], n: int = 1):
         self.bookkeeping.increment_ref_batch_uniform(uuids, n)
+
+    def set_shm_placement(
+        self, uuids: list[int], segments: list[str | None],
+        offsets: list[int],
+    ):
+        self.bookkeeping.set_shm_placement(uuids, segments, offsets)
 
     def increment_ref_batch(self, uuids: list[int], counts: list[int]):
         self.bookkeeping.increment_ref_batch(uuids, counts)
