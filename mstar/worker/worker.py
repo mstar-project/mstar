@@ -25,7 +25,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AllocationFailed, StepContext
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.graph.base import GraphEdge, GraphNode, SpeculativeNodeInfo
+from mstar.graph.base import GraphEdge, GraphNode, GraphSection, SpeculativeNodeInfo
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, WorkerGraph
@@ -408,17 +408,42 @@ class Worker:
             conn.edge_name for conn in self._my_consumer_connections
         }
 
-        # Build consumer node cache: edge_name -> next_node name
+        # Build consumer node cache: edge_name -> consuming node name.
         self._consumer_node_cache: dict[str, str] = {}
         if self._my_consumer_connections and model:
-            walks = model.get_graph_walk_graphs()
-            for conn in self._my_consumer_connections:
-                for section in walks.values():
-                    if hasattr(section, 'input_names') and conn.edge_name in section.input_names:
-                        self._consumer_node_cache[conn.edge_name] = section.name
+            self._consumer_node_cache = self._build_consumer_node_cache(
+                self._my_consumer_connections, model.get_graph_walk_graphs(),
+            )
+
+    @staticmethod
+    def _build_consumer_node_cache(
+        connections, walks: dict[str, GraphSection],
+    ) -> dict[str, str]:
+        """Map each incoming streaming edge to the node that consumes it.
+
+        Recurses through ``get_nodes()`` so a consumer nested inside a
+        ``Loop`` / ``Sequential`` / ``Parallel`` is found too. Matching the
+        walk's top-level ``input_names`` only finds a walk that is itself a
+        single ``GraphNode``; a decode ``Loop`` whose inner node consumes the
+        streamed edge would be missed, and its chunks routed to ``next_node=""``.
+        """
+        cache: dict[str, str] = {}
+        for conn in connections:
+            for section in walks.values():
+                for node in section.get_nodes().values():
+                    if conn.edge_name in node.input_names:
+                        cache[conn.edge_name] = node.name
+        return cache
 
     def _get_node_names_for_partition(self, partition_name: str, model: Model) -> list[str]:
-        """Get the node names that belong to a partition."""
+        """Get the node names that belong to a partition.
+
+        Recurses into each walk so nodes nested in a ``Loop`` / ``Sequential``
+        / ``Parallel`` are included. Taking the section's own ``name`` would
+        return the Loop's name (e.g. ``"talker_decode_loop"``) instead of the
+        consuming node's, so its ``StreamBuffer`` would never be created and
+        routing the streamed edge would fail with a ``KeyError``.
+        """
         walks = model.get_graph_walk_graphs()
         partitions = model.get_partitions()
         for pdef in partitions:
@@ -426,8 +451,8 @@ class Worker:
                 nodes = set()
                 for walk_name in pdef.graph_walks:
                     section = walks.get(walk_name)
-                    if section and hasattr(section, 'name'):
-                        nodes.add(section.name)
+                    if section is not None:
+                        nodes.update(section.get_nodes().keys())
                 return list(nodes)
         return []
 
@@ -2318,6 +2343,18 @@ class Worker:
         stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs)
         # the same host copy, before stops, so a request ending here still indexes its pages
         engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs)
+
+        # Stream-terminated loop: a stream-consuming node inside a loop has no
+        # internal stop signal (unlike a self-EOS loop), so when it consumes the
+        # terminal chunk of its stream (``final_stream_rids``: the StreamBuffer
+        # popped ``is_final``, which a ``continue_after_done`` policy never
+        # sets) end its innermost enclosing loop. Without this the loop would
+        # spin to ``max_iters`` and the partition would never report done.
+        for rid in batch_N.node_batch.final_stream_rids:
+            nested = per_req_nested_idxs.get(rid)
+            if nested is not None and nested.loop_name_order:
+                stops.setdefault(rid, set()).add(nested.loop_name_order[-1])
+
         if batch_N.node_batch.failed_requests:
             # A rid whose stop check raised has no trustworthy stop decision:
             # routing it would either run its loop forever or end it early.
