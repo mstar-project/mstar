@@ -57,6 +57,9 @@ def main():
                     help="stop once the agent has been silent this long after speaking")
     ap.add_argument("--output", default="agent_out.wav", help="where to save the agent's speech")
     ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--instructions", default=None,
+                    help="system prompt primed before the first frame (e.g. the vLLM-Omni demo's "
+                         "'You are NVIDIA Voice Chat. Answer briefly. Start by greeting the user.')")
     args = ap.parse_args()
 
     load_env()
@@ -67,7 +70,8 @@ def main():
 
     c = MStarClient(url, timeout=600)
     gen = c.generate(
-        audio=audio, input_modalities=("audio",),
+        audio=audio, text=args.instructions,
+        input_modalities=("audio", "text") if args.instructions else ("audio",),
         output_modalities=("text", "audio"), temperature=args.temperature, stream=True,
     )
 
