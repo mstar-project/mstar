@@ -391,9 +391,10 @@ class ChatterboxAdapter(OpenAIAdapter):
     (a data URL, base64, local path or, when allowed, a URL) and is loaded by
     the worker exactly like an uploaded file. The model's own knobs --
     ``exaggeration``, ``cfg_weight``, ``min_p``, ``repetition_penalty``,
-    ``top_k``, ``n_cfm_timesteps``, ``watermark``, ``max_new_tokens`` -- pass
-    through ``extra_body`` verbatim; ``temperature``/``top_p``/``seed`` are the
-    standard fields. ``speed`` is not a Chatterbox control and is dropped.
+    ``top_k``, ``n_cfm_timesteps``, ``watermark``, ``max_new_tokens`` and, for
+    the multilingual checkpoint, ``language_id`` -- pass through ``extra_body``
+    verbatim; ``temperature``/``top_p``/``seed`` are the standard fields.
+    ``speed`` is not a Chatterbox control and is dropped.
     """
 
     supports_speech = True
@@ -548,6 +549,7 @@ class Wan22Adapter(OpenAIAdapter):
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "bagel": BagelAdapter(),
     "chatterbox": ChatterboxAdapter(),
+    "chatterbox_multilingual": ChatterboxAdapter(),
     "chatterbox_turbo": ChatterboxAdapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
