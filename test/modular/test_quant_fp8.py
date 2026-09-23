@@ -34,9 +34,11 @@ def test_per_token_group_quant_fp8_host_contract(monkeypatch):
     assert x_q.dtype == FP8_DTYPE and x_q.shape == x.shape
     assert x_s.dtype == torch.float32 and x_s.shape == (6, 3)
     (call,) = rec.calls
-    assert call["grid"] == (6 * 3,)  # one program per (row, group)
-    assert call["args"][3] == 128 and call["kwargs"]["BLOCK"] == 128
-    assert call["args"][5] == torch.finfo(FP8_DTYPE).min and call["args"][6] == torch.finfo(FP8_DTYPE).max
+    groups = quant_fp8.GROUPS_PER_PROGRAM
+    assert call["grid"] == (-(-6 * 3 // groups),)  # 18 groups, GROUPS per program
+    assert call["args"][3] == 128 and call["args"][4] == 6 * 3
+    assert call["kwargs"] == {"BLOCK": 128, "GROUPS": groups}
+    assert call["args"][6] == torch.finfo(FP8_DTYPE).min and call["args"][7] == torch.finfo(FP8_DTYPE).max
 
     with pytest.raises(AssertionError, match="multiple of group_size"):
         quant_fp8.per_token_group_quant_fp8(torch.randn(2, 100, dtype=torch.bfloat16), 128)
