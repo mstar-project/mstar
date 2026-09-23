@@ -2,6 +2,7 @@
 prompt processing, the conductor state machine and the T3 step declaration.
 No weights are loaded; the model object is built without ``__init__``."""
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -1066,6 +1067,63 @@ def test_s3gen_solves_go_through_the_solver_when_enabled():
     s3gen.solver = lambda *a: calls.append(("graphs", a[-1])) or a[0]
     S3Gen._run_solve(s3gen, mu, mu, mu, mu, mu, 5)
     assert calls[-1] == ("graphs", 5)
+
+
+# ---------------------------------------------------------------------------
+# Multilingual variant: config, registry and the pure-Python text preprocessing
+# ---------------------------------------------------------------------------
+
+
+def test_multilingual_variant_config_and_registry():
+    cfg = ChatterboxConfig.from_variant("chatterbox_multilingual")
+    assert cfg.is_multilingual and not cfg.is_turbo
+    assert cfg.t3.text_vocab_size == 2454 and cfg.t3.cond_len == 34  # the English T3 with a wider text table
+    assert cfg.t3_weights == "t3_mtl23ls_v2.safetensors"
+    assert cfg.text_tokenizer_file == "grapheme_mtl_merged_expanded_v1.json"
+    assert cfg.cangjie_file == "Cangjie5_TC.json" and cfg.default_language == "en"
+    assert cfg.s3gen_weights == ChatterboxConfig.chatterbox().s3gen_weights
+    assert HF_MODELS["chatterbox_multilingual"] == {"model_path_hf": "ResembleAI/chatterbox", "variant": "multilingual"}
+    assert get_model_class("chatterbox_multilingual") is ChatterboxModel
+    yaml_cfg = yaml.safe_load((CONFIGS / "chatterbox_multilingual.yaml").read_text())
+    assert yaml_cfg["model"] == "chatterbox_multilingual"
+
+
+def test_language_id_reaches_the_multilingual_tokenizer_only(caplog):
+    model = _make_model()
+    model.config = ChatterboxConfig.multilingual()
+    seen = []
+
+    class _MtlStub:
+        def __call__(self, text, language_id=None):
+            seen.append(language_id)
+            return torch.tensor([255, 5, 0])
+
+    model.tokenizer = _MtlStub()
+    ChatterboxModel._tokenize(model, "Hallo", "de")
+    ChatterboxModel._tokenize(model, "Hello", None)  # falls back to the deployment default
+    assert seen == ["de", "en"]
+    english = _make_model()
+    with caplog.at_level("WARNING"):
+        assert ChatterboxModel._tokenize(english, "Hello", "de").tolist() == english.tokenizer("Hello").tolist()
+    assert "ignored" in caplog.text
+
+
+def test_multilingual_text_preprocessing_steps(tmp_path):
+    from mstar.model.chatterbox.components.text import CangjieConverter, decompose_hangul
+
+    # Hangul syllables become jamo; other characters pass through
+    assert decompose_hangul("한글 abc") == "\u1112\u1161\u11ab\u1100\u1173\u11af abc"
+    # Cangjie: code letters as tokens, a terminator per character, an index for a shared code
+    table = tmp_path / "cj.json"
+    table.write_text(json.dumps(["你\tonf", "好\tvnd", "妳\tvnf", "奶\tvnd"]), encoding="utf-8")
+    cj = CangjieConverter(table)
+    assert cj.encode_glyph("你") == "onf" and cj.encode_glyph("奶") == "vnd1" and cj.encode_glyph("a") is None
+    assert cj("你好!") == "[cj_o][cj_n][cj_f][cj_.][cj_v][cj_n][cj_d][cj_.]!"
+    # the multilingual punctuation table accepts CJK sentence enders
+    from mstar.model.chatterbox.components.text import punc_norm
+
+    assert punc_norm("今天天气很好。", multilingual=True) == "今天天气很好。"
+    assert punc_norm("今天天气很好。") == "今天天气很好。."
 
 
 def test_s3gen_node_advertises_its_batch_size_to_the_scheduler():
