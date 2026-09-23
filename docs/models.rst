@@ -162,6 +162,9 @@ Chatterbox notes
 - Outputs are watermarked with Resemble's PerTh network when ``resemble-perth``
   is installed; ``watermark: false`` per request or in ``model_kwargs`` turns it
   off, and a deployment without the package logs that outputs are unmarked.
+  The mark is embedded on the worker's device end to end (the package's own
+  routine resamples on the CPU); it decodes with the package's detector like
+  the package's output, from which it differs by the resampler only.
 - Streaming (``stream: true``) emits WAV chunks as the speech tokens arrive:
   the first after 15 tokens (about 0.23 s on an H100), then 50, 100 and 200
   tokens (``model_kwargs: stream_first_chunk_tokens`` / ``stream_chunk_tokens``
@@ -178,6 +181,18 @@ Chatterbox notes
   window stays as close to the whole-utterance decode as the full history
   does (log-mel correlation 0.988 vs 0.985 on CPU). Requests whose chunks
   are ready together share one padded flow solve (up to 8 per step).
+- Speed knobs (``model_kwargs``): ``s3gen_graphs: true`` replays every flow
+  solve from a CUDA graph captured per (rows, frames, steps) shape, since the
+  estimator's hundreds of tiny kernels per Euler step make the eager solve
+  launch-bound; rows are padded to 1/2/4/8 and frames to
+  ``s3gen_frame_bucket`` (64 with graphs on), the built-in voice's chunk
+  shapes are captured at startup and other shapes on first use.
+  ``s3gen_estimator_dtype: bfloat16`` (or ``float16``) runs the flow
+  estimator in that precision with the Euler state kept in float32
+  (``float32`` is the reference path). ``t3_prefill_graphs`` (default on)
+  captures T3 prefill as packed CUDA graphs by token bucket for batches of up
+  to four requests; decode graphs are always captured. ``s3gen_compile`` is
+  the older alternative to the graphs (not both).
 - Sampling follows the reference order inside the sampler resource:
   repetition penalty -> temperature -> ``min_p`` -> ``top_p``; the T3 node
   declares ``enable_min_p`` on its ``SamplerSpec`` (see
