@@ -347,4 +347,8 @@ for minutes (an 8192² request means 262k tokens of quadratic attention).
 Requests at the same output size batch across users in every node, including the
 text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the
 transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or
-BFL-layout safetensors), so a styled deployment runs at the base model's speed.
+BFL-layout safetensors), so a styled deployment runs at the base model's speed. The adapter's
+own scaling follows PEFT: an ``alpha`` key in the weights, else the ``lora_alpha`` (and
+``use_rslora``) of an ``adapter_config.json`` / ``config.json`` next to them, else ``alpha = r``;
+``scale`` multiplies that (a public rank-64 rsLoRA adapter lands within 53 dB of diffusers'
+fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).
