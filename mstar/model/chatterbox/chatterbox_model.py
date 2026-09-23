@@ -125,6 +125,7 @@ class ChatterboxModel(Model):
         s3gen_estimator_dtype: str | None = None,
         t3_prefill_graphs: bool | None = None,
         t3_dtype: str | None = None,
+        default_language: str | None = None,
         **kwargs: Any,
     ) -> None:
         del kwargs
@@ -170,6 +171,8 @@ class ChatterboxModel(Model):
             self.config.s3gen_estimator_dtype = str(s3gen_estimator_dtype)
         if t3_prefill_graphs is not None:
             self.config.t3_prefill_graphs = bool(t3_prefill_graphs)
+        if default_language is not None:
+            self.config.default_language = str(default_language)
         self._s3gen_estimator_dtype = _parse_dtype(self.config.s3gen_estimator_dtype)
         if self.config.s3gen_graphs:
             if self.config.s3gen_compile:
@@ -187,11 +190,20 @@ class ChatterboxModel(Model):
     def _build_text_tokenizer(self):
         from mstar.model.chatterbox.components.text import (
             ChatterboxTextTokenizer,
+            MultilingualTextTokenizer,
             TurboTextTokenizer,
         )
 
         if self.config.is_turbo:
             return TurboTextTokenizer(self.local_dir)
+        if self.config.is_multilingual:
+            cangjie = self.config.cangjie_file
+            return MultilingualTextTokenizer(
+                Path(self.local_dir) / self.config.text_tokenizer_file,
+                Path(self.local_dir) / cangjie if cangjie else None,
+                start_token=self.config.t3.start_text_token,
+                stop_token=self.config.t3.stop_text_token,
+            )
         return ChatterboxTextTokenizer(
             Path(self.local_dir) / self.config.text_tokenizer_file,
             start_token=self.config.t3.start_text_token,
@@ -485,7 +497,7 @@ class ChatterboxModel(Model):
         if set(output_modalities) != {"audio"}:
             raise ValueError("Chatterbox produces audio output only")
 
-        text_ids = self.tokenizer(prompt)
+        text_ids = self._tokenize(prompt, kwargs.get("language_id"))
         if text_ids.numel() > self.config.max_text_tokens:
             raise ValueError(
                 f"Text is {text_ids.numel()} tokens; the limit is "
@@ -507,6 +519,17 @@ class ChatterboxModel(Model):
         out[REF_AUDIO] = [wav]
         out[VOICE_KEY] = [voice_key_for(wav)]
         return out
+
+    def _tokenize(self, prompt: str, language_id: str | None) -> torch.Tensor:
+        """Text ids for the variant's front end; ``language_id`` (a request knob)
+        selects the multilingual checkpoint's language token and preprocessing
+        and falls back to the deployment's ``default_language``."""
+        if self.config.is_multilingual:
+            lang = language_id if language_id is not None else self.config.default_language
+            return self.tokenizer(prompt, language_id=lang)
+        if language_id is not None:
+            logger.warning("language_id %r is ignored: only Chatterbox Multilingual takes a language", language_id)
+        return self.tokenizer(prompt)
 
     # -----------------------------------------------------------------------
     # Conductor state machine
