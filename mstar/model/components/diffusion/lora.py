@@ -9,7 +9,9 @@ Accepted checkpoint layouts (``.safetensors``):
 
 * diffusers / PEFT: ``[transformer.]<module>.lora_A.weight`` + ``.lora_B.weight`` (also the
   ``base_model.model.`` prefix), optionally ``<module>.alpha``; without an alpha the scaling
-  is ``1`` (diffusers sets ``lora_alpha = r``).
+  comes from an ``adapter_config.json`` / ``config.json`` next to the weights when there is one
+  (``lora_alpha`` / ``r``, and ``use_rslora`` for ``lora_alpha / sqrt(r)``, as PEFT applies them),
+  else it is ``1`` (``lora_alpha = r``).
 * Kohya-style naming ``lora_down`` / ``lora_up`` for A / B.
 * model-native layouts (e.g. the BFL ``double_blocks.N.img_attn.qkv`` keys of FLUX.2) through a
   model-supplied ``convert_keys`` hook that rewrites them to the diffusers module paths.
@@ -69,9 +71,43 @@ def load_lora_file(path: str, device="cpu") -> dict[str, torch.Tensor]:
 
 KeyConverter = Callable[[dict[str, torch.Tensor]], dict[str, torch.Tensor]]
 
+_SIDECAR_CONFIGS = ("adapter_config.json", "config.json")
+
+
+def sidecar_default_alpha(path: str) -> Callable[[int], float] | None:
+    """``rank -> alpha`` reproducing PEFT's scaling for an adapter whose safetensors has no alpha keys.
+
+    PEFT reads ``lora_alpha`` (and ``use_rslora``) from the adapter's config, so ``load_lora_weights`` applies
+    ``lora_alpha / r`` — or ``lora_alpha / sqrt(r)`` for rank-stabilized adapters — where the bare weights
+    would suggest ``1``. Looks for ``adapter_config.json`` then ``config.json`` next to ``path`` and accepts
+    the training-config spellings too (``alpha``, ``lora_rank`` / ``rank``). None when there is nothing to read.
+    """
+    import json
+    import math
+    from pathlib import Path
+
+    for name in _SIDECAR_CONFIGS:
+        candidate = Path(path).parent / name
+        if not candidate.is_file():
+            continue
+        try:
+            config = json.loads(candidate.read_text())
+        except ValueError:
+            continue
+        if not isinstance(config, dict):
+            continue
+        lora_alpha = config.get("lora_alpha", config.get("alpha"))
+        if lora_alpha is None:
+            continue
+        rslora = bool(config.get("use_rslora", False))
+        logger.info("LoRA %s: scaling from %s (lora_alpha %s, rslora %s)", path, name, lora_alpha, rslora)
+        return lambda rank: float(lora_alpha) * (math.sqrt(rank) if rslora else 1.0)
+    return None
+
 
 def normalize_lora_state_dict(
     state_dict: dict[str, torch.Tensor], convert_keys: KeyConverter | None = None,
+    default_alpha: Callable[[int], float] | None = None,
 ) -> LoraAdapter:
     """Group raw LoRA tensors into per-module ``(A, B, alpha)`` triples in diffusers naming."""
     sd = {}
@@ -105,7 +141,8 @@ def normalize_lora_state_dict(
         rank = a.shape[0]
         if b.shape[1] != rank:
             raise ValueError(f"LoRA module {module!r}: A is rank {rank} but B has {b.shape[1]} columns")
-        adapter.layers[module] = (a, b, alphas.get(module, float(rank)))
+        fallback = default_alpha(rank) if default_alpha is not None else float(rank)
+        adapter.layers[module] = (a, b, alphas.get(module, fallback))
     return adapter
 
 
@@ -161,6 +198,8 @@ def apply_loras(
 ) -> None:
     """Load and merge each adapter in order (later adapters see the earlier merges)."""
     for spec in specs:
-        adapter = normalize_lora_state_dict(load_lora_file(spec.path), convert_keys=convert_keys)
+        adapter = normalize_lora_state_dict(
+            load_lora_file(spec.path), convert_keys=convert_keys, default_alpha=sidecar_default_alpha(spec.path),
+        )
         merge_lora(module, adapter, remap, stacked_params, scale=spec.scale)
         logger.info("LoRA %s: %d layers merged at scale %.3f", spec.path, len(adapter), spec.scale)
