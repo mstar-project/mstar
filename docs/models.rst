@@ -209,7 +209,10 @@ Chatterbox notes
   (``bench_all.sh`` drives M*, Chatterbox-TTS-Server and chatterbox-vllm on
   one GPU; ``reference_greedy.py`` + ``serve_parity.py`` compare a served
   greedy synthesis with the reference package; ``wer_eval.py`` is the Whisper
-  intelligibility guard).
+  intelligibility guard; ``node_breakdown.py`` turns a served run's
+  ``--log-stats`` profiles into a per-node time table; ``profile_s3gen.py``
+  micro-benchmarks the flow estimator, solve, encoder, vocoder and watermark
+  by precision, eager vs. CUDA graph).
 
 Cosmos3 environment requirements
 --------------------------------
