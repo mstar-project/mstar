@@ -13,6 +13,7 @@ Reference behaviour these mirror: ``chatterbox/tts.py`` (``prepare_conditionals`
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from collections import OrderedDict
@@ -25,7 +26,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig
+from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -177,6 +178,11 @@ class T3Submodule(ARNodeSubmodule):
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # prefill captures: total tokens of the batch (conditioning + text + BOS,
+    # about 170-300 per request; Turbo's longer voice prompt about 400-550),
+    # for a few requests at a time; bigger admissions run eagerly
+    PREFILL_TOKEN_BUCKETS = [256, 512, 1024, 2048]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
     def __init__(
         self, model: nn.Module, config: ChatterboxConfig, builtin_voice: BuiltinT3Voice | None,
@@ -419,11 +425,38 @@ class T3Submodule(ARNodeSubmodule):
         del graph_walk
         return self.MAX_BATCH_SIZE
 
+    def _prefill_capture_input(
+        self, requires_cfg: bool, device: torch.device, dtype: torch.dtype, n: int,
+    ) -> ARNodeInputs:
+        """A stand-in prefill of ``n`` tokens with the shape ``prepare_inputs`` yields."""
+        tensor_inputs = {"cfg_weight": torch.full((1,), 0.5 if requires_cfg else 0.0, device=device)}
+        if requires_cfg:
+            tensor_inputs["uncond_embeds"] = torch.zeros(n, self.t3.hidden_size, dtype=dtype, device=device)
+        return ARNodeInputs(
+            input_embeds=torch.zeros(n, self.t3.hidden_size, dtype=dtype, device=device),
+            input_seq_len=n,
+            tensor_inputs=tensor_inputs,
+            resource_step_info=requires_cfg,
+        )
+
     def get_cuda_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list[CudaGraphConfig]:
         del tp_world_size
         dtype = self.model.speech_emb.weight.dtype
         configs = []
         for requires_cfg in ((True, False) if self.supports_cfg else (False,)):
+            if self.config.t3_prefill_graphs:
+                # both prefill walks replay the same captures; the packed
+                # layout pads the batch's tokens up to the bucket
+                configs.append(PackedCudaGraphConfig(
+                    capture_graph_walk="prefill",
+                    replay_graph_walks=list(PREFILL_WALKS),
+                    capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
+                    make_node_input=functools.partial(self._prefill_capture_input, requires_cfg, device, dtype),
+                    additional_key_info=requires_cfg,
+                    capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                    caps_eager_batch_size=False,
+                    compile=False,
+                ))
             configs.append(BatchedCudaGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
@@ -443,7 +476,9 @@ class T3Submodule(ARNodeSubmodule):
         return configs
 
     def can_use_cuda_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        if batch.graph_walk != "decode" or not self.can_batch(batch, model_inputs):
+        if not self.can_batch(batch, model_inputs):
+            return False
+        if batch.graph_walk in PREFILL_WALKS and not self.config.t3_prefill_graphs:
             return False
         return super().can_use_cuda_graphs(batch, model_inputs)
 
