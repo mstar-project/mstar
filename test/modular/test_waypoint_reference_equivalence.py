@@ -135,7 +135,8 @@ class _DitNode(NodeSubmodule):
 
 
 def _load_reference(checkpoint: Path = CHECKPOINT) -> dict:
-    # Served reference: islands cloned pre-patch, flex pinned to the port's kernel, matmul precision 'high' for the reference's batch-5 sigma LUT (TF32, not 'highest').
+    # Served reference: islands cloned pre-patch, flex pinned to the port's kernel,
+    # matmul precision 'high' for the reference's batch-5 sigma LUT (TF32, not 'highest').
     WorldModel, StaticKVCache, patch_model = _import_reference()
     torch.set_float32_matmul_precision("high")
 

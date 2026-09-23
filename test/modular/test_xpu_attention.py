@@ -8,8 +8,8 @@ from mstar.engine.resources import (
     AttentionSpec,
     AttentionStep,
     AttnBackend,
-    KVConfig,
     KVSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     StepContext,
@@ -22,8 +22,8 @@ from mstar.engine.resources.kv.plan import KVPlanOutput, SequenceView
 from mstar.engine.resources.sampler.utils import _rng_offset_stride
 
 
-def _kv_config() -> KVConfig:
-    return KVConfig(
+def _kv_config() -> PagedKVConfig:
+    return PagedKVConfig(
         num_layers=1,
         num_kv_heads=2,
         head_dim=8,

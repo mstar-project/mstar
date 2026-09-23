@@ -26,6 +26,7 @@ _BACKEND_KV_CONFIG: dict[AttnBackend, type[KVConfig]] = {
     AttnBackend.DENSE: PagedKVConfig,
     AttnBackend.FLASHINFER: PagedKVConfig,
     AttnBackend.FLEX: RingKVConfig,
+    AttnBackend.XPU_PAGED: PagedKVConfig,
 }
 
 

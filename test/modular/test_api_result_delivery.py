@@ -165,6 +165,7 @@ def _api_server_stub(preprocess_worker):
     server.log_stats = False
     server.request_lock = threading.Lock()
     server.timeout_seconds = 5.0
+    server.enable_nvtx = False
     return server
 
 

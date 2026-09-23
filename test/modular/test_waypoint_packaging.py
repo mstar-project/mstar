@@ -24,7 +24,7 @@ from mstar.model.waypoint.components.taehv import load_taehv
 ROOT = Path(__file__).resolve().parents[2]
 ROOT_PYPROJECT = ROOT / "pyproject.toml"
 ALIAS_PYPROJECTS = (
-    ROOT / "packaging" / "aliases" / "mstar-ai" / "pyproject.toml",
+    ROOT / "packaging" / "aliases" / "mstar-serve" / "pyproject.toml",
     ROOT / "packaging" / "aliases" / "mstar-project" / "pyproject.toml",
 )
 
@@ -46,13 +46,11 @@ def test_published_metadata_contains_no_direct_url_dependencies():
     assert direct == [], "PyPI rejects distributions that declare direct-URL dependencies"
 
 
-def test_alias_packages_forward_every_root_extra():
-    root_extras = _project(ROOT_PYPROJECT)["optional-dependencies"]
+def test_alias_packages_forward_the_waypoint_extra():
+    root_name = _project(ROOT_PYPROJECT)["name"]
     for path in ALIAS_PYPROJECTS:
         alias_extras = _project(path)["optional-dependencies"]
-        assert set(alias_extras) == set(root_extras)
-        for extra in root_extras:
-            assert alias_extras[extra] == [f"m-star[{extra}]"]
+        assert alias_extras.get("waypoint") == [f"{root_name}[waypoint]"], path
 
 
 def test_waypoint_extra_is_index_safe_and_taehv_pin_is_runtime_contract():

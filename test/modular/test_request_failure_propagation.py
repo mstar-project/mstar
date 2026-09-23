@@ -255,6 +255,8 @@ def _preprocess_thread(model):
     wt.request_model_kwargs = {}
     wt.tensor_uuid_to_metadata_per_request = {"r1": {"u1": {}}}
     wt.enable_prof = False
+    wt.enable_nvtx = False
+    wt.tensor_uuid_to_output_order_per_request = {"r1": {"u1": (0, None)}}
     return wt
 
 
