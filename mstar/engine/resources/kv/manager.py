@@ -26,6 +26,7 @@ from mstar.engine.resources.kv.plan import (
     group_by_plan_label,
 )
 from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
+from mstar.engine.resources.speculative.config import SPEC_ACCEPTANCE
 from mstar.engine.resources.step import (
     ADMIT_OK,
     AdmitFailedReason,
@@ -188,7 +189,10 @@ class KVManager(AttentionResource):
         transfer_engine_info: TransferEngineInfo,
         device: torch.device,
         dtype=torch.bfloat16,
+            plan_after: tuple[str, ...] = (),
     ):
+        # plans that must precede this cache's (KVSpec.plan_after)
+        self._plan_after = set(plan_after)
         self.config = cfg
         if joint_comm_group is not None:
             # before the cache is allocated: it is sized off the head counts
@@ -250,8 +254,12 @@ class KVManager(AttentionResource):
             device=info.device,
             joint_comm_group=info.joint_comm_group,
             transfer_engine_info=info.transfer_engine_info,
+            plan_after=tuple(spec.plan_after),
             dtype=info.kv_dtype,
         )
+
+    def depends_on(self) -> set[str]:
+        return set(self._plan_after)
 
     def build_cuda_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
@@ -584,6 +592,13 @@ class KVManager(AttentionResource):
         for (from_label, to_label) in step.pre_forks:
             for rid in ctx.padded_request_ids:
                 self._apply_fork(rid, from_label, to_label, undo=undo)
+        # a speculating node's previous step committed its full block; take the
+        # rejected tail back before the views are built (a fact about that step,
+        # so it is not part of a preplan's undo record)
+        verdicts = ctx.plan_results.get(SPEC_ACCEPTANCE)
+        if verdicts:
+            for rid, verdict in verdicts.items():
+                self.correct_len(rid, verdict.label, -verdict.rejected)
         res = KVPlanOutputs(
             {
                 plan_label: self._plan_output(self._sequence_views(segments))
@@ -634,6 +649,18 @@ class KVManager(AttentionResource):
         self._preplanned = False
         self._preplan_states = {}
         self._cached_plan_output = None
+
+    def correct_len(self, rid: str, label: str, delta: int) -> None:
+        """Move a stream's stored length by ``delta`` tokens, pages kept: a
+        speculative verify step commits its whole block and its rejected tail
+        is taken back here once the acceptance is known. The generation moves
+        so an offload claimed against the old length fails its guard."""
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None or delta == 0:
+                return
+            stream.stored_len = max(0, stream.stored_len + delta)
+            stream.generation += 1
 
     def commit(self, step: KVStep, ctx: StepContext):
         # atomic against admit_retrieve reading stored_len on another thread
@@ -1137,10 +1164,11 @@ class KVManager(AttentionResource):
 
     @torch.compiler.disable
     def write_kv(
-        self, k: torch.Tensor, v: torch.Tensor,
+        self, k: torch.Tensor, v: torch.Tensor | None = None,
         layer_idx: int=None, label: str=None, return_tensor: bool = False,
     ) -> torch.Tensor | None:
-        """Write K, V into this step's planned slots.
+        """Write K, V into this step's planned slots (under MLA: the per-token
+        latent as ``k`` and ``v=None``).
 
         Returns nothing by default: reading the slots back is a gather no
         caller wants today, and skipping it keeps the write a pure mutation.
@@ -1153,7 +1181,7 @@ class KVManager(AttentionResource):
         n = plan_state.total_tokens
         return self.kv_cache.write_tokens(
             layer_idx=layer_idx,
-            k=k[:n], v=v[:n],
+            k=k[:n], v=None if v is None else v[:n],
             page_idx=plan_state.token_to_page[:n],
             cache_idx=plan_state.token_to_cache[:n],
             return_tensor=return_tensor,

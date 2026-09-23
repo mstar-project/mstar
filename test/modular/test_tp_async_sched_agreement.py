@@ -68,3 +68,38 @@ def test_sp_mismatch_is_refused():
             tp_group=_Group([0], [1]),
             sp_group=_Group([0, 1], [1, 0]),
         ))
+
+
+# --- the submodule's default (MSTAR_TP_ASYNC_SCHED unset) --------------------
+
+def _resolving_worker(prefers, *, env_unset=True, already_on=False):
+    submodule = types.SimpleNamespace(prefers_tp_async_scheduling=prefers)
+    engine = types.SimpleNamespace(submodule=lambda n: submodule)
+    return types.SimpleNamespace(
+        parallel_nodes={"LLM"}, tp_async_sched=already_on, tp_async_nodes=None,
+        _tp_async_from_model=env_unset, worker_id="w0", is_tp_follower=False,
+        engine_manager=types.SimpleNamespace(get_engine=lambda n: engine),
+    )
+
+
+def test_submodule_default_turns_async_on_when_the_variable_is_unset():
+    w = _resolving_worker(True)
+    Worker._resolve_tp_async_default(w)
+    assert w.tp_async_sched and w.tp_async_nodes == frozenset({"LLM"})
+
+
+def test_a_set_variable_wins_over_the_submodule_default():
+    w = _resolving_worker(True, env_unset=False)  # MSTAR_TP_ASYNC_SCHED=0
+    Worker._resolve_tp_async_default(w)
+    assert not w.tp_async_sched and w.tp_async_nodes is None
+
+
+def test_no_preference_keeps_the_serial_protocol():
+    w = _resolving_worker(False)
+    Worker._resolve_tp_async_default(w)
+    assert not w.tp_async_sched
+    # a node whose engine has no loaded submodule is skipped, not an error
+    w = _resolving_worker(True)
+    w.engine_manager = types.SimpleNamespace(get_engine=lambda n: (_ for _ in ()).throw(KeyError(n)))
+    Worker._resolve_tp_async_default(w)
+    assert not w.tp_async_sched

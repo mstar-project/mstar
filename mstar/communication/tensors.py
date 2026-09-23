@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass
+from itertools import count
 from uuid import uuid4
 
 from mstar.distributed.base import ShardingConfig
@@ -26,6 +27,21 @@ from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
 
 logger = logging.getLogger(__name__)
+
+
+# Tensor ids: unique across every process of a deployment, cheap to make. A random per-process
+# prefix and a counter cost a string format each; ``str(uuid4())`` is several times that, and a
+# step stores one id per request. The prefix is made on first use in each process (keyed by pid,
+# so a forked child starts its own sequence instead of repeating its parent's).
+_tensor_ids: tuple[int, str, "count[int]"] | None = None  # (pid, prefix, counter)
+
+
+def new_tensor_id() -> str:
+    global _tensor_ids
+    pid = os.getpid()
+    if _tensor_ids is None or _tensor_ids[0] != pid:
+        _tensor_ids = (pid, f"{pid:x}-{uuid4().hex[:16]}-", count())
+    return f"{_tensor_ids[1]}{next(_tensor_ids[2]):x}"
 
 
 @dataclass
@@ -437,7 +453,7 @@ class TensorCommunicationManager(ABC):
 
             shard_dim = cfg.shard_dim.get(name) if cfg is not None else None
             for tensor in tensor_list:
-                tensor_uuid = str(uuid4())
+                tensor_uuid = new_tensor_id()
                 # TODO: only rearrange when (1) the tensor will be sent and
                 # (2) it may be split along the shard dim in transport. Doing
                 # it here unconditionally so TensorPointerInfo dims/strides
@@ -486,12 +502,12 @@ class TensorCommunicationManager(ABC):
             skip_cuda_sync=skip_cuda_sync,
         )
         for name in tensors:
-            logger.debug(
-                "Storing tensor %s (uuids %s) for nodes %s",
-                name, str([info.uuid for info in graph_node_info[name]]),
-                str([edge.name for edge in name_to_graph_edges.get(name, [])])
-            )
             edges = name_to_graph_edges.get(name, [])
+            if logger.isEnabledFor(logging.DEBUG):  # the lists are built per request per step
+                logger.debug(
+                    "Storing tensor %s (uuids %s) for nodes %s",
+                    name, [info.uuid for info in graph_node_info[name]], [edge.name for edge in edges],
+                )
             if skip_ref_count:
                 # Safety hold: ref=1 prevents premature GC. The caller
                 # must call set_output_ref_counts() to adjust to the real
@@ -529,8 +545,8 @@ class TensorCommunicationManager(ABC):
                 if info.uuid in actual_counts:
                     actual_counts[info.uuid] += 1
 
-        for uuid, count in actual_counts.items():
-            delta = count - 1  # subtract the safety hold of 1
+        for uuid, seen in actual_counts.items():
+            delta = seen - 1  # subtract the safety hold of 1
             if delta > 0:
                 self.tensor_store.increment_ref(request_id, uuid, n=delta)
             elif delta < 0:
@@ -577,7 +593,7 @@ class TensorCommunicationManager(ABC):
             start = info.offset // bytes_per_row
             end = start + info.nbytes // bytes_per_row
             slice_view = canonical_tensor[start:end]
-            new_uuid = str(uuid4())
+            new_uuid = new_tensor_id()
             self.tensor_store.put_tensor(request_id, new_uuid, slice_view)
             self.uuid_to_shard_dim[new_uuid] = shard_dim
             # Release this edge's stake on the producer's UUID — the slice now
@@ -726,7 +742,7 @@ class TensorCommunicationManager(ABC):
                         consolidated = buf.consolidate()
                         new_infos: list[TensorPointerInfo] = []
                         for uuid_, tensor in (
-                            (str(uuid4()), t) for t in consolidated
+                            (new_tensor_id(), t) for t in consolidated
                         ):
                             self.tensor_store.put_tensor(req_id, uuid_, tensor)
                             # +1 for graph-node usage (released by the

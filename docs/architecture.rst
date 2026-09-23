@@ -75,3 +75,5 @@ Execution flow (simplified)
    and admits each step's resource work around the forward pass. Workers then route the
    output tensors to downstream nodes and workers.
 4. Outputs marked for the client are post-processed (``postprocess``) and streamed back.
+   Small per-step outputs (a token per request, up to 4 KiB per tensor) travel as bytes
+   inside one message per step; larger ones are read over the tensor transport.

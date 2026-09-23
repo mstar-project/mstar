@@ -1,0 +1,19 @@
+# Speculative variant of kimi_k3_tiny_tp2.yaml with a block length that follows the batch size (see kimi_k3_tiny_spec_sched.yaml).
+# Tensor-parallel smoke of the Kimi K3 path (tiny checkpoint) on two GPUs.
+model: "kimi_k3"
+max_seq_len: 4096
+model_kwargs:
+  speculative_schedule: {2: 3, 4: 1, 8: 0}   # drafts per row by step size
+  checkpoint_dir: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ref/tiny_kimi_k3
+  max_output_tokens: 256
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1]
+    tp_size: 2
+    graph_walks: [prefill, decode]
+resources:
+  mla_kv:
+    max_num_pages: 512
+    page_size: 64
+  kda_state:
+    max_slots: 129

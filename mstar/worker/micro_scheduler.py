@@ -1,7 +1,7 @@
 import logging
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -39,6 +39,12 @@ class ScheduledBatch:
     # ``ScheduleTPNode.spec_seq`` this batch came off the TP-follow FIFO with,
     # -1 otherwise. ``split_off_first`` / ``merge`` only ever see -1.
     tp_seq: int = -1
+    # rid -> walk for rows riding along from another walk of the same node
+    # (``NodeSubmodule.mixed_step_walks``); rids absent here run ``graph_walk``
+    request_walks: dict[str, str] = field(default_factory=dict)
+
+    def walk_of(self, rid: str) -> str:
+        return self.request_walks.get(rid, self.graph_walk)
 
     def merge(self, other: "ScheduledBatch") -> None:
         """Fold ``other``'s requests in, ours first — they have waited longer."""
@@ -47,6 +53,7 @@ class ScheduledBatch:
         ), "only batches for the same (node, walk) share a backlog entry"
         self.node_objects.update(other.node_objects)
         self.request_to_worker_graph.update(other.request_to_worker_graph)
+        self.request_walks.update(other.request_walks)
 
     def split_off_first(
         self, bs: int | None, exclude_rids: set[str] | None = None
@@ -69,6 +76,7 @@ class ScheduledBatch:
             return None, self
 
         rids = list(rids)
+        rest = keep_rids[bs:] + exclude_rids
         return ScheduledBatch(
             node_name=self.node_name,
             graph_walk=self.graph_walk,
@@ -77,16 +85,18 @@ class ScheduledBatch:
             },
             request_to_worker_graph={
                 rid: self.request_to_worker_graph[rid] for rid in keep_rids[:bs]
-            }
+            },
+            request_walks={rid: w for rid, w in self.request_walks.items() if rid in keep_rids[:bs]},
         ), ScheduledBatch(
             node_name=self.node_name,
             graph_walk=self.graph_walk,
             node_objects={
-                rid: self.node_objects[rid] for rid in keep_rids[bs:] + exclude_rids
+                rid: self.node_objects[rid] for rid in rest
             },
             request_to_worker_graph={
-                rid: self.request_to_worker_graph[rid] for rid in keep_rids[bs:] + exclude_rids
-            }
+                rid: self.request_to_worker_graph[rid] for rid in rest
+            },
+            request_walks={rid: w for rid, w in self.request_walks.items() if rid in rest},
         )
 
 
@@ -117,6 +127,9 @@ class MicroScheduler:
         self.engine_manager = engine_manager
         self.batch_number = 0
         self.sched_type = sched_type
+        # steps that carried rows of another walk, and those rows (mixed_step_walks)
+        self.mixed_steps = 0
+        self.mixed_rows = 0
 
         # RIDs that have failed but have not gone through the cleanup procedure;
         # these cannot be scheduled (unless this is a TP follower node)
@@ -211,21 +224,12 @@ class MicroScheduler:
         retries later for a partially ready set."""
         if not request_ids:
             return {}, {}
-        node_partition = worker_graphs_manager.get_partition_for_node(node_name)
+        if not self.rids_ready(worker_graphs_manager, node_name, graph_walk, request_ids):
+            return None
         wgid = worker_graphs_manager.get_worker_graph_id_for_node(
             request_ids[0], node_name, graph_walk=graph_walk,
         )
         queue = worker_graphs_manager.queues[wgid]
-        for rid in request_ids:
-            # An unknown rid (removed on this rank) counts as not ready.
-            wg = queue.per_request_queues.get(rid)
-            if wg is None or node_name not in wg.ready_node_names:
-                return None
-            fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
-            # Engine-level readiness
-            if not self._check_ready(node_name, rid, fwd_info):
-                return None
-
         node_objects: dict[str, GraphNode] = {}
         request_to_worker_graph: dict[str, str] = {}
         for rid in request_ids:
@@ -238,6 +242,29 @@ class MicroScheduler:
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[(node_name, graph_walk)] = self.batch_number
         return node_objects, request_to_worker_graph
+
+    def rids_ready(
+        self, worker_graphs_manager: WorkerGraphsManager,
+        node_name: str, graph_walk: str, request_ids: list[str],
+    ) -> bool:
+        """Whether ``node_name`` is ready for every one of ``request_ids`` on ``graph_walk``
+        (an unknown rid, removed on this rank, counts as not ready)."""
+        if not request_ids:
+            return True
+        node_partition = worker_graphs_manager.get_partition_for_node(node_name)
+        wgid = worker_graphs_manager.get_worker_graph_id_for_node(
+            request_ids[0], node_name, graph_walk=graph_walk,
+        )
+        queue = worker_graphs_manager.queues[wgid]
+        for rid in request_ids:
+            wg = queue.per_request_queues.get(rid)
+            if wg is None or node_name not in wg.ready_node_names:
+                return False
+            fwd_info = worker_graphs_manager.get_fwd_info(rid, node_partition)
+            # Engine-level readiness
+            if not self._check_ready(node_name, rid, fwd_info):
+                return False
+        return True
 
     def _try_schedule_tp_follow(
         self, worker_graphs_manager: WorkerGraphsManager,
@@ -255,15 +282,26 @@ class MicroScheduler:
                     (first_tp_node.node_name, first_tp_node.graph_walk)
                 ):
             return
-        # Check readiness for every rid to pop all-or-none. Use the
-        # leader's graph walk.
-        popped = self.pop_ready_rids(
-            worker_graphs_manager, first_tp_node.node_name,
-            first_tp_node.graph_walk, first_tp_node.request_ids,
-        )
-        if popped is None:
-            return
-        node_objects, request_to_worker_graph = popped
+        # Check readiness for every rid to pop all-or-none, using the leader's
+        # walk per rid: rows riding along from another walk are popped under
+        # theirs. The batch order is the leader's wire order.
+        walks = first_tp_node.request_walks or {}
+        groups: dict[str, list[str]] = {}
+        for rid in first_tp_node.request_ids:
+            groups.setdefault(walks.get(rid, first_tp_node.graph_walk), []).append(rid)
+        for walk, rids in groups.items():
+            if not self.rids_ready(worker_graphs_manager, first_tp_node.node_name, walk, rids):
+                return
+        node_objects: dict[str, GraphNode] = {}
+        request_to_worker_graph: dict[str, str] = {}
+        for walk, rids in groups.items():
+            popped = self.pop_ready_rids(
+                worker_graphs_manager, first_tp_node.node_name, walk, rids,
+            )
+            assert popped is not None, (walk, rids)  # checked just above
+            node_objects.update(popped[0])
+            request_to_worker_graph.update(popped[1])
+        node_objects = {rid: node_objects[rid] for rid in first_tp_node.request_ids}
 
         self.pop_tp_follow_head()
 
@@ -273,6 +311,7 @@ class MicroScheduler:
             node_objects=node_objects,
             request_to_worker_graph=request_to_worker_graph,
             tp_seq=first_tp_node.spec_seq,
+            request_walks=dict(walks),
         )
 
 
@@ -312,7 +351,7 @@ class MicroScheduler:
             pre_existing_batch_size=pre_existing_batch_size
         )
         if sched_from_backlog is not None:
-            return sched_from_backlog
+            return self._with_mixed_rows(worker_graphs_manager, sched_from_backlog, target)
 
         if target is not None:
             target_node_name, target_graph_walk = target
@@ -403,7 +442,80 @@ class MicroScheduler:
 
         # Everything past the first step is already popped off the queues, so
         # it has to be remembered here or it would never run.
-        return self._cap_batch_and_schedule(batch=full_batch, max_bs=remaining)
+        capped = self._cap_batch_and_schedule(batch=full_batch, max_bs=remaining)
+        return self._with_mixed_rows(worker_graphs_manager, capped, target)
+
+    def _with_mixed_rows(
+        self, worker_graphs_manager: WorkerGraphsManager,
+        batch: ScheduledBatch | None, target: tuple[str, str] | None,
+    ) -> ScheduledBatch | None:
+        """Append the ready requests of the walks the node lets ride along in a
+        step of ``batch.graph_walk`` (``NodeSubmodule.mixed_step_walks``), each
+        under its own walk and up to that walk's own cap.
+
+        Only for a leader's own step: a targeted call (speculation) and a
+        TP-follow batch reproduce a composition decided elsewhere.
+        """
+        if batch is None or target is not None or batch.tp_seq != -1:
+            return batch
+        # engine stand-ins in tests may predate the hook: no hook, nothing rides along
+        hook = getattr(self.engine_manager.get_engine(batch.node_name), "mixed_step_walks", None)
+        walks = hook(batch.node_name, batch.graph_walk) if hook is not None else set()
+        for walk in sorted(walks):
+            if walk == batch.graph_walk:
+                continue
+            cap = self._max_batch_size(batch.node_name, walk)
+            entries = self._ready_entries(
+                worker_graphs_manager, batch.node_name, walk, exclude=set(batch.node_objects),
+            )
+            logger.debug(
+                "MicroScheduler: %s step of %s with %d rows; %d %s rows ready to ride along (cap %s)",
+                batch.graph_walk, batch.node_name, len(batch.node_objects), len(entries), walk, cap,
+            )
+            if cap is not None:
+                entries = entries[:cap]
+            extra = self._assemble_batch(worker_graphs_manager, batch.node_name, walk, entries)
+            if not extra:
+                continue
+            batch.node_objects.update(extra.node_objects)
+            batch.request_to_worker_graph.update(extra.request_to_worker_graph)
+            for rid in extra.node_objects:
+                batch.request_walks[rid] = walk
+            self._mark_scheduled(batch.node_name, walk, len(extra.node_objects))
+            self.mixed_steps += 1
+            self.mixed_rows += len(extra.node_objects)
+            # once per process at INFO (operational visibility that the feature engaged), then DEBUG
+            (logger.info if self.mixed_steps == 1 else logger.debug)(
+                "MicroScheduler: %d %s rows ride along in a %s step of %s (%d own rows)",
+                len(extra.node_objects), walk, batch.graph_walk, batch.node_name,
+                len(batch.node_objects) - len(batch.request_walks),
+            )
+        return batch
+
+    def _ready_entries(
+        self, worker_graphs_manager: WorkerGraphsManager,
+        node_name: str, graph_walk: str, exclude: set[str],
+    ) -> list[ReadyNodeEntry]:
+        """The requests ready for ``node_name`` on ``graph_walk`` right now, in
+        queue order, with the same exclusions as the main scan."""
+        entries: list[ReadyNodeEntry] = []
+        for worker_graph_id, queue in worker_graphs_manager.queues.items():
+            for request_id, node_names in queue.get_ready_node_names().items():
+                if (
+                    request_id in exclude or node_name not in node_names
+                    or request_id not in worker_graphs_manager.per_request_info
+                    or request_id in self.pending_removes or request_id in self.held_until
+                    or request_id in self.failed_rids
+                ):
+                    continue
+                node_partition = worker_graphs_manager.get_partition_for_node(node_name)
+                if worker_graphs_manager.get_graph_walk(request_id, node_partition) != graph_walk:
+                    continue
+                fwd_info = worker_graphs_manager.get_fwd_info(request_id, node_partition)
+                if not self._check_ready(node_name, request_id, fwd_info):
+                    continue
+                entries.append(ReadyNodeEntry(request_id, worker_graph_id, graph_walk))
+        return entries
 
     @staticmethod
     def _remaining_capacity(

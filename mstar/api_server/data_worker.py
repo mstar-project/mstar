@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import time
+from dataclasses import dataclass
 
 import torch
 
@@ -23,7 +24,7 @@ from mstar.api_server.request_types import (
     ResultTensors,
 )
 from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
-from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
+from mstar.communication.tensors import NameToTensorList, _deserialize_tensor, create_tensor_communication_manager
 from mstar.model.base import Model
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils.ipc_format import (
@@ -139,6 +140,20 @@ class PreprocessWorker:
         self.output_loop_idxs.pop(request_id, None)
         self.per_request_reading_tensors.pop(request_id, None)
 
+    def new_inline_result(self, res: ResultTensors, data: dict[str, bytes]):
+        """A result whose tensor bytes arrived in the message (``InlineResults``): the same
+        bookkeeping as :meth:`new_result_tensors`, then delivery without a transport read."""
+        if res.request_id not in self.output_loop_idxs:
+            logger.debug("Late inline result for cleaned-up request %s, dropping", res.request_id)
+            return
+        name = res.graph_edge.name
+        self.output_loop_idxs[res.request_id][name] = res.loop_indices.max(
+            self.output_loop_idxs[res.request_id].get(name, None)
+        )
+        self.per_request_reading_tensors[res.request_id] += len(res.graph_edge.tensor_info)
+        self.result_tensor_input_queue.put(
+            InlineResult(res, {info.uuid: data[info.uuid] for info in res.graph_edge.tensor_info}))
+
     def new_result_tensors(self, input: ResultTensors):
         name = input.graph_edge.name
         if input.request_id not in self.output_loop_idxs:
@@ -242,6 +257,13 @@ class PreprocessWorker:
         self.stop_event.set()
         if self.thread.is_alive():
             self.thread.join()
+
+
+@dataclass
+class InlineResult:
+    """A ``ResultTensors`` whose tensors came inline (uuid -> bytes) instead of over the transport."""
+    result: ResultTensors
+    data: dict[str, bytes]
 
 
 class PreprocessWorkerThread:
@@ -487,29 +509,9 @@ class PreprocessWorkerThread:
                             request_id=request_id,
                             uuid=tensor_info.uuid
                         )
-                        postprocessed = self.model.postprocess(
-                            tensor, modality,
-                            request_kwargs=self.request_model_kwargs.get(request_id),
-                        )
-
                         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][
                             tensor_info.uuid] or {}
-                        # Audio is emitted as headerless 16-bit PCM; surface the
-                        # model's output sample rate + channel count so clients can
-                        # wrap it.
-                        if modality == "audio" and self.model is not None:
-                            chunk_metadata = {
-                                **chunk_metadata,
-                                "sample_rate": self.model.get_output_sample_rate("audio"),
-                                "num_channels": self.model.get_output_audio_channels("audio"),
-                            }
-
-                        self.out_queue.put(ResultChunk(
-                            request_id=request_id,
-                            modality=modality,
-                            data=postprocessed,
-                            metadata=chunk_metadata,
-                        ))
+                        self._emit_chunk(request_id, modality, tensor, chunk_metadata)
                     except Exception as exc:  # noqa: BLE001 — must reach the client
                         self._fail_request(
                             request_id, exc, f"{modality} output postprocessing",
@@ -522,6 +524,40 @@ class PreprocessWorkerThread:
                         uuid=tensor_info.uuid
                     )
         return did_work
+
+    def _emit_chunk(self, request_id: str, modality: str, tensor, chunk_metadata: dict) -> None:
+        """Postprocess one output tensor and queue the chunk for the client."""
+        postprocessed = self.model.postprocess(
+            tensor, modality,
+            request_kwargs=self.request_model_kwargs.get(request_id),
+        )
+        # Audio is emitted as headerless 16-bit PCM; surface the model's output sample
+        # rate + channel count so clients can wrap it.
+        if modality == "audio" and self.model is not None:
+            chunk_metadata = {
+                **chunk_metadata,
+                "sample_rate": self.model.get_output_sample_rate("audio"),
+                "num_channels": self.model.get_output_audio_channels("audio"),
+            }
+        self.out_queue.put(ResultChunk(
+            request_id=request_id,
+            modality=modality,
+            data=postprocessed,
+            metadata=chunk_metadata,
+        ))
+
+    def _deliver_inline_result(self, item: InlineResult) -> None:
+        """A result whose bytes came in the message: rebuild the tensors and emit the chunks.
+        Nothing to read or ack; a draining request's chunks are simply dropped."""
+        res = item.result
+        if res.request_id in self._draining_rids:
+            return
+        for info in res.graph_edge.tensor_info:
+            try:
+                tensor = _deserialize_tensor(item.data[info.uuid], "cpu", info)
+                self._emit_chunk(res.request_id, res.modality, tensor, res.metadata or {})
+            except Exception as exc:  # noqa: BLE001 — must reach the client
+                self._fail_request(res.request_id, exc, f"{res.modality} output postprocessing")
 
     def _process_messages(self):
         did_work = False
@@ -614,6 +650,9 @@ class PreprocessWorkerThread:
                 while not self.result_tensor_queue.empty():
                     did_work = True
                     result = self.result_tensor_queue.get()
+                    if isinstance(result, InlineResult):
+                        self._deliver_inline_result(result)
+                        continue
                     # Draining for teardown: don't start new reads — ack the
                     # tensors back so the producing worker can free its buffers.
                     if result.request_id in self._draining_rids:

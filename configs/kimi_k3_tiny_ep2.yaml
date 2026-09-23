@@ -1,0 +1,21 @@
+# Expert-parallel smoke of the Kimi K3 path (tiny fp32 checkpoint) on two GPUs: the two ranks
+# still form one tensor-parallel group, but each holds half of the routed experts whole
+# (moe_ep_size = tp_size) instead of every expert sharded on its intermediate dim. Served output
+# must match the dense greedy reference like the TP2 deployment does.
+model: "kimi_k3"
+max_seq_len: 4096
+model_kwargs:
+  checkpoint_dir: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ref/tiny_kimi_k3
+  max_output_tokens: 256
+  moe_ep_size: 2
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1]
+    tp_size: 2
+    graph_walks: [prefill, decode]
+resources:
+  mla_kv:
+    max_num_pages: 512
+    page_size: 64
+  kda_state:
+    max_slots: 129

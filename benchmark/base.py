@@ -323,6 +323,22 @@ class HiggsAudio(Model):
         }
 
 
+class KimiK3(Model):
+    """Kimi K3 text serving (M* ``kimi_k3``). Benchmarks send the prompt verbatim
+    (``raw_prompt``: no chat template, so fixed-length prompt files stay fixed-length)
+    and force greedy decoding; ``max_tokens``/``ignore_eos`` come from the runner's
+    output-length flags so both systems decode the same number of tokens."""
+
+    def get_hf_url(self):
+        return self.config.get("hf_url", "moonshotai/Kimi-K3")
+
+    def get_model_kwargs(self, request_type: RequestType):
+        return {"raw_prompt": True, "temperature": 0.0}
+
+    def get_supported_modalities(self):
+        return {RequestType.T2T}
+
+
 class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
@@ -332,8 +348,11 @@ class ModelType(Enum):
     VJEPA2AC = "vjepa2ac"
     WHISPER_LARGE = "whisper_large"
     HIGGS_AUDIO = "higgs_audio"
+    KIMI_K3 = "kimi_k3"
 
     def inst(self, **kwargs) -> Model:
+        if self == ModelType.KIMI_K3:
+            return KimiK3(**kwargs)
         if self == ModelType.BAGEL:
             return Bagel(**kwargs)
         if self == ModelType.ORPHEUS:

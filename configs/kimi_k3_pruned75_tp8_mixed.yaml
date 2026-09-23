@@ -1,0 +1,23 @@
+# Kimi-K3-pruned75 at TP8 (see configs/kimi_k3_pruned75_tp8.yaml) with decoding requests riding
+# along in prefill steps (model_kwargs.mixed_prefill_decode): a prefill of up to 8 prompts no longer
+# stalls the other streams for its ~1.3 s; their one-token rows are packed behind the prompts and the
+# step still runs eagerly as a prefill. Same memory budget as the TP8 config.
+model: "kimi_k3"
+max_seq_len: 16384
+model_kwargs:
+  checkpoint_dir: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ckpt/Kimi-K3-pruned75
+  max_output_tokens: 2048
+  max_capture_batch_size: 64   # = kda_state.max_slots - 1
+  max_prefill_batch_size: 8    # prompts per prefill step
+  mixed_prefill_decode: true
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]
+resources:
+  mla_kv:
+    max_num_pages: 1792      # 64 requests x 24 pages (1024+512 tokens) + 128 capture rows; 3.2 GB per rank
+    page_size: 64
+  kda_state:
+    max_slots: 65        # 64 x 54 MiB = 3.5 GB per rank (+1 sink slot for captures/padding)

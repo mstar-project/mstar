@@ -59,6 +59,45 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
+   * - ``kimi_k3`` *(Beta)*
+     - ``moonshotai/Kimi-K3``
+     - Kimi K3 text LLM: 93-layer hybrid of Kimi Delta Attention (linear, recurrent
+       state) and gated NoPE MLA, Block Attention Residuals, 896-expert latent MoE with
+       MXFP4 experts. The expert-pruned ``mgoin/Kimi-K3-pruned75`` (224 experts, 475 GB)
+       fits one 8xH100 node at TP8 (``configs/kimi_k3_pruned75_tp8.yaml``); the full
+       1.56 TB checkpoint needs a multi-node deployment. Routed experts run on the Marlin
+       MXFP4 MoE kernel (vendored from vLLM, built on first use); FlashInfer's CUTLASS
+       MoE and an in-tree Triton kernel are the alternatives (``moe_backend``). The experts
+       are sharded on their intermediate dim across the tensor-parallel ranks by default;
+       ``model_kwargs.moe_ep_size`` (a divisor of ``tp_size``) places whole experts on
+       each rank instead (expert parallelism, ``configs/kimi_k3_pruned75_ep8.yaml``), or
+       mixes the two. The MoE latent down-projection is column-parallel and all-gathered
+       by default (``model_kwargs.moe_shard_latent: false`` replicates it). The KDA state
+       lives in the engine's recurrent state pool (``RecurrentStatePool``, one slot per
+       resident request; ``resources.kda_state.max_slots`` in the yaml, sink slot included)
+       and the layers run through the ``LinearAttnManager`` planned against it (variant
+       ``KDA``, fla / FlashKDA kernels; ``model_kwargs.kda_backend``).
+       ``model_kwargs.mixed_prefill_decode: true`` lets decoding requests
+       ride along in prefill steps instead of pausing for them;
+       ``model_kwargs.cuda_graphs: false`` serves every step eagerly (op-level
+       profiling). The decode step's fused Triton kernels (the KDA recurrence and
+       gated norm reading the projection slices in place, MLA's per-head output
+       with its gate) can be switched off with ``MSTAR_K3_FUSED_DECODE=0``. Tensor-parallel
+       deployments run the async scheduling protocol by default (the submodule sets
+       ``prefers_tp_async_scheduling``; ``MSTAR_TP_ASYNC_SCHED=0`` restores the serial
+       one): on pruned75 at TP8 it adds 10-14% decode throughput at every concurrency
+       with identical outputs. Text only for now (no vision tower).
+       Speculative decoding (experimental): ``model_kwargs.speculative_tokens: k`` makes
+       every decode step verify ``k`` drafted tokens in one pass (speculative sampling with each
+       request's temperature / top-k / top-p in captured steps, greedy verification in eager
+       ones; the KDA state is never rolled back, the pool keeps a checkpoint and the pending
+       prefix); ``model_kwargs.speculative_draft: <dir>`` loads the ``Inferact/Kimi-K3-DSpark``
+       draft (5 rope MLA layers over the target's aux hidden states, its own latent cache
+       ``resources.dspark_kv``), without it the drafts are the bonus token repeated (a path test).
+       ``model_kwargs.speculative_schedule: {16: 7, 32: 4, 64: 0}`` lets the block follow the
+       step's batch size (drafts per row up to each bound, the bounds being capture buckets;
+       none beyond the last): a verify step's cost grows with rows times block, so large batches
+       run shorter blocks or, at 0, single tokens that still consume the pending prefix.
 
 Notes
 -----

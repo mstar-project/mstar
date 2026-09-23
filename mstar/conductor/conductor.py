@@ -49,6 +49,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
+from mstar.utils.procs import die_with_parent, graceful_sigterm
 from mstar.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
@@ -139,11 +140,10 @@ def _worker_process_target(
     # the box. Turning it into SystemExit unwinds the interpreter normally,
     # which runs the transport's cleanup. The main process gets this for
     # free from SIGINT -> KeyboardInterrupt, which is why only the workers
-    # leaked.
-    def _graceful_exit(_signum, _frame):
-        raise SystemExit(0)
-
-    signal.signal(signal.SIGTERM, _graceful_exit)
+    # leaked. And a worker must not outlive the conductor: one that did kept
+    # its model resident (3.7 GB per GPU after a killed server, 2026-09-15).
+    graceful_sigterm()
+    die_with_parent(signal.SIGTERM)
     logging.basicConfig(
         level=getattr(logging, log_level),
         format=f"%(asctime)s %(levelname)s [{worker_id}] %(name)s: %(message)s",

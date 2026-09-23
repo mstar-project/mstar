@@ -1,8 +1,41 @@
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
+
+
+def _symm_mode(mode: str) -> tuple[bool, bool]:
+    """``MSTAR_SYMM_MEM_ALLREDUCE`` -> (use symmetric memory, prefer the multicast kernel).
+
+    ``auto`` (the default), ``lamport`` and ``multimem`` take the NVLink-multicast path for
+    what the Lamport kernel does not cover (see :func:`_lamport_mode`), falling back to the
+    one-shot/two-shot kernels where NVLS is missing and to NCCL where the group spans nodes;
+    ``1`` is the one-shot/two-shot path; ``0`` is NCCL only.
+    """
+    mode = mode.strip().lower()
+    if mode in ("0", "off", "false", "nccl"):
+        return False, False
+    if mode == "1":
+        return True, False
+    return True, True  # auto / lamport / multimem
+
+
+def _lamport_mode(mode: str) -> bool:
+    """Whether ``MSTAR_SYMM_MEM_ALLREDUCE`` selects the Lamport one-shot tier
+    (``mstar.distributed.lamport_allreduce``) for small 16-bit 2-D all-reduces and all-gathers:
+    ``auto`` (the default), ``lamport`` and ``flashinfer`` do; ``multimem``, ``1`` and ``0`` do not."""
+    return mode.strip().lower() in ("auto", "lamport", "flashinfer")
+
+
+def _flashinfer_mode(mode: str) -> bool:
+    """Whether the all-reduces of the Lamport tier run on flashinfer's TensorRT-LLM one-shot kernel
+    when its comm module imports (``auto`` and ``flashinfer``; ``lamport`` keeps M*'s own kernel,
+    which also serves the all-gathers and is the fallback without flashinfer)."""
+    return mode.strip().lower() in ("auto", "flashinfer")
 
 
 class CommGroup:
@@ -41,6 +74,12 @@ class CommGroup:
         if dim < 0:
             # Convert negative dim to positive
             dim += input_.dim()
+        if dim == 1 and input_.dim() == 2 and input_.is_cuda and self._symm_available():
+            # small column shards of a decode batch: one Lamport launch instead of NCCL + reshapes
+            channel = self._lamport_channel(input_, gather=True)
+            if channel is not None:
+                return channel.all_gather(input_)
+        input_ = input_.contiguous()  # the Lamport path above reads a strided view; NCCL needs a dense one
         input_size = input_.size()
         output_size = (input_size[0] * self.world_size,) + input_size[1:]
         # Allocate output tensor
@@ -64,9 +103,248 @@ class CommGroup:
             return
         dist.barrier(group=self.device_group)
 
+    # --- small-message all-reduce over symmetric memory -------------------------------
+    # A tensor-parallel decode step issues two small all-reduces per layer (a few KB to a
+    # few hundred KB). Measured on an 8xH100 NVLink node at [rows, 7168] bf16: NCCL takes
+    # 24-29 µs whatever the size; torch's symmetric-memory one-shot kernel (every rank reads
+    # its peers over NVLink and reduces locally) 12-13 µs up to ~128 KB, and the two-shot
+    # kernel (reduce-scatter + all-gather) 14-16 µs at 1 MB. Opt in with
+    # On by default (MSTAR_SYMM_MEM_ALLREDUCE=auto: the NVLink-multicast kernel, in place on a ring of
+    # buffers; =1 one-shot/two-shot; =0 NCCL). Messages up to
+    # MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES (default 256 KiB) go one-shot, up to
+    # MSTAR_SYMM_MEM_ALLREDUCE_MAX_BYTES (default 4 MiB) two-shot, larger ones stay on NCCL.
+    _symm_enabled: bool | None = None
+    _symm_multimem: bool = False
+    _symm_one_shot_max_bytes: int = 256 * 1024
+    _symm_max_bytes: int = 4 * 1024 * 1024
+    # the Lamport one-shot kernel (mstar/distributed/lamport_allreduce.py): one launch, no barrier,
+    # for 2-D bf16/fp16 messages (decode batches); one workspace per (dtype, width), built eagerly on
+    # first use (a collective, never under capture). All-gathers take it up to
+    # MSTAR_LAMPORT_ALLGATHER_MAX_ROWS rows (also the workspaces' row capacity); all-reduces only up to
+    # MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS rows, by default 128 // world_size: the one-shot's cost grows
+    # with rows x ranks and on 8xH100 it crosses the multicast ring near 16 rows at width 7168
+    # (4.0 / 5.9 / 28 / 62 us at 1 / 8 / 64 / 128 rows against 7.9 / 8.6 / 12.6 / 15.8; 2026-09-17)
+    _lamport_enabled: bool = False
+    _lamport_flashinfer: bool = False
+    _lamport_max_rows: int = 128
+    _lamport_reduce_max_rows: int | None = None
+
+    def _symm_available(self) -> bool:
+        if self._symm_enabled is None:
+            import os
+
+            mode = os.environ.get("MSTAR_SYMM_MEM_ALLREDUCE", "auto")
+            enabled, self._symm_multimem = _symm_mode(mode)
+            if enabled:
+                try:
+                    import torch.distributed._symmetric_memory  # noqa: F401
+
+                    enabled = hasattr(torch.ops.symm_mem, "one_shot_all_reduce")
+                except Exception:
+                    enabled = False
+                self._symm_max_bytes = int(os.environ.get("MSTAR_SYMM_MEM_ALLREDUCE_MAX_BYTES", self._symm_max_bytes))
+                self._symm_one_shot_max_bytes = int(
+                    os.environ.get("MSTAR_SYMM_MEM_ALLREDUCE_ONE_SHOT_MAX_BYTES", self._symm_one_shot_max_bytes))
+                self._lamport_enabled = enabled and _lamport_mode(mode)
+                self._lamport_flashinfer = self._lamport_enabled and _flashinfer_mode(mode)
+                self._lamport_max_rows = int(os.environ.get("MSTAR_LAMPORT_ALLGATHER_MAX_ROWS", self._lamport_max_rows))
+                reduce_rows = os.environ.get("MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS")
+                if reduce_rows is not None:
+                    self._lamport_reduce_max_rows = int(reduce_rows)
+            self._symm_enabled = enabled
+            self._symm_bufs: dict = {}
+            self._lamport_channels: dict = {}
+        return self._symm_enabled
+
+    # --- Lamport one-shot tier ----------------------------------------------------------
+    @property
+    def lamport_reduce_max_rows(self) -> int:
+        """Largest row count an all-reduce takes through the Lamport kernel (the all-gathers take
+        ``_lamport_max_rows``): ``MSTAR_LAMPORT_ALLREDUCE_MAX_ROWS`` or ``128 // world_size``, at
+        least 8 and never above the workspaces' capacity."""
+        if self._lamport_reduce_max_rows is None:
+            self._lamport_reduce_max_rows = min(self._lamport_max_rows, max(8, 128 // max(self.world_size, 1)))
+        return self._lamport_reduce_max_rows
+
+    def lamport_applies(self, shape, dtype: torch.dtype, device: torch.device, gather: bool = False) -> bool:
+        """Whether a 2-D message of this shape would take the Lamport kernel (all-reduce, or with
+        ``gather`` the all-gather along the last dim)."""
+        if self.world_size == 1 or device.type != "cuda" or not self._symm_available() or not self._lamport_enabled:
+            return False
+        if len(shape) != 2 or dtype not in (torch.bfloat16, torch.float16):
+            return False
+        rows, width = int(shape[0]), int(shape[1])
+        cap = self._lamport_max_rows if gather else self.lamport_reduce_max_rows
+        return 0 < rows <= cap and width > 0 and rows * width * 2 <= self._symm_max_bytes
+
+    def _lamport_channel(self, x: torch.Tensor, gather: bool = False):
+        """The workspace for ``x``'s (dtype, width), or None when the tier does not apply (or the
+        channel is missing while a CUDA graph is being captured: the caller stays on its other path).
+        All-reduces take flashinfer's kernel when selected and importable, all-gathers always ours."""
+        if not self.lamport_applies(x.shape, x.dtype, x.device, gather=gather) or x.stride(1) != 1:
+            return None
+        kind = "gather" if gather or not self._lamport_flashinfer else "reduce"
+        key = (kind, x.dtype, x.shape[1], x.device)
+        channel = self._lamport_channels.get(key, False)
+        if channel is False:
+            if torch.cuda.is_current_stream_capturing():
+                logger.warning("Lamport all-reduce channel %s first requested under CUDA-graph capture; "
+                               "warm the shape up eagerly first. Falling back for this call.", key)
+                return None
+            from mstar.distributed.lamport_allreduce import FlashInferAllReduce, LamportAllReduce
+
+            channel = None
+            if kind == "reduce":
+                try:
+                    channel = FlashInferAllReduce(
+                        self.device_group, self.rank, self.world_size, self._lamport_max_rows, x.shape[1], x.dtype,
+                        x.device)
+                    logger.info("all-reduce channel ready (flashinfer one-shot): %s x %d, up to %d rows "
+                                "(workspace %d), %d ranks", x.dtype, x.shape[1], self.lamport_reduce_max_rows,
+                                self._lamport_max_rows, self.world_size)
+                except Exception as ex:  # flashinfer missing or its workspace failing: our kernel
+                    logger.warning("flashinfer all-reduce unavailable (%s); using M*'s Lamport kernel", ex)
+                    self._lamport_flashinfer = False
+                    channel = None
+            if channel is None:
+                try:
+                    channel = LamportAllReduce(
+                        self.device_group.group_name, self.rank, self.world_size, self._lamport_max_rows,
+                        x.shape[1], x.dtype, x.device)
+                    logger.info("Lamport %s channel ready: %s x %d (%s), up to %d rows, %d ranks",
+                                "all-gather" if gather else "all-reduce", x.dtype, x.shape[1], x.device,
+                                self._lamport_max_rows if gather else self.lamport_reduce_max_rows, self.world_size)
+                except (RuntimeError, ValueError) as ex:  # no symmetric memory across nodes, odd group sizes
+                    logger.warning("Lamport all-reduce unavailable for this group (%s); using the other tiers", ex)
+                    self._lamport_enabled = False
+                    channel = None
+            self._lamport_channels[key] = channel
+        return channel or None
+
+    # multimem (NVLink multicast, ``MSTAR_SYMM_MEM_ALLREDUCE=multimem``) reduces in place and hands
+    # the symmetric buffer itself back, so each shape owns a ring of buffers: a result stays valid
+    # until this many more all-reduces of the same shape have happened. Kimi K3 keeps at most one
+    # result per shape live (attention output, then the FFN output), so 4 is ample.
+    _SYMM_RING = 4
+
+    def symm_applies(self, shape, dtype: torch.dtype, device: torch.device) -> bool:
+        """Whether an all-reduce of this shape would take the symmetric-memory *buffer* path (the
+        in-place multicast / one-shot kernels on a ring of buffers). Shapes the Lamport kernel
+        takes are excluded: its input is any plain tensor, so producers need no buffer."""
+        if self.world_size == 1 or device.type != "cuda" or not self._symm_available():
+            return False
+        if self.lamport_applies(shape, dtype, device):
+            return False
+        numel = 1
+        for d in shape:
+            numel *= int(d)
+        return numel * torch.empty((), dtype=dtype).element_size() <= self._symm_max_bytes
+
+    def symm_buffer(self, shape, dtype: torch.dtype, device: torch.device) -> torch.Tensor | None:
+        """The next symmetric buffer for this shape, or None when the path does not apply. A
+        producer writes its result straight into it (``torch.mm(..., out=buf)``, ``torch.add(...,
+        out=buf)``) and hands it to :meth:`all_reduce_symm_buffer`: one copy launch less per
+        all-reduce (279 per Kimi K3 decode step). Ring slots are reused, see ``_SYMM_RING``."""
+        if not self.symm_applies(shape, dtype, device):
+            return None
+        try:
+            return self._next_symm_buffer(tuple(int(d) for d in shape), dtype, device)
+        except RuntimeError as ex:
+            logger.warning("symmetric-memory all-reduce unavailable for this group (%s); using NCCL", ex)
+            self._symm_enabled = False
+            return None
+
+    def _next_symm_buffer(self, shape: tuple, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        import torch.distributed._symmetric_memory as symm_mem
+
+        key = (shape, dtype, device)
+        ring = self._symm_bufs.get(key)
+        if ring is None:
+            # first use of a shape: allocate the symmetric buffer(s) and rendezvous (a
+            # collective; every rank sees the shapes in the same order). The engine's
+            # warmup runs each capture shape eagerly first, so this never happens
+            # inside a CUDA-graph capture.
+            bufs = []
+            for _ in range(self._SYMM_RING if self._symm_multimem else 1):
+                buf = symm_mem.empty(*shape, dtype=dtype, device=device)
+                symm_mem.rendezvous(buf, self.device_group.group_name)
+                bufs.append(buf)
+            ring = self._symm_bufs[key] = (bufs, [0])
+        bufs, cursor = ring
+        buf = bufs[cursor[0]]
+        cursor[0] = (cursor[0] + 1) % len(bufs)
+        return buf
+
+    def _symm_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        try:
+            buf = self._next_symm_buffer(tuple(input_.shape), input_.dtype, input_.device)
+        except RuntimeError as ex:  # e.g. ranks on several nodes: no symmetric memory, stay on NCCL
+            logger.warning("symmetric-memory all-reduce unavailable for this group (%s); using NCCL", ex)
+            self._symm_enabled = False
+            dist.all_reduce(input_, group=self.device_group)
+            return input_
+        buf.copy_(input_)
+        return self.all_reduce_symm_buffer(buf)
+
+    def all_reduce_symm_buffer(self, buf: torch.Tensor) -> torch.Tensor:
+        """Sum a buffer obtained from :meth:`symm_buffer` across the group; use the returned tensor."""
+        name = self.device_group.group_name
+        if self._symm_multimem:
+            try:
+                torch.ops.symm_mem.multimem_all_reduce_(buf, "sum", name)
+                return buf  # aliased ring slot, see _SYMM_RING
+            except RuntimeError as ex:  # no NVLS support here: stay on the copying kernels
+                logger.warning("symmetric-memory multimem all-reduce unavailable (%s); using one-shot/two-shot", ex)
+                self._symm_multimem = False
+        if buf.numel() * buf.element_size() <= self._symm_one_shot_max_bytes:
+            return torch.ops.symm_mem.one_shot_all_reduce(buf, "sum", name)
+        return torch.ops.symm_mem.two_shot_all_reduce_(buf, "sum", name)
+
+    def all_reduce_is_nccl(self, shape, dtype: torch.dtype, device: torch.device) -> bool:
+        """Whether :meth:`all_reduce` of this shape would run NCCL's kernel (no Lamport channel, too
+        large for the symmetric-memory buffers): the sizes at which a producer that needs only its own
+        columns of the sum is better off with :meth:`reduce_scatter_stacked`."""
+        if self.world_size == 1 or device.type != "cuda":
+            return False  # off the GPU there is no NCCL path; test doubles simulate all_reduce alone
+        if not self._symm_available():
+            return True
+        if self.lamport_applies(shape, dtype, device):
+            return False
+        numel = 1
+        for d in shape:
+            numel *= int(d)
+        return numel * torch.empty((), dtype=dtype).element_size() > self._symm_max_bytes
+
+    def reduce_scatter_stacked(self, stacked: torch.Tensor) -> torch.Tensor:
+        """``stacked [world_size, ...]`` (contiguous): the sum over the group of every rank's
+        ``stacked``, this rank receiving chunk ``self.rank`` of it, ``[...]``. Half of an all-reduce
+        whose result is then sliced (each byte moves once); the caller lays its chunks out along the
+        leading dim, so nothing is copied here."""
+        if self.world_size == 1:
+            return stacked[0]
+        assert stacked.shape[0] == self.world_size and stacked.is_contiguous(), stacked.shape
+        out = torch.empty(stacked.shape[1:], dtype=stacked.dtype, device=stacked.device)
+        dist.reduce_scatter_tensor(out, stacked, group=self.device_group)
+        return out
+
+    def all_reduce_plain(self, input_: torch.Tensor) -> torch.Tensor:
+        """Sum ``input_`` in place over NCCL, whatever its shape or dtype: for small statistics (fp32 row
+        sums) whose shapes change from step to step, which must not each get a symmetric-memory ring."""
+        if self.world_size > 1:
+            dist.all_reduce(input_, group=self.device_group)
+        return input_
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        """Sum ``input_`` across the group. Use the returned tensor: NCCL reduces in place,
+        the symmetric-memory path returns a reduced tensor of its own."""
         if self.world_size == 1:
             return input_
+        if input_.is_cuda and self._symm_available():
+            channel = self._lamport_channel(input_)
+            if channel is not None:
+                return channel.all_reduce(input_)
+            if input_.numel() * input_.element_size() <= self._symm_max_bytes:
+                return self._symm_all_reduce(input_)
         dist.all_reduce(input_, group=self.device_group)
         return input_
 

@@ -478,8 +478,7 @@ class ParallelSparseMoeBlock(nn.Module):
         )
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
-        self.comm_group.all_reduce(output)
-        return output
+        return self.comm_group.all_reduce(output)
 
 
 class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
@@ -587,5 +586,4 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         )
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
-        self.comm_group.all_reduce(output)
-        return output
+        return self.comm_group.all_reduce(output)

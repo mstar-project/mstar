@@ -8,6 +8,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
+    "kimi_k3": ("mstar.model.kimi_k3.kimi_k3_model", "KimiK3Model"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
@@ -35,6 +36,10 @@ HF_MODELS: dict[str, dict] = {
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
+    # Kimi K3 (2.8T hybrid KDA + MLA MoE, MXFP4 experts). The expert-pruned
+    # ``mgoin/Kimi-K3-pruned75`` (224 experts) shares the architecture and is the
+    # single-node dev checkpoint; override ``model_path_hf`` under ``model_kwargs``.
+    "kimi_k3": {"model_path_hf": "moonshotai/Kimi-K3"},
     # OmniVoice — masked-diffusion TTS, 600+ languages. A Qwen3-0.6B body read
     # bidirectionally over an 8-codebook canvas, plus the Higgs-Audio-v2 codec
     # shipped in the checkpoint's audio_tokenizer/ subfolder (~3.3 GB total).

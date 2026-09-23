@@ -409,14 +409,19 @@ class RowParallelLinear(nn.Module):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = torch.nn.functional.linear(input_parallel, self.weight, bias_)
-
         if self.reduce_results and self.tp_size > 1:
-            output = self.comm_group.all_reduce(output_parallel)
-        else:
-            output = output_parallel
+            if bias_ is None and input_parallel.dim() == 2:
+                # the GEMM writes straight into the symmetric all-reduce buffer when that path
+                # applies: no separate output allocation and no copy into the buffer
+                buf = self.comm_group.symm_buffer(
+                    (input_parallel.shape[0], self.weight.shape[0]), input_parallel.dtype, input_parallel.device)
+                if buf is not None:
+                    torch.mm(input_parallel, self.weight.t(), out=buf)
+                    return self.comm_group.all_reduce_symm_buffer(buf)
+            output_parallel = torch.nn.functional.linear(input_parallel, self.weight, bias_)
+            return self.comm_group.all_reduce(output_parallel)
+        return torch.nn.functional.linear(input_parallel, self.weight, bias_)
 
-        return output
 
 class KVColumnParallelLinear(ColumnParallelLinear):
     """One K or V projection, sharded by head, replicated when heads run out.

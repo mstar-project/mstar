@@ -1,0 +1,27 @@
+# DSpark-draft variant of kimi_k3_tiny_realdims_tp2.yaml with a block length that follows the batch size: 7 drafts up
+# to 4 rows, 3 up to 8, none beyond (captured buckets, so the bounds are bucket sizes); served greedy texts must equal the plain ones.
+# Kimi K3 architecture smoke deployment: the random-weight 0.4B test checkpoint
+# with the production kernel shapes (MLA 512/64, KDA head 128, MXFP4 experts; bench/make_tiny_realdims.py) on two GPUs (TP2): FlashInfer MLA, FlashKDA, CUTLASS MoE and CUDA graphs all engage. Same code path as the real
+# model; only the checkpoint directory differs.
+model: "kimi_k3"
+max_seq_len: 4096
+model_kwargs:
+  speculative_schedule: {4: 7, 8: 3, 16: 0}   # drafts per row by capture bucket (random draft: a path test)
+  speculative_draft: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ref/tiny_kimi_k3_realdims_dspark
+  checkpoint_dir: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ref/tiny_kimi_k3_realdims
+  max_output_tokens: 256
+  moe_backend: auto
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1]
+    tp_size: 2
+    graph_walks: [prefill, decode]
+resources:
+  mla_kv:
+    max_num_pages: 512
+    page_size: 64
+  kda_state:
+    max_slots: 129
+  dspark_kv:
+    max_num_pages: 512
+    page_size: 64

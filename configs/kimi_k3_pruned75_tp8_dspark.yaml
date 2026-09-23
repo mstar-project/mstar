@@ -1,0 +1,32 @@
+# Kimi-K3-pruned75 TP8 with the Kimi-K3-DSpark draft (plan section 8): +0.84 GiB of draft weights per rank (sharded
+# attention / MLP / context projection, replicated q_a / kv_a and Markov head) and a 0.66 GB draft cache. The draft
+# attention is a second FlashInfer MLA resource with its own workspaces: serve with MSTAR_WORKSPACE_BUFFER_MB=128
+# (32 MB suffices at every shape here; the 512 MB default costs ~1.1 GB per rank across the two resources).
+# Kimi-K3-pruned75 (224 of 896 experts, 475 GB MXFP4, otherwise the full architecture)
+# on one 8xH100 node, tensor-parallel 8. Weights take ~59 GB per GPU; the KDA state
+# costs ~54 MiB per resident request per rank, so slots, not KV pages, bound concurrency.
+# Budget per rank: 60.6 GB weights + 2.7 GB MLA cache + 3.5 GB KDA slots + kernel/graph
+# workspaces, plus ~7 GB of CUDA contexts the other ranks hold on every GPU, on 80 GB.
+model: "kimi_k3"
+max_seq_len: 16384
+model_kwargs:
+  speculative_tokens: 7        # DSpark: 7 drafts verified per step (greedy)
+  speculative_draft: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ckpt/Kimi-K3-DSpark
+  checkpoint_dir: /scratch/m000137-pm06/atj10/kimi_k3_mstar/ckpt/Kimi-K3-pruned75
+  max_output_tokens: 2048
+  max_capture_batch_size: 64   # = kda_state.max_slots - 1
+  max_prefill_batch_size: 8    # prompts per prefill step: ~8k tokens of eager prefill fits the ~4 GB of headroom
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]
+resources:
+  mla_kv:
+    max_num_pages: 1792      # 64 requests x 24 pages (1024+512 tokens) + 128 capture rows; 3.2 GB per rank
+    page_size: 64
+  kda_state:
+    max_slots: 65        # 64 x 54 MiB = 3.5 GB per rank (+1 sink slot for captures/padding)
+  dspark_kv:
+    max_num_pages: 1792     # the draft cache mirrors the target cache: 5 layers x 576 bf16 per token, 0.66 GB per rank
+    page_size: 64
