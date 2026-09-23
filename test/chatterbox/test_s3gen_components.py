@@ -259,6 +259,40 @@ def test_low_precision_estimator_stays_close_to_float32(pair):
     assert corr > 0.999 and diff < 1.0
 
 
+def test_graphed_solve_matches_eager_on_cuda(pair):
+    """Replaying a captured solve gives the eager solve's mel (rows padded to
+    the captured count, frames to the bucket) and is deterministic across
+    replays. Needs a GPU; the shape bookkeeping is covered on the CPU in
+    ``test/modular``."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    import copy
+
+    from mstar.model.chatterbox.components.s3gen import FlowRow
+
+    variant, (ref, mine, ref_dict, mine_ref, n_steps) = pair
+    torch.backends.cuda.matmul.allow_tf32 = False
+    gpu = copy.deepcopy(mine).to("cuda")
+    gref = mine_ref.to("cuda")
+    tokens = _tokens(mine_ref)[0].to("cuda")
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    rows = []
+    for toks, final in ((tokens, True), (tokens[: NUM_TOKENS - 6], False), (tokens[: NUM_TOKENS - 10], False)):
+        noise = torch.randn(1, 80, 2 * (gref.num_prompt_tokens + toks.numel()), device="cuda", generator=gen)
+        rows.append(FlowRow(tokens=toks, ref=gref, finalize=final, noise=noise))
+    eager = gpu.tokens_to_mel_rows(rows, n_timesteps=n_steps, frame_bucket=64)
+    solver = gpu.enable_graphs(rows=(1, 2, 4))
+    graphed = gpu.tokens_to_mel_rows(rows, n_timesteps=n_steps, frame_bucket=64)
+    again = gpu.tokens_to_mel_rows(rows, n_timesteps=n_steps, frame_bucket=64)
+    assert solver.captures == 1 and solver.replays == 2  # three rows ride the 4-row graph, then replay
+    for a, b, c in zip(eager, graphed, again, strict=True):
+        assert a.shape == b.shape
+        diff = (a - b).abs().max().item()
+        print(f"[{variant}] graphed vs eager: {diff:.3e}")
+        assert diff < 1e-3
+        assert torch.equal(b, c)
+
+
 def test_embed_reference_matches(pair):
     variant, (ref, mine, _, _, _) = pair
     sr = 24000
