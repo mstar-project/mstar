@@ -436,8 +436,21 @@ class ChatterboxConfig:
     s3gen_compile_mode: str = "default"
     # Pad every flow solve to a multiple of this many mel frames (0 = exact
     # length). Padding is masked, so outputs stay the same up to float noise;
-    # it bounds the number of distinct shapes the compiled estimator sees.
+    # it bounds the number of distinct shapes the compiled or graph-captured
+    # estimator sees (graphs need a bucket; 0 becomes 64 with them on).
     s3gen_frame_bucket: int = 0
+    # Replay whole flow solves from CUDA graphs, one per (rows, frames, steps)
+    # shape: the estimator's hundreds of tiny kernels per Euler step make an
+    # eager solve launch-bound. Rows are padded to 1/2/4/8, frames to the
+    # bucket; the shapes of the built-in voice are captured at startup, others
+    # on first use.
+    s3gen_graphs: bool = False
+    # Precision of the flow estimator ("float32", "bfloat16", "float16"); the
+    # Euler state and update stay in float32. float32 is the reference path.
+    s3gen_estimator_dtype: str = "float32"
+    # Capture T3 prefill as packed CUDA graphs (token buckets x small batch
+    # sizes, both guidance modes); off = eager prefill, decode still captured.
+    t3_prefill_graphs: bool = True
 
     @property
     def sample_rate(self) -> int:
