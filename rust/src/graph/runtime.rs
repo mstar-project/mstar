@@ -2114,6 +2114,14 @@ impl GraphRuntime {
                 ingested_locally.push(took);
             }
 
+            // A local consumer that refused the edge makes it remote, as
+            // Python's `leftover` branch does. Recorded before the frame
+            // check so it, the registration, the reference count and
+            // take_send_plan all agree.
+            for (e, &took) in edges.iter_mut().zip(&ingested_locally) {
+                e.declined_local = !took && matches!(e.dest, Dest::Local(_));
+            }
+
             // Which rids will actually produce a frame carrying
             // `per_request_info`: an INPUT_SIGNALS to a peer, or a
             // WORKER_GRAPHS_DONE. EmitToClient does not carry it.
@@ -2132,7 +2140,8 @@ impl GraphRuntime {
                     Dest::Local(d) if e.declined_local => self.g(wg).node(d).name,
                     _ => continue,
                 };
-                let goes_out = match e.worker {
+                // A refused edge goes on the wire even when we are its owner.
+                let goes_out = e.declined_local || match e.worker {
                     // Post-fanout: one edge, one destination worker.
                     Some(w) => w != me_now || !is_local,
                     None => walk_sym
@@ -2147,13 +2156,6 @@ impl GraphRuntime {
                     sends_a_frame.insert(rid);
                     break;
                 }
-            }
-
-            // A local consumer that refused the edge makes it remote, as
-            // Python's `leftover` branch does. Recorded here so the
-            // registration, the reference count and take_send_plan agree.
-            for (e, &took) in edges.iter_mut().zip(&ingested_locally) {
-                e.declined_local = !took && matches!(e.dest, Dest::Local(_));
             }
 
             // Staged before the routed edges, so a persist signal is

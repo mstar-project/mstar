@@ -1,6 +1,7 @@
 import itertools
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
 from typing import Type
 
 import torch
@@ -29,6 +30,11 @@ from mstar.model.multimodal import PromptPart
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
+
+def video_metadata_dict(metadata_obj) -> dict:
+    # torchcodec>=0.9 reports pixel_aspect_ratio as a Fraction, which the wire codec rejects.
+    return {k: float(v) if isinstance(v, Fraction) else v for k, v in asdict(metadata_obj).items()}
+
 
 @dataclass
 class TensorAndMetadata:
@@ -481,7 +487,7 @@ class Model(ABC):
 
         decoder = VideoDecoder(filepath, device=device)
         video = torch.stack([frame for frame in decoder]).float() / 255.0
-        return TensorAndMetadata(data=video, metadata=asdict(decoder.metadata))
+        return TensorAndMetadata(data=video, metadata=video_metadata_dict(decoder.metadata))
 
     @abstractmethod
     def postprocess(
