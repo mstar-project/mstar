@@ -1296,7 +1296,7 @@ class Worker:
         engine = self.engine_manager.get_engine(spec_node_batch.node_name)
         engine.reset_pre_plan_for_batch(spec_node_batch)
 
-    def _init_cuda_executor_thread(self) -> None:
+    def _init_engine_thread(self) -> None:
         """Pin this executor thread to the worker's accelerator device.
 
         The CUDA current device is per-thread and defaults to 0. PyTorch
@@ -1305,6 +1305,9 @@ class Worker:
         resolve against the THREAD's device — on a worker whose model
         lives on a non-zero device, work issued from an unpinned thread
         lands on device 0's stream, unordered with the real compute.
+
+        It also applies mstar's torch config, because dynamo config is
+        per-thread since torch 2.12 and this thread compiles.
         """
         if self.device.type != "cpu" and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
@@ -2683,7 +2686,7 @@ class Worker:
         # 1-worker GPU thread.
         gpu_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix=f"mstar-gpu-{self.worker_id}",
-            initializer=self._init_cuda_executor_thread,
+            initializer=self._init_engine_thread,
         )
         logger.info(
             "Worker %s: engine runs on dedicated GPU thread",
@@ -2711,7 +2714,7 @@ class Worker:
         if pre_plan_spec:
             plan_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix=f"mstar-plan-{self.worker_id}",
-                initializer=self._init_cuda_executor_thread,
+                initializer=self._init_engine_thread,
             )
             logger.info(
                 "Worker %s: plan_executor enabled — speculative plan() "
