@@ -166,6 +166,12 @@ class T3Config:
         return cls()
 
     @classmethod
+    def multilingual(cls) -> "T3Config":
+        """The 23-language checkpoint: the English model with a 2454-token
+        grapheme text vocabulary (reference ``T3Config.multilingual``)."""
+        return cls(text_vocab_size=2454)
+
+    @classmethod
     def turbo(cls) -> "T3Config":
         return cls(
             backbone=T3BackboneConfig.gpt2_medium(),
@@ -372,7 +378,7 @@ class GenerationDefaults:
 
 @dataclass
 class ChatterboxConfig:
-    variant: str = "chatterbox"  # "chatterbox" | "turbo"
+    variant: str = "chatterbox"  # "chatterbox" | "multilingual" | "turbo"
     t3: T3Config = field(default_factory=T3Config.english)
     voice_encoder: VoiceEncoderConfig = field(default_factory=VoiceEncoderConfig)
     s3_tokenizer: S3TokenizerConfig = field(default_factory=S3TokenizerConfig)
@@ -385,6 +391,10 @@ class ChatterboxConfig:
     voice_encoder_weights: str = "ve.safetensors"
     text_tokenizer_file: str = "tokenizer.json"
     builtin_voice_file: str = "conds.pt"
+    # Multilingual only: the Cangjie table for Chinese and the language the
+    # text is read in when a request gives none (``language_id``).
+    cangjie_file: str = ""
+    default_language: str | None = None
 
     # Reference-audio windows: T3's speech prompt is tokenized from the first
     # ``enc_cond_seconds``; S3Gen embeds the first ``dec_cond_seconds``.
@@ -460,9 +470,28 @@ class ChatterboxConfig:
     def is_turbo(self) -> bool:
         return self.variant == "turbo"
 
+    @property
+    def is_multilingual(self) -> bool:
+        return self.variant == "multilingual"
+
     @classmethod
     def chatterbox(cls) -> "ChatterboxConfig":
         return cls()
+
+    @classmethod
+    def multilingual(cls) -> "ChatterboxConfig":
+        """Chatterbox Multilingual (reference ``mtl_tts.py``): the same S3Gen,
+        voice encoder, built-in voice and sampling as the English model; the
+        T3 weights ``t3_mtl23ls_v2.safetensors`` and the grapheme tokenizer
+        with a language token."""
+        return cls(
+            variant="multilingual",
+            t3=T3Config.multilingual(),
+            t3_weights="t3_mtl23ls_v2.safetensors",
+            text_tokenizer_file="grapheme_mtl_merged_expanded_v1.json",
+            cangjie_file="Cangjie5_TC.json",
+            default_language="en",
+        )
 
     @classmethod
     def turbo(cls) -> "ChatterboxConfig":
@@ -493,6 +522,8 @@ class ChatterboxConfig:
     def from_variant(cls, variant: str) -> "ChatterboxConfig":
         if variant in ("chatterbox", "english", "default"):
             return cls.chatterbox()
+        if variant in ("multilingual", "chatterbox_multilingual", "chatterbox-multilingual", "mtl"):
+            return cls.multilingual()
         if variant in ("turbo", "chatterbox_turbo", "chatterbox-turbo"):
             return cls.turbo()
         raise ValueError(f"Unknown Chatterbox variant {variant!r}")
