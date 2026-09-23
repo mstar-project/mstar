@@ -13,6 +13,8 @@ from mstar.utils.ipc_format import (
     InputSignals,
     MessageSource,
     RemoveRequest,
+    WorkerMessage,
+    WorkerMessageType,
 )
 from mstar.worker.worker import Worker
 
@@ -143,6 +145,24 @@ def test_remove_force_cleans_and_clears_drain_state():
     assert "X" not in w._reads_done_sent
 
 
+def test_remove_deferred_while_committed_tp_follow_pending():
+    """Removing while a committed TP-follow is queued strands its ScheduleTPNode
+    in the FIFO, blocking later follows — so defer, like an in-flight rid."""
+    w = _worker(known_rids=("X",), tp_follow=("X",))
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    assert "X" in w._pending_removes
+    assert w.forced == []   # tensors not torn down
+    assert w.cleared == []  # scheduler state kept until the follow runs
+
+
+def test_pending_remove_held_back_while_tp_follow_pending():
+    w = _worker(known_rids=("X",), tp_follow=("X",))
+    w._pending_removes = {"X"}
+    w._apply_pending_removes_safe_to_drop(in_flight_rids=set())
+    assert "X" in w._pending_removes  # still deferred
+    assert w.forced == []
+
+
 def test_process_new_inputs_skips_reads_for_draining_rid():
     w = _worker(draining=("X",))
 
@@ -160,6 +180,25 @@ def test_add_new_request_skips_draining_rid():
     w = _worker(draining=("X",))
     # Bails before touching engine/graph managers (out-of-order NEW after DRAIN).
     Worker._add_new_request(w, SimpleNamespace(request_id="X"))
+
+
+def test_drain_before_new_is_buffered_not_applied():
+    """A DRAIN that beats the NEW must buffer until the NEW lands. Applied early
+    it sets _draining_rids, the NEW gate drops the NEW, and REMOVE strands."""
+    w = _worker(known_rids=(), is_follower=True)
+    w._unprocessed_messages = {}
+    Worker._process_message_list(w, [
+        WorkerMessage(
+            message_type=WorkerMessageType.DRAIN_REQUEST,
+            body=DrainRequest(request_id="X", source=MessageSource.TP_RANK_0),
+        )
+    ])
+    # buffered (rid unknown): no drain state, no premature READS_DONE
+    assert [m.message_type for m in w._unprocessed_messages["X"]] == [
+        WorkerMessageType.DRAIN_REQUEST
+    ]
+    assert "X" not in w._draining_rids
+    assert _reads_done(w) == []
 
 
 # ── preprocess worker ───────────────────────────────────────────────────────

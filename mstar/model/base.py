@@ -265,6 +265,30 @@ class ForwardPassArgs:
 
 
 class Model(ABC):
+    # Input/output modalities the model handles at intake. The base is the full
+    # universe, so a model that doesn't narrow it behaves as before
+    SUPPORTED_INPUT_MODALITIES: frozenset[str] = frozenset(
+        {"text", "image", "audio", "video", "action", "scalar", "tensor"}
+    )
+    SUPPORTED_OUTPUT_MODALITIES: frozenset[str] = frozenset(
+        {"text", "image", "audio", "video", "action", "scalar", "tensor"}
+    )
+
+    def unsupported_modalities(
+        self, input_modalities: list[str], output_modalities: list[str],
+    ) -> list[tuple[str, str]]:
+        """Return the ``(modality, direction)`` pairs this model can't handle,
+        for intake to reject. Empty means every requested modality is supported."""
+        bad = [
+            (m, "input") for m in input_modalities
+            if m not in self.SUPPORTED_INPUT_MODALITIES
+        ]
+        bad += [
+            (m, "output") for m in output_modalities
+            if m not in self.SUPPORTED_OUTPUT_MODALITIES
+        ]
+        return bad
+
     def _get_worker_graphs_for_graph_walk(
         self,
         graph_walk: str,

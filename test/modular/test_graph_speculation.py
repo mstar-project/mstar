@@ -140,3 +140,97 @@ def test_graph_clear_wipes_node_speculative_buffer():
     assert not io.nodes["ar_decode"].speculative_signals.ready_names
     # WG-level tracking is NOT cleared by wg_state_registry.clear() — the caller
     # must use clear_speculative_inputs() when discarding a live spec schedule.
+
+
+# ── speculative loop indices: what a speculated step should read ──────────────
+
+def _nested_graph():
+    # refine_loop ⊃ [denoise_loop(denoiser), refiner]. refiner -> denoiser is
+    # refine_loop's loop-back, so speculating from refiner into denoiser
+    # advances refine_loop and restarts denoise_loop at 0.
+    return Sequential(sections=[
+        Loop(
+            name="refine_loop",
+            section=Sequential(sections=[
+                Loop(
+                    name="denoise_loop",
+                    section=GraphNode(
+                        name="denoiser",
+                        input_names={"latents"},
+                        outputs=[GraphEdge(name="latents", next_node="denoiser")],
+                    ),
+                    outputs=[GraphEdge(name="latents", next_node="refiner")],
+                    max_iters=3,
+                ),
+                GraphNode(
+                    name="refiner",
+                    input_names={"latents"},
+                    outputs=[GraphEdge(name="latents", next_node="denoiser")],
+                ),
+            ]),
+            outputs=[GraphEdge(name="latents", next_node="decoder")],
+            max_iters=2,
+        ),
+        GraphNode(
+            name="decoder",
+            input_names={"latents"},
+            outputs=[GraphEdge(name="image", next_node="EMIT_TO_CLIENT")],
+        ),
+    ])
+
+
+def test_speculative_loop_indices_flat_loop_back_advances_the_loop():
+    io = WorkerGraphIO(_make_ar_graph())
+    io.loops["ar_loop"].curr_iter = 5
+    ready = io.ingest_for_speculation([
+        GraphEdge(name="token", next_node="ar_decode"),
+        GraphEdge(name="kv_cache", next_node="ar_decode"),
+    ], "ar_decode")
+    assert ready[0].advancing_loop_name == "ar_loop"
+    assert io.speculative_loop_indices(ready[0]) == {"ar_loop": 6}
+    # a prediction only: the real routing still advances the io
+    assert io.get_loop_indices() == {"ar_loop": 5}
+
+
+def test_speculative_loop_indices_forward_transition_is_unchanged():
+    io = WorkerGraphIO(_make_ar_graph())
+    ready = io.ingest_for_speculation([
+        GraphEdge(name="token", next_node="ar_decode"),
+        GraphEdge(name="kv_cache", next_node="ar_decode"),
+    ], "prefill")
+    assert ready[0].is_new_loop_iter is False
+    assert ready[0].advancing_loop_name is None
+    assert io.speculative_loop_indices(ready[0]) == {"ar_loop": 0}
+
+
+def test_speculative_loop_indices_nested_outer_advance_restarts_inner():
+    io = WorkerGraphIO(_nested_graph())
+    # denoise_loop just ran its last iteration (0..2) inside refine iter 0
+    io.loops["denoise_loop"].curr_iter = 2
+    io.loops["refine_loop"].curr_iter = 0
+    ready = io.ingest_for_speculation(
+        [GraphEdge(name="latents", next_node="denoiser")], "refiner"
+    )
+    assert len(ready) == 1
+    info = ready[0]
+    assert info.node_name == "denoiser"
+    assert info.is_new_loop_iter is True
+    assert info.loop_name == "denoise_loop"           # the destination's loop
+    assert info.advancing_loop_name == "refine_loop"  # the one that moves
+    assert io.speculative_loop_indices(info) == {
+        "refine_loop": 1, "denoise_loop": 0,
+    }
+
+
+def test_speculative_loop_indices_nested_inner_loop_back():
+    io = WorkerGraphIO(_nested_graph())
+    io.loops["denoise_loop"].curr_iter = 1
+    io.loops["refine_loop"].curr_iter = 1
+    ready = io.ingest_for_speculation(
+        [GraphEdge(name="latents", next_node="denoiser")], "denoiser"
+    )
+    info = ready[0]
+    assert info.advancing_loop_name == "denoise_loop"
+    assert io.speculative_loop_indices(info) == {
+        "refine_loop": 1, "denoise_loop": 2,
+    }

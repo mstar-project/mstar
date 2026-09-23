@@ -867,6 +867,15 @@ class Engine:
                     submodule_mgmt, None, raw, [inp], req_info,
                     request_ids=[rid], step_request_ids=(rid,),
                 ))
+            except Exception as error:
+                # A forward error here is attributable to this one request, not
+                # the batch: fail only one with failed_requests
+                logger.exception(
+                    "forward failed for request %s (node=%s, walk=%s)",
+                    rid, batch.node_name, batch.step_context.graph_walk,
+                )
+                batch.register_failure(rid, error)
+                merged[rid] = {}
             finally:
                 if nvtx:
                     range_pop()

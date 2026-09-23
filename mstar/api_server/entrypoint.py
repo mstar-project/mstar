@@ -38,6 +38,13 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_MODALITIES = frozenset({"text", "image", "audio", "video", "action", "scalar", "tensor"})
 
+
+class UnsupportedModalityError(ValueError):
+    """A request asked for a modality the loaded model can't handle. Raised at
+    intake so the HTTP layer returns 400 instead of accepting it and failing
+    downstream."""
+
+
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
 for _mod, _exts in {
@@ -353,9 +360,20 @@ class APIServer:
         if request_id is None:
             request_id = str(uuid.uuid4())
 
-        for m in input_modalities + output_modalities:
-            if m not in SUPPORTED_MODALITIES:
-                raise ValueError(f"Unsupported modality: {m!r}")
+        # Reject at intake anything the loaded model has no encoder/decoder for
+        if self.model is not None:
+            bad = self.model.unsupported_modalities(
+                input_modalities, output_modalities
+            )
+            if bad:
+                detail = ", ".join(f"{m!r} ({direction})" for m, direction in bad)
+                raise UnsupportedModalityError(
+                    f"model {self.model_name!r} does not support: {detail}"
+                )
+        else:
+            for m in input_modalities + output_modalities:
+                if m not in SUPPORTED_MODALITIES:
+                    raise UnsupportedModalityError(f"unsupported modality: {m!r}")
 
         # Register pending request
         with self.request_lock:
@@ -927,6 +945,8 @@ async def generate(
 
     except HTTPException:
         raise
+    except UnsupportedModalityError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     finally:

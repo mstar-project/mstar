@@ -247,10 +247,12 @@ class _FakeExecEngine:
     _declare_and_admit = Engine._declare_and_admit
 
     def __init__(
-        self, fail_on: str | None = None, num_slots: int = 1, next_slot: int = 0,
+        self, fail_on: str | None = None, raise_on: str | None = None,
+        num_slots: int = 1, next_slot: int = 0,
     ):
         self._enable_nvtx = False
         self._fail_on = fail_on
+        self._raise_on = raise_on
         # ordered log, so the test can assert admit-all-then-run
         self.events: list[tuple[str, str]] = []
         self._runner = self
@@ -290,6 +292,8 @@ class _FakeExecEngine:
         rid = request_ids[0]
         assert step is not None, "the step admitted for this rid must reach it"
         assert tuple(ctx.request_ids) == (rid,), "each rid drives its own ctx"
+        if rid == self._raise_on:
+            raise RuntimeError(f"forward failed for {rid}")
         self.events.append(("run", rid))
         self.run_slots.append(ctx.slot)
         return {rid: {"token": 1}}, step
@@ -370,3 +374,22 @@ def test_per_request_keeps_one_slot_when_the_node_is_single_buffered():
 
     assert engine.run_slots == [0, 0, 0]
     assert engine.mgmt.next_slot == 0
+
+
+def test_per_request_isolates_a_forward_error_to_the_failing_rid():
+    """A forward error is attributable to one request, not full batch: the other
+    rids in an unbatchable batch still run, and only the failing one is recorded
+    in ``failed_requests`` for the worker to drop."""
+    engine = _FakeExecEngine(raise_on="b")
+    batch = _exec_batch(["a", "b", "c"])
+
+    out = engine._exec_per_request(batch)
+
+    # a and c ran despite b's forward raising
+    assert [e for e in engine.events if e[0] == "run"] == [("run", "a"), ("run", "c")]
+    assert out["a"] == {"token": 1}
+    assert out["c"] == {"token": 1}
+    assert out["b"] == {}
+    # only b is failed
+    assert set(batch.failed_requests) == {"b"}
+    assert "RuntimeError" in batch.failed_requests["b"]
