@@ -28,7 +28,7 @@ from mstar.model.chatterbox.chatterbox_model import (
     ChatterboxModel,
     voice_key_for,
 )
-from mstar.model.chatterbox.components.s3gen_graphs import SolveGraphs
+from mstar.model.chatterbox.components.s3gen_graphs import EncoderGraphs, SolveGraphs, VocoderGraphs
 from mstar.model.chatterbox.config import (
     CFG_LABEL,
     COND_LABEL,
@@ -962,11 +962,19 @@ def test_graph_warmup_covers_the_built_in_voice_chunk_shapes():
 
 
 class _FakeGraph:
+    """Stands in for a captured CUDA graph: a replay recomputes the function on
+    the static inputs into the static outputs (a tensor or a tuple of them)."""
+
     def __init__(self, run, output):
         self.run, self.output = run, output
 
     def replay(self):
-        self.output.copy_(self.run())
+        fresh = self.run()
+        if isinstance(self.output, tuple):
+            for static, value in zip(self.output, fresh, strict=True):
+                static.copy_(value)
+        else:
+            self.output.copy_(fresh)
 
 
 def _fake_solve(mu, mask, spks, cond, noise, n_timesteps):
@@ -1067,6 +1075,86 @@ def test_solve_graphs_warmup_captures_the_grid_once():
     assert graphs.warmup([32], n_timesteps=2, example=example) == 0
     out = graphs(**_solve_inputs(2, 32, 1), n_timesteps=2)
     assert out.shape == (2, 3, 32) and graphs.captures == 4
+
+
+def _graphs_on_cpu(graphs):
+    graphs._capturable = lambda tensors: True
+
+    def record(run, device):
+        del device
+        out = run()
+        return _FakeGraph(run, out), out
+
+    graphs._record = record
+    return graphs
+
+
+def test_encoder_graphs_pad_rows_and_tokens_to_the_bucket_and_trim():
+    seen = []
+
+    def encoder(tokens, lens):
+        seen.append((tuple(tokens.shape), lens.tolist()))
+        # mu [B, 3, 2T] from the tokens, mask [B, 1, 2T] from the lengths
+        mu = tokens.float().repeat_interleave(2, dim=1)[:, None, :].expand(-1, 3, -1) * (lens[:, None, None] > 0)
+        mask = (torch.arange(2 * tokens.shape[1])[None, None, :] < 2 * lens[:, None, None])
+        return mu, mask
+
+    graphs = _graphs_on_cpu(EncoderGraphs(encoder, rows=(1, 2, 4), token_bucket=8))
+    tokens = torch.arange(1, 3 * 11 + 1).view(3, 11)
+    lens = torch.tensor([11, 7, 5])
+    mu, mask = graphs(tokens, lens)
+    assert seen[-1] == ((4, 16), [11, 7, 5, 0])  # 3 rows -> 4, 11 tokens -> 16
+    assert mu.shape == (3, 3, 32) and mask.shape == (3, 1, 32)  # padding rows cut, frames stay bucketed
+    assert mask[0, 0].sum() == 22 and mask[2, 0].sum() == 10
+    assert torch.equal(mu[1, 0, :14], tokens[1, :7].float().repeat_interleave(2))
+    graphs(tokens[:2, :5], lens[:2])
+    assert graphs.captures == 2 and set(graphs.keys()) == {
+        ((("tokens", (4, 16)), ("lens", (4,))), ()), ((("tokens", (2, 8)), ("lens", (2,))), ()),
+    }
+    with pytest.raises(ValueError):
+        EncoderGraphs(encoder, token_bucket=0)
+
+
+def test_vocoder_graphs_key_on_length_and_cache_presence():
+    calls = []
+
+    def vocode(mel, phase, harmonic, cache):
+        calls.append(cache is not None)
+        wav = mel.sum(dim=1).repeat_interleave(4, dim=-1) + phase.sum()
+        return wav, harmonic[:, :1]
+
+    graphs = _graphs_on_cpu(VocoderGraphs(vocode))
+    mel = torch.randn(1, 3, 10)
+    phase, harmonic = torch.rand(1, 9, 1), torch.randn(1, 9, 40)
+    wav, source = graphs(mel, phase, harmonic, None)
+    assert wav.shape == (1, 40) and source.shape == (1, 1, 40) and calls[-1] is False
+    graphs(mel, phase, harmonic, torch.zeros(1, 1, 0))  # an empty cache counts as none
+    assert graphs.captures == 1 and graphs.replays == 2
+    graphs(mel, phase, harmonic, torch.zeros(1, 1, 8))
+    assert graphs.captures == 2 and calls[-1] is True
+    expected_wav, _ = vocode(mel, phase, harmonic, None)
+    assert torch.equal(wav, expected_wav)
+
+
+def test_graph_stages_knob_selects_the_stages():
+    from mstar.model.chatterbox.components.s3gen import S3Gen
+
+    s3gen = object.__new__(S3Gen)
+    s3gen.solve = lambda *a: a[0]
+    s3gen.flow_encoder = lambda tokens, lens: (tokens, lens)
+    s3gen.vocoder = SimpleNamespace(vocode_with=lambda *a: (a[0], a[0]))
+    S3Gen.enable_graphs(s3gen, rows=(1, 2), stages=("solve", "vocoder"), token_bucket=16)
+    assert s3gen.solver is not None and s3gen.encoder_graphs is None and s3gen.vocoder_graphs is not None
+    S3Gen.enable_graphs(s3gen, stages=("encoder",))
+    assert s3gen.solver is None and s3gen.encoder_graphs.token_bucket == 32 and s3gen.vocoder_graphs is None
+    model = ChatterboxModel(
+        model_path_hf="ResembleAI/chatterbox", variant="chatterbox", s3gen_graphs=True,
+        s3gen_graph_stages="solve, vocoder",
+    )
+    assert model._graph_stages == ("solve", "vocoder")
+    with pytest.raises(ValueError, match="unknown s3gen_graph_stages"):
+        ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", s3gen_graph_stages="solve,hift")
+    assert _make_model().config.s3gen_graph_stages == "solve,encoder,vocoder"
 
 
 def test_s3gen_solves_go_through_the_solver_when_enabled():
