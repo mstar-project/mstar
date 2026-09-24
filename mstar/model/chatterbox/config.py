@@ -434,10 +434,10 @@ class ChatterboxConfig:
     # chunk and stays as close to the whole-utterance decode as the full
     # history does (log-mel correlation 0.988 vs 0.985 on CPU).
     stream_context_tokens: int = 25
-    # torch.compile the flow-matching estimator (the UNet the Euler solve
-    # calls 10 x 2 times per chunk): fuses its many small kernels, which is
-    # what a chunk's latency is made of. Dynamic shapes, so one compile covers
-    # every chunk length; costs a few minutes at startup.
+    # torch.compile the flow-matching estimator instead of the CUDA graphs
+    # below (the older, slower alternative: +14 % at concurrency 8, nothing at
+    # 32; asking for it turns ``s3gen_graphs`` off). Dynamic shapes, so one
+    # compile covers every chunk length; costs a few minutes at startup.
     s3gen_compile: bool = False
     # ``torch.compile`` mode for the estimator: "default" fuses kernels
     # (measured +14 % at concurrency 8, nothing at 32); "reduce-overhead"
@@ -446,21 +446,26 @@ class ChatterboxConfig:
     s3gen_compile_mode: str = "default"
     # Pad every flow solve to a multiple of this many mel frames (0 = exact
     # length). Padding is masked, so outputs stay the same up to float noise;
-    # it bounds the number of distinct shapes the compiled or graph-captured
+    # it bounds the number of distinct shapes the graph-captured (or compiled)
     # estimator sees (graphs need a bucket; 0 becomes 64 with them on).
-    s3gen_frame_bucket: int = 0
-    # Replay whole flow solves from CUDA graphs, one per (rows, frames, steps)
-    # shape: the estimator's hundreds of tiny kernels per Euler step make an
-    # eager solve launch-bound. Rows are padded to 1/2/4/8, frames to the
-    # bucket; the shapes of the built-in voice are captured at startup, others
-    # on first use.
-    s3gen_graphs: bool = False
+    s3gen_frame_bucket: int = 64
+    # Replay the S3Gen stages from CUDA graphs, one per shape: the estimator's
+    # hundreds of tiny kernels per Euler step make an eager solve launch-bound
+    # (a 10-step solve of one row went from 170 ms to 45 ms on an H100, the
+    # streamed first chunk from 0.22 s to 0.12 s, throughput at concurrency
+    # 8/32 up 1.8x/1.6x, WER unchanged). Rows are padded to 1/2/4/8, frames to
+    # the bucket; the shapes of the built-in voice are captured at startup,
+    # others on first use. Off = the eager reference path.
+    s3gen_graphs: bool = True
     # Which S3Gen stages the graphs cover: the flow solve, the token encoder
     # (rows and tokens padded to the bucket) and the vocoder (exact lengths).
     s3gen_graph_stages: str = "solve,encoder,vocoder"
     # Precision of the flow estimator ("float32", "bfloat16", "float16"); the
-    # Euler state and update stay in float32. float32 is the reference path.
-    s3gen_estimator_dtype: str = "float32"
+    # Euler state and update stay in float32. float16 runs the estimator 2.5x
+    # faster than float32 under a graph and stays within 0.02-0.15 of the
+    # float32 log-mel (bfloat16: 0.1-1.8, same speed); float32 is the
+    # reference path, bit-exact with the package at a fixed seed.
+    s3gen_estimator_dtype: str = "float16"
     # Capture T3 prefill as packed CUDA graphs (token buckets x small batch
     # sizes, both guidance modes); off = eager prefill, decode still captured.
     t3_prefill_graphs: bool = True
