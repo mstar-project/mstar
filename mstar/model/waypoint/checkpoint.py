@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import asdict
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -107,39 +108,25 @@ def _checkpoint_weight_files(checkpoint_dir: Path) -> tuple[Path, ...]:
     return shards
 
 
+# Manifest keys that carry a WaypointConfig field of the same name.
+_MANIFEST_CONFIG_FIELDS = (
+    "inference_fps", "temporal_compression", "taehv_ae", "ae_uri",
+    "prompt_conditioning", "channels", "n_layers", "n_heads", "n_kv_heads", "d_model",
+    "mlp_ratio", "moe", "n_buttons", "patch", "base_fps", "local_window",
+    "global_window", "global_pinned_dilation", "global_attn_period",
+    "global_attn_offset", "rope_impl", "value_residual", "gated_attn",
+    "noise_conditioning", "ctrl_conditioning", "ctrl_cond_dropout",
+    "ctrl_conditioning_period", "scheduler_sigmas",
+)
+
+
 def _expected_manifest(config: WaypointConfig) -> dict[str, Any]:
+    values = asdict(config)
     return {
         "model_type": "waypoint-1.5",
-        "inference_fps": config.inference_fps,
-        "temporal_compression": config.temporal_compression,
-        "taehv_ae": config.taehv_ae,
-        "ae_uri": config.ae_uri,
-        "prompt_conditioning": config.prompt_conditioning,
-        "channels": config.channels,
-        "n_layers": config.n_layers,
-        "n_heads": config.n_heads,
-        "n_kv_heads": config.n_kv_heads,
-        "d_model": config.d_model,
-        "mlp_ratio": config.mlp_ratio,
         "causal": True,
-        "moe": config.moe,
-        "n_buttons": config.n_buttons,
-        "patch": config.patch,
-        "base_fps": config.base_fps,
-        "local_window": config.local_window,
-        "global_window": config.global_window,
-        "global_pinned_dilation": config.global_pinned_dilation,
-        "global_attn_period": config.global_attn_period,
-        "global_attn_offset": config.global_attn_offset,
         "n_frames": config.max_frames,
-        "rope_impl": config.rope_impl,
-        "value_residual": config.value_residual,
-        "gated_attn": config.gated_attn,
-        "noise_conditioning": config.noise_conditioning,
-        "ctrl_conditioning": config.ctrl_conditioning,
-        "ctrl_cond_dropout": config.ctrl_cond_dropout,
-        "ctrl_conditioning_period": config.ctrl_conditioning_period,
-        "scheduler_sigmas": config.scheduler_sigmas,
+        **{key: values[key] for key in _MANIFEST_CONFIG_FIELDS},
     }
 
 

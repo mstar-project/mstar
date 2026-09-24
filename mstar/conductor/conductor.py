@@ -335,6 +335,7 @@ class Conductor:
             int(rank): int(index)
             for rank, index in (self.model_config.get("rank_devices") or {}).items()
         }
+        model.validate_config_yaml(self.model_config, model_config_file)
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
         # The conductor is the only process that sees every worker graph, so it

@@ -422,6 +422,7 @@ def test_shipped_config_builds_through_registry_and_engine_manager_without_netwo
         skip_weight_loading=True,
     )
 
+    model.validate_config_yaml(model_config, str(config_path))
     model.get_worker_graphs(str(config_path))
     manager = EngineManager.build(
         node_names={DIT_NODE, VAE_ENCODER_NODE},

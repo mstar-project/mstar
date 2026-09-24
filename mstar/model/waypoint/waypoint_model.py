@@ -35,7 +35,6 @@ import math
 from dataclasses import replace
 
 import torch
-import yaml
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import (
@@ -60,7 +59,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata, WorkerGraph
+from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.waypoint.config import (
     WAYPOINT_VARIANT_360P,
@@ -200,7 +199,7 @@ class WaypointModel(Model):
             # Resident session count, not the step batch (that's
             # ``max_batch_size``/``step_batch_size``). Default 1; a deployment
             # raises it via ``resources: {kv: {num_sessions: N}}`` along with
-            # ``max_concurrent_requests`` (see ``get_worker_graphs``).
+            # ``max_concurrent_requests`` (see ``validate_config_yaml``).
             num_sessions=1,
         )
         # Logged since nothing downstream prints this ~816 MiB/world cost.
@@ -275,8 +274,8 @@ class WaypointModel(Model):
 
         return {PRIME_WALK: prime, ROLLOUT_WALK: rollout}
 
-    def get_worker_graphs(self, config_path: str) -> list[WorkerGraph]:
-        """Refuse to build unless the deployment caps concurrency at the number
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Refuse to serve unless the deployment caps concurrency at the number
         of worlds the ring was sized for.
 
         The primary gate on the world pool: a world is claimed at ``admit``,
@@ -285,14 +284,7 @@ class WaypointModel(Model):
         pool. ``max_batch_size``/``step_batch_size`` caps a step's row count,
         not how many worlds may exist, so it does not substitute for this
         check.
-
-        Checked here because this hook is the only place a model sees the
-        key: the Conductor reads it from the YAML and
-        ``api_server/entrypoint.py`` forwards only ``model_kwargs`` to
-        ``Model.__init__``.
         """
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f) or {}
         # Same block ``EngineManager.build`` feeds to
         # ``apply_yaml_overrides``, so the gate and the allocation agree.
         overrides = (config.get("resources") or {}).get(KV_RESOURCE) or {}
@@ -339,7 +331,6 @@ class WaypointModel(Model):
                 f"{config_path}. A step cannot batch more rows than there are "
                 "resident worlds to supply them."
             )
-        return super().get_worker_graphs(config_path)
 
     # ------------------------------------------------------------------
     # Model ABC: I/O

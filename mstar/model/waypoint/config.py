@@ -8,7 +8,7 @@ the settled K/V into the ring.
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 WAYPOINT_VARIANT_720P = "waypoint-1.5-1b-720p"
 WAYPOINT_VARIANT_360P = "waypoint-1.5-1b-360p"
@@ -26,6 +26,58 @@ WAYPOINT_VARIANT_GEOMETRY: dict[str, tuple[int, int, int]] = {
     WAYPOINT_VARIANT_720P: (512, 16, 32),
     WAYPOINT_VARIANT_360P: (128, 8, 16),
 }
+
+
+_POSITIVE_INT_FIELDS = (
+    "n_layers", "n_heads", "n_kv_heads", "d_model", "mlp_ratio", "channels",
+    "tokens_per_frame", "height", "width", "local_window", "global_window",
+    "global_pinned_dilation", "global_attn_period", "ctrl_conditioning_period",
+    "n_buttons", "base_fps", "inference_fps", "temporal_compression",
+    "max_frames", "step_batch_size",
+)
+
+
+# What the released checkpoints were trained with; validate_supported_deployment
+# rejects a deployment config that disagrees.
+_RELEASED_CHECKPOINT_FIELDS: dict[str, object] = {
+    "n_layers": 24,
+    "n_heads": 32,
+    "n_kv_heads": 16,
+    "d_model": 2048,
+    "mlp_ratio": 4,
+    "channels": 32,
+    "patch": (2, 2),
+    "local_window": 16,
+    "global_window": 128,
+    "global_pinned_dilation": 8,
+    "global_attn_period": 4,
+    "global_attn_offset": -1,
+    "rope_impl": "ortho",
+    "rope_nyquist_frac": 0.8,
+    "rope_theta": 10_000.0,
+    "noise_conditioning": "wan",
+    "value_residual": True,
+    "gated_attn": False,
+    "moe": False,
+    "prompt_conditioning": None,
+    "ctrl_conditioning": True,
+    "ctrl_cond_dropout": 0.0,
+    "ctrl_conditioning_period": 3,
+    "n_buttons": 256,
+    "scheduler_sigmas": WAYPOINT_SCHEDULER_SIGMAS,
+    "base_fps": 15,
+    "inference_fps": 60,
+    "temporal_compression": 4,
+    "max_frames": 512,
+    "taehv_ae": True,
+    "ae_uri": "Overworld-Models/taehv1_5",
+    "auto_aspect_ratio": True,
+}
+
+
+def _as_tuple(value: object) -> object:
+    # A YAML override arrives as a list; the released values are tuples.
+    return tuple(value) if isinstance(value, list) else value
 
 
 @dataclass
@@ -158,32 +210,14 @@ class WaypointConfig:
                 "WaypointDiT does not implement prompt cross-attention; this "
                 f"checkpoint declares prompt_conditioning={self.prompt_conditioning!r}."
             )
-        positive_ints = {
-            "n_layers": self.n_layers,
-            "n_heads": self.n_heads,
-            "n_kv_heads": self.n_kv_heads,
-            "d_model": self.d_model,
-            "mlp_ratio": self.mlp_ratio,
-            "channels": self.channels,
-            "tokens_per_frame": self.tokens_per_frame,
-            "height": self.height,
-            "width": self.width,
-            "local_window": self.local_window,
-            "global_window": self.global_window,
-            "global_pinned_dilation": self.global_pinned_dilation,
-            "global_attn_period": self.global_attn_period,
-            "ctrl_conditioning_period": self.ctrl_conditioning_period,
-            "n_buttons": self.n_buttons,
-            "base_fps": self.base_fps,
-            "inference_fps": self.inference_fps,
-            "temporal_compression": self.temporal_compression,
-            "max_frames": self.max_frames,
-            "step_batch_size": self.step_batch_size,
-        }
-        invalid = [name for name, value in positive_ints.items() if type(value) is not int or value <= 0]
+        values = asdict(self)
+        invalid = [
+            name for name in _POSITIVE_INT_FIELDS
+            if type(values[name]) is not int or values[name] <= 0
+        ]
         if invalid:
-            values = ", ".join(f"{name}={positive_ints[name]!r}" for name in invalid)
-            raise ValueError(f"Waypoint positive integer fields are invalid: {values}.")
+            listed = ", ".join(f"{name}={values[name]!r}" for name in invalid)
+            raise ValueError(f"Waypoint positive integer fields are invalid: {listed}.")
         if len(self.patch) != 2 or any(type(size) is not int or size <= 0 for size in self.patch):
             raise ValueError(f"patch must contain two positive integers; got {self.patch!r}.")
         if self.tokens_per_frame != self.height * self.width:
@@ -250,44 +284,11 @@ class WaypointConfig:
                 f"Waypoint variant {self.variant!r} requires "
                 f"(tokens_per_frame, height, width)={expected_geometry}; got {actual_geometry}."
             )
-        checkpoint_facts = {
-            "n_layers": (self.n_layers, 24),
-            "n_heads": (self.n_heads, 32),
-            "n_kv_heads": (self.n_kv_heads, 16),
-            "d_model": (self.d_model, 2048),
-            "mlp_ratio": (self.mlp_ratio, 4),
-            "channels": (self.channels, 32),
-            "patch": (self.patch, (2, 2)),
-            "local_window": (self.local_window, 16),
-            "global_window": (self.global_window, 128),
-            "global_pinned_dilation": (self.global_pinned_dilation, 8),
-            "global_attn_period": (self.global_attn_period, 4),
-            "global_attn_offset": (self.global_attn_offset, -1),
-            "rope_impl": (self.rope_impl, "ortho"),
-            "rope_nyquist_frac": (self.rope_nyquist_frac, 0.8),
-            "rope_theta": (self.rope_theta, 10_000.0),
-            "noise_conditioning": (self.noise_conditioning, "wan"),
-            "value_residual": (self.value_residual, True),
-            "gated_attn": (self.gated_attn, False),
-            "moe": (self.moe, False),
-            "prompt_conditioning": (self.prompt_conditioning, None),
-            "ctrl_conditioning": (self.ctrl_conditioning, True),
-            "ctrl_cond_dropout": (self.ctrl_cond_dropout, 0.0),
-            "ctrl_conditioning_period": (self.ctrl_conditioning_period, 3),
-            "n_buttons": (self.n_buttons, 256),
-            "scheduler_sigmas": (tuple(self.scheduler_sigmas), WAYPOINT_SCHEDULER_SIGMAS),
-            "base_fps": (self.base_fps, 15),
-            "inference_fps": (self.inference_fps, 60),
-            "temporal_compression": (self.temporal_compression, 4),
-            "max_frames": (self.max_frames, 512),
-            "taehv_ae": (self.taehv_ae, True),
-            "ae_uri": (self.ae_uri, "Overworld-Models/taehv1_5"),
-            "auto_aspect_ratio": (self.auto_aspect_ratio, True),
-        }
+        values = asdict(self)
         mismatches = [
-            f"{name}={actual!r} (expected {expected!r})"
-            for name, (actual, expected) in checkpoint_facts.items()
-            if actual != expected
+            f"{name}={values[name]!r} (expected {expected!r})"
+            for name, expected in _RELEASED_CHECKPOINT_FIELDS.items()
+            if _as_tuple(values[name]) != expected
         ]
         if mismatches:
             raise ValueError(
