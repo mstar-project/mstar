@@ -180,7 +180,7 @@ Chatterbox notes
   routine resamples on the CPU); it decodes with the package's detector like
   the package's output, from which it differs by the resampler only.
 - Streaming (``stream: true``) emits WAV chunks as the speech tokens arrive:
-  the first after 15 tokens (about 0.23 s on an H100), then 50, 100 and 200
+  the first after 15 tokens (about 0.12 s on an H100), then 50, 100 and 200
   tokens (``model_kwargs: stream_first_chunk_tokens`` / ``stream_chunk_tokens``
   / ``stream_chunk_growth`` / ``stream_max_chunk_tokens``): each chunk buys
   the playback time to produce a bigger one, so a stream costs three or four
@@ -195,22 +195,24 @@ Chatterbox notes
   window stays as close to the whole-utterance decode as the full history
   does (log-mel correlation 0.988 vs 0.985 on CPU). Requests whose chunks
   are ready together share one padded flow solve (up to 8 per step).
-- Speed knobs (``model_kwargs``): ``s3gen_graphs: true`` replays the S3Gen
-  stages from CUDA graphs: the flow solve (one graph per rows x frames x
-  steps; the estimator's hundreds of tiny kernels per Euler step make the
-  eager solve launch-bound), the token encoder (per rows x token bucket) and
+- S3Gen runs from CUDA graphs by default (``s3gen_graphs``): the flow solve
+  (one graph per rows x frames x steps; the estimator's hundreds of tiny
+  kernels per Euler step make the eager solve launch-bound, 170 ms vs 45 ms
+  for one row on an H100), the token encoder (per rows x token bucket) and
   the HiFT vocoder (per exact chunk length, its excitation noise drawn
   outside the graph in the reference's order). Rows are padded to the powers
   of two up to ``s3gen_max_batch_size`` (8) and frames to
-  ``s3gen_frame_bucket`` (64 with graphs on); the built-in voice's chunk
-  shapes are captured at startup, other shapes on first use;
-  ``s3gen_graph_stages`` (default ``solve,encoder,vocoder``) picks the stages.
-  ``s3gen_estimator_dtype: bfloat16`` (or ``float16``) runs the flow
-  estimator in that precision with the Euler state kept in float32
-  (``float32`` is the reference path). ``t3_prefill_graphs`` (default on)
-  captures T3 prefill as packed CUDA graphs by token bucket for batches of up
-  to four requests; decode graphs are always captured. ``s3gen_compile`` is
-  the older alternative to the graphs (not both).
+  ``s3gen_frame_bucket`` (64); the built-in voice's chunk shapes are captured
+  at startup, other shapes on first use; ``s3gen_graph_stages`` (default
+  ``solve,encoder,vocoder``) picks the stages. The flow estimator runs in
+  ``s3gen_estimator_dtype`` float16 by default with the Euler state in
+  float32 (within 0.02-0.15 of the float32 log-mel; ``bfloat16`` is as fast
+  and further off; ``float32`` is the reference path, bit-exact with the
+  package at a fixed seed). ``t3_prefill_graphs`` (default on) captures T3
+  prefill as packed CUDA graphs by token bucket for batches of up to four
+  requests; decode graphs are always captured. ``s3gen_graphs: false`` gives
+  the eager path; ``s3gen_compile: true`` is the older alternative and turns
+  the graphs off.
 - Sampling follows the reference order inside the sampler resource:
   repetition penalty -> temperature -> ``min_p`` -> ``top_p``; the T3 node
   declares ``enable_min_p`` on its ``SamplerSpec`` (see
