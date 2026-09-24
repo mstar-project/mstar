@@ -267,7 +267,10 @@ def main() -> None:
     if not args.results and not args.stats:
         parser.error("--results or --stats is required")
 
-    files = [Path(args.stats)] if args.stats else sorted(Path(args.results).glob("*/stats.log"))
+    # run dirs set aside by the stage scripts carry a dotted suffix (``<run>.failed.HHMMSS``) and are skipped
+    files = [Path(args.stats)] if args.stats else sorted(
+        p for p in Path(args.results).glob("*/stats.log") if "." not in p.parent.name
+    )
     blocks = []
     rows = [HEADER, " | ".join(["---"] * (HEADER.count("|") + 1))]
     for path in files:
