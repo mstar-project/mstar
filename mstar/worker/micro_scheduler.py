@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class ReadyNodeEntry:
     """A ready node entry for a single request."""
     request_id: str
-    worker_graph_id: str
+    worker_graph_id: int
     graph_walk: str
 
 
@@ -35,7 +35,7 @@ class ScheduledBatch:
     graph_walk: str
     node_objects: dict[str,GraphNode]
     # request_id -> worker_graph_id (for push-back on OOM)
-    request_to_worker_graph: dict[str, str] = None
+    request_to_worker_graph: dict[str, int] = None
     # ``ScheduleTPNode.spec_seq`` this batch came off the TP-follow FIFO with,
     # -1 otherwise. ``split_off_first`` / ``merge`` only ever see -1.
     tp_seq: int = -1
@@ -227,7 +227,7 @@ class MicroScheduler:
                 return None
 
         node_objects: dict[str, GraphNode] = {}
-        request_to_worker_graph: dict[str, str] = {}
+        request_to_worker_graph: dict[str, int] = {}
         for rid in request_ids:
             popped = queue.pop_ready_nodes(rid, [node_name])
             if popped:

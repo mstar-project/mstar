@@ -44,8 +44,8 @@ class WorkerMessageType(Enum):
 @dataclass
 class NewRequest(MessageBody):
     request_id: str
-    partition_worker_graph_ids: list[str]
-    worker_graph_to_workers: dict[str, list[str]]
+    partition_worker_graph_ids: list[int]
+    worker_graph_to_workers: dict[int, list[str]]
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
 
@@ -146,7 +146,7 @@ class NewRequestConductor(MessageBody):
 @dataclass
 class WorkerGraphsDone(MessageBody):
     request_id: str
-    worker_graph_ids: list[str]
+    worker_graph_ids: list[int]
     is_first_tp_rank: bool
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_token_counts: dict[str, int] = field(default_factory=dict) # name to token counts

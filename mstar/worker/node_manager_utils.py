@@ -31,7 +31,7 @@ class NodeOutputRouting:
     to_workers: dict[str, list[GraphEdge]] # worker id to signals
     emit_to_client: list[GraphEdge] = field(default_factory=list)
     new_token_outputs: list[GraphEdge] = field(default_factory=list)
-    completed_worker_graph_ids: list[str] = field(default_factory=list)
+    completed_worker_graph_ids: list[int] = field(default_factory=list)
     streaming_to_workers: dict[str, list[GraphEdge]] = field(default_factory=dict)  # streaming edges to other workers
     streaming_local: list[GraphEdge] = field(default_factory=list)  # streaming edges staying on this worker
 
@@ -42,7 +42,7 @@ class WorkerGraphQueues:
     For a single worker graph, keeps track of which nodes are waiting on which
     inputs for each request, and which nodes are ready to run per request.
     """
-    worker_graph_id: str
+    worker_graph_id: int
     graph_walks: set[str] # e.g., this worker graph is active during decode and image_gen
                           # but not the prefill graph walk
     worker_graph: WorkerGraph
@@ -191,7 +191,7 @@ class WorkerGraphQueues:
 class PerPartitionInfo:
     current_fwd_info: CurrentForwardPassInfo
     # graph_walk_worker_graph_ids = worker graphs for current graph walk
-    graph_walk_worker_graph_ids: list[str] = field(default_factory=list) # for this worker
+    graph_walk_worker_graph_ids: list[int] = field(default_factory=list) # for this worker
     stream_partition_done: bool = False  # set True when last chunk pops with is_final
 
 
@@ -217,7 +217,7 @@ class PerRequestInfo:
     """
     node_to_workers: dict[NodeAndGraphWalk, list[str]]  # for all nodes
     dyn_loop_to_workers: dict[NodeAndGraphWalk, list[str]]
-    worker_graph_ids: list[str] # for this worker
+    worker_graph_ids: list[int] # for this worker
     sharding_config: ShardingConfig
 
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
@@ -237,15 +237,15 @@ class WorkerGraphsManager:
     to which worker graphs, and which worker graphs belong to which graph walks, for
     routing external outputs to the correct worker.
     """
-    queues: dict[str, WorkerGraphQueues] # worker graph id to queues
+    queues: dict[int, WorkerGraphQueues] # worker graph id to queues
     per_request_info: dict[str, PerRequestInfo] # request id to info
     base_sharding_config: ShardingConfig
     worker_id: str
 
     # The following two are for routing purposes:
-    all_worker_graph_ids_to_graph_walks: dict[str, set[str]] # for worker graphs on different workers too
-    all_worker_graph_ids_to_nodes: dict[str, set[str]] # for worker graphs on different workers too
-    all_worker_graph_ids_to_dyn_loops: dict[str, set[str]]
+    all_worker_graph_ids_to_graph_walks: dict[int, set[str]] # for worker graphs on different workers too
+    all_worker_graph_ids_to_nodes: dict[int, set[str]] # for worker graphs on different workers too
+    all_worker_graph_ids_to_dyn_loops: dict[int, set[str]]
 
     # Maps node_name -> partition_name. Populated from the model's partitions
     # and graph walk definitions. Used to look up which partition a node belongs
@@ -256,7 +256,7 @@ class WorkerGraphsManager:
     # Built in __post_init__ from all_worker_graph_ids_to_graph_walks +
     # all_worker_graph_ids_to_nodes. Lets get_worker_graph_id_for_node skip
     # the linear scan over the request's worker_graph_ids.
-    walk_node_to_worker_graph_id: dict[tuple[str, str], str] = field(default_factory=dict)
+    walk_node_to_worker_graph_id: dict[tuple[str, str], int] = field(default_factory=dict)
 
     def __post_init__(self):
         for wg_id, walks in self.all_worker_graph_ids_to_graph_walks.items():
@@ -369,7 +369,7 @@ class WorkerGraphsManager:
         return wg_id
 
     def mark_node_complete(
-        self, request_id: str, worker_graph_id: str, node_name: str,
+        self, request_id: str, worker_graph_id: int, node_name: str,
     ) -> NodeCompletionOutput:
         """Complete a node in the given worker graph's per-request io.
 
@@ -451,7 +451,7 @@ class WorkerGraphsManager:
         # ingested any edge in this call — e.g. when the just-completed node's
         # outputs all target EMPTY_DESTINATION / EMIT_TO_CLIENT / a streaming
         # partition (Orpheus prefill, BAGEL vae_decoder, Code2Wav).
-        completed_worker_graph_ids: list[str] = []
+        completed_worker_graph_ids: list[int] = []
         for wg_id in self.per_request_info[request_id].worker_graph_ids:
             if graph_walk not in self.all_worker_graph_ids_to_graph_walks[wg_id]:
                 continue
@@ -605,8 +605,8 @@ class WorkerGraphsManager:
 
     def add_request(
         self, request_id: str,
-        partition_worker_graph_ids: list[str], # for this worker's worker graphs
-        worker_graph_to_workers: dict[str, list[str]], # for other / all worker graphs
+        partition_worker_graph_ids: list[int], # for this worker's worker graphs
+        worker_graph_to_workers: dict[int, list[str]], # for other / all worker graphs
         current_fwd_info: CurrentForwardPassInfo,
     ):
         """
