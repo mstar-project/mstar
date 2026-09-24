@@ -30,7 +30,7 @@ from torch import nn
 from mstar.model.chatterbox.components.audio import MelSpectrogram24k, kaldi_fbank_80
 from mstar.model.chatterbox.components.s3gen_cfm import CausalConditionalCFM, ConditionalDecoder
 from mstar.model.chatterbox.components.s3gen_flow import FlowTokenEncoder, lengths_to_mask
-from mstar.model.chatterbox.components.s3gen_graphs import SolveGraphs
+from mstar.model.chatterbox.components.s3gen_graphs import EncoderGraphs, SolveGraphs, VocoderGraphs
 from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator
 from mstar.model.chatterbox.components.s3gen_xvector import CAMPPlus
 from mstar.model.chatterbox.config import S3GenConfig
@@ -82,8 +82,10 @@ class S3Gen(nn.Module):
             config.cfm, ConditionalDecoder(config.estimator, meanflow=config.meanflow),
         )
         self.vocoder = HiFTGenerator(config.hift)
-        # optional CUDA-graph replay of whole solves (``enable_graphs``)
+        # optional CUDA-graph replay of the solve, the encoder and the vocoder (``enable_graphs``)
         self.solver: SolveGraphs | None = None
+        self.encoder_graphs: EncoderGraphs | None = None
+        self.vocoder_graphs: VocoderGraphs | None = None
 
         n_trim = config.trim_fade_frames
         trim_fade = torch.zeros(2 * n_trim)
@@ -112,9 +114,26 @@ class S3Gen(nn.Module):
             return self.solver(mu, mask, spks, cond, noise, n_timesteps)
         return self.solve(mu, mask, spks, cond, noise, n_timesteps)
 
-    def enable_graphs(self, rows: Sequence[int] = (1, 2, 4, 8), max_graphs: int = 64) -> "SolveGraphs":
-        """Replay whole flow solves from CUDA graphs, one per (rows, frames, steps)."""
-        self.solver = SolveGraphs(self.solve, rows=rows, max_graphs=max_graphs)
+    def _run_encoder(self, tokens: torch.Tensor, token_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.encoder_graphs is not None:
+            return self.encoder_graphs(tokens, token_lens)
+        return self.flow_encoder(tokens, token_lens)
+
+    def enable_graphs(
+        self, rows: Sequence[int] = (1, 2, 4, 8), max_graphs: int = 64, *,
+        stages: Sequence[str] = ("solve", "encoder", "vocoder"), token_bucket: int = 32,
+    ) -> "SolveGraphs | None":
+        """Replay the flow solve (one graph per rows x frames x steps), the
+        token encoder (per rows x token bucket) and the vocoder (per exact
+        length) from CUDA graphs; ``stages`` picks which."""
+        self.solver = SolveGraphs(self.solve, rows=rows, max_graphs=max_graphs) if "solve" in stages else None
+        self.encoder_graphs = (
+            EncoderGraphs(self.flow_encoder, rows=rows, token_bucket=token_bucket, max_graphs=max_graphs)
+            if "encoder" in stages else None
+        )
+        self.vocoder_graphs = (
+            VocoderGraphs(self.vocoder.vocode_with, max_graphs=2 * max_graphs) if "vocoder" in stages else None
+        )
         return self.solver
 
     @property
@@ -200,7 +219,7 @@ class S3Gen(nn.Module):
         full_lens = token_lens.to(self.device) + prompt_len
 
         spk = self.flow_encoder.project_speaker(ref.embedding.expand(batch, -1))
-        mu, h_masks = self.flow_encoder(full_tokens, full_lens)
+        mu, h_masks = self._run_encoder(full_tokens, full_lens)
         h_lens = h_masks.sum(dim=-1).squeeze(-1)
         if not finalize:
             cut = self.config.encoder.pre_lookahead_len * self.config.token_mel_ratio
@@ -248,7 +267,7 @@ class S3Gen(nn.Module):
         tokens = torch.nn.utils.rnn.pad_sequence(full, batch_first=True)
 
         spk = self.flow_encoder.project_speaker(torch.cat([ref.embedding for ref in refs], dim=0))
-        mu, h_masks = self.flow_encoder(tokens, full_lens)
+        mu, h_masks = self._run_encoder(tokens, full_lens)
         cuts = torch.tensor([0 if row.finalize else lookahead for row in rows], device=self.device)
         h_lens = (h_masks.sum(dim=-1).squeeze(-1) - cuts).clamp_min(0)
         total = mu.shape[-1]
@@ -294,7 +313,12 @@ class S3Gen(nn.Module):
         (reference ``HiFTGenerator.inference(cache_source=...)``). ``fade_in``
         applies the utterance-head trim/fade and belongs on the first chunk only.
         """
-        wav, source = self.vocoder.vocode(mel.to(self.dtype), generator=generator, cache_source=cache_source)
+        mel = mel.to(self.dtype)
+        noise = self.vocoder.draw_noise(mel, generator)
+        if self.vocoder_graphs is not None:
+            wav, source = self.vocoder_graphs(mel, noise.phase, noise.harmonic, cache_source)
+        else:
+            wav, source = self.vocoder.vocode(mel, cache_source=cache_source, noise=noise)
         if fade_in:
             n = self.trim_fade.shape[0]
             wav[:, :n] = wav[:, :n] * self.trim_fade
