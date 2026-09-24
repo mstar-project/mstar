@@ -455,6 +455,9 @@ class ChatterboxConfig:
     # bucket; the shapes of the built-in voice are captured at startup, others
     # on first use.
     s3gen_graphs: bool = False
+    # Which S3Gen stages the graphs cover: the flow solve, the token encoder
+    # (rows and tokens padded to the bucket) and the vocoder (exact lengths).
+    s3gen_graph_stages: str = "solve,encoder,vocoder"
     # Precision of the flow estimator ("float32", "bfloat16", "float16"); the
     # Euler state and update stay in float32. float32 is the reference path.
     s3gen_estimator_dtype: str = "float32"
