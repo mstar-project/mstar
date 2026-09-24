@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import time
 
 import torch
 import triton
@@ -85,21 +86,35 @@ def _cuda_op_available() -> bool:
     """
     if not torch.cuda.is_available():
         return False
-    try:
-        from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import load
 
-        _clear_stale_build_lock("_mstar_moe_C")
-        load(name="_mstar_moe_C", sources=[_CSRC], is_python_module=False, verbose=False)
-        # Touch the op so a registration failure surfaces here, not at call time.
-        _ = torch.ops._mstar_moe_C.moe_align_block_size
-        return True
-    except Exception as e:  # pragma: no cover -- depends on the build toolchain
-        logger.warning(
-            "fused MoE: could not build the CUDA moe_align_block_size op (%s); "
-            "using the slower torch fallback.",
-            e,
-        )
-        return False
+    # TP workers building together can race on the stale-lock
+    # sweep and fail a build that did write the .so. The fallback is not
+    # graph-capturable, so one losing rank would run the whole group eager.
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            if attempt == 0:
+                _clear_stale_build_lock("_mstar_moe_C")
+            else:
+                time.sleep(2.0)
+            load(
+                name="_mstar_moe_C",
+                sources=[_CSRC],
+                is_python_module=False,
+                verbose=False,
+            )
+            # Touch the op so a registration failure surfaces here, not at call time.
+            _ = torch.ops._mstar_moe_C.moe_align_block_size
+            return True
+        except Exception as e:  # pragma: no cover -- depends on the build toolchain
+            last_error = e
+    logger.warning(
+        "fused MoE: could not build the CUDA moe_align_block_size op (%s); "
+        "using the slower torch fallback (NOT CUDA-graph capturable).",
+        last_error,
+    )
+    return False
 
 
 def moe_align_block_size(
@@ -136,7 +151,8 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
 
-    if _cuda_op_available():
+    # CPU inputs (host-side tests) take the torch fallback even on a GPU box.
+    if _cuda_op_available() and topk_ids.is_cuda:
         torch.ops._mstar_moe_C.moe_align_block_size(
             topk_ids,
             num_experts,
@@ -147,7 +163,12 @@ def moe_align_block_size(
         )
     else:
         _moe_align_block_size_torch(
-            topk_ids, block_size, num_experts, sorted_ids, expert_ids, num_tokens_post_pad
+            topk_ids,
+            block_size,
+            num_experts,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
         )
 
     return sorted_ids, expert_ids, num_tokens_post_pad
@@ -197,6 +218,8 @@ def _moe_align_block_size_torch(
     sorted_experts = flat[order].to(torch.int64)
     ucounts = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
     ucounts[1:] = torch.cumsum(counts, dim=0)  # unpadded prefix over sorted tokens
-    local_rank = torch.arange(numel, device=device, dtype=torch.int64) - ucounts[sorted_experts]
+    local_rank = (
+        torch.arange(numel, device=device, dtype=torch.int64) - ucounts[sorted_experts]
+    )
     dest = cumsum[sorted_experts] + local_rank
     sorted_ids[dest] = order.to(torch.int32)
