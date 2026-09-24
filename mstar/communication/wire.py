@@ -184,16 +184,55 @@ def _encoder(hint):
     return _dynamic
 
 
-def _decoder(hint):
+def _checked(kinds: tuple[type, ...], name: str):
+    """A plain-type decoder that refuses a value of the wrong kind. Only used
+    for union branches: see ``_decoder``'s ``strict``."""
+    def dec(v):
+        if v is not None and not isinstance(v, kinds):
+            raise WireError(f"expected {name}, got {type(v).__name__}")
+        return v
+    return dec
+
+
+# What a union branch of each plain type accepts off the wire. Lenient where
+# Python is: an int arrives for a float field, and bool is an int.
+_PLAIN_CHECKS = {
+    int: _checked((int,), "int"),
+    float: _checked((int, float), "float"),
+    bool: _checked((bool,), "bool"),
+    str: _checked((str,), "str"),
+    bytes: _checked((bytes,), "bytes"),
+}
+
+
+def _array(v):
+    if not isinstance(v, list):
+        raise WireError(f"expected an array, got {type(v).__name__}")
+    return v
+
+
+def _decoder(hint, strict: bool = False):
+    """A closure that decodes one value of declared type ``hint``.
+
+    ``strict`` is for union branches, which are tried in order until one does
+    not raise. Unchecked, a plain type passes anything through and a
+    container iterates whatever it is handed, so the first such branch
+    claimed every value: ``int | tuple[str, str]`` decoded a tuple as a list
+    (and as a dict key, raised unhashable), and ``tuple[str, str]`` decoded
+    the string "ab" as ('a', 'b'). Strict branches check the value's kind
+    first. Outside unions nothing is checked, so a field that round-tripped
+    before still does.
+    """
     origin = typing.get_origin(hint)
     args = typing.get_args(hint)
+    arr = _array if strict else _identity
 
     if origin is typing.Union or origin is type(int | str):
         branches = [a for a in args if a is not type(None)]
         if len(branches) == 1:
-            inner = _decoder(branches[0])
+            inner = _decoder(branches[0], strict)
             return lambda v: None if v is None else inner(v)
-        decs = [_decoder(b) for b in branches]
+        decs = [_decoder(b, strict=True) for b in branches]
 
         def dec_union(v):
             if v is None:
@@ -207,25 +246,37 @@ def _decoder(hint):
         return dec_union
 
     if origin is list:
-        inner = _decoder(args[0]) if args else _dynamic_decode
-        return lambda v: [inner(x) for x in v]
+        inner = _decoder(args[0], strict) if args else _dynamic_decode
+        return lambda v: [inner(x) for x in arr(v)]
     if origin is tuple:
         if len(args) == 2 and args[1] is Ellipsis:
-            inner = _decoder(args[0])
-            return lambda v: tuple(inner(x) for x in v)
-        decs = [_decoder(a) for a in args]
+            inner = _decoder(args[0], strict)
+            return lambda v: tuple(inner(x) for x in arr(v))
+        decs = [_decoder(a, strict) for a in args]
+        if strict:
+            def dec_tuple(v):
+                if len(_array(v)) != len(decs):
+                    raise WireError(
+                        f"expected {len(decs)} elements, got {len(v)}"
+                    )
+                return tuple(d(x) for d, x in zip(decs, v, strict=True))
+            return dec_tuple
         return lambda v: tuple(d(x) for d, x in zip(decs, v, strict=False))
     if origin in (set, frozenset):
-        inner = _decoder(args[0]) if args else _dynamic_decode
-        return lambda v: origin(inner(x) for x in v)
+        inner = _decoder(args[0], strict) if args else _dynamic_decode
+        return lambda v: origin(inner(x) for x in arr(v))
 
     if origin is dict:
         kt, vt = args if args else (Any, Any)
-        vdec = _decoder(vt)
+        vdec = _decoder(vt, strict)
         if kt is str:
-            return lambda v: {k: vdec(x) for k, x in v.items()}
-        kdec = _decoder(kt)
-        return lambda v: {kdec(k): vdec(x) for k, x in v}
+            def dec_str_map(v):
+                if strict and not isinstance(v, dict):
+                    raise WireError(f"expected a map, got {type(v).__name__}")
+                return {k: vdec(x) for k, x in v.items()}
+            return dec_str_map
+        kdec = _decoder(kt, strict)
+        return lambda v: {kdec(k): vdec(x) for k, x in arr(v)}
 
     if hint is torch.dtype:
         return _dtype_from_name
@@ -237,6 +288,8 @@ def _decoder(hint):
             return _decode_tagged
         if dataclasses.is_dataclass(hint):
             return lambda v: _decode_dataclass(v, hint)
+        if strict and hint in _PLAIN_CHECKS:
+            return _PLAIN_CHECKS[hint]
 
     return _dynamic_decode
 
