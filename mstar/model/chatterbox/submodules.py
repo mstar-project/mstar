@@ -456,6 +456,8 @@ class T3Submodule(ARNodeSubmodule):
                     capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
                     caps_eager_batch_size=False,
                     compile=False,
+                    # guidance packs the cond and uncond streams into one plan
+                    total_tokens_multiplier=2 if requires_cfg else 1,
                 ))
             configs.append(BatchedCudaGraphConfig(
                 capture_graph_walk="decode",
