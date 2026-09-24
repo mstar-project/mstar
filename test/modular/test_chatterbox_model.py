@@ -1126,6 +1126,28 @@ def test_multilingual_text_preprocessing_steps(tmp_path):
     assert punc_norm("今天天气很好。") == "今天天气很好。."
 
 
+def test_s3gen_batch_size_knob_and_graph_rows():
+    """``s3gen_max_batch_size`` sizes the padded solve and the captured row counts."""
+    from mstar.model.chatterbox.chatterbox_model import _graph_rows
+
+    assert _graph_rows(8) == (1, 2, 4, 8)
+    assert _graph_rows(16) == (1, 2, 4, 8, 16)
+    assert _graph_rows(12) == (1, 2, 4, 8, 12)
+    assert _graph_rows(1) == (1,)
+    model = ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", s3gen_max_batch_size=16)
+    assert model.config.s3gen_max_batch_size == 16
+    with pytest.raises(ValueError, match="at least 1"):
+        ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", s3gen_max_batch_size=0)
+    config = ChatterboxConfig.chatterbox()
+    config.s3gen_max_batch_size = 16
+    sub = S3GenSubmodule(
+        _FakeS3Gen(), s3_tokenizer=None, config=config, builtin_voice=SimpleNamespace(num_prompt_tokens=4),
+    )
+    assert sub.max_batch_size("s3gen_chunk") == 16
+    one = [sub.prepare_inputs("s3gen_chunk", _s3_info(rid="a"), {SPEECH_TOKENS: [torch.tensor([1, 2])]})]
+    assert sub.can_batch(None, one * 16) and not sub.can_batch(None, one * 17) and not sub.can_batch(None, one)
+
+
 def test_s3gen_node_advertises_its_batch_size_to_the_scheduler():
     """The micro-scheduler only groups requests up to ``max_batch_size``; the
     base default is one, which would silently disable the batched flow solve."""
