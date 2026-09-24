@@ -64,7 +64,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
-from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.multimodal import PromptPart
 from mstar.model.nemotron_duplex.config import (
@@ -512,28 +512,26 @@ class NemotronDuplexModel(Model):
             input_names=["audio_features"],
             outputs=[StreamingGraphEdge(next_node="nano_llm", name="audio_frame", target_partition="LLM")],
         )
-        # LLM: optional system-prompt prefill (primes the cache like the reference;
-        # persists the carry-in prev_text / prev_func, both PAD after a prompt),
-        # then the frame-synchronous decode loop.
-        prefill_text = GraphNode(
-            name="nano_llm",
-            input_names=["text_inputs"],
-            outputs=[
-                GraphEdge(next_node=EMPTY_DESTINATION, name="prev_text", persist=True),
-                GraphEdge(next_node=EMPTY_DESTINATION, name="prev_func", persist=True),
-            ],
-        )
+        # LLM: the frame-synchronous decode loop. A system prompt is not a
+        # separate walk: the reference feeds the prompt tokens as leading
+        # frames of the same stream, so here they are the leading tokens of
+        # the session's first step (prompt + first audio frame, sampled at the
+        # last position only). ``text_inputs`` rides the loop as a fed-back
+        # token: the request seeds it with the prompt ids (or a -1 sentinel
+        # without a prompt) and the node hands back the sentinel once it has
+        # consumed the prompt, so a re-injected copy can never win over it.
         decode = Loop(
             name="decode_loop",
             section=GraphNode(
                 name="nano_llm",
-                input_names=["audio_frame", "prev_text", "prev_func"],
+                input_names=["audio_frame", "prev_text", "prev_func", "text_inputs"],
                 consumes_stream=True,
                 outputs=[
                     GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token",
                               output_modality="text", conductor_new_token=True),
                     GraphEdge(next_node="nano_llm", name="prev_text"),   # fed-back agent text
                     GraphEdge(next_node="nano_llm", name="prev_func"),   # fed-back function
+                    GraphEdge(next_node="nano_llm", name="text_inputs"), # prompt, consumed once
                     StreamingGraphEdge(next_node="eartts_talker", name="new_token",
                                        target_partition="Talker"),
                 ],
@@ -561,8 +559,7 @@ class NemotronDuplexModel(Model):
             consumes_stream=True,
             outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
         )
-        return dict(encode=encode, prefill_text=prefill_text, decode=decode,
-                    talker_decode=talker_decode, codec_chunk=codec_chunk)
+        return dict(encode=encode, decode=decode, talker_decode=talker_decode, codec_chunk=codec_chunk)
 
     def get_partitions(self) -> list[PartitionDefinition]:
         return [
@@ -571,7 +568,7 @@ class NemotronDuplexModel(Model):
                 producer_partitions=[],
             ),
             PartitionDefinition(
-                name="LLM", graph_walks={"prefill_text", "decode"}, initial_walk="prefill_text",
+                name="LLM", graph_walks={"decode"}, initial_walk="decode",
                 producer_partitions=["Encoder"],
             ),
             PartitionDefinition(
@@ -648,6 +645,12 @@ class NemotronDuplexModel(Model):
         first_prev = self.config.text_pad_id if prompt else self.config.text_bos_id
         out["prev_text"] = [torch.tensor([first_prev], dtype=torch.long)]
         out["prev_func"] = [torch.tensor([self.config.text_pad_id], dtype=torch.long)]
+        # The prompt rides the decode loop as a fed-back token; -1 = no prompt.
+        # ``has_prompt`` lets the routing know before any tensor is readable.
+        if prompt:
+            out["has_prompt"] = [torch.tensor([1], dtype=torch.long)]
+        else:
+            out["text_inputs"] = [torch.tensor([-1], dtype=torch.long)]
         return out
 
     def load_audio(self, filepath: str, device: str):
@@ -672,6 +675,13 @@ class NemotronDuplexModel(Model):
     # (Encoder -> LLM -> Talker -> Codec), mirroring qwen3_omni.
     # -------------------------------------------------------------------
 
+    @staticmethod
+    def _has_prompt(input_signals, model_kwargs=None) -> bool:
+        """Whether the request seeded ``text_inputs`` with prompt ids rather
+        than the no-prompt sentinel: ``process_prompt`` adds a ``has_prompt``
+        signal alongside (the tensors themselves are not readable here)."""
+        return bool(input_signals.get("has_prompt"))
+
     def _meta(self, imod, omod, walk, is_prefill):
         return CurrentForwardConductorMetadata(
             input_modalities=imod, output_modalities=omod, graph_walk=walk, is_prefill=is_prefill,
@@ -695,28 +705,22 @@ class NemotronDuplexModel(Model):
                 inputs=[edge], unpersist_tensors=list(edge.tensor_info), step_metadata={},
             )
         if partition_name == "LLM":
-            # System prompt (if any) primes the cache first; else jump straight into
-            # the frame-synchronous decode loop, self-triggered by the audio stream.
-            has_prompt = bool(input_signals.get("text_inputs"))
-            walk = "prefill_text" if has_prompt else "decode"
+            # Straight into the frame-synchronous decode loop, self-triggered
+            # by the audio stream. Seed iteration 0's fed-back tokens (agent
+            # BOS / PAD, function PAD) and the prompt ids (a -1 sentinel when
+            # there is no prompt) so the node is ready before any loop-back
+            # exists. ``prompt_pending`` tells the worker that this request's
+            # first step is prompt + frame, which no fixed-shape capture fits.
+            has_prompt = self._has_prompt(input_signals, model_kwargs)
             edges = []
-            if has_prompt:
-                e = GraphEdge(next_node="nano_llm", name="text_inputs")
-                e.tensor_info = input_signals.get("text_inputs", [])
-                edges = [e]
-            else:
-                # No system prompt: jump straight into the frame-synchronous
-                # decode loop. Seed iteration-0's fed-back tokens (BOS / PAD)
-                # so the node is ready before any loop-back exists; the audio
-                # frames then self-trigger it via the StreamBuffer.
-                for name in ("prev_text", "prev_func"):
-                    e = GraphEdge(next_node="nano_llm", name=name)
-                    e.tensor_info = input_signals.get(name, [])
-                    edges.append(e)
+            for name in ("prev_text", "prev_func", "text_inputs"):
+                e = GraphEdge(next_node="nano_llm", name=name)
+                e.tensor_info = input_signals.get(name, [])
+                edges.append(e)
             return ForwardPassArgs(
-                full_metadata=self._meta(input_modalities, output_modalities, walk, has_prompt),
+                full_metadata=self._meta(input_modalities, output_modalities, "decode", has_prompt),
                 inputs=edges, unpersist_tensors=sum([e.tensor_info for e in edges], start=[]),
-                step_metadata={"is_prefill": has_prompt},
+                step_metadata={"prompt_pending": has_prompt},
             )
         if partition_name in ("Talker", "Codec"):
             walk = "talker_decode" if partition_name == "Talker" else "codec_chunk"
@@ -747,9 +751,7 @@ class NemotronDuplexModel(Model):
         # step is still running and its output would arrive for a finished
         # request (observed as sessions losing their final audio frame).
         if partition_name == "LLM":
-            if m.is_prefill:                               # prefill_text -> decode
-                m.is_prefill = False
-                m.graph_walk = "decode"
+            m.is_prefill = False                            # the prompt rode the first step
             edges = []
             for name in ("prev_text", "prev_func"):        # fed-back tokens for AddFusion
                 e = GraphEdge(next_node="nano_llm", name=name)
@@ -758,7 +760,7 @@ class NemotronDuplexModel(Model):
             return ForwardPassArgs(
                 full_metadata=m, inputs=edges,
                 unpersist_tensors=sum([e.tensor_info for e in edges], start=[]),
-                request_done=False, step_metadata={"is_prefill": False},
+                request_done=False, step_metadata={"prompt_pending": False},
             )
 
         if partition_name in ("Talker", "Codec"):          # self-triggered by the upstream stream
