@@ -292,7 +292,9 @@ class EncoderGraphs(ShapeGraphs):
 
 
 class VocoderGraphs(ShapeGraphs):
-    """One graph per exact ``(frames, with cache)`` for the HiFT vocoder.
+    """One graph per exact ``(frames, with cache)`` for the HiFT vocoder up to
+    its output spectrum (``HiFTGenerator.spectrum``); the inverse STFT runs
+    eagerly behind the replay because ``torch.istft`` synchronises.
 
     The vocoder runs one request at a time behind its own excitation cache,
     so nothing is padded: the mel's frame count and whether a cache is
@@ -300,15 +302,17 @@ class VocoderGraphs(ShapeGraphs):
     ``HiFTGenerator.draw_noise``) and comes in as a tensor input.
     """
 
-    def __init__(self, vocode: Callable[..., tuple[torch.Tensor, torch.Tensor]], *, max_graphs: int = 128):
-        def fn(tensors: Tensors, extra: tuple) -> tuple[torch.Tensor, torch.Tensor]:
-            return tuple(vocode(tensors["mel"], tensors["phase"], tensors["harmonic"], tensors.get("cache")))
+    def __init__(
+        self, spectrum: Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]], *, max_graphs: int = 128,
+    ):
+        def fn(tensors: Tensors, extra: tuple) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return tuple(spectrum(tensors["mel"], tensors["phase"], tensors["harmonic"], tensors.get("cache")))
 
         super().__init__(fn, max_graphs=max_graphs)
 
     def __call__(
         self, mel: torch.Tensor, phase: torch.Tensor, harmonic: torch.Tensor, cache: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         tensors = {"mel": mel, "phase": phase, "harmonic": harmonic}
         if cache is not None and cache.shape[-1] > 0:
             tensors["cache"] = cache
