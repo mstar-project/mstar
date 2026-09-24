@@ -167,11 +167,22 @@ def main() -> None:
         help="only the rows the PR table needs: baselines, the shipped defaults ('final') and the "
              "offline decoder ('fix_chunk0' / 'chunk0' without lost requests)",
     )
+    parser.add_argument(
+        "--label", action="append", default=[], metavar="TAG=TEXT",
+        help="keep only M* runs whose option tag is TAG and label them TEXT (repeatable); "
+             "baseline rows are kept and labelled by their tag",
+    )
     args = parser.parse_args()
     results = Path(args.results)
     rows = collect(results)
     env = read_env(results)
-    if args.curated:
+    if args.label:
+        labels = dict(item.split("=", 1) for item in args.label)
+        rows = [r for r in rows if r["system"] != "M*" or r["options"] in labels]
+        for r in rows:
+            if r["system"] == "M*":
+                r["options"] = labels[r["options"]]
+    elif args.curated:
         # the PR rows: shipped defaults and the offline decoder per node, the earlier default,
         # and every baseline run (n04 = first allocation, n08 = second; the nodes differ)
         labels = {
@@ -188,7 +199,8 @@ def main() -> None:
             elif r["system"] == "chatterbox-vllm":
                 r["options"] = ("reference sampling, " if r["options"] == "refsampling" else "its defaults, ") + "n04"
     md = "\n\n".join(table(rows, v, env) for v in ("chatterbox", "turbo") if any(r["variant"] == v for r in rows))
-    out = Path(args.out) if args.out else results / ("TABLE_curated.md" if args.curated else "TABLE.md")
+    curated = args.curated or bool(args.label)
+    out = Path(args.out) if args.out else results / ("TABLE_curated.md" if curated else "TABLE.md")
     out.write_text(md + "\n")
     (results / "TABLE.json").write_text(json.dumps({"env": env, "rows": rows}, indent=2))
     print(md)
