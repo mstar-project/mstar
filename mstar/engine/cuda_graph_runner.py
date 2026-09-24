@@ -522,9 +522,12 @@ class CudaGraphRunner:
             # same GPU addresses; replay writes real values into them.
             for key, value in list(static_inputs.items()):
                 if isinstance(value, torch.Tensor):
+                    seq_dim_override = (
+                        config.input_seq_dims.get(key) if config.input_seq_dims else None
+                    )
                     static_inputs[key] = self._intern_static_buffer(
                         spec.config_idx, key, value,
-                        seq_len=spec.num_tokens, batch_size=spec.bs,
+                        seq_len=spec.num_tokens, seq_dim_override=seq_dim_override,
                     )
             static_input_keys = tuple(
                 key for key, value in static_inputs.items()
@@ -600,26 +603,12 @@ class CudaGraphRunner:
         )
 
     @staticmethod
-    def _seq_dim(value: torch.Tensor, seq_len: int, batch_size: int | None = None) -> int:
-        """Index of the dim that varies with this bucket, else 0.
+    def _seq_dim(value: torch.Tensor, seq_len: int) -> int:
+        """Index of the first dim whose size matches ``seq_len``, else 0.
 
-        Dim 0 is checked first against both accepted sizes — the flattened
-        token count (``seq_len``) and the row count (``batch_size``) — since
-        that is where every real per-bucket-varying Waypoint input already
-        lives (``preprocess`` concatenates rows on dim 0). Only a tensor with
-        something else on dim 0 falls through to the later-dim scan, which
-        exists for mrope-style ids that carry seq in a later dim (e.g.
-        ``[3, seq]`` → 1).
-
-        Checking dim 0 first, rather than folding ``batch_size`` into the same
-        scan, matters: a fixed-width tensor unrelated to batching can collide
-        with ``seq_len`` on a later dim (Waypoint's ``button`` is ``[B, 1,
-        256]``, and 360p's bs=2 bucket also has 256 tokens) — that used to get
-        hoisted before dim 0's real, smaller ``batch_size`` match was ever
-        checked.
-        """
-        if value.shape and value.shape[0] in (seq_len, batch_size):
-            return 0
+        Used to bring the (bucket-varying) seq dim to the front for shared-buffer
+        interning: most inputs are seq-leading (returns 0), but mrope-style ids
+        carry seq in a later dim (e.g. ``[3, seq]`` → 1)."""
         for dim, size in enumerate(value.shape):
             if size == seq_len:
                 return dim
@@ -627,7 +616,7 @@ class CudaGraphRunner:
 
     def _intern_static_buffer(
         self, config_idx: int, key: str, value: torch.Tensor,
-        seq_len: int | None = None, batch_size: int | None = None,
+        seq_len: int | None = None, seq_dim_override: int | None = None,
     ) -> torch.Tensor:
         """Return a slice view into the shared buffer for (config_idx, key).
 
@@ -635,8 +624,10 @@ class CudaGraphRunner:
         largest-first) bucket's shape; smaller buckets reslice its leading dim.
         If ``seq_len`` is given, the seq dim is moved to the front for storage and
         back on return, so the captured forward sees the original layout.
-        ``batch_size`` — the bucket's row count — disambiguates dim 0 from a
-        coincidental same-size match elsewhere; see `_seq_dim`.
+        ``seq_dim_override``, from the config's ``input_seq_dims``, is used
+        instead of `_seq_dim`'s size-based guess when a caller already knows
+        which dim varies with the bucket (`_seq_dim` can pick the wrong dim
+        when an unrelated axis happens to match ``seq_len``).
         """
         buf_key = (config_idx, key)
         if seq_len is None:
@@ -647,7 +638,10 @@ class CudaGraphRunner:
             # — and the buffer is shared, so its layout cannot vary anyway
             seq_dim = self._static_buffer_seq_dims[buf_key]
         else:
-            seq_dim = self._seq_dim(value, seq_len, batch_size)
+            seq_dim = (
+                seq_dim_override if seq_dim_override is not None
+                else self._seq_dim(value, seq_len)
+            )
             self._static_buffer_seq_dims[buf_key] = seq_dim
         stored = value.movedim(seq_dim, 0) if seq_dim != 0 else value
         shared = self._shared_static_buffers.get(buf_key)
