@@ -95,19 +95,32 @@ def test_nano_fuse_frame_handles_empty_audio_frame():
     assert not torch.allclose(with_audio["input_embeds"], pre["input_embeds"])
 
 
-def test_nano_prompt_priming_matches_reference():
-    """System-prompt prefill fuses each prompt token with the agent channel (BOS
-    on the first token, PAD after) and a PAD function token — the reference's
-    ``_prime_prompt`` — instead of embedding the raw ids."""
+def test_nano_prompt_rides_the_first_frame_step():
+    """A session's first step with a system prompt is prompt tokens + first
+    frame in one sequence: each prompt token fused with the agent channel (BOS
+    on the first, PAD after) and a PAD function token -- the reference's
+    ``_prime_prompt`` -- followed by the frame fused with prev PAD. Afterwards
+    the loop-back carries the NO_PROMPT sentinel and the step is a plain frame."""
+    from mstar.model.nemotron_duplex.submodules import NO_PROMPT
+
     nano = _make_nano()
     cfg, emb = nano.config, nano.embeddings
     ids = torch.tensor([10, 11, 12, 13])
-    inp, pre = _fuse(nano, "prefill_text", {"text_inputs": [ids]})
-    assert inp.input_seq_len == 4 and pre["seq_lens"] == [4]
+    frame = torch.ones(H)
+    inputs = {"text_inputs": [ids], "audio_frame": [frame],
+              "prev_text": [torch.tensor([cfg.text_pad_id])], "prev_func": [torch.tensor([cfg.text_pad_id])]}
+    inp, pre = _fuse(nano, "decode", inputs)
+    assert inp.input_seq_len == 5 and pre["seq_lens"] == [5] and inp.kwargs["mode"] == "prompt_frame"
     agent = torch.tensor([cfg.text_bos_id] + [cfg.text_pad_id] * 3)
-    expected = (emb(agent) * cfg.agent_text_weight + emb(ids) * cfg.user_audio_weight
-                + emb(torch.tensor([cfg.text_pad_id])) * cfg.function_weight)
-    assert torch.allclose(pre["input_embeds"], expected)
+    pad = emb(torch.tensor([cfg.text_pad_id]))
+    prompt_rows = emb(agent) * cfg.agent_text_weight + emb(ids) * cfg.user_audio_weight + pad * cfg.function_weight
+    frame_row = pad * cfg.agent_text_weight + frame.view(1, -1) * cfg.user_audio_weight + pad * cfg.function_weight
+    assert torch.allclose(pre["input_embeds"], torch.cat([prompt_rows, frame_row]))
+    # sentinel (or absent) text_inputs -> an ordinary one-token frame step
+    inputs["text_inputs"] = [torch.tensor([NO_PROMPT])]
+    inp2, pre2 = _fuse(nano, "decode", inputs)
+    assert inp2.input_seq_len == 1 and inp2.kwargs["mode"] == "frame" and pre2["input_embeds"].shape == (1, H)
+    assert torch.allclose(pre2["input_embeds"], frame_row)
 
 
 STATE_KEYS = {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA}
@@ -119,19 +132,25 @@ def test_nano_declare_step_per_walk():
     'main' segment per request, spanning its token count — padding rows
     included (strict zip)."""
     nano = _make_nano()
-    p_inp = nano.prepare_inputs("prefill_text", None, {"text_inputs": [torch.arange(5)]})
-    step = nano.declare_step("prefill_text", ["a"], [p_inp])
-    assert set(step.keys()) == STATE_KEYS
+    p_inp = nano.prepare_inputs("decode", None, {"text_inputs": [torch.arange(4)], "audio_frame": [torch.ones(H)]})
+    step = nano.declare_step("decode", ["a"], [p_inp])
+    assert set(step.keys()) == STATE_KEYS | {NANO_SAMPLER}
     assert isinstance(step.get(NANO_KV), KVStep) and isinstance(step.get(NANO_ATTN), AttentionStep)
     assert isinstance(step.get(MAMBA_STATE), RecurrentStep) and isinstance(step.get(MAMBA), LinearAttnStep)
     assert step.get(NANO_ATTN).causal is True
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("a", "main", 5)]
+    assert step.cg_key_info is None                       # prompt + frame: no fixed-shape capture fits
 
     d_inp = nano.prepare_inputs("decode", None, {"audio_frame": [torch.ones(H)]})
     step = nano.declare_step("decode", ["a", "b"], [d_inp, d_inp])
     assert set(step.keys()) == STATE_KEYS | {NANO_SAMPLER}
     assert isinstance(step.get(NANO_SAMPLER), SamplerStep)
     assert [(s.request_id, s.span) for s in step.segments] == [("a", 1), ("b", 1)]
+    assert step.cg_key_info == nano.DECODE_KEY
+    # the engine asks before the inputs exist: the routing's step_metadata answers
+    pending = {"a": SimpleNamespace(step_metadata={"prompt_pending": True}), "b": SimpleNamespace(step_metadata={})}
+    assert nano.cg_key_info("decode", pending) is None
+    assert nano.cg_key_info("decode", {"b": pending["b"]}) == nano.DECODE_KEY
 
 
 def test_nano_captures_the_decode_step():
@@ -148,7 +167,7 @@ def test_nano_captures_the_decode_step():
     cfg = configs[0]
     assert isinstance(cfg, BatchedCudaGraphConfig)
     assert cfg.capture_graph_walk == "decode" and cfg.replay_graph_walks == ["decode"]
-    assert cfg.compile is False
+    assert cfg.compile is False and cfg.additional_key_info == nano.DECODE_KEY
     assert max(cfg.capture_batch_sizes) <= NemotronDuplexModel.DEFAULT_MAMBA_SLOTS
     row = cfg.single_request_inputs
     assert row.input_seq_len == 1 and row.kwargs["mode"] == "frame"
