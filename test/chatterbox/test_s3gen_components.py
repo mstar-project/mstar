@@ -259,6 +259,46 @@ def test_low_precision_estimator_stays_close_to_float32(pair):
     assert corr > 0.999 and diff < 1.0
 
 
+def test_vocoder_noise_hoisting_is_exact(pair):
+    """Drawing the excitation noise before the forward (for graph capture)
+    gives the same waveform as drawing it inside, draw for draw."""
+    variant, (ref, mine, ref_dict, mine_ref, n_steps) = pair
+    mel = torch.randn(1, 80, 60, generator=torch.Generator().manual_seed(2)) * 2 - 6
+    inline = mine.vocoder.vocode(mel, generator=torch.Generator().manual_seed(9))
+    noise = mine.vocoder.draw_noise(mel, torch.Generator().manual_seed(9))
+    hoisted = mine.vocoder.vocode_with(mel, noise.phase, noise.harmonic, None)
+    assert torch.equal(inline[0], hoisted[0]) and torch.equal(inline[1], hoisted[1])
+    # with a cache the head of the excitation is the cache
+    cache = torch.randn(1, 1, 480 * 8, generator=torch.Generator().manual_seed(3))
+    wav, source = mine.vocoder.vocode_with(mel, noise.phase, noise.harmonic, cache)
+    assert torch.equal(source[:, :, : 480 * 8], cache) and wav.shape == (1, 480 * 60)
+    print(f"[{variant}] hoisted vocoder noise: exact")
+
+
+def test_encoder_padding_leaves_valid_rows_unchanged(pair):
+    """Rows and tokens padded to a bucket (what the encoder graphs do) give the
+    same encoder output on the valid rows and frames."""
+    from mstar.model.chatterbox.components.s3gen_graphs import EncoderGraphs
+
+    variant, (ref, mine, ref_dict, mine_ref, n_steps) = pair
+    prompt = mine_ref.prompt_tokens[0]
+    rows = [torch.cat([prompt, _tokens(mine_ref)[0][:n]]) for n in (13, 7, 21)]
+    lens = torch.tensor([r.numel() for r in rows])
+    tokens = torch.nn.utils.rnn.pad_sequence(rows, batch_first=True)
+    with torch.no_grad():
+        exact_mu, exact_mask = mine.flow_encoder(tokens, lens)
+        padded = EncoderGraphs(mine.flow_encoder, rows=(1, 2, 4, 8), token_bucket=32).pad(
+            {"tokens": tokens, "lens": lens}, (),
+        )
+        assert padded["tokens"].shape[0] == 4 and padded["tokens"].shape[1] % 32 == 0
+        mu, mask = mine.flow_encoder(padded["tokens"], padded["lens"])
+    for i, n in enumerate(lens.tolist()):
+        diff = (mu[i, :, : 2 * n] - exact_mu[i, :, : 2 * n]).abs().max().item()
+        assert diff < 1e-4, f"row {i}: {diff}"
+        assert int(mask[i].sum()) == int(exact_mask[i].sum()) == 2 * n
+    print(f"[{variant}] bucketed encoder rows match exact")
+
+
 def test_graphed_solve_matches_eager_on_cuda(pair):
     """Replaying a captured solve gives the eager solve's mel (rows padded to
     the captured count, frames to the bucket) and is deterministic across
@@ -285,10 +325,12 @@ def test_graphed_solve_matches_eager_on_cuda(pair):
         noise = torch.randn(1, 80, 2 * (gref.num_prompt_tokens + toks.numel()), device="cuda", generator=gen)
         rows.append(FlowRow(tokens=toks, ref=gref, finalize=final, noise=noise))
     eager = gpu.tokens_to_mel_rows(rows, n_timesteps=n_steps, frame_bucket=64)
-    solver = gpu.enable_graphs(rows=(1, 2, 4))
+    wav_eager = gpu.mel_to_wav(eager[0], generator=torch.Generator(device="cuda").manual_seed(8))
+    solver = gpu.enable_graphs(rows=(1, 2, 4))  # solve, encoder and vocoder graphs
     graphed = gpu.tokens_to_mel_rows(rows, n_timesteps=n_steps, frame_bucket=64)
     again = gpu.tokens_to_mel_rows(rows, n_timesteps=n_steps, frame_bucket=64)
     assert solver.captures == 1 and solver.replays == 2  # three rows ride the 4-row graph, then replay
+    assert gpu.encoder_graphs.captures == 1 and gpu.encoder_graphs.replays == 2
     for a, b, c in zip(eager, graphed, again, strict=True):
         assert a.shape == b.shape
         diff = (a - b).abs().max().item()
@@ -297,6 +339,11 @@ def test_graphed_solve_matches_eager_on_cuda(pair):
         print(f"[{variant}] graphed vs eager: max {diff:.3e}, log-mel corr {corr:.6f}")
         assert diff < 2e-2 and corr > 0.99999
         assert torch.equal(b, c), "a replay must be deterministic"
+    wav_graphed = gpu.mel_to_wav(eager[0], generator=torch.Generator(device="cuda").manual_seed(8))
+    assert gpu.vocoder_graphs.captures == 1
+    wav_diff = (wav_eager - wav_graphed).abs().max().item()
+    print(f"[{variant}] graphed vocoder vs eager: max {wav_diff:.3e}")
+    assert wav_diff < 1e-3
 
 
 def test_embed_reference_matches(pair):
