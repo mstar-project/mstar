@@ -573,6 +573,9 @@ def test_t3_prefill_is_captured_as_packed_graphs_for_both_guidance_modes():
         assert cfg.capture_token_lengths == T3Submodule.PREFILL_TOKEN_BUCKETS
         assert cfg.capture_batch_sizes == T3Submodule.PREFILL_CAPTURE_BATCH_SIZES
         assert cfg.caps_eager_batch_size is False and cfg.compile is False
+        # the combined cond + uncond plan carries twice the input tokens
+        assert cfg.total_tokens_multiplier == (2 if cfg.additional_key_info else 1)
+        assert cfg.get_total_tokens(1) == [n * cfg.total_tokens_multiplier for n in T3Submodule.PREFILL_TOKEN_BUCKETS]
         stand_in = cfg.make_node_input(7)
         assert stand_in.input_seq_len == 7
         assert stand_in.input_embeds.shape == (7, sub.t3.hidden_size)
