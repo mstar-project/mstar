@@ -199,7 +199,13 @@ turns it off): the eager step is over a thousand tiny kernels, and the fused
 step runs at the weight-streaming floor (about twice the uncompiled rate at
 batch size 1 on an H100). Concurrent chat requests share decode steps
 (continuous batching over the captured decode graphs, padded to the next batch
-bucket); a request's tokens are the same whether it runs alone or in a batch. Generation requests batch
+bucket). Requests never see each other's data, but the batch bucket changes the
+bf16 arithmetic of the step, so a long greedy answer can part from its solo run
+where two candidate tokens tie: in every measured divergence the two tokens'
+logits were equal or one bf16 ulp apart, the first differing token came after
+tens to hundreds of identical ones, and identical prompts in one batch agreed
+with each other. Short answers (128 tokens) came out identical in 8 of 8 runs;
+256-token answers with thinking on in 2 of 8. Generation requests batch
 into one denoise pass too, which is the same maths but not the same bf16
 arithmetic — under classifier-free guidance the branch rounding is amplified,
 so an image or clip produced alongside other requests differs from its solo
