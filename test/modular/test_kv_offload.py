@@ -28,7 +28,7 @@ from mstar.engine.resources import (
     StepContext,
 )
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVStep
+from mstar.engine.resources.kv.config import KVConfig, KVLayout, KVStep
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
 
@@ -61,7 +61,11 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransferManager)
 
 
-def _make_manager(max_num_pages: int = 16, cpu_offload_pages: int = 16):
+def _make_manager(
+    max_num_pages: int = 16, cpu_offload_pages: int = 16,
+    layout: KVLayout = KVLayout.NHD,
+):
+    mla = dict(kv_lora_rank=3, qk_rope_head_dim=1) if layout == KVLayout.MLA else {}
     cfg = KVConfig(
         num_layers=2,
         num_kv_heads=1,
@@ -70,6 +74,8 @@ def _make_manager(max_num_pages: int = 16, cpu_offload_pages: int = 16):
         max_num_pages=max_num_pages,
         page_size=PAGE_SIZE,
         cpu_offload_pages=cpu_offload_pages,
+        layout=layout,
+        **mla,
     )
     return KVManager(
         cfg=cfg, name="kv", joint_comm_group=None, transfer_engine_info=None,
@@ -161,8 +167,9 @@ def _hook_offload_stream(mgr: KVManager, hook, when: str | None = None):
 
 
 @requires_cuda
-def test_offload_reload_round_trip():
-    mgr = _make_manager()
+@pytest.mark.parametrize("layout", [KVLayout.NHD, KVLayout.MLA])
+def test_offload_reload_round_trip(layout):
+    mgr = _make_manager(layout=layout)
     mgr.ingest_request("r0")
     _grow(mgr, "r0", "main", 3 * PAGE_SIZE)
 

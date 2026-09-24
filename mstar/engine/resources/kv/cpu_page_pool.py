@@ -44,10 +44,7 @@ class CPUPagePool:
         self.cpu_kv_cache = torch.zeros(
             config.num_layers,
             max_cpu_pages,
-            2,  # K and V
-            config.page_size,
-            config.num_kv_heads,
-            config.head_dim,
+            *kv_cache.tensor.shape[2:],  # one page: K/V axis under NHD, latent under MLA
             dtype=kv_cache.dtype,
             device="cpu",
         ).pin_memory()
