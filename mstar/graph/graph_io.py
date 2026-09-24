@@ -16,7 +16,7 @@ class WorkerGraphIO:
     """
     def __init__(
         self, graph: GraphSection,
-        wg_id: str | None=None
+        wg_id: int | None=None
     ):
         self.nodes = graph.get_nodes()
         self.loops = graph.get_loops()

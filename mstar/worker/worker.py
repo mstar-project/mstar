@@ -153,9 +153,9 @@ class Worker:
         model: Model,
         my_worker_graphs: list[WorkerGraph],
         model_config: dict,
-        all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-        all_worker_graph_ids_to_nodes: dict[str, set[str]],
-        all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
+        all_worker_graph_ids_to_graph_walks: dict[int, set[str]],
+        all_worker_graph_ids_to_nodes: dict[int, set[str]],
+        all_worker_graph_ids_to_dyn_loops: dict[int, set[str]],
         sharding_config: ShardingConfig,
         parallel_groups: WorkerParallelGroups,
         hostname: str = "localhost",
@@ -1684,7 +1684,7 @@ class Worker:
         sample_node: GraphNode,
         spec_node_info: SpeculativeNodeInfo,
         node_objects: dict[str, GraphNode],
-        request_to_worker_graph: dict[str, str],
+        request_to_worker_graph: dict[str, int],
         per_request_inputs: dict[str, NameToTensorList],
         consumed_streaming_edges: dict[str, list[GraphEdge]],
         continuing: list[str],
@@ -1806,7 +1806,7 @@ class Worker:
 
         continuing = []
         new_node_objects: dict[str, GraphNode] = {}
-        new_request_to_worker_graph: dict[str, str] = {}
+        new_request_to_worker_graph: dict[str, int] = {}
         per_request_inputs: dict[str, NameToTensorList] = {}
         consumed_streaming_edges: dict[str, GraphEdge] = {}
         # Backlogged rids for this target get first claim on the batch: they
@@ -2018,7 +2018,7 @@ class Worker:
         fresh_nodes, fresh_wg = popped
 
         new_node_objects: dict[str, GraphNode] = {}
-        new_request_to_worker_graph: dict[str, str] = {}
+        new_request_to_worker_graph: dict[str, int] = {}
         per_request_inputs: dict[str, NameToTensorList] = {}
         consumed_streaming_edges: dict[str, list[GraphEdge]] = {}
         for rid in head.request_ids:  # wire order == the leader's batch order

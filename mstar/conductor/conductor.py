@@ -116,9 +116,9 @@ def _worker_process_target(
     worker_ids: list[str],
     my_worker_graphs: list[WorkerGraph],
     model_config: dict,
-    all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-    all_worker_graph_ids_to_nodes: dict[str, set[str]],
-    all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
+    all_worker_graph_ids_to_graph_walks: dict[int, set[str]],
+    all_worker_graph_ids_to_nodes: dict[int, set[str]],
+    all_worker_graph_ids_to_dyn_loops: dict[int, set[str]],
     sharding_config: ShardingConfig,
     parallel_groups: WorkerParallelGroups,
     hostname: str,
@@ -192,8 +192,8 @@ class RequestData:
     # Request-level shared state
     persist_signals: dict[str, list[TensorPointerInfo]]  # signals passed back to conductor
     persist_signal_ref_cnt: dict[int, int]  # uuid -> number of times it was passed to workers
-    worker_graph_to_workers: dict[str, list[str]]
-    all_worker_graph_ids: set[str]
+    worker_graph_to_workers: dict[int, list[str]]
+    all_worker_graph_ids: set[int]
     max_output_tokens: int
     random_seed: int
     # resource label -> the config this request's resources were opened with
@@ -319,9 +319,15 @@ class Conductor:
         assert "node_groups" in self.model_config
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
+        # The conductor is the only process that sees every worker graph, so it
+        # owns the numbering. Workers receive their graphs (and these ids) at
+        # spawn, so everyone agrees without the ids having to be negotiated.
+        worker_graphs = model.get_worker_graphs(model_config_file)
+        for index, worker_graph in enumerate(worker_graphs):
+            worker_graph.worker_graph_id = index
         self.worker_graphs = {
             worker_graph.worker_graph_id: worker_graph
-            for worker_graph in model.get_worker_graphs(model_config_file)
+            for worker_graph in worker_graphs
         }
 
         # (1) Set up worker graph TP ranks
@@ -344,7 +350,7 @@ class Conductor:
 
         # v1: one sharding group per worker graph. Track which group "owns"
         # each wg so we can assert single-group-per-wg.
-        wg_to_owning_group: dict[str, str] = {}
+        wg_to_owning_group: dict[int, str] = {}
 
         for group in self.default_sharding_config.groups:
             if group.graph_walks is not None and any([
@@ -448,14 +454,14 @@ class Conductor:
             self._per_worker_graphs[worker_id] = worker_graphs
 
         # Global maps needed by all workers
-        self._all_worker_graph_ids_to_graph_walks: dict[str, set[str]] = {
+        self._all_worker_graph_ids_to_graph_walks: dict[int, set[str]] = {
             worker_graph_id: worker_graph.graph_walks for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
-        self._all_worker_graph_ids_to_nodes: dict[str, set[str]] = {
+        self._all_worker_graph_ids_to_nodes: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_nodes())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
-        self._all_worker_graph_ids_to_dyn_loops: dict[str, set[str]] = {
+        self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
@@ -608,7 +614,7 @@ class Conductor:
                 ),
             )
 
-    def _assign_worker_graphs_to_workers(self) -> dict[str, list[str]]:
+    def _assign_worker_graphs_to_workers(self) -> dict[int, list[str]]:
         """
         For a request, assign worker graphs to workers. DP picks are
         coordinated by ``_group_id`` so all wgs derived from the same
@@ -642,7 +648,7 @@ class Conductor:
         return result
 
     def _build_request_sharding_config(
-        self, worker_graph_to_workers: dict[str, list[str]],
+        self, worker_graph_to_workers: dict[int, list[str]],
     ) -> ShardingConfig:
         """Per-request ShardingConfig: clone default + setup with this
         request's worker assignments.
@@ -845,7 +851,7 @@ class Conductor:
             )
 
         # Collect all worker_graph_ids per worker for the NewRequest
-        worker_to_worker_graph_ids: dict[str, list[str]] = defaultdict(list)
+        worker_to_worker_graph_ids: dict[str, list[int]] = defaultdict(list)
         for wg_id, worker_ids in worker_graph_to_workers.items():
             for worker_id in worker_ids:
                 worker_to_worker_graph_ids[worker_id].append(wg_id)
@@ -950,9 +956,9 @@ class Conductor:
                 )
 
     def _resolve_worker_partition(
-        self, worker_graph_ids: list[str],
+        self, worker_graph_ids: list[int],
         partitions: list[PartitionDefinition],
-    ) -> dict[str, set[str]]:
+    ) -> dict[str, set[int]]:
         """Find which partition(s) a set of worker graphs belongs to."""
         partition_wg_ids = {}
         for wg_id in worker_graph_ids:
