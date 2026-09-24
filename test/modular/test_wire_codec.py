@@ -381,3 +381,57 @@ def test_one_undecodable_frame_does_not_lose_the_batch():
     good = WireCodec.encode(_conductor_request({}))
     got = decode_each(WireCodec, [good, b"\xc1not msgpack", good], "test")
     assert len(got) == 2
+
+
+# --- union branches -----------------------------------------------------------
+
+def _round_trip(value, hint):
+    import msgpack
+
+    from mstar.communication import wire
+    raw = msgpack.unpackb(
+        msgpack.packb(wire._encoder(hint)(value), use_bin_type=True),
+        raw=False, strict_map_key=False,
+    )
+    return wire._decoder(hint)(raw)
+
+
+@pytest.mark.parametrize("value, hint", [
+    # The first branch used to claim everything: a plain type passed the list
+    # through, so the tuple came back a list -- and as a key, raised
+    # unhashable.
+    ({3: 1, ("a", "b"): 2}, dict[int | tuple[str, str], int]),
+    ((1, 2), int | tuple[int, int]),
+    (7, int | tuple[int, int]),
+    # And a container iterated a string: "ab" came back ('a', 'b').
+    ("ab", tuple[str, str] | str),
+    (("a", "b"), tuple[str, str] | str),
+    ([1, 2], int | list[int]),
+    ({"k": 1}, list[int] | dict[str, int]),
+    ({1, 2}, str | set[int]),
+    (b"x", str | bytes),
+    (True, bool | int),
+    (5, bool | int),
+    # Lenient where Python is: an int is a fine float.
+    (2, float | str),
+    ([(1, "a")], list[tuple[int, str]] | str),
+])
+def test_a_union_decodes_to_the_branch_that_was_sent(value, hint):
+    got = _round_trip(value, hint)
+    assert got == value
+    assert type(got) is type(value)
+
+
+def test_the_wrong_arity_is_not_a_match():
+    # (1, 2, 3) is no tuple[int, int]; the list branch is.
+    got = _round_trip([1, 2, 3], tuple[int, int] | list[int])
+    assert got == [1, 2, 3] and type(got) is list
+
+
+def test_outside_a_union_nothing_is_checked():
+    """Strictness is for choosing a branch. A plain field keeps passing its
+    value through, so a sender that was loose about types -- None in a field
+    declared int -- still round-trips as it did."""
+    from mstar.communication import wire
+    assert _round_trip(None, int) is None
+    assert wire._decoder(int)("not an int") == "not an int"
