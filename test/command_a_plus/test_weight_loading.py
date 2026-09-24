@@ -1,9 +1,9 @@
 """Offline synthetic checkpoint tests; no GPU or model download required."""
 
-from dataclasses import replace
-from pathlib import Path
 import tempfile
 import unittest
+from dataclasses import replace
+from pathlib import Path
 
 import torch
 from safetensors.torch import save_file
@@ -13,7 +13,6 @@ from mstar.model.command_a_plus.components.language_model import CommandAPlusFor
 from mstar.model.command_a_plus.config import CommandAPlusConfig
 from mstar.model.command_a_plus.weight_loading import remap_text_weight_name
 from mstar.model.loader import load_weights
-
 
 PREFIX = "model.language_model."
 
@@ -86,10 +85,10 @@ class WeightLoadingTests(unittest.TestCase):
         for layer in range(config.num_hidden_layers):
             base = f"layers.{layer}."
 
-            def get(suffix):
+            def get(suffix, base=base):
                 return source[PREFIX + base + suffix]
 
-            def put(suffix, tensor):
+            def put(suffix, tensor, base=base):
                 expected["model." + base + suffix] = tensor
 
             put("input_layernorm.weight", get("input_layernorm.weight"))

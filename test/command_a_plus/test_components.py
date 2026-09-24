@@ -7,12 +7,12 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from mstar.distributed.communication import CommGroup
 from mstar.model.command_a_plus.components.language_model import (
     CommandAPlusLayerNorm,
     CommandAPlusMoeBlock,
     CommandAPlusRouter,
 )
-from mstar.distributed.communication import CommGroup
 from mstar.model.command_a_plus.config import CommandAPlusConfig
 
 

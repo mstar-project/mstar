@@ -3,6 +3,7 @@ from importlib import import_module
 from mstar.model.base import Model
 
 MODEL_REGISTRY: dict[str, tuple[str, str]] = {
+    "command_a_plus": ("mstar.model.command_a_plus.command_a_plus_model", "CommandAPlusModel"),
     "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
     "chatterbox": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "chatterbox_multilingual": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
@@ -35,6 +36,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
 }
 
 HF_MODELS: dict[str, dict] = {
+    "command_a_plus": {"model_path_hf": "CohereLabs/command-a-plus-05-2026-bf16"},
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
     # Resemble AI Chatterbox: Llama-520M T3 speech-token LM + S3Gen flow
     # matching decoder + HiFT vocoder, zero-shot voice cloning with CFG and
