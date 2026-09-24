@@ -673,13 +673,16 @@ class CudaGraphRunner:
 
         A walk may have several captures (e.g. one per image resolution, each a
         fixed shape with its own token count), so every matching bucket is
-        considered rather than the first config declared.
+        considered rather than the first config declared. ``num_tokens`` counts
+        the batch's input tokens; a bucket is keyed by the tokens its plan
+        carries, so the request is scaled by that config's multiplier.
         """
         best: BucketKey | None = None
         for key, bucket in self._buckets.items():
             if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info:
                 continue
-            if key.bs < bs or key.num_tokens < num_tokens or not bucket.slots:
+            needed = num_tokens * bucket.config.total_tokens_multiplier
+            if key.bs < bs or key.num_tokens < needed or not bucket.slots:
                 continue
             if best is None or (key.num_tokens, key.bs) < (best.num_tokens, best.bs):
                 best = key
