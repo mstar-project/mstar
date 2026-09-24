@@ -437,10 +437,14 @@ class Cosmos3Config:
     # torch.compile the reasoner's eager prefill (text and vision prompts; the
     # decode step has its own captured graph). The eager prefill of a ~300-token
     # image prompt is ~1250 kernels for ~5 ms of GPU work (24 ms wall on an
-    # H100, launch-bound); fused it is a third of that. Dynamic shapes: one
-    # compile covers every prompt length; the first prefill on a fresh server
-    # pays it (warmup). Env override COSMOS3_REASONER_PREFILL_COMPILE=0/1.
-    compile_reasoner_prefill: bool = True
+    # H100, launch-bound), so the fusion would take a third of that. Off by
+    # default: with dynamic shapes (one compile for every prompt length) torch
+    # 2.11's inductor fails in its joint-graph noop pass ("'SymInt' object has
+    # no attribute 'size'"), and a static compile recompiles per prompt length
+    # until automatic dynamic shapes route it into the same failure. Env
+    # override COSMOS3_REASONER_PREFILL_COMPILE=0/1 for the A/B once fixed
+    # upstream; the padded prefill graph (like the DiT's) is the real answer.
+    compile_reasoner_prefill: bool = False
     # Which attention backends the DiT node declares (see
     # Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the
     # paged FlashInfer backend the understanding prefill and the captured
