@@ -134,7 +134,11 @@ def main(argv: list[str] | None = None) -> int:
     proc = subprocess.Popen(
         args.command, shell=True, env=env, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, bufsize=1,
-        preexec_fn=os.setsid,       # so the whole tree can be signalled
+        # setsid, so the whole tree can be signalled -- as a flag rather than
+        # preexec_fn=os.setsid, which runs Python between fork and exec and
+        # can deadlock on a lock another thread held at fork. The watcher
+        # thread below is exactly the hazard.
+        start_new_session=True,
     )
     threading.Thread(
         target=_watch_health, args=(port, proc, args.health_timeout),

@@ -138,7 +138,7 @@ class Lockstep:
     def _both(self, step, fn):
         self.log.append(step)
         out = []
-        for name, trio in (("python", self.py), ("rust", self.rs)):
+        for trio in (self.py, self.rs):
             try:
                 out.append(fn(*trio))
             except Exception as e:  # a raise on one side only is a divergence
@@ -162,7 +162,7 @@ class Lockstep:
     def put(self, uuid):
         """Store a tensor on both sides so routing has something to refer to."""
         self.log.append(f"put_tensor({uuid})")
-        for _rt, book, store in (self.py, self.rs):
+        for _rt, _book, store in (self.py, self.rs):
             store.put_tensor(rid=1, uuid=uuid, tensor=torch.zeros(4),
                              info=_info(uuid))
             # The worker's safety hold: _postprocess_batch stores the outputs
@@ -569,7 +569,9 @@ def test_speculative_flag_survives_completion(lock):
     lock.route("prefill", rid, ["token"], [201])
     lock.pop("ar_decode", rid)
 
-    flag = lambda rt, b, s: rt.is_speculatively_scheduled("ar_decode", WG_ID, rid)
+    def flag(rt, _book, _store):
+        return rt.is_speculatively_scheduled("ar_decode", WG_ID, rid)
+
     assert lock._both("is_spec_scheduled before", flag) is False
 
     lock._both("set_speculatively_scheduled(ar_decode, True)",

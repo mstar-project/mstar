@@ -34,8 +34,8 @@ from mstar.engine.resources import (
     StepContext,
     SubmoduleStep,
 )
-from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker import worker as worker_mod
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
 
 
