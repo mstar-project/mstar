@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 
 import pytest
+import torch
 
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 
@@ -610,7 +611,7 @@ def test_vae_encoder_walk_and_signal_wiring() -> None:
     # Prefill -> gen: the persisted latents ride the cond_latents edge and are
     # unpersisted with this pass; without a persist signal the edge is empty.
     info = TensorPointerInfo(
-        dims=[1], dtype="bfloat16", nbytes=2, address=0, stride=[1],
+        dims=[1], dtype=torch.bfloat16, nbytes=2, address=0, stride=[1],
         uuid="u-lat", source_session_id="s", source_entity="worker",
     )
     fpa2 = model.get_partition_forward_pass_args(

@@ -11,7 +11,8 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.communication.rust_communicator import PickleCodec
+import mstar.communication.wire_types  # noqa: F401  (registers the tags)
+from mstar.communication import wire
 from mstar.communication.tensor_uuid import (
     COUNTER_BITS,
     COUNTER_MASK,
@@ -110,7 +111,7 @@ def test_uuid_fits_in_u64():
 
 
 def _roundtrip(msg):
-    return PickleCodec.decode(PickleCodec.encode(msg))
+    return wire.decode(wire.encode(msg))
 
 
 def test_int_uuids_survive_the_wire_in_tensor_pointer_info():
@@ -140,7 +141,8 @@ def test_int_uuids_survive_the_wire_in_tensor_pointer_info():
 
 
 def test_int_keyed_uuid_maps_survive_the_wire():
-    """Maps keyed by uuid have to come back int-keyed, not stringified."""
+    """msgpack has no int map keys in the strict sense; these go over as
+    list-of-pairs and have to come back as an int-keyed dict."""
     m = TensorUuidMinter("worker_4")
     u1, u2 = m.mint(), m.mint()
 
@@ -175,10 +177,10 @@ def test_int_uuids_are_smaller_on_the_wire_than_uuid4_strings():
         body=UnpersistTensors(request_id="r",
                               uuid_to_ref_count={i.uuid: 1 for i in infos}),
     )
-    int_bytes = len(PickleCodec.encode(msg))
+    int_bytes = len(wire.encode(msg))
     # the same map keyed by uuid4 strings, for reference
     import uuid as _uuid
-    str_msg = PickleCodec.encode(WorkerMessage(
+    str_msg = wire.encode(WorkerMessage(
         message_type=WorkerMessageType.UNPERSIST_TENSORS,
         body=UnpersistTensors(request_id="r",
                               uuid_to_ref_count={str(_uuid.uuid4()): 1 for _ in infos}),

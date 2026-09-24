@@ -1,9 +1,9 @@
 """``ZMQCommunicator`` over the Rust transport vendored in
 ``rust/`` (``mstar_rust.ZmqCommunicator``) — drop-in for the pyzmq class:
-same constructor, methods, endpoints, and pickle wire, so wrapped and
-unwrapped entities interoperate and migration can proceed one process at a
-time. The codec is a :class:`Codec` (pickle default; msgpack for
-cross-language edges); ``register_event_for_poll`` forwards the eventfd to
+same constructor, methods, endpoints, and wire, so wrapped and unwrapped
+entities interoperate and migration can proceed one process at a time. The
+codec is a :class:`Codec` (typed msgpack by default, so an edge can
+terminate in a Rust process); ``register_event_for_poll`` forwards the eventfd to
 the Rust poller; a readiness poll buffers any consumed message so nothing is
 dropped or reordered. Build: ``maturin develop --release`` in ``rust/``
 (see ``docs/installation.rst``)."""
@@ -12,12 +12,19 @@ from __future__ import annotations
 
 import logging
 import os
-import pickle
 import time
 from collections import deque
 
 from mstar_rust import ZmqCommunicator as _RustZmq
 
+from mstar.communication.codec import (  # noqa: F401  (re-exported)
+    Codec,
+    MsgpackCodec,
+    PickleCodec,
+    WireCodec,
+    decode_each,
+    default_codec,
+)
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.event import EventWakeup
 
@@ -29,54 +36,6 @@ logger = logging.getLogger(__name__)
 #: ``timeout_s`` deadline check responsive. Matches ``wait_for_work``'s tick.
 BLOCKING_POLL_SLICE_MS = 50
 
-class Codec:
-    """The encode/decode seam, mirroring the Rust ``Codec`` trait::
-
-        pub trait Codec<M> {
-            fn encode(msg: &M) -> Result<Vec<u8>, CommError>;
-            fn decode(bytes: &[u8]) -> Option<M>;
-        }
-
-    The transport never looks inside the bytes; migrating an edge to another
-    encoding (e.g. msgpack) means giving both endpoints that codec — never a
-    transport change.
-    """
-
-    @staticmethod
-    def encode(msg) -> bytes:
-        raise NotImplementedError
-
-    @staticmethod
-    def decode(data: bytes):
-        raise NotImplementedError
-
-
-class PickleCodec(Codec):
-    """Pickle matches today's ``send_pyobj`` wire, so a wrapped entity
-    interoperates with unwrapped pyzmq entities in both directions."""
-
-    encode = staticmethod(pickle.dumps)
-    decode = staticmethod(pickle.loads)
-
-
-class MsgpackCodec(Codec):
-    """msgpack is language-neutral: edges using it can terminate in (future)
-    Rust processes — the migration's target wire. Both endpoints of an edge
-    must use the same codec. Requires the ``msgpack`` package."""
-
-    @staticmethod
-    def encode(msg) -> bytes:
-        import msgpack
-
-        return msgpack.packb(msg, default=str)
-
-    @staticmethod
-    def decode(data: bytes):
-        import msgpack
-
-        return msgpack.unpackb(data, raw=False)
-
-
 class RustZMQCommunicator(BaseCommunicator):
     """The pyzmq ``ZMQCommunicator`` surface over the Rust transport."""
 
@@ -86,13 +45,13 @@ class RustZMQCommunicator(BaseCommunicator):
         push_ids: list[str],
         protocol: CommProtocol = CommProtocol.IPC,
         ipc_socket_path_prefix: str = "/tmp/mstar/",
-        codec: type[Codec] = PickleCodec,
+        codec: type[Codec] | None = None,
     ):
         transport = os.getenv("MSTAR_ZMQ_TRANSPORT", protocol.value).upper()
         self.protocol = CommProtocol(transport)
         self.my_id = my_id
         self.ipc_socket_path_prefix = ipc_socket_path_prefix
-        self.codec = codec
+        self.codec = codec or default_codec()
         self.event: EventWakeup | None = None
         # Messages consumed by a readiness poll, awaiting get_all_new_messages.
         self._buffered: deque = deque()
@@ -153,7 +112,8 @@ class RustZMQCommunicator(BaseCommunicator):
         return bool(self._buffered)
 
     def send(self, entity_id: str, msg) -> None:
-        logger.debug("%s to send a message %s to entity %s", self.my_id, str(msg), entity_id)
+        # no str(): the repr is ~10us on an InputSignals and DEBUG is off here
+        logger.debug("%s to send a message %s to entity %s", self.my_id, msg, entity_id)
         if self.protocol == CommProtocol.TCP:
             self._register(entity_id)
         self._inner.send(entity_id, self.codec.encode(msg))
@@ -172,8 +132,8 @@ class RustZMQCommunicator(BaseCommunicator):
             while self._poll_once(BLOCKING_POLL_SLICE_MS) == "timeout":
                 if deadline is not None and time.monotonic() >= deadline:
                     break
-        messages = [self.codec.decode(b) for b in self._buffered]
+        messages = decode_each(self.codec, self._buffered, self.my_id)
         self._buffered.clear()
         # One FFI call for the whole queued batch (vs try_recv per message).
-        messages.extend(self.codec.decode(b) for b in self._inner.drain())
+        messages.extend(decode_each(self.codec, self._inner.drain(), self.my_id))
         return messages
