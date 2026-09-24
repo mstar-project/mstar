@@ -19,6 +19,9 @@ class AttnBackend(Enum):
     FLASHINFER = "flashinfer"
     DENSE = "dense"
     XPU_PAGED = "xpu_paged"
+    # Multi-head Latent Attention over a ``KVLayout.MLA`` cache (FlashInfer's
+    # ``BatchMLAPagedAttentionWrapper``); queries are the absorbed latent form
+    FLASHINFER_MLA = "flashinfer_mla"
 
 
 @dataclass
@@ -26,6 +29,9 @@ class AttentionConfig:
     kv_cache: str # name of the KV cache
     backend: AttnBackend = AttnBackend.FLASHINFER
     flashinfer_backend: str = "auto"
+    # softmax scale; None means the kernel default (head_dim ** -0.5). MLA must
+    # pass the *original* qk head dim's scale, not the latent width's
+    sm_scale: float | None = None
 
 
 @dataclass
@@ -115,3 +121,7 @@ class CrossAttentionSpec(NodeResourceSpec):
 @dataclass(frozen=True)
 class AttentionStep(ResourceStep):
     causal: bool = True
+    # queries attend to the stream's stored context only, not to the tokens this step appends
+    # (a draft block over the context the target has produced so far); the step's own
+    # `segments` then carry the query counts, the cache's segments the appended counts
+    context_only: bool = False
