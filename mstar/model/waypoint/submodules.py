@@ -558,18 +558,25 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
             # falling back to a runtime eager re-trace (see
             # ``RingKVManager.plan``).
             walks.append((PRIME_WALK, "latent"))
-        return [
-            BatchedCudaGraphConfig(
+        configs = []
+        for walk, latent_key in walks:
+            single_request_inputs = template(latent_key)
+            configs.append(BatchedCudaGraphConfig(
                 capture_graph_walk=walk,
-                single_request_inputs=template(latent_key),
+                single_request_inputs=single_request_inputs,
                 capture_batch_sizes=batch_sizes,
                 capture_forward_method="forward_batched",
                 # The DiT compiles its two reference-shaped fullgraph regions
                 # itself. Compiling this wrapper would fuse across their boundary.
                 compile=False,
-            )
-            for walk, latent_key in walks
-        ]
+                # Every tensor here is a per-request row that ``preprocess``
+                # concatenates on dim 0 -- including ``button``, whose
+                # ``n_buttons`` can coincidentally equal a bucket's token
+                # count (e.g. 360p at bs=2) and fool the runner's size-based
+                # guess.
+                input_seq_dims={key: 0 for key in single_request_inputs.tensor_inputs},
+            ))
+        return configs
 
     # ------------------------------------------------------------------
     # step tail
@@ -677,8 +684,8 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         **kwargs,
     ) -> NameToTensorList:
         """Encode the seed clip into the latent the dit primes the world on.
-        Request ids are safe to read here and not on the dit: this node is never
-        captured, so never handed a capture dummy's ids."""
+        Request ids are never read here: forward deletes ``engine_inputs``
+        outright, so it never needs a real request's ids, captured or not."""
         del graph_walk, kwargs
         del engine_inputs
         latent = encode_seed_clip(
@@ -688,17 +695,19 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         # reference adds it (``WorldEngine.append_frame``).
         return {"latent": [latent.unsqueeze(1)]}
 
+    @property
+    def _captured_image_shape(self) -> tuple[int, int, int, int]:
+        """The one ``image`` shape ``get_cuda_graph_configs`` captures."""
+        return (self.config.temporal_compression, *self.pixel_size, 3)
+
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[CudaGraphConfig]:
         del tp_world_size
         if not self.config.cuda_graph:
             return []
-        height, width = self.pixel_size
         image = torch.zeros(
-            (self.config.temporal_compression, height, width, 3),
-            dtype=self.ae_dtype,
-            device=device,
+            self._captured_image_shape, dtype=self.ae_dtype, device=device,
         )
         return [BatchedCudaGraphConfig(
             capture_graph_walk=PRIME_WALK,
@@ -710,3 +719,15 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
             capture_forward_method="forward_batched",
             compile=True,
         )]
+
+    def can_use_cuda_graphs(self, batch, model_inputs) -> bool:
+        """``_seed_clip`` accepts any 16:9 size, but the graph's static
+        buffer is sized for exactly one H/W (``pixel_size``). A batch with
+        any other image shape must run eager, where ``encode_seed_clip``
+        resizes it to ``encoded_size``."""
+        if not super().can_use_cuda_graphs(batch, model_inputs):
+            return False
+        return all(
+            node_inputs.tensor_inputs["image"].shape == self._captured_image_shape
+            for node_inputs in model_inputs
+        )

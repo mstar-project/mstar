@@ -28,18 +28,20 @@ import yaml
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionSpec,
     AttnBackend,
     KVSpec,
     RingKVConfig,
     RingKVStep,
+    StepContext,
 )
 from mstar.engine.resources.runner import topo_sort
 from mstar.graph.base import GraphEdge, Loop, Sequential, SpeculativeNodeInfo
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 from mstar.model.waypoint.components.attention import WaypointAttention
 from mstar.model.waypoint.components.dit import WaypointDiT
 from mstar.model.waypoint.components.taehv import decode_latent, initial_decoder_histories
@@ -420,7 +422,8 @@ def test_no_prepared_tensor_carries_tokens_per_frame_in_its_shape(
     At 720P nothing collides, but the margin is thin: a 256-token-per-frame
     variant would put ``button``'s ``n_buttons=256`` in the crosshairs. With
     ``step_batch_size > 1``, 360p at bs=2 does collide with ``n_buttons``;
-    that case is handled runner-side instead (see ``test_cuda_graph_capture.py``).
+    that case is handled via the config's ``input_seq_dims`` override instead
+    (see ``get_cuda_graph_configs`` and ``test_cuda_graph_capture.py``).
     """
     inputs = _controller_stream(config, frames=4)
     inputs["latent"] = [torch.zeros((1, 1, *config.latent_shape))]
@@ -459,6 +462,20 @@ def test_prepared_shapes_and_dtypes_are_the_capture_template_exactly(submodule, 
     # indexes into and the one a "scalar frame index" instinct would get wrong.
     frame_pos = templates[ROLLOUT_WALK].tensor_inputs["frame_pos"]
     assert frame_pos.shape == (1,) and frame_pos.dtype == torch.int64
+
+
+def test_input_seq_dims_covers_every_static_input_on_dim_zero(submodule):
+    """Every tensor the DiT's config templates -- including ``button``, whose
+    ``n_buttons`` can collide with a bucket's token count -- is a per-request
+    row ``preprocess`` concatenates on dim 0. ``input_seq_dims`` must declare
+    exactly those keys, all on dim 0, or the runner falls back to its
+    size-based guess for whichever key is missing."""
+    for cfg in submodule.get_cuda_graph_configs(torch.device("meta")):
+        assert cfg.input_seq_dims is not None, cfg.capture_graph_walk
+        assert set(cfg.input_seq_dims) == set(cfg.single_request_inputs.tensor_inputs), (
+            cfg.capture_graph_walk
+        )
+        assert set(cfg.input_seq_dims.values()) == {0}, cfg.capture_graph_walk
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1170,34 @@ def test_the_encoder_emits_the_dit_s_priming_latent(encoder, ae_config):
     # here rather than left for the dit to guess at.
     assert latent.shape == (1, 1, ae_config.channels, *ae_config.latent_shape[1:])
     assert latent.dtype == torch.bfloat16
+
+
+def _batch(graph_walk: str) -> ExecutingBatch:
+    return ExecutingBatch(
+        node_name="Encoder",
+        step_context=StepContext(
+            request_ids=("r0",), graph_walk=graph_walk, slot=None,
+            capture=False, plan_results={},
+        ),
+        per_request_info={},
+    )
+
+
+def _image_inputs(shape: tuple[int, int, int, int]) -> list[NodeInputs]:
+    return [NodeInputs(tensor_inputs={"image": torch.zeros(shape)})]
+
+
+def test_encoder_only_replays_the_captured_image_shape(encoder, ae_config):
+    """The graph's static buffer is sized for exactly one H/W; any other
+    16:9 image, or the wrong graph walk, must fall back to eager."""
+    captured = (ae_config.temporal_compression, 360, 640, 3)
+    bigger = (ae_config.temporal_compression, 720, 1280, 3)
+    smaller = (ae_config.temporal_compression, 180, 320, 3)
+
+    assert encoder.can_use_cuda_graphs(_batch(PRIME_WALK), _image_inputs(captured))
+    assert not encoder.can_use_cuda_graphs(_batch(PRIME_WALK), _image_inputs(bigger))
+    assert not encoder.can_use_cuda_graphs(_batch(PRIME_WALK), _image_inputs(smaller))
+    assert not encoder.can_use_cuda_graphs(_batch(ROLLOUT_WALK), _image_inputs(captured))
 
 
 def test_the_fused_decode_turns_one_frame_into_one_raw_clip(decoder, ae_config):
