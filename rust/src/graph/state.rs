@@ -285,8 +285,9 @@ impl RequestState {
         }
     }
 
-    /// Back to seeded membership, for the two paths where Python rebuilds the
-    /// whole set: `reset_for_iter` and `clear`.
+    /// Back to seeded membership for a node whose inputs were just cleared: a
+    /// loop member on advance or finish (Python's
+    /// `LoopStateRegistry._reseed_streaming_ready`), or any node on reset.
     fn reseed_streaming_ready(&mut self, id: NodeId) {
         let only = self.graph.node(id).only_streaming;
         let (w, b) = Self::bit(id);
@@ -328,6 +329,12 @@ impl RequestState {
 
     fn record_external(&mut self, node: NodeId, name: Sym, t: &[TensorRef]) {
         let graph = self.graph.clone();
+        // Never a streamed input: each iteration takes the NEXT chunk, and
+        // re-injecting this one on advance would feed it again.
+        let spec = graph.node(node);
+        if spec.slot_of(name).is_some_and(|i| spec.streaming_mask >> i & 1 == 1) {
+            return;
+        }
         let mut cur = graph.node(node).loop_id;
         while let Some(lid) = cur {
             let ls = graph.lp(lid);
@@ -389,9 +396,15 @@ impl RequestState {
 
     /// Inputs of `node` that are an enclosing loop's external inputs. Python
     /// marks those edges `_persist_for_loop` -- they are re-injected every
-    /// iteration -- and `ReadySignals.clear` does not dereference them.
+    /// iteration -- and `ReadySignals.clear` does not dereference them. A
+    /// streamed input is never re-injected (see `record_external`), so it is
+    /// never held either.
     fn held_inputs(&self, node: NodeId) -> Vec<Sym> {
         let graph = &self.graph;
+        let spec = graph.node(node);
+        let streamed = |n: &Sym| {
+            spec.slot_of(*n).is_some_and(|i| spec.streaming_mask >> i & 1 == 1)
+        };
         let mut names = Vec::new();
         let mut cur = graph.node(node).loop_id;
         while let Some(lid) = cur {
@@ -399,7 +412,7 @@ impl RequestState {
             names.extend(
                 ls.external_inputs
                     .iter()
-                    .filter(|(_, d)| *d == node)
+                    .filter(|(n, d)| *d == node && !streamed(n))
                     .map(|(n, _)| *n),
             );
             cur = ls.parent;

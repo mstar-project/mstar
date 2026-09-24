@@ -95,7 +95,7 @@ class _StubTM:
 
 
 def _nodes(graph):
-    return {"prefill", "ar_decode"}
+    return set(graph.get_nodes())
 
 
 def _build(kind, graph):
@@ -104,7 +104,7 @@ def _build(kind, graph):
     common = dict(
         my_worker_id=WORKER, my_worker_graphs=[wg],
         all_wg_ids_to_graph_walks={WG_ID: {WALK}},
-        all_wg_ids_to_dyn_loops={WG_ID: {"ar_loop"}},
+        all_wg_ids_to_dyn_loops={WG_ID: set(graph.get_loops())},
         all_wg_ids_to_nodes={WG_ID: _nodes(graph)},
         node_to_partition=dict.fromkeys(_nodes(graph), "default"),
         sharding_config=ShardingConfig(
@@ -192,6 +192,18 @@ class Lockstep:
         return self._both(
             f"ingest({signal}->{node}, uuids={list(uuids)})",
             lambda rt, b, s: rt.ingest_inputs_batch(ParallelList([rid], [spec])))
+
+    def stream(self, rid, signal, node, uuids=()):
+        """A chunk from a StreamBuffer, ingested as the worker does: for this
+        iteration only, gated on streaming readiness. Returns what was left
+        uningested."""
+        spec = EdgeSpec(signal=signal, next_node=node, uuids=list(uuids),
+                        is_final_streaming_chunk=False)
+        return self._both(
+            f"stream({signal}->{node}, uuids={list(uuids)})",
+            lambda rt, b, s: rt.ingest_inputs_batch(
+                ParallelList([rid], [spec]), can_buffer=False,
+                is_streaming=True))
 
     def ready(self):
         return self._both("get_ready_nodes", lambda rt, b, s: sorted(
@@ -543,3 +555,55 @@ def test_speculative_flag_survives_completion(lock):
                lambda rt, b, s: rt.set_speculatively_scheduled(
                    "ar_decode", WG_ID, [rid], False))
     assert lock._both("is_spec_scheduled after clear", flag) is False
+
+
+def _streaming_loop_graph():
+    """A loop whose only member takes nothing but a stream -- a vocoder
+    decoding chunk by chunk inside the loop.
+
+    ``hidden`` is also declared one of the loop's external inputs, which a
+    hand-built graph can do (``_divide_into_worker_graphs`` strips streams
+    from them): the runtime itself must not re-inject a streamed chunk.
+    """
+    talker = GraphNode(
+        name="talker", input_names={"hidden"},
+        outputs=[GraphEdge(name="audio", next_node=EMIT_TO_CLIENT)],
+    )
+    talker._register_streaming({"hidden"})
+    return Sequential(sections=[
+        GraphNode(
+            name="prefill", input_names={"prompt"},
+            outputs=[GraphEdge(name="hidden", next_node="talker",
+                               is_streaming=True)],
+        ),
+        Loop(name="talk_loop", section=talker, outputs=[], max_iters=3),
+    ])
+
+
+def test_an_all_streaming_loop_member_takes_a_new_chunk_every_iteration():
+    """Each iteration consumes the NEXT chunk, and nothing else.
+
+    Rust re-injected the first chunk as a loop external input on every
+    advance, so the node re-ran on it and refused the real next chunk
+    (its slot was full). Python refused it too, differently: the node left the
+    streaming-ready set when it first filled and nothing put it back.
+    """
+    lock = Lockstep(_streaming_loop_graph())
+    rid = lock.admit()
+    for i in range(3):
+        chunk, out = 100 + i, 200 + i
+        lock.put(chunk)
+        assert lock.stream(rid, "hidden", "talker", [chunk]) == [], (
+            f"iteration {i}: the chunk was refused"
+        )
+        assert lock.ready() == [("talker", WALK, [rid])]
+        popped = lock.pop("talker", rid)
+        assert popped[2] == [("hidden", "talker", [chunk])], (
+            f"iteration {i}: ran on a stale chunk"
+        )
+        lock.cleanup("talker", rid)
+        lock.put(out)
+        lock.route("talker", rid, ["audio"], [out])
+        # Not ready again until the next chunk arrives.
+        assert lock.ready() == []
+        lock.refcounts([chunk])
