@@ -191,7 +191,7 @@ def _worker_process_target(
 class RequestData:
     # Request-level shared state
     persist_signals: dict[str, list[TensorPointerInfo]]  # signals passed back to conductor
-    persist_signal_ref_cnt: dict[str, int]  # uuid -> number of times it was passed to workers
+    persist_signal_ref_cnt: dict[int, int]  # uuid -> number of times it was passed to workers
     worker_graph_to_workers: dict[str, list[str]]
     all_worker_graph_ids: set[str]
     max_output_tokens: int
@@ -223,7 +223,7 @@ class RequestData:
     rx_info: dict[tuple[str, str, str], RxInfo] = field(default_factory=dict)
     tx_info: dict[tuple[str, str], TxInfo] = field(default_factory=dict)
 
-    def remove_persist_signal_uuids(self, uuids: list[str]):
+    def remove_persist_signal_uuids(self, uuids: list[int]):
         uuids = set(uuids)
         for name in self.persist_signals:
             self.persist_signals[name] = [
