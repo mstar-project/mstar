@@ -403,6 +403,10 @@ def test_register_for_send_uuids_matches_the_per_request_loop(tmp_path):
 
     for rid in loop_out:
         for a, b in zip(loop_out[rid], batch_out[rid], strict=True):
+            # Read back from the store: the uuid form stamps placement there,
+            # and a Rust bookkeeper holds a copy, not the object returned above.
+            a = looped.tensor_store.get_info(a.uuid)
+            b = batched.tensor_store.get_info(b.uuid)
             # Staged into the arena (not spilled) in both, at the same offset.
             assert (a.shm_segment is None) == (b.shm_segment is None)
             assert a.shm_offset == b.shm_offset
@@ -411,7 +415,9 @@ def test_register_for_send_uuids_matches_the_per_request_loop(tmp_path):
             assert batched.tensor_store.is_registered(b.uuid)
 
     # And the bytes actually survive a read by a third party.
-    edges = [GraphEdge(name="h", next_node="n", tensor_info=[batch_out[10][0]])]
+    edges = [GraphEdge(name="h", next_node="n", tensor_info=[
+        batched.tensor_store.get_info(batch_out[10][0].uuid)
+    ])]
     cons.start_read_tensors(10, edges)
     assert torch.equal(
         cons.tensor_store.get_tensor(batch_out[10][0].uuid),
