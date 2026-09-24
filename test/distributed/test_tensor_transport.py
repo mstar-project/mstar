@@ -142,7 +142,7 @@ def test_basic_replicated_roundtrip(make_manager, protocol):
 
     assert "req1" in ready and len(ready["req1"]) == 1
     out_uuid = ready["req1"][0].tensor_info[0].uuid
-    assert torch.equal(receiver.get_tensor("req1", out_uuid), original)
+    assert torch.equal(receiver.get_tensor(out_uuid), original)
 
 
 @pytest.mark.parametrize("protocol", _PROTOCOLS)
@@ -177,7 +177,7 @@ def test_sharded_tp2_to_tp1_fanin_consolidates(make_manager, protocol):
 
     assert "req1" in ready and len(ready["req1"]) == 1
     out_uuid = ready["req1"][0].tensor_info[0].uuid
-    consolidated = receiver.get_tensor("req1", out_uuid)
+    consolidated = receiver.get_tensor(out_uuid)
     assert torch.equal(consolidated, torch.cat([shard0, shard1], dim=1))
 
 
@@ -215,7 +215,7 @@ def test_fanin_buffers_partial_then_completes(make_manager, protocol):
     assert "req1" in second and len(second["req1"]) == 1
     out_uuid = second["req1"][0].tensor_info[0].uuid
     assert torch.equal(
-        receiver.get_tensor("req1", out_uuid),
+        receiver.get_tensor(out_uuid),
         torch.cat([shard0, shard1], dim=0),
     )
 
@@ -281,11 +281,11 @@ def test_sharded_tp4_to_tp2_fanin(make_manager, protocol):
     r0_uuid = r0_ready["req1"][0].tensor_info[0].uuid
     r1_uuid = r1_ready["req1"][0].tensor_info[0].uuid
     assert torch.equal(
-        receivers[0].get_tensor("req1", r0_uuid),
+        receivers[0].get_tensor(r0_uuid),
         torch.cat([shards[0], shards[1]], dim=0),
     )
     assert torch.equal(
-        receivers[1].get_tensor("req1", r1_uuid),
+        receivers[1].get_tensor(r1_uuid),
         torch.cat([shards[2], shards[3]], dim=0),
     )
 
@@ -314,7 +314,7 @@ def test_sharded_with_nonzero_shard_dim_roundtrips(make_manager, protocol):
     ready = receiver.get_ready_tensors(graph_walk="decode")
     assert "req1" in ready and len(ready["req1"]) == 1
     out_uuid = ready["req1"][0].tensor_info[0].uuid
-    assert torch.equal(receiver.get_tensor("req1", out_uuid), original)
+    assert torch.equal(receiver.get_tensor(out_uuid), original)
 
 
 @pytest.mark.parametrize("protocol", _PROTOCOLS)
@@ -349,7 +349,7 @@ def test_colocated_replicated_to_sharded_slices_locally(make_manager, protocol):
     # producer's refcount. _send only registered one outgoing edge (rank 0),
     # so without this the colocated slice's dereference would drop the
     # producer's ref to 0 and GC the canonical tensor.
-    mgr.tensor_store.increment_ref("req1", producer_uuid, 1)
+    mgr.tensor_store.increment_ref(producer_uuid, 1)
 
     # Worker-pre-computed per-receiver slice metadata.
     half_nbytes = edge.tensor_info[0].nbytes // 2
@@ -365,8 +365,8 @@ def test_colocated_replicated_to_sharded_slices_locally(make_manager, protocol):
     slice_uuid = ready["req1"][0].tensor_info[0].uuid
     # A fresh UUID — producer's UUID stays available for the other LLM rank.
     assert slice_uuid != producer_uuid
-    assert mgr.tensor_store.check_uuid_presence("req1", producer_uuid)
+    assert mgr.tensor_store.check_uuid_presence(producer_uuid)
 
-    received = mgr.get_tensor("req1", slice_uuid)
+    received = mgr.get_tensor(slice_uuid)
     expected = original[:, :4]
     assert torch.equal(received, expected)
