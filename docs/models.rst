@@ -199,8 +199,10 @@ Chatterbox notes
   (one graph per rows x frames x steps; the estimator's hundreds of tiny
   kernels per Euler step make the eager solve launch-bound, 170 ms vs 45 ms
   for one row on an H100), the token encoder (per rows x token bucket) and
-  the HiFT vocoder (per exact chunk length, its excitation noise drawn
-  outside the graph in the reference's order). Rows are padded to the powers
+  the HiFT vocoder up to its output spectrum (per exact chunk length, its
+  excitation noise drawn outside the graph in the reference's order; the
+  inverse STFT runs eagerly since ``torch.istft`` synchronises). Rows are
+  padded to the powers
   of two up to ``s3gen_max_batch_size`` (8) and frames to
   ``s3gen_frame_bucket`` (64); the built-in voice's chunk shapes are captured
   at startup, other shapes on first use; ``s3gen_graph_stages`` (default
