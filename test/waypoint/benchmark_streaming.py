@@ -995,7 +995,9 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
                 f"(worlds={args.worlds} batch={args.batch})"
             )
             concurrent_result, concurrent_failures = _run_concurrent_phase(
-                client_factory=lambda: MStarClient(url, timeout=args.request_timeout),
+                client_factory=lambda: MStarClient(
+                    url, timeout=args.request_timeout, prefer_binary=args.protocol == "binary"
+                ),
                 seed_image=seed_image,
                 variant=variant,
                 streams=args.streams,

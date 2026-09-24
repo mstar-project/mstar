@@ -67,16 +67,16 @@ class MStarClient:
         timeout: float = 600.0,
         session: requests.Session | None = None,
         enable_nvtx: bool = False,
-        prefer_binary: bool = True,
+        prefer_binary: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._session = session or requests.Session()
-        # Ask for length-framed binary payloads, but decide how to parse from
-        # the response's Content-Type. A server that does not implement the
-        # framing — an older build, or the Rust frontend, neither of which reads
-        # ``Accept`` — answers NDJSON and the historical path handles it. Set
-        # False to force NDJSON, which the streaming benchmark uses to A/B.
+        # Opt in to ask for length-framed binary payloads (e.g. waypoint's
+        # large video frames), but decide how to parse from the response's
+        # Content-Type. A server that does not implement the framing — an
+        # older build, or the Rust frontend, neither of which reads
+        # ``Accept`` — answers NDJSON and the historical path handles it.
         self._prefer_binary = prefer_binary
         # Splits the client's share of the streaming gap into the blocking
         # socket read and the decode of the line it returns. Without this the
