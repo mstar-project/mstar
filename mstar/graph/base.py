@@ -515,13 +515,20 @@ class Loop(GraphSection):
         self._uncache_outputs()
 
     def ingest_external_input(self, graph_edge: GraphEdge):
-        # track one copy of each external input for re-injection on the next iteration
+        # track one copy of each external input for re-injection on the next
+        # iteration -- except a streamed one: each iteration takes the NEXT
+        # chunk, and re-injecting this one would feed it again.
         if (graph_edge.name, graph_edge.next_node) in self._external_inputs \
-                and graph_edge.name not in self._ingested_external_input_names:
+                and graph_edge.name not in self._ingested_external_input_names \
+                and not self._is_streamed_input(graph_edge):
             self._ingested_external_inputs.append(graph_edge)
             self._ingested_external_input_names.add(graph_edge.name)
             graph_edge._persist_for_loop = True
         self._managing_registry.register_ingested_input(graph_edge)
+
+    def _is_streamed_input(self, graph_edge: GraphEdge) -> bool:
+        node = self.section.get_nodes().get(graph_edge.next_node)
+        return node is not None and graph_edge.name in node._streaming_inputs
 
     def complete_iter(self):
         """Called when every entity in the loop's section has finished for this iteration.
@@ -727,6 +734,27 @@ class LoopStateRegistry(GraphStateRegistry):
     def register_ingested_input(self, graph_edge: GraphEdge):
         self.loop.ingest_external_input(graph_edge)
 
+    def reset_for_iter(self):
+        super().reset_for_iter()
+        self._reseed_streaming_ready()
+
+    def clear(self):
+        super().clear()
+        self._reseed_streaming_ready()
+
+    def _reseed_streaming_ready(self):
+        """The member nodes' inputs were just cleared, so their streaming
+        readiness goes back to its seed. Without this a node whose inputs are
+        ALL streaming leaves the set when it first fills and nothing puts it
+        back -- no non-streaming input will ever arrive to -- so every chunk
+        after the first iteration's is refused."""
+        root = self.loop._managing_registry
+        while isinstance(root, LoopStateRegistry):
+            root = root.loop._managing_registry
+        for name, entity in self.managed_entities.items():
+            if isinstance(entity, GraphNode):
+                root.reseed_streaming_ready(name)
+
 
 class WorkerGraphStateRegistry(GraphStateRegistry):
     def __init__(self, graph_section: GraphSection):
@@ -779,14 +807,17 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
             entity.ready_signals.clear()
             # The registry's set has to follow the node-level clear down.
             # Left alone, the name lingers after its inputs are gone and the
-            # node reads as streaming-ready with nothing ingested. A node
-            # whose inputs are ALL streaming is seeded into the set, so it
-            # goes back rather than being dropped.
-            if entity_name in self.only_streaming_inputs:
-                self.ready_for_streaming.add(entity_name)
-            else:
-                self.ready_for_streaming.discard(entity_name)
+            # node reads as streaming-ready with nothing ingested.
+            self.reseed_streaming_ready(entity_name)
         return output
+
+    def reseed_streaming_ready(self, node_name: str):
+        """Back to the seeded membership for a node whose inputs were just
+        cleared: in the set only if its inputs are ALL streaming."""
+        if node_name in self.only_streaming_inputs:
+            self.ready_for_streaming.add(node_name)
+        else:
+            self.ready_for_streaming.discard(node_name)
 
     def reset_for_iter(self):
         super().reset_for_iter()
