@@ -321,12 +321,13 @@ per listed ``[height, width]`` and batch size; other shapes run the eager batche
 ``capture_edit_sizes`` (klein: edit buckets with one reference image of the output size, the shape
 of an edit that keeps its reference's size; defaults to ``capture_sizes``, ``[]`` captures none; the
 eight edit buckets of the 1024² default cost about 8 GiB of peak VRAM on klein-4B and 6 GiB on 9B,
-and every extra capture size adds roughly 7 minutes of startup), ``async_scheduling`` (marks the image nodes
-for the engine's speculative scheduling, which assembles a batch's next step while the current one
-runs and merges requests that became ready meanwhile; off by default, and with the current engine the
-worker takes no speculative step for the denoise loop even when it is on — a served profile with the
-knob showed the same latency, throughput and step gaps as lockstep — so it changes nothing measurable
-until the engine speculates loop-back steps),
+and every extra capture size adds roughly 7 minutes of startup), ``async_scheduling`` (the engine's speculative scheduling of the image
+nodes: the worker assembles a batch's next denoise step while the current one runs and merges requests
+that became ready meanwhile, so requests at different steps share a forward; on by default. Measured on
+one H100 against lockstep, same GPU back to back: klein-4B 0.365 to 0.372 s vs 0.377 to 0.390 s at B=1
+and about 3 percent more images per second at 4 and 16 concurrent requests, klein-9B 2 percent, Z-Image
+neutral, with the served images unchanged; the denoise phase is compute-bound either way. The step a
+request speculates past its schedule is vetoed before any forward. ``false`` restores lockstep),
 ``max_batch_size``, and ``vae_compile`` (``torch.compile`` of the VAE decode with inductor
 autotuning: 89 to 29 ms at 1024² on an H100; its fused reductions move the image by about 55 dB
 PSNR from the eager decode on every prompt, and the autotuner may pick other conv kernels in
