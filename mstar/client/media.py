@@ -72,11 +72,16 @@ def iter_binary_frames(raw, read_size: int = _FRAME_HEADER_READ_SIZE) -> Iterato
     production, a ``BytesIO`` in tests. ``read_size`` only bounds the header
     scan; payload reads ask for exactly what is outstanding.
     """
+    # ``read(n)`` blocks until ``n`` bytes or EOF, which stalls the header scan
+    # behind a full 64 KiB on small frames. ``read1`` returns as soon as any
+    # bytes are available, like a single ``recv()``; fall back to ``read`` for
+    # objects that lack it.
+    read_header = raw.read1 if hasattr(raw, "read1") else raw.read
     buf = bytearray()
     while True:
         newline = buf.find(b"\n")
         while newline < 0:
-            block = raw.read(read_size)
+            block = read_header(read_size)
             if not block:
                 if buf:
                     raise RuntimeError(
