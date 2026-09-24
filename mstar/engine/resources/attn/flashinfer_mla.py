@@ -58,8 +58,6 @@ class FlashInferMLAWrapper:
         use_cuda_graph: bool = False,
         backend: str = "auto",
     ):
-        import flashinfer
-
         self.device = device
         self.use_cuda_graph = use_cuda_graph
         self.batch_size = batch_size
@@ -82,6 +80,8 @@ class FlashInferMLAWrapper:
             self._fb: tuple | None = None
             self.attn_wrapper = None
             return
+        import flashinfer
+
         if use_cuda_graph:
             assert batch_size is not None and max_num_pages is not None
             self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
