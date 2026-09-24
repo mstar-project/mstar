@@ -168,6 +168,9 @@ class Worker:
         dist_init_method=None
     ):
         self.worker_id = worker_id
+        # the other workers of this deployment: the only readers a persisted
+        # output can have besides this worker (see ``_register_outputs``)
+        self._peer_workers = [w for w in worker_ids if w != worker_id]
         self.device = device
         self.enable_nvtx = enable_nvtx
 
@@ -1090,12 +1093,19 @@ class Worker:
         and populate tensor_info on the GraphEdges.
         For outputs staying local: store tensors in tensor_manager.
         Returns the output edges per request (with tensor_info filled in).
+
+        A persisted output (``persist=True``: handed to the conductor for a later
+        walk of the request) is registered only when another worker exists to
+        read it. With a single worker the later walk runs here, where the tensor
+        already is, and staging it is pure cost: the SHM transport serializes it
+        to a file, 13 ms for the 7.5 MiB text embedding of every image request.
         """
         for request_id, _node in batch.node_objects.items():
             routing = routing_per_request[request_id]
             infos_by_uuid = {}
+            persist = routing.persist if self._peer_workers else []
             for edge in (
-                routing.persist +
+                persist +
                 sum(routing.to_workers.values(), start=[]) +
                 routing.emit_to_client +
                 sum(routing.streaming_to_workers.values(), start=[])
