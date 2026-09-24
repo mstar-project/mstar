@@ -14,6 +14,7 @@ from mstar.conductor.request_info import (
     CurrentForwardPassInfo,
 )
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources.kv.manager import KVSequenceInfo, PublishedKVInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.model.base import WorkerGraph
 from mstar.worker.node_manager_utils import (
@@ -135,6 +136,66 @@ def test_inverted_index_populated_at_init():
     assert mgr.walk_node_to_worker_graph_id[(walk, "ar_decode")] == wg_id
     # Unknown (walk, node) pairs should not be in the index.
     assert ("other_walk", "prefill") not in mgr.walk_node_to_worker_graph_id
+
+
+def test_completion_flushes_only_publication_produced_by_this_worker():
+    mgr, _, _ = _make_manager()
+    inherited = PublishedKVInfo.build_for_rank(
+        rank=0,
+        world_size=2,
+        seq_info={
+            "main": KVSequenceInfo(
+                seq_len=10,
+                latest_kv_transfer_info="rank-0",
+                page_indices=[0],
+            )
+        },
+    )
+    inherited.update(PublishedKVInfo.build_for_rank(
+        rank=1,
+        world_size=2,
+        seq_info={
+            "main": KVSequenceInfo(
+                seq_len=8,
+                latest_kv_transfer_info="rank-1-old",
+                page_indices=[1],
+            )
+        },
+    ))
+    mgr.update_request_info(
+        "rid", "default", resource_publish_info={"kv": inherited},
+    )
+
+    produced = PublishedKVInfo.build_for_rank(
+        rank=1,
+        world_size=2,
+        seq_info={
+            "main": KVSequenceInfo(
+                seq_len=9,
+                latest_kv_transfer_info="rank-1-new",
+                page_indices=[2],
+            )
+        },
+    )
+    mgr.buffer_publish_info("rid", "default", {"kv": produced})
+    produced.update(PublishedKVInfo.build_for_rank(
+        rank=0,
+        world_size=2,
+        seq_info={
+            "main": KVSequenceInfo(
+                seq_len=11,
+                latest_kv_transfer_info="rank-0-later",
+                page_indices=[3],
+            )
+        },
+    ))
+
+    flushed = mgr.flush_publish_info("rid", "default")
+
+    assert set(flushed["kv"].info) == {1}
+    assert flushed["kv"].get(1)["main"].seq_len == 9
+    assert set(mgr.get_publish_info("rid", "default")["kv"].info) == {0, 1}
+    assert mgr.flush_publish_info("rid", "default") == {}
 
 
 def test_get_worker_graph_id_uses_inverted_index():

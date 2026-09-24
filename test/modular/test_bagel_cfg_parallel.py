@@ -198,6 +198,35 @@ def test_shm_publication_refreshes_when_seq_len_changes(tmp_path):
     assert not Path(refreshed.path).exists()
 
 
+def test_shm_publication_refreshes_when_generation_changes(tmp_path):
+    source = torch.zeros((1, 1, 2, 4, 1, 1), dtype=torch.float32)
+    source_cache = _kv_cache(source)
+    producer = ShmKVTransferEngine(source_cache, "producer", str(tmp_path))
+
+    info = producer.get_kv_transfer_info(
+        request_id="request",
+        label="main",
+        page_indices=[0],
+        seq_len=2,
+        generation=0,
+    )
+    source_cache.tensor.fill_(7)
+    refreshed = producer.get_kv_transfer_info(
+        request_id="request",
+        label="main",
+        page_indices=[0],
+        seq_len=2,
+        generation=1,
+    )
+
+    assert refreshed.path == info.path
+    assert refreshed.generation == 1
+    torch.testing.assert_close(
+        torch.load(refreshed.path, weights_only=True),
+        source_cache.tensor,
+    )
+
+
 def test_shm_publications_are_namespaced_by_resource(tmp_path):
     source = torch.zeros((1, 1, 2, 4, 1, 1), dtype=torch.float32)
     source_cache = _kv_cache(source)
@@ -328,6 +357,75 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
     )
 
 
+def test_remote_generation_replaces_same_length_cached_kv(tmp_path):
+    manager = KVManager(
+        cfg=KVConfig(
+            max_num_pages=4,
+            page_size=4,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=1,
+            max_seq_len=16,
+        ),
+        name="kv",
+        joint_comm_group=None,
+        transfer_engine_info=TransferEngineInfo(
+            my_entity_id="consumer",
+            my_session_id="session",
+            transfer_engine=LocalTransferEngine("consumer"),
+            shm_dir=str(tmp_path),
+        ),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    manager.ingest_request("request", KVReqConfig(needed_labels=["main"]))
+    path = tmp_path / "published.pt"
+
+    def publication(value: float, generation: int) -> PublishedKVInfo:
+        torch.save(
+            torch.full((1, 1, 2, 4, 1, 1), value, dtype=torch.float32),
+            path,
+        )
+        return PublishedKVInfo.build_for_rank(
+            rank=0,
+            world_size=1,
+            seq_info={
+                "main": KVSequenceInfo(
+                    seq_len=2,
+                    latest_kv_transfer_info=ShmKVTransferInfo(
+                        path=str(path),
+                        page_indices=(0,),
+                        layout=manager.kv_cache.layout,
+                        generation=generation,
+                    ),
+                    page_indices=[0],
+                )
+            },
+        )
+
+    first = manager.admit_retrieve(
+        "request", "consumer", "decode", publication(1, generation=0),
+    )
+    first_page = manager._streams["request"]["main"].page_indices[0]
+    assert first.ok and first.ready
+    torch.testing.assert_close(
+        manager.kv_cache.tensor[:, first_page, :, :2],
+        torch.ones_like(manager.kv_cache.tensor[:, first_page, :, :2]),
+    )
+
+    second = manager.admit_retrieve(
+        "request", "consumer", "decode", publication(2, generation=1),
+    )
+    second_page = manager._streams["request"]["main"].page_indices[0]
+    assert second.ok and second.ready
+    torch.testing.assert_close(
+        manager.kv_cache.tensor[:, second_page, :, :2],
+        torch.full_like(
+            manager.kv_cache.tensor[:, second_page, :, :2], 2,
+        ),
+    )
+
+
 def test_kv_shm_directory_is_private_to_the_deployment(
     tmp_path, monkeypatch,
 ):
@@ -353,11 +451,13 @@ def test_kv_shm_directory_is_private_to_the_deployment(
 
 def test_local_only_cpu_cache_does_not_publish_shm_snapshots():
     source = torch.zeros((1, 1, 2, 4, 1, 1), dtype=torch.float32)
+    factory_calls = []
     manager = KVTransferManager(
         TransferEngineInfo(
             my_entity_id="producer",
             my_session_id="session",
             transfer_engine=LocalTransferEngine("producer"),
+            shm_dir_factory=lambda: factory_calls.append(True) or "/unused",
         ),
         _kv_cache(source),
         resource_key="local_kv",
@@ -373,3 +473,4 @@ def test_local_only_cpu_cache_does_not_publish_shm_snapshots():
         page_indices=[0],
         seq_len=1,
     ) is None
+    assert factory_calls == []

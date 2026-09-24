@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
 from mstar.engine.cuda_graph_runner import (
     CudaGraphRunner,
@@ -23,6 +23,7 @@ from mstar.engine.resources import (
     AdmitFailedReason,
     FullAdmitOutcome,
     NodeResourceSpec,
+    PublishedInfo,
     Resource,
     ResourceReqConfig,
     SlotLease,
@@ -222,6 +223,12 @@ class ExecutingBatch:
     # This step's per-rid outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
     outputs: dict[str, NameToTensorList] = field(default_factory=dict)
+
+    # Durable resource state produced by this worker in this batch. This is
+    # deliberately narrower than per_request_info's inherited aggregate.
+    resource_publish_info: dict[str, dict[str, PublishedInfo]] = field(
+        default_factory=dict
+    )
 
     # The next step reads N's outputs, and plans against N's committed state.
     # Two separate dependencies, so two events: whoever prepares N+1 can start
@@ -1208,7 +1215,7 @@ class Engine:
 
     def finalize_batch(
         self, batch: ExecutingBatch
-    ):
+    ) -> dict[str, dict[str, PublishedInfo]]:
         if self._enable_nvtx:
             range_push("engine.finalize_batch")
         try:
@@ -1222,6 +1229,7 @@ class Engine:
                 if rid not in published:
                     continue
                 info.update_publish_info(published[rid])
+            return published
         finally:
             if self._enable_nvtx:
                 range_pop()
@@ -1238,7 +1246,12 @@ class Engine:
             graph_walk=batch.step_context.graph_walk,
         )
         for rid in request_ids:
-            batch.per_request_info[rid].update_publish_info(published.get(rid, {}))
+            rid_published = published.get(rid, {})
+            batch.per_request_info[rid].update_publish_info(rid_published)
+            merge_publish_info(
+                batch.resource_publish_info.setdefault(rid, {}),
+                rid_published,
+            )
 
     def _collect_outputs(
         self,

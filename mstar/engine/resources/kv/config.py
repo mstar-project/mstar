@@ -123,6 +123,8 @@ class KVReqConfig(ResourceReqConfig):
             self.final_publish_labels_per_node_walk
             if final else self.publish_labels_per_node_walk
         )
+        # Final publication is a new, opt-in hook. Ordinary publication keeps
+        # the legacy "all available labels" behavior when its map is absent.
         if final and mapping is None:
             return []
         if mapping is None:

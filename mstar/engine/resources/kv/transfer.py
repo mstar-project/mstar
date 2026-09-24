@@ -17,7 +17,7 @@ import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
@@ -56,6 +56,7 @@ class KVTransferEngine(ABC):
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
+        generation: int | None = None,
     ) -> Any:
         pass
 
@@ -83,6 +84,7 @@ class MooncakeKVTransferInfo:
     session_id: str
     data_ptr: int
     layout: KVLayout
+    generation: int | None = None
 
 
 class MooncakeKVTransferEngine(KVTransferEngine):
@@ -113,8 +115,29 @@ class MooncakeKVTransferEngine(KVTransferEngine):
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
+        generation: int | None = None,
     ) -> MooncakeKVTransferInfo:
-        return self._transfer_info
+        return MooncakeKVTransferInfo(
+            entity_id=self._transfer_info.entity_id,
+            session_id=self._transfer_info.session_id,
+            data_ptr=self._transfer_info.data_ptr,
+            layout=self._transfer_info.layout,
+            generation=generation,
+        )
+
+    def owns_transfer_info(
+        self,
+        transfer_info: Any,
+        request_id: str,
+        label: str,
+    ) -> bool:
+        del request_id, label
+        return (
+            isinstance(transfer_info, MooncakeKVTransferInfo)
+            and transfer_info.entity_id == self._transfer_info.entity_id
+            and transfer_info.session_id == self._transfer_info.session_id
+            and transfer_info.data_ptr == self._transfer_info.data_ptr
+        )
 
     def read_batched_async(
         self, remote_kv_info: MooncakeKVTransferInfo,
@@ -166,6 +189,7 @@ class CudaIpcKVTransferInfo:
     dtype: str
     requires_grad: bool
     layout: KVLayout
+    generation: int | None = None
 
 
 
@@ -206,8 +230,30 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
+        generation: int | None = None,
     ) -> CudaIpcKVTransferInfo:
-        return self._transfer_info
+        return CudaIpcKVTransferInfo(
+            cuda_share=self._transfer_info.cuda_share,
+            size=self._transfer_info.size,
+            stride=self._transfer_info.stride,
+            offset=self._transfer_info.offset,
+            dtype=self._transfer_info.dtype,
+            requires_grad=self._transfer_info.requires_grad,
+            layout=self._transfer_info.layout,
+            generation=generation,
+        )
+
+    def owns_transfer_info(
+        self,
+        transfer_info: Any,
+        request_id: str,
+        label: str,
+    ) -> bool:
+        del request_id, label
+        return (
+            isinstance(transfer_info, CudaIpcKVTransferInfo)
+            and transfer_info.cuda_share == self._transfer_info.cuda_share
+        )
 
     def read_batched_async(
         self, remote_kv_info: CudaIpcKVTransferInfo,
@@ -307,8 +353,9 @@ class LocalOnlyKVTransferEngine(KVTransferEngine):
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
+        generation: int | None = None,
     ) -> None:
-        del request_id, label, page_indices, seq_len
+        del request_id, label, page_indices, seq_len, generation
 
     def shutdown(self):
         pass
@@ -319,6 +366,7 @@ class ShmKVTransferInfo:
     path: str
     page_indices: tuple[int, ...]
     layout: KVLayout
+    generation: int | None = None
 
 
 class ShmKVTransferEngine(KVTransferEngine):
@@ -348,7 +396,7 @@ class ShmKVTransferEngine(KVTransferEngine):
         self._resource_key = resource_key
         self._published: dict[
             tuple[str, str],
-            tuple[tuple[tuple[int, ...], int], ShmKVTransferInfo],
+            tuple[tuple[tuple[int, ...], int, int | None], ShmKVTransferInfo],
         ] = {}
 
     def _path(self, request_id: str, label: str) -> str:
@@ -364,6 +412,7 @@ class ShmKVTransferEngine(KVTransferEngine):
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
+        generation: int | None = None,
     ) -> ShmKVTransferInfo | None:
         if (
             request_id is None
@@ -373,7 +422,7 @@ class ShmKVTransferEngine(KVTransferEngine):
         ):
             return None
         pages = tuple(page_indices)
-        version = (pages, seq_len)
+        version = (pages, seq_len, generation)
         key = (request_id, label)
         previous = self._published.get(key)
         if previous is not None and previous[0] == version:
@@ -396,6 +445,7 @@ class ShmKVTransferEngine(KVTransferEngine):
             path=path,
             page_indices=pages,
             layout=self._kv_cache.layout,
+            generation=generation,
         )
         self._published[key] = (version, info)
         return info
@@ -551,6 +601,13 @@ class TransferEngineInfo:
     my_session_id: str
     transfer_engine: TensorTransferEngine
     shm_dir: str | None = None
+    shm_dir_factory: Callable[[], str] | None = None
+
+    def get_shm_dir(self) -> str | None:
+        """Resolve the deployment SHM directory only for a cache that needs it."""
+        if self.shm_dir is None and self.shm_dir_factory is not None:
+            self.shm_dir = self.shm_dir_factory()
+        return self.shm_dir
 
 
 class KVTransferManager:
@@ -582,14 +639,15 @@ class KVTransferManager:
             if kv_cache.device.type == "cuda":
                 self._kv_transfer_engine = CudaIpcKVTransferEngine(kv_cache)
             elif needs_remote_transfer:
-                if not transfer_engine_info.shm_dir:
+                shm_dir = transfer_engine_info.get_shm_dir()
+                if not shm_dir:
                     raise ValueError(
                         "shm_dir is required for shared-memory KV transfer"
                     )
                 self._kv_transfer_engine = ShmKVTransferEngine(
                     kv_cache=kv_cache,
                     entity_id=transfer_engine_info.my_entity_id,
-                    shm_dir=transfer_engine_info.shm_dir,
+                    shm_dir=shm_dir,
                     resource_key=resource_key,
                 )
             else:
@@ -658,6 +716,7 @@ class KVTransferManager:
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
+        generation: int | None = None,
     ):
         """Descriptor another process needs to read this cache remotely.
         ``KVCachePool.publish`` stamps it onto every ``SequenceInfo``."""
@@ -666,6 +725,7 @@ class KVTransferManager:
             label=label,
             page_indices=page_indices,
             seq_len=seq_len,
+            generation=generation,
         )
 
     def remove_request(self, request_id: str) -> None:

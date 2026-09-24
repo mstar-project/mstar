@@ -3,7 +3,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 from mstar.communication.tensors import TensorCommunicationManager
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
@@ -193,6 +193,11 @@ class PerPartitionInfo:
     # graph_walk_worker_graph_ids = worker graphs for current graph walk
     graph_walk_worker_graph_ids: list[str] = field(default_factory=list) # for this worker
     stream_partition_done: bool = False  # set True when last chunk pops with is_final
+    # Publication produced by this worker since its last completion message.
+    # Kept separate from current_fwd_info, which also contains peer state.
+    pending_resource_publish_info: dict[str, PublishedInfo] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -296,6 +301,30 @@ class WorkerGraphsManager:
 
     def get_publish_info(self, request_id: str, partition_name: str):
         return self.get_fwd_info(request_id, partition_name).resource_publish_info
+
+    def buffer_publish_info(
+        self,
+        request_id: str,
+        partition_name: str,
+        published: dict[str, PublishedInfo],
+    ) -> None:
+        pending = self.per_request_info[request_id].per_partition_info[
+            partition_name
+        ].pending_resource_publish_info
+        # finalize_batch also merges these objects into current_fwd_info.
+        # Detach the pending delta so a later peer update to that aggregate
+        # cannot leak another rank into this worker's completion message.
+        merge_publish_info(pending, deepcopy(published))
+
+    def flush_publish_info(
+        self, request_id: str, partition_name: str,
+    ) -> dict[str, PublishedInfo]:
+        part_info = self.per_request_info[request_id].per_partition_info[
+            partition_name
+        ]
+        published = part_info.pending_resource_publish_info
+        part_info.pending_resource_publish_info = {}
+        return published
 
     def get_fwd_number(self, request_id: str, partition_name: str):
         return self.get_fwd_info(request_id, partition_name).fwd_index

@@ -11,6 +11,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import partial
 from time import sleep
 
 import torch
@@ -233,14 +234,15 @@ class Worker:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=enable_prof
         )
-        kv_shm_dir = None
+        kv_shm_dir_factory = None
         if (
             isinstance(
                 self.tensor_manager.transfer_engine, LocalTransferEngine,
             )
             and self.device.type != "cuda"
         ):
-            kv_shm_dir = make_deployment_kv_shm_dir(
+            kv_shm_dir_factory = partial(
+                make_deployment_kv_shm_dir,
                 socket_path_prefix=socket_path_prefix,
                 dist_init_method=dist_init_method,
             )
@@ -258,7 +260,7 @@ class Worker:
                 my_entity_id=worker_id,
                 my_session_id=self.tensor_manager.my_session_id,
                 transfer_engine=self.tensor_manager.transfer_engine,
-                shm_dir=kv_shm_dir,
+                shm_dir_factory=kv_shm_dir_factory,
             ),
             model=model,
             enable_nvtx=self.enable_nvtx,
@@ -1235,7 +1237,11 @@ class Worker:
                     persist_signals=self.worker_graphs_manager.flush_persist_signals(request_id),
                     new_token_counts=self.worker_graphs_manager.flush_new_token_counts(request_id),
                     output_signal_names=self.worker_graphs_manager.flush_output_signals(request_id),
-                    resource_publish_info=self.worker_graphs_manager.get_publish_info(request_id, partition_name),
+                    resource_publish_info=(
+                        self.worker_graphs_manager.flush_publish_info(
+                            request_id, partition_name,
+                        )
+                    ),
                     partition_name=partition_name,
                     partition_done=p_done,
                     stream_tokens_consumed=stream_consumed,
@@ -1423,7 +1429,7 @@ class Worker:
             # the next iter's prep and the conductor see it. Runs regardless
             # of success, allocation failure, or an uncaught raise —
             # finalize_batch reads whatever state the engine actually reached.
-            engine.finalize_batch(node_batch)
+            node_batch.resource_publish_info = engine.finalize_batch(node_batch)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -2347,6 +2353,15 @@ class Worker:
         # before routing reports the completed loop to the conductor.
         if stopped_rids:
             engine.finalize_stopped_requests(batch_N.node_batch, stopped_rids)
+
+        # CurrentForwardPassInfo also contains publication inherited from peer
+        # ranks. Buffer only what this worker produced for the conductor.
+        for rid in batch_N.node_batch.request_ids:
+            self.worker_graphs_manager.buffer_publish_info(
+                rid,
+                batch_N.partition,
+                batch_N.node_batch.resource_publish_info.get(rid, {}),
+            )
 
         if self.enable_nvtx:
             range_pop(synchronize=False)

@@ -210,6 +210,17 @@ def test_publish_exports_only_labels_declared_for_remote_consumers():
     assert set(final_published.get(0)) == {"branch"}
 
 
+def test_final_publication_is_opt_in_without_changing_ordinary_default():
+    config = KVReqConfig()
+
+    assert config.get_publish_labels(
+        "producer", "decode", ["main", "branch"],
+    ) == ["main", "branch"]
+    assert config.get_publish_labels(
+        "producer", "decode", ["main", "branch"], final=True,
+    ) == []
+
+
 def test_decode_exports_kv_once_after_stop():
     kv = _manager()
     kv.ingest_request(
