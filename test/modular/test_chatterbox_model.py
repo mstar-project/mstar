@@ -571,7 +571,7 @@ def test_t3_prefill_is_captured_as_packed_graphs_for_both_guidance_modes():
         assert cfg.capture_graph_walk == "prefill"
         assert cfg.replay_graph_walks == ["prefill", "prefill_voice"]
         assert cfg.capture_token_lengths == T3Submodule.PREFILL_TOKEN_BUCKETS
-        assert cfg.capture_batch_sizes == T3Submodule.PREFILL_CAPTURE_BATCH_SIZES
+        assert cfg.capture_batch_sizes == T3Submodule.PREFILL_CAPTURE_BATCH_SIZES == [1, 2, 4, 8]
         assert cfg.caps_eager_batch_size is False and cfg.compile is False
         # the combined cond + uncond plan carries twice the input tokens
         assert cfg.total_tokens_multiplier == (2 if cfg.additional_key_info else 1)
@@ -1129,17 +1129,42 @@ def test_vocoder_graphs_key_on_length_and_cache_presence():
         magnitude = mel.sum(dim=1, keepdim=True).repeat_interleave(4, dim=-1) + phase.sum()
         return magnitude, torch.sin(magnitude), harmonic[:, :1]
 
-    graphs = _graphs_on_cpu(VocoderGraphs(spectrum))
+    graphs = _graphs_on_cpu(VocoderGraphs(spectrum))  # captures a length on its second use
     mel = torch.randn(1, 3, 10)
     phase, harmonic = torch.rand(1, 9, 1), torch.randn(1, 9, 40)
     magnitude, out_phase, source = graphs(mel, phase, harmonic, None)
     assert magnitude.shape == (1, 1, 40) and source.shape == (1, 1, 40) and calls[-1] is False
-    graphs(mel, phase, harmonic, torch.zeros(1, 1, 0))  # an empty cache counts as none
-    assert graphs.captures == 1 and graphs.replays == 2
+    assert graphs.captures == 0  # first sight of this length: eager
+    graphs(mel, phase, harmonic, torch.zeros(1, 1, 0))  # an empty cache counts as none: same shape, captured now
+    assert graphs.captures == 1 and graphs.replays == 1
     graphs(mel, phase, harmonic, torch.zeros(1, 1, 8))
-    assert graphs.captures == 2 and calls[-1] is True
+    assert graphs.captures == 1 and calls[-1] is True  # a cache changes the shape: eager on first sight
+    graphs(mel, phase, harmonic, torch.zeros(1, 1, 8))
+    assert graphs.captures == 2 and graphs.replays == 2
     expected, _, _ = spectrum(mel, phase, harmonic, None)
     assert torch.equal(magnitude, expected)
+
+
+def test_shape_graphs_capture_after_a_shape_recurs():
+    """With ``capture_after=2`` a shape runs eagerly the first time and is
+    captured on its second use; one-off shapes never cost a capture."""
+    calls = []
+
+    def solve(mu, mask, spks, cond, noise, n_timesteps):
+        calls.append(tuple(mu.shape))
+        return _fake_solve(mu, mask, spks, cond, noise, n_timesteps)
+
+    graphs = _solve_graphs_on_cpu(solve, rows=(1,))
+    graphs.capture_after = 2
+    a = _solve_inputs(1, 8, 0)
+    assert torch.equal(graphs(**a, n_timesteps=1), _fake_solve(**a, n_timesteps=1))
+    assert graphs.captures == 0 and graphs.replays == 0  # first sight: eager
+    graphs(**a, n_timesteps=1)
+    assert graphs.captures == 1 and graphs.replays == 1  # second sight: captured and replayed
+    graphs(**_solve_inputs(1, 24, 0), n_timesteps=1)
+    assert graphs.captures == 1  # a one-off length stays eager
+    vocoder = VocoderGraphs(lambda *a: (a[0], a[0], a[0]))
+    assert vocoder.capture_after == 2 and SolveGraphs(_fake_solve).capture_after == 1
 
 
 def test_graph_stages_knob_selects_the_stages():
