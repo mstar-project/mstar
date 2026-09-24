@@ -2482,11 +2482,21 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
                     image[0], height, width, self.config.conditioning_resize,
                 ).to(device=device, dtype=torch.float32)
             if is_action and num_frames > 1:
-                # Policy / forward-dynamics condition on latent frame 0 but the
-                # reference pipelines encode the frame repeated across the whole
-                # clip; keep that math. Image-to-video encodes the single frame
-                # (bit-identical frame 0 under the causal Wan VAE).
-                vision = vision.expand(-1, -1, num_frames, -1, -1)
+                # Policy / forward-dynamics condition on latent frame 0 only
+                # (their vmask), and the Wan VAE is temporally causal: frame 0's
+                # latent is bit-identical whether the frame is encoded alone or
+                # repeated over the clip as the reference pipelines do
+                # (measured 0.0 on Edge at 480p). Encode the one frame — 38 ms
+                # instead of ~350 ms for a 33-frame clip — and let ``forward``
+                # place it in the full latent shape the denoise loop pins.
+                s = self.config.vae.scale_factor_spatial
+                out_kwargs = {
+                    "condition_indexes": (0,),
+                    "latent_shape": (
+                        1, self.config.latent_channel, self._latent_t(num_frames),
+                        height // s, width // s,
+                    ),
+                }
         else:
             raise ValueError("Cosmos3 vae_encoder received neither an image nor a video conditioning input.")
         return NodeInputs(tensor_inputs={"vision": vision}, kwargs=out_kwargs)
