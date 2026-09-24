@@ -461,6 +461,11 @@ class ChatterboxConfig:
     # Capture T3 prefill as packed CUDA graphs (token buckets x small batch
     # sizes, both guidance modes); off = eager prefill, decode still captured.
     t3_prefill_graphs: bool = True
+    # Requests whose flow solves share one padded batch (the scheduler groups
+    # up to this many); with graphs the captured row counts are the powers of
+    # two up to it. 16 rows solve about 1.5x more efficiently per row than 8
+    # under a graph, at the cost of a longer wait for the batch to form.
+    s3gen_max_batch_size: int = 8
 
     @property
     def sample_rate(self) -> int:
