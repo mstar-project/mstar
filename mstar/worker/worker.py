@@ -3030,14 +3030,7 @@ class Worker:
                     future=future,
                     tp_seq=fallthrough_tp_seq,
                 ))
-                # Same accounting as the speculative path above. Without it a
-                # workload that never speculates -- image generation is one --
-                # flushes nothing, so MSTAR_PHASE_TIMING silently reports no
-                # breakdown at all, and the shared sample buffer (cleared only
-                # by _phase_flush) grows for the life of the run. The idle
-                # `batch is None` spin above is deliberately NOT counted:
-                # it is a wait, and counting it would both skew iter_total and
-                # make the flush period mean something other than iterations.
+                # Same accounting as the speculative path above
                 if phase_period:
                     _phase_record("iter_total", _time.perf_counter() - _iter_start)
                     phase_iter[0] += 1

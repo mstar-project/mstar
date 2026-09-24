@@ -180,11 +180,7 @@ class ReadySignals:
             return
         self.is_ready = self.input_names.issubset(self.ready_names)
         # Ready once the only missing inputs are streaming ones, which arrive
-        # incrementally. issubset, not issuperset: ready_names is asserted a
-        # subset of input_names above and streaming_inputs is one by
-        # construction, so their union always is too -- issuperset was a
-        # tautology, making every node with any input at all read as
-        # streaming-ready.
+        # incrementally
         self.is_ready_for_streaming = self.is_ready or \
             self.is_ready_for_streaming or (
             self.input_names.issubset(self.ready_names.union(self.streaming_inputs))
@@ -222,8 +218,6 @@ class ReadySignals:
             return None
         self.ready_names.discard(edge_name)
         self.is_ready = self.input_names.issubset(self.ready_names)
-        # issubset for the same reason as in `update`. Not sticky here: this
-        # undoes an ingest, so the flag has to be able to go back down.
         self.is_ready_for_streaming = self.is_ready or self.input_names.issubset(
             self.ready_names | self.streaming_inputs
         )
