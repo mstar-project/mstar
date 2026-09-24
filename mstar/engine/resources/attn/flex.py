@@ -11,6 +11,7 @@ are whole frames of tokens. That is what makes "capacity must be a multiple of
 128" a real constraint here rather than a convenience.
 """
 
+import logging
 import os
 
 import torch
@@ -30,39 +31,53 @@ from mstar.engine.resources.step import StepContext
 
 __all__ = ["FlexAttentionManager", "flex_attention_masked", "make_block_mask"]
 
-# Backend switch, read once at import. "FLASH" is the default. Setting
-# MSTAR_FLEX_BACKEND=TRITON is the rollback switch: it restores the previous
-# Triton flex kernel bit-for-bit; see the comment block below for why FLASH
-# needs a non-trivial mask_mod. FLASH requires the flash-attn-4 package
-# (flash_attn.cute) -- see docs/installation.rst. Torch itself raises "CUTE
-# flash attention library is not available" if it's missing, so there's no
-# extra check here.
+logger = logging.getLogger(__name__)
+
+# Torch passes FLASH the sparse block size from 2.11; flash-attn-4 cannot infer
+# it for every shape and raises during capture on older torch.
+_FLASH_MIN_TORCH = "2.11"
 _ALLOWED_FLEX_BACKENDS = ("TRITON", "FLASH")
-_FLEX_BACKEND = os.environ.get("MSTAR_FLEX_BACKEND", "FLASH")
-if _FLEX_BACKEND not in _ALLOWED_FLEX_BACKENDS:
-    raise ValueError(
-        f"MSTAR_FLEX_BACKEND must be one of {_ALLOWED_FLEX_BACKENDS}, got {_FLEX_BACKEND!r}"
-    )
 
 
-# CORRECTNESS, not speed. Our BlockMask carries a NO-OP `mask_mod`: we pass
-# `mask_mod=None` to `from_kv_blocks` and it substitutes `noop_mask`, so
-# `bm.mask_mod` is a function returning True everywhere, not `None`. Visibility
-# is therefore encoded *entirely* in the block index lists (`full_kv_indices`
-# truncated to `full_kv_num_blocks`), which is what makes a ring expressible at
-# all. The compiled kernel iterates exactly those blocks. The eager path does
-# not -- it rebuilds the mask by evaluating `mask_mod` over the grid, and a noop
-# mask_mod means "everything is visible", so eager attention silently reads
-# every unwritten slot in the ring as a zero K/V and blends it in.
-#
-# Measured on the ported cache: eager output diverges from a masked-dense
-# reference by 2.7e-01, while the compiled path matches it to 1.2e-07. Nothing
-# raises. This is why the reference wraps both of its regions in
-# @torch.compile(fullgraph=True) -- compilation is load-bearing for the *result*
-# there too, not just the throughput.
-#
-# So the compile is pinned here (below, after the backend selection) rather than
-# left to the caller: correctness must not depend on whether someone set
+def _flash_unavailable_reason() -> str | None:
+    """Why FLASH cannot run in this environment, or None if it can."""
+    if torch.__version__ < _FLASH_MIN_TORCH:  # TorchVersion compares as a version
+        return f"torch {torch.__version__} < {_FLASH_MIN_TORCH}"
+    try:
+        import flash_attn.cute  # noqa: F401
+    except Exception as exc:  # a broken install raises more than ImportError
+        return f"flash-attn-4 (flash_attn.cute) is not importable: {exc!r}"
+    return None
+
+
+def _resolve_flex_backend() -> str:
+    """Read once at import. Unset defaults to FLASH and falls back to TRITON,
+    bit-for-bit the previous kernel, when FLASH cannot run; an explicit FLASH
+    fails instead. See docs/installation.rst for installing flash-attn-4."""
+    requested = os.environ.get("MSTAR_FLEX_BACKEND")
+    if requested is not None and requested not in _ALLOWED_FLEX_BACKENDS:
+        raise ValueError(
+            f"MSTAR_FLEX_BACKEND must be one of {_ALLOWED_FLEX_BACKENDS}, got {requested!r}"
+        )
+    if requested == "TRITON":
+        return "TRITON"
+    reason = _flash_unavailable_reason()
+    if reason is None:
+        return "FLASH"
+    if requested == "FLASH":
+        raise RuntimeError(f"MSTAR_FLEX_BACKEND=FLASH but {reason}")
+    logger.warning("flex attention: falling back to TRITON (%s)", reason)
+    return "TRITON"
+
+
+_FLEX_BACKEND = _resolve_flex_backend()
+
+
+# CORRECTNESS, not speed. Our BlockMask's `mask_mod` is a no-op, so visibility
+# lives entirely in the block index lists. The compiled kernel iterates those;
+# eager flex evaluates `mask_mod` instead, so it reads every unwritten ring slot
+# as zero K/V (measured: eager 2.7e-01 vs compiled 1.2e-07 from a masked-dense
+# reference, and nothing raises). So the compile is pinned here, not left to
 # `WaypointConfig.compile_dit`.
 
 

@@ -292,20 +292,30 @@ default. That backend needs the **flash-attn-4** package, which provides
 FA3-style sm90 kernel with TMA and warpgroup specialisation. It is **not on
 PyPI** as of 2026-09-17, and it is **not** pulled in by any extra.
 
-Install it from the upstream repo's ``flash_attn/cute`` subdirectory:
+FLASH needs **torch 2.11 or newer**: older torch does not pass flash-attn-4 the
+block-sparse block size, and capture fails with ``Block sparse tensors ...
+require explicit sparse_block_size[0]``. Note this rules out the flash-attn
+prebuilt wheels above, which stop at ``torch2.10``.
+
+Install it from the upstream repo's ``flash_attn/cute`` subdirectory, pinned to
+the revision this was tested against (with ``nvidia-cutlass-dsl`` 4.7.1 and
+torch 2.12.1):
 
 .. code-block:: bash
 
    git clone https://github.com/Dao-AILab/flash-attention
+   git -C flash-attention checkout 1bda8f9290cd48d030f1516f0e680cd464ef3554
    uv pip install --torch-backend=auto ./flash-attention/flash_attn/cute
 
 This is pure Python plus ``nvidia-cutlass-dsl`` — there is no CUDA extension to
 build. Its kernels are JIT-compiled on first use, which adds roughly a minute to
 the first server startup.
 
-If ``flash-attn-4`` isn't installed, set ``MSTAR_FLEX_BACKEND=TRITON`` to fall
-back to the previous Triton flex kernel. It is correct but slower — about 1.8x
-per attention call at 720p.
+If ``flash-attn-4`` isn't importable or torch is older than 2.11, the server
+logs a warning and falls back to the previous Triton flex kernel. It is correct
+but slower — about 1.8x per attention call at 720p. Set
+``MSTAR_FLEX_BACKEND=TRITON`` to choose it explicitly, or
+``MSTAR_FLEX_BACKEND=FLASH`` to fail at startup instead of falling back.
 
 Matching your CUDA toolkit
 --------------------------
