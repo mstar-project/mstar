@@ -24,6 +24,8 @@ model_kwargs:
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
   # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
+  # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
+  # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
 
 node_groups:
   - node_names: [text_encoder]
