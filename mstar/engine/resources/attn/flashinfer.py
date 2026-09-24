@@ -83,12 +83,18 @@ class FlashInferManager(AttentionManager):
 
         bucket = lease.bucket
         buffer = self._workspaces.get(label, lease.slot)
+        # per row, not per pool: rows that matched one cached prefix all name
+        # its pages, so a step can name more page ids than the pool holds
+        kv_kwargs = {
+            **self._wrapper_kv_kwargs,
+            "max_num_pages": num_rows * self._kv_config.max_num_pages,
+        }
         if bucket.bs == bucket.num_tokens:
             wrapper = FlashInferDecodeWrapper(
                 workspace_buffer=buffer,
                 batch_size=num_rows,
                 use_cuda_graph=True,
-                **self._wrapper_kv_kwargs,
+                **kv_kwargs,
             )
         else:
             wrapper = FlashInferPrefillWrapper(
@@ -96,7 +102,7 @@ class FlashInferManager(AttentionManager):
                 batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
                 use_cuda_graph=True,
-                **self._wrapper_kv_kwargs,
+                **kv_kwargs,
             )
         self._cg_plan_states[key] = wrapper
         return wrapper

@@ -26,7 +26,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
-from mstar.engine.resources import ResourceReqConfig
+from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
@@ -419,10 +419,16 @@ class Conductor:
         Resolved once, here, and carried on the request: the worker hands each
         config to its resource at ingest. KV shape is not part of this — that
         is a deployment-wide property the model declares in its resource specs.
+
+        A declared stream gets a config even when the model returned none, or its
+        keys would have nowhere to go.
         """
-        return self.model.get_request_resource_configs(
+        configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
+        for key, streams in self.model.prefix_key_streams().items():
+            configs.setdefault(key, KVReqConfig(needed_labels=list(streams)))
+        return configs
 
     def _derive_worker_info(self):
         """Derive per-rank worker info from the worker graphs."""
@@ -892,8 +898,20 @@ class Conductor:
         request_data.resource_configs = self._get_resource_configs(
             model_kwargs, partition_fwd_args
         )
-        for cfg in request_data.resource_configs.values():
-            cfg.apply_conductor_config(seed=seed)
+        # keyed by resource, so each config is handed only its own chain
+        kwargs = model_kwargs or {}
+        prefix_keys = kwargs.get("prefix_keys") or {}
+        prefix_tail = kwargs.get("prefix_tail") or {}
+        prefix_decode = kwargs.get("prefix_decode") or {}
+        prefix_cache = kwargs.get("prefix_cache")
+        for key, cfg in request_data.resource_configs.items():
+            cfg.apply_conductor_config(
+                seed=seed,
+                prefix_keys=prefix_keys.get(key),
+                prefix_tail=prefix_tail.get(key),
+                prefix_decode=prefix_decode.get(key),
+                prefix_cache=prefix_cache,
+            )
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         for worker_id, worker_graph_ids in worker_to_worker_graph_ids.items():

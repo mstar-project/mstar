@@ -5,7 +5,8 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import torch
 
@@ -30,6 +31,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
@@ -38,6 +40,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
 )
 from mstar.model.submodule_base import (
+    ARNodeInputs,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
@@ -46,6 +49,9 @@ from mstar.model.submodule_base import (
 from mstar.profile.worker import ExecTimings
 from mstar.utils.profiler import mark, range_pop, range_push
 
+if TYPE_CHECKING:
+    from mstar.model.base import Model
+
 logger = logging.getLogger(__name__)
 
 # Block the GPU thread on its step's outputs before returning (1-step launch
@@ -53,6 +59,27 @@ logger = logging.getLogger(__name__)
 # GPU(N+1)/postprocess(N) overlap. Enable only where 2 steps overflow the CUDA
 # launch queue and block a launch (machine/driver dependent).
 _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
+
+
+def checkpoint_identity(path: str | Path) -> bytes:
+    """Name the weights a cached page was produced under, without reading them.
+
+    A checkpoint with no safetensors index falls back to its shard names and
+    sizes, which catches a replaced shard but not one edited in place at the
+    same length.
+    """
+    root = Path(path)
+    index = root / "model.safetensors.index.json"
+    parts: list[object] = []
+    if index.is_file():
+        parts.append(index.read_bytes())
+    else:
+        for shard in sorted(root.glob("*.safetensors")):
+            parts += [shard.name, shard.stat().st_size]
+    config = root / "config.json"
+    if config.is_file():
+        parts.append(config.read_bytes())
+    return fingerprint(*parts)
 
 
 @dataclass
@@ -301,6 +328,7 @@ class Engine:
         device: torch.device,
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
+        model: "Model | None" = None,
     ):
         self._device = device
         if kv_cache_type is None:
@@ -345,6 +373,8 @@ class Engine:
             node_resources={n: node_to_resources.get(n, []) for n in node_names},
             enable_nvtx=self._enable_nvtx,
         )
+
+        self._open_prefix_caches(specs_by_key, model)
 
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and
@@ -493,6 +523,64 @@ class Engine:
             runners[label] = runner
         return runners
 
+    def _open_prefix_caches(self, specs_by_key, model) -> None:
+        """Root each resource's cache in the weights, the preprocessing, and the
+        config of every resource its pages were planned against."""
+        checkpoint = model.checkpoint_path() if model is not None else None
+        shared = [
+            checkpoint_identity(checkpoint) if checkpoint is not None else b"",
+            model.preprocess_fingerprint() if model is not None else "",
+        ]
+        declared = model.prefix_key_streams() if model is not None else {}
+        self._prefix_model = type(model).__name__
+        # node -> the walks a probe may run on: the keyed walk of every stream
+        # declared on a cache the node uses
+        self._keyed_walks: dict[str, set[str]] = {}
+        for key, by_label in declared.items():
+            for node in specs_by_key[key].nodes:
+                self._keyed_walks.setdefault(node, set()).update(
+                    stream.walk for stream in by_label.values()
+                )
+        for key, resource in self._resources.items():
+            if checkpoint is None and declared.get(key):
+                config = specs_by_key[key].config
+                if config.prefix_cache and not config.prefix_cache_salt:
+                    logger.info(
+                        "KV %s: prefix cache off: %s names no checkpoint, so "
+                        "builds that differ only in their weights cannot be "
+                        "told apart; set prefix_cache_salt to enable it",
+                        key, self._prefix_model,
+                    )
+                    continue
+            # its own, then its dependents' in key order, so the root does not
+            # move with the order the engine happened to build them in
+            parts = [resource.fingerprint()]
+            for other in sorted(specs_by_key):
+                if key in specs_by_key[other].depends_on():
+                    built = self._resources.get(other)
+                    mark = built.fingerprint() if built is not None else None
+                    if mark is not None:
+                        parts.append(mark)
+            opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
+                label: (stream.walk, stream.decode_walk)
+                for label, stream in declared.get(key, {}).items()
+            })
+            if not opened or not declared.get(key):
+                continue
+            nodes = ", ".join(sorted(specs_by_key[key].nodes))
+            for label in declared[key]:
+                logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
+            if not resource.supports_eviction:
+                # a hit allocates only the prompt's tail, so admission no longer
+                # bounds how many requests decode at once
+                logger.warning(
+                    "KV %s: prefix cache on with cpu_offload_pages 0: a decode "
+                    "step that finds nothing to evict holds its requests until "
+                    "they time out. max_concurrent_requests caps how many run "
+                    "at once, and cpu_offload_pages gives the worker a victim",
+                    key,
+                )
+
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.
 
@@ -519,6 +607,8 @@ class Engine:
                     inputs=batch.per_request_input_tensors.get(rid, {}),
                     resources=self._submodules[batch.node_name].resources,
                 )
+                if req_inputs is not None:
+                    req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
             except Exception as error:
                 logger.exception(
                     "prepare_inputs failed for request %s (node=%s, walk=%s)",
@@ -535,6 +625,46 @@ class Engine:
         batch.drop_rids(batch.skipped_rids | batch.failed_requests.keys())
         batch.running_batched = submodule.can_batch(
             batch=batch, model_inputs=node_inputs
+        )
+
+    def extend_prefix_chains(
+        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+    ) -> None:
+        """Key what this step generated, from the stop check's host copy."""
+        walk = batch.step_context.graph_walk
+        for rid in batch.request_ids:
+            per_rid = outputs.get(rid)
+            if isinstance(per_rid, dict):
+                self._runner.extend_prefix_chains(
+                    rid, batch.node_name, walk, per_rid,
+                )
+
+    def _skip_cached_prefix(
+        self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,
+    ) -> NodeInputs:
+        """Cut the leading tokens this node's resources already hold.
+
+        Only the keyed walk is probed, and only when `split_inputs` can cut its
+        inputs; a guided walk writes two labels from one input, so it is skipped.
+        """
+        walk = batch.step_context.graph_walk
+        if walk not in self._keyed_walks.get(batch.node_name, ()):
+            return inputs
+        assert isinstance(inputs, ARNodeInputs) and inputs.custom_pos_ids is None, (
+            f"{self._prefix_model} keys the {walk!r} walk of {batch.node_name} "
+            "for prefix reuse, but that walk places positions of its own"
+        )
+        if inputs.tensor_inputs or inputs.kwargs or inputs.resource_step_info:
+            return inputs
+        matched = self._runner.resolve_cached_prefix(rid, batch.node_name, walk)
+        self._runner.apply_cached_prefix(
+            rid, batch.node_name, walk, inputs, matched,
+        )
+        if matched <= 0:
+            return inputs
+        return self._submodules[batch.node_name].submodule.split_inputs(
+            walk, batch.per_request_info[rid], inputs,
+            matched, inputs.input_seq_len,
         )
 
     def exec(

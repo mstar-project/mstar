@@ -18,15 +18,23 @@ from mstar.engine.resources.attn.wrappers import (
     FlashInferPrefillWrapper,
 )
 from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
+from mstar.engine.resources.kv.keys import fingerprint
 
 logger = logging.getLogger(__name__)
 
 
 class AttentionManager(AttentionResource):
+    prefix_skip_safe = True
+
     # Remains abstract except for build; will build based
     # on the attention backend
 
     # Label / layer cursors come from `AttentionResource`; `run` resolves them.
+
+    def fingerprint(self) -> bytes:
+        # the class, not the declared backend: `build` degrades dense to paged
+        # where the FA3 kernel is unusable, and the two do not agree bit for bit
+        return fingerprint(type(self).__name__)
 
     @classmethod
     def build(cls, spec: AttentionSpec, info: EngineResourceInfo):
