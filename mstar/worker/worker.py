@@ -1769,6 +1769,22 @@ class Worker:
             tp_seq=tp_seq,
         )
 
+    def _is_tearing_down(self, rid: int) -> bool:
+        """Removed, aborted or failed: no further speculative work for ``rid``.
+
+        A deferred drain only fires once the rid leaves ``_in_flight_rids``,
+        and a same-node speculation chain keeps it there every step, so a
+        drain the chain does not see would never fire and the rollout would
+        run to ``max_iters`` for a client that has gone.
+
+        ``rid`` is the worker handle; ``_pending_drains``/``_draining_rids``
+        hold wire strings.
+        """
+        if rid in self._pending_removes or rid in self.scheduler.failed_rids:
+            return True
+        wire = self._rid_str(rid)
+        return wire in self._pending_drains or wire in self._draining_rids
+
     def _try_speculate_next(
         self,
         pending: PendingBatch
@@ -1818,9 +1834,10 @@ class Worker:
         spec_target = (spec_node_name, batch_N.graph_walk)
         max_continuing = self.scheduler.room_for_continuing(spec_target)
 
-        # Removes are filtered here; prep_spec_rids assumes that.
+        # Removes, aborts and failures are filtered here; prep_spec_rids
+        # assumes that.
         candidates = [
-            r for r in batch_N.request_to_worker_graph if r not in self._pending_removes
+            r for r in batch_N.request_to_worker_graph if not self._is_tearing_down(r)
         ]
         # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, GraphEdge]] = []
