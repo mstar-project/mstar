@@ -14,6 +14,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - Registry key
      - Example Hugging Face model ID
      - Description
+   * - ``command_a_plus`` *(Experimental)*
+     - ``CohereLabs/command-a-plus-05-2026-bf16``
+     - Text-only MoE integration with real-checkpoint generation tested. TP8
+       numerical acceptance and full-checkpoint HTTP validation remain open.
+       See :doc:`command_a_plus`.
    * - ``bagel``
      - ``ByteDance-Seed/BAGEL-7B-MoT``
      - Unified multimodal model (text + image understanding and generation).

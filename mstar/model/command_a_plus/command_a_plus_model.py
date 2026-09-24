@@ -1,37 +1,41 @@
-"""Single-node, text-only Command A+ graph using an existing local checkpoint.
-
-Construction reads configuration only. Tokenizer and weights load lazily and
-never trigger a checkpoint download. Official-tokenizer and GPU parity remain
-separate validation steps before registering this model for deployment.
-"""
+"""Single-node text generation with pinned metadata and explicitly supplied weights."""
 
 import json
-from pathlib import Path
 
 import torch
 
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, DEFAULT_PARTITION
+from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
-    AttentionConfig, AttentionSpec, KVConfig, KVSpec, PositionConfig, PositionSpec,
-    SamplerSpec, SamplingReqConfig,
+    AttentionConfig,
+    AttentionSpec,
+    KVConfig,
+    KVSpec,
+    PositionConfig,
+    PositionSpec,
+    SamplerSpec,
+    SamplingReqConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.command_a_plus.assets import resolve_metadata
 from mstar.model.command_a_plus.config import (
-    GLOBAL_ATTN, KV_CACHE, LOCAL_ATTN, ROPE, SAMPLER, CommandAPlusConfig,
+    GLOBAL_ATTN,
+    KV_CACHE,
+    LOCAL_ATTN,
+    ROPE,
+    SAMPLER,
+    CommandAPlusConfig,
 )
 
 
 class CommandAPlusModel(Model):
     def __init__(
         self, model_path_hf: str, cache_dir: str | None = None,
-        max_seq_len: int | None = None, **kwargs,
+        max_seq_len: int | None = None, checkpoint_dir: str | None = None, **kwargs,
     ):
-        self.local_dir = Path(model_path_hf)
-        if not (self.local_dir / "config.json").is_file():
-            raise ValueError("Command A+ currently requires a local checkpoint directory with config.json")
+        self.local_dir = resolve_metadata(checkpoint_dir or model_path_hf, cache_dir)
         self.config = CommandAPlusConfig.from_json(self.local_dir / "config.json").text_config
         self.max_seq_len = min(8192, self.config.max_position_embeddings) if max_seq_len is None else max_seq_len
         if type(self.max_seq_len) is not int or not 0 < self.max_seq_len <= self.config.max_position_embeddings:
@@ -135,14 +139,31 @@ class CommandAPlusModel(Model):
             raise ValueError("Command A+ sequence parallelism is not implemented")
         from mstar.model.command_a_plus.components.language_model import CommandAPlusForCausalLM
         from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
-        from mstar.model.loader import load_weights
+        from mstar.model.loader import iter_safetensors_shards
+
+        # Validate availability before allocating hundreds of GB of parameters.
+        index = self.local_dir / "model.safetensors.index.json"
+        if index.is_file():
+            weight_map = json.loads(index.read_text())["weight_map"]
+            required = {shard for name, shard in weight_map.items()
+                        if name.startswith("model.language_model.")}
+        else:
+            required = {"model.safetensors"}
+        missing = [name for name in sorted(required) if not (self.local_dir / name).is_file()]
+        if not required or missing:
+            raise FileNotFoundError(
+                "Command A+ weights are not present locally; obtain the checkpoint explicitly "
+                f"before starting workers. Missing shards: {missing[:3]}"
+            )
 
         dtype = autocast_dtype if autocast_dtype is not None else torch.float32
         with torch.device("meta"):
             language_model = CommandAPlusForCausalLM(self.config, tp_group).to(dtype=dtype)
         language_model.to_empty(device=device)
         # Stream source tensors through CPU; loaders copy just this rank's slice.
-        load_weights(language_model, self.local_dir, device="cpu")
+        language_model.load_weights(iter_safetensors_shards(
+            self.local_dir, device="cpu", prefix="model.language_model.",
+        ))
         language_model.eval()
         return CommandAPlusLLMSubmodule(language_model, self.config).eval()
 
@@ -171,7 +192,8 @@ class CommandAPlusModel(Model):
             if not isinstance(prompt, str):
                 raise ValueError("Expected a text prompt")
             ids = torch.tensor(self._get_tokenizer().apply_chat_template(
-                [{"role": "user", "content": prompt}], tokenize=True, add_generation_prompt=True,
+                [{"role": "user", "content": prompt}], tokenize=True,
+                add_generation_prompt=True, return_dict=False,
             ), dtype=torch.long)
         if ids.ndim != 1 or ids.numel() == 0 or ids.numel() > self.max_seq_len:
             raise ValueError("Prompt must contain 1..max_seq_len token IDs")

@@ -3,8 +3,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-
-# Resource names shared by the text components and the future LLM node.
+# Resource names shared by the text components and the LLM node.
 KV_CACHE = "kv_cache"
 LOCAL_ATTN = "local_attn"
 GLOBAL_ATTN = "global_attn"
@@ -20,13 +19,13 @@ class CommandAPlusTextConfig:
     num_attention_heads: int
     num_key_value_heads: int
     head_dim: int
-    
+
     # MoE
     intermediate_size: int
     num_experts: int
     num_experts_per_tok: int
     num_shared_experts: int
-    
+
     layer_types: list[str]
     sliding_window: int
     max_position_embeddings: int
@@ -36,13 +35,13 @@ class CommandAPlusTextConfig:
     bos_token_id: int
     eos_token_id: int
     pad_token_id: int
-    
+
 
     @property
     def shared_intermediate_size(self) -> int:
         """Width of the shared MLP, derived from the expert dimensions."""
         return self.intermediate_size * self.num_shared_experts
-    
+
 
     @classmethod
     def from_dict(cls, data: dict) -> "CommandAPlusTextConfig":
@@ -116,7 +115,7 @@ class CommandAPlusTextConfig:
             eos_token_id=data["eos_token_id"],
             pad_token_id=data["pad_token_id"]
         )
-    
+
     def __post_init__(self) -> None:
         for name in (
             "hidden_size",
@@ -139,15 +138,17 @@ class CommandAPlusTextConfig:
         # Validate that the number of attention heads is divisible by the number of key-value heads
         if self.num_attention_heads % self.num_key_value_heads != 0:
             raise ValueError(
-                f"num_attention_heads ({self.num_attention_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})"
+                f"num_attention_heads ({self.num_attention_heads}) must be divisible by "
+                f"num_key_value_heads ({self.num_key_value_heads})"
             )
-            
+
         # reject num_experts_per_tok greater than num_experts
         if self.num_experts_per_tok > self.num_experts:
             raise ValueError(
-                f"num_experts_per_tok ({self.num_experts_per_tok}) cannot be greater than num_experts ({self.num_experts})"
+                f"num_experts_per_tok ({self.num_experts_per_tok}) cannot be greater than "
+                f"num_experts ({self.num_experts})"
             )
-        
+
         # even head dim
         if self.head_dim % 2 != 0:
             raise ValueError(f"head_dim ({self.head_dim}) must be an even integer")

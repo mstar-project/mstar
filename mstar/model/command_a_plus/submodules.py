@@ -8,11 +8,22 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import (
-    AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep,
+    AttentionStep,
+    KVStep,
+    PositionStep,
+    SamplerStep,
+    Segment,
+    SlotLease,
+    SubmoduleStep,
 )
 from mstar.model.command_a_plus.components.language_model import CommandAPlusForCausalLM
 from mstar.model.command_a_plus.config import (
-    GLOBAL_ATTN, KV_CACHE, LOCAL_ATTN, ROPE, SAMPLER, CommandAPlusTextConfig,
+    GLOBAL_ATTN,
+    KV_CACHE,
+    LOCAL_ATTN,
+    ROPE,
+    SAMPLER,
+    CommandAPlusTextConfig,
 )
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine
 

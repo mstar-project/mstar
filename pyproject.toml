@@ -49,6 +49,15 @@ mstar = "mstar.cli.main:main"
 mstar-serve = "mstar.api_server.entrypoint:main"
 
 [project.optional-dependencies]
+command_a_plus = [
+    "flashinfer-python>=0.6.11,<0.7",
+    "huggingface-hub>=1.5,<2",
+    "mooncake-transfer-engine",
+    "ninja",
+    "safetensors",
+    "transformers>=5.17,<5.18",
+]
+
 dev = [
     "ruff<=0.16",
     "pytest",
