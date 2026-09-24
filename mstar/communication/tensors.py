@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import platform
@@ -1059,6 +1060,24 @@ def _default_shm_dir() -> str:
     return "/tmp/mstar_shm"
 
 
+def _deployment_namespace(communicator) -> str:
+    """A token every process of ONE deployment derives identically, and two
+    deployments on the same host never share.
+
+    Tensor uuids are per-entity counters, so ``worker_0``'s uuid 5 exists in
+    every deployment at once; a file named by entity and uuid alone is written
+    -- and unlinked -- by every server on the host. The IPC socket prefix is
+    already unique per concurrent deployment (their sockets would collide
+    otherwise) and every process of one is handed the same one, so it names
+    the deployment. Empty for a communicator without one (tests).
+    """
+    prefix = getattr(communicator, "ipc_socket_path_prefix", None)
+    if not prefix:
+        return ""
+    # realpath: "/tmp/mstar_x/" and "/tmp/mstar_x" are one deployment.
+    return hashlib.sha1(os.path.realpath(prefix).encode()).hexdigest()[:12]
+
+
 # ---------------------------------------------------------------------------
 # SharedMemoryCommunicationManager
 # ---------------------------------------------------------------------------
@@ -1090,6 +1109,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
 
         # uuid → file path for sender-side cleanup
         self._shm_files: dict[int, str] = {}
+        self._shm_namespace = _deployment_namespace(communicator)
 
         # Dedicated copy streams: D2H/H2D run here so they don't serialize
         # behind the next GPU step queued on the default stream.
@@ -1100,7 +1120,8 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
             self._h2d_stream = torch.cuda.Stream(device=device)
 
     def _shm_path(self, entity_id: str, uuid: int) -> str:
-        return os.path.join(self.shm_dir, f"mstar_{entity_id}_{uuid}")
+        ns = f"{self._shm_namespace}_" if self._shm_namespace else ""
+        return os.path.join(self.shm_dir, f"mstar_{ns}{entity_id}_{uuid}")
 
     def register_for_send(
         self, request_id: Rid, tensor_infos: list[TensorPointerInfo],
