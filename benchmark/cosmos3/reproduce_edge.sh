@@ -1,6 +1,7 @@
 #!/bin/bash
-# Reproduce the Cosmos3-Edge serving benchmarks: M* vs vLLM-Omni (generator:
-# i2v/t2v at 480p, action policy) and M* vs vLLM (reasoner: TTFT / decode tok/s).
+# Reproduce the Cosmos3-Edge serving benchmarks: M* vs vLLM-Omni and SGLang-Diffusion
+# (generator: i2v/t2v at 480p, t2i, the DROID action loop) and M* vs vLLM (reasoner:
+# TTFT / decode tok/s).
 # Both engines expose OpenAI-compatible routes, so the clients in this dir hit
 # them identically (same prompt / size / frames / steps / guidance / seed).
 #
@@ -9,6 +10,7 @@
 #   SNAP   = Cosmos3-Edge HF snapshot dir (hf download nvidia/Cosmos3-Edge)
 #   MSTAR  = this repo checkout
 #   VLLM_OMNI_PY / VLLM_PY = python of the pinned baseline envs (vllm-omni 0.28 / vllm 0.29)
+#   SGLANG = the `sglang` launcher of a sglang 0.5.19 env (SGLang-Diffusion, multimodal_gen)
 set -eu
 
 # --------------------------------------------------------------------------
@@ -75,6 +77,35 @@ bench_generator() {
   python "$here/bench_t2i_oai.py" --port "$mp" --model cosmos3_edge        --sizes 640x640 --tag mstar
   python "$here/bench_t2i_oai.py" --port "$vp" --model nvidia/Cosmos3-Edge --sizes 640x640 --tag vllm
 }
+# SGLang-Diffusion server (async /v1/videos, /v1/images/generations, /v1/actions/generations).
+#   usage: serve_sglang <gpu> <port>
+serve_sglang() {
+  CUDA_VISIBLE_DEVICES="$1" "${SGLANG:-sglang}" serve --model-path nvidia/Cosmos3-Edge --model-type diffusion \
+    --num-gpus 1 --host 0.0.0.0 --port "$2"
+}
+# M* DROID policy deployment (4 steps, guidance 3.0, shift 5.0).
+#   usage: serve_mstar_droid <gpu> <port>
+serve_mstar_droid() {
+  CUDA_VISIBLE_DEVICES="$1" python "$MSTAR/mstar/api_server/entrypoint.py" --config "$MSTAR/configs/cosmos3_edge_droid.yaml" \
+    --port "$2" --mooncake-port "$(( $2 + 1000 ))" --tensor-comm-protocol SHM
+}
+# SGLang generator rows, same knobs as bench_generator.
+#   usage: bench_sglang <sglang_port> <cond_image.jpg>
+bench_sglang() {
+  local sp="$1" img="$2"
+  python "$here/bench_sglang_video.py" --port "$sp" --size 832x480 --frames 121 --steps 20 --gs 6.0 --flow-shift 12.0 --rounds 3 --warmup 1 --image "$img"
+  python "$here/bench_sglang_video.py" --port "$sp" --size 832x480 --frames 121 --steps 20 --gs 6.0 --flow-shift 12.0 --rounds 3 --warmup 1
+  python "$here/bench_sglang_video.py" --port "$sp" --t2i --size 640x640 --steps 20 --gs 6.0 --rounds 3 --warmup 1
+}
+# DROID action loop, 32 actions per call, 4 steps / guidance 3.0 / shift 5.0 on every system.
+#   usage: bench_action <mstar_droid_port> <vllm_omni_port> <sglang_port> <observation.jpg>
+bench_action() {
+  local mp="$1" vp="$2" sp="$3" img="$4"
+  python "$MSTAR/examples/cosmos3_action_ws_client.py" --host 127.0.0.1 --port "$mp" --image "$img" \
+    --domain droid_lerobot --action-dim 10 --chunk 32 --iters 20 --warmup 2 --pipeline 1
+  python "$here/bench_action_baselines.py" vllm-omni --port "$vp" --image "$img" --rounds 10 --warmup 2
+  python "$here/bench_action_baselines.py" sglang    --port "$sp" --image "$img" --rounds 10 --warmup 2
+}
 # Reasoner: TTFT + decode tok/s, image prompt, concurrency 1/8/32.
 #   usage: bench_reasoner <mstar_port> <vllm_port> <image.png>
 bench_reasoner() {
@@ -90,5 +121,9 @@ case "${1:-}" in
   bench-generator)     shift; bench_generator "$@";;
   bench-reasoner)      shift; bench_reasoner "$@";;
   bench-stream)        shift; bench_stream "$@";;
+  serve-sglang)        shift; serve_sglang "$@";;
+  serve-mstar-droid)   shift; serve_mstar_droid "$@";;
+  bench-sglang)        shift; bench_sglang "$@";;
+  bench-action)        shift; bench_action "$@";;
   *) echo "usage: $0 {serve-mstar <gpu> <port> | serve-vllm-omni <gpu> <port> | serve-vllm-reasoner <gpu> <port> | bench-generator <mp> <vp> <img> | bench-reasoner <mp> <vp> <img> | bench-stream <mp> [img]}";;
 esac
