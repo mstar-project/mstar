@@ -180,9 +180,10 @@ class T3Submodule(ARNodeSubmodule):
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
     # prefill captures: total tokens of the batch (conditioning + text + BOS,
     # about 170-300 per request; Turbo's longer voice prompt about 400-550),
-    # for a few requests at a time; bigger admissions run eagerly
+    # for up to eight requests at a time (a fast S3Gen lets the scheduler admit
+    # that many together at concurrency 8-32); bigger admissions run eagerly
     PREFILL_TOKEN_BUCKETS = [256, 512, 1024, 2048]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
 
     def __init__(
         self, model: nn.Module, config: ChatterboxConfig, builtin_voice: BuiltinT3Voice | None,
