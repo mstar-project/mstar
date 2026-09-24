@@ -12,7 +12,10 @@ activations are not the reference as served.
 
 Both sides here run everything eager except one shared attention kernel:
 ``src.patch_model.flex_attention`` is rebound to the port's own
-``flex_attention_masked``, so attention cannot be the variable under test.
+``flex_attention_masked``, so attention cannot be the variable under test. The
+reference's ``BlockMask`` is rebuilt with the port's ``mask_mod`` on the way in: its
+``mask_mod=None`` reads as "no mask" to the FLASH backend, which then attends over
+the whole ring.
 
 **Every test is run on two ports**, built from the same checkpoint and differing only
 in ``WaypointConfig.reference_compat``:
@@ -44,6 +47,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.nn.attention.flex_attention import BlockMask
 
 sys.path.insert(0, ".")
 
@@ -54,7 +58,7 @@ from mstar.engine.resources.attn.config import (
     AttentionStep,
     AttnBackend,
 )
-from mstar.engine.resources.attn.flex import flex_attention_masked
+from mstar.engine.resources.attn.flex import _MASK_MOD, flex_attention_masked
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import KVSpec, RingKVConfig, RingKVLayerConfig, RingKVStep
 from mstar.engine.resources.kv.ring import RingKVManager
@@ -134,6 +138,22 @@ class _DitNode(NodeSubmodule):
         raise NotImplementedError("binding stand-in")
 
 
+def _reference_flex_attention(q, k, v, *, block_mask, enable_gqa):
+    # Same blocks, the port's mask_mod: FLASH treats the reference's mask_mod=None
+    # as trivial and attends densely (flex.py, _flash_mask_mod). None under TRITON.
+    block_mask = BlockMask.from_kv_blocks(
+        block_mask.kv_num_blocks,
+        block_mask.kv_indices,
+        block_mask.full_kv_num_blocks,
+        block_mask.full_kv_indices,
+        BLOCK_SIZE=block_mask.BLOCK_SIZE,
+        mask_mod=_MASK_MOD,
+        seq_lengths=block_mask.seq_lengths,
+        compute_q_blocks=False,
+    )
+    return flex_attention_masked(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
+
+
 def _load_reference(checkpoint: Path = CHECKPOINT) -> dict:
     # Served reference: islands cloned pre-patch, flex pinned to the port's kernel,
     # matmul precision 'high' for the reference's batch-5 sigma LUT (TF32, not 'highest').
@@ -151,7 +171,7 @@ def _load_reference(checkpoint: Path = CHECKPOINT) -> dict:
     bare_cond_head = model.transformer.blocks[0].cond_head
 
     patch_model.apply_inference_patches(model)
-    patch_model.flex_attention = flex_attention_masked
+    patch_model.flex_attention = _reference_flex_attention
     cache = StaticKVCache(cfg, batch_size=1, dtype=DTYPE).to(device=DEVICE)
     return {
         "cfg": cfg,
@@ -184,11 +204,13 @@ def reference():
     yield _load_reference()
 
 
-def _build_port(config, checkpoint: Path = CHECKPOINT):
+def _build_port(config, checkpoint: Path = CHECKPOINT, *, num_sessions: int = 1):
     """Build a port from the checkpoint belonging to ``config``.
 
     The default preserves the original 720p harness. The explicit path is used
     by the 360p live-reference gate, whose weights are a distinct publication.
+    ``num_sessions`` is 1 for every test but the batching one, which needs a
+    second resident session to run two rows in one DiT call.
     """
     dit = build_waypoint_dit(config, str(checkpoint), device=DEVICE)
     spec = KVSpec(
@@ -200,7 +222,7 @@ def _build_port(config, checkpoint: Path = CHECKPOINT):
             head_dim=config.d_head,
             num_qo_heads=config.n_heads,
             tokens_per_frame=config.tokens_per_frame,
-            num_sessions=1,
+            num_sessions=num_sessions,
             layers=tuple(
                 RingKVLayerConfig(
                     ring_frames=config.ring_frames(i),
@@ -283,17 +305,31 @@ def _reference_forward(reference, x, sigma_value: float, ctx, *, commit: bool):
         return reference["model"](x, sigma, **ctx, kv_cache=reference["kv"]).clone()
 
 
+def _cond_idx(port, sigma_value: float, *, commit: bool) -> int:
+    """The ``scheduler_sigmas`` slot the cond_head cache (``d881b43e``) expects
+    for one ``_port_forward`` call: the trailing slot for the committing pass,
+    exactly as ``WaypointDiT._cache_pass`` picks it, or the slot whose
+    scheduled sigma equals ``sigma_value``, exactly as ``_denoise_pass``'s
+    ``enumerate`` does.
+    """
+    sigmas = port["config"].scheduler_sigmas
+    if commit:
+        return len(sigmas) - 1
+    return list(sigmas[:-1]).index(sigma_value)
+
+
 def _port_forward(port, x, sigma_value: float, ctx, frame_pos: int, *, commit: bool):
     with torch.inference_mode():
         sigma = x.new_full((x.size(0), x.size(1)), sigma_value)
         return port["dit"](
             x,
             sigma,
-            torch.tensor(frame_pos, dtype=torch.int64, device=DEVICE),
+            torch.full((x.size(0),), frame_pos, dtype=torch.int64, device=DEVICE),
             mouse=ctx["mouse"],
             button=ctx["button"],
             scroll=ctx["scroll"],
             commit=commit,
+            cond_idx=_cond_idx(port, sigma_value, commit=commit),
         ).clone()
 
 
@@ -331,7 +367,7 @@ def _port_frame(port, noise, ctx, frame_pos: int):
         with torch.inference_mode():
             x0 = dit.generate_frame(
                 noise,
-                torch.tensor(frame_pos, dtype=torch.int64, device=DEVICE),
+                torch.full((noise.size(0),), frame_pos, dtype=torch.int64, device=DEVICE),
                 mouse=ctx["mouse"],
                 button=ctx["button"],
                 scroll=ctx["scroll"],
@@ -375,6 +411,30 @@ def _admit(port, frame: int) -> None:
 
 def _commit(port, frame: int) -> None:
     port["kv"].commit(*_step_and_context(port, frame))
+
+
+def _batch_step_and_context(frames: list[tuple[str, int]]):
+    """``_step_and_context``'s multi-row form: one step naming every ``(rid,
+    frame)`` pair, in the row order a batched forward's inputs use. Only the
+    batching test below drives more than one row per step."""
+    rids = tuple(rid for rid, _ in frames)
+    return (
+        RingKVStep(frames=tuple(frames)),
+        StepContext(request_ids=rids, graph_walk="rollout", slot=0, capture=False),
+    )
+
+
+def _admit_batch(port, frames: list[tuple[str, int]]) -> None:
+    step, context = _batch_step_and_context(frames)
+    outcome = port["kv"].admit(step, context)
+    assert outcome.ok, f"batch {frames} refused: {outcome.reason}"
+    context.plan_results["kv"] = port["kv"].plan(step, context)
+    port["attn"].plan(AttentionStep(), context)
+    assert not port["attn"].needs_token_visibility
+
+
+def _commit_batch(port, frames: list[tuple[str, int]]) -> None:
+    port["kv"].commit(*_batch_step_and_context(frames))
 
 
 # ---------------------------------------------------------------------------
@@ -428,13 +488,18 @@ def _divergent_stages(reference_stages, port_stages, names):
     ]
 
 
-def _comparable_ring(reference_layer, port_layer):
+def _comparable_ring(reference_layer, port_layer, session_idx: int):
     """One world of ring state, in a shape the two sides share.
 
     The reference allocates 128 frame slots for a global layer but addresses only
     its 16 buckets, so its live region is ``[0, port ring_len)`` and its scratch is
     the tail ``[L, capacity)``. The port compacts the gap away. Callers assert the
     gap stays clear rather than trusting it.
+
+    Since ``20965ec1`` the port's ring also holds one shared scratch session past
+    the resident pool (``total_sessions == num_sessions + 1``), so ``port_layer.kv``/
+    ``written`` span every session, not just the one request under test.
+    ``session_idx`` slices out that one span.
     """
     ring_len = port_layer.ring_len
     reference_kv = torch.cat(
@@ -442,14 +507,37 @@ def _comparable_ring(reference_layer, port_layer):
         dim=3,
     )
     reference_written = torch.cat((reference_layer.written[:ring_len], reference_layer.written[reference_layer.L :]))
-    return (reference_kv, reference_written), (port_layer.kv, port_layer.written)
+    lo, hi = port_layer.session_span(session_idx)
+    return (reference_kv, reference_written), (port_layer.kv[:, :, :, lo:hi], port_layer.written[lo:hi])
+
+
+def _assert_padding_session_clean(port) -> None:
+    """The one session past the resident pool (``RingKVManager.num_sessions``)
+    is never claimed by ``admit`` -- it only exists for a padded replay's dummy
+    rows -- and nothing here drives a padded step, so it must stay exactly at
+    the zero/scratch-tail-only state ``LayerRingCache.__init__`` leaves it in.
+    Cheap: a couple of tensor comparisons per layer.
+    """
+    padding = port["kv"].num_sessions
+    for layer in port["kv"].layers:
+        lo, hi = layer.session_span(padding)
+        assert layer.kv[:, :, :, lo:hi].eq(0).all(), "padding session KV was written"
+        expected_written = torch.zeros(layer.capacity, dtype=torch.bool, device=layer.written.device)
+        expected_written[layer.ring_len :] = True
+        assert torch.equal(layer.written[lo:hi], expected_written), "padding session written mask moved"
 
 
 def _ring_deviation(reference, port) -> list[tuple[int, float, float, bool]]:
-    """Per layer: ``(index, max abs, relative, written masks equal)``."""
+    """Per layer: ``(index, max abs, relative, written masks equal)``, for the
+    session the port's active request occupies. Also pins the padding session
+    untouched, since that is exactly the span a session-slicing bug would stop
+    catching.
+    """
+    _assert_padding_session_clean(port)
+    session_idx = port["kv"].session_of(port["rid"])
     rows = []
     for i, (reference_layer, port_layer) in enumerate(zip(reference["kv"].layers, port["kv"].layers, strict=True)):
-        (ref_kv, ref_written), (port_kv, port_written) = _comparable_ring(reference_layer, port_layer)
+        (ref_kv, ref_written), (port_kv, port_written) = _comparable_ring(reference_layer, port_layer, session_idx)
         gap, relative = _deviation(ref_kv, port_kv)
         rows.append((i, gap, relative, torch.equal(ref_written, port_written)))
     return rows
@@ -587,6 +675,40 @@ def test_the_compat_conditioner_reproduces_the_reference_sigma_lut(ports, refere
     assert max(live_gaps) > 0.0, (
         "the exact conditioner already agrees with the reference's LUT, so the flag's conditioner half is a no-op"
     )
+
+
+def test_the_cond_head_cache_matches_the_live_projection(ports, oracle):
+    """``d881b43e`` caches every block's cond_head modulation per sigma, and
+    ``build_waypoint_dit`` already runs ``materialize_runtime_tables`` before
+    handing a port back -- so every forward test in this file, compat or
+    exact, already runs the cached path (``CondHead.forward`` with
+    ``self._cache is not None``), never the ``_project`` GEMM it replaced.
+    This pins the mechanism directly against this suite's own checkpoint:
+    forcing every block back onto the live projection and re-running the
+    identical forward must reproduce the cached output bit-for-bit, the way
+    ``CondHead.build_cache``'s docstring promises.
+    """
+    port = ports[True]
+    dit = port["dit"]
+    frame = _frame(oracle, 0)
+    ctx = _ctx(frame)
+    x = frame["latent"].to(DEVICE)
+
+    _new_request(port)
+    _admit(port, 0)
+    cached_out = _port_forward(port, x, 1.0, ctx, 0, commit=False)
+
+    caches = [block.cond_head._cache for block in dit.blocks]
+    assert all(cache is not None for cache in caches), "port was not built with the cond_head cache live"
+    for block in dit.blocks:
+        block.cond_head._cache = None
+    try:
+        live_out = _port_forward(port, x, 1.0, ctx, 0, commit=False)
+    finally:
+        for block, cache in zip(dit.blocks, caches, strict=True):
+            block.cond_head._cache = cache
+
+    assert torch.equal(cached_out, live_out), "cond_head cache diverged from the live projection"
 
 
 @COMPAT_MODES
@@ -756,10 +878,14 @@ def _load_snapshot(port, reference, oracle, frame_index: int) -> None:
     for layer, saved in zip(reference["kv"].layers, snapshot, strict=True):
         layer.kv.copy_(saved["kv"].to(DEVICE))
         layer.written.copy_(saved["written"].to(DEVICE))
+    # ``_new_request`` above only registers the rid; ``admit`` (called later, by
+    # the caller's own ``_admit``/``_port_frame``) is what actually claims a
+    # session. Slot 0 is the only one it can claim -- these ports are all
+    # ``num_sessions=1`` -- so this hardcodes it exactly as ``_reset`` does.
     for reference_layer, port_layer in zip(reference["kv"].layers, port["kv"].layers, strict=True):
-        (ref_kv, ref_written), _ = _comparable_ring(reference_layer, port_layer)
-        port_layer.kv.copy_(ref_kv)
-        port_layer.written.copy_(ref_written)
+        (ref_kv, ref_written), (port_kv, port_written) = _comparable_ring(reference_layer, port_layer, 0)
+        port_kv.copy_(ref_kv)
+        port_written.copy_(ref_written)
 
 
 def _rollout(port, reference, oracle, frames: int):
@@ -857,3 +983,99 @@ def test_the_port_compacts_only_slots_the_reference_never_addresses(ports, oracl
             )
             checked += 1
     assert checked, "no global-layer ring snapshots found; the compaction claim is untested"
+
+
+# ---------------------------------------------------------------------------
+# L4 -- batched sessions
+# ---------------------------------------------------------------------------
+
+def _roll(port, rows: list[tuple[str, list[dict]]], frames: int) -> dict[str, list[torch.Tensor]]:
+    """Step every row in ``rows`` together for local frames ``j = 0..frames-1``.
+    ``rows`` pairs a request id with its per-frame inputs (``kind``,
+    ``latent``/``noise_bf16``, ``ctx``), already on device. A batch of one row
+    runs the exact same admit/forward/commit sequence a batch of two does, so
+    the solo and batched arms below share this one driver. Returns each row's
+    per-frame output, cloned.
+    """
+    outputs: dict[str, list[torch.Tensor]] = {rid: [] for rid, _ in rows}
+    with torch.inference_mode():
+        for j in range(frames):
+            step = [(rid, j) for rid, _ in rows]
+            _admit_batch(port, step)
+            frames_j = [per_frame[j] for _, per_frame in rows]
+            ctx_cat = {key: torch.cat([f["ctx"][key] for f in frames_j], dim=0) for key in frames_j[0]["ctx"]}
+            if j == 0:
+                latent_cat = torch.cat([f["latent"] for f in frames_j], dim=0)
+                out = _port_forward(port, latent_cat, 0.0, ctx_cat, j, commit=True)
+            else:
+                noise_cat = torch.cat([f["noise_bf16"] for f in frames_j], dim=0)
+                out = port["dit"].generate_frame(
+                    noise_cat,
+                    torch.full((len(rows),), j, dtype=torch.int64, device=DEVICE),
+                    mouse=ctx_cat["mouse"],
+                    button=ctx_cat["button"],
+                    scroll=ctx_cat["scroll"],
+                )
+            _commit_batch(port, step)
+            for i, (rid, _) in enumerate(rows):
+                outputs[rid].append(out[i : i + 1].clone())
+    return outputs
+
+
+def test_batched_generate_frame_matches_the_same_sessions_run_solo(ports, oracle):
+    """``20965ec1`` batches concurrent sessions into one DiT call. The ``ports``
+    fixture is fixed at ``num_sessions=1``, so this builds its own two-session
+    port from the same checkpoint and config, then rolls two sessions for 20
+    frames each on the oracle's real noise and controls -- local frame
+    ``j = 0..19``, past the local ring's 16-frame capacity, so the ring wraps
+    once. ``w0`` runs oracle frames 0..19; ``w1`` shares only frame 0's seed
+    latent, paired with oracle frame 20's controls at ``j=0`` and oracle
+    frames 21..39 at ``j=1..19``, so the two sessions diverge from frame 0 on.
+    Each row is run once as a solo B=1 rollout and once as a batched B=2
+    rollout, and compared row by row, frame by frame.
+
+    Frame 0 on an empty ring measured 0.00 ulp deviation between B=1 and B=2 on
+    both flex backends (jobs 8141/8142), so the bar here is bit-exact at every
+    frame, not a tolerance.
+    """
+    config = ports[True]["config"]
+    port = _build_port(config, CHECKPOINT, num_sessions=2)
+    kv = port["kv"]
+
+    seed = _frame(oracle, 0)
+    seed_latent = seed["latent"].to(DEVICE)
+    w0 = [{"kind": "seed", "latent": seed_latent, "ctx": _ctx(seed)}]
+    for j in range(1, 20):
+        frame = _frame(oracle, j)
+        w0.append({"kind": "gen", "noise_bf16": frame["noise_bf16"].to(DEVICE), "ctx": _ctx(frame)})
+
+    frame20 = _frame(oracle, 20)
+    w1 = [{"kind": "seed", "latent": seed_latent, "ctx": _ctx(frame20)}]
+    for j in range(1, 20):
+        frame = _frame(oracle, 20 + j)
+        assert frame["kind"] != "seed", f"oracle frame {20 + j} unexpectedly a seed frame"
+        w1.append({"kind": "gen", "noise_bf16": frame["noise_bf16"].to(DEVICE), "ctx": _ctx(frame)})
+
+    # ---- B=1: each session rolled alone.
+    kv.ingest_request("w0")
+    solo_w0 = _roll(port, [("w0", w0)], 20)["w0"]
+    kv.reset_request("w0", free=True)
+    kv.remove_request("w0")
+
+    kv.ingest_request("w1")
+    solo_w1 = _roll(port, [("w1", w1)], 20)["w1"]
+    kv.reset_request("w1", free=True)
+    kv.remove_request("w1")
+
+    # ---- B=2: both sessions rolled together.
+    kv.ingest_request("w0")
+    kv.ingest_request("w1")
+    batched = _roll(port, [("w0", w0), ("w1", w1)], 20)
+    _assert_padding_session_clean(port)
+
+    solo = {"w0": solo_w0, "w1": solo_w1}
+    for rid in ("w0", "w1"):
+        gaps = [_deviation(solo[rid][j], batched[rid][j])[0] for j in range(20)]
+        print(f"{rid}: batched vs solo maxabs over 20 frames={max(gaps):.4e}")
+        first = next((j for j in range(20) if not torch.equal(solo[rid][j], batched[rid][j])), None)
+        assert first is None, f"{rid}: batching diverged from its solo run at frame {first}, maxabs={gaps[first]:.4e}"
