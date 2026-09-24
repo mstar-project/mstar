@@ -6,6 +6,7 @@ import os
 import queue
 import threading
 import time
+from dataclasses import dataclass, field
 
 import torch
 
@@ -305,6 +306,26 @@ class PreprocessWorker:
             self.thread.join()
 
 
+@dataclass
+class RequestOutputState:
+    """One request's output ordering, held by the data worker.
+
+    Transport reads may complete out of order. Each output takes a sequence
+    when the worker notification arrives, and completed chunks are held until
+    every earlier sequence has been emitted.
+    """
+
+    # tensor uuid -> (sequence, loop indices)
+    order: dict[str, tuple[int, NestedLoopIndices]] = field(default_factory=dict)
+    next_sequence: int = 0
+    next_emit: int = 0
+    # sequence -> completed chunk waiting on an earlier one
+    pending: dict[int, ResultChunk] = field(default_factory=dict)
+    # A video_frame chunk can carry several frames, so this advances by
+    # frame_count rather than chunks.
+    frame_index: int = 0
+
+
 class PreprocessWorkerThread:
     def __init__(
         self,
@@ -363,18 +384,7 @@ class PreprocessWorkerThread:
         # The request's model_kwargs, kept so output postprocessing can
         # honor per-request parameters (e.g. the video container fps).
         self.request_model_kwargs: dict[str, dict] = {}
-        # Next raw-frame index for each request. A video_frame chunk can carry
-        # several frames, so this advances by frame_count rather than chunks.
-        self.request_output_frame_indices: dict[str, int] = {}
-        # Transport reads may complete out of order. Record output order when
-        # the worker notification arrives, then hold completed chunks until all
-        # preceding tensors for that request have been emitted.
-        self.tensor_uuid_to_output_order_per_request: dict[
-            str, dict[str, tuple[int, NestedLoopIndices]]
-        ] = {}
-        self.request_next_output_sequence: dict[str, int] = {}
-        self.request_next_emit_sequence: dict[str, int] = {}
-        self.request_pending_output_chunks: dict[str, dict[int, ResultChunk]] = {}
+        self.request_output_state: dict[str, RequestOutputState] = {}
 
         # Owned by PreprocessWorker (main thread); used only from this thread.
         self.communicator = communicator
@@ -393,19 +403,21 @@ class PreprocessWorkerThread:
             else:
                 self.tensor_manager.cleanup_request(request_id)
         finally:
-            self.in_flight_requests.discard(request_id)
-            for state_name in (
-                "tensor_uuid_to_metadata_per_request",
-                "tensor_uuid_to_output_order_per_request",
-                "request_model_kwargs",
-                "request_output_frame_indices",
-                "request_next_output_sequence",
-                "request_next_emit_sequence",
-                "request_pending_output_chunks",
-            ):
-                state = getattr(self, state_name, None)
-                if state is not None:
-                    state.pop(request_id, None)
+            self._drop_request_state(request_id)
+
+    def _drop_request_state(self, request_id: str) -> None:
+        """Forget every per-request dict this thread keeps. Shared by both
+        teardown paths so a new dict cannot be dropped by one and leaked by the
+        other; a held reorder chunk can be a full 11 MiB 720p frame."""
+        self.in_flight_requests.discard(request_id)
+        for state_name in (
+            "tensor_uuid_to_metadata_per_request",
+            "request_model_kwargs",
+            "request_output_state",
+        ):
+            state = getattr(self, state_name, None)
+            if state is not None:
+                state.pop(request_id, None)
 
     def _process_input(
         self, input: PreprocessInput
@@ -501,11 +513,7 @@ class PreprocessWorkerThread:
             )
 
         self.request_model_kwargs[input.request_id] = model_kwargs
-        self.request_output_frame_indices[input.request_id] = 0
-        self.tensor_uuid_to_output_order_per_request[input.request_id] = {}
-        self.request_next_output_sequence[input.request_id] = 0
-        self.request_next_emit_sequence[input.request_id] = 0
-        self.request_pending_output_chunks[input.request_id] = {}
+        self.request_output_state[input.request_id] = RequestOutputState()
         msg = ConductorMessage(
             message_type=ConductorMessageType.NEW_REQUEST,
             body=NewRequestConductor(
@@ -590,6 +598,7 @@ class PreprocessWorkerThread:
 
     def _fail_request(
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
+        sequence: int | None = None,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -597,16 +606,33 @@ class PreprocessWorkerThread:
         ``per_request_reading_tensors`` accounting is one decrement per chunk:
         a failure that kills N queued tensors has to answer for all N, or the
         request looks like it still has reads outstanding.
+
+        ``sequence`` is the output slot the failed tensor held. Its error chunk
+        takes that slot in the reorder buffer; put straight on ``out_queue`` it
+        would leave every later sequence held in ``pending`` until the TTL.
         """
         logger.exception("%s failed for request %s", stage, request_id)
         status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
-        for _ in range(max(count, 1)):
-            self.out_queue.put(ResultChunk(
+        chunks = [
+            ResultChunk(
                 request_id=request_id,
                 modality="error",
                 data=f"{stage} failed: {type(exc).__name__}: {exc}".encode("utf-8"),
                 metadata={"status": status},
-            ))
+            )
+            for _ in range(max(count, 1))
+        ]
+        if sequence is not None and self._sequence_unanswered(request_id, sequence):
+            self._queue_completed_output(request_id, sequence, chunks.pop())
+        for chunk in chunks:
+            self.out_queue.put(chunk)
+
+    def _sequence_unanswered(self, request_id: str, sequence: int) -> bool:
+        """True if no chunk has been queued for ``sequence`` yet."""
+        state = self.request_output_state.get(request_id)
+        if state is None:
+            return True
+        return sequence >= state.next_emit and sequence not in state.pending
 
     def _read_result_tensor(
         self, result: ResultTensors
@@ -618,16 +644,14 @@ class PreprocessWorkerThread:
         )
         if result.request_id not in self.tensor_uuid_to_metadata_per_request:
             self.tensor_uuid_to_metadata_per_request[result.request_id] = {}
-        output_order = self.tensor_uuid_to_output_order_per_request.setdefault(
-            result.request_id, {}
+        state = self.request_output_state.setdefault(
+            result.request_id, RequestOutputState()
         )
-        sequence = self.request_next_output_sequence.setdefault(result.request_id, 0)
         for tensor_info in result.graph_edge.tensor_info:
             self.tensor_uuid_to_metadata_per_request[result.request_id][
                 tensor_info.uuid] = result.metadata
-            output_order[tensor_info.uuid] = (sequence, result.loop_indices)
-            sequence += 1
-        self.request_next_output_sequence[result.request_id] = sequence
+            state.order[tensor_info.uuid] = (state.next_sequence, result.loop_indices)
+            state.next_sequence += 1
 
     def _queue_completed_output(
         self,
@@ -635,25 +659,20 @@ class PreprocessWorkerThread:
         sequence: int,
         chunk: ResultChunk,
     ) -> None:
-        pending = self.request_pending_output_chunks.setdefault(request_id, {})
-        if sequence in pending:
+        state = self.request_output_state.setdefault(request_id, RequestOutputState())
+        if sequence in state.pending:
             raise RuntimeError(
                 f"duplicate completed output sequence {sequence} for request {request_id}"
             )
-        pending[sequence] = chunk
+        state.pending[sequence] = chunk
 
-        next_sequence = self.request_next_emit_sequence.setdefault(request_id, 0)
-        while next_sequence in pending:
-            ready = pending.pop(next_sequence)
+        while state.next_emit in state.pending:
+            ready = state.pending.pop(state.next_emit)
             if ready.modality == "video_frame":
-                frame_index = self.request_output_frame_indices[request_id]
-                ready.metadata["frame_index"] = frame_index
-                self.request_output_frame_indices[request_id] = (
-                    frame_index + ready.metadata["frame_count"]
-                )
+                ready.metadata["frame_index"] = state.frame_index
+                state.frame_index += ready.metadata["frame_count"]
             self.out_queue.put(ready)
-            next_sequence += 1
-        self.request_next_emit_sequence[request_id] = next_sequence
+            state.next_emit += 1
 
     def _discard_result_tensor(
         self, result: ResultTensors
@@ -679,11 +698,10 @@ class PreprocessWorkerThread:
                     # and keep draining everyone else's tensors. Letting it
                     # escape to run()'s catch-all would abandon the rest of this
                     # pass and leave the client waiting on the request timeout.
+                    sequence = None
                     try:
                         sequence, loop_indices = (
-                            self.tensor_uuid_to_output_order_per_request[request_id][
-                                tensor_info.uuid
-                            ]
+                            self.request_output_state[request_id].order[tensor_info.uuid]
                         )
                         logger.debug(
                             "Postprocessing output sequence %d for request %s at %s",
@@ -763,13 +781,14 @@ class PreprocessWorkerThread:
                     except Exception as exc:  # noqa: BLE001 — must reach the client
                         self._fail_request(
                             request_id, exc, f"{modality} output postprocessing",
+                            sequence=sequence,
                         )
                     self.tensor_uuid_to_metadata_per_request.get(
                         request_id, {}
                     ).pop(tensor_info.uuid, None)
-                    self.tensor_uuid_to_output_order_per_request.get(
-                        request_id, {}
-                    ).pop(tensor_info.uuid, None)
+                    state = self.request_output_state.get(request_id)
+                    if state is not None:
+                        state.order.pop(tensor_info.uuid, None)
                     self.tensor_manager.dereference(
                         request_id=request_id,
                         uuid=tensor_info.uuid
@@ -850,9 +869,7 @@ class PreprocessWorkerThread:
         self._draining_rids.discard(request_id)
         self._reads_done_sent.discard(request_id)
         self.tensor_manager.force_cleanup_request(request_id)
-        self.tensor_uuid_to_metadata_per_request.pop(request_id, None)
-        self.request_model_kwargs.pop(request_id, None)
-        self.in_flight_requests.discard(request_id)
+        self._drop_request_state(request_id)
 
     def run(self):
         while not self.stop_event.is_set():

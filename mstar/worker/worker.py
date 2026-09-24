@@ -1751,6 +1751,21 @@ class Worker:
             tp_seq=tp_seq,
         )
 
+    def _is_tearing_down(self, rid: str) -> bool:
+        """Removed, aborted or failed: no further speculative work for ``rid``.
+
+        A deferred drain only fires once the rid leaves ``_in_flight_rids``,
+        and a same-node speculation chain keeps it there every step, so a
+        drain the chain does not see would never fire and the rollout would
+        run to ``max_iters`` for a client that has gone.
+        """
+        return (
+            rid in self._pending_removes
+            or rid in self._pending_drains
+            or rid in self._draining_rids
+            or rid in self.scheduler.failed_rids
+        )
+
     def _try_speculate_next(
         self,
         pending: PendingBatch
@@ -1834,7 +1849,7 @@ class Worker:
             loop = wgio.loops.get(spec_node_info.loop_name)
 
             # check conditions where the rid cannot be furtuer speculated
-            already_removed = rid in self._pending_removes
+            already_removed = self._is_tearing_down(rid)
             already_stopped = spec_node_info.is_new_loop_iter and PendingLoopStop(
                 rid, graph_walk, spec_node_info.loop_name
             ) in self._pending_loop_stops

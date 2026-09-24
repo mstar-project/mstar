@@ -25,6 +25,7 @@ pytest.importorskip("requests")
 from mstar.api_server import entrypoint  # noqa: E402
 from mstar.api_server.data_worker import (  # noqa: E402
     PreprocessWorkerThread,
+    RequestOutputState,
     _video_frame_metadata,
 )
 from mstar.api_server.entrypoint import SUPPORTED_MODALITIES, APIServer  # noqa: E402
@@ -223,28 +224,22 @@ class _ReadyTensorManager:
         pass
 
 
-def _set_output_order_state(worker, tensors_by_request):
+def _set_output_order_state(worker, tensors_by_request, frame_indices=None):
     loop_indices = NestedLoopIndices(
         loop_name_order=["rollout_loop"],
         loop_indices={"rollout_loop": 0},
         wg_fwd_pass_idx=0,
     )
-    worker.tensor_uuid_to_output_order_per_request = {
-        request_id: {
-            name: (sequence, loop_indices)
-            for sequence, name in enumerate(tensors)
-        }
+    worker.request_output_state = {
+        request_id: RequestOutputState(
+            order={
+                name: (sequence, loop_indices)
+                for sequence, name in enumerate(tensors)
+            },
+            next_sequence=len(tensors),
+            frame_index=(frame_indices or {}).get(request_id, 0),
+        )
         for request_id, tensors in tensors_by_request.items()
-    }
-    worker.request_next_output_sequence = {
-        request_id: len(tensors)
-        for request_id, tensors in tensors_by_request.items()
-    }
-    worker.request_next_emit_sequence = {
-        request_id: 0 for request_id in tensors_by_request
-    }
-    worker.request_pending_output_chunks = {
-        request_id: {} for request_id in tensors_by_request
     }
 
 
@@ -259,7 +254,6 @@ def test_data_worker_emits_complete_metadata_and_monotonic_frame_indices():
     worker.model = _FrameModel()
     worker.out_queue = queue.Queue()
     worker.request_model_kwargs = {"request": {"world": "test"}}
-    worker.request_output_frame_indices = {"request": 0}
     worker.tensor_uuid_to_metadata_per_request = {"request": {name: {"producer": "decoder"} for name in tensors}}
     _set_output_order_state(worker, {"request": tensors})
 
@@ -271,7 +265,7 @@ def test_data_worker_emits_complete_metadata_and_monotonic_frame_indices():
     assert all(chunk.metadata["frame_count"] == 4 for chunk in chunks)
     assert all(chunk.metadata["pixel_format"] == "rgb24" for chunk in chunks)
     assert all(chunk.metadata["producer"] == "decoder" for chunk in chunks)
-    assert worker.request_output_frame_indices["request"] == 8
+    assert worker.request_output_state["request"].frame_index == 8
     assert worker.tensor_manager.dereferenced == [
         ("request", "first"),
         ("request", "second"),
@@ -297,7 +291,6 @@ def test_data_worker_tracks_interleaved_frame_indices_per_request():
         "request-a": {"world": "test"},
         "request-b": {"world": "test"},
     }
-    worker.request_output_frame_indices = {"request-a": 0, "request-b": 0}
     worker.tensor_uuid_to_metadata_per_request = {
         request_id: {name: {} for name in request_tensors} for request_id, request_tensors in tensors.items()
     }
@@ -314,10 +307,9 @@ def test_data_worker_tracks_interleaved_frame_indices_per_request():
         "request-a",
     ]
     assert [chunk.metadata["frame_index"] for chunk in chunks] == [0, 0, 4]
-    assert worker.request_output_frame_indices == {
-        "request-a": 8,
-        "request-b": 4,
-    }
+    assert {
+        rid: state.frame_index for rid, state in worker.request_output_state.items()
+    } == {"request-a": 8, "request-b": 4}
 
 
 def test_data_worker_reorders_async_completions_before_frame_emission():
@@ -331,12 +323,8 @@ def test_data_worker_reorders_async_completions_before_frame_emission():
     worker.model = _FrameModel()
     worker.out_queue = queue.Queue()
     worker.request_model_kwargs = {"request": {"world": "test"}}
-    worker.request_output_frame_indices = {"request": 0}
     worker.tensor_uuid_to_metadata_per_request = {}
-    worker.tensor_uuid_to_output_order_per_request = {"request": {}}
-    worker.request_next_output_sequence = {"request": 0}
-    worker.request_next_emit_sequence = {"request": 0}
-    worker.request_pending_output_chunks = {"request": {}}
+    worker.request_output_state = {"request": RequestOutputState()}
 
     for iteration, name in enumerate(("first", "second")):
         worker._read_result_tensor(ResultTensors(
@@ -378,24 +366,19 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
         "reused": {"world": "old"},
         "other": {"world": "keep"},
     }
-    worker.request_output_frame_indices = {"reused": 24, "other": 8}
     worker.in_flight_requests = {"reused", "other"}
     _set_output_order_state(worker, {
         "reused": {"old": object()},
         "other": {"keep": object()},
-    })
+    }, frame_indices={"reused": 24, "other": 8})
 
     worker._cleanup_request_state("reused")
 
     assert worker.tensor_manager.cleaned == ["reused"]
     assert "reused" not in worker.tensor_uuid_to_metadata_per_request
     assert "reused" not in worker.request_model_kwargs
-    assert "reused" not in worker.request_output_frame_indices
-    assert "reused" not in worker.tensor_uuid_to_output_order_per_request
-    assert "reused" not in worker.request_next_output_sequence
-    assert "reused" not in worker.request_next_emit_sequence
-    assert "reused" not in worker.request_pending_output_chunks
-    assert worker.request_output_frame_indices == {"other": 8}
+    assert "reused" not in worker.request_output_state
+    assert worker.request_output_state["other"].frame_index == 8
 
     worker.model = SimpleNamespace(process_prompt=lambda *args, **kwargs: {})
     worker.device = "cpu"
@@ -413,7 +396,7 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
         )
     )
 
-    assert worker.request_output_frame_indices["reused"] == 0
+    assert worker.request_output_state["reused"] == RequestOutputState()
     assert worker.request_model_kwargs["reused"] == {"world": "new"}
 
 

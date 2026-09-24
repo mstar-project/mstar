@@ -247,7 +247,7 @@ def test_engine_failure_does_not_clobber_an_earlier_error():
 
 
 def _preprocess_thread(model):
-    from mstar.api_server.data_worker import PreprocessWorkerThread
+    from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.out_queue = queue.Queue()
@@ -256,7 +256,9 @@ def _preprocess_thread(model):
     wt.tensor_uuid_to_metadata_per_request = {"r1": {"u1": {}}}
     wt.enable_prof = False
     wt.enable_nvtx = False
-    wt.tensor_uuid_to_output_order_per_request = {"r1": {"u1": (0, None)}}
+    wt.request_output_state = {
+        "r1": RequestOutputState(order={"u1": (0, None)}, next_sequence=1),
+    }
     return wt
 
 
@@ -287,6 +289,37 @@ def test_output_postprocess_failure_becomes_an_error_chunk():
     assert chunk.metadata["status"] == 500
     # The tensor is still released even though postprocessing died.
     assert dereferenced == ["u1"]
+
+
+def test_a_failed_output_releases_the_outputs_held_behind_it():
+    """Sequence 1 finished first and waits in the reorder buffer for 0. When 0
+    fails, its error chunk must take slot 0 so 1 is released in order; emitted
+    around the buffer, 1 would sit in ``pending`` until the API server's TTL."""
+
+    class _BadModel:
+        def postprocess(self, tensor, modality, request_kwargs=None):
+            raise RuntimeError("decode failed")
+
+    wt = _preprocess_thread(_BadModel())
+    held = ResultChunk(request_id="r1", modality="text", data=b"later", metadata={})
+    wt.request_output_state["r1"].pending[1] = held
+    wt.request_output_state["r1"].next_sequence = 2
+    edge = SimpleNamespace(
+        name="text_output", tensor_info=[SimpleNamespace(uuid="u1")],
+    )
+    wt.tensor_manager = SimpleNamespace(
+        get_ready_tensors=lambda: {"r1": [edge]},
+        get_tensor=lambda request_id, uuid: object(),
+        dereference=lambda request_id, uuid: None,
+    )
+
+    assert wt._process_read_tensors() is True
+    chunks = [wt.out_queue.get_nowait(), wt.out_queue.get_nowait()]
+    assert [c.modality for c in chunks] == ["error", "text"]
+    assert chunks[1] is held
+    assert wt.out_queue.empty()
+    assert wt.request_output_state["r1"].pending == {}
+    assert wt.request_output_state["r1"].next_emit == 2
 
 
 def test_result_transfer_failure_answers_for_every_queued_tensor():
