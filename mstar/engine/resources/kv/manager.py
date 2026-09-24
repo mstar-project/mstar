@@ -831,6 +831,18 @@ class KVManager(AttentionResource):
             for segment in step.segments:
                 if segment.span == 0:
                     continue
+                if (
+                    ctx.is_preplan
+                    and segment.label not in self._streams.get(
+                        segment.request_id, {}
+                    )
+                ):
+                    # `_ensure_label` below makes this label. Record it
+                    # here, like the fork loop above. If not, `clear_preplan`
+                    # keeps the stream and its pages.
+                    self._preplan_new_labels.append(
+                        (segment.request_id, segment.label)
+                    )
                 stream = self._ensure_label(segment.request_id, segment.label)
                 alloc_res = self._alloc(
                     segment.request_id,
@@ -867,7 +879,20 @@ class KVManager(AttentionResource):
         views = []
         page_size = self.kv_cache.page_size
         for s in segments:
-            stream = self._streams[s.request_id][s.label]
+            stream = self._streams.get(s.request_id, {}).get(s.label)
+            if stream is None:
+                # `admit` reserves no stream for a zero-span segment. The
+                # segment reads and writes no token, so its view is empty and
+                # holds no page. A padding row then addresses SINK_PAGE.
+                assert s.span == 0, (
+                    f"segment {s.request_id}/{s.label!r} spans {s.span} "
+                    "tokens, but admit reserved no stream for it"
+                )
+                views.append(SequenceView(
+                    request_id=s.request_id, label=s.label,
+                    page_idxs=[], length=0, to_compute=0,
+                ))
+                continue
             # `page_indices` is a high-water mark, so a stream can hold more
             # pages than its tokens need (a refused admit, a reset that kept
             # its pages). slice to the length or the view addresses token 0
@@ -1067,7 +1092,13 @@ class KVManager(AttentionResource):
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
             for segment in step.segments:
-                stream = self._streams[segment.request_id][segment.label]
+                stream = self._streams.get(
+                    segment.request_id, {}
+                ).get(segment.label)
+                if stream is None:
+                    # `admit` reserves no stream for a zero-span segment.
+                    # There is no mark to clear and no span to commit.
+                    continue
                 # cleared before the `step.commit` test: a step that keeps no
                 # tokens (image_gen, action_gen) still read these pages, and
                 # leaving the mark set would make the request unevictable
