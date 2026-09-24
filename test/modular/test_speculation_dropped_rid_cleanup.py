@@ -29,7 +29,6 @@ def _speculation(rids: list[str]) -> Speculation:
     return Speculation(
         scheduled_batch=SimpleNamespace(
             request_to_worker_graph={r: "wg" for r in rids},
-            node_objects={r: object() for r in rids},
         ),
         node_batch=SimpleNamespace(
             request_ids=list(rids),
@@ -65,7 +64,7 @@ def test_dropped_rid_gets_its_own_edges_back():
         spec.node_batch.per_request_input_tensors,
         spec.node_batch.per_request_info,
         spec.scheduled_batch.request_to_worker_graph,
-        spec.scheduled_batch.node_objects,
+        spec.scheduled_batch.request_to_worker_graph,
     ):
         assert set(table) == {"keep"}
 

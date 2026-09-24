@@ -39,6 +39,25 @@ from mstar.worker.worker import PendingBatch, Worker
 # ── worker ─────────────────────────────────────────────────────────────────
 
 
+class _Runtime:
+    """Interning plus the speculative flag, which the runtime owns now."""
+
+    def __init__(self, known_rids):
+        self._known = set(known_rids)
+        self.cleared: list[tuple[str, list]] = []
+
+    def get_rid_handle(self, r):
+        return r if r in self._known else None
+
+    def get_rid_string(self, h):
+        return h
+
+    def set_speculatively_scheduled(self, node, wg_id, rids, value):
+        del wg_id
+        if not value:
+            self.cleared.append((node, list(rids)))
+
+
 def _worker(known_rids=("r1", "r2")):
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
@@ -46,14 +65,11 @@ def _worker(known_rids=("r1", "r2")):
     w.communicator = SimpleNamespace(
         send=lambda entity_id, msg: w.sent.append((entity_id, msg))
     )
-    w.worker_graphs_manager = SimpleNamespace(
+    w.request_state = SimpleNamespace(
         per_request_info={rid: object() for rid in known_rids}
     )
     # Identity interning: the rid string doubles as its own handle here.
-    w._rids = SimpleNamespace(
-        handle=lambda r: r if r in known_rids else None,
-        name=lambda h: h,
-    )
+    w._graph_runtime = _Runtime(known_rids)
     w.scheduler = MicroScheduler.__new__(MicroScheduler)
     w.scheduler.failed_rids = set()
     w.scheduler.held_until = {}
@@ -87,9 +103,6 @@ def _pending_batch(rids, future=None):
     return PendingBatch(
         batch=ScheduledBatch(
             node_name="node", graph_walk="walk",
-            node_objects={
-                rid: SimpleNamespace(_speculatively_scheduled=True) for rid in rids
-            },
             request_to_worker_graph={rid: "wg" for rid in rids},
         ),
         # _handle_main_loop_error works off the ScheduledBatch alone; the
@@ -117,11 +130,8 @@ def test_crashed_forward_fails_the_whole_batch():
         assert set(errors) == {"r1"}
         assert "ZeroDivisionError" in errors["r1"]
         # The node must not stay flagged as speculatively scheduled, or it can
-        # never be re-queued.
-        assert all(
-            not n._speculatively_scheduled
-            for n in pending.batch.node_objects.values()
-        )
+        # never be re-queued. The runtime owns that flag now.
+        assert w._graph_runtime.cleared == [("node", ["r1"])]
     finally:
         executor.shutdown(wait=True)
 
@@ -158,7 +168,6 @@ def test_error_handler_also_fails_the_batch_built_this_iteration():
     w._in_flight_rids = {"r1"}
     scheduled = ScheduledBatch(
         node_name="node", graph_walk="walk",
-        node_objects={"r2": SimpleNamespace(_speculatively_scheduled=True)},
         request_to_worker_graph={"r2": "wg"},
     )
     w._handle_main_loop_error(RuntimeError("boom"), (None, None), scheduled)

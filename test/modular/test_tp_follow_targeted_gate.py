@@ -23,6 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
 from mstar.graph.base import GraphNode  # noqa: E402
+from mstar.graph.runtime.base import PopRidsOutput
+from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
 
@@ -64,16 +66,58 @@ class _FakeQueue:
         return {}
 
 
-class _FakeWorkerGraphsManager:
+class _FakeRuntime:
+    """The runtime owns the (walk, node) -> worker graph index, the
+    graph-level ready scan and the pop now."""
+
+    def __init__(self, queue=None):
+        self._queue = queue
+
+    def get_worker_graph_id_for_node(self, node_name, graph_walk):
+        return "wg0"
+    def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):
+        del graph_walk
+        queue = self._queue
+        if check_ready:
+            for rid in request_ids:
+                wg = queue.per_request_queues.get(rid)
+                if wg is None or node_name not in wg.ready_node_names:
+                    return None
+        rids = [
+            rid for rid in request_ids
+            if queue.pop_ready_nodes(rid, [node_name])
+        ]
+        return PopRidsOutput(
+            wg_ids=ParallelList(rids, ["wg0"] * len(rids)),
+            input_edges=[], input_edges_per_rid=[0] * len(rids),
+        )
+
+    def get_nodes(self, node_name, rids, wg_ids):
+        del wg_ids
+        return [
+            GraphNode(name=node_name, input_names=set(), outputs=[])
+            for _ in rids
+        ]
+
+
+    def has_ready_excluding(self, exclude_rids, exclude_target=None):
+        # Pure TP follower: no locally-initiated work, matching _FakeQueue.
+        return False
+
+    def get_ready_nodes(self, exclude_rids, target=None, exclude_target=None):
+        return []
+
+
+class _FakeRequestStateManager:
     def __init__(self, queue):
         self.queues = {"wg0": queue}
+        # The real runtime owns the queues and the manager shares them; bind
+        # the fake pair the same way.
+        self.runtime = _FakeRuntime(queue)
         self.per_request_info = {}
 
     def get_partition_for_node(self, node_name):
         return "p0"
-
-    def get_worker_graph_id_for_node(self, rid, node_name, graph_walk=None):
-        return "wg0"
 
     def get_fwd_info(self, rid, partition):
         return None
@@ -90,7 +134,8 @@ def _setup(rids=("r0", "r1")):
         parallel_leader_nodes=set(),
     )
     queue = _FakeQueue(rids, NODE)
-    manager = _FakeWorkerGraphsManager(queue)
+    manager = _FakeRequestStateManager(queue)
+    sched.runtime = manager.runtime
     return sched, manager
 
 
@@ -113,7 +158,7 @@ def test_targeted_call_never_pops_tp_follow():
     batch = sched.get_next_batch(manager)
     assert batch is not None
     assert batch.node_name == NODE
-    assert set(batch.node_objects) == {"r0", "r1"}
+    assert set(batch.request_to_worker_graph) == {"r0", "r1"}
 
 
 def test_untargeted_call_serves_and_drains():
@@ -124,7 +169,7 @@ def test_untargeted_call_serves_and_drains():
     assert batch is not None
     assert batch.node_name == NODE
     assert batch.graph_walk == WALK
-    assert set(batch.node_objects) == {"r0", "r1"}
+    assert set(batch.request_to_worker_graph) == {"r0", "r1"}
     assert len(sched.tp_batches_pending_schedule) == 0
 
 
@@ -137,7 +182,7 @@ def test_exclude_target_skips_head_but_keeps_it_queued():
 
     batch = sched.get_next_batch(manager)
     assert batch is not None
-    assert set(batch.node_objects) == {"r0", "r1"}
+    assert set(batch.request_to_worker_graph) == {"r0", "r1"}
 
 
 def test_fifo_order_survives_refused_targeted_calls():
@@ -148,7 +193,7 @@ def test_fifo_order_survives_refused_targeted_calls():
     assert sched.get_next_batch(manager, target=(NODE, WALK)) is None
 
     first = sched.get_next_batch(manager)
-    assert set(first.node_objects) == {"r0", "r1"}
+    assert set(first.request_to_worker_graph) == {"r0", "r1"}
     second = sched.get_next_batch(manager)
-    assert set(second.node_objects) == {"r2", "r3"}
+    assert set(second.request_to_worker_graph) == {"r2", "r3"}
     assert len(sched.tp_batches_pending_schedule) == 0
