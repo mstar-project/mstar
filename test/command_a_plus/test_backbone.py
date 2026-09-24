@@ -4,20 +4,26 @@ These exercise real projections, MoE dispatch and AttentionCallable plumbing;
 they do not substitute for FlashInfer or Hugging Face end-to-end parity.
 """
 
+import unittest
 from dataclasses import replace
 from pathlib import Path
-import unittest
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.command_a_plus.config import (
-    GLOBAL_ATTN, KV_CACHE, LOCAL_ATTN, ROPE, CommandAPlusConfig,
-)
 from mstar.model.command_a_plus.components.language_model import (
-    CommandAPlusAttention, CommandAPlusDecoderLayer, CommandAPlusLanguageModel,
+    CommandAPlusAttention,
+    CommandAPlusDecoderLayer,
+    CommandAPlusLanguageModel,
+)
+from mstar.model.command_a_plus.config import (
+    GLOBAL_ATTN,
+    KV_CACHE,
+    LOCAL_ATTN,
+    ROPE,
+    CommandAPlusConfig,
 )
 
 

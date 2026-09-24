@@ -1,32 +1,36 @@
 """Offline graph/node integration checks; attention and sampling use CPU doubles."""
 
 import json
-from pathlib import Path
 import shutil
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
-from torch import nn
 from safetensors.torch import save_file
+from torch import nn
 
-from mstar.conductor.request_info import CurrentForwardPassInfo, DEFAULT_PARTITION
+from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AttentionStep, SamplingReqConfig
-from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.graph.base import GraphEdge
 from mstar.graph.graph_io import WorkerGraphIO
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.config import (
-    GLOBAL_ATTN, KV_CACHE, LOCAL_ATTN, ROPE, SAMPLER, CommandAPlusConfig,
+    GLOBAL_ATTN,
+    KV_CACHE,
+    LOCAL_ATTN,
+    ROPE,
+    SAMPLER,
+    CommandAPlusConfig,
 )
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine
 from test.command_a_plus.test_backbone import bind_test_resources
 from test.command_a_plus.test_weight_loading import checkpoint
-
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tiny_config.json"
 
@@ -230,7 +234,8 @@ class ModelIntegrationTests(unittest.TestCase):
     def test_prompt_adapter_and_byte_stream_preserve_unicode_and_markers(self):
         # Two tokens split the UTF-8 bytes for é. Ġ is the byte-level space.
         vocab = {10: "Ã", 11: "©", 12: "Ġhi", 13: "<|START_THINKING|>"}
-        convert = lambda ids: vocab[ids] if isinstance(ids, int) else [vocab[i] for i in ids]
+        def convert(ids):
+            return vocab[ids] if isinstance(ids, int) else [vocab[i] for i in ids]
         tokenizer = SimpleNamespace(
             all_special_ids=[0, 2, 3, 13], convert_ids_to_tokens=convert,
             apply_chat_template=Mock(return_value=[2, 10, 11]),
@@ -242,7 +247,8 @@ class ModelIntegrationTests(unittest.TestCase):
         result = self.model.process_prompt("hello", ["text"], ["text"])
         self.assertEqual(result["text_inputs"][0].tolist(), [2, 10, 11])
         tokenizer.apply_chat_template.assert_called_once_with(
-            [{"role": "user", "content": "hello"}], tokenize=True, add_generation_prompt=True,
+            [{"role": "user", "content": "hello"}], tokenize=True,
+            add_generation_prompt=True, return_dict=False,
         )
         chunks = [self.model.postprocess(torch.tensor([i]), "text") for i in (10, 11, 12, 13, 3)]
         self.assertEqual(b"".join(chunks).decode("utf-8"), "é hi<|START_THINKING|>")
