@@ -258,6 +258,18 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
+    def is_speculatively_scheduled(
+        self, node: str, wg_id: int, rid: int,
+    ) -> bool:
+        """Whether this rid's node is marked speculatively scheduled.
+
+        The flag must SURVIVE node completion: its rids are still in flight
+        for the speculative N+1 step, so the node must stay out of the ready
+        set until the speculation resolves.
+        """
+        pass
+
+    @abstractmethod
     def get_dynamic_loop_iters(
         self, request_ids: list[int],
         partition: str,

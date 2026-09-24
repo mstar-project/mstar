@@ -113,3 +113,39 @@ def test_end_to_end_from_log_text():
     recs = parse_log(log)
     assert len(recs) == 2
     assert len(segment(recs)) == 1
+
+
+def test_request_steps_is_bs_times_iters():
+    """Work normalisation: a segment's request-steps is the sum over records
+    of bs x iter_total samples, which is what makes phase cost comparable
+    between runs whose iteration mix differs (e.g. orpheus' snac decoder)."""
+    log = (
+        "2026-09-23 21:17:31,409 INFO [worker_0] mstar.worker.worker: "
+        "Worker worker_0 phase-timing iter=100 bs=10.00: "
+        "iter_total: p50=1.00ms p95=1.00ms mean=1.00ms n=100 | "
+        "foo: p50=0.50ms p95=0.50ms mean=0.50ms n=100\n"
+        "2026-09-23 21:17:32,409 INFO [worker_0] mstar.worker.worker: "
+        "Worker worker_0 phase-timing iter=200 bs=10.00: "
+        "iter_total: p50=1.00ms p95=1.00ms mean=1.00ms n=100 | "
+        "foo: p50=0.50ms p95=0.50ms mean=0.50ms n=100\n"
+    )
+    segs = segment(parse_log(log), skip_warmup=0, bs_tolerance=1.0)
+    assert len(segs) == 1
+    seg = segs[0]
+    assert seg.request_steps == 2000.0          # 2 records x 10.00 bs x 100
+    # foo: 200 samples x 0.5ms = 100ms over 2000 steps = 50us per 1k steps.
+    # foo total 200 x 0.5ms = 100ms; 100ms / 2000 steps x 1e6 = 50000 us/1k.
+    assert seg.summary()["foo"]["us_per_1k"] == 50_000.0
+
+
+def test_us_per_1k_is_zero_without_bs():
+    """A log from a worker predating the bs field still parses; the work
+    column is simply absent rather than wrong."""
+    log = (
+        "2026-09-23 21:17:31,409 INFO [worker_0] mstar.worker.worker: "
+        "Worker worker_0 phase-timing iter=100: "
+        "iter_total: p50=1.00ms p95=1.00ms mean=1.00ms n=100\n"
+    )
+    segs = segment(parse_log(log), skip_warmup=0, bs_tolerance=1.0)
+    assert segs[0].request_steps == 0.0
+    assert segs[0].summary()["iter_total"]["us_per_1k"] == 0.0

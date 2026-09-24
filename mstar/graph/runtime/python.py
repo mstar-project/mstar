@@ -322,6 +322,12 @@ class PythonGraphRuntime(GraphRuntime):
                 continue
             queues[rid].get_node(node)._speculatively_scheduled = speculatively_scheduled
 
+    def is_speculatively_scheduled(
+        self, node: str, wg_id: int, rid: int,
+    ) -> bool:
+        wgio = self._queues[wg_id].per_request_queues.get(rid)
+        return wgio is not None and wgio.get_node(node)._speculatively_scheduled
+
     def get_dynamic_loop_iters(
         self, request_ids: list[int],
         partition: str,

@@ -301,6 +301,11 @@ class RustGraphRuntime(GraphRuntime):
             node, wg_id, rids, speculatively_scheduled
         )
 
+    def is_speculatively_scheduled(
+        self, node: str, wg_id: int, rid: int,
+    ) -> bool:
+        return self._rust.is_speculatively_scheduled(node, wg_id, rid)
+
     def mark_stream_partition_done(self, rid: int, partition: str):
         self._rust.mark_stream_partition_done(rid, partition)
 

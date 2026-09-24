@@ -102,6 +102,24 @@ class Segment:
     def bs_range(self) -> tuple[float, float]:
         return min(r.bs for r in self.records), max(r.bs for r in self.records)
 
+    @property
+    def request_steps(self) -> float:
+        """Work the segment did: sum over records of ``bs`` x iterations.
+
+        One worker iteration advances ``bs`` requests by a step. Per-iteration
+        means are not comparable between two runs that interleave a different
+        mix of iterations -- orpheus runs the snac decoder alongside the AR
+        loop, so both the batch size and what one iteration means shift -- and
+        dividing a phase's total time by this is throughput normalisation:
+        cost per unit of output rather than per iteration.
+        """
+        total = 0.0
+        for rec in self.records:
+            it = rec.phases.get("iter_total")
+            if it is not None and rec.bs:
+                total += rec.bs * it.n
+        return total
+
     def summary(self) -> dict[str, dict[str, float]]:
         """Per phase: n-weighted mean (exact), median p50, max p95, samples.
 
@@ -118,6 +136,7 @@ class Segment:
                 a["n"] += ph.n
                 a["p50s"].append(ph.p50)
                 a["p95s"].append(ph.p95)
+        work = self.request_steps
         return {
             name: {
                 "mean_ms": a["sum"] / a["n"] if a["n"] else 0.0,
@@ -125,6 +144,9 @@ class Segment:
                 "p95_ms": max(a["p95s"]),
                 "samples": a["n"],
                 "records": len(a["p50s"]),
+                # us of this phase per 1000 request-steps; 0.0 when the log
+                # has no bs (older workers), which the renderer omits.
+                "us_per_1k": a["sum"] / work * 1e6 if work else 0.0,
             }
             for name, a in sorted(acc.items())
         }
@@ -191,13 +213,20 @@ def render(segments: list[Segment], phases: list[str] | None = None) -> str:
         if phases:
             rows = {k: v for k, v in rows.items()
                     if any(p in k for p in phases)}
+        work = seg.request_steps
+        if work:
+            buf.append(f"    work: {work:,.0f} request-steps "
+                       f"(bs x iters) -- us/1k is cost per unit of output, "
+                       f"comparable across runs with a different iteration mix")
         head = (f"{'phase':<40}{'mean_ms':>10}{'p50_ms':>9}"
-                f"{'p95_ms':>9}{'samples':>9}")
+                f"{'p95_ms':>9}{'samples':>9}"
+                + (f"{'us/1k':>11}" if work else ""))
         buf.append(head)
         buf.append("-" * len(head))
         for name, v in rows.items():
             buf.append(
                 f"{name:<40}{v['mean_ms']:>10.3f}{v['p50_ms']:>9.3f}"
                 f"{v['p95_ms']:>9.3f}{v['samples']:>9}"
+                + (f"{v['us_per_1k']:>11.1f}" if work else "")
             )
     return "\n".join(buf)
