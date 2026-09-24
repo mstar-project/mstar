@@ -1032,6 +1032,24 @@ def test_solve_graphs_fall_back_to_eager_when_a_capture_fails(caplog):
     assert torch.equal(graphs(**a, n_timesteps=2), _fake_solve(**a, n_timesteps=2))  # still served
 
 
+def test_solve_graphs_run_without_autograd():
+    """Warm-up and replay are inference: with autograd on, the warm-up solves
+    kept every activation of the 10-step estimator chain alive and ran the
+    GPU out of memory at start-up (74 GB for two rows on an H100)."""
+    grad_states = []
+
+    def solve(mu, mask, spks, cond, noise, n_timesteps):
+        grad_states.append(torch.is_grad_enabled())
+        return _fake_solve(mu, mask, spks, cond, noise, n_timesteps)
+
+    graphs = _solve_graphs_on_cpu(solve, rows=(1, 2))
+    with torch.enable_grad():
+        graphs.warmup([8], n_timesteps=1, example=_solve_inputs(1, 8, 0))
+        out = graphs(**_solve_inputs(2, 8, 1), n_timesteps=1)
+    assert grad_states and not any(grad_states)
+    assert not out.requires_grad
+
+
 def test_solve_graphs_drop_the_least_recently_used_shape():
     graphs = _solve_graphs_on_cpu(rows=(1,), max_graphs=2)
     for frames in (8, 16):
