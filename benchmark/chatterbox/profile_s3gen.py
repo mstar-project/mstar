@@ -381,35 +381,29 @@ def section_encoder_vocoder(s3gen: S3Gen, ref: ReferenceConditioning, device: st
 
 
 def section_watermark(device: str, wav: torch.Tensor) -> list[str]:
-    """Perth as served today (network on the device, librosa resampling and a
-    numpy round trip on the CPU) against a device-only path."""
+    """The package's own routine (network on the device, librosa resampling
+    and a numpy round trip on the CPU) against the adapter's device-only path."""
     try:
         import perth
     except ImportError:
         return ["## Watermark", "", "resemble-perth is not installed"]
     import numpy as np
-    import torchaudio.functional as taf
 
     from mstar.model.chatterbox.components.watermark import PerthWatermarker
 
     seconds = wav.numel() / SAMPLE_RATE
     lines = [f"## Perth watermark on {seconds:.1f} s of 24 kHz audio", "",
-             "path | ms per utterance | detected | SNR vs unmarked dB | SNR vs today dB", "--- | --- | --- | --- | ---"]
-    served = PerthWatermarker.build(device)
-    impl = served._impl
-    net = impl.perth_net
-    perth_sr = net.hp.sample_rate
+             "path | ms per utterance | detected | SNR vs unmarked dB | SNR vs package dB",
+             "--- | --- | --- | --- | ---"]
+    adapter = PerthWatermarker.build(device)
+    impl = adapter._impl
 
-    def today() -> torch.Tensor:
-        return served.apply(wav, SAMPLE_RATE)
+    def package() -> torch.Tensor:
+        marked = impl.apply_watermark(wav.detach().cpu().float().numpy(), sample_rate=SAMPLE_RATE)
+        return torch.from_numpy(np.asarray(marked, dtype=np.float32))[: wav.numel()]
 
     def device_only() -> torch.Tensor:
-        x = taf.resample(wav.float(), SAMPLE_RATE, perth_sr)
-        mag, phase = net.ap.signal_to_magphase(x)
-        wm_mag, _ = net.encoder(mag[None])
-        y = net.ap.magphase_to_signal(wm_mag[0], phase)
-        y = taf.resample(y, perth_sr, SAMPLE_RATE)[: wav.numel()]
-        return y
+        return adapter.apply(wav, SAMPLE_RATE)
 
     detector = perth.PerthImplicitWatermarker(device="cpu")
 
@@ -417,14 +411,14 @@ def section_watermark(device: str, wav: torch.Tensor) -> list[str]:
         score = detector.get_watermark(x.detach().cpu().float().numpy(), sample_rate=SAMPLE_RATE)
         return f"{float(np.asarray(score).mean()):.2f}"
 
-    marked_today = today()
-    ms_today = statistics.median([_wall(today) for _ in range(5)])
+    marked_pkg = package()
+    ms_pkg = statistics.median([_wall(package) for _ in range(5)])
     marked_dev = device_only()
     ms_dev = statistics.median([_wall(device_only) for _ in range(5)])
-    lines.append(f"today (numpy + librosa on CPU, network on {device}) | {ms_today:.1f} | {detected(marked_today)} | "
-                 f"{snr_db(wav, marked_today):.1f} | -")
-    lines.append(f"device only (torchaudio resample) | {ms_dev:.1f} | {detected(marked_dev)} | "
-                 f"{snr_db(wav, marked_dev):.1f} | {snr_db(marked_today, marked_dev):.1f}")
+    lines.append(f"package (numpy + librosa on CPU, network on {device}) | {ms_pkg:.1f} | {detected(marked_pkg)} | "
+                 f"{snr_db(wav, marked_pkg):.1f} | -")
+    lines.append(f"adapter (device end to end) | {ms_dev:.1f} | {detected(marked_dev)} | "
+                 f"{snr_db(wav, marked_dev):.1f} | {snr_db(marked_pkg, marked_dev.cpu()):.1f}")
     lines.append(f"unmarked | - | {detected(wav)} | - | -")
     return lines
 
