@@ -326,6 +326,18 @@ costs real latency on the hot receive path. Verify with:
    python -c "import mstar_rust; print('mstar_rust OK')"
    pytest test/rust/test_rust_communicator.py
 
+The crate's own tests need ``--no-default-features``, which turns off
+``pyo3/extension-module``:
+
+.. code-block:: bash
+
+   cargo test --release --no-default-features --manifest-path rust/Cargo.toml
+
+That feature is on for the extension module, which resolves the CPython
+symbols when the interpreter loads it and must not link libpython. A test
+binary is an executable, so it has to link libpython itself; leave the
+feature on and the link fails on every ``Py*`` symbol the crate references.
+
 Optional: the Rust HTTP frontend
 --------------------------------
 
