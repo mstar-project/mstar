@@ -7,6 +7,7 @@ These validate everything the engine needs to *wire* the model (no weights / GPU
 so a dangling edge name or unresolved partition fails loudly here.
 """
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -214,6 +215,15 @@ def test_duplex_process_prompt_seeds_frame0_feedback():
     assert "audio_features" in out
     assert int(out["prev_text"][0].item()) == model.config.text_bos_id
     assert int(out["prev_func"][0].item()) == model.config.text_pad_id
+    # after a system prompt the agent channel is held at PAD across the prompt, so
+    # the first audio frame's previous agent token is PAD, not BOS (reference)
+    model._tokenizer = lambda prompt, return_tensors: SimpleNamespace(input_ids=torch.tensor([[5, 6, 7]]))
+    out_p = model.process_prompt(
+        "You are NVIDIA Voice Chat.", ["audio", "text"], ["audio", "text"],
+        tensors={"audio_inputs": [torch.zeros(16000)]},
+    )
+    assert int(out_p["prev_text"][0].item()) == model.config.text_pad_id
+    assert out_p["text_inputs"][0].tolist() == [5, 6, 7]
 
 
 def test_duplex_no_prompt_seeds_initial_decode_inputs():
