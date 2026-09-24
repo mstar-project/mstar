@@ -1,0 +1,20 @@
+model: "chatterbox_multilingual"
+# cond (34) + text (<= 512) + speech (<= 4096) tokens per stream
+max_seq_len: 4680
+resources:
+  t3_kv:
+    # 30 layers x 16 kv heads x 64 dims x bf16 = 120 KB per token and stream;
+    # 1536 pages x 64 tokens holds ~50 concurrent CFG requests at 1000 tokens.
+    page_size: 64
+    max_num_pages: 1536
+node_groups:
+  - node_names: [voice_encoder, T3]
+    ranks: [0]
+    graph_walks: [prefill, prefill_voice, decode]
+  - node_names: [s3gen]
+    ranks: [0]
+    graph_walks: [s3gen_chunk, s3gen_chunk_voice]
+# model_kwargs:
+#   default_language: en           # language_id used when a request gives none (23 codes, see docs)
+#   voices_dir: /path/to/preset/wavs   # voice="<name>" loads <name>.wav
+#   watermark: true                     # Perth watermark on every output

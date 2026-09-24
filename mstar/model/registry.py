@@ -4,6 +4,9 @@ from mstar.model.base import Model
 
 MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
+    "chatterbox": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
+    "chatterbox_multilingual": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
+    "chatterbox_turbo": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
@@ -21,6 +24,15 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
 
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
+    # Resemble AI Chatterbox: Llama-520M T3 speech-token LM + S3Gen flow
+    # matching decoder + HiFT vocoder, zero-shot voice cloning with CFG and
+    # exaggeration control. The Turbo checkpoint is a GPT-2-medium T3 with a
+    # distilled two-step decoder; same class, variant picked from the repo id.
+    # The 23-language checkpoint lives in the same repo as the English one
+    # (a T3 with a 2454-token grapheme vocabulary), so its variant is named.
+    "chatterbox": {"model_path_hf": "ResembleAI/chatterbox"},
+    "chatterbox_multilingual": {"model_path_hf": "ResembleAI/chatterbox", "variant": "multilingual"},
+    "chatterbox_turbo": {"model_path_hf": "ResembleAI/chatterbox-turbo"},
     # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
     "cosmos3": {"model_path_hf": "nvidia/Cosmos3-Nano"},
     # Cosmos3-Nano-Policy-DROID — Nano-sized action-policy fine-tune for the

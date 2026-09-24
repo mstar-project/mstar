@@ -14,7 +14,7 @@ from typing import Optional
 import aiohttp
 import numpy as np
 
-from benchmark.base import Bagel, Model, Orpheus, RequestType, Status
+from benchmark.base import Bagel, Chatterbox, Model, Orpheus, RequestType, Status
 from benchmark.utils import _write_wav
 
 
@@ -1494,7 +1494,7 @@ class OursOpenAI(VLLMOmni):
                 metrics=metrics,
                 additional_model_kwargs=additional_model_kwargs,
             )
-        if req_type.get_output_modalities() == "audio" and isinstance(model, Orpheus):
+        if req_type.get_output_modalities() == "audio" and isinstance(model, (Orpheus, Chatterbox)):
             metrics = RequestMetrics(
                 request_id=request_id,
                 type=req_type,
@@ -1624,7 +1624,7 @@ class OursOpenAI(VLLMOmni):
         metrics: "RequestMetrics",
         additional_model_kwargs: dict,
     ) -> "RequestMetrics":
-        """Orpheus TTS via OpenAI ``/v1/audio/speech`` (streaming WAV).
+        """Orpheus / Chatterbox TTS via OpenAI ``/v1/audio/speech`` (streaming WAV).
 
         M*'s streaming speech response is a WAV: a 44-byte header followed by
         16-bit PCM frames. Strip the header once, then record each subsequent
