@@ -27,15 +27,17 @@ class StubTensorManager:
     """Records ref/deref calls so we can assert reference balance."""
 
     def __init__(self):
-        self.refs: dict[tuple[str, str], int] = {}
+        self.refs: dict[str, int] = {}
 
-    def increment_ref(self, request_id: str, uuid: str, n: int = 1):
-        key = (request_id, uuid)
-        self.refs[key] = self.refs.get(key, 0) + n
+    def increment_ref(self, uuid: str, n: int = 1):
+        self.refs[uuid] = self.refs.get(uuid, 0) + n
 
-    def dereference(self, request_id: str, uuid: str, n: int = 1):
-        key = (request_id, uuid)
-        self.refs[key] = self.refs.get(key, 0) - n
+    def dereference(self, uuid: str, n: int = 1):
+        self.refs[uuid] = self.refs.get(uuid, 0) - n
+
+    def dereference_batch_uniform(self, uuids: list[str], n: int = 1):
+        for uuid in uuids:
+            self.dereference(uuid, n)
 
 
 def _fwd_info(graph_walk: str, partition: str = "default", fwd_index: int = 0):

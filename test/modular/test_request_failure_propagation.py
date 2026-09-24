@@ -278,8 +278,8 @@ def test_output_postprocess_failure_becomes_an_error_chunk():
     )
     wt.tensor_manager = SimpleNamespace(
         get_ready_tensors=lambda: {"r1": [edge]},
-        get_tensor=lambda request_id, uuid: object(),
-        dereference=lambda request_id, uuid: dereferenced.append(uuid),
+        get_tensor=lambda uuid: object(),
+        dereference=dereferenced.append,
     )
 
     assert wt._process_read_tensors() is True
