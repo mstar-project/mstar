@@ -636,12 +636,17 @@ class NemotronDuplexModel(Model):
             wav = tensors.get("audio_inputs") or tensors.get("audio_features")
             if wav:
                 out["audio_features"] = wav
-        # Seed the decode loop's iteration-0 fed-back tokens (agent-text BOS,
-        # function PAD). The frame-synchronous nano step lists prev_text /
-        # prev_func as inputs, so without these the readiness gate never fires
-        # on the first frame (no loop-back exists yet) and the decode loop
-        # hangs. Later iterations overwrite them via the loop-back edges.
-        out["prev_text"] = [torch.tensor([self.config.text_bos_id], dtype=torch.long)]
+        # Seed the decode loop's iteration-0 fed-back tokens. The frame-
+        # synchronous nano step lists prev_text / prev_func as inputs, so
+        # without these the readiness gate never fires on the first frame (no
+        # loop-back exists yet) and the decode loop hangs. Later iterations
+        # overwrite them via the loop-back edges. The agent channel starts at
+        # BOS only at true global frame 0; after a system prompt the reference
+        # holds it at PAD across the prompt, so the first audio frame's prev is
+        # the last prompt PAD (this seed is what the first frame sees, ahead of
+        # the prefill node's own persisted PAD).
+        first_prev = self.config.text_pad_id if prompt else self.config.text_bos_id
+        out["prev_text"] = [torch.tensor([first_prev], dtype=torch.long)]
         out["prev_func"] = [torch.tensor([self.config.text_pad_id], dtype=torch.long)]
         return out
 
