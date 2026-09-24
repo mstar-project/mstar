@@ -122,6 +122,7 @@ class ChatterboxModel(Model):
         s3gen_compile_mode: str | None = None,
         s3gen_frame_bucket: int | None = None,
         s3gen_graphs: bool | None = None,
+        s3gen_graph_stages: str | None = None,
         s3gen_estimator_dtype: str | None = None,
         t3_prefill_graphs: bool | None = None,
         s3gen_max_batch_size: int | None = None,
@@ -168,6 +169,12 @@ class ChatterboxModel(Model):
             self.config.s3gen_frame_bucket = int(s3gen_frame_bucket)
         if s3gen_graphs is not None:
             self.config.s3gen_graphs = bool(s3gen_graphs)
+        if s3gen_graph_stages is not None:
+            self.config.s3gen_graph_stages = str(s3gen_graph_stages)
+        stages = {s.strip() for s in self.config.s3gen_graph_stages.split(",") if s.strip()}
+        if unknown := stages - {"solve", "encoder", "vocoder"}:
+            raise ValueError(f"unknown s3gen_graph_stages {sorted(unknown)}; choose from solve, encoder, vocoder")
+        self._graph_stages = tuple(sorted(stages))
         if s3gen_estimator_dtype is not None:
             self.config.s3gen_estimator_dtype = str(s3gen_estimator_dtype)
         if t3_prefill_graphs is not None:
@@ -803,8 +810,11 @@ class ChatterboxModel(Model):
             embedding=gen["embedding"].to(device),
         )
         if self.config.s3gen_graphs:
-            solver = s3gen.enable_graphs(rows=_graph_rows(self.config.s3gen_max_batch_size))
-            if torch.device(device).type == "cuda":
+            solver = s3gen.enable_graphs(
+                rows=_graph_rows(self.config.s3gen_max_batch_size), stages=self._graph_stages,
+                token_bucket=max(1, self.config.s3gen_frame_bucket // self.config.s3gen.token_mel_ratio),
+            )
+            if solver is not None and torch.device(device).type == "cuda":
                 self._warm_solve_graphs(s3gen, solver, builtin.prompt_feat.shape[1])
         return S3GenSubmodule(
             s3gen.eval(), self._s3_tokenizer(device), self.config,
