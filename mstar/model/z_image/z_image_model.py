@@ -69,7 +69,7 @@ class ZImageModel(Model):
         max_batch_size: int = 8,
         max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
-        async_scheduling: bool = False,
+        async_scheduling: bool = True,
         **kwargs,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
@@ -91,7 +91,7 @@ class ZImageModel(Model):
         # largest output (pixels) a request may ask for; larger requests are rejected before scheduling
         self.max_image_area = int(max_image_area)
         self.vae_compile = bool(vae_compile)
-        # speculative scheduling of the image nodes, off by default (see Flux2KleinModel)
+        # speculative scheduling of the image nodes, on by default (see Flux2KleinModel.async_scheduling)
         self.async_scheduling = bool(async_scheduling)
         self._snapshot = None
         self._config: ZImageConfig | None = None
@@ -140,7 +140,7 @@ class ZImageModel(Model):
             name=DENOISE_LOOP,
             section=GraphNode(
                 name="dit", input_names=[TEXT_EMBEDS, LATENTS],
-                # lockstep by default so concurrent requests batch (see Flux2KleinModel.async_scheduling)
+                # speculative by default (see Flux2KleinModel.async_scheduling); measured neutral on Z-Image
                 outputs=[GraphEdge(next_node="dit", name=LATENTS)], enable_async_scheduling=self.async_scheduling,
             ),
             max_iters=self.config.max_denoise_steps,
