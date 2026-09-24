@@ -1124,22 +1124,22 @@ def test_encoder_graphs_pad_rows_and_tokens_to_the_bucket_and_trim():
 def test_vocoder_graphs_key_on_length_and_cache_presence():
     calls = []
 
-    def vocode(mel, phase, harmonic, cache):
+    def spectrum(mel, phase, harmonic, cache):
         calls.append(cache is not None)
-        wav = mel.sum(dim=1).repeat_interleave(4, dim=-1) + phase.sum()
-        return wav, harmonic[:, :1]
+        magnitude = mel.sum(dim=1, keepdim=True).repeat_interleave(4, dim=-1) + phase.sum()
+        return magnitude, torch.sin(magnitude), harmonic[:, :1]
 
-    graphs = _graphs_on_cpu(VocoderGraphs(vocode))
+    graphs = _graphs_on_cpu(VocoderGraphs(spectrum))
     mel = torch.randn(1, 3, 10)
     phase, harmonic = torch.rand(1, 9, 1), torch.randn(1, 9, 40)
-    wav, source = graphs(mel, phase, harmonic, None)
-    assert wav.shape == (1, 40) and source.shape == (1, 1, 40) and calls[-1] is False
+    magnitude, out_phase, source = graphs(mel, phase, harmonic, None)
+    assert magnitude.shape == (1, 1, 40) and source.shape == (1, 1, 40) and calls[-1] is False
     graphs(mel, phase, harmonic, torch.zeros(1, 1, 0))  # an empty cache counts as none
     assert graphs.captures == 1 and graphs.replays == 2
     graphs(mel, phase, harmonic, torch.zeros(1, 1, 8))
     assert graphs.captures == 2 and calls[-1] is True
-    expected_wav, _ = vocode(mel, phase, harmonic, None)
-    assert torch.equal(wav, expected_wav)
+    expected, _, _ = spectrum(mel, phase, harmonic, None)
+    assert torch.equal(magnitude, expected)
 
 
 def test_graph_stages_knob_selects_the_stages():
@@ -1148,7 +1148,7 @@ def test_graph_stages_knob_selects_the_stages():
     s3gen = object.__new__(S3Gen)
     s3gen.solve = lambda *a: a[0]
     s3gen.flow_encoder = lambda tokens, lens: (tokens, lens)
-    s3gen.vocoder = SimpleNamespace(vocode_with=lambda *a: (a[0], a[0]))
+    s3gen.vocoder = SimpleNamespace(spectrum=lambda *a: (a[0], a[0], a[0]))
     S3Gen.enable_graphs(s3gen, rows=(1, 2), stages=("solve", "vocoder"), token_bucket=16)
     assert s3gen.solver is not None and s3gen.encoder_graphs is None and s3gen.vocoder_graphs is not None
     S3Gen.enable_graphs(s3gen, stages=("encoder",))
