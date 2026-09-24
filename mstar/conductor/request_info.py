@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 
 from mstar.engine.resources import PublishedInfo, ResourceReqConfig
-from mstar.graph.loop_indices import NestedLoopIndices
 
 
 @dataclass
@@ -33,9 +32,9 @@ class CurrentForwardPassInfo:
     max_tokens: int
 
     # The worker-local integer handle for request_id, stamped by the worker on
-    # receipt (see mstar/worker/rid_table.py). Worker-internal state keys on
-    # this; ``request_id`` stays the wire identity, so this object can be
-    # forwarded to a peer without a copy. -1 means not yet stamped -- the
+    # receipt (GraphRuntime.add_request / get_rid_handle). Worker-internal state
+    # keys on this; ``request_id`` stays the wire identity, so this object can
+    # be forwarded to a peer without a copy. -1 means not yet stamped -- the
     # conductor and api server never set it, and a peer overwrites whatever
     # arrives with its own.
     rid_handle: int = -1
@@ -53,13 +52,9 @@ class CurrentForwardPassInfo:
     # per_label_seq_info: PerLabelSeqInfo = field(default_factory=PerLabelSeqInfo)
     partition_name: str = field(default=DEFAULT_PARTITION)
 
-    # Per-loop stop indices; stop decisions come from each submodule's check_stop.
-    loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
+    # Per-loop stop indices are worker-only, so they live on the graph runtime
+    # rather than riding on this object across the wire.
     dynamic_loop_iter_counts: dict[str, int] = field(default_factory=dict)
-
-    def clear_loop_stop_info(self):
-        self.loop_stop_times.clear()
-        self.dynamic_loop_iter_counts.clear()
 
     def update_publish_info(self, other: dict[str, PublishedInfo]):
         merge_publish_info(self.resource_publish_info, other)
@@ -120,7 +115,7 @@ class PartitionState:
     completed_worker_graph_ids: set[int] = field(default_factory=set)
     current_worker_graph_ids: set[int] = field(default_factory=set)
     # wg_id -> count of distinct TP ranks that have reported completion
-    wg_rank_completions: dict[str, int] = field(default_factory=dict)
+    wg_rank_completions: dict[int, int] = field(default_factory=dict)
     num_output_tokens: int = 0
     curr_forward_outputs: list[str] = field(default_factory=list)
     # resource label -> PublishedInfo, accumulated from the rank-0 worker's
