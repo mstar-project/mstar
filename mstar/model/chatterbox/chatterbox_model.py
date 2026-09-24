@@ -124,6 +124,7 @@ class ChatterboxModel(Model):
         s3gen_graphs: bool | None = None,
         s3gen_estimator_dtype: str | None = None,
         t3_prefill_graphs: bool | None = None,
+        s3gen_max_batch_size: int | None = None,
         t3_dtype: str | None = None,
         default_language: str | None = None,
         **kwargs: Any,
@@ -173,6 +174,10 @@ class ChatterboxModel(Model):
             self.config.t3_prefill_graphs = bool(t3_prefill_graphs)
         if default_language is not None:
             self.config.default_language = str(default_language)
+        if s3gen_max_batch_size is not None:
+            if int(s3gen_max_batch_size) < 1:
+                raise ValueError("s3gen_max_batch_size must be at least 1")
+            self.config.s3gen_max_batch_size = int(s3gen_max_batch_size)
         self._s3gen_estimator_dtype = _parse_dtype(self.config.s3gen_estimator_dtype)
         if self.config.s3gen_graphs:
             if self.config.s3gen_compile:
@@ -798,7 +803,7 @@ class ChatterboxModel(Model):
             embedding=gen["embedding"].to(device),
         )
         if self.config.s3gen_graphs:
-            solver = s3gen.enable_graphs()
+            solver = s3gen.enable_graphs(rows=_graph_rows(self.config.s3gen_max_batch_size))
             if torch.device(device).type == "cuda":
                 self._warm_solve_graphs(s3gen, solver, builtin.prompt_feat.shape[1])
         return S3GenSubmodule(
@@ -859,6 +864,17 @@ class ChatterboxModel(Model):
         from mstar.model.chatterbox.components.watermark import PerthWatermarker
 
         return PerthWatermarker.build(device) if self.config.generation.watermark else None
+
+
+def _graph_rows(max_rows: int) -> tuple[int, ...]:
+    """Captured row counts for a batch limit: the powers of two up to it, plus
+    the limit itself (1, 2, 4, 8 for 8; 1, 2, 4, 8, 12 for 12)."""
+    rows = [1]
+    while rows[-1] * 2 <= max_rows:
+        rows.append(rows[-1] * 2)
+    if rows[-1] != max_rows:
+        rows.append(int(max_rows))
+    return tuple(rows)
 
 
 def _parse_dtype(name: str) -> torch.dtype:
