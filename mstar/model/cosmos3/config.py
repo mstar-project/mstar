@@ -434,6 +434,13 @@ class Cosmos3Config:
     # at the weight-streaming floor (H100: 4.2 -> 2.05 ms/token). Env override
     # COSMOS3_REASONER_COMPILE=0/1 for A/B.
     compile_reasoner_decode: bool = True
+    # torch.compile the reasoner's eager prefill (text and vision prompts; the
+    # decode step has its own captured graph). The eager prefill of a ~300-token
+    # image prompt is ~1250 kernels for ~5 ms of GPU work (24 ms wall on an
+    # H100, launch-bound); fused it is a third of that. Dynamic shapes: one
+    # compile covers every prompt length; the first prefill on a fresh server
+    # pays it (warmup). Env override COSMOS3_REASONER_PREFILL_COMPILE=0/1.
+    compile_reasoner_prefill: bool = True
     # Which attention backends the DiT node declares (see
     # Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the
     # paged FlashInfer backend the understanding prefill and the captured
