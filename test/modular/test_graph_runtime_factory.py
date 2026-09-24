@@ -10,8 +10,8 @@ the transport and a SHARE of the bookkeeper, so a mismatched communicator or
 bookkeeper is not a degraded mode -- it is a runtime that cannot send, or two
 views of the refcounts that drift apart with nothing raising.
 
-The flag is 0, 1 or AUTO. 0 is the default for now; AUTO is Rust where the
-extension imports and Python where it does not, so it is a property of the
+The flag is 0, 1 or AUTO, and AUTO is the default: Rust where the extension
+imports, Python where it does not. So the default is a property of the
 machine, and both halves of it need a case.
 """
 import sys
@@ -57,17 +57,10 @@ def _kwargs(communicator=None, bookkeeping=None):
     )
 
 
-def test_the_default_is_the_python_runtime(monkeypatch):
-    """Rust is opt-in until it has run in production: an unset flag must not
-    move a worker onto it, even where the extension is built."""
-    monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
-    assert isinstance(_make_graph_runtime(**_kwargs()), PythonGraphRuntime)
-
-
-def test_auto_takes_rust_where_it_is_built(monkeypatch):
-    """AUTO means "whatever this machine has"."""
+def test_the_default_is_auto_and_takes_rust_where_it_is_built(monkeypatch):
+    """AUTO is the default: an unset flag means "whatever this machine has"."""
     pytest.importorskip("mstar_rust")
-    monkeypatch.setenv("MSTAR_RUST_GRAPH", "AUTO")
+    monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
     # AUTO reads the transport flag too, so the ambient value would decide it.
     monkeypatch.delenv("MSTAR_RUST_ZMQ", raising=False)
 
@@ -82,11 +75,11 @@ def test_auto_takes_rust_where_it_is_built(monkeypatch):
     assert isinstance(runtime, RustGraphRuntime)
 
 
-def test_auto_falls_back_to_python_without_the_extension(monkeypatch):
+def test_the_default_falls_back_to_python_without_the_extension(monkeypatch):
     """The other half of AUTO, and the one that keeps mstar runnable on a
     machine that never ran maturin. A None entry in sys.modules makes the
     import raise, which is what the probe sees when it is really absent."""
-    monkeypatch.setenv("MSTAR_RUST_GRAPH", "AUTO")
+    monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
     monkeypatch.setitem(sys.modules, "mstar.graph.runtime.rust", None)
     assert isinstance(_make_graph_runtime(**_kwargs()), PythonGraphRuntime)
 
@@ -117,7 +110,7 @@ def test_auto_does_not_pick_rust_against_a_pinned_pyzmq_transport(monkeypatch):
     machine cannot run that pair.
     """
     pytest.importorskip("mstar_rust")
-    monkeypatch.setenv("MSTAR_RUST_GRAPH", "AUTO")
+    monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
     monkeypatch.setenv("MSTAR_RUST_ZMQ", "0")
     assert isinstance(_make_graph_runtime(**_kwargs()), PythonGraphRuntime)
 

@@ -16,12 +16,16 @@ import pytest
 from mstar.communication.tensor_store import TensorStore
 
 
-def test_the_default_backend_is_python(monkeypatch):
-    """The Rust bookkeeper copies each descriptor in and rebuilds it on the way
-    out, which only pays off for the Rust runtime holding the same state, and
-    that runtime is opt-in."""
+def test_the_default_backend_follows_the_resolved_runtime(monkeypatch):
+    """The two have to agree: the Rust runtime takes a SHARE of this object,
+    so an unset flag resolving to Rust in one place and Python in the other is
+    a worker that refuses to start."""
+    pytest.importorskip("mstar_rust", reason="extension not built")
     monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
-    assert type(TensorStore().bookkeeping).__name__ == "PythonTensorBookkeeping"
+    # AUTO declines Rust against a pinned pyzmq transport, so an ambient
+    # MSTAR_RUST_ZMQ would decide this one.
+    monkeypatch.delenv("MSTAR_RUST_ZMQ", raising=False)
+    assert type(TensorStore().bookkeeping).__name__ == "RustTensorBookkeeping"
 
 
 def test_the_rust_graph_flag_selects_the_rust_backend(monkeypatch):
