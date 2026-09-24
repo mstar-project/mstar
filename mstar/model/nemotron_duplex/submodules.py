@@ -61,6 +61,8 @@ logger = logging.getLogger(__name__)
 
 # How ``prepare_inputs`` classified a request's step; ``preprocess`` fuses accordingly.
 _MODE_FRAME = "frame"      # one streamed audio frame + fed-back prev_text / prev_func
+_MODE_PROMPT_FRAME = "prompt_frame"   # a session's first step: the system prompt's tokens, then its first frame
+NO_PROMPT = -1             # the ``text_inputs`` loop-back value once the prompt has been consumed (or never existed)
 _MODE_PROMPT = "prompt"    # system-prompt token ids (priming)
 _MODE_EMBEDS = "embeds"    # pre-fused embeddings
 
@@ -85,6 +87,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     # 80 ms tick. The recurrent pool holds a slot per row (padding rows take
     # one transiently), so the model's pool sizing covers the largest bucket.
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
 
     def __init__(self, language_model: nn.Module, config: NemotronDuplexConfig):
         super().__init__()
@@ -119,6 +122,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
                 capture_graph_walk="decode",
                 single_request_inputs=frame,
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+                additional_key_info=self.DECODE_KEY,
                 compile=False,
             ),
         ]
@@ -147,15 +151,41 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             # steps the sampler; the reference's repetition penalty likewise
             # only ever sees generated tokens.
             steps[NANO_SAMPLER] = SamplerStep(apply_penalty=True)
+        # a session's prompt + first-frame step has more than one token per
+        # request, which no fixed-shape decode capture fits (same answer as
+        # cg_key_info, which the engine asks before the inputs exist)
+        first = any(inp.kwargs.get("mode") == _MODE_PROMPT_FRAME for inp in inputs)
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
+            cg_key_info=None if (first or graph_walk != "decode") else self.DECODE_KEY,
             steps=steps,
         )
 
+    def cg_key_info(self, graph_walk: str, per_request_info: Mapping[str, Any]) -> str | None:
+        """The decode capture serves a batch unless a request in it still has
+        its system prompt pending (its first step is prompt + frame, so it
+        runs eager); the routing marks that in ``step_metadata``."""
+        if graph_walk != "decode":
+            return None
+        for info in per_request_info.values():
+            if (getattr(info, "step_metadata", None) or {}).get("prompt_pending"):
+                return None
+        return self.DECODE_KEY
+
     # -- inputs ----------------------------------------------------------
+
+    @staticmethod
+    def _prompt_ids(inputs: NameToTensorList) -> torch.Tensor | None:
+        """The pending system-prompt ids from the ``text_inputs`` loop-back, or
+        None when it carries the NO_PROMPT sentinel (or is absent)."""
+        if not inputs.get("text_inputs"):
+            return None
+        ids = inputs["text_inputs"][0].reshape(-1).to(torch.long)
+        ids = ids[ids >= 0]
+        return ids if ids.numel() > 0 else None
 
     @staticmethod
     def _tok(inputs: NameToTensorList, name: str, default: int) -> torch.Tensor:
@@ -185,6 +215,13 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             frames = inputs.get("audio_frame") or []
             if frames:
                 tensors["audio_frame"] = frames[0].reshape(1, -1)
+            # The system prompt rides the loop as ``text_inputs``: real ids on
+            # the session's first step, the NO_PROMPT sentinel afterwards.
+            prompt = self._prompt_ids(inputs)
+            if prompt is not None:
+                tensors["prompt_ids"] = prompt
+                return ARNodeInputs(input_seq_len=int(prompt.numel()) + 1, tensor_inputs=tensors,
+                                    kwargs={"mode": _MODE_PROMPT_FRAME})
             return ARNodeInputs(input_seq_len=1, tensor_inputs=tensors, kwargs={"mode": _MODE_FRAME})
         if "combined_embeds" in inputs:
             emb = inputs["combined_embeds"][0]
@@ -213,6 +250,17 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             fused = fused + t["audio_frame"].to(device=device, dtype=fused.dtype) * cfg.user_audio_weight
         if cfg.use_function_head:
             fused = fused + self.embeddings(t["prev_func"].to(device)) * cfg.function_weight
+        if mode == _MODE_PROMPT_FRAME:
+            # the reference's ``_prime_prompt``: prompt tokens on the audio
+            # channel, the agent channel BOS then PAD, the function channel
+            # PAD, all ahead of the first frame in the same stream
+            ids = t["prompt_ids"].to(device)
+            agent = torch.full_like(ids, cfg.text_pad_id)
+            agent[0] = cfg.text_bos_id
+            prompt = self.embeddings(agent) * cfg.agent_text_weight + self.embeddings(ids) * cfg.user_audio_weight
+            if cfg.use_function_head:
+                prompt = prompt + func_pad * cfg.function_weight
+            fused = torch.cat([prompt, fused])
         return fused
 
     def preprocess(
@@ -291,9 +339,12 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         if cfg.use_function_head:
             # Tool-call channel: plain argmax, as in the reference.
             new_func = self.language_model.function_head(last).argmax(dim=-1)
+        # the prompt (if any) has been consumed by this step: the loop-back
+        # carries the sentinel from here on
+        no_prompt = torch.full((1,), NO_PROMPT, dtype=torch.long, device=hidden.device)
         out: dict[str, NameToTensorList] = {}
         for i, rid in enumerate(rids):
-            o: NameToTensorList = {"new_token": [new_token[i : i + 1]]}
+            o: NameToTensorList = {"new_token": [new_token[i : i + 1]], "text_inputs": [no_prompt]}
             if new_func is not None:
                 o["new_func"] = [new_func[i : i + 1]]
             out[rid] = o
