@@ -2955,6 +2955,30 @@ impl GraphRuntime {
         }
         Ok(())
     }
+
+    /// Whether this rid's node is currently marked speculatively scheduled.
+    ///
+    /// Exposed so the invariant that the flag SURVIVES completion is
+    /// assertable from the parity tests: `State::complete` used to clear it,
+    /// which let `refresh_ready` re-add a node whose rids were still in
+    /// flight. Python holds the same state in
+    /// `GraphNode._speculatively_scheduled`.
+    fn is_speculatively_scheduled(
+        &self, node: String, wg_id: u32, rid: u32,
+    ) -> PyResult<bool> {
+        let wg = self.wg_index(wg_id).ok_or_else(|| {
+            PyValueError::new_err(format!("unknown worker graph id {wg_id}"))
+        })?;
+        let node_id = self.nid(wg, &node).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "node {node:?} is not in worker graph {wg_id}"
+            ))
+        })?;
+        Ok(self
+            .state(wg, rid)
+            .map(|s| s.is_spec_scheduled(node_id))
+            .unwrap_or(false))
+    }
 }
 #[cfg(test)]
 mod tests {

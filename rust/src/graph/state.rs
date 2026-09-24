@@ -437,8 +437,10 @@ impl RequestState {
         let mut freed: Vec<u64> = Vec::new();
         {
             let st = &mut self.nodes[node as usize];
+            // NOTE: this cannot clear .scheduled, or else refresh_ready re-adds
+            // a node while its rids are still in flight as a speculative batch.
             st.completed = true;
-            st.scheduled = false;
+            
             // A loop member keeps `cur` until its loop advances, so later
             // loop-back arrivals land in `next` — Python only clears
             // ready_signals for top-level entities (base.py:758-767).
