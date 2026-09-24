@@ -1,0 +1,71 @@
+"""Reference oracle + client I/O for the ${model} correctness gate (read-only).
+
+This is the ONE model-specific file. The modality checker/benchmark call these
+hooks; the model-specific request shape, response decode, and the reference
+oracle live here. Copy to ``instances/${model}.reference.py`` and fill in.
+
+Hooks (single client request — no walks, that is the port's internal detail):
+- sample_input()               -> a fixed, deterministic request payload
+- initial_latent(sample)       -> the shared starting noise as a numpy array, or
+                                  None for non-generative models (strict only)
+- to_request(sample, latents)  -> (method, path, json_body) for the mstar server;
+                                  embed `latents` (base64 .npy) when not None
+- from_response(response)      -> the candidate output as a comparable artifact
+                                  (video: an (T,H,W,C) uint8 numpy array; None if invalid)
+- load()                       -> load the upstream reference model (strict only)
+- oracle(sample, latents)      -> the reference output, same artifact type as
+                                  from_response, denoising `latents` when provided
+
+Weights are at /model (docker) or resolve from the HF id. Do NOT reuse the
+candidate's mstar code here — the oracle must be the independent upstream model.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+MODEL_DIR = "/model"
+HF_ID = "${hf_id}"
+SERVED = "${served_model_name}"
+_MODEL: Any = None
+
+
+def sample_input() -> dict:
+    # TODO(${model}): a fixed probe (prompt + deterministic gen params, seed=0).
+    raise NotImplementedError("reference.sample_input")
+
+
+def initial_latent(sample: dict) -> Any:
+    # TODO(${model}): the shared initial noise the strict gate feeds to BOTH sides,
+    # as a numpy array of the model's latent shape (e.g. [B, C, T, H, W]). Build it
+    # from a fixed generator (seed) so it is deterministic. Return None only if the
+    # model has no sampled initial latent (non-generative).
+    raise NotImplementedError("reference.initial_latent")
+
+
+def to_request(sample: dict, latents: Any = None) -> tuple[str, str, dict]:
+    # TODO(${model}): map sample -> ("POST", "${endpoint}", body). When latents is
+    # not None, add it to the body base64-encoded (np.save -> bytes -> b64) as the
+    # field the server reads for injected initial noise (e.g. "init_latents").
+    raise NotImplementedError("reference.to_request")
+
+
+def from_response(response) -> Any:
+    # TODO(${model}): parse the candidate output into a comparable artifact.
+    raise NotImplementedError("reference.from_response")
+
+
+def load() -> None:
+    global _MODEL
+    if _MODEL is not None:
+        return
+    # TODO(${model}): construct the upstream reference model from MODEL_DIR/HF_ID.
+    raise NotImplementedError("reference.load")
+
+
+def oracle(sample: dict, latents: Any = None) -> Any:
+    load()
+    # TODO(${model}): run the upstream model on sample and return the artifact.
+    # When latents is not None, denoise that exact starting noise (e.g. pass it as
+    # the pipeline's `latents=` kwarg) instead of sampling from the seed.
+    raise NotImplementedError("reference.oracle")

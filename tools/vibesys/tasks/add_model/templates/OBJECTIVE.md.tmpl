@@ -1,0 +1,77 @@
+# Objective — implement `${model}` natively in mstar
+
+Add support for `${hf_id}` to the mstar serving system by **implementing the
+model yourself** in mstar's Walk-Graph contract, then verifying it against the
+reference implementation. The goal is a **correct implementation at reasonable
+performance** — not the fastest possible one.
+
+## Client contract (what is observed)
+
+The model is served by `./run.sh <port>` → `mstar-serve --config
+configs/${model}.yaml`, answering `/health` with 200 and serving on
+`${endpoint}`:
+
+- **input modalities:** ${input_modalities}
+- **output modalities:** ${output_modalities}
+
+Only this client-facing behavior is graded. How you decompose the model
+internally (walks, nodes, engines) is your design decision, not part of the
+contract.
+
+## What "implement it yourself" means (required)
+
+Port `${hf_id}` into `mstar/model/${model}/` following `docs/adding_models.rst`,
+using **`mstar/model/${reference_model}/`** as the structural template:
+
+1. Decompose the model into **submodule nodes** (`NodeSubmodule` /
+   `ARNodeSubmodule`), one per graph node — encoders, backbone, diffusion/flow
+   head, decoder, etc. — writing the actual compute yourself.
+2. Define the **walk graph** (`get_graph_walk_graphs`) connecting those nodes for
+   the request path(s).
+3. Choose an **engine type** per node (`KV_CACHE` vs `STATELESS`).
+4. Load weights via mstar's loader (`load_weights` / `load_hf_weights`), building
+   on `meta` and `to_empty`, so the same code loads single-GPU and TP shards.
+5. Wire it up: `mstar/model/registry.py` (`MODEL_REGISTRY` + `HF_MODELS`),
+   `configs/${model}.yaml` (`node_groups`), and the OpenAI adapter in
+   `mstar/api_server/openai/adapters.py`.
+6. Declare a **`${model}` pip extra** in `pyproject.toml` with your model's
+   runtime deps (the framework runs `run.sh` and the strict checker via
+   `uv run --extra ${model}`).
+
+**Do not import or serve the upstream package/pipeline as the implementation.**
+Reading the upstream repo (e.g. via `official_source` in `reference/meta.json`)
+to understand the architecture is expected; wrapping its
+`Pipeline.from_pretrained(...)(...)` and calling it end-to-end is **not** a port
+and will not satisfy this objective. The reference implementation exists for the
+*checker* to compare against — your served path must be mstar-native compute.
+
+## Correctness gate (the target)
+
+`vibeval/checker.py` sends a client request to your server and compares the
+output to the reference implementation's output (run by `vibeval/reference.py`,
+weights at `/model` or the HF id) using **${compare}** within tolerance
+**${tol}**. Drive it deterministically (fixed seed; greedy where applicable).
+Do not weaken the checker or reference — they are framework-owned and read-only.
+
+### Shared starting state for generative models (required if you sample noise)
+
+Diffusion/flow models are chaotic in their initial noise: two *correct*
+implementations that draw different starting noise produce different (each
+valid) outputs, so an output-vs-output metric can only pass when both denoise
+the **same** starting latent. The strict checker supplies one. Your served
+endpoint **must accept an optional `init_latents` field** (a base64-encoded
+`.npy` ndarray of the model's initial-noise latent shape, e.g. `[B, C, T, H,
+W]`) and use it **verbatim** as the starting latent — skip your own noise
+sampling when it is present, and match its layout/scaling to the reference's
+latent convention. When `init_latents` is absent (smoke, benchmark) sample
+normally from `seed`. The reference oracle denoises the identical latent, so a
+faithful port lands within tolerance; a mismatch (wrong latent shape, scaling,
+or channel order) shows up as a low score and points at a real bug.
+
+## Performance (secondary — do not over-optimize)
+
+Once the output is correct, get to **reasonable** serving latency
+(`${headline_metric}` from `vibeval/benchmark.py`) and stop. A correct,
+reasonably-fast implementation is a complete success; do **not** spend rounds
+chasing further speedups (CUDA graphs, extra compile, placement tuning) beyond
+what a straightforward implementation needs.
