@@ -132,7 +132,7 @@ class S3Gen(nn.Module):
             if "encoder" in stages else None
         )
         self.vocoder_graphs = (
-            VocoderGraphs(self.vocoder.vocode_with, max_graphs=2 * max_graphs) if "vocoder" in stages else None
+            VocoderGraphs(self.vocoder.spectrum, max_graphs=2 * max_graphs) if "vocoder" in stages else None
         )
         return self.solver
 
@@ -316,7 +316,8 @@ class S3Gen(nn.Module):
         mel = mel.to(self.dtype)
         noise = self.vocoder.draw_noise(mel, generator)
         if self.vocoder_graphs is not None:
-            wav, source = self.vocoder_graphs(mel, noise.phase, noise.harmonic, cache_source)
+            magnitude, phase, source = self.vocoder_graphs(mel, noise.phase, noise.harmonic, cache_source)
+            wav = self.vocoder.waveform(magnitude, phase)
         else:
             wav, source = self.vocoder.vocode(mel, cache_source=cache_source, noise=noise)
         if fade_in:
