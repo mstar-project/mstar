@@ -6,7 +6,7 @@ would drop a Python object without the GIL.
 
 ``TensorBookkeeping`` holds everything else -- refcounts, the persist flag,
 whether the memory has been registered for remote reads -- and sees nothing but
-integer uuids. That is what gets ported, so a Rust-side caller can adjust
+integer uuids. That is what gets ported, so the Rust graph runtime can adjust
 refcounts without a hop back to Python.
 
 Uuids are globally unique now (see ``tensor_uuid``), so nothing here is keyed by
@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 import torch
 
 from mstar.graph.base import TensorPointerInfo
+from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 
 NameToTensorList = dict[str, list[torch.Tensor]]
 
@@ -523,14 +524,16 @@ class RustTensorBookkeeping(TensorBookkeeping):
 
 
 def _build_tensor_bookkeeping() -> TensorBookkeeping:
-    """The Python bookkeeper, always, for now.
+    """Gated on ``MSTAR_RUST_GRAPH``, which is what actually needs it: the
+    Rust graph runtime holds a SHARE of this object, so the two have to be the
+    same implementation.
 
-    The Rust one is not worth taking on its own: a descriptor is copied into
-    Rust on the way in and rebuilt on the way out, and the saving is in the
-    boundary crossings a Rust-side caller avoids by holding the same state.
-    Until there is such a caller it is reachable only by passing it to
-    ``TensorStore`` explicitly.
+    Not worth taking on its own. A descriptor is copied into Rust on the way
+    in and rebuilt on the way out, which the Python runtime pays for and gets
+    nothing back -- the saving is in the crossings the Rust runtime avoids.
     """
+    if resolve_graph_runtime_type(log=False) == GraphRuntimeType.RUST:
+        return RustTensorBookkeeping()
     return PythonTensorBookkeeping()
 
 
@@ -704,7 +707,9 @@ class TensorStore:
 
     def mark_forgotten(self, uuids: list[int]):
         """These records are already gone from the bookkeeper, so the teardown
-        that follows must not cross again to drop them."""
+        that follows must not cross again to drop them. For a caller that went
+        to the bookkeeper directly -- the Rust runtime releasing a node's
+        consumed inputs holds a share of it and never comes through here."""
         self._forgotten.update(uuids)
 
     def set_metadata(

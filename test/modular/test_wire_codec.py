@@ -435,3 +435,66 @@ def test_outside_a_union_nothing_is_checked():
     from mstar.communication import wire
     assert _round_trip(None, int) is None
     assert wire._decoder(int)("not an int") == "not an int"
+
+
+# --- fields encoded on their own -------------------------------------------
+
+def test_a_field_encoded_alone_matches_the_field_encoded_in_place():
+    """``encode_field`` is what lets a Rust sender stay ignorant of the type.
+
+    It encodes what it owns and splices these in as opaque values, so it never
+    has to know CurrentForwardPassInfo or grow a case for every new
+    PublishedInfo subclass. That only holds if encoding the field on its own
+    gives exactly what encoding the whole message would have put there.
+    """
+    import msgpack
+
+    from mstar.communication.wire import encode_field
+    from mstar.utils.ipc_format import InputSignals
+
+    info = CurrentForwardPassInfo(
+        request_id="r1", graph_walk="decode", fwd_index=3,
+        random_seed=7, max_tokens=16, partition_name="default",
+    )
+    msg = InputSignals(request_id="r1", inputs=[], request_info=info)
+
+    in_place = msgpack.unpackb(encode(msg), raw=False,
+                               strict_map_key=False)[1]["request_info"]
+    alone = msgpack.unpackb(
+        encode_field(info, CurrentForwardPassInfo), raw=False,
+        strict_map_key=False,
+    )
+    assert alone == in_place
+    # And the spliced frame decodes back to an equal message.
+    assert decode(encode(msg)).request_info == info
+
+
+def test_a_polymorphic_field_keeps_its_tag_when_encoded_alone():
+    """``resource_publish_info`` is dict[str, PublishedInfo] -- abstract, so
+    each value rides as [tag, payload]. A Rust sender splices it verbatim
+    rather than learning the subclasses."""
+    import msgpack
+
+    from mstar.communication.wire import encode_field
+    from mstar.engine.resources.base import PublishedInfo
+    from mstar.utils.ipc_format import WorkerGraphsDone
+
+    published = {
+        tag: cls for cls, tag in _TYPE_TO_TAG.items()
+        if isinstance(cls, type) and issubclass(cls, PublishedInfo)
+    }
+    tag, cls = next(iter(sorted(published.items())))
+    value = {"kv": cls()}
+
+    msg = WorkerGraphsDone(
+        request_id="r1", worker_graph_ids=[0], is_first_tp_rank=True,
+        resource_publish_info=value,
+    )
+    in_place = msgpack.unpackb(encode(msg), raw=False,
+                               strict_map_key=False)[1]["resource_publish_info"]
+    alone = msgpack.unpackb(
+        encode_field(value, dict[str, PublishedInfo]), raw=False,
+        strict_map_key=False,
+    )
+    assert alone == in_place
+    assert alone["kv"][0] == tag, "the subclass tag has to survive"

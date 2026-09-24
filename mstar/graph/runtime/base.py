@@ -89,6 +89,23 @@ class ReadyNodeSpec(NamedTuple):
     rids: list[int]
 
 
+class FreedTensors(NamedTuple):
+    """Tensors a runtime dereferenced to zero and dropped from the bookkeeper,
+    for the caller to finish tearing down.
+
+    ``registered`` is each uuid's ``mem_registered`` flag, which the forget
+    took with it and the transport still needs: it is what decides whether the
+    memory has to be unregistered. Hand the pair straight to
+    ``TensorCommunicationManager.cleanup_collectable``.
+    """
+    uuids: list[int]
+    registered: list[bool]
+
+    @classmethod
+    def none(cls) -> "FreedTensors":
+        return cls([], [])
+
+
 class RouteInput(NamedTuple):
     partition: str
     graph_walk: str
@@ -119,6 +136,21 @@ class RouteOutput(NamedTuple):
     # Push these into the request's stream buffer for their edge. Keyed by
     # edge name -> (rid, uuid) per tensor.
     local_streaming_by_signal: dict[str, ParallelList[int, int]]
+
+    # The rids this completion will actually build a frame for -- one bound
+    # for a peer worker (INPUT_SIGNALS) or the conductor (WORKER_GRAPHS_DONE).
+    # Only those need `per_request_info`, and preparing it is not free for a
+    # runtime that has to encode it: the object is mutated in place every
+    # pass, so it cannot be cached. On a single-worker deployment inside a
+    # loop neither frame goes out on most passes.
+    #
+    # ``None`` means "not computed, pass it for everyone" -- the Python
+    # runtime hands the live object over untouched, so it has nothing to save.
+    rids_needing_request_info: frozenset[int] | None = None
+    # Consumed inputs the completion itself dropped to zero, for the caller to
+    # tear down -- see ``cleanup_consumed_inputs``. Empty in the normal order,
+    # where that call has already taken them.
+    freed_inputs: FreedTensors = FreedTensors.none()
 
 
 
@@ -225,6 +257,18 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
+    def is_speculatively_scheduled(
+        self, node: str, wg_id: int, rid: int,
+    ) -> bool:
+        """Whether this rid's node is marked speculatively scheduled.
+
+        The flag must SURVIVE node completion: its rids are still in flight
+        for the speculative N+1 step, so the node must stay out of the ready
+        set until the speculation resolves.
+        """
+        pass
+
+    @abstractmethod
     def get_dynamic_loop_iters(
         self, request_ids: list[int],
         partition: str,
@@ -253,8 +297,16 @@ class GraphRuntime(ABC):
     @abstractmethod
     def cleanup_consumed_inputs(
         self, node_name: str, rids: list[int], wg_ids: list[int],
-    ):
-        """Release the input tensors the just-executed node consumed."""
+    ) -> FreedTensors:
+        """Release the input tensors the just-executed node consumed.
+
+        Returns the ones that became collectable and so still need the
+        transport-side teardown -- shm files, arena slots, memory
+        unregistration -- which lives on the tensor manager and not here. A
+        runtime that holds the manager itself may do that in place and return
+        ``FreedTensors.none()``; the Rust one has only the bookkeeper, so its
+        freed tensors would otherwise sit until the request is torn down.
+        """
         pass
 
     @abstractmethod

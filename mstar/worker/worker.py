@@ -28,6 +28,7 @@ from mstar.graph.base import GraphEdge
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
     EdgeSpec,
+    GraphRuntime,
     RouteInput,
     RouteOutput,
     SendInput,
@@ -35,6 +36,7 @@ from mstar.graph.runtime.base import (
     SpeculationPrepInput,
 )
 from mstar.graph.runtime.python import PythonGraphRuntime
+from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
@@ -68,6 +70,49 @@ logger = logging.getLogger(__name__)
 # seconds between "no offload possible" lines for one node and walk: a hold is
 # retried every backoff, and a line per retry buries the rest of the log
 _HOLD_LOG_INTERVAL = 5.0
+
+
+def _make_graph_runtime(
+    communicator,
+    tensor_manager,
+    **kwargs,
+) -> GraphRuntime:
+    """The runtime ``MSTAR_RUST_GRAPH`` selects (see
+    ``resolve_graph_runtime_type``).
+
+    Rust requires the Rust communicator and the Rust bookkeeper: it sends
+    WORKER_GRAPHS_DONE and INPUT_SIGNALS itself on an Arc to the same
+    transport, and settles refcounts on a share of the same bookkeeper, rather
+    than hopping back into Python for either. A Python one of either has no
+    such object to share, so asking for Rust with one raises.
+    """
+    if resolve_graph_runtime_type(log=True) == GraphRuntimeType.PYTHON:
+        return PythonGraphRuntime(
+            communicator=communicator,
+            tensor_manager=tensor_manager,
+            **kwargs,
+        )
+
+    from mstar.communication.rust_communicator import RustZMQCommunicator
+    from mstar.graph.runtime.rust import RustGraphRuntime
+
+    if not isinstance(communicator, RustZMQCommunicator):
+        raise ValueError(
+            "MSTAR_RUST_GRAPH=1 needs the Rust communicator, but this worker "
+            f"built a {type(communicator).__name__}. Set MSTAR_RUST_ZMQ=1."
+        )
+    bookkeeping = tensor_manager.tensor_store.bookkeeping
+    if not hasattr(bookkeeping, "_rust"):
+        raise ValueError(
+            "MSTAR_RUST_GRAPH=1 needs the Rust TensorBookkeeping: the runtime "
+            "holds a share of it, so a Python one cannot be handed over. "
+            f"Got {type(bookkeeping).__name__}."
+        )
+    return RustGraphRuntime(
+        bookkeeping=bookkeeping,
+        communicator=communicator,
+        **kwargs,
+    )
 
 
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
@@ -242,7 +287,7 @@ class Worker:
         )
 
         # The graph runtime owns the per-request queues and the graph state.
-        self._graph_runtime = PythonGraphRuntime(
+        self._graph_runtime = _make_graph_runtime(
             my_worker_id=self.worker_id,
             my_worker_graphs=my_worker_graphs,
             all_wg_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
@@ -2080,9 +2125,14 @@ class Worker:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
 
         rids = list(batch_N.batch.request_to_worker_graph)
-        self._graph_runtime.cleanup_consumed_inputs(
-            batch_N.batch.node_name, rids,
-            [batch_N.batch.request_to_worker_graph[r] for r in rids],
+        # What the runtime dereferenced to zero and cannot reclaim itself: a
+        # runtime behind the contract has the bookkeeper, not the shm files or
+        # the registered memory.
+        self.tensor_manager.cleanup_collectable(
+            *self._graph_runtime.cleanup_consumed_inputs(
+                batch_N.batch.node_name, rids,
+                [batch_N.batch.request_to_worker_graph[r] for r in rids],
+            )
         )
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -2242,6 +2292,11 @@ class Worker:
             self.tensor_manager.tensor_store,
         )
 
+        # Normally empty: cleanup_consumed_inputs ran above and took them. Not
+        # empty if a completion ever precedes it, and then nobody else will.
+        if route_output.freed_inputs.uuids:
+            self.tensor_manager.cleanup_collectable(*route_output.freed_inputs)
+
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
@@ -2287,13 +2342,18 @@ class Worker:
             route_output.new_token_output_idxs,
             flat_rids, flat_uuids, signals, signal_idxs,
         )
+        needs_info = route_output.rids_needing_request_info
+        info_rids = (
+            send_rids if needs_info is None
+            else [rid for rid in send_rids if rid in needs_info]
+        )
         self._graph_runtime.send_outputs(SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
-                send_rids,
+                info_rids,
                 [
                     self.request_state.get_fwd_info(rid, batch_N.partition)
-                    for rid in send_rids
+                    for rid in info_rids
                 ],
             ),
             new_token_counts=ParallelList(

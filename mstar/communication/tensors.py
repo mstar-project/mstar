@@ -998,8 +998,8 @@ class TensorCommunicationManager(ABC):
         self, collectable: list[int], registered: list[bool],
     ):
         """Transport-side teardown for tensors the bookkeeper has already
-        dereferenced to zero and forgotten -- what a batched dereference
-        hands back."""
+        dereferenced to zero and forgotten -- what a batched dereference, or
+        the graph runtime releasing a node's consumed inputs, hands back."""
         if not collectable:
             return
         self.tensor_store.mark_forgotten(collectable)

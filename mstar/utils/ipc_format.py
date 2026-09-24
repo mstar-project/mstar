@@ -75,7 +75,10 @@ class InputSignals(MessageBody):
     inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
     partition_name: str = "default"
-    producer_done: set = field(default_factory=set)
+    # Producer partition names. Declared, not a bare ``set``: a bare one is
+    # untyped on the wire, so an empty set a Rust sender writes came back a
+    # list.
+    producer_done: set[str] = field(default_factory=set)
 
 
 @dataclass
