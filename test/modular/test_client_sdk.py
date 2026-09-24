@@ -162,7 +162,7 @@ def test_stream_takes_the_binary_path_when_the_server_says_so():
     )
     resp = _fake_response(BINARY_STREAM_MEDIA_TYPE, header + body)
 
-    events, post = _stream_with(MStarClient("http://x"), resp)
+    events, post = _stream_with(MStarClient("http://x", prefer_binary=True), resp)
 
     assert [e.text for e in events] == [payload.decode("utf-8", "replace")]
     headers = post.call_args.kwargs["headers"]
@@ -177,7 +177,7 @@ def test_stream_falls_back_to_ndjson_when_the_server_ignores_accept():
     resp = _fake_response("application/x-ndjson", (line + "\n").encode())
 
     with mock.patch.object(resp, "iter_lines", wraps=resp.iter_lines) as iter_lines:
-        events, _ = _stream_with(MStarClient("http://x"), resp)
+        events, _ = _stream_with(MStarClient("http://x", prefer_binary=True), resp)
 
     assert [e.text for e in events] == ["hi"]
     iter_lines.assert_called_once_with(chunk_size=1024 * 1024, decode_unicode=True)
@@ -187,7 +187,7 @@ def test_stream_sends_no_negotiation_headers_when_binary_is_disabled():
     line = json.dumps({"modality": "text", "data": base64.b64encode(b"hi").decode(), "metadata": {}})
     resp = _fake_response("application/x-ndjson", (line + "\n").encode())
 
-    events, post = _stream_with(MStarClient("http://x", prefer_binary=False), resp)
+    events, post = _stream_with(MStarClient("http://x"), resp)
 
     assert [e.text for e in events] == ["hi"]
     assert post.call_args.kwargs["headers"] == {}
@@ -202,4 +202,4 @@ def test_stream_names_content_encoding_as_the_cause_on_a_compressed_binary_body(
         BINARY_STREAM_MEDIA_TYPE, b"\x1f\x8b garbage", {"Content-Encoding": "gzip"}
     )
     with pytest.raises(RuntimeError, match="Content-Encoding 'gzip'"):
-        _stream_with(MStarClient("http://x"), resp)
+        _stream_with(MStarClient("http://x", prefer_binary=True), resp)

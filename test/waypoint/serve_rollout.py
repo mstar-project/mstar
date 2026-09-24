@@ -932,7 +932,7 @@ def main() -> int:
     failures: list[str] = []
     sampler: MemorySampler | None = None
     try:
-        client = MStarClient(url, timeout=args.request_timeout)
+        client = MStarClient(url, timeout=args.request_timeout, prefer_binary=True)
         started = time.time()
         _wait_for_health(client, proc, args.startup_timeout)
         print(f"server ready after {time.time() - started:.1f}s")
@@ -1014,7 +1014,7 @@ def main() -> int:
                 print(f"--- {phase}: {' + '.join(spec.request_id for spec in specs)} ---")
                 log_offset = args.log.stat().st_size
                 chunks_by_label = _concurrent_rollouts(
-                    lambda: MStarClient(url, timeout=args.request_timeout),
+                    lambda: MStarClient(url, timeout=args.request_timeout, prefer_binary=True),
                     seed,
                     args.steps,
                     specs,
