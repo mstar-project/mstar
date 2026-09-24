@@ -923,6 +923,7 @@ def test_streaming_and_compile_knobs_reach_the_config():
         stream_context_tokens=25, s3gen_compile=True,
     )
     assert model.config.stream_context_tokens == 25 and model.config.s3gen_compile is True
+    assert model.config.s3gen_graphs is False  # compile replaces the graphs
     assert _make_model().config.s3gen_compile is False
 
 
@@ -940,8 +941,13 @@ def test_graph_and_precision_knobs_reach_the_config():
             model_path_hf="ResembleAI/chatterbox", variant="chatterbox", s3gen_graphs=True, s3gen_compile=True,
         )
     default = _make_model().config
-    assert default.s3gen_graphs is False and default.s3gen_estimator_dtype == "float32"
-    assert default.t3_prefill_graphs is True and default.s3gen_frame_bucket == 0
+    assert default.s3gen_graphs is True and default.s3gen_estimator_dtype == "float16"
+    assert default.t3_prefill_graphs is True and default.s3gen_frame_bucket == 64
+    # asking for the older compile path turns the graphs off instead of erroring
+    compiled = ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", s3gen_compile=True)
+    assert compiled.config.s3gen_compile is True and compiled.config.s3gen_graphs is False
+    plain = ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", s3gen_graphs=False)
+    assert plain.config.s3gen_graphs is False and plain.config.s3gen_frame_bucket == 64
 
 
 def test_graph_warmup_covers_the_built_in_voice_chunk_shapes():
