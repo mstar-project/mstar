@@ -2115,12 +2115,6 @@ class Worker:
             if rid not in valid_rids:
                 batch_N.batch.request_to_worker_graph.pop(rid, None)
 
-        per_req_nested_idxs = {
-            rid: self._graph_runtime.get_nested_loop_idxs_for_node(
-                rid, batch_N.partition, batch_N.node_name
-            ) for rid in batch_N.node_batch.request_ids
-        }
-
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.update_lru", synchronize=False)
@@ -2305,10 +2299,6 @@ class Worker:
             new_token_counts=ParallelList(
                 send_rids,
                 [new_token_counts.get(rid, {}) for rid in send_rids],
-            ),
-            nested_loop_indices=ParallelList(
-                send_rids,
-                [per_req_nested_idxs.get(rid) for rid in send_rids],
             ),
             stream_tokens_consumed=ParallelList(
                 send_rids,
@@ -3040,6 +3030,18 @@ class Worker:
                     future=future,
                     tp_seq=fallthrough_tp_seq,
                 ))
+                # Same accounting as the speculative path above. Without it a
+                # workload that never speculates -- image generation is one --
+                # flushes nothing, so MSTAR_PHASE_TIMING silently reports no
+                # breakdown at all, and the shared sample buffer (cleared only
+                # by _phase_flush) grows for the life of the run. The idle
+                # `batch is None` spin above is deliberately NOT counted:
+                # it is a wait, and counting it would both skew iter_total and
+                # make the flush period mean something other than iterations.
+                if phase_period:
+                    _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                    phase_iter[0] += 1
+                    _phase_flush()
             except Exception as e:
                 self._handle_main_loop_error(e, (pending, spec_pending), batch)
                 # Follower: a head from a step that raised must not sit at the

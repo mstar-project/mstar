@@ -132,10 +132,6 @@ class SendInput(NamedTuple):
     # Opaque to the runtime: it forwards each on the frames it builds.
     per_request_info: ParallelList[int, CurrentForwardPassInfo]
     new_token_counts: ParallelList[int, dict[str, int]]
-    # Snapshotted BEFORE the completion that produced this batch, because
-    # mark_node_complete and stop_loops both advance loop state -- the runtime
-    # cannot re-derive the pre-completion value at send time.
-    nested_loop_indices: ParallelList[int, NestedLoopIndices]
 
     # WORKER_GRAPHS_DONE fields the runtime cannot derive, so they come in here.
     # rid -> {edge name -> tokens consumed}; from StreamBuffer._consumed
@@ -484,6 +480,11 @@ class GraphRuntime(ABC):
         accessed when send_batch is called. This includes the partition,
         graph walk, rids involved, nested loop indices, output routing, etc.
         These are keyed on completion_id.
+
+        The nested loop indices are the node's loop context BEFORE this
+        completion: marking the node complete advances the loop counters, so
+        they are snapshotted here, first, and the send reports that snapshot
+        (on RESULT_TENSORS and as WORKER_GRAPHS_DONE's output loop indices).
         """
         pass
 

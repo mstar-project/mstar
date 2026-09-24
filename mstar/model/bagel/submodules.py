@@ -1278,7 +1278,7 @@ class LLMSubmodule(ARNodeSubmodule):
             + pos_embed
 
         empty_combined_emb[1:-1] = latents_
-        logger.debug(f"packed_seq = {empty_combined_emb}")
+        logger.debug("packed_seq = %s", empty_combined_emb)  # tensor repr: keep lazy
 
         if requires_cfg:
             cfg_text_scale = kwargs.pop("cfg_text_scale", self.config.cfg_text_scale)
@@ -1638,7 +1638,7 @@ class VAEDecoderSubmodule(NodeSubmodule):
     ) -> NameToTensorList:
         logger.debug(
             "Running BAGEL VAE dec with latents shape %s, h %d, w %d",
-            str(latents.shape), image_h, image_w
+            latents.shape, image_h, image_w
         )
         H = image_h
         W = image_w
