@@ -130,6 +130,58 @@ def test_store_and_register_creates_file():
         assert os.path.isfile(expected_path)
 
 
+class _DeploymentCommunicator(MockCommunicator):
+    def __init__(self, prefix: str):
+        super().__init__()
+        self.ipc_socket_path_prefix = prefix
+
+
+def _deployed_manager(shm_dir, prefix, entity_id="worker_0"):
+    mgr = SharedMemoryCommunicationManager(
+        my_entity_id=entity_id, hostname="localhost", device="cpu",
+        communicator=_DeploymentCommunicator(prefix), shm_dir=shm_dir,
+    )
+    mgr.register_request("req1", _empty_sharding_config())
+    return mgr
+
+
+def test_two_deployments_on_one_host_do_not_share_files():
+    """Tensor uuids are per-entity counters, so both servers' ``worker_0``
+    mint the same uuid. Named by entity and uuid alone, the second server
+    overwrote the first's file and its teardown unlinked a tensor the first
+    was still reading."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        a = _deployed_manager(tmpdir, "/tmp/mstar_a/")
+        b = _deployed_manager(tmpdir, "/tmp/mstar_b/")
+        [ia] = a.store_and_return_tensor_info("req1", {"out": [torch.ones(4)]})["out"]
+        [ib] = b.store_and_return_tensor_info("req1", {"out": [torch.zeros(4)]})["out"]
+        assert ia.uuid == ib.uuid, "precondition: the uuids really do collide"
+        a.register_for_send("req1", [ia])
+        b.register_for_send("req1", [ib])
+
+        assert a._shm_path("worker_0", ia.uuid) != b._shm_path("worker_0", ib.uuid)
+        b.force_cleanup_request("req1")
+        assert os.path.isfile(a._shm_path("worker_0", ia.uuid)), (
+            "the other deployment's teardown removed this one's tensor"
+        )
+
+
+def test_one_deployment_agrees_on_the_file_name():
+    """Producer and consumer derive the name independently, so the prefix has
+    to normalise: a trailing slash is the same deployment."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sender = _deployed_manager(tmpdir, "/tmp/mstar_a/", "worker_0")
+        receiver = _deployed_manager(tmpdir, "/tmp/mstar_a", "worker_1")
+        original = torch.randn(3, 5)
+        edges = [GraphEdge(next_node="LLM", name="x")]
+        sender.store_and_populate_graph_edges("req1", {"x": [original]}, edges)
+        sender.register_for_send("req1", edges[0].tensor_info)
+        receiver.start_read_tensors("req1", edges, graph_walk="decode")
+        receiver.get_ready_tensors(graph_walk="decode")
+        uuid = edges[0].tensor_info[0].uuid
+        assert torch.equal(receiver.get_tensor("req1", uuid), original)
+
+
 def test_full_sender_receiver_cycle():
     """Simulate a full sender → receiver cycle via SHM."""
     with tempfile.TemporaryDirectory() as tmpdir:
