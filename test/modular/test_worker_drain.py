@@ -35,6 +35,14 @@ def _worker(
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
     w._pending_removes = set()
+    w._pending_loop_stops = set()
+    # Identity interning: these tests use the rid string as its own handle, so
+    # the string/handle split is exercised without a real table.
+    w._rids = SimpleNamespace(
+        handle=lambda r: r if r in known_rids else None,
+        name=lambda h: h,
+        release=lambda h: None,
+    )
     w._last_active = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(

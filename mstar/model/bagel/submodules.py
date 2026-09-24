@@ -844,7 +844,7 @@ class LLMSubmodule(ARNodeSubmodule):
             labels = ["main", "cfg_text", "cfg_img"] # just return all labels since it is cheap
 
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
-                labels, fwd_info.request_id, device, seq_len
+                labels, fwd_info.rid_handle, device, seq_len
             )
 
         if graph_walk == "prefill_vae":
@@ -879,7 +879,7 @@ class LLMSubmodule(ARNodeSubmodule):
             seq_len = tensor_inputs["empty_combined_emb"].shape[0]
             node_inputs.input_seq_len = seq_len
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
-                labels, fwd_info.request_id, device, seq_len
+                labels, fwd_info.rid_handle, device, seq_len
             )
             node_inputs.tensor_inputs = {
                 **tensor_inputs,
