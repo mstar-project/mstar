@@ -49,6 +49,7 @@ import torch
 from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import (
     FutureAndPointers,
+    Rid,
     SharedMemoryCommunicationManager,
     _deserialize_tensor,
     _nullcontext,
@@ -553,7 +554,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             return seg, off
 
     def register_for_send(
-        self, request_id: str, tensor_infos: list[TensorPointerInfo],
+        self, request_id: Rid, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
         if not skip_cuda_sync and torch.cuda.is_available():
@@ -640,7 +641,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     # -- consumer ---------------------------------------------------------
 
     def start_read_tensors(
-        self, request_id: str, graph_edges: list[GraphEdge],
+        self, request_id: Rid, graph_edges: list[GraphEdge],
         graph_walk: str | None = None,
     ):
         # Increment races are benign here: a torn count can only make
@@ -791,7 +792,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 self._wake_q.put(None)
                 self._wake_q = None
 
-    def _cleanup_by_uuid(self, request_id: str, uuid: int):
+    def _cleanup_by_uuid(self, request_id: Rid, uuid: int):
         # Grandparent cleanup (refcounts): skip the file manager's unlink.
         super(SharedMemoryCommunicationManager, self)._cleanup_by_uuid(
             request_id, uuid)

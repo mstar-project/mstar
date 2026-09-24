@@ -1,6 +1,7 @@
 import logging
 import time
 from collections import defaultdict, deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -13,11 +14,17 @@ from mstar.worker.node_manager_utils import WorkerGraphsManager
 
 logger = logging.getLogger(__name__)
 
+# ``ScheduleTPNode`` names its requests by wire string, and a follower can get
+# one for a request it has already torn down (or not yet admitted). ``tp_rids``
+# maps those to this sentinel, which no request's handle ever equals, so it
+# reads as not-ready exactly as an unknown string rid used to.
+REMOVED_RID = -1
+
 
 @dataclass
 class ReadyNodeEntry:
     """A ready node entry for a single request."""
-    request_id: str
+    request_id: int
     worker_graph_id: int
     graph_walk: str
 
@@ -33,9 +40,9 @@ class ScheduledBatch:
     """
     node_name: str
     graph_walk: str
-    node_objects: dict[str,GraphNode]
+    node_objects: dict[int, GraphNode]
     # request_id -> worker_graph_id (for push-back on OOM)
-    request_to_worker_graph: dict[str, int] = None
+    request_to_worker_graph: dict[int, int] = None
     # ``ScheduleTPNode.spec_seq`` this batch came off the TP-follow FIFO with,
     # -1 otherwise. ``split_off_first`` / ``merge`` only ever see -1.
     tp_seq: int = -1
@@ -49,7 +56,7 @@ class ScheduledBatch:
         self.request_to_worker_graph.update(other.request_to_worker_graph)
 
     def split_off_first(
-        self, bs: int | None, exclude_rids: set[str] | None = None
+        self, bs: int | None, exclude_rids: set[int] | None = None
     ) -> "tuple[ScheduledBatch | None, ScheduledBatch | None]":
         """
         Return the first ScheduledBatch, as well as the remainder (None if
@@ -116,14 +123,19 @@ class MicroScheduler:
     ):
         self.engine_manager = engine_manager
         self.batch_number = 0
+        # Looks up the handle for a wire request id; the worker installs its
+        # rid table's. Only the TP-follow messages need it -- everything else
+        # here already holds handles. Defaults to the identity so a scheduler
+        # driven directly with its own keys (tests) needs no table.
+        self.rid_of: Callable[[str], int | None] = lambda r: r
         self.sched_type = sched_type
 
         # RIDs that have failed but have not gone through the cleanup procedure;
         # these cannot be scheduled (unless this is a TP follower node)
-        self.failed_rids: set[str] = set()
+        self.failed_rids: set[int] = set()
         # rid -> message, for requests a resource declared unservable during a
         # readiness check. Drained by the worker, which reports them onward.
-        self.admit_errors: dict[str, str] = {}
+        self.admit_errors: dict[int, str] = {}
 
         # lockstep-parallel (TP / SP instance) scheduling
         self.parallel_leader_nodes = parallel_leader_nodes
@@ -140,16 +152,16 @@ class MicroScheduler:
 
         self.node_and_walk_to_last_batch_num = {}
         # request_id -> monotonic time until which the request is held
-        self.held_until: dict[str, float] = {}
+        self.held_until: dict[int, float] = {}
         # Rids with a deferred remove; stop initiating new work for them.
         # Shared by reference with Worker._pending_removes.
-        self.pending_removes: set[str] = set()
+        self.pending_removes: set[int] = set()
 
         # rid -> number of committed (ZMQ received) tp follow batches still
         # queued. On the fail/abort path we drain these before ACKing READS_DONE
         # so the worker graph queues aren't torn down while a follow still needs
         # to pop from them.
-        self.pending_tp_follow_count: dict[str, int] = defaultdict(int)
+        self.pending_tp_follow_count: dict[int, int] = defaultdict(int)
 
     def _select_node_rr(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
@@ -169,18 +181,28 @@ class MicroScheduler:
                     best_graph_walk = req.graph_walk
         return best_node_name, best_graph_walk
 
-    def hold_requests(self, request_ids: list[str]) -> None:
+    def hold_requests(self, request_ids: list[int]) -> None:
         """Put requests on hold for a brief backoff period after OOM."""
         deadline = time.monotonic() + self.HOLD_BACKOFF_SECONDS
         for rid in request_ids:
             self.held_until[rid] = deadline
 
+    def tp_rids(self, message: ScheduleTPNode) -> list[int]:
+        """``ScheduleTPNode`` crosses the wire, so its rids are strings; these
+        are this rank's handles for them, in the leader's order. A rid this rank
+        does not know maps to ``REMOVED_RID``."""
+        return [
+            REMOVED_RID if (handle := self.rid_of(r)) is None else handle
+            for r in message.request_ids
+        ]
+
     def register_tp_follow(
         self, message: ScheduleTPNode
     ):
         self.tp_batches_pending_schedule.append(message)
-        for rid in message.request_ids:
-            self.pending_tp_follow_count[rid] += 1
+        for rid in self.tp_rids(message):
+            if rid != REMOVED_RID:
+                self.pending_tp_follow_count[rid] += 1
 
     # TP-follow FIFO accessors for the follower's async path (head only).
 
@@ -194,7 +216,7 @@ class MicroScheduler:
         # and the async follower's build / drop / void paths) pops here, so the
         # drain refcount is discharged in one place.
         message = self.tp_batches_pending_schedule.popleft()
-        for rid in message.request_ids:
+        for rid in self.tp_rids(message):
             if rid not in self.pending_tp_follow_count:
                 continue
             self.pending_tp_follow_count[rid] -= 1
@@ -204,8 +226,8 @@ class MicroScheduler:
 
     def pop_ready_rids(
         self, worker_graphs_manager: WorkerGraphsManager,
-        node_name: str, graph_walk: str, request_ids: list[str],
-    ) -> tuple[dict[str, GraphNode], dict[str, str]] | None:
+        node_name: str, graph_walk: str, request_ids: list[int],
+    ) -> tuple[dict[int, GraphNode], dict[int, int]] | None:
         """Pop ``node_name`` for exactly ``request_ids``, all or none.
         Checked for every rid before anything is popped, so the caller
         retries later for a partially ready set."""
@@ -226,8 +248,8 @@ class MicroScheduler:
             if not self._check_ready(node_name, rid, fwd_info):
                 return None
 
-        node_objects: dict[str, GraphNode] = {}
-        request_to_worker_graph: dict[str, int] = {}
+        node_objects: dict[int, GraphNode] = {}
+        request_to_worker_graph: dict[int, int] = {}
         for rid in request_ids:
             popped = queue.pop_ready_nodes(rid, [node_name])
             if popped:
@@ -259,7 +281,7 @@ class MicroScheduler:
         # leader's graph walk.
         popped = self.pop_ready_rids(
             worker_graphs_manager, first_tp_node.node_name,
-            first_tp_node.graph_walk, first_tp_node.request_ids,
+            first_tp_node.graph_walk, self.tp_rids(first_tp_node),
         )
         if popped is None:
             return
@@ -436,7 +458,7 @@ class MicroScheduler:
 
     def _cap_batch_and_schedule(
         self, batch: ScheduledBatch, max_bs: int | None,
-        exclude_rids: set[str] | None=None
+        exclude_rids: set[int] | None=None
     ) -> ScheduledBatch | None:
         """One step's worth off ``batch``; whatever is left goes to the backlog.
 
@@ -521,7 +543,7 @@ class MicroScheduler:
                 return scheduled
         return None
 
-    def _drop_backlogged_rid(self, rid: str) -> None:
+    def _drop_backlogged_rid(self, rid: int) -> None:
         """Take a request out of anything still queued for it.
 
         Its node was popped off the ready queue when the batch was assembled,
@@ -629,11 +651,11 @@ class MicroScheduler:
         # work that never materializes. The exception is a rid sitting in the
         # head TP follow batch: get_next_batch *will* schedule that one (rank 0
         # is waiting on it), so it counts as real ready work.
-        tp_pend_rids: set[str] = set()
+        tp_pend_rids: set[int] = set()
         if self.tp_batches_pending_schedule:
             pend: ScheduleTPNode = self.tp_batches_pending_schedule[0]
             if (pend.node_name, pend.graph_walk) != exclude_target:
-                tp_pend_rids = set(pend.request_ids)
+                tp_pend_rids = set(self.tp_rids(pend))
         now = time.monotonic()
         # Don't bother expiring held_until here — we only read it; the next
         # get_next_batch call will refresh.
@@ -661,7 +683,7 @@ class MicroScheduler:
         return False
 
     def _check_ready(
-        self, node_name: str, rid: str, fwd_info: CurrentForwardPassInfo,
+        self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
     ) -> bool:
         """Engine-level readiness, with a terminal failure taken out of the
         scan. Retryable not-ready (an in-flight KV read, a reload that doesn't
@@ -682,19 +704,19 @@ class MicroScheduler:
             return False
         return outcome.ok and outcome.ready
 
-    def take_admit_errors(self) -> dict[str, str]:
+    def take_admit_errors(self) -> dict[int, str]:
         """Hand the accumulated terminal admit failures to the caller, once."""
         errors, self.admit_errors = self.admit_errors, {}
         return errors
 
-    def fail_rids(self, rids: set[str]) -> None:
+    def fail_rids(self, rids: set[int]) -> None:
         """Stop scheduling new work for requests reported to the conductor as
         failed. Cleared by ``clear_rid`` when the removal comes back."""
         self.failed_rids.update(rids)
         for rid in rids:
             self._drop_backlogged_rid(rid)
 
-    def clear_rid(self, rid: str) -> None:
+    def clear_rid(self, rid: int) -> None:
         """Forget all per-request scheduler state; called on REMOVE_REQUEST."""
         self.failed_rids.discard(rid)
         self.admit_errors.pop(rid, None)

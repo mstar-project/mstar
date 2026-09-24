@@ -13,21 +13,29 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+from mstar.worker.rid_table import RidTable
 from mstar.worker.worker import Worker
 
 
 def _stub_worker(active_rids):
     """Minimal stub exposing only what _process_message_list touches."""
     stub = types.SimpleNamespace()
+    # Real interning: per_request_info is keyed by handle while messages carry
+    # the string, which is the translation _process_message_list relies on.
+    rids = RidTable()
+    stub._rid = rids.handle
     stub.worker_graphs_manager = types.SimpleNamespace(
-        per_request_info={rid: object() for rid in active_rids}
+        per_request_info={rids.intern(rid): object() for rid in active_rids}
     )
     stub._unprocessed_messages = {}
 
-    # REMOVE drops the rid from per_request_info (mirrors _remove_request's
-    # teardown); the other handlers are no-ops we don't exercise here.
+    # REMOVE drops the rid from per_request_info and frees its handle (mirrors
+    # _remove_request's teardown); the other handlers are no-ops we don't
+    # exercise here.
     def _remove(body):
-        stub.worker_graphs_manager.per_request_info.pop(body.request_id, None)
+        handle = rids.handle(body.request_id)
+        stub.worker_graphs_manager.per_request_info.pop(handle, None)
+        rids.release(handle)
 
     stub._remove_request = _remove
     stub._add_new_request = lambda body: None
@@ -83,7 +91,8 @@ def test_replay_buffered_remove_then_signal_terminates():
     assert err is None, f"unexpected error: {err!r}"
     assert finished, "_process_message_list did not terminate (re-append loop)"
     # The request was removed and not resurrected.
-    assert "X" not in stub.worker_graphs_manager.per_request_info
+    assert stub._rid("X") is None
+    assert not stub.worker_graphs_manager.per_request_info
 
 
 def test_out_of_order_messages_buffer_for_unknown_request():
