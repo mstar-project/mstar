@@ -406,8 +406,8 @@ def test_postprocess_honours_output_format():
         model.postprocess(image, "audio", None)
 
 
-def test_image_nodes_schedule_in_lockstep():
-    """Speculative scheduling launches each request's next step alone; batching needs lockstep."""
+def test_image_nodes_schedule_speculatively_unless_told_otherwise():
+    """Every image node is marked for the engine's speculative scheduling; the knob restores lockstep."""
     model = _make_model()
     nodes: dict[str, GraphNode] = {}
 
@@ -423,11 +423,11 @@ def test_image_nodes_schedule_in_lockstep():
     for section in model.get_graph_walk_graphs().values():
         collect(section)
     assert set(nodes) == {"text_encoder", "vae_encoder", "dit", "vae_decoder"}
-    assert {name: node.enable_async_scheduling for name, node in nodes.items()} == dict.fromkeys(nodes, False)
-    nodes.clear()
-    for section in _make_model(async_scheduling=True).get_graph_walk_graphs().values():
-        collect(section)  # the knob flips every image node to speculative scheduling
     assert {name: node.enable_async_scheduling for name, node in nodes.items()} == dict.fromkeys(nodes, True)
+    nodes.clear()
+    for section in _make_model(async_scheduling=False).get_graph_walk_graphs().values():
+        collect(section)  # the knob puts every image node back in lockstep
+    assert {name: node.enable_async_scheduling for name, node in nodes.items()} == dict.fromkeys(nodes, False)
 
 
 def test_vae_compile_knob_reaches_the_decoder_node():
