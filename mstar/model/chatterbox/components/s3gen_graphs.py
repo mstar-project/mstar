@@ -57,9 +57,15 @@ class ShapeGraphs:
     tensors to a captured shape (``pad``) and cut the result back (``trim``).
     """
 
-    def __init__(self, fn: Callable[[Tensors, tuple], Output], *, max_graphs: int = 64):
+    def __init__(self, fn: Callable[[Tensors, tuple], Output], *, max_graphs: int = 64, capture_after: int = 1):
         self._fn = fn
         self.max_graphs = int(max_graphs)
+        # a shape is captured on its ``capture_after``-th use: 1 captures at
+        # once, 2 leaves shapes that never recur (an utterance's last chunk
+        # has its own length) to the eager path instead of paying a capture
+        # for a graph nobody replays
+        self.capture_after = max(1, int(capture_after))
+        self._seen: dict[tuple, int] = {}
         self._graphs: OrderedDict[tuple, _Entry] = OrderedDict()
         self._pool = None
         self.captures = 0
@@ -98,6 +104,12 @@ class ShapeGraphs:
         key = self.key_of(padded, extra)
         entry = self._graphs.get(key)
         if entry is None:
+            if self.capture_after > 1:
+                seen = self._seen.get(key, 0) + 1
+                self._seen[key] = seen
+                if seen < self.capture_after:
+                    return self._fn(tensors, extra)
+                del self._seen[key]
             try:
                 entry = self._capture(key, padded, extra)
             except Exception:
@@ -304,11 +316,14 @@ class VocoderGraphs(ShapeGraphs):
 
     def __init__(
         self, spectrum: Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]], *, max_graphs: int = 128,
+        capture_after: int = 2,
     ):
         def fn(tensors: Tensors, extra: tuple) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             return tuple(spectrum(tensors["mel"], tensors["phase"], tensors["harmonic"], tensors.get("cache")))
 
-        super().__init__(fn, max_graphs=max_graphs)
+        # the ramp's chunk lengths recur across requests and get captured on
+        # their second use; a final chunk's length is usually unique and stays eager
+        super().__init__(fn, max_graphs=max_graphs, capture_after=capture_after)
 
     def __call__(
         self, mel: torch.Tensor, phase: torch.Tensor, harmonic: torch.Tensor, cache: torch.Tensor | None,
