@@ -209,6 +209,12 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   transcribing it (``test/nemotron_duplex/asr_check.py``, Whisper
   large-v3-turbo): MaskGIT sampling is knife-edge, so attention-backend
   numerics change the waveform but not the words.
+- Against vLLM-Omni 0.28's native duplex serving of the same checkpoint (three
+  eager fp32 engines, one session per GPU by its deploy config, its realtime
+  client): on the demo clip both systems' response latency is the model's
+  turn-taking decision (first agent text about 1.8 s after the user stops;
+  first voiced audio 1.6 s here vs 2.0 s in stream time there, 2.3-2.6 s wall
+  there), while M* serves 32 concurrent sessions with margin on one H100.
 - The nano text tokenizer is read from the ``nano/`` folder of
   ``pipecat-ai/NVIDIA-NemotronLabs-VoiceChat-11B-Spark`` (the base checkpoint
   ships only the RNN-T tokenizer); prefetch both repositories on machines
