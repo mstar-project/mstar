@@ -127,10 +127,12 @@ class HarmonicSource(nn.Module):
         harmonics = torch.arange(1, self.harmonic_num + 2, device=f0.device, dtype=f0.dtype).view(1, -1, 1)
         f_mat = f0 * harmonics / self.sampling_rate
         theta_mat = 2 * math.pi * (torch.cumsum(f_mat, dim=-1) % 1)
-        # torch.distributions.Uniform(-pi, pi).sample(): low + u*high - u*low
+        # torch.distributions.Uniform(-pi, pi).sample(): low + u*high - u*low, with
+        # the bounds as Python floats (cast to the tensor dtype per op, the same
+        # float32 arithmetic) rather than device tensors built from the host,
+        # which a CUDA graph capture cannot copy in
         u = noise.phase
-        low = torch.tensor(-math.pi, dtype=f0.dtype, device=f0.device)
-        high = torch.tensor(math.pi, dtype=f0.dtype, device=f0.device)
+        low, high = -math.pi, math.pi
         phase_vec = low + u * high - u * low
         phase_vec = torch.cat([torch.zeros_like(phase_vec[:, :1]), phase_vec[:, 1:]], dim=1)
         sine_waves = self.sine_amp * torch.sin(theta_mat + phase_vec)
