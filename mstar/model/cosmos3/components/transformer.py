@@ -163,8 +163,15 @@ class Cosmos3RotaryEmbedding(nn.Module):
 class TimestepEmbedder(nn.Module):
     """Two-layer MLP over sinusoidal timestep features (``linear_1``/``linear_2``).
 
-    Matches diffusers ``TimestepEmbedding`` (act = SiLU, no cond/post-act). Kept
-    in fp32 at build time, like diffusers' ``_keep_in_fp32_modules``.
+    Matches diffusers ``TimestepEmbedding`` (act = SiLU, no cond/post-act) and
+    stays fp32 like diffusers' ``_keep_in_fp32_modules`` — whatever dtype the
+    module tree around it is cast to. The transformer is shared by the DiT and
+    reasoner submodules and the worker casts each of them to bf16 in whatever
+    order it loads them; a cast that recursed into this module used to flip it
+    to bf16 whenever the reasoner's cast came after the DiT's, and the fp32
+    timestep features then failed the matmul (batched CFG and image-gen graph
+    capture). The upcast is lossless: the checkpoint stores these weights in
+    bf16.
     """
 
     def __init__(self, in_channels: int, time_embed_dim: int):
@@ -173,8 +180,16 @@ class TimestepEmbedder(nn.Module):
         self.act = nn.SiLU()
         self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim, bias=True)
 
+    def _apply(self, fn, recurse=True):
+        # ``Module.to``/``.bfloat16()`` on any ancestor lands here; keep the
+        # device move, undo the dtype change.
+        super()._apply(fn, recurse)
+        if any(t.is_floating_point() and t.dtype != torch.float32 for t in self.parameters()):
+            super()._apply(lambda t: t.float() if t.is_floating_point() else t, recurse)
+        return self
+
     def forward(self, sample: torch.Tensor) -> torch.Tensor:
-        return self.linear_2(self.act(self.linear_1(sample)))
+        return self.linear_2(self.act(self.linear_1(sample.float())))
 
 
 class Cosmos3PackedMoTAttention(nn.Module):
