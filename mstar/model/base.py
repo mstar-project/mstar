@@ -298,6 +298,16 @@ class Model(ABC):
             input_streams=input_streams,
         )
 
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Reject a deployment YAML this model cannot serve.
+
+        Called by the Conductor at startup with the parsed YAML. The model
+        sees only ``model_kwargs`` in ``__init__``, so checks on other keys
+        (``max_concurrent_requests``, ``resources``, ...) belong here. Raise
+        ``ValueError`` naming the key; ``config_path`` is for the message.
+        """
+        return
+
     def get_worker_graphs(self, config_path: str) -> list[WorkerGraph]:
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)

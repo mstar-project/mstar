@@ -686,6 +686,11 @@ def _write_config(tmp_path, name: str, **extra) -> str:
     return str(path)
 
 
+def _validate(model, path: str) -> None:
+    """What the Conductor does at startup with the deployment YAML."""
+    model.validate_config_yaml(yaml.safe_load(pathlib.Path(path).read_text()), path)
+
+
 def _sessions(n: int) -> dict:
     """The ``resources:`` block a deployment writes to size the ring — the same
     one ``EngineManager.build`` feeds to ``apply_yaml_overrides``, which is why
@@ -694,7 +699,7 @@ def _sessions(n: int) -> dict:
 
 
 @pytest.mark.parametrize("limit", [None, 0, -1, True, 1.0, "2"])
-def test_get_worker_graphs_refuses_a_deployment_with_no_admit_queue(
+def test_validate_config_yaml_refuses_a_deployment_with_no_admit_queue(
     model, tmp_path, limit
 ):
     """The pool is finite, and this is the primary gate on it.
@@ -714,11 +719,11 @@ def test_get_worker_graphs_refuses_a_deployment_with_no_admit_queue(
     extra = {} if limit is None else {"max_concurrent_requests": limit}
     path = _write_config(tmp_path, f"reject_{limit}.yaml", **extra)
     with pytest.raises(ValueError, match="max_concurrent_requests"):
-        model.get_worker_graphs(path)
+        _validate(model, path)
 
 
 @pytest.mark.parametrize("worlds", [0, -1, True, 1.0, 1.9, "2"])
-def test_get_worker_graphs_refuses_invalid_world_pool_size(
+def test_validate_config_yaml_refuses_invalid_world_pool_size(
     model, tmp_path, worlds
 ):
     path = _write_config(
@@ -728,11 +733,11 @@ def test_get_worker_graphs_refuses_invalid_world_pool_size(
         **_sessions(worlds),
     )
     with pytest.raises(ValueError, match=r"resources\.kv\.num_sessions"):
-        model.get_worker_graphs(path)
+        _validate(model, path)
 
 
 @pytest.mark.parametrize(("limit", "worlds"), [(2, 1), (8, 4), (2, None)])
-def test_get_worker_graphs_refuses_more_arrivals_than_worlds(
+def test_validate_config_yaml_refuses_more_arrivals_than_worlds(
     model, tmp_path, limit, worlds
 ):
     """A queue longer than the pool is a delayed failure: the conductor admits
@@ -750,11 +755,11 @@ def test_get_worker_graphs_refuses_more_arrivals_than_worlds(
     path = _write_config(tmp_path, f"over_{limit}_{worlds}.yaml", **extra)
 
     with pytest.raises(ValueError, match="exceeds the"):
-        model.get_worker_graphs(path)
+        _validate(model, path)
 
 
 @pytest.mark.parametrize(("limit", "worlds"), [(1, None), (1, 1), (4, 4), (8, 8)])
-def test_get_worker_graphs_accepts_a_deployment_inside_its_pool(
+def test_validate_config_yaml_accepts_a_deployment_inside_its_pool(
     model, tmp_path, limit, worlds
 ):
     """``limit == num_sessions`` is the shape that should be written, at any size.
@@ -765,6 +770,7 @@ def test_get_worker_graphs_accepts_a_deployment_inside_its_pool(
         extra |= _sessions(worlds)
     path = _write_config(tmp_path, f"ok_{limit}_{worlds}.yaml", **extra)
 
+    _validate(model, path)
     graphs = model.get_worker_graphs(path)
 
     assert graphs
@@ -784,6 +790,7 @@ def test_the_shipped_config_serializes_both_nodes_onto_one_rank(model):
     """
     path = pathlib.Path(__file__).resolve().parents[2] / "configs" / "waypoint.yaml"
 
+    _validate(model, str(path))
     graphs = model.get_worker_graphs(str(path))
 
     assert {walk for g in graphs for walk in g.graph_walks} == {PRIME_WALK, ROLLOUT_WALK}
@@ -793,7 +800,16 @@ def test_the_shipped_config_serializes_both_nodes_onto_one_rank(model):
     assert set(by_walk[ROLLOUT_WALK].section.get_nodes()) == {DIT_NODE}
 
 
-def test_get_worker_graphs_warns_about_worlds_no_request_can_reach(
+def test_validate_config_yaml_refuses_a_step_wider_than_the_world_pool(tmp_path):
+    model = WaypointModel(skip_weight_loading=True, step_batch_size=4)
+    path = _write_config(
+        tmp_path, "wide_step.yaml", max_concurrent_requests=2, **_sessions(2)
+    )
+    with pytest.raises(ValueError, match="step_batch_size: 4"):
+        _validate(model, path)
+
+
+def test_validate_config_yaml_warns_about_worlds_no_request_can_reach(
     model, tmp_path, caplog
 ):
     """Legal, only wasteful -- a warning, not a refusal. Each unreachable
@@ -804,7 +820,7 @@ def test_get_worker_graphs_warns_about_worlds_no_request_can_reach(
     )
 
     with caplog.at_level(logging.WARNING):
-        assert model.get_worker_graphs(path)
+        _validate(model, path)
 
     assert any("can never be filled" in r.getMessage() for r in caplog.records)
 
