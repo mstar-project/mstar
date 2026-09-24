@@ -228,6 +228,19 @@ class HiFTGenerator(nn.Module):
         )
 
     def decode(self, mel: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        magnitude, phase = self.decode_spectrum(mel, source)
+        return self.waveform(magnitude, phase)
+
+    def waveform(self, magnitude: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        """Output spectrum -> waveform: the inverse STFT and the clamp. Kept out
+        of the vocoder's CUDA graph because ``torch.istft`` synchronises on its
+        window-overlap check, which a capture forbids; it is a handful of
+        16-point frames, so it costs next to nothing eagerly."""
+        x = self._istft(magnitude, phase)
+        return torch.clamp(x, -self.config.audio_limit, self.config.audio_limit)
+
+    def decode_spectrum(self, mel: torch.Tensor, source: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """mel + excitation -> (magnitude, phase) of the output STFT; capturable."""
         s_real, s_imag = self._stft(source.squeeze(1))
         s_stft = torch.cat([s_real, s_imag], dim=1)
 
@@ -250,8 +263,7 @@ class HiFTGenerator(nn.Module):
         half = self.config.istft_n_fft // 2 + 1
         magnitude = torch.exp(x[:, :half, :])
         phase = torch.sin(x[:, half:, :])
-        x = self._istft(magnitude, phase)
-        return torch.clamp(x, -self.config.audio_limit, self.config.audio_limit)
+        return magnitude, phase
 
     def draw_noise(self, mel: torch.Tensor, generator: torch.Generator | None) -> HiFTNoise:
         """The excitation draws for vocoding ``mel`` (``[B, 80, T]``)."""
@@ -277,7 +289,15 @@ class HiFTGenerator(nn.Module):
     def vocode_with(
         self, mel: torch.Tensor, phase: torch.Tensor, harmonic: torch.Tensor, cache_source: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``vocode`` with every random draw given: deterministic, graph-capturable."""
+        """``vocode`` with every random draw given: deterministic."""
+        magnitude, out_phase, source = self.spectrum(mel, phase, harmonic, cache_source)
+        return self.waveform(magnitude, out_phase), source
+
+    def spectrum(
+        self, mel: torch.Tensor, phase: torch.Tensor, harmonic: torch.Tensor, cache_source: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Everything but the inverse STFT: ``(magnitude, phase, source)`` from
+        the mel and the excitation draws; deterministic and graph-capturable."""
         f0 = self.f0_predictor(mel)
         source = F.interpolate(f0[:, None], scale_factor=float(self.upsample_factor), mode="nearest").transpose(1, 2)
         source = self.m_source(source, HiFTNoise(phase=phase, harmonic=harmonic)).transpose(1, 2)
@@ -285,7 +305,8 @@ class HiFTGenerator(nn.Module):
             n = min(cache_source.shape[-1], source.shape[-1])
             head = cache_source[:, :, :n].to(source.dtype)
             source = torch.cat([head, source[:, :, n:]], dim=-1)
-        return self.decode(mel, source), source
+        magnitude, out_phase = self.decode_spectrum(mel, source)
+        return magnitude, out_phase, source
 
     def forward(self, mel: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
         return self.vocode(mel, generator=generator)[0]
