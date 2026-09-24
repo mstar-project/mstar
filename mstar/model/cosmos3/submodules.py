@@ -2825,6 +2825,17 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
         self.eos_token_id = reasoner.eos_token_id if reasoner is not None else None
         self.image_token_id = reasoner.image_token_id if reasoner is not None else -1
         self.video_token_id = reasoner.video_token_id if reasoner is not None else -1
+        # The prefill's text tower, compiled (dynamic over the prompt length;
+        # fullgraph=False breaks at the attention op like the denoise). Decode
+        # keeps the captured graph. CUDA only: the CPU tests run eager.
+        env = os.environ.get("COSMOS3_REASONER_PREFILL_COMPILE")
+        want = (env == "1") if env is not None else bool(config.compile_reasoner_prefill)
+        on_cuda = transformer is not None and any(p.is_cuda for p in transformer.parameters())
+        if want and on_cuda:
+            self._prefill_text_forward = torch.compile(transformer.text_forward, fullgraph=False, dynamic=True)
+            logger.info("Cosmos3 reasoner prefill torch.compile enabled")
+        else:
+            self._prefill_text_forward = transformer.text_forward if transformer is not None else None
 
     # ------------------------------------------------------------------
     # prepare_inputs
@@ -2948,8 +2959,10 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
         # Native bf16 (see the DiT node): the reference text tower runs pure bf16.
         with torch.autocast(device_type="cuda", enabled=False):
             embeds = self._embed(input_ids, vision_embeds)
-            hidden = self.transformer.text_forward(embeds, position_ids.to(embeds.device), REASONER_LABEL)
-            if graph_walk in REASONER_PREFILL_WALKS:
+            prefill = graph_walk in REASONER_PREFILL_WALKS
+            text_forward = self._prefill_text_forward if prefill else self.transformer.text_forward
+            hidden = text_forward(embeds, position_ids.to(embeds.device), REASONER_LABEL)
+            if prefill:
                 # The last position of each request's span predicts its first token.
                 ends = torch.tensor(seq_lens, device=hidden.device).cumsum(0) - 1
                 hidden = hidden[ends]
