@@ -83,6 +83,7 @@ class SolveGraphs:
 
     # -- solving -------------------------------------------------------------
 
+    @torch.no_grad()
     def __call__(
         self, mu: torch.Tensor, mask: torch.Tensor, spks: torch.Tensor, cond: torch.Tensor,
         noise: torch.Tensor, n_timesteps: int,
@@ -109,10 +110,13 @@ class SolveGraphs:
         self.replays += 1
         return entry.output[:batch].clone()
 
+    @torch.no_grad()
     def warmup(self, frames: Iterable[int], n_timesteps: int, example: dict[str, torch.Tensor]) -> int:
         """Capture every ``(rows, frames)`` shape ahead of time from ``example``
         inputs (one row each, frames ≥ every requested length; the head is used).
-        Returns how many graphs were captured."""
+        Returns how many graphs were captured. Inference only, like ``__call__``:
+        with autograd on, the warm-up solves would keep every activation of
+        the 560 estimator blocks alive (tens of GB for a few rows)."""
         before = self.captures
         for f in sorted(set(int(x) for x in frames)):
             for rows in self.rows:
