@@ -8,7 +8,6 @@ from pathlib import Path
 
 from mstar.model.command_a_plus.config import CommandAPlusConfig, CommandAPlusTextConfig
 
-
 FIXTURE = Path(__file__).parent / "fixtures" / "tiny_config.json"
 
 

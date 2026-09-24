@@ -189,8 +189,8 @@ class CommandAPlusLanguageModel(nn.Module):
 
     As in Orpheus, the node's preprocessing calls ``embed_tokens`` separately.
     ``forward`` takes ``[total_step_tokens, hidden_size]``; resource plans carry
-    request boundaries, positions and cached history. Logits and checkpoint
-    loading belong to the causal-LM wrapper added in the next milestone.
+    request boundaries, positions and cached history. The causal-LM wrapper
+    provides tied output logits and checkpoint loading.
     """
 
     def __init__(
