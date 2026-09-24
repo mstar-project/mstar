@@ -186,9 +186,13 @@ class ChatterboxModel(Model):
                 raise ValueError("s3gen_max_batch_size must be at least 1")
             self.config.s3gen_max_batch_size = int(s3gen_max_batch_size)
         self._s3gen_estimator_dtype = _parse_dtype(self.config.s3gen_estimator_dtype)
-        if self.config.s3gen_graphs:
-            if self.config.s3gen_compile:
+        if self.config.s3gen_compile and self.config.s3gen_graphs:
+            if s3gen_graphs:
                 raise ValueError("s3gen_graphs and s3gen_compile are alternatives; enable one of them")
+            # compile was asked for explicitly, graphs are the default: compile wins
+            logger.info("s3gen_compile requested: the S3Gen CUDA graphs are off for this deployment")
+            self.config.s3gen_graphs = False
+        if self.config.s3gen_graphs:
             if self.config.s3gen_frame_bucket <= 0:
                 # graphs are per shape: without a bucket every chunk length
                 # would be a capture of its own
