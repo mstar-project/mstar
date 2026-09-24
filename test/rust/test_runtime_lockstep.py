@@ -20,7 +20,7 @@ import torch
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
-from mstar.graph.runtime.base import EdgeSpec, RouteInput
+from mstar.graph.runtime.base import EdgeSpec, RouteInput, SpeculationPrepInput
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
@@ -49,6 +49,32 @@ def _loop_graph():
             name="ar_loop",
             section=GraphNode(
                 name="ar_decode", input_names={"token"},
+                outputs=[GraphEdge(name="token", next_node="ar_decode")],
+            ),
+            outputs=[GraphEdge(name="token", next_node="post_processor")],
+            max_iters=4,
+        ),
+    ])
+
+
+def _ext_loop_graph():
+    """A rollout loop whose node takes a loop-EXTERNAL input as well as a
+    self loop-back -- the wan22/waypoint shape. `text` is held by the loop and
+    re-injected unchanged each iteration, so it only ever lands in
+    ready_signals; `token` is the loop-back. `_loop_graph` has no external
+    inputs at all, so nothing else here exercises that path."""
+    return Sequential(sections=[
+        GraphNode(
+            name="prefill", input_names={"prompt"},
+            outputs=[
+                GraphEdge(name="token", next_node="ar_decode"),
+                GraphEdge(name="text", next_node="ar_decode"),
+            ],
+        ),
+        Loop(
+            name="ar_loop",
+            section=GraphNode(
+                name="ar_decode", input_names={"token", "text"},
                 outputs=[GraphEdge(name="token", next_node="ar_decode")],
             ),
             outputs=[GraphEdge(name="token", next_node="post_processor")],
@@ -194,7 +220,7 @@ class Lockstep:
                            for e in p.input_edges))
         return self._both(f"pop_rids({node})", f)
 
-    def route(self, node, rid, signals, uuids):
+    def route(self, node, rid, signals, uuids, num_tensors=None):
         def f(rt, b, s):
             out = rt.complete_and_route_batch(
                 RouteInput(
@@ -202,7 +228,8 @@ class Lockstep:
                     output_signals=list(signals),
                     wg_ids=ParallelList([rid], [WG_ID]),
                     tensors=list(uuids),
-                    num_tensors=[len(uuids)] * len(signals),
+                    num_tensors=list(num_tensors) if num_tensors is not None
+                    else [len(uuids)] * len(signals),
                 ), s)
             _finish_teardown(s, out.freed_inputs)
             return (sorted(out.register_tensor_idxs), sorted(out.register_rids),
@@ -222,6 +249,24 @@ class Lockstep:
         for rt, _b, store in (self.py, self.rs):
             freed = rt.cleanup_consumed_inputs(node, [rid], [WG_ID])
             _finish_teardown(store, freed)
+
+    def spec(self, node, rid, tag=""):
+        return self._both(f"speculate_node({node}){tag}",
+                          lambda rt, b, s: _spec(rt, node, rid))
+
+    def prep(self, spec_node, curr_node, rid, tag=""):
+        """prep_spec_rids: which rids continue, and with WHICH inputs. The
+        input edges are what the worker turns into the batch's tensors."""
+        def f(rt, b, s):
+            out = rt.prep_spec_rids(SpeculationPrepInput(
+                spec_node_name=spec_node, curr_node_name=curr_node,
+                graph_walk=WALK, rids=[rid], room_for_continuing=8,
+                streaming_edges=[], streaming_edges_per_rid=[0],
+            ))
+            return (sorted(out.ready_rids),
+                    sorted((e.signal, e.next_node, list(e.uuids))
+                           for e in out.input_edges))
+        return self._both(f"prep_spec_rids({curr_node}->{spec_node}){tag}", f)
 
     def refcounts(self, uuids):
         """The bookkeeper's view -- tracked and collectable -- per uuid."""
@@ -592,3 +637,66 @@ def test_speculative_flag_survives_completion(lock):
                lambda rt, b, s: rt.set_speculatively_scheduled(
                    "ar_decode", WG_ID, [rid], False))
     assert lock._both("is_spec_scheduled after clear", flag) is False
+
+
+@pytest.fixture
+def ext_lock():
+    return Lockstep(_ext_loop_graph())
+
+
+def test_loop_external_input_speculation_agrees(ext_lock):
+    """A loop-external input must not block a same-node speculation.
+
+    It never lands in ready_next_iter -- the loop re-injects it into
+    ready_signals each iteration -- so the next-iter gate has to count it
+    (GraphNode.is_ready_for_speculation's `carried_names`, mirrored by
+    `Slot::persist` on the Rust side). Both runtimes are driven through two
+    iterations, cleanup and route included, so a bit that goes stale on one
+    side shows up here.
+    """
+    lock = ext_lock
+    rid = lock.admit()
+    lock.put(101)
+    lock.ingest(rid, "prompt", "prefill", [101])
+    lock.pop("prefill", rid)
+    lock.put(201)
+    lock.put(202)
+    lock.route("prefill", rid, ["token", "text"], [201, 202], num_tensors=[1, 1])
+    lock.ready()
+    lock.spec("ar_decode", rid, " iter 0")
+    for uuid in (203, 204):
+        lock.pop("ar_decode", rid)
+        lock.spec("ar_decode", rid, f" popped {uuid}")
+        lock.put(uuid)
+        # Worker order: _postprocess_batch cleans up, then routes.
+        lock.cleanup("ar_decode", rid)
+        lock.spec("ar_decode", rid, f" cleanup/route window {uuid}")
+        lock.route("ar_decode", rid, ["token"], [uuid])
+        lock.ready()
+        lock.spec("ar_decode", rid, f" post-route {uuid}")
+    lock.refcounts([101, 201, 202, 203, 204])
+
+
+def test_speculative_batch_carries_the_loop_external_input(ext_lock):
+    """The gate and the input gathering must agree on what is available.
+
+    Not just a parity check: both runtimes admitted the speculation while
+    handing back a batch with no `text` in it. Only the source node's consumed
+    edges (`token`) get threaded in after the await, so nothing would ever have
+    filled it and the node would execute an input short.
+    """
+    lock = ext_lock
+    rid = lock.admit()
+    lock.put(101)
+    lock.ingest(rid, "prompt", "prefill", [101])
+    lock.pop("prefill", rid)
+    lock.put(201)
+    lock.put(202)  # 201 = token (loop-back), 202 = text (external)
+    lock.route("prefill", rid, ["token", "text"], [201, 202], num_tensors=[1, 1])
+    lock.pop("ar_decode", rid)
+    assert lock.spec("ar_decode", rid) == [
+        ("ar_decode", WALK, True, "ar_loop", ("token",))
+    ]
+    ready_rids, input_edges = lock.prep("ar_decode", "ar_decode", rid)
+    assert ready_rids == [rid]
+    assert ("text", "ar_decode", [202]) in input_edges, input_edges

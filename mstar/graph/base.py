@@ -338,8 +338,19 @@ class GraphNode(GraphSection):
         if allow_streaming:
             needed_inputs = needed_inputs - self._streaming_inputs
         if check_next_iter:
+            # Loop-external inputs are re-injected unchanged into ready_signals
+            # every iteration (Loop.ingest_external_input / complete_iter) and
+            # never routed through ready_next_iter. Count them here so a
+            # same-node next-iteration speculation isn't blocked on inputs
+            # that are guaranteed to reappear.
+            carried_names = {
+                name for name, edge in self.ready_signals.ready_inputs.items()
+                if edge._persist_for_loop
+            }
             return needed_inputs.issubset(
-                self.ready_next_iter.ready_names | self.speculative_signals.ready_names
+                self.ready_next_iter.ready_names
+                | self.speculative_signals.ready_names
+                | carried_names
             )
         return needed_inputs.issubset(
             self.ready_signals.ready_names | self.speculative_signals.ready_names

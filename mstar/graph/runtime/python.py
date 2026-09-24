@@ -896,6 +896,20 @@ class PythonGraphRuntime(GraphRuntime):
             return None
 
         slots = node.ready_next_iter if same_node else node.ready_signals
+        ready_inputs = slots.ready_inputs
+        if same_node:
+            # Carry over the loop-external inputs sitting in ready_signals --
+            # the same set is_ready_for_speculation counts. They are re-injected
+            # unchanged every iteration and never land in ready_next_iter, so
+            # without them the gate admits a speculation whose batch is built
+            # with an input missing: only the source node's consumed edges are
+            # threaded in afterwards.
+            carried = {
+                name: edge
+                for name, edge in node.ready_signals.ready_inputs.items()
+                if edge._persist_for_loop and name not in ready_inputs
+            }
+            ready_inputs = {**carried, **ready_inputs}
         return _SpecRidPrep(
             rid=rid,
             node=node,
@@ -906,7 +920,7 @@ class PythonGraphRuntime(GraphRuntime):
                     next_node=edge.next_node,
                     uuids=[info.uuid for info in edge.tensor_info],
                     is_final_streaming_chunk=edge._final_stream_chunk,
-                ) for name, edge in slots.ready_inputs.items()
+                ) for name, edge in ready_inputs.items()
             ],
             into_signals=into_signals,
             into_next_iter=into_next_iter,

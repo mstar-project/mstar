@@ -30,22 +30,29 @@ struct Slot {
     /// consuming pass reports the partition done, so it has to survive the
     /// ingest.
     final_chunk: u64,
+    /// Python's `GraphEdge._persist_for_loop`, per input slot: a loop's saved
+    /// external input. On the Slot rather than the node because Python reads
+    /// the flag off the edge sitting in a ReadySignals, so it must die with
+    /// the slot -- cleared, removed or swapped to the next iteration with it.
+    persist_for_loop: u64,
     tensors: Vec<Option<Vec<TensorRef>>>,
 }
 
 impl Slot {
     fn new(n: usize) -> Self {
-        Slot { mask: 0, final_chunk: 0, tensors: vec![None; n] }
+        Slot { mask: 0, final_chunk: 0, persist_for_loop: 0, tensors: vec![None; n] }
     }
     fn clear(&mut self) {
         self.mask = 0;
         self.final_chunk = 0;
+        self.persist_for_loop = 0;
         for t in self.tensors.iter_mut() {
             *t = None;
         }
     }
     fn set(&mut self, slot: u8, t: Vec<TensorRef>, final_chunk: bool) {
         self.mask |= 1 << slot;
+        self.persist_for_loop &= !(1 << slot);
         if final_chunk {
             self.final_chunk |= 1 << slot;
         } else {
@@ -56,6 +63,7 @@ impl Slot {
     fn take(&mut self, slot: u8) -> Option<Vec<TensorRef>> {
         self.mask &= !(1 << slot);
         self.final_chunk &= !(1 << slot);
+        self.persist_for_loop &= !(1 << slot);
         self.tensors[slot as usize].take()
     }
     fn is_final_chunk(&self, slot: u8) -> bool {
@@ -63,6 +71,9 @@ impl Slot {
     }
     fn has(&self, slot: u8) -> bool {
         self.mask >> slot & 1 == 1
+    }
+    fn is_persisted(&self, slot: u8) -> bool {
+        self.persist_for_loop >> slot & 1 == 1
     }
 }
 
@@ -283,28 +294,41 @@ impl RequestState {
         can_buffer: bool, final_chunk: bool,
     ) -> bool {
         let name = self.graph.node(node).inputs[slot as usize];
-        {
+        let into_next = {
             let st = &mut self.nodes[node as usize];
             if !st.cur.has(slot) {
                 st.cur.set(slot, tensors.clone(), final_chunk);
+                false
             } else if can_buffer && !st.next.has(slot) {
                 st.next.set(slot, tensors.clone(), final_chunk);
+                true
             } else {
                 return false;
             }
-        }
+        };
         // An ingest bubbles through every enclosing loop, each recording it if
         // it is external at that level (Loop.ingest_external_input recursing
         // via _managing_registry), then reaches the root's ready sets.
-        self.record_external(node, name, &tensors);
+        if self.record_external(node, name, &tensors) {
+            let st = &mut self.nodes[node as usize];
+            let slots = if into_next { &mut st.next } else { &mut st.cur };
+            slots.persist_for_loop |= 1 << slot;
+        }
         self.refresh_ready(node);
         self.note_ingested_for_streaming(node);
         true
     }
 
-    fn record_external(&mut self, node: NodeId, name: Sym, t: &[TensorRef]) {
+    /// Returns whether the ingested edge is a loop's saved external input,
+    /// i.e. Python's `_persist_for_loop`. That flag lives on the EDGE, so it
+    /// holds on every iteration once set -- hence membership in `ext_inputs`
+    /// rather than "was newly recorded". A second destination for the same
+    /// name reads false, as `Loop.ingest_external_input` skips it by name (and
+    /// so never re-injects it either).
+    fn record_external(&mut self, node: NodeId, name: Sym, t: &[TensorRef]) -> bool {
         let graph = self.graph.clone();
         let mut cur = graph.node(node).loop_id;
+        let mut persisted = false;
         while let Some(lid) = cur {
             let ls = graph.lp(lid);
             if ls.external_inputs.iter().any(|(n, d)| *n == name && *d == node) {
@@ -313,9 +337,11 @@ impl RequestState {
                     st.ext_names.push(name);
                     st.ext_inputs.push((name, node, t.to_vec()));
                 }
+                persisted |= st.ext_inputs.iter().any(|(n, d, _)| *n == name && *d == node);
             }
             cur = ls.parent;
         }
+        persisted
     }
 
     /// Python's `ReadySignals.remove` — speculation rollback. No dereference.
@@ -340,8 +366,25 @@ impl RequestState {
         let st = &self.nodes[node as usize];
         let slot = if next_iter { &st.next } else { &st.cur };
         spec.inputs.iter().enumerate()
-            .filter_map(|(i, &n)| slot.tensors[i].as_ref().map(
-                |t| (n, t.clone(), slot.is_final_chunk(i as u8))))
+            .filter_map(|(i, &n)| {
+                // Next-iteration gathering also carries the loop-external
+                // inputs still sitting in `cur` -- the same set
+                // `ready_for_speculation` counts. Without them the gate admits
+                // a speculation whose batch is then built with an input
+                // missing, and nothing later fills it: only the source node's
+                // consumed edges get threaded in. `next` wins where both hold
+                // the slot, as Python's `{**carried, **inputs}` does.
+                let from = if next_iter
+                    && !slot.has(i as u8)
+                    && st.cur.is_persisted(i as u8)
+                {
+                    &st.cur
+                } else {
+                    slot
+                };
+                from.tensors[i].as_ref().map(
+                    |t| (n, t.clone(), from.is_final_chunk(i as u8)))
+            })
             .collect()
     }
 
@@ -393,6 +436,11 @@ impl RequestState {
         let mut freed = Vec::new();
         for (i, name) in spec.inputs.iter().enumerate() {
             if held.contains(name) {
+                // The tensors stay (they must not be freed), but the slot no
+                // longer counts as a carried input: Python's counterpart
+                // clears ready_signals outright, so nothing is carried until
+                // the loop re-injects it on the next iteration.
+                st.cur.persist_for_loop &= !(1 << i);
                 continue;
             }
             if let Some(tensors) = st.cur.tensors[i].take() {
@@ -725,7 +773,14 @@ impl RequestState {
             needed &= !spec.streaming_mask;
         }
         let st = &self.nodes[node as usize];
-        let have = if check_next_iter { st.next.mask } else { st.cur.mask } | st.spec.mask;
+        // Python's `carried_names`: loop-external inputs are re-injected
+        // unchanged into ready_signals every iteration and never routed
+        // through ready_next_iter, so a same-node next-iteration speculation
+        // must not be blocked on inputs guaranteed to reappear. Read off `cur`
+        // exactly as Python reads ready_signals.ready_inputs.
+        let have = if check_next_iter {
+            st.next.mask | st.cur.persist_for_loop
+        } else { st.cur.mask } | st.spec.mask;
         needed & !have == 0
     }
 
