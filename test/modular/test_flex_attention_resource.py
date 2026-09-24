@@ -54,6 +54,7 @@ from mstar.engine.resources import (
     KVSpec,
     StepContext,
 )
+from mstar.engine.resources.attn import flex as flex_module
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.flex import (
     _FLEX_BACKEND,
@@ -202,6 +203,59 @@ def test_requires_kv_write_is_false_for_flex_and_true_for_the_paged_backend():
 
     paged_manager = build_attention(AttnBackend.FLASHINFER, paged_config())
     assert paged_manager.requires_kv_write is True
+
+
+@pytest.fixture
+def flash_env(monkeypatch):
+    """Drive ``_resolve_flex_backend`` with a chosen env var and FLASH verdict."""
+    def set_env(requested, reason):
+        if requested is None:
+            monkeypatch.delenv("MSTAR_FLEX_BACKEND", raising=False)
+        else:
+            monkeypatch.setenv("MSTAR_FLEX_BACKEND", requested)
+        monkeypatch.setattr(flex_module, "_flash_unavailable_reason", lambda: reason)
+    return set_env
+
+
+def test_the_default_backend_is_flash_when_it_can_run(flash_env):
+    flash_env(None, None)
+    assert flex_module._resolve_flex_backend() == "FLASH"
+
+
+def test_the_default_backend_falls_back_to_triton_when_flash_cannot_run(flash_env, caplog):
+    flash_env(None, "torch 2.10.0 < 2.11")
+    assert flex_module._resolve_flex_backend() == "TRITON"
+    assert "torch 2.10.0 < 2.11" in caplog.text
+
+
+def test_an_explicit_flash_request_fails_instead_of_falling_back(flash_env):
+    flash_env("FLASH", "flash-attn-4 (flash_attn.cute) is not importable")
+    with pytest.raises(RuntimeError, match="not importable"):
+        flex_module._resolve_flex_backend()
+
+
+def test_an_explicit_triton_request_skips_the_flash_probe(flash_env, monkeypatch):
+    flash_env("TRITON", None)
+    monkeypatch.setattr(flex_module, "_flash_unavailable_reason", None)  # raises if called
+    assert flex_module._resolve_flex_backend() == "TRITON"
+
+
+def test_an_unknown_backend_is_rejected(flash_env):
+    flash_env("CUDNN", None)
+    with pytest.raises(ValueError, match="MSTAR_FLEX_BACKEND"):
+        flex_module._resolve_flex_backend()
+
+
+@pytest.mark.parametrize(
+    ("version", "too_old"),
+    [("2.10.0+cu128", True), ("2.11.0", False), ("2.12.1+cu130", False)],
+)
+def test_flash_needs_a_torch_that_passes_the_sparse_block_size(monkeypatch, version, too_old):
+    from torch.torch_version import TorchVersion
+
+    monkeypatch.setattr(torch, "__version__", TorchVersion(version))
+    reason = flex_module._flash_unavailable_reason()
+    assert (reason is not None and reason.startswith("torch")) == too_old
 
 
 def test_plan_clears_the_inherited_cursors():
