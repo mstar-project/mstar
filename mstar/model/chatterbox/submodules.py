@@ -562,6 +562,7 @@ class S3GenSubmodule(NodeSubmodule):
         self.lookahead_tokens = s3.encoder.pre_lookahead_len
         self.context_tokens = config.stream_context_tokens
         self.frame_bucket = config.s3gen_frame_bucket
+        self.max_rows = int(config.s3gen_max_batch_size) if config.s3gen_max_batch_size else self.MAX_BATCH_SIZE
         self.cache_frames = config.stream_mel_cache_frames
         self.cache_samples = self.cache_frames * self.samples_per_frame
         # crossfade of the re-synthesised tail: the second half of a Hamming
@@ -639,7 +640,7 @@ class S3GenSubmodule(NodeSubmodule):
 
     # -- synthesis ----------------------------------------------------------------
 
-    MAX_BATCH_SIZE = 8  # requests whose flow solves share one padded batch
+    MAX_BATCH_SIZE = 8  # default for ``s3gen_max_batch_size``: requests per padded flow solve
 
     def _generator(self, seed: int, device) -> torch.Generator:
         return torch.Generator(device=device).manual_seed(seed)
@@ -797,13 +798,13 @@ class S3GenSubmodule(NodeSubmodule):
 
     def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
         del batch
-        return 1 < len(model_inputs) <= self.MAX_BATCH_SIZE
+        return 1 < len(model_inputs) <= self.max_rows
 
     def max_batch_size(self, graph_walk: str) -> int:
         # the scheduler sizes the node's batches from this (the base default is
         # one request), so without it the padded multi-request solve never runs
         del graph_walk
-        return self.MAX_BATCH_SIZE
+        return self.max_rows
 
     def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs]):
         del graph_walk, engine_inputs
