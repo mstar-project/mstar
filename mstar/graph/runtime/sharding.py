@@ -1,12 +1,16 @@
-"""Per-request sharding.
+"""Per-request sharding, derived the same way by both runtimes.
 
 A request's ``ShardingConfig`` is a pure function of the base config and the
 ``worker_graph_to_workers`` map the conductor sent with NEW_REQUEST:
-``clone_empty()`` then ``setup()`` on the map this module assembles.
+``clone_empty()`` then ``setup()`` on the map this module assembles. Rust
+derives its own copy by the same rule (``ShardingTemplate::instantiate``), but
+that copy cannot come back out: ``TensorCommunicationManager.register_request``
+wants the Python object, and the TP fan-out paths reach into
+``group._workers``. So the Python object is built here for both.
 """
 from __future__ import annotations
 
-from mstar.distributed.base import NodeAndGraphWalk
+from mstar.distributed.base import NodeAndGraphWalk, ShardingConfig
 from mstar.graph.runtime.base import ParallelList
 
 
@@ -29,3 +33,18 @@ def node_to_workers(
             for name in all_wg_ids_to_nodes[wg_id]:
                 out[NodeAndGraphWalk(node=name, graph_walk=walk)] = worker_ids
     return out
+
+
+def for_request(
+    base: ShardingConfig,
+    worker_graph_to_workers: ParallelList[int, list[str]],
+    all_wg_ids_to_graph_walks: dict[int, set[str]],
+    all_wg_ids_to_nodes: dict[int, set[str]],
+) -> ShardingConfig:
+    """This request's config. ``clone_empty`` so the base is never mutated --
+    it is shared by every request on this rank."""
+    config = base.clone_empty()
+    config.setup(node_to_workers(
+        worker_graph_to_workers, all_wg_ids_to_graph_walks, all_wg_ids_to_nodes,
+    ))
+    return config
