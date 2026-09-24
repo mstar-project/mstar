@@ -39,7 +39,7 @@ from mstar.streaming.chunk_policy import FixedChunkPolicy
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "nemotron_duplex.yaml"
 
-WALKS = {"encode", "prefill_text", "decode", "talker_decode", "codec_chunk"}
+WALKS = {"encode", "decode", "talker_decode", "codec_chunk"}
 NODES = {"conformer_encoder", "nano_llm", "eartts_talker", "audio_codec"}
 
 
@@ -157,27 +157,39 @@ def test_duplex_worker_graphs_derive_all_walks():
 
 def test_duplex_initial_partition_routing():
     model = _make_model()
-    sig = {"audio_features": ["a"], "text_inputs": ["t"]}
-    expected = {"Encoder": "encode", "LLM": "prefill_text",
+    sig = {"audio_features": ["a"], "text_inputs": ["t"], "has_prompt": ["h"], "prev_text": ["p"], "prev_func": ["f"]}
+    expected = {"Encoder": "encode", "LLM": "decode",
                 "Talker": "talker_decode", "Codec": "codec_chunk"}
     for pname, walk in expected.items():
         fpa = model.get_initial_forward_pass_args(pname, ["audio"], ["audio", "text"], sig)
         assert fpa.full_metadata.graph_walk == walk
-    # no system prompt -> LLM starts straight in the decode loop
-    fpa = model.get_initial_forward_pass_args("LLM", ["audio"], ["audio"], {"audio_features": ["a"]})
-    assert fpa.full_metadata.graph_walk == "decode"
+    # with a system prompt the LLM's first step is prompt + frame: flagged so the
+    # worker keeps it off the fixed-shape decode capture; the prompt rides the loop
+    fpa = model.get_initial_forward_pass_args("LLM", ["audio", "text"], ["audio", "text"], sig)
+    assert fpa.step_metadata == {"prompt_pending": True} and fpa.full_metadata.is_prefill is True
+    assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func", "text_inputs"}
+    # no system prompt -> same walk, nothing pending
+    no_prompt = {"audio_features": ["a"], "text_inputs": ["s"]}
+    fpa = model.get_initial_forward_pass_args("LLM", ["audio"], ["audio"], no_prompt)
+    assert fpa.full_metadata.graph_walk == "decode" and fpa.step_metadata == {"prompt_pending": False}
     # audio not requested -> streaming output partitions are immediately done
     assert model.get_initial_forward_pass_args("Codec", ["audio"], ["text"], sig).request_done
 
 
-def test_duplex_llm_prefill_to_decode_transition():
+def test_duplex_llm_after_the_first_step_nothing_is_pending():
     model = _make_model()
-    meta = model._meta(["audio"], ["audio"], "prefill_text", True)
+    meta = model._meta(["audio", "text"], ["audio"], "decode", True)
     fpa = model.get_partition_forward_pass_args("LLM", meta, {"prev_text": ["pt"], "prev_func": ["pf"]})
     assert fpa.full_metadata.graph_walk == "decode"
     assert fpa.full_metadata.is_prefill is False
-    # the primed carry-in tokens persisted by prefill_text feed decode iteration 0
+    assert fpa.step_metadata == {"prompt_pending": False}
     assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func"}
+    # the decode node lists the prompt as a fed-back input, so a re-injected copy
+    # of the seed can never outrank the node's own sentinel
+    decode = model.get_graph_walk_graphs()["decode"]
+    node = next(iter(decode.section.get_nodes().values()))
+    assert "text_inputs" in node.input_names
+    assert any(e.name == "text_inputs" and e.next_node == "nano_llm" for e in node.outputs)
 
 
 def test_duplex_stream_connection_policies():
@@ -215,6 +227,7 @@ def test_duplex_process_prompt_seeds_frame0_feedback():
     assert "audio_features" in out
     assert int(out["prev_text"][0].item()) == model.config.text_bos_id
     assert int(out["prev_func"][0].item()) == model.config.text_pad_id
+    assert out["text_inputs"][0].tolist() == [-1] and "has_prompt" not in out   # no prompt: the sentinel
     # after a system prompt the agent channel is held at PAD across the prompt, so
     # the first audio frame's previous agent token is PAD, not BOS (reference)
     model._tokenizer = lambda prompt, return_tensors: SimpleNamespace(input_ids=torch.tensor([[5, 6, 7]]))
@@ -223,15 +236,15 @@ def test_duplex_process_prompt_seeds_frame0_feedback():
         tensors={"audio_inputs": [torch.zeros(16000)]},
     )
     assert int(out_p["prev_text"][0].item()) == model.config.text_pad_id
-    assert out_p["text_inputs"][0].tolist() == [5, 6, 7]
+    assert out_p["text_inputs"][0].tolist() == [5, 6, 7] and "has_prompt" in out_p
 
 
 def test_duplex_no_prompt_seeds_initial_decode_inputs():
-    """Audio-only start (no system prompt): the LLM partition jumps straight to
-    the decode loop and its initial inputs carry the seeded prev_text / prev_func
-    so iteration 0's readiness gate fires."""
+    """Audio-only start (no system prompt): the LLM partition starts in the
+    decode loop and its initial inputs carry the seeded prev_text / prev_func
+    and the no-prompt text_inputs sentinel so iteration 0's readiness gate fires."""
     model = _make_model()
-    sig = {"audio_features": ["a"], "prev_text": ["pt"], "prev_func": ["pf"]}
+    sig = {"audio_features": ["a"], "prev_text": ["pt"], "prev_func": ["pf"], "text_inputs": ["s"]}
     fpa = model.get_initial_forward_pass_args("LLM", ["audio"], ["audio"], sig)
     assert fpa.full_metadata.graph_walk == "decode"
-    assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func"}
+    assert {e.name for e in fpa.inputs} == {"prev_text", "prev_func", "text_inputs"}
