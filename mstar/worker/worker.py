@@ -2326,7 +2326,7 @@ class Worker:
             range_push("worker.postprocess.route_outputs", synchronize=False)
         # Mark nodes complete and route
         routing_per_request: dict[str, NodeOutputRouting] = {}
-        per_request_uuids: dict[str, set[str]] = {}
+        per_request_uuids: dict[str, set[int]] = {}
         for rid, wg_id in batch_N.batch.request_to_worker_graph.items():
             # Store output tensors before marking the node as complete so that
             # loop outputs can be buffered properly.

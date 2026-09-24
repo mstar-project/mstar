@@ -81,14 +81,14 @@ class InputSignals(MessageBody):
 @dataclass
 class TensorReceived(MessageBody):
     request_id: str
-    successful_tensors: dict[str, int] # uuid -> graph edge count
-    failed_tensor_ids: list[str] # uuids
+    successful_tensors: dict[int, int] # uuid -> graph edge count
+    failed_tensor_ids: list[int] # uuids
 
 
 @dataclass
 class UnpersistTensors(MessageBody):
     request_id: str
-    uuid_to_ref_count: dict[str, int]
+    uuid_to_ref_count: dict[int, int]
 
 @dataclass
 class StopLoops(MessageBody):

@@ -21,7 +21,7 @@ class TensorPointerInfo:
     nbytes: int
     address: int
     stride: list[int]
-    uuid: str  # for indexing storage
+    uuid: int  # (entity_index << 48) | counter; see communication/tensor_uuid.py
     source_session_id: str  # "{HOSTNAME}:{client_engine.get_rpc_port()}"
     source_entity: str  # which {worker, api_server} the tensor is on
     offset: int = 0 # offset, in bytes, of the read (e.g., for in-transport sharding

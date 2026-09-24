@@ -293,7 +293,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # uuid -> (segment_idx, offset) for sender-side reclaim.
         # (register_for_send receives the TensorPointerInfos directly and
         # stamps them in place — no side-table needed.)
-        self._arena_locs: dict[str, tuple[int, int]] = {}
+        self._arena_locs: dict[int, tuple[int, int]] = {}
         # uuid -> stage time, for the TTL backstop: a request aborted after
         # staging but before every consumer ACKs defers reclaim forever
         # (cleanup_request waits for ACKs that will never come). A slot
@@ -302,7 +302,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # above it cannot race a real consumer. Default OFF pending review
         # discussion; enable with MSTAR_SHM_ARENA_SLOT_TTL_S (recommend
         # >= 2x the request timeout).
-        self._arena_ts: dict[str, float] = {}
+        self._arena_ts: dict[int, float] = {}
         self._slot_ttl_s = float(
             os.getenv("MSTAR_SHM_ARENA_SLOT_TTL_S", "0"))
         self._ttl_reclaimed_total = 0
@@ -791,7 +791,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 self._wake_q.put(None)
                 self._wake_q = None
 
-    def _cleanup_by_uuid(self, request_id: str, uuid: str):
+    def _cleanup_by_uuid(self, request_id: str, uuid: int):
         # Grandparent cleanup (refcounts): skip the file manager's unlink.
         super(SharedMemoryCommunicationManager, self)._cleanup_by_uuid(
             request_id, uuid)
