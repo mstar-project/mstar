@@ -339,8 +339,11 @@ def test_graphed_solve_matches_eager_on_cuda(pair):
         print(f"[{variant}] graphed vs eager: max {diff:.3e}, log-mel corr {corr:.6f}")
         assert diff < 2e-2 and corr > 0.99999
         assert torch.equal(b, c), "a replay must be deterministic"
+    # the vocoder captures a length on its second use (one-off final-chunk lengths stay eager)
+    wav_first = gpu.mel_to_wav(eager[0], generator=torch.Generator(device="cuda").manual_seed(8))
+    assert gpu.vocoder_graphs.captures == 0 and torch.equal(wav_first, wav_eager)
     wav_graphed = gpu.mel_to_wav(eager[0], generator=torch.Generator(device="cuda").manual_seed(8))
-    assert gpu.vocoder_graphs.captures == 1
+    assert gpu.vocoder_graphs.captures == 1 and gpu.vocoder_graphs.replays == 1
     wav_diff = (wav_eager - wav_graphed).abs().max().item()
     print(f"[{variant}] graphed vocoder vs eager: max {wav_diff:.3e}")
     assert wav_diff < 1e-3
