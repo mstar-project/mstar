@@ -394,6 +394,26 @@ def test_python_tears_a_freed_input_down_in_place():
     assert book.can_gc(7), "still released, just by the other route"
 
 
+def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
+    """``pending_loop_stops`` is cleared once per postprocess, not per removal,
+    and handles are recycled -- so a request admitted in between reads as
+    already stopped. The worker then drops its outputs on a speculative new
+    iteration and prep leaves it out of speculation. On main the key was the
+    string rid, which never recurs."""
+    rt, _book, _store = pair
+    rid = _admit(rt, "r1")
+    rt.stop_loops_batched(
+        partition="default", graph_walk=WALK, last_node_run="prefill",
+        loop_names=ParallelList([rid], [["ar_loop"]]),
+    )
+    assert rt.has_pending_loop_stop(rid, WALK, "ar_loop"), "nothing to inherit"
+    rt.remove_request(rid)
+
+    assert _admit(rt, "r2") == rid, "the handle was recycled, as intended"
+    assert not rt.has_pending_loop_stop(rid, WALK, "ar_loop")
+    assert rt.pending_loop_stop_rids(WALK, "ar_loop") == set()
+
+
 # --- stale handles -----------------------------------------------------------
 
 @pytest.mark.parametrize("call", [

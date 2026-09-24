@@ -285,6 +285,13 @@ class PythonGraphRuntime(GraphRuntime):
                 self._queues[wg_id].remove_request(rid)
         del self._rid_to_handle[request_id]
         self._rids[rid] = None
+        # This set is cleared once per postprocess, not per removal, so a
+        # request admitted between a stop and that clear would read as already
+        # stopped: the worker drops its outputs on a speculative new iteration
+        # and prep excludes it from speculation.
+        self._pending_loop_stops = {
+            stop for stop in self._pending_loop_stops if stop.rid != rid
+        }
         # Recycling means a stale handle held anywhere else now points at a
         # DIFFERENT request; see GraphRuntime.remove_request for what has to be
         # purged alongside this.

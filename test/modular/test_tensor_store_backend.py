@@ -25,7 +25,20 @@ def test_the_default_backend_follows_the_resolved_runtime(monkeypatch):
     a worker that refuses to start."""
     pytest.importorskip("mstar_rust", reason="extension not built")
     monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
+    # AUTO declines Rust against a pinned pyzmq transport, so an ambient
+    # MSTAR_RUST_ZMQ would decide this one.
+    monkeypatch.delenv("MSTAR_RUST_ZMQ", raising=False)
     assert type(TensorStore().bookkeeping).__name__ == "RustTensorBookkeeping"
+
+
+def test_the_backend_follows_the_runtime_down_to_python(monkeypatch):
+    """The two must agree: the Rust runtime holds a SHARE of the bookkeeper,
+    so a resolution that declines Rust has to take the bookkeeper with it or
+    the worker refuses to start on the mismatch instead."""
+    pytest.importorskip("mstar_rust", reason="extension not built")
+    monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
+    monkeypatch.setenv("MSTAR_RUST_ZMQ", "0")
+    assert type(TensorStore().bookkeeping).__name__ == "PythonTensorBookkeeping"
 
 
 def test_zero_pins_the_python_backend(monkeypatch):

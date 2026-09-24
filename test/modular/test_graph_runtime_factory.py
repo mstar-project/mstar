@@ -61,6 +61,8 @@ def test_the_default_is_auto_and_takes_rust_where_it_is_built(monkeypatch):
     """AUTO is the default: an unset flag means "whatever this machine has"."""
     pytest.importorskip("mstar_rust")
     monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
+    # AUTO reads the transport flag too, so the ambient value would decide it.
+    monkeypatch.delenv("MSTAR_RUST_ZMQ", raising=False)
 
     from mstar.communication.rust_communicator import RustZMQCommunicator
     from mstar.communication.tensor_store import RustTensorBookkeeping
@@ -97,6 +99,20 @@ def test_anything_other_than_0_1_or_auto_is_refused(monkeypatch, value):
     monkeypatch.setenv("MSTAR_RUST_GRAPH", value)
     with pytest.raises(ValueError, match="must be 0, 1, or AUTO"):
         _make_graph_runtime(**_kwargs())
+
+
+def test_auto_does_not_pick_rust_against_a_pinned_pyzmq_transport(monkeypatch):
+    """MSTAR_RUST_ZMQ=0 on its own has to keep working.
+
+    It is documented as safe to set per process, and the Rust runtime refuses
+    a pyzmq communicator -- so AUTO selecting Rust there is a worker that
+    cannot start at all. AUTO means "whatever this machine can run", and this
+    machine cannot run that pair.
+    """
+    pytest.importorskip("mstar_rust")
+    monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
+    monkeypatch.setenv("MSTAR_RUST_ZMQ", "0")
+    assert isinstance(_make_graph_runtime(**_kwargs()), PythonGraphRuntime)
 
 
 def test_rust_refuses_the_pyzmq_communicator(monkeypatch):
