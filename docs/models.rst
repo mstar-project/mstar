@@ -195,12 +195,16 @@ Chatterbox notes
   window stays as close to the whole-utterance decode as the full history
   does (log-mel correlation 0.988 vs 0.985 on CPU). Requests whose chunks
   are ready together share one padded flow solve (up to 8 per step).
-- Speed knobs (``model_kwargs``): ``s3gen_graphs: true`` replays every flow
-  solve from a CUDA graph captured per (rows, frames, steps) shape, since the
-  estimator's hundreds of tiny kernels per Euler step make the eager solve
-  launch-bound; rows are padded to 1/2/4/8 and frames to
-  ``s3gen_frame_bucket`` (64 with graphs on), the built-in voice's chunk
-  shapes are captured at startup and other shapes on first use.
+- Speed knobs (``model_kwargs``): ``s3gen_graphs: true`` replays the S3Gen
+  stages from CUDA graphs: the flow solve (one graph per rows x frames x
+  steps; the estimator's hundreds of tiny kernels per Euler step make the
+  eager solve launch-bound), the token encoder (per rows x token bucket) and
+  the HiFT vocoder (per exact chunk length, its excitation noise drawn
+  outside the graph in the reference's order). Rows are padded to the powers
+  of two up to ``s3gen_max_batch_size`` (8) and frames to
+  ``s3gen_frame_bucket`` (64 with graphs on); the built-in voice's chunk
+  shapes are captured at startup, other shapes on first use;
+  ``s3gen_graph_stages`` (default ``solve,encoder,vocoder``) picks the stages.
   ``s3gen_estimator_dtype: bfloat16`` (or ``float16``) runs the flow
   estimator in that precision with the Euler state kept in float32
   (``float32`` is the reference path). ``t3_prefill_graphs`` (default on)
