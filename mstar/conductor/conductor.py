@@ -1285,9 +1285,7 @@ class Conductor:
 
             request_data.final_outputs.update(body.output_loop_indices)
 
-            pstate.curr_forward_outputs += body.output_signal_names if isinstance(
-                body.output_signal_names, list
-            ) else []
+            pstate.curr_forward_outputs += body.output_signal_names
 
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
