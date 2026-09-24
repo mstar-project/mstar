@@ -18,6 +18,7 @@ is consumed exactly like the reference, which is what the parity test relies on.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -85,6 +86,17 @@ class F0Predictor(nn.Module):
         return torch.abs(self.classifier(x).squeeze(-1))
 
 
+@dataclass
+class HiFTNoise:
+    """The random draws one vocoder call consumes, taken in the reference's
+    order (harmonic phase offsets, harmonic noise, then a field the reference
+    draws and discards) so they can be made before the forward and the
+    forward stays deterministic and graph-capturable."""
+
+    phase: torch.Tensor  # [B, H+1, 1] uniform in [0, 1)
+    harmonic: torch.Tensor  # [B, H+1, L] standard normal
+
+
 class HarmonicSource(nn.Module):
     """Sine harmonics + noise excitation from an upsampled f0 track (``SourceModuleHnNSF``)."""
 
@@ -99,36 +111,46 @@ class HarmonicSource(nn.Module):
         self.voiced_threshold = voiced_threshold
         self.l_linear = nn.Linear(harmonic_num + 1, 1)
 
-    def _sines(self, f0: torch.Tensor, generator: torch.Generator | None) -> tuple[torch.Tensor, torch.Tensor]:
+    def draw_noise(
+        self, batch: int, length: int, dtype: torch.dtype, device, generator: torch.Generator | None,
+    ) -> HiFTNoise:
+        """The draws ``forward`` used to make inline, in the same order: the
+        phase offsets, the harmonic noise, then the field the reference draws
+        and discards (so a shared generator keeps the reference's state)."""
+        phase = torch.rand((batch, self.harmonic_num + 1, 1), dtype=dtype, device=device, generator=generator)
+        harmonic = torch.randn((batch, self.harmonic_num + 1, length), dtype=dtype, device=device, generator=generator)
+        torch.randn((batch, length, 1), dtype=dtype, device=device, generator=generator)
+        return HiFTNoise(phase=phase, harmonic=harmonic)
+
+    def _sines(self, f0: torch.Tensor, noise: HiFTNoise) -> tuple[torch.Tensor, torch.Tensor]:
         """``f0``: ``[B, 1, L]`` Hz -> (sine harmonics ``[B, H+1, L]``, voiced mask ``[B, 1, L]``)."""
-        b, _, length = f0.shape
         harmonics = torch.arange(1, self.harmonic_num + 2, device=f0.device, dtype=f0.dtype).view(1, -1, 1)
         f_mat = f0 * harmonics / self.sampling_rate
         theta_mat = 2 * math.pi * (torch.cumsum(f_mat, dim=-1) % 1)
         # torch.distributions.Uniform(-pi, pi).sample(): low + u*high - u*low
-        u = torch.rand((b, self.harmonic_num + 1, 1), dtype=f0.dtype, device=f0.device, generator=generator)
+        u = noise.phase
         low = torch.tensor(-math.pi, dtype=f0.dtype, device=f0.device)
         high = torch.tensor(math.pi, dtype=f0.dtype, device=f0.device)
         phase_vec = low + u * high - u * low
-        phase_vec[:, 0, :] = 0
+        phase_vec = torch.cat([torch.zeros_like(phase_vec[:, :1]), phase_vec[:, 1:]], dim=1)
         sine_waves = self.sine_amp * torch.sin(theta_mat + phase_vec)
         uv = (f0 > self.voiced_threshold).to(torch.float32)
         noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-        noise = noise_amp * torch.randn(
-            sine_waves.shape, dtype=sine_waves.dtype, device=sine_waves.device, generator=generator,
-        )
-        return sine_waves * uv + noise, uv
+        return sine_waves * uv + noise_amp * noise.harmonic, uv
 
-    def forward(self, f0_upsampled: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
-        """``[B, L, 1]`` f0 -> merged excitation ``[B, L, 1]``."""
+    def forward(
+        self, f0_upsampled: torch.Tensor, noise: HiFTNoise | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """``[B, L, 1]`` f0 -> merged excitation ``[B, L, 1]``; ``noise`` from
+        ``draw_noise`` (drawn here from ``generator`` when not given)."""
+        b, length, _ = f0_upsampled.shape
+        if noise is None:
+            noise = self.draw_noise(b, length, f0_upsampled.dtype, f0_upsampled.device, generator)
         with torch.no_grad():
-            sine_waves, uv = self._sines(f0_upsampled.transpose(1, 2), generator)
+            sine_waves, _uv = self._sines(f0_upsampled.transpose(1, 2), noise)
             sine_waves = sine_waves.transpose(1, 2)
-            uv = uv.transpose(1, 2)
-        sine_merge = torch.tanh(self.l_linear(sine_waves))
-        # the reference also draws (and discards) a noise field the shape of ``uv``
-        torch.randn(uv.shape, dtype=uv.dtype, device=uv.device, generator=generator)
-        return sine_merge
+        return torch.tanh(self.l_linear(sine_waves))
 
 
 class HiFTGenerator(nn.Module):
@@ -229,22 +251,38 @@ class HiFTGenerator(nn.Module):
         x = self._istft(magnitude, phase)
         return torch.clamp(x, -self.config.audio_limit, self.config.audio_limit)
 
+    def draw_noise(self, mel: torch.Tensor, generator: torch.Generator | None) -> HiFTNoise:
+        """The excitation draws for vocoding ``mel`` (``[B, 80, T]``)."""
+        return self.m_source.draw_noise(
+            mel.shape[0], mel.shape[-1] * self.upsample_factor, mel.dtype, mel.device, generator,
+        )
+
     def vocode(
         self,
         mel: torch.Tensor,
         generator: torch.Generator | None = None,
         cache_source: torch.Tensor | None = None,
+        noise: HiFTNoise | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``(wav [B, 480T], source [B, 1, 480T])``; ``cache_source`` overwrites
         the head of the excitation so consecutive chunks share their harmonics
-        (reference ``inference(cache_source=...)``)."""
+        (reference ``inference(cache_source=...)``). ``noise`` is the excitation's
+        random draws (``draw_noise``), taken from ``generator`` when not given."""
+        if noise is None:
+            noise = self.draw_noise(mel, generator)
+        return self.vocode_with(mel, noise.phase, noise.harmonic, cache_source)
+
+    def vocode_with(
+        self, mel: torch.Tensor, phase: torch.Tensor, harmonic: torch.Tensor, cache_source: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``vocode`` with every random draw given: deterministic, graph-capturable."""
         f0 = self.f0_predictor(mel)
         source = F.interpolate(f0[:, None], scale_factor=float(self.upsample_factor), mode="nearest").transpose(1, 2)
-        source = self.m_source(source, generator=generator).transpose(1, 2)
+        source = self.m_source(source, HiFTNoise(phase=phase, harmonic=harmonic)).transpose(1, 2)
         if cache_source is not None and cache_source.shape[-1] > 0:
             n = min(cache_source.shape[-1], source.shape[-1])
-            source = source.clone()
-            source[:, :, :n] = cache_source[:, :, :n].to(source.dtype)
+            head = cache_source[:, :, :n].to(source.dtype)
+            source = torch.cat([head, source[:, :, n:]], dim=-1)
         return self.decode(mel, source), source
 
     def forward(self, mel: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
