@@ -99,7 +99,7 @@ class Flux2KleinModel(Model):
         max_batch_size: int = 8,
         max_image_area: int = 2048 * 2048,
         vae_compile: bool = False,
-        async_scheduling: bool = False,
+        async_scheduling: bool = True,
         lora: list | None = None,
         **kwargs,
     ):
@@ -130,11 +130,14 @@ class Flux2KleinModel(Model):
         # minutes (8192^2 = 262k tokens of quadratic attention); requests above it are rejected before scheduling
         self.max_image_area = int(max_image_area)
         self.vae_compile = bool(vae_compile)
-        # Speculative (asynchronous) scheduling of the image nodes: the worker assembles each batch's next step
-        # while the current one runs and merges requests that became ready meanwhile. Off by default: measured
-        # on 2026-09-18 it launched each request's next step alone (38 of 43 steps unbatched at 8 concurrent
-        # requests); lockstep waits for the step to finish (~2 ms of launch overlap per step) and batches
-        # everything ready. The knob exists to re-price it as the engine's merge logic evolves.
+        # Speculative (asynchronous) scheduling of the image nodes: the worker assembles each batch's next denoise
+        # step while the current one runs (the loop's persisted inputs count as ready, the step runs under its own
+        # loop counter) and merges requests that became ready meanwhile, so requests at different steps share a
+        # forward. On by default since 2026-09-23: same-GPU rows put klein-4B at 0.365-0.372 s vs 0.377-0.390 s
+        # lockstep at B=1 and +3% images/s at 4 and 16 concurrent requests (9B +2%), with the served images
+        # unchanged (>= 53 dB from the eager path on all 100 protocol prompts). One speculated step per request
+        # overshoots the schedule and is vetoed by the denoise loop before any forward. `false` restores lockstep
+        # (wait for the step, then batch everything ready), which is within a few percent.
         self.async_scheduling = bool(async_scheduling)
         # LoRA adapters folded into the transformer at load time (static merge).
         self.loras = [LoraSpec.parse(item) for item in (lora or [])]
@@ -211,8 +214,7 @@ class Flux2KleinModel(Model):
                 input_names=dit_inputs,
                 # latents is the only loop-carried edge; the step index is the loop counter
                 outputs=[GraphEdge(next_node="dit", name=LATENTS)],
-                # Lockstep by default (see the async_scheduling knob): waiting for the step to finish
-                # costs ~2 ms of launch overlap per step and batches everything ready.
+                # speculative by default (see the async_scheduling knob); `false` = lockstep
                 enable_async_scheduling=self.async_scheduling,
             ),
             max_iters=self.config.max_denoise_steps,
