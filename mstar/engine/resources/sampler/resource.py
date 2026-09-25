@@ -12,7 +12,7 @@ from mstar.engine.resources.sampler.config import (
     SamplingReqConfig,
 )
 from mstar.engine.resources.sampler.utils import CudaGraphableSampler, Sampler, SamplerBuffers
-from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
 
 
 class SamplerResource(Resource):
@@ -64,6 +64,12 @@ class SamplerResource(Resource):
 
         # This is set during plan in the cuda graph case
         self._cg_sampler: CudaGraphableSampler | None = None
+        # How many times a replay of each bucket samples (learned while it is
+        # captured), so commit can move the eager offsets by the same amount
+        # and a later eager step continues the stream the graph left off.
+        self._samples_per_replay: dict[BucketKey, int] = {}
+        self._capture_bucket: BucketKey | None = None
+        self._step_samples = 0
         # pre-planned a step ahead, promoted by the next non-preplan plan
         self._preplan_cg_sampler: CudaGraphableSampler | None = None
         self._preplanned = False
@@ -113,6 +119,7 @@ class SamplerResource(Resource):
             tp_group=self._comm_group,
             vocab_size=self._vocab_size,
             cg_slots=self._cg_slots,
+            request_offsets=self._sampler._step_offset,
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
@@ -203,6 +210,12 @@ class SamplerResource(Resource):
 
     def plan(self, step: SamplerStep, ctx: StepContext):
         self._set_penalty_flags(step, ctx)
+        if not ctx.is_preplan:
+            lease = ctx.slot_lease
+            self._capture_bucket = (
+                lease.bucket if ctx.capture and lease is not None else None
+            )
+            self._step_samples = 0
         if not ctx.is_preplan and self._penalty_live:
             for rid, tokens in step.prefill_tracked_tokens.items():
                 self._sampler.get_token_mask(rid).add_tokens(tokens)
@@ -273,6 +286,12 @@ class SamplerResource(Resource):
         if self._cg_buffers is None or self._cg_sampler is None:
             return
         self._cg_buffers.scatter_offset(ctx.slot_lease.slot)
+        advanced = self._samples_per_replay.get(ctx.slot_lease.bucket, 0)
+        if advanced:
+            offsets = self._sampler._step_offset
+            for rid in ctx.request_ids:
+                if rid in offsets:
+                    offsets[rid] += advanced
         # Skipped when nothing read the mask this step: there is then nothing to
         # copy back, and the rows go stale only for requests at penalty 1.0,
         # which never read them. See `_penalty_live` for why that stays sound.
@@ -294,6 +313,9 @@ class SamplerResource(Resource):
         The eager sampler keys off request ids and sees the real batch only.
         """
         if self._cg_sampler is not None:
+            if self._capture_bucket is not None:
+                self._step_samples += 1
+                self._samples_per_replay[self._capture_bucket] = self._step_samples
             # The capability flag, not the liveness one. Under a replay this
             # argument is inert (the kernel variant was baked at capture), and
             # under capture it has to match what every later replay will run.
@@ -303,4 +325,7 @@ class SamplerResource(Resource):
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step
             )
-        return self._sampler.sample(request_ids, logits)
+        tokens = self._sampler.sample(request_ids, logits)
+        if self._cg_buffers is not None:
+            self._cg_buffers.offsets_advanced(request_ids)
+        return tokens

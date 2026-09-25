@@ -17,7 +17,7 @@ Usage:
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -1004,6 +1004,16 @@ class SamplerBuffers:
     # Last-known config per rid — change-detect for ``update_request_config``
     # so steady-state per-step calls do zero GPU work (for the scalar rows).
     _cached_config: dict[str, SamplingConfig] = field(default_factory=dict, repr=False)
+    # The eager sampler's per-request RNG offsets, the one counter both
+    # sampling paths draw from. A slot's offset master row is written from it
+    # inline, at the first ``gather_dynamic`` after registration and again
+    # after an eager step advanced it (``offsets_advanced``), so a request that
+    # samples eagerly (a prefill) and then in graph continues one stream
+    # instead of restarting at 0. The graph path advances the row in graph and
+    # scatters it back; the resource's commit advances this counter to match.
+    request_offsets: "Mapping[str, int] | None" = field(default=None, repr=False)
+    # slots whose offset master row must be rewritten from ``request_offsets``
+    _stale_offsets: set[int] = field(default_factory=set, repr=False)
 
     @property
     def tracks_seen_tokens(self) -> bool:
@@ -1020,6 +1030,7 @@ class SamplerBuffers:
         tp_group: "CommGroup | None" = None,  # noqa: F821
         vocab_size: int | None = None,
         cg_slots: int = 1,
+        request_offsets: "Mapping[str, int] | None" = None,
     ) -> "SamplerBuffers":
         """Allocate sampling buffers for ``max_batch_size``.
 
@@ -1059,6 +1070,7 @@ class SamplerBuffers:
             _slot_idx_gpu=torch.zeros(cg_slots, max_batch_size, dtype=torch.long, device=device),
             _last_real_bs=[0] * cg_slots,
             _free_slots=list(range(cap)),
+            request_offsets=request_offsets,
         )
 
     def slice_for_bs(self, bs: int, cg_slot: int = 0) -> dict[str, Any]:
@@ -1146,7 +1158,29 @@ class SamplerBuffers:
             return
         self._cached_config.pop(rid, None)
         self._pending_init.discard(slot)
+        self._stale_offsets.discard(slot)
         self._free_slots.append(slot)
+
+    def offsets_advanced(self, request_ids: list[str]) -> None:
+        """An eager step moved these requests' offsets in ``request_offsets``;
+        rewrite their master rows before the next in-graph sample."""
+        for rid in request_ids:
+            slot = self._rid_to_slot.get(rid)
+            if slot is not None:
+                self._stale_offsets.add(slot)
+
+    def _sync_stale_offsets(self, request_ids: list[str]) -> None:
+        """Write the master offset rows ``request_offsets`` moved. Inline, on
+        the current stream, right before the gather that reads them."""
+        if self.request_offsets is None or not self._stale_offsets:
+            return
+        for rid in request_ids:
+            slot = self._rid_to_slot.get(rid)
+            if slot is not None and slot in self._stale_offsets:
+                self.offset.master[slot:slot + 1].fill_(
+                    int(self.request_offsets.get(rid, 0))
+                )
+                self._stale_offsets.discard(slot)
 
     def update_request_config(
         self, rid: str, sampling_config: SamplingConfig,
@@ -1206,7 +1240,12 @@ class SamplerBuffers:
         """GPU-side init for a newly registered slot. Must run on the thread
         that gathers, so these writes are ordered ahead of the index_selects
         that read them (``register_request`` runs on the main thread)."""
-        self.offset.master[slot:slot + 1].zero_()
+        if self.request_offsets is None:
+            self.offset.master[slot:slot + 1].zero_()
+        else:
+            # written inline by the next gather_dynamic, from the shared
+            # counter, so an eager prefill's draws are already counted
+            self._stale_offsets.add(slot)
         self._write_master_row(slot, self._cached_config[rid])
         # mask row not cleared: always staged fresh before gather, and clearing
         # here would race the default-stream stage from the plan stream
@@ -1287,6 +1326,7 @@ class SamplerBuffers:
         if self._staged_rids.get(cg_slot) != (tuple(request_ids), padded_bs):
             self._stage_slot_idx(request_ids, padded_bs, cg_slot)
         idx_view = self._upload_slot_idx(padded_bs, cg_slot)
+        self._sync_stale_offsets(request_ids)
         self.offset.gather(idx_view, padded_bs, cg_slot)
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
