@@ -23,7 +23,8 @@ from mstar.model.components.linear import FusedColumnLinear
 
 def _resolve_activation(activation: str | Callable) -> Callable:
     """Resolve an activation name to a callable. Accepts the canonical
-    HF names (``silu``, ``gelu``, ``gelu_tanh``, ``relu``) or a callable.
+    HF names (``silu``, ``gelu``, ``gelu_tanh``, ``relu``, ``relu2``) or a
+    callable.
     """
     if callable(activation):
         return activation
@@ -35,6 +36,9 @@ def _resolve_activation(activation: str | Callable) -> Callable:
         return lambda x: F.gelu(x, approximate="tanh")
     if activation == "relu":
         return F.relu
+    if activation in ("relu2", "relu_squared"):
+        # Squared ReLU (the dense Nemotron / Cosmos3-Edge FFN activation).
+        return lambda x: torch.square(F.relu(x))
     raise ValueError(f"Unknown activation: {activation!r}")
 
 

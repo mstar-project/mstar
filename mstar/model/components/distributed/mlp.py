@@ -13,6 +13,11 @@ loaded_shard_id=0)`` for gate and ``loaded_shard_id=1`` for up.
 ``ColumnParallelLinear`` projections so ``state_dict()`` keys match a
 checkpoint's one-to-one — for loaders that stream weights by name with no
 stacked-parameter rules.
+
+``ParallelMLP`` is the dense, ungated two-projection FFN
+(``down(act(up(x)))``) of the Nemotron family (relu2) and of ViT/CLIP-style
+towers (gelu), sharded the same way: ``up_proj`` column-parallel over the
+intermediate dim, ``down_proj`` row-parallel with an all-reduce.
 """
 from __future__ import annotations
 
@@ -115,3 +120,33 @@ class ParallelGatedMLPUnfused(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
+
+
+class ParallelMLP(nn.Module):
+    """Dense two-projection MLP ``down_proj(act(up_proj(x)))`` across TP ranks.
+
+    The parallel counterpart of ``mstar.model.components.MLP``, named after the
+    dense-LLM checkpoint convention (``up_proj`` / ``down_proj``) so a
+    Nemotron-style FFN loads by name. ``activation`` accepts the HF names
+    ``_resolve_activation`` knows (``relu2`` is the Nemotron squared ReLU) or
+    a callable. A trivial comm group (world size 1) makes both projections
+    plain linears.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        comm_group: CommGroup | None = None,
+        activation: str | Callable = "relu2",
+        bias: bool = False,
+    ):
+        super().__init__()
+        if comm_group is None:
+            comm_group = CommGroup.trivial()
+        self.act = _resolve_activation(activation)
+        self.up_proj = ColumnParallelLinear(comm_group, hidden_size, intermediate_size, bias=bias)
+        self.down_proj = RowParallelLinear(comm_group, intermediate_size, hidden_size, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act(self.up_proj(x)))
