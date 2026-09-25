@@ -752,7 +752,7 @@ def test_routing_decodes_the_flat_rid_major_layout(runtime):
     )
     assert out.completion_id > 0
     # Every uuid that a remote consumer reads is reported once.
-    assert len(out.register_tensor_idxs) == len(set(out.register_tensor_idxs))
+    assert len(out.register_uuids) == len(set(out.register_uuids))
 
 
 def test_routing_ingests_a_local_destination(runtime):

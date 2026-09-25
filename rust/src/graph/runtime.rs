@@ -985,10 +985,27 @@ pub struct RouteArg {
 #[derive(Default)]
 pub struct RouteOut {
     #[pyo3(get)] pub completion_id: u64,
-    #[pyo3(get)] pub register_tensor_idxs: Vec<usize>,
+    /// Uuids, not indices into the batch's tensors: an outgoing edge can
+    /// carry a tensor an EARLIER batch produced -- a loop's accumulated
+    /// outputs gather one per iteration, and a loop output a non-terminal
+    /// body node fed was filled before the batch that finishes the loop.
+    /// Indexing dropped exactly those, so nothing staged them and the reader
+    /// hit a missing tensor.
+    #[pyo3(get)] pub register_uuids: Vec<u64>,
     #[pyo3(get)] pub register_rids: Vec<u32>,
+    /// Indices into the batch's tensors, and deliberately only those: a
+    /// new-token edge reports the batch that minted the tokens, so a tensor
+    /// a loop re-emits at completion was already counted by the pass that
+    /// produced it.
     #[pyo3(get)] pub new_token_output_idxs: Vec<usize>,
-    #[pyo3(get)] pub local_streaming_tensor_idxs: Vec<usize>,
+    /// Local streaming, grouped by edge name -- one name per stream rather
+    /// than one per chunk. Parallel: `local_streaming_rids[i]` and
+    /// `local_streaming_uuids[i]` belong to `local_streaming_signals[i]`.
+    /// Order matters within a group (a stream is ordered, and one accumulated
+    /// edge flushes every iteration's chunk at once) and not across them.
+    #[pyo3(get)] pub local_streaming_signals: Vec<String>,
+    #[pyo3(get)] pub local_streaming_rids: Vec<Vec<u32>>,
+    #[pyo3(get)] pub local_streaming_uuids: Vec<Vec<u64>>,
     /// Consumed inputs the completion itself dropped to zero, with each one's
     /// `mem_registered` flag -- empty in the normal order, where
     /// `cleanup_consumed_inputs` has already taken them.
@@ -1890,6 +1907,10 @@ impl GraphRuntime {
         let mut first_tp_rank: FxHashMap<u32, bool> = FxHashMap::default();
         let mut speculative: FxHashMap<u32, bool> = FxHashMap::default();
         let mut staged: FxHashSet<u64> = FxHashSet::default();
+        // Edge name -> (rids, uuids), insertion-ordered. Syms now, strings
+        // once at the end: the interner cannot be borrowed while the loop
+        // below holds `&mut self`, and a name per stream is cheaper anyway.
+        let mut streaming_by_signal: Vec<(Sym, Vec<u32>, Vec<u64>)> = vec![];
         let mut sends_a_frame: FxHashSet<u32> = FxHashSet::default();
         let mut nested_snapshot: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)> =
             FxHashMap::default();
@@ -2114,7 +2135,7 @@ impl GraphRuntime {
                         // A streaming edge never goes straight into the node:
                         // it lands in the worker's StreamBuffer, which decides
                         // when a chunk is whole. Reported to the caller via
-                        // local_streaming_tensor_idxs below.
+                        // local_streaming_signals below.
                         took = true;
                     } else {
                         let slot =
@@ -2187,30 +2208,41 @@ impl GraphRuntime {
             // edge for it -- Python stages `routing.persist` unconditionally.
             for (_name, tensors) in &persist_pre {
                 for t in tensors {
-                    let Some(&idx) = uuid_to_idx.get(&t.uuid) else { continue };
                     if staged.insert(t.uuid) {
-                        out.register_tensor_idxs.push(idx);
+                        out.register_uuids.push(t.uuid);
                         out.register_rids.push(rid);
                     }
                 }
             }
 
             for (e, &is_local) in edges.iter().zip(&ingested_locally) {
-                let idxs: Vec<usize> = e
-                    .tensors
-                    .iter()
-                    .filter_map(|t| uuid_to_idx.get(&t.uuid).copied())
-                    .collect();
                 // `is_local`, not Dest::Local: the consumer is just as local
                 // when it lives in a SIBLING worker graph on this worker, which
                 // compiles to External (Orpheus streams new_token from the LLM
                 // graph into the snac_decoder graph).
-                if e.streaming && is_local {
-                    out.local_streaming_tensor_idxs.extend(&idxs);
+                if e.streaming && is_local && !e.tensors.is_empty() {
+                    let slot = match streaming_by_signal
+                        .iter()
+                        .position(|(name, _, _)| *name == e.name)
+                    {
+                        Some(i) => i,
+                        None => {
+                            streaming_by_signal.push((e.name, vec![], vec![]));
+                            streaming_by_signal.len() - 1
+                        }
+                    };
+                    let (_, rids_for_edge, uuids_for_edge) =
+                        &mut streaming_by_signal[slot];
+                    for t in &e.tensors {
+                        rids_for_edge.push(rid);
+                        uuids_for_edge.push(t.uuid);
+                    }
                 }
-                // What a remote consumer will read. Deduped by uuid and
-                // skipping anything already staged, so a re-emitted edge does
-                // not stage twice.
+                // What a remote consumer will read. Every tensor on the edge,
+                // not just the ones this batch produced: a loop edge carries
+                // tensors from earlier iterations and those need staging just
+                // as much. Deduped by uuid, so a re-emitted edge does not
+                // stage twice.
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
@@ -2219,9 +2251,9 @@ impl GraphRuntime {
                     || (!is_local
                         && matches!(e.dest, Dest::External(_) | Dest::EmitToClient));
                 if remote {
-                    for (&idx, t) in idxs.iter().zip(&e.tensors) {
+                    for t in &e.tensors {
                         if staged.insert(t.uuid) {
-                            out.register_tensor_idxs.push(idx);
+                            out.register_uuids.push(t.uuid);
                             out.register_rids.push(rid);
                         }
                     }
@@ -2343,6 +2375,14 @@ impl GraphRuntime {
             }
         }
         out.rids_needing_request_info = sends_a_frame.into_iter().collect();
+
+        // One string per stream, resolved now that `&mut self` is released.
+        for (name, rids_for_edge, uuids_for_edge) in streaming_by_signal {
+            out.local_streaming_signals
+                .push(self.interner.name(name).to_string());
+            out.local_streaming_rids.push(rids_for_edge);
+            out.local_streaming_uuids.push(uuids_for_edge);
+        }
 
         self.completion_counter += 1;
         out.completion_id = self.completion_counter;

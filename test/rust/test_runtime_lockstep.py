@@ -231,8 +231,10 @@ class Lockstep:
                     num_tensors=[len(uuids)] * len(signals),
                 ), s)
             _finish_teardown(s, out.freed_inputs)
-            return (sorted(out.register_tensor_idxs), sorted(out.register_rids),
-                    sorted(out.new_token_output_idxs))
+            return (sorted(out.register_uuids), sorted(out.register_rids),
+                    sorted(out.new_token_output_idxs),
+                    {k: (v.keys, v.values)
+                     for k, v in out.local_streaming_by_signal.items()})
         return self._both(f"route({node}, signals={list(signals)})", f)
 
     def cleanup(self, node, rid):
