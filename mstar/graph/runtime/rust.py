@@ -265,6 +265,11 @@ class RustGraphRuntime(GraphRuntime):
             counts.append(len(workers))
         handle = self._rust.add_request(
             request_id, partition, graph_walk,
+            # Two distinct lists: the partition's worker graphs decide which
+            # of this worker's graphs the request opens and which are live in
+            # the walk, while the full map is what the node -> workers routing
+            # is derived from.
+            list(partition_worker_graph_ids),
             list(worker_graph_to_workers.keys), flat, counts,
         )
         # One NewRequest arrives PER PARTITION, all carrying the same map, so

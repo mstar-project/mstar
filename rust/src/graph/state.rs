@@ -513,6 +513,12 @@ impl RequestState {
             }
         }
         self.refresh_ready(node);
+        // The slot was just cleared, so streaming membership goes back to its
+        // seed; Python's `WorkerGraphStateRegistry.mark_entity_complete`
+        // does exactly this right after `entity.ready_signals.clear()`.
+        if spec.loop_id.is_none() {
+            self.reseed_streaming_ready(node);
+        }
 
         for (i, e) in spec.outputs.iter().enumerate() {
             out.push(routed(e, out_tensors.get(i).cloned().unwrap_or_default()));
@@ -1032,6 +1038,62 @@ mod tests {
         st.ingest(talker, 1, vec![t(3)], false, false);
         assert!(st.is_ready(talker));
         assert!(!st.is_ready_for_streaming(talker), "full, so plain ready");
+    }
+
+    #[test]
+    fn completing_a_top_level_node_restores_its_streaming_membership() {
+        // Orpheus's `snac_chunk` walk: one TOP-LEVEL node whose only input is
+        // streamed. `complete` clears its slot, so streaming membership has to
+        // go back to the seed -- Python's `mark_entity_complete` reseeds right
+        // after `entity.ready_signals.clear()`. Left out, the bit stays 0 (the
+        // full slot cleared it) and `ingest_one` refuses every later chunk,
+        // handing it back to the StreamBuffer until the worker graph resets.
+        //
+        // Whether the node can be SCHEDULED again is a separate gate:
+        // `NodeState.completed` keeps it out of the ready set until `reset`,
+        // which is why this asserts membership and the ingest, not readiness.
+        let mut it = StrToId::default();
+        let nodes = vec![node(
+            "snac", &["new_token"], &["new_token"],
+            vec![edge("audio_chunk", "emit_to_client")],
+        )];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let snac = 0;
+        let mut st = RequestState::new(g);
+
+        assert!(st.is_ready_for_streaming(snac), "seeded: all inputs streamed");
+        assert!(st.ingest(snac, 0, vec![t(1)], false, false));
+        assert!(st.is_ready(snac));
+        assert!(!st.is_ready_for_streaming(snac), "full, so plainly ready");
+
+        st.clear_consumed_inputs(snac);
+        st.complete(snac, &[vec![t(100)]]);
+
+        assert!(
+            st.is_ready_for_streaming(snac),
+            "the slot was cleared, so the next chunk has to be accepted"
+        );
+        assert!(st.ingest(snac, 0, vec![t(2)], false, false));
+    }
+
+    #[test]
+    fn completing_a_node_with_a_regular_input_leaves_it_out_of_the_set() {
+        // The reseed is seeded membership, not a blanket add: a node with any
+        // non-streaming input must NOT read as streaming-ready with nothing
+        // ingested.
+        let mut it = StrToId::default();
+        let nodes = vec![node("talker", &["text", "audio"], &["audio"], vec![])];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let talker = 0;
+        let mut st = RequestState::new(g);
+        st.ingest(talker, 0, vec![t(1)], false, false);
+        st.ingest(talker, 1, vec![t(2)], false, false);
+        assert!(st.is_ready(talker));
+        st.complete(talker, &[]);
+        assert!(
+            !st.is_ready_for_streaming(talker),
+            "`text` is still missing, so a chunk must not be accepted"
+        );
     }
 
     #[test]

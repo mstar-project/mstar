@@ -1274,13 +1274,21 @@ impl GraphRuntime {
 
     /// One call per partition, as the conductor sends one NewRequest each.
     ///
+    /// `partition_worker_graph_ids` is this partition's worker graphs;
+    /// `worker_graph_ids` is every worker graph of the request, which is what
+    /// the node -> workers map has to be derived from.
+    ///
     /// `worker_graph_workers` is flattened; `workers_per_worker_graph` gives
     /// each worker graph's slice, parallel to `worker_graph_ids`.
+    // Struct-of-arrays across the boundary, as everywhere else here: a dict
+    // per worker graph would be a Python allocation per admission.
+    #[allow(clippy::too_many_arguments)]
     fn add_request(
         &mut self,
         request_id: String,
         partition: String,
         graph_walk: String,
+        partition_worker_graph_ids: Vec<u32>,
         worker_graph_ids: Vec<u32>,
         worker_graph_workers: Vec<String>,
         workers_per_worker_graph: Vec<usize>,
@@ -1342,7 +1350,11 @@ impl GraphRuntime {
         // walk's graph cannot have a signal ingested there, so the node never
         // becomes ready and the request stops after one pass. Python opens
         // all of them -- the conductor sends the partition's full list.
-        let mine: Vec<WgIndex> = worker_graph_ids
+        //
+        // This partition's list and not the request's: Python's
+        // `my_worker_graph_ids` is `partition_worker_graph_ids` intersected
+        // with the local graphs.
+        let mine: Vec<WgIndex> = partition_worker_graph_ids
             .iter()
             .filter_map(|&wg_id| self.wg_index(wg_id))
             .collect();
@@ -1383,10 +1395,14 @@ impl GraphRuntime {
         // Routing parked by complete_and_route_batch whose send never ran --
         // an exception between the two abandons it. Handles are recycled, so
         // a stale entry would make the next request to get this integer send
-        // another request's outputs.
+        // another request's outputs. Remove it from every rid-keyed map.
         self.completions.retain(|_, c| {
             c.routing.remove(&rid);
             c.completed_wgs.remove(&rid);
+            c.persist.remove(&rid);
+            c.first_tp_rank.remove(&rid);
+            c.speculative.remove(&rid);
+            c.nested.remove(&rid);
             !c.routing.is_empty()
         });
 
@@ -1975,9 +1991,12 @@ impl GraphRuntime {
             // than 0 loses these edges in the replicated fanout -- their
             // destination (EMPTY_DESTINATION) has no sharding group -- and
             // reporting them is not the fanout's business anyway.
+            //
+            // `!e.streaming` on both to match Python's behavior, though
+            // not filtering on `!e.streaming` would also be semantically valid/
             let persist_pre: Vec<(Sym, Vec<TensorRef>)> = pre_shard_edges
                 .iter()
-                .filter(|e| e.persist)
+                .filter(|e| e.persist && !e.streaming)
                 .map(|e| (e.name, e.tensors.clone()))
                 .collect();
             {
@@ -1985,7 +2004,9 @@ impl GraphRuntime {
                 // _count_new_tokens: one output routed twice is two edges
                 // over the SAME tensors.
                 let mut seen: FxHashSet<Sym> = FxHashSet::default();
-                for e in pre_shard_edges.iter().filter(|e| e.new_token) {
+                let minted =
+                    pre_shard_edges.iter().filter(|e| e.new_token && !e.streaming);
+                for e in minted {
                     if !seen.insert(e.name) {
                         continue;
                     }
@@ -2852,30 +2873,25 @@ impl GraphRuntime {
                             });
                         }
                     }
-                    // Refused locally, so send it to the node's owner like
-                    // Python does. `mine` is not consulted: the point is that
-                    // our own copy did not take it.
+                    // Refused locally, so it goes on the wire to the node's
+                    // owner, which is the current worker. Note that fanout
+                    // had already been applied to this edge, so any copies
+                    // to different TP ranks have already been sent.
                     Dest::Local(d) if e.declined_local => {
                         let dest = g.node(d).name;
-                        let workers = walk
-                            .and_then(|w| {
-                                self.info(rid)?.node_to_workers.get(&(dest, w)).cloned()
-                            })
-                            .unwrap_or_default();
-                        for worker in workers {
-                            let (shard_dim, total_fanin) =
-                                wire_shape(e.name, dest, e.streaming, worker);
-                            plan.to_workers.push(WireEdge {
-                                rid,
-                                worker,
-                                signal: name.clone(),
-                                next_node: self.interner.name(dest).to_string(),
-                                tensors: e.tensors.clone(),
-                                streaming: e.streaming,
-                                shard_dim,
-                                total_fanin,
-                            });
-                        }
+                        let worker = e.worker.unwrap_or(self.shard.me);
+                        let (shard_dim, total_fanin) =
+                            wire_shape(e.name, dest, e.streaming, worker);
+                        plan.to_workers.push(WireEdge {
+                            rid,
+                            worker,
+                            signal: name.clone(),
+                            next_node: self.interner.name(dest).to_string(),
+                            tensors: e.tensors.clone(),
+                            streaming: e.streaming,
+                            shard_dim,
+                            total_fanin,
+                        });
                     }
                     Dest::Local(_) | Dest::Empty => {}
                 }
@@ -2906,6 +2922,20 @@ impl GraphRuntime {
 
     fn num_handles(&self) -> usize {
         self.rids.len()
+    }
+
+    /// The persist signal names this request has accumulated since its last
+    /// WORKER_GRAPHS_DONE. Just used for testing.
+    fn pending_persist_signals(&self, rid: u32) -> Vec<String> {
+        match self.info(rid) {
+            Some(info) => info
+                .pending
+                .persist
+                .iter()
+                .map(|(sig, _)| self.interner.name(*sig).to_string())
+                .collect(),
+            None => vec![],
+        }
     }
 
     fn set_speculatively_scheduled(
