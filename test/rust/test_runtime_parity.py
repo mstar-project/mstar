@@ -1217,8 +1217,10 @@ def test_a_stream_to_a_sibling_graph_is_reported_local(streams_to_sibling):
         ),
         store,
     )
-    assert out.local_streaming_tensor_idxs == [0], "the chunk was not local"
-    assert out.register_tensor_idxs == [], "a local chunk must not be staged"
+    assert out.local_streaming_by_signal.keys() == {"new_token"}, \
+        "the chunk was not local"
+    assert out.local_streaming_by_signal["new_token"].values == [1]
+    assert out.register_uuids == [], "a local chunk must not be staged"
     # A streaming edge does NOT go straight into the node: the StreamBuffer
     # decides when a chunk is whole, so the consumer is not ready yet.
     assert _ready(rt) == []
@@ -1743,3 +1745,101 @@ def test_a_peers_copy_does_not_feed_this_ranks_node(tp_pair):
         ("dit", [("latent", (3,))]),
         "idle",
     ]
+
+
+# --- a loop edge carries tensors earlier batches produced --------------------
+#
+# The batch that finishes a loop is not the batch that produced everything the
+# loop emits: ``accumulated_outputs`` gathers one tensor per iteration. Both
+# runtimes used to report the staging set as indices into the completing
+# batch's tensors, which dropped every earlier iteration -- nothing staged
+# them, and the reader got a missing tensor for a request that then hung
+# (vjepa2 prefill_video_rollout with rollout_horizon > 1).
+
+ROLL_NODES = {"encode", "step"}
+
+
+def _rollout_graph(accumulated_edge, max_iters=2):
+    return Sequential(sections=[
+        GraphNode(
+            name="encode", input_names={"video"},
+            outputs=[GraphEdge(name="pred", next_node="step")],
+        ),
+        Loop(
+            name="roll",
+            section=GraphNode(
+                name="step", input_names={"pred"},
+                outputs=[GraphEdge(name="pred", next_node="step")],
+            ),
+            outputs=[],
+            accumulated_outputs=[accumulated_edge],
+            max_iters=max_iters,
+        ),
+    ])
+
+
+# Staging splits on `persist` -- the Rust runtime takes persist edges off the
+# node's own outputs BEFORE the fanout and stages them in their own pass, so
+# the two paths have to be covered separately or one of them keeps the bug.
+@pytest.fixture(params=[
+    ("python", True), ("python", False), ("rust", True), ("rust", False),
+], ids=["python-persist", "python-emit", "rust-persist", "rust-emit"])
+def rollout(request):
+    """encode -> loop(step), with ``pred`` accumulated across iterations and
+    emitted to the client all at once when the loop finishes."""
+    which, persist = request.param
+    wg = WorkerGraph(
+        section=_rollout_graph(
+            GraphEdge(name="pred", next_node=EMIT_TO_CLIENT, persist=persist),
+        ),
+        graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[wg],
+        all_wg_ids_to_graph_walks={WG_ID: {WALK}},
+        all_wg_ids_to_dyn_loops={WG_ID: {"roll"}},
+        all_wg_ids_to_nodes={WG_ID: ROLL_NODES},
+        node_to_partition=dict.fromkeys(ROLL_NODES, "default"),
+        sharding_config=_sharding(),
+    )
+    if which == "python":
+        book = PythonTensorBookkeeping()
+        tm = _StubTensorManager(book)
+        return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
+                                   **common), book, tm.tensor_store)
+    book = RustTensorBookkeeping()
+    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
+
+
+def _route_one(rt, book, store, rid, node, signal, uuid):
+    """Complete ``node`` for one request, having produced one tensor."""
+    rt.pop_rids(node, WALK, [rid])
+    book.put_tensor(uuid, _info(uuid))
+    book.increment_ref(uuid, 1)
+    return rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name=node,
+            output_signals=[signal], wg_ids=ParallelList([rid], [WG_ID]),
+            tensors=[uuid], num_tensors=[1],
+        ),
+        store,
+    )
+
+
+def test_accumulated_loop_outputs_are_staged_for_every_iteration(rollout):
+    rt, book, store = rollout
+    rid = _admit(rt)
+    rt.ingest_inputs_batch(ParallelList([rid], [_spec("video", "encode")]))
+    _route_one(rt, book, store, rid, "encode", "pred", 1)
+
+    out = None
+    for uuid in (2, 3):
+        out = _route_one(rt, book, store, rid, "step", "pred", uuid)
+
+    # 2 was minted by the first iteration, 3 by the batch that finished the
+    # loop; the accumulated edge flushes both, so both have to be staged.
+    assert sorted(out.register_uuids) == [2, 3], (
+        "every tensor on an outgoing edge has to be staged, not just the "
+        "ones the completing batch produced"
+    )
+    assert out.register_rids == [rid, rid]

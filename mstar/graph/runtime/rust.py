@@ -537,10 +537,21 @@ class RustGraphRuntime(GraphRuntime):
         })
         return RouteOutput(
             completion_id=out.completion_id,
-            register_tensor_idxs=out.register_tensor_idxs,
+            register_uuids=out.register_uuids,
             register_rids=out.register_rids,
             new_token_output_idxs=out.new_token_output_idxs,
-            local_streaming_tensor_idxs=out.local_streaming_tensor_idxs,
+            # Rust hands the groups over as three parallel columns, one entry
+            # per stream; the dict is rebuilt here so both runtimes return the
+            # same shape.
+            local_streaming_by_signal={
+                name: ParallelList(rids, uuids)
+                for name, rids, uuids in zip(
+                    out.local_streaming_signals,
+                    out.local_streaming_rids,
+                    out.local_streaming_uuids,
+                    strict=True,
+                )
+            },
             rids_needing_request_info=frozenset(out.rids_needing_request_info),
             freed_inputs=FreedTensors(
                 out.freed_input_uuids, out.freed_input_registered,
