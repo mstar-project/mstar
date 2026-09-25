@@ -1,11 +1,15 @@
 """Unit tests for SharedMemoryCommunicationManager and tensor serialization."""
 
+import errno
 import os
+import shutil
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from mstar.communication import tensors
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
     MooncakeCommunicationManager,
@@ -192,6 +196,68 @@ def test_cleanup_unlinks_file():
         mgr.dereference("req1", uuid, n=0)  # ref is already 0
         mgr.cleanup_request("req1")
         assert not os.path.isfile(path)
+
+
+class _StubFullDir:
+    """Opens files that take half of a write and then fail it, as a tmpfs out of space does."""
+
+    def __init__(self):
+        self.partial: dict[str, int] = {}
+
+    def __call__(self, path: str, mode: str = "r"):
+        return _StubFullFile(self, path, mode)
+
+
+class _StubFullFile:
+    """One file of a ``_StubFullDir``; records the bytes it kept before failing."""
+
+    def __init__(self, full_dir: _StubFullDir, path: str, mode: str):
+        self._dir, self._path, self._f = full_dir, path, open(path, mode)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._f.close()
+
+    def write(self, data: bytes):
+        self._f.write(data[: len(data) // 2])
+        self._f.flush()
+        self._dir.partial[self._path] = os.path.getsize(self._path)
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+
+def _send_into(monkeypatch, mgr, full_dir: _StubFullDir) -> tuple[TensorPointerInfo, OSError]:
+    info = mgr.store_and_return_tensor_info("req1", {"out": [torch.zeros(4096)]})["out"][0]
+    monkeypatch.setattr(tensors, "open", full_dir, raising=False)
+    with pytest.raises(OSError) as err:
+        mgr.register_for_send("req1", [info])
+    return info, err.value
+
+
+def test_a_full_shm_dir_fails_the_send_with_what_ran_out(monkeypatch):
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=1024))
+    with tempfile.TemporaryDirectory() as tmpdir:
+        info, err = _send_into(monkeypatch, _make_manager(tmpdir, request_id="req1"), _StubFullDir())
+    ran_out = f"{tmpdir} has 1024 bytes free, too few for a {info.nbytes}-byte tensor"
+    assert ran_out in str(err) and "--shm-size" in str(err), "the error hides what ran out"
+
+
+def test_a_full_shm_dir_with_room_left_is_not_called_too_small(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _, err = _send_into(monkeypatch, _make_manager(tmpdir, request_id="req1"), _StubFullDir())
+    assert "after the failed write" in str(err) and "too few" not in str(err), (
+        "the error would blame the dir's size for inodes or another writer"
+    )
+
+
+def test_a_failed_send_leaves_nothing_in_the_shm_dir(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, full_dir = _make_manager(tmpdir, request_id="req1"), _StubFullDir()
+        info, _ = _send_into(monkeypatch, mgr, full_dir)
+        path = mgr._shm_path(mgr.my_entity_id, info.uuid)
+        assert full_dir.partial[path] > 0, "the write must fail part way, as a filling tmpfs does"
+        assert not os.path.lexists(path), "a partial file no cleanup tracks would hold the space for good"
 
 
 def test_local_tensor_skips_shm():
