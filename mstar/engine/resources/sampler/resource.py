@@ -66,6 +66,7 @@ class SamplerResource(Resource):
         self._cg_sampler: CudaGraphableSampler | None = None
         # pre-planned a step ahead, promoted by the next non-preplan plan
         self._preplan_cg_sampler: CudaGraphableSampler | None = None
+        self._preplan_key = None
         self._preplanned = False
         # rid -> the prompt tokens a cache hit kept out of this step's inputs
         self._cached_prefix: dict[str, torch.Tensor] = {}
@@ -200,6 +201,14 @@ class SamplerResource(Resource):
     def clear_preplan(self):
         self._preplanned = False
         self._preplan_cg_sampler = None
+        self._preplan_key = None
+
+    @staticmethod
+    def _plan_key(ctx: StepContext):
+        """What identifies the step a pre-plan was staged for: its padded
+        request rows and the slot they were leased on."""
+        lease = ctx.slot_lease
+        return (tuple(ctx.padded_request_ids), lease.slot if lease is not None else None)
 
     def plan(self, step: SamplerStep, ctx: StepContext):
         self._set_penalty_flags(step, ctx)
@@ -217,12 +226,20 @@ class SamplerResource(Resource):
         # the preplan; the per-step state (RNG offset + seen-token mask) is NOT
         # double-buffered — it must reflect the previous step's commit, so
         # gather it inline now, on the default stream, after that commit.
+        # Only the leased step the plan was staged for may promote it: a
+        # different batch reaching the GPU thread first (a new request's
+        # eager prefill while a decode step sits pre-planned) plans inline
+        # and the staged plan is dropped, exactly as `reset_pre_plan_for_batch`
+        # would have done.
         if self._preplanned and not ctx.is_preplan:
-            self._gather_dynamic(ctx, ctx.slot_lease)
-            self._cg_sampler = self._preplan_cg_sampler
-            self._preplan_cg_sampler = None
-            self._preplanned = False
-            return
+            if ctx.slot_lease is None or self._preplan_key != self._plan_key(ctx):
+                self.clear_preplan()
+            else:
+                self._gather_dynamic(ctx, ctx.slot_lease)
+                self._cg_sampler = self._preplan_cg_sampler
+                self._preplan_cg_sampler = None
+                self._preplanned = False
+                return
 
         # invalidated on the inline path here (not in commit, which now runs
         # before output collection); a preplan must leave the in-flight one be
@@ -243,6 +260,7 @@ class SamplerResource(Resource):
         sampler = self._cg_buffers.sampler_for(padded_bs, cg_slot)
         if ctx.is_preplan:
             self._preplan_cg_sampler = sampler
+            self._preplan_key = self._plan_key(ctx)
             self._preplanned = True
         else:
             # fresh inline (capture / no preplan): gather the per-step state too
