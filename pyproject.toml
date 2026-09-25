@@ -199,6 +199,8 @@ wan22 = [
 ]
 
 waypoint = [
+    # mp4 encode for benchmark_streaming.py --save-videos.
+    "av",
     "huggingface-hub",
     "safetensors",
     # TAEHV is installed separately at a pinned revision. PyPI rejects project
