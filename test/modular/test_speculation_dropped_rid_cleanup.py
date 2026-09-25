@@ -47,7 +47,7 @@ def _speculation(rids: list[str]) -> Speculation:
 def test_dropped_rid_gets_its_own_edges_back():
     returned: list[tuple[str, str]] = []
     worker = SimpleNamespace(
-        _return_speculative_streaming_edge=lambda rid, edge: returned.append((rid, edge.name)),
+        _return_streaming_edge=lambda rid, edge: returned.append((rid, edge.name)),
     )
     # The dropped rid goes first: the threading loop leaves its variable bound
     # to the LAST rid it visited, so a cleanup that read that leftover would

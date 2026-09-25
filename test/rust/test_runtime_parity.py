@@ -17,7 +17,7 @@ from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStor
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
-from mstar.graph.runtime.base import EdgeSpec, RouteInput, SpeculationPrepInput
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, RouteInput, SpeculationPrepInput
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
@@ -29,6 +29,21 @@ pytest.importorskip(
 )
 from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.graph.runtime import rust as rust_runtime
+
+
+def _ingest_block(rids, specs) -> ColumnarEdgeSpecs:
+    """(rids, EdgeSpecs) as the columnar block ``ingest_inputs_batch`` takes.
+
+    Mirrors the ``ParallelList`` these call sites used to build, so the shape
+    of each case is unchanged.
+    """
+    block = ColumnarEdgeSpecs.empty()
+    for rid, spec in zip(rids, specs, strict=True):
+        block.add(
+            rid, spec.signal, spec.uuids, spec.is_final_streaming_chunk,
+            next_node=spec.next_node,
+        )
+    return block
 
 WG_ID = 0
 WALK = "decode"
@@ -196,7 +211,7 @@ def test_admit_ingest_schedule(pair):
     assert _ready(rt) == []
 
     assert rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill")])
+        _ingest_block([rid], [_spec("prompt", "prefill")])
     ) == []
     assert _ready(rt) == [("prefill", WALK, [rid])]
     assert rt.has_ready_excluding(set())
@@ -205,7 +220,8 @@ def test_admit_ingest_schedule(pair):
     popped = rt.pop_rids("prefill", WALK, [rid])
     assert popped.wg_ids.keys == [rid]
     assert popped.wg_ids.values == [WG_ID]
-    assert [e.signal for e in popped.input_edges] == ["prompt"]
+    assert [sig for _r, sig, _u, _f in popped.input_edges.edge_tuples()] \
+        == ["prompt"]
     assert _ready(rt) == []
 
 
@@ -224,13 +240,13 @@ def test_refusals_agree(pair):
     rid = _admit(rt)
     # unknown node, an input the node does not take, unknown rid
     assert rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("x", "no_such_node")])
+        _ingest_block([rid], [_spec("x", "no_such_node")])
     ) == [0]
     assert rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("not_an_input", "prefill")])
+        _ingest_block([rid], [_spec("not_an_input", "prefill")])
     ) == [0]
     assert rt.ingest_inputs_batch(
-        ParallelList([424242], [_spec("prompt", "prefill")])
+        _ingest_block([424242], [_spec("prompt", "prefill")])
     ) == [0]
 
 
@@ -302,7 +318,7 @@ def test_loop_iters_agree(pair):
 def test_routing_agrees(pair):
     rt, book, store = pair
     rid = _admit(rt)
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     rt.pop_rids("prefill", WALK, [rid])
 
     for u in (1, 2):
@@ -329,9 +345,9 @@ def test_routing_agrees(pair):
 def test_prep_agrees(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     rt.pop_rids("prefill", WALK, [rid])
-    rt.ingest_inputs_batch(ParallelList(
+    rt.ingest_inputs_batch(_ingest_block(
         [rid, rid],
         [_spec("token", "ar_decode"), _spec("kv_cache", "ar_decode")],
     ))
@@ -343,7 +359,10 @@ def test_prep_agrees(pair):
     ))
     assert out.ready_rids == [rid]
     assert out.wg_ids == [WG_ID]
-    assert sum(out.input_edges_per_rid) == len(out.input_edges)
+    # Same node, so the prep reads the NEXT-iter slot -- empty here, hence
+    # no edges. Whatever it does report belongs to a rid it called ready.
+    assert {r for r, *_ in out.input_edges.edge_tuples()} \
+        <= set(out.ready_rids)
 
     capped = rt.prep_spec_rids(SpeculationPrepInput(
         spec_node_name="ar_decode", curr_node_name="ar_decode",
@@ -359,13 +378,13 @@ def test_cleanup_agrees(pair):
     book.put_tensor(5, _info(5))
     book.increment_ref(5, 1)
     rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill", uuids=[5])])
+        _ingest_block([rid], [_spec("prompt", "prefill", uuids=[5])])
     )
     rt.cleanup_consumed_inputs("prefill", [rid], [WG_ID])
     assert _released(book, 5), "the consumed input was dereferenced"
     # And the slot is free again.
     assert rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill")]), can_buffer=False
+        _ingest_block([rid], [_spec("prompt", "prefill")]), can_buffer=False
     ) == []
 
 
@@ -382,7 +401,7 @@ def _consume_one_input(rt, book, uuid=7):
     book.increment_ref(uuid, 1)
     book.set_mem_registered(uuid, True)
     rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill", uuids=[uuid])])
+        _ingest_block([rid], [_spec("prompt", "prefill", uuids=[uuid])])
     )
     rt.pop_rids("prefill", WALK, [rid])
     return rt.cleanup_consumed_inputs("prefill", [rid], [WG_ID])
@@ -491,7 +510,7 @@ def test_a_recycled_handle_does_not_inherit_a_loop_stop(pair):
         id="prep_follow_spec_rids"),
     pytest.param(
         lambda rt, r: rt.ingest_inputs_batch(
-            ParallelList([r], [_spec("prompt", "prefill")])),
+            _ingest_block([r], [_spec("prompt", "prefill")])),
         id="ingest_inputs_batch"),
 ])
 def test_a_stale_handle_never_panics(pair, call):
@@ -521,7 +540,7 @@ def test_an_input_is_released_whichever_order_runs(pair, cleanup_first):
     book.put_tensor(100, _info(100))
     book.increment_ref(100, 1)
     rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill", uuids=[100])])
+        _ingest_block([rid], [_spec("prompt", "prefill", uuids=[100])])
     )
     rt.pop_rids("prefill", WALK, [rid])
 
@@ -562,7 +581,7 @@ def test_whoever_frees_a_consumed_input_names_it(pair, cleanup_first):
     book.put_tensor(100, _info(100))
     book.increment_ref(100, 1)
     rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill", uuids=[100])])
+        _ingest_block([rid], [_spec("prompt", "prefill", uuids=[100])])
     )
     rt.pop_rids("prefill", WALK, [rid])
 
@@ -599,7 +618,7 @@ def test_removal_purges_routing_parked_for_a_send_that_never_ran(pair):
     for i in range(20):
         rid = _admit(rt, f"r{i}")
         rt.ingest_inputs_batch(
-            ParallelList([rid], [_spec("prompt", "prefill")])
+            _ingest_block([rid], [_spec("prompt", "prefill")])
         )
         rt.pop_rids("prefill", WALK, [rid])
         rt.complete_and_route_batch(
@@ -749,7 +768,7 @@ def one_node(request):
 
 def _one_pass(rt, book, store, rid, uuid):
     """Drive the single node through a full pass; return the completed wgs."""
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "only")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "only")]))
     rt.pop_rids("only", WALK, [rid])
     book.put_tensor(uuid, _info(uuid))
     book.increment_ref(uuid, 1)  # the safety hold
@@ -783,7 +802,7 @@ def test_a_worker_graph_completes_on_every_pass_not_just_the_first(one_node):
 
     # Second pass. Without the reset the node's completed flag and the
     # worker graph's is_done both latch, so this ingest goes nowhere.
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "only")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "only")]))
     assert _ready(rt) == [("only", WALK, [rid])], "the graph must run again"
 
     second = _one_pass(rt, book, store, rid, uuid=2)
@@ -847,7 +866,7 @@ def test_a_tensor_read_by_two_workers_holds_two_references(two_consumers):
             [WG_ID, 1], [[WORKER], ["worker1", "worker2"]],
         ),
     )
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "only")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "only")]))
     rt.pop_rids("only", WALK, [rid])
 
     book.put_tensor(1, _info(1))
@@ -881,7 +900,7 @@ def test_a_batch_of_three_routes_and_stays_schedulable(pair):
     rids = [_admit(rt, f"r{i}") for i in range(3)]
     assert len(set(rids)) == 3, "handles must be distinct"
 
-    rt.ingest_inputs_batch(ParallelList(
+    rt.ingest_inputs_batch(_ingest_block(
         rids, [_spec("prompt", "prefill") for _ in rids],
     ))
     assert _ready(rt) == [("prefill", WALK, sorted(rids))]
@@ -925,7 +944,7 @@ def test_a_batch_completes_every_request_not_just_the_first(pair):
     """
     rt, book, store = pair
     rids = [_admit(rt, f"r{i}") for i in range(3)]
-    rt.ingest_inputs_batch(ParallelList(
+    rt.ingest_inputs_batch(_ingest_block(
         rids, [_spec("prompt", "prefill") for _ in rids],
     ))
     rt.pop_rids("prefill", WALK, rids)
@@ -990,7 +1009,7 @@ def two_walks(request):
 
 
 def _run_walk(rt, book, store, rid, walk, wg_id, uuid):
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("text_inputs", "LLM")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
     ready = _ready(rt)
     rt.pop_rids("LLM", walk, [rid])
     book.put_tensor(uuid, _info(uuid))
@@ -1041,7 +1060,7 @@ def test_a_batch_transitions_together(two_walks):
         )
         for i in range(3)
     ]
-    rt.ingest_inputs_batch(ParallelList(
+    rt.ingest_inputs_batch(_ingest_block(
         rids, [_spec("text_inputs", "LLM") for _ in rids],
     ))
     assert _ready(rt) == [("LLM", "prefill", sorted(rids))]
@@ -1061,7 +1080,7 @@ def test_a_batch_transitions_together(two_walks):
     )
     for rid in rids:
         rt.set_walk(rid, "default", "decode")
-    rt.ingest_inputs_batch(ParallelList(
+    rt.ingest_inputs_batch(_ingest_block(
         rids, [_spec("text_inputs", "LLM") for _ in rids],
     ))
     assert _ready(rt) == [("LLM", "decode", sorted(rids))]
@@ -1126,7 +1145,7 @@ def test_an_edge_into_a_sibling_local_graph_is_ingested_not_only_sent(
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
     )
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("image_inputs", "encoder")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("image_inputs", "encoder")]))
     assert _ready(rt) == [("encoder", WALK, [rid])]
     rt.pop_rids("encoder", WALK, [rid])
 
@@ -1203,7 +1222,7 @@ def test_a_stream_to_a_sibling_graph_is_reported_local(streams_to_sibling):
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
     )
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("text_inputs", "LLM")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
     rt.pop_rids("LLM", WALK, [rid])
     book.put_tensor(1, _info(1))
     book.increment_ref(1, 1)
@@ -1240,7 +1259,7 @@ def test_a_sibling_graph_chunk_is_held_once_not_twice(streams_to_sibling):
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
     )
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("text_inputs", "LLM")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
     rt.pop_rids("LLM", WALK, [rid])
     book.put_tensor(1, _info(1))
     book.increment_ref(1, 1)
@@ -1292,7 +1311,7 @@ def test_marking_speculatively_scheduled_does_not_unready_the_node(pair):
     unmarking put it back."""
     rt, _book, _store = pair
     rid = _admit(rt)
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     assert _ready(rt) == [("prefill", WALK, [rid])]
 
     rt.set_speculatively_scheduled("prefill", WG_ID, [rid], True)
@@ -1312,7 +1331,7 @@ def test_push_back_re_readies_a_node_whose_inputs_were_consumed(pair):
     """
     rt, _book, _store = pair
     rid = _admit(rt)
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     rt.pop_rids("prefill", WALK, [rid])
     rt.cleanup_consumed_inputs("prefill", [rid], [WG_ID])
     assert _ready(rt) == []
@@ -1330,7 +1349,7 @@ def test_a_purely_local_completion_needs_no_request_info():
     """
     rt, book, store = _rust()
     rid = _admit(rt)
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     rt.pop_rids("prefill", WALK, [rid])
     book.put_tensor(1, _info(1))
     book.increment_ref(1, 1)
@@ -1366,7 +1385,7 @@ def test_a_finished_worker_graph_asks_for_request_info(streams_to_sibling):
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
     )
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("text_inputs", "LLM")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("text_inputs", "LLM")]))
     rt.pop_rids("LLM", WALK, [rid])
     book.put_tensor(1, _info(1))
     book.increment_ref(1, 1)
@@ -1513,7 +1532,7 @@ def test_a_loop_inside_a_loop_runs_every_iteration(nested):
         return u
 
     rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("latents", "denoiser", uuids=[fresh()])])
+        _ingest_block([rid], [_spec("latents", "denoiser", uuids=[fresh()])])
     )
     log = []
     for _ in range(40):
@@ -1549,7 +1568,7 @@ def test_the_inner_loop_is_the_one_that_advances(nested):
     book.put_tensor(900, _info(900))
     book.increment_ref(900, 1)
     rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("latents", "denoiser", uuids=[900])])
+        _ingest_block([rid], [_spec("latents", "denoiser", uuids=[900])])
     )
     rt.pop_rids("denoiser", WALK, [rid])
     book.put_tensor(901, _info(901))
@@ -1591,8 +1610,9 @@ def test_an_unchecked_pop_returns_every_rid_it_was_given(pair):
     assert popped is not None
     assert popped.wg_ids.keys == [rid]
     assert popped.wg_ids.values == [WG_ID]
-    assert popped.input_edges == []
-    assert popped.input_edges_per_rid == [0]
+    # A rid with nothing ready contributes no edge; the block is empty.
+    assert popped.input_edges.edge_tuples() == []
+    assert len(popped.input_edges) == 0
 
 
 def test_a_checked_pop_still_refuses_a_rid_that_is_not_ready(pair):
@@ -1601,7 +1621,7 @@ def test_a_checked_pop_still_refuses_a_rid_that_is_not_ready(pair):
     rt, _book, _store = pair
     rid = _admit(rt)
     assert rt.pop_rids("prefill", WALK, [rid], check_ready=True) is None
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     assert rt.pop_rids("prefill", WALK, [rid], check_ready=True) is not None
 
 
@@ -1610,7 +1630,7 @@ def test_cleanup_then_push_back_still_pops(pair):
     pins that ``push_back_node`` stays unconditional."""
     rt, _book, _store = pair
     rid = _admit(rt)
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     rt.pop_rids("prefill", WALK, [rid])
     rt.cleanup_consumed_inputs("prefill", [rid], [WG_ID])
     rt.push_back_node("prefill", [rid], [WG_ID])
@@ -1706,7 +1726,7 @@ def _drive_tp(rt, book, store, steps=8):
         partition_worker_graph_ids=[0, 1],
         worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER, PEER]]),
     )
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "src")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "src")]))
 
     log, uuid = [], 0
     for _ in range(steps):
@@ -1718,7 +1738,10 @@ def _drive_tp(rt, book, store, steps=8):
         wg_id = rt.get_worker_graph_id_for_node(node, walk)
         popped = rt.pop_rids(node, walk, [rid], check_ready=True)
         assert popped is not None, f"{node} went unschedulable"
-        log.append((node, [(e.signal, tuple(e.uuids)) for e in popped.input_edges]))
+        log.append((node, [
+            (sig, tuple(u)) for _r, sig, u, _f
+            in popped.input_edges.edge_tuples()
+        ]))
         rt.cleanup_consumed_inputs(node, [rid], [wg_id])
         uuid += 1
         store.put_tensor(rid, uuid, torch.zeros(4), _info(uuid))
@@ -1829,7 +1852,7 @@ def _route_one(rt, book, store, rid, node, signal, uuid):
 def test_accumulated_loop_outputs_are_staged_for_every_iteration(rollout):
     rt, book, store = rollout
     rid = _admit(rt)
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("video", "encode")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("video", "encode")]))
     _route_one(rt, book, store, rid, "encode", "pred", 1)
 
     out = None

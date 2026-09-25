@@ -8,7 +8,7 @@ from typing import NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AdmitRuntimeError
-from mstar.graph.runtime.base import EdgeSpec, GraphRuntime
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -45,9 +45,15 @@ class ScheduledBatch:
     graph_walk: str
     # request_id -> worker_graph_id (for push-back on OOM)
     request_to_worker_graph: dict[int, int] = field(default_factory=dict)
-    # rid handle -> the node's ready inputs, as the pop reported them. Carried
-    # so the batch build never has to walk node.ready_signals again.
-    input_edges: dict[int, list[EdgeSpec]] = field(default_factory=dict)
+    # The node's ready inputs for every rid in the batch, as the pop reported
+    # them -- carried so the batch build never has to walk node.ready_signals
+    # again. Columns, with the rid on each edge, so nothing here builds an
+    # object per edge; the batch build walks them once
+    # (``to_input_tensors``). The three methods below have to keep this and
+    # ``request_to_worker_graph`` describing the same rids.
+    input_edges: ColumnarEdgeSpecs = field(
+        default_factory=ColumnarEdgeSpecs.empty
+    )
     # The node's output edge names, recorded by the POP. Structural, so it is
     # the same for every rid and survives a split. Carried here so completion
     # never has to ask the runtime again -- and so the names come from the
@@ -63,7 +69,7 @@ class ScheduledBatch:
             other.node_name, other.graph_walk
         ), "only batches for the same (node, walk) share a backlog entry"
         self.request_to_worker_graph.update(other.request_to_worker_graph)
-        self.input_edges.update(other.input_edges)
+        self.input_edges.extend(other.input_edges)
 
     def split_off_first(
         self, bs: int | None, exclude_rids: set[int] | None = None
@@ -81,30 +87,29 @@ class ScheduledBatch:
         exclude_rids = [rid for rid in rids if rid in exclude_rids]
 
         if len(keep_rids) <= bs and not exclude_rids:
+            # The whole point of the columnar block: the common case hands the
+            # batch back untouched, so nothing is re-sliced per edge.
             return self, None
         if not keep_rids:
             return None, self
 
-        rids = list(rids)
+        taken = keep_rids[:bs]
+        left = keep_rids[bs:] + exclude_rids
         return ScheduledBatch(
             node_name=self.node_name,
             graph_walk=self.graph_walk,
             request_to_worker_graph={
-                rid: self.request_to_worker_graph[rid] for rid in keep_rids[:bs]
+                rid: self.request_to_worker_graph[rid] for rid in taken
             },
-            input_edges={
-                rid: self.input_edges[rid] for rid in keep_rids[:bs]
-            },
+            input_edges=self.input_edges.select_rids(set(taken)),
             output_signals=self.output_signals,
         ), ScheduledBatch(
             node_name=self.node_name,
             graph_walk=self.graph_walk,
             request_to_worker_graph={
-                rid: self.request_to_worker_graph[rid] for rid in keep_rids[bs:] + exclude_rids
+                rid: self.request_to_worker_graph[rid] for rid in left
             },
-            input_edges={
-                rid: self.input_edges[rid] for rid in keep_rids[bs:] + exclude_rids
-            },
+            input_edges=self.input_edges.select_rids(set(left)),
             output_signals=self.output_signals,
         )
 
@@ -122,7 +127,7 @@ class SchedulingType(Enum):
 
 class PopReadyResult(NamedTuple):
     wg_ids: dict[int, int]
-    edge_specs: dict[int, EdgeSpec]
+    edge_specs: ColumnarEdgeSpecs
     # Flat, not per-rid: the node's output edge names are structural, so every
     # rid in the batch shares them.
     output_signals: tuple[str, ...]
@@ -250,17 +255,6 @@ class MicroScheduler:
                 self.pending_tp_follow_count.pop(rid, None)
         return message
 
-    @staticmethod
-    def _input_edges_by_rid(popped) -> dict[int, list[EdgeSpec]]:
-        """Slice PopRidsOutput's flat, rid-major edge list back out per rid."""
-        by_rid: dict[int, list[EdgeSpec]] = {}
-        cursor = 0
-        for i, rid in enumerate(popped.wg_ids.keys):
-            count = popped.input_edges_per_rid[i]
-            by_rid[rid] = popped.input_edges[cursor:cursor + count]
-            cursor += count
-        return by_rid
-
     def pop_ready_rids(
         self, request_state: RequestStateManager,
         node_name: str, graph_walk: str, request_ids: list[int],
@@ -269,7 +263,7 @@ class MicroScheduler:
         Checked for every rid before anything is popped, so the caller
         retries later for a partially ready set."""
         if not request_ids:
-            return PopReadyResult({}, {}, ())
+            return PopReadyResult({}, ColumnarEdgeSpecs.empty(), ())
         # Engine readiness first: pop_rids treats it as a prerequisite, and it
         # is all-or-nothing too, so one not-ready rid leaves the set intact.
         node_partition = request_state.get_partition_for_node(node_name)
@@ -309,7 +303,7 @@ class MicroScheduler:
         self.node_and_walk_to_last_batch_num[(node_name, graph_walk)] = self.batch_number
         return PopReadyResult(
             dict(zip(batch_rids, wg_ids, strict=True)),
-            self._input_edges_by_rid(popped),
+            popped.input_edges,
             popped.output_signals,
         )
 
@@ -490,9 +484,13 @@ class MicroScheduler:
         # A failed rid is not "not ready yet": excluding it would put it
         # straight back in the backlog. This chunk is out of `self.backlog`
         # right now, so `_drop_backlogged_rid` cannot reach it.
-        for rid in not_ready_rids & self.failed_rids:
-            batch.request_to_worker_graph.pop(rid, None)
-            batch.input_edges.pop(rid, None)
+        dropped = not_ready_rids & self.failed_rids
+        if dropped:
+            for rid in dropped:
+                batch.request_to_worker_graph.pop(rid, None)
+            batch.input_edges = batch.input_edges.select_rids(
+                batch.request_to_worker_graph.keys()
+            )
         not_ready_rids -= self.failed_rids
         return self._cap_batch_and_schedule(batch, max_bs, not_ready_rids)
 
@@ -591,8 +589,13 @@ class MicroScheduler:
         so this is the only place holding it.
         """
         for batch in self.backlog.values():
-            batch.request_to_worker_graph.pop(rid, None)
-            batch.input_edges.pop(rid, None)
+            # Membership, not a falsy pop: a worker graph id of 0 is real.
+            if rid not in batch.request_to_worker_graph:
+                continue
+            del batch.request_to_worker_graph[rid]
+            batch.input_edges = batch.input_edges.select_rids(
+                batch.request_to_worker_graph.keys()
+            )
         self.backlog = {
             k: v for k, v in self.backlog.items() if len(v) > 0
         }
@@ -623,7 +626,7 @@ class MicroScheduler:
             node_name=node_name,
             graph_walk=graph_walk,
             request_to_worker_graph=dict(zip(batch_rids, wg_ids, strict=True)),
-            input_edges=self._input_edges_by_rid(popped),
+            input_edges=popped.input_edges,
             output_signals=popped.output_signals,
         )
 

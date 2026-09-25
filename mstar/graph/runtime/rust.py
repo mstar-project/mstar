@@ -33,7 +33,7 @@ from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime import sharding
 from mstar.graph.runtime.base import (
-    EdgeSpec,
+    ColumnarEdgeSpecs,
     FreedTensors,
     GraphRuntime,
     ParallelList,
@@ -183,6 +183,24 @@ def sharding_args(config: ShardingConfig) -> dict:
         "tp_enabled_nodes": sorted(config.tp_enabled_nodes),
         "sp_enabled_nodes": sorted(config.sp_enabled_nodes),
     }
+
+
+def _columns(out) -> ColumnarEdgeSpecs:
+    """The edge columns off a pop or a prep result.
+
+    Six list conversions for the whole batch, where the per-edge form was a
+    tuple plus two Rust ``String`` allocations each. Rust flattens the columns
+    onto its result rather than nesting them, because a ``#[pyo3(get)]`` on a
+    pyclass field clones it -- hence the names being read off ``out`` here.
+    """
+    return ColumnarEdgeSpecs(
+        signal_names=out.signal_names,
+        uuids=out.uuids,
+        tensors_per_edge=out.tensors_per_edge,
+        signal_name_idxs=out.signal_name_idxs,
+        rids=out.edge_rids,
+        is_final_streaming_chunk=out.is_final_streaming_chunk,
+    )
 
 
 class RustGraphRuntime(GraphRuntime):
@@ -360,22 +378,14 @@ class RustGraphRuntime(GraphRuntime):
 
     def ingest_inputs_batch(
         self,
-        signals: ParallelList[int, EdgeSpec],
+        signals: ColumnarEdgeSpecs,
         can_buffer: bool = True,
         is_streaming: bool = False,
     ) -> list[int]:
+        # The block goes straight over: Rust reads the columns off the
+        # dataclass, so nothing is marshalled per arriving signal.
         return self._rust.ingest_inputs_batch(
-            signals.keys,
-            [
-                {
-                    "signal": s.signal,
-                    "next_node": s.next_node,
-                    "uuids": s.uuids,
-                    "is_final_streaming_chunk": s.is_final_streaming_chunk,
-                } for s in signals.values
-            ],
-            can_buffer,
-            is_streaming,
+            signals, can_buffer, is_streaming,
         )
 
     def get_dynamic_loop_iters(
@@ -416,15 +426,8 @@ class RustGraphRuntime(GraphRuntime):
             return None
         return PopRidsOutput(
             wg_ids=ParallelList(out.rids, out.wg_ids),
-            input_edges=[
-                EdgeSpec(
-                    signal=signal, next_node=next_node, uuids=uuids,
-                    is_final_streaming_chunk=final,
-                )
-                for signal, next_node, uuids, final in out.input_edges
-            ],
+            input_edges=_columns(out),
             output_signals=tuple(out.output_signals),
-            input_edges_per_rid=out.input_edges_per_rid,
         )
 
     def has_ready_excluding(
@@ -487,7 +490,9 @@ class RustGraphRuntime(GraphRuntime):
             "room_for_continuing": input.room_for_continuing,
             "streaming_edges": [
                 {
-                    "signal": e.signal, "next_node": e.next_node,
+                    # next_node is not sent: the poll filtered on it, so it
+                    # is spec_node_name for every one of these.
+                    "signal": e.signal,
                     "uuids": e.uuids,
                     "is_final_streaming_chunk": e.is_final_streaming_chunk,
                 } for e in input.streaming_edges
@@ -501,13 +506,7 @@ class RustGraphRuntime(GraphRuntime):
             consumed_streaming_edge_idxs=out.consumed_streaming_edge_idxs,
             ready_rids=out.ready_rids,
             wg_ids=out.wg_ids,
-            input_edges=[
-                EdgeSpec(
-                    signal=s, next_node=n, uuids=u,
-                    is_final_streaming_chunk=f,
-                ) for s, n, u, f in out.input_edges
-            ],
-            input_edges_per_rid=out.input_edges_per_rid,
+            input_edges=_columns(out),
         )
 
     def prep_spec_rids(

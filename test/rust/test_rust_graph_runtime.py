@@ -25,7 +25,22 @@ from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime import base as rust_runtime_base
 from mstar.graph.runtime import rust as rust_runtime
-from mstar.graph.runtime.base import RouteInput, SpeculationPrepInput
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SpeculationPrepInput
+
+
+def _ingest_block(rids, specs) -> ColumnarEdgeSpecs:
+    """(rids, EdgeSpecs) as the columnar block ``ingest_inputs_batch`` takes.
+
+    Mirrors the ``ParallelList`` these call sites used to build, so the shape
+    of each case is unchanged.
+    """
+    block = ColumnarEdgeSpecs.empty()
+    for rid, spec in zip(rids, specs, strict=True):
+        block.add(
+            rid, spec.signal, spec.uuids, spec.is_final_streaming_chunk,
+            next_node=spec.next_node,
+        )
+    return block
 
 WG_ID = 0
 WALK = "decode"
@@ -304,14 +319,14 @@ def _spec(signal, next_node, uuids=(), final=False):
 def test_a_signal_reaches_its_node(runtime):
     rid = _admit(runtime)
     assert runtime.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill")])
+        _ingest_block([rid], [_spec("prompt", "prefill")])
     ) == []
 
 
 def test_a_signal_for_an_unknown_node_comes_back_by_index(runtime):
     rid = _admit(runtime)
     uningested = runtime.ingest_inputs_batch(
-        ParallelList(
+        _ingest_block(
             [rid, rid],
             [_spec("prompt", "prefill"), _spec("x", "not_here")],
         )
@@ -324,7 +339,7 @@ def test_a_signal_a_node_does_not_take_is_refused(runtime):
     # silently drop it into some other slot.
     rid = _admit(runtime)
     assert runtime.ingest_inputs_batch(
-        ParallelList([rid], [_spec("not_an_input", "prefill")])
+        _ingest_block([rid], [_spec("not_an_input", "prefill")])
     ) == [0]
 
 
@@ -333,28 +348,28 @@ def test_a_second_signal_buffers_then_refuses(runtime):
     # caller re-queues rather than losing the chunk.
     rid = _admit(runtime)
     assert runtime.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill")])
+        _ingest_block([rid], [_spec("prompt", "prefill")])
     ) == []
     assert runtime.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill")]), can_buffer=True
+        _ingest_block([rid], [_spec("prompt", "prefill")]), can_buffer=True
     ) == [], "the second goes to the next-iter slot"
     assert runtime.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill")]), can_buffer=True
+        _ingest_block([rid], [_spec("prompt", "prefill")]), can_buffer=True
     ) == [0], "the third has nowhere to go"
 
 
 def test_can_buffer_false_refuses_the_second(runtime):
     rid = _admit(runtime)
-    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     assert runtime.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill")]), can_buffer=False
+        _ingest_block([rid], [_spec("prompt", "prefill")]), can_buffer=False
     ) == [0], "streaming must not buffer for an iteration that may not come"
 
 
 def test_an_unknown_rid_is_refused_not_raised(runtime):
     # A signal can arrive for a request this rank already removed.
     assert runtime.ingest_inputs_batch(
-        ParallelList([9999], [_spec("prompt", "prefill")])
+        _ingest_block([9999], [_spec("prompt", "prefill")])
     ) == [0]
 
 
@@ -363,15 +378,17 @@ def test_streaming_gates_on_the_non_streaming_inputs(runtime):
     # ready-for-streaming and a streaming ingest must not land.
     rid = _admit(runtime)
     assert runtime.ingest_inputs_batch(
-        ParallelList([rid], [_spec("token", "ar_decode")]), is_streaming=True
+        _ingest_block([rid], [_spec("token", "ar_decode")]), is_streaming=True
     ) == [0]
 
 
-def test_mismatched_lengths_are_rejected(runtime):
+def test_inconsistent_columns_are_rejected(runtime):
+    """The columns describing one edge each have to agree in length -- a short
+    one would silently re-pair every edge after it with the wrong rid."""
+    block = _ingest_block([1], [_spec("prompt", "prefill")])
+    block.rids.append(2)  # a rid with no matching edge in the other columns
     with pytest.raises((ValueError, RuntimeError)):
-        runtime.ingest_inputs_batch(
-            ParallelList([1, 2], [_spec("prompt", "prefill")])
-        )
+        runtime.ingest_inputs_batch(block)
 
 
 # --- consumed inputs and loop iters ------------------------------------------
@@ -379,12 +396,12 @@ def test_mismatched_lengths_are_rejected(runtime):
 def test_cleanup_releases_consumed_inputs(runtime):
     rid = _admit(runtime)
     runtime.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill", uuids=[7])])
+        _ingest_block([rid], [_spec("prompt", "prefill", uuids=[7])])
     )
     runtime.cleanup_consumed_inputs("prefill", [rid], [WG_ID])
     # The slot is free again, so the same signal lands rather than refusing.
     assert runtime.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill")]), can_buffer=False
+        _ingest_block([rid], [_spec("prompt", "prefill")]), can_buffer=False
     ) == []
 
 
@@ -414,7 +431,7 @@ def test_cleanup_holds_a_loops_external_inputs():
         bookkeeping=RustTensorBookkeeping(),
     )
     rid = _admit(rt)
-    rt.ingest_inputs_batch(ParallelList(
+    rt.ingest_inputs_batch(_ingest_block(
         [rid, rid],
         [_spec("seed", "body", uuids=[1]), _spec("tok", "body", uuids=[2])],
     ))
@@ -423,10 +440,10 @@ def test_cleanup_holds_a_loops_external_inputs():
     # "seed" is external to the loop, so it is still held; "tok" loops back
     # and was released.
     assert rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("seed", "body")]), can_buffer=False
+        _ingest_block([rid], [_spec("seed", "body")]), can_buffer=False
     ) == [0], "the external input must still be held"
     assert rt.ingest_inputs_batch(
-        ParallelList([rid], [_spec("tok", "body")]), can_buffer=False
+        _ingest_block([rid], [_spec("tok", "body")]), can_buffer=False
     ) == [], "the loop-back input was consumed and released"
 
 
@@ -447,7 +464,7 @@ def test_dynamic_loop_iters_for_an_unknown_partition_are_empty(runtime):
 def test_a_ready_node_is_reported(runtime):
     rid = _admit(runtime)
     assert runtime.get_ready_nodes(set()) == []
-    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     ready = runtime.get_ready_nodes(set())
     assert [(r.node_name, r.graph_walk, r.rids) for r in ready] == [
         ("prefill", WALK, [rid])
@@ -456,14 +473,14 @@ def test_a_ready_node_is_reported(runtime):
 
 def test_excluded_rids_are_invisible(runtime):
     rid = _admit(runtime)
-    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     assert runtime.get_ready_nodes({rid}) == []
     assert not runtime.has_ready_excluding({rid})
 
 
 def test_target_and_exclude_target_filter(runtime):
     rid = _admit(runtime)
-    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     assert len(runtime.get_ready_nodes(set(), target=("prefill", WALK))) == 1
     assert runtime.get_ready_nodes(set(), target=("ar_decode", WALK)) == []
     assert runtime.get_ready_nodes(
@@ -474,7 +491,7 @@ def test_target_and_exclude_target_filter(runtime):
 def test_the_peek_agrees_with_the_scan(runtime):
     rid = _admit(runtime)
     assert not runtime.has_ready_excluding(set())
-    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     assert runtime.has_ready_excluding(set())
     assert not runtime.has_ready_excluding(set(), exclude_target=("prefill", WALK))
 
@@ -482,13 +499,11 @@ def test_the_peek_agrees_with_the_scan(runtime):
 def test_pop_returns_the_inputs_it_popped(runtime):
     rid = _admit(runtime)
     runtime.ingest_inputs_batch(
-        ParallelList([rid], [_spec("prompt", "prefill", uuids=[11, 12])])
+        _ingest_block([rid], [_spec("prompt", "prefill", uuids=[11, 12])])
     )
     out = runtime.pop_rids("prefill", WALK, [rid])
     assert out.wg_ids.keys == [rid] and out.wg_ids.values == [WG_ID]
-    assert out.input_edges_per_rid == [1]
-    edge = out.input_edges[0]
-    assert edge.signal == "prompt" and edge.uuids == [11, 12]
+    assert out.input_edges.edge_tuples() == [(rid, "prompt", [11, 12], False)]
 
     # Popped, so it is no longer ready.
     assert runtime.get_ready_nodes(set()) == []
@@ -498,7 +513,7 @@ def test_pop_with_check_ready_is_all_or_nothing(runtime):
     # One not-ready rid must leave the whole set intact for a later retry.
     a = _admit(runtime, "ra")
     b = _admit(runtime, "rb")
-    runtime.ingest_inputs_batch(ParallelList([a], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([a], [_spec("prompt", "prefill")]))
 
     assert runtime.pop_rids("prefill", WALK, [a, b], check_ready=True) is None
     # a was NOT popped by the failed attempt.
@@ -512,7 +527,7 @@ def test_pop_of_an_unknown_node_returns_none(runtime):
 
 def test_push_back_makes_a_popped_node_ready_again(runtime):
     rid = _admit(runtime)
-    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     runtime.pop_rids("prefill", WALK, [rid])
     assert runtime.get_ready_nodes(set()) == []
     runtime.push_back_node("prefill", [rid], [WG_ID])
@@ -590,9 +605,9 @@ def _prep_input(rids, spec="ar_decode", curr="prefill", room=None, edges=()):
 
 def _drive_into_loop(runtime, rid):
     """Get the request as far as ar_decode being ready to loop back."""
-    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     runtime.pop_rids("prefill", WALK, [rid])
-    runtime.ingest_inputs_batch(ParallelList(
+    runtime.ingest_inputs_batch(_ingest_block(
         [rid, rid],
         [_spec("token", "ar_decode"), _spec("kv_cache", "ar_decode")],
     ))
@@ -604,8 +619,8 @@ def test_prep_reports_the_worker_graph_per_ready_rid(runtime):
     out = runtime.prep_spec_rids(_prep_input([rid], curr="ar_decode"))
     assert out.ready_rids == [rid]
     assert out.wg_ids == [WG_ID], "wg_ids is parallel to ready_rids"
-    assert len(out.input_edges_per_rid) == len(out.ready_rids)
-    assert sum(out.input_edges_per_rid) == len(out.input_edges)
+    # Every edge belongs to a rid the prep reported ready.
+    assert {r for r, *_ in out.input_edges.edge_tuples()} <= set(out.ready_rids)
 
 
 def test_prep_respects_room_for_continuing(runtime):
@@ -660,7 +675,7 @@ def test_prep_skips_a_rid_whose_other_input_has_not_arrived():
     # a's outputs cover x; y has to be there already.
     assert rt.prep_spec_rids(_ab([rid])).ready_rids == []
 
-    rt.ingest_inputs_batch(ParallelList([rid], [_spec("y", "b")]))
+    rt.ingest_inputs_batch(_ingest_block([rid], [_spec("y", "b")]))
     assert rt.prep_spec_rids(_ab([rid])).ready_rids == [rid]
 
 
@@ -668,7 +683,7 @@ def test_the_follower_prep_is_all_or_nothing():
     rt = _two_node_runtime()
     ready = _admit(rt, "ra")
     blank = _admit(rt, "rb")
-    rt.ingest_inputs_batch(ParallelList([ready], [_spec("y", "b")]))
+    rt.ingest_inputs_batch(_ingest_block([ready], [_spec("y", "b")]))
 
     # The leader's best-effort prep takes the one that is ready...
     assert rt.prep_spec_rids(_ab([ready, blank])).ready_rids == [ready]
@@ -683,7 +698,7 @@ def test_a_failed_follower_prep_leaves_no_ingest_behind():
     rt = _two_node_runtime()
     ready = _admit(rt, "ra")
     blank = _admit(rt, "rb")
-    rt.ingest_inputs_batch(ParallelList([ready], [_spec("y", "b")]))
+    rt.ingest_inputs_batch(_ingest_block([ready], [_spec("y", "b")]))
 
     assert rt.prep_follow_spec_rids(_ab([ready, blank])) is None
     # The ready rid is still preppable, so nothing was consumed or left set.
@@ -695,7 +710,7 @@ def test_the_follower_prep_succeeds_when_every_rid_is_ready():
     a = _admit(rt, "ra")
     b = _admit(rt, "rb")
     for r in (a, b):
-        rt.ingest_inputs_batch(ParallelList([r], [_spec("y", "b")]))
+        rt.ingest_inputs_batch(_ingest_block([r], [_spec("y", "b")]))
     out = rt.prep_follow_spec_rids(_ab([a, b]))
     assert out is not None
     assert out.ready_rids == [a, b], "wire order is the leader's batch order"
@@ -706,7 +721,7 @@ def test_prep_room_cap_applies_before_any_ingest():
     a = _admit(rt, "ra")
     b = _admit(rt, "rb")
     for r in (a, b):
-        rt.ingest_inputs_batch(ParallelList([r], [_spec("y", "b")]))
+        rt.ingest_inputs_batch(_ingest_block([r], [_spec("y", "b")]))
     assert rt.prep_spec_rids(_ab([a, b], room=1)).ready_rids == [a]
     # The capped rid was skipped before any ingest, so it is untouched.
     assert rt.prep_spec_rids(_ab([b])).ready_rids == [b]
@@ -738,7 +753,7 @@ def test_routing_decodes_the_flat_rid_major_layout(runtime):
     a = _admit(runtime, "ra")
     b = _admit(runtime, "rb")
     for r in (a, b):
-        runtime.ingest_inputs_batch(ParallelList([r], [_spec("prompt", "prefill")]))
+        runtime.ingest_inputs_batch(_ingest_block([r], [_spec("prompt", "prefill")]))
         runtime.pop_rids("prefill", WALK, [r])
 
     bk = runtime._bookkeeping_for_test
@@ -759,7 +774,7 @@ def test_routing_ingests_a_local_destination(runtime):
     # prefill -> ar_decode is local, so ar_decode becomes ready without any
     # round trip through the worker.
     rid = _admit(runtime)
-    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     runtime.pop_rids("prefill", WALK, [rid])
 
     bk = runtime._bookkeeping_for_test
@@ -775,7 +790,7 @@ def test_routing_settles_the_safety_hold(runtime):
     """Outputs come in with a hold of 1; routing corrects to the real fanout.
     Too low frees a tensor a consumer still needs, too high leaks it."""
     rid = _admit(runtime)
-    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     runtime.pop_rids("prefill", WALK, [rid])
 
     bk = runtime._bookkeeping_for_test
@@ -860,7 +875,7 @@ def test_send_consumes_the_completion(runtime):
     A double-take would raise on the second pass of a live request."""
     rid = _admit(runtime)
     runtime._communicator = _Recorder()
-    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     runtime.pop_rids("prefill", WALK, [rid])
     bk = runtime._bookkeeping_for_test
     for u in (30, 31):
@@ -877,7 +892,7 @@ def test_a_local_only_batch_sends_nothing_to_peers(runtime):
     rid = _admit(runtime)
     rec = _Recorder()
     runtime._communicator = rec
-    runtime.ingest_inputs_batch(ParallelList([rid], [_spec("prompt", "prefill")]))
+    runtime.ingest_inputs_batch(_ingest_block([rid], [_spec("prompt", "prefill")]))
     runtime.pop_rids("prefill", WALK, [rid])
     bk = runtime._bookkeeping_for_test
     for u in (40, 41):
