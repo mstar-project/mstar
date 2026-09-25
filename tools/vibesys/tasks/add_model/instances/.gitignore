@@ -1,0 +1,6 @@
+# Per-model instance specs (<model>.toml, <model>.reference.py) are local working
+# files, not tool source. Only the tracked example template is kept in git.
+*
+!.gitignore
+!example.toml
+!example.reference.py

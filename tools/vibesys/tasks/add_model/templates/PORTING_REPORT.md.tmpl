@@ -1,0 +1,58 @@
+# Model Port Report: `${model}`
+
+## Strategy Signals
+
+Summarize the current state of
+`progress-artifacts/evidence/model-port-decisions.jsonl`. The JSONL file remains
+the chronological source of truth.
+
+| signal | value | supporting decision sequence |
+|---|---|---|
+| shape classification | _matched, composed, or unmatched-derived_ | |
+| selected references | _reference names or none_ | |
+| persistent-state strategy | _reused resources, added resources, or neither_ | |
+| skill guidance gaps | _none or ambiguous/missing/misleading signals_ | |
+
+## Engine Mapping
+
+Complete this table before implementation and update the evidence column as
+validation lands.
+
+| node | walks | inputs/outputs | persistent state | resource keys | dependencies | resident capacity | eager validation |
+|---|---|---|---|---|---|---|---|
+| _replace with one row per node_ | | | | | | | |
+
+Resident capacity describes how many persistent sessions or allocations the
+engine can hold. It is separate from a node's maximum batch size for one step.
+
+## Resources
+
+| resource key | reused or added | owning nodes | lifecycle/capacity evidence |
+|---|---|---|---|
+| _replace_ | | | |
+
+## Direction Status
+
+Use only `implemented`, `evidence-blocked`, or `deferred`. Include a test,
+artifact, or precise blocker for every requested direction. An
+`evidence-blocked` entry must show the attempted engine mapping and name the
+exact required operation missing from the generic resource extension
+interfaces. A missing reference model, implementation effort, or loss of a
+preferred optimization is not a blocker. Never use model-owned resource
+lifecycle as a fallback for a blocked direction.
+
+| direction | status | evidence or blocker |
+|---|---|---|
+| eager correctness | _replace_ | |
+| engine-owned persistent state | _replace_ | |
+| native weight loading and registration | _replace_ | |
+| client-facing correctness | _replace_ | |
+| observational benchmark | _replace_ | |
+
+## Deferred Performance Opportunities
+
+Record opportunities without implementing them in this add-model MVP.
+
+| opportunity | baseline observation | separate task needed |
+|---|---|---|
+| _replace_ | | yes |
