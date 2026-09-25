@@ -99,6 +99,10 @@ pub struct Bookkeeping {
     ref_info: FxHashMap<u64, ReferenceInfo>,
     tensor_info: FxHashMap<u64, TensorPointerInfo>,
     strings: StrToId,
+    /// Arena segment index -> interned name, filled once per segment as the
+    /// arena grows. Placement then crosses as an index, so a name never
+    /// travels per tensor -- see `set_shm_placement`.
+    shm_segments: Vec<Sym>,
 }
 
 /// Uncontended in practice -- everything runs under the GIL today -- but a
@@ -280,34 +284,67 @@ impl Bookkeeping {
         Ok(())
     }
 
+    /// Name one arena segment, once, when the arena grows into it.
+    ///
+    /// Idempotent: re-registering the same index re-interns to the same Sym.
+    fn register_shm_segment(&mut self, index: usize, name: &str) {
+        let sym = self.strings.intern(name);
+        if index >= self.shm_segments.len() {
+            // Sym::MAX marks a gap. Growth is sequential in practice, so this
+            // only pads if a caller ever registers out of order.
+            self.shm_segments.resize(index + 1, Sym::MAX);
+        }
+        self.shm_segments[index] = sym;
+    }
+
     /// Stamp arena placement onto descriptors already held here.
     ///
     /// `register_for_send` only changes `shm_segment` and `shm_offset`, but
     /// the descriptor round trip to do it is not cheap: rebuilding each one
     /// for Python costs ~2.2us (15 attribute crossings plus the dataclass)
     /// and marshalling it back another ~1.3us -- ~3.5us per tensor to write
-    /// two fields this side already owns. Segments are interned, so a batch
-    /// staged into one segment interns one string.
+    /// two fields this side already owns.
+    ///
+    /// `segment_idxs` are indices from `register_shm_segment`, not names:
+    /// the caller reserved by index, so making it materialize a name per
+    /// tensor only for this side to intern it back down to an id is a
+    /// Python str alloc, a String alloc, a memcpy and a hash per tensor to
+    /// recover an integer it already had. `-1` is "no segment" (the producer
+    /// spilled this one to its own file), which is what a consumer reads as
+    /// the file fallback.
     ///
     /// An untracked uuid is skipped, matching every other mutator here: a
     /// late stamp for a tensor already collected is benign.
     fn set_shm_placement(
         &mut self,
         uuids: Vec<u64>,
-        segments: Vec<Option<String>>,
+        segment_idxs: Vec<i64>,
         offsets: Vec<i64>,
     ) -> PyResult<()> {
         let n = uuids.len();
-        if segments.len() != n || offsets.len() != n {
+        if segment_idxs.len() != n || offsets.len() != n {
             return Err(PyValueError::new_err(
-                "set_shm_placement: uuids, segments and offsets must have \
-                 the same length",
+                "set_shm_placement: uuids, segment_idxs and offsets must \
+                 have the same length",
             ));
         }
         for i in 0..n {
-            let seg = match &segments[i] {
-                Some(name) => Some(self.strings.intern(name)),
-                None => None,
+            let seg = match segment_idxs[i] {
+                idx if idx < 0 => None,
+                idx => {
+                    let idx = idx as usize;
+                    match self.shm_segments.get(idx) {
+                        Some(&sym) if sym != Sym::MAX => Some(sym),
+                        // A segment nobody registered would ship a descriptor
+                        // the consumer reads as "spilled to a file" and then
+                        // fail to find, which is far harder to trace back
+                        // here than a loud error.
+                        _ => return Err(PyValueError::new_err(format!(
+                            "set_shm_placement: segment {idx} was never \
+                             registered via register_shm_segment"
+                        ))),
+                    }
+                }
             };
             if let Some(info) = self.tensor_info.get_mut(&uuids[i]) {
                 info.shm_segment = seg;
@@ -520,13 +557,20 @@ impl TensorBookkeeping {
         )
     }
 
+    fn register_shm_segment(&self, index: usize, name: &str) {
+        self.inner.lock().unwrap().register_shm_segment(index, name)
+    }
+
     fn set_shm_placement(
         &self,
         uuids: Vec<u64>,
-        segments: Vec<Option<String>>,
+        segment_idxs: Vec<i64>,
         offsets: Vec<i64>,
     ) -> PyResult<()> {
-        self.inner.lock().unwrap().set_shm_placement(uuids, segments, offsets)
+        self.inner
+            .lock()
+            .unwrap()
+            .set_shm_placement(uuids, segment_idxs, offsets)
     }
 
     fn get_info(&self, uuid: u64) -> Option<TensorInfoOut> {
