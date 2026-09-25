@@ -556,7 +556,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self, request_id: str, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         ctx = (
             torch.cuda.stream(self._d2h_stream)

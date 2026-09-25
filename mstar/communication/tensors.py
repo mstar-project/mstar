@@ -362,6 +362,9 @@ class TensorCommunicationManager(ABC):
         self.my_session_id = my_session_id
         self.enable_prof = enable_prof
         self.device = device
+        # by the manager's device, not torch.cuda.is_available() alone: a host manager holds only host tensors,
+        # and its first sync would create a CUDA context on a GPU that other processes may have filled
+        self._on_cuda = torch.cuda.is_available() and torch.device(device).type == "cuda"
         self.communicator = communicator
         self.transfer_engine = transfer_engine
         self.tensor_store = TensorStore()
@@ -414,7 +417,7 @@ class TensorCommunicationManager(ABC):
         # step), so the unconditional default-stream sync here would
         # uselessly drain GPU(N+1). Pass ``skip_cuda_sync=True`` from
         # those call sites.
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
 
@@ -892,7 +895,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         )
 
     def register_for_send(self, request_id, tensor_infos, skip_cuda_sync=False):
-        if not skip_cuda_sync:
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         for info in tensor_infos:
             uuid = info.uuid
@@ -1094,7 +1097,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         self, request_id: str, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         # Producer's completion event is already waited on upstream, so the
         # source tensors are device-visible on entry. Running the D2H on a
