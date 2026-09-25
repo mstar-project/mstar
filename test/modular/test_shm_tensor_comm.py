@@ -460,6 +460,50 @@ def test_has_inflight_reads_tracks_pending_futures():
         assert not mgr.has_inflight_reads("other-req")
 
 
+def test_a_read_that_finishes_early_waits_for_the_ones_started_before_it():
+    """The async reader runs reads on a thread pool, so a request's second read
+    can finish before its first. Its edges still have to come out in order."""
+    from mstar.communication.tensors import FutureAndPointers
+
+    class _Fut:
+        def __init__(self, done: bool):
+            self.finished = done
+
+        def done(self):
+            return self.finished
+
+        def result(self):
+            return None
+
+    def _read(future, rid: str, name: str) -> FutureAndPointers:
+        return FutureAndPointers(
+            future=future, graph_edges=[GraphEdge(next_node="LLM", name=name)],
+            request_id=rid,
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir, request_id="req1")
+        mgr.register_request("req2", _empty_sharding_config())
+        first = _Fut(done=False)
+        mgr.pending = [
+            _read(first, "req1", "token_0"),
+            _read(_Fut(done=True), "req1", "token_1"),
+            _read(_Fut(done=True), "req2", "token_0"),
+        ]
+
+        ready = mgr.get_ready_tensors()
+        assert "req1" not in ready, "a token went out ahead of the one before it"
+        assert [e.name for e in ready["req2"]] == ["token_0"], (
+            "another request's read waited on this one"
+        )
+
+        first.finished = True
+        ready = mgr.get_ready_tensors()
+        assert [e.name for e in ready["req1"]] == ["token_0", "token_1"], (
+            "the request's reads came out out of order"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Factory tests
 # ---------------------------------------------------------------------------
