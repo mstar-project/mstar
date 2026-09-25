@@ -131,15 +131,17 @@ def test_store_and_register_creates_file():
 
 
 class _DeploymentCommunicator(MockCommunicator):
-    def __init__(self, prefix: str):
+    def __init__(self, prefix: str, protocol=CommProtocol.IPC):
         super().__init__()
+        self.protocol = protocol
         self.ipc_socket_path_prefix = prefix
 
 
-def _deployed_manager(shm_dir, prefix, entity_id="worker_0"):
+def _deployed_manager(shm_dir, prefix, entity_id="worker_0",
+                      protocol=CommProtocol.IPC):
     mgr = SharedMemoryCommunicationManager(
         my_entity_id=entity_id, hostname="localhost", device="cpu",
-        communicator=_DeploymentCommunicator(prefix), shm_dir=shm_dir,
+        communicator=_DeploymentCommunicator(prefix, protocol), shm_dir=shm_dir,
     )
     mgr.register_request("req1", _empty_sharding_config())
     return mgr
@@ -153,6 +155,27 @@ def test_two_deployments_on_one_host_do_not_share_files():
     with tempfile.TemporaryDirectory() as tmpdir:
         a = _deployed_manager(tmpdir, "/tmp/mstar_a/")
         b = _deployed_manager(tmpdir, "/tmp/mstar_b/")
+        [ia] = a.store_and_return_tensor_info("req1", {"out": [torch.ones(4)]})["out"]
+        [ib] = b.store_and_return_tensor_info("req1", {"out": [torch.zeros(4)]})["out"]
+        assert ia.uuid == ib.uuid, "precondition: the uuids really do collide"
+        a.register_for_send("req1", [ia])
+        b.register_for_send("req1", [ib])
+
+        assert a._shm_path("worker_0", ia.uuid) != b._shm_path("worker_0", ib.uuid)
+        b.force_cleanup_request("req1")
+        assert os.path.isfile(a._shm_path("worker_0", ia.uuid)), (
+            "the other deployment's teardown removed this one's tensor"
+        )
+
+
+def test_two_tcp_deployments_do_not_share_files(monkeypatch):
+    """TCP ignores the socket prefix, so both deployments carry the default
+    one; the base port is what actually separates them."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        monkeypatch.setenv("MSTAR_ZMQ_TCP_BASE_PORT", "19000")
+        a = _deployed_manager(tmpdir, "/tmp/mstar/", protocol=CommProtocol.TCP)
+        monkeypatch.setenv("MSTAR_ZMQ_TCP_BASE_PORT", "29000")
+        b = _deployed_manager(tmpdir, "/tmp/mstar/", protocol=CommProtocol.TCP)
         [ia] = a.store_and_return_tensor_info("req1", {"out": [torch.ones(4)]})["out"]
         [ib] = b.store_and_return_tensor_info("req1", {"out": [torch.zeros(4)]})["out"]
         assert ia.uuid == ib.uuid, "precondition: the uuids really do collide"
