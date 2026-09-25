@@ -1060,22 +1060,30 @@ def _default_shm_dir() -> str:
     return "/tmp/mstar_shm"
 
 
+#: The entity whose endpoint names the deployment in `_deployment_namespace`.
+#: Any fixed id works; the conductor is the one every deployment has.
+_NAMESPACE_ANCHOR = "conductor"
+
+
 def _deployment_namespace(communicator) -> str:
     """A token every process of ONE deployment derives identically, and two
     deployments on the same host never share.
 
     Tensor uuids are per-entity counters, so ``worker_0``'s uuid 5 exists in
     every deployment at once; a file named by entity and uuid alone is written
-    -- and unlinked -- by every server on the host. The IPC socket prefix is
-    already unique per concurrent deployment (their sockets would collide
-    otherwise) and every process of one is handed the same one, so it names
-    the deployment. Empty for a communicator without one (tests).
+    and unlinked by every server on the host. The conductor's endpoint is used
+    to disambiguate, as it is unique across concurrent deployments by
+    construction (otherwise ZMQ sockets would already collide).
     """
-    prefix = getattr(communicator, "ipc_socket_path_prefix", None)
-    if not prefix:
+    if getattr(communicator, "protocol", None) not in (
+        CommProtocol.IPC, CommProtocol.TCP
+    ):
         return ""
-    # realpath: "/tmp/mstar_x/" and "/tmp/mstar_x" are one deployment.
-    return hashlib.sha1(os.path.realpath(prefix).encode()).hexdigest()[:12]
+    endpoint = communicator._endpoint(_NAMESPACE_ANCHOR)
+    if endpoint.startswith("ipc://"):
+        # realpath: "/tmp/mstar_x/" and "/tmp/mstar_x" are one deployment.
+        endpoint = "ipc://" + os.path.realpath(endpoint.removeprefix("ipc://"))
+    return hashlib.sha1(endpoint.encode()).hexdigest()[:12]
 
 
 # ---------------------------------------------------------------------------
