@@ -513,15 +513,10 @@ impl RequestState {
             }
         }
         self.refresh_ready(node);
+        // The slot was just cleared, so streaming membership goes back to its
+        // seed; Python's `WorkerGraphStateRegistry.mark_entity_complete`
+        // does exactly this right after `entity.ready_signals.clear()`.
         if spec.loop_id.is_none() {
-            // `refresh_ready` only writes `ready`. The inputs were just
-            // cleared, so the streaming bit has to follow them down --
-            // `note_ingested_for_streaming` dropped it when the node filled
-            // up, and an only-streaming node needs it BACK or its second
-            // chunk is refused and the stream stalls. Same re-seed Python
-            // does on this path (WorkerGraphStateRegistry.mark_entity_complete),
-            // and same top-level-only scope: a loop member keeps `cur` until
-            // its loop advances, and `reset_subtree_for_iter` re-seeds it then.
             self.reseed_streaming_ready(node);
         }
 
