@@ -21,7 +21,7 @@ from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStor
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
-from mstar.graph.runtime.base import EdgeSpec, RouteInput
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, RouteInput
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
@@ -36,6 +36,20 @@ from mstar.graph.runtime import rust as rust_runtime
 
 WG_ID, WALK, WORKER = 0, "decode", "worker_0"
 
+
+def _ingest_block(rids, specs) -> ColumnarEdgeSpecs:
+    """(rids, EdgeSpecs) as the columnar block ``ingest_inputs_batch`` takes.
+
+    Mirrors the ``ParallelList`` these call sites used to build, so the shape
+    of each case is unchanged.
+    """
+    block = ColumnarEdgeSpecs.empty()
+    for rid, spec in zip(rids, specs, strict=True):
+        block.add(
+            rid, spec.signal, spec.uuids, spec.is_final_streaming_chunk,
+            next_node=spec.next_node,
+        )
+    return block
 
 def _loop_graph():
     """An AR loop whose token is BOTH emitted to the client and fed back as
@@ -191,7 +205,7 @@ class Lockstep:
                         is_final_streaming_chunk=False)
         return self._both(
             f"ingest({signal}->{node}, uuids={list(uuids)})",
-            lambda rt, b, s: rt.ingest_inputs_batch(ParallelList([rid], [spec])))
+            lambda rt, b, s: rt.ingest_inputs_batch(_ingest_block([rid], [spec])))
 
     def stream(self, rid, signal, node, uuids=()):
         """A chunk from a StreamBuffer, ingested as the worker does: for this
@@ -202,7 +216,7 @@ class Lockstep:
         return self._both(
             f"stream({signal}->{node}, uuids={list(uuids)})",
             lambda rt, b, s: rt.ingest_inputs_batch(
-                ParallelList([rid], [spec]), can_buffer=False,
+                _ingest_block([rid], [spec]), can_buffer=False,
                 is_streaming=True))
 
     def ready(self):
@@ -215,9 +229,12 @@ class Lockstep:
             p = rt.pop_rids(node, WALK, [rid])
             if p is None:
                 return None
+            # next_node is not in the block: a pop reports edges for the
+            # node the caller named, so it was the same string every time.
             return (p.wg_ids.keys, p.wg_ids.values,
-                    sorted((e.signal, e.next_node, list(e.uuids))
-                           for e in p.input_edges))
+                    sorted((sig, node, list(uuids))
+                           for _r, sig, uuids, _f
+                           in p.input_edges.edge_tuples()))
         return self._both(f"pop_rids({node})", f)
 
     def route(self, node, rid, signals, uuids):

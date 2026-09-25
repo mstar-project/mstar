@@ -32,6 +32,7 @@ from mstar.communication.wire import decode, encode, encode_field, encode_fields
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
+from mstar.graph.runtime.base import ColumnarEdgeSpecs
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -40,6 +41,13 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+
+
+def _one_signal(rid, signal, next_node) -> ColumnarEdgeSpecs:
+    """One arriving signal as the columnar block the raw runtime takes."""
+    block = ColumnarEdgeSpecs.empty()
+    block.add(rid, signal, [], False, next_node=next_node)
+    return block
 
 WALK = "decode"
 WG_ID = 0
@@ -90,10 +98,7 @@ class _Mesh:
 
     def run(self, rid, uuids, **send_kwargs):
         """Ingest, pop, complete and send. Returns the frames each peer got."""
-        self.rt.ingest_inputs_batch([rid], [{
-            "signal": "prompt", "next_node": "only", "uuids": [],
-            "is_final_streaming_chunk": False,
-        }])
+        self.rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
         self.rt.pop_rids("only", WALK, [rid])
         signals = self.rt.get_output_signals("only", WALK)
         out = self.rt.complete_and_route_batch({
@@ -446,10 +451,7 @@ def _emit_mesh(tmp_path, tp_rank, shard_dim=None):
     )
     book.put_tensor(1, info)
     book.increment_ref(1, 1)
-    rt.ingest_inputs_batch([rid], [{
-        "signal": "prompt", "next_node": "only", "uuids": [],
-        "is_final_streaming_chunk": False,
-    }])
+    rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     rt.pop_rids("only", WALK, [rid])
     out = rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "node_name": "only",
@@ -494,10 +496,7 @@ def _persist_mesh(tmp_path, tp_rank):
     )
     book.put_tensor(1, info)
     book.increment_ref(1, 1)
-    rt.ingest_inputs_batch([rid], [{
-        "signal": "prompt", "next_node": "only", "uuids": [],
-        "is_final_streaming_chunk": False,
-    }])
+    rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     rt.pop_rids("only", WALK, [rid])
     out = rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "node_name": "only",
@@ -594,10 +593,7 @@ def _fanout_mesh(tmp_path, shard_dim=None):
     book.put_tensor(1, _info(1, dims=[4, 3], nbytes=24))
     book.increment_ref(1, 1)
 
-    rt.ingest_inputs_batch([rid], [{
-        "signal": "prompt", "next_node": "src", "uuids": [],
-        "is_final_streaming_chunk": False,
-    }])
+    rt.ingest_inputs_batch(_one_signal(rid, "prompt", "src"))
     rt.pop_rids("src", WALK, [rid])
     out = rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "node_name": "src",
@@ -679,10 +675,7 @@ def _gather_mesh(tmp_path, src_tp, dest_tp, my_rank=0, shard_dim=0,
                          srcs + dests, [src_tp, dest_tp])
     book.put_tensor(1, _info(1, dims=[4, 3], nbytes=24))
     book.increment_ref(1, 1)
-    rt.ingest_inputs_batch([rid], [{
-        "signal": "prompt", "next_node": "src", "uuids": [],
-        "is_final_streaming_chunk": False,
-    }])
+    rt.ingest_inputs_batch(_one_signal(rid, "prompt", "src"))
     rt.pop_rids("src", WALK, [rid])
     out = rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "node_name": "src",
@@ -782,10 +775,7 @@ def _looping_emit_mesh(tmp_path):
 
 def _iterate(rt, book, rid, uuid, stop_first=False):
     """One pass of the loop, driven exactly as the worker drives it."""
-    rt.ingest_inputs_batch([rid], [{
-        "signal": "token", "next_node": "ar_decode", "uuids": [],
-        "is_final_streaming_chunk": False,
-    }])
+    rt.ingest_inputs_batch(_one_signal(rid, "token", "ar_decode"))
     rt.pop_rids("ar_decode", WALK, [rid])
     book.put_tensor(uuid, _info(uuid))
     book.increment_ref(uuid, 1)
@@ -856,10 +846,7 @@ def test_an_output_nobody_runs_is_an_error(tmp_path):
     mesh = _Mesh(tmp_path, outs=[("out", "nowhere", False)])
     rid = mesh.admit()
     _put(mesh, 1)
-    mesh.rt.ingest_inputs_batch([rid], [{
-        "signal": "prompt", "next_node": "only", "uuids": [],
-        "is_final_streaming_chunk": False,
-    }])
+    mesh.rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     mesh.rt.pop_rids("only", WALK, [rid])
     out = mesh.rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "node_name": "only",
@@ -890,10 +877,7 @@ def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
     _put(mesh, 1)
     _put(mesh, 2)
     for rid in (keep, doomed):
-        mesh.rt.ingest_inputs_batch([rid], [{
-            "signal": "prompt", "next_node": "only", "uuids": [],
-            "is_final_streaming_chunk": False,
-        }])
+        mesh.rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
     mesh.rt.pop_rids("only", WALK, [keep, doomed])
     out = mesh.rt.complete_and_route_batch({
         "partition": "default", "graph_walk": WALK, "node_name": "only",

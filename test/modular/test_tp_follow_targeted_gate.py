@@ -23,10 +23,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
 from mstar.graph.base import GraphNode  # noqa: E402
-from mstar.graph.runtime.base import PopRidsOutput
+from mstar.graph.runtime.base import (
+    ColumnarEdgeSpecs,
+    PopRidsOutput,
+)
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
+
+
+def _edge_block(rids) -> ColumnarEdgeSpecs:
+    """One ready input per rid, so the split / drop paths that re-slice the
+    columns have something to re-slice."""
+    block = ColumnarEdgeSpecs.empty()
+    for i, rid in enumerate(rids):
+        block.add(rid, "token", [i + 1], False)
+    return block
 
 
 class _FakeEngine:
@@ -89,7 +101,7 @@ class _FakeRuntime:
         ]
         return PopRidsOutput(
             wg_ids=ParallelList(rids, ["wg0"] * len(rids)),
-            input_edges=[], input_edges_per_rid=[0] * len(rids),
+            input_edges=_edge_block(rids),
         )
 
     def get_nodes(self, node_name, rids, wg_ids):

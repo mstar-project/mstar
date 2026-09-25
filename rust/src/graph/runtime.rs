@@ -372,28 +372,26 @@ pub struct GraphRuntime {
     ///
     /// A claim loop, not a lookup: a node can refuse a signal it owns when the
     /// name does not match an input or both ready slots are already full.
+    ///
+    /// Takes ids and refs already resolved: the caller interns each distinct
+    /// name once for the whole batch and takes the bookkeeping lock once,
+    /// rather than once per arriving signal.
+    // Flat parameters rather than a struct: every one of them is already
+    // resolved by the batch loop, and wrapping them would allocate per edge.
+    #[allow(clippy::too_many_arguments)]
     fn ingest_one(
         &mut self,
         rid: u32,
-        spec: &EdgeSpecArg,
+        dest: Sym,
+        signal: Sym,
+        tensors: &[TensorRef],
+        final_chunk: bool,
         can_buffer: bool,
         is_streaming: bool,
     ) -> bool {
-        let (Some(dest), Some(signal)) = (
-            self.interner.get(&spec.next_node),
-            self.interner.get(&spec.signal),
-        ) else {
-            return false; // a name this worker never compiled
-        };
         let Some(info) = self.requests.get(rid as usize).and_then(|r| r.as_ref())
         else {
             return false; // never admitted here, or already removed
-        };
-        // Resolved once: the descriptors are the same whichever worker graph
-        // claims the signal.
-        let tensors: Vec<TensorRef> = {
-            let bk = self.bookkeeping.lock().unwrap();
-            spec.uuids.iter().map(|&u| bk.tensor_ref(u)).collect()
         };
 
         let live: Vec<WgIndex> = info
@@ -419,8 +417,7 @@ pub struct GraphRuntime {
                 continue;
             }
             if state.ingest(
-                node, slot, tensors.clone(), can_buffer,
-                spec.is_final_streaming_chunk,
+                node, slot, tensors.to_vec(), can_buffer, final_chunk,
             ) {
                 return true;
             }
@@ -578,6 +575,7 @@ pub struct GraphRuntime {
         };
 
         let mut out = SpecPrepOut::default();
+        let mut cols = EdgeColumns::default();
         let mut undo: Vec<(u32, Vec<(u8, bool)>)> = Vec::new();
         let mut cursor = 0usize;
 
@@ -610,8 +608,12 @@ pub struct GraphRuntime {
                     out.consumed_streaming_edge_idxs.extend(kept);
                     out.ready_rids.push(rid);
                     out.wg_ids.push(wg_id);
-                    out.input_edges_per_rid.push(edges.len());
-                    out.input_edges.extend(edges);
+                    for (name, uuids, final_chunk) in edges {
+                        cols.push(
+                            &self.interner, rid, name,
+                            uuids.into_iter(), final_chunk,
+                        );
+                    }
                 }
                 None if follower => {
                     // Undo every rid prepped so far, or this rank joins the
@@ -627,6 +629,7 @@ pub struct GraphRuntime {
                 None => {}
             }
         }
+        out.set_edges(cols);
         Ok(out)
     }
 
@@ -665,7 +668,7 @@ pub struct GraphRuntime {
         same_node: bool,
         edges: &[EdgeSpecArg],
         base_idx: usize,
-    ) -> Option<(Vec<usize>, Vec<(String, String, Vec<u64>, bool)>, Vec<(u8, bool)>)> {
+    ) -> Option<(Vec<usize>, Vec<(Sym, Vec<u64>, bool)>, Vec<(u8, bool)>)> {
         let g = self.graphs[wg as usize].clone();
         let tensors_of = |spec: &EdgeSpecArg| -> Vec<TensorRef> {
             let bk = self.bookkeeping.lock().unwrap();
@@ -724,6 +727,9 @@ pub struct GraphRuntime {
             return None;
         }
 
+        // Interned names, resolved once per DISTINCT name when the caller
+        // folds these into its columns -- not a String per edge, and no
+        // `next_node` at all.
         let edges_out = state
             .input_tensors(spec_node, same_node)
             .into_iter()
@@ -731,18 +737,6 @@ pub struct GraphRuntime {
                 (name, tensors.iter().map(|t| t.uuid).collect(), final_chunk)
             })
             .collect::<Vec<(Sym, Vec<u64>, bool)>>();
-        let node_name = self.interner.name(g.node(spec_node).name).to_string();
-        let edges_out = edges_out
-            .into_iter()
-            .map(|(name, uuids, final_chunk)| {
-                (
-                    self.interner.name(name).to_string(),
-                    node_name.clone(),
-                    uuids,
-                    final_chunk,
-                )
-            })
-            .collect();
         Some((kept, edges_out, ingested))
     }
 
@@ -908,19 +902,85 @@ pub struct GraphRuntime {
     }
 }
 
-/// `PopRidsOutput`. Edges are flat and rid-major, `input_edges_per_rid[i]`
-/// belonging to `rids[i]`.
+/// The edge columns Python's `ColumnarEdgeSpecs` takes.
+///
+/// One tuple per edge cost two `String` allocations each -- and one of them was
+/// `next_node`, identical for every edge of a pop and read by nobody. Here a
+/// signal name crosses once per DISTINCT name (a node has one to three inputs)
+/// and the rest is flat lists of primitives.
+///
+/// `next_nodes` is deliberately absent: both users of this report edges for a
+/// node the caller just named.
+#[derive(Default)]
+pub struct EdgeColumns {
+    pub signal_names: Vec<String>,
+    pub signal_name_idxs: Vec<u32>,
+    /// Per EDGE, which is what replaces a run-length column.
+    pub rids: Vec<u32>,
+    pub tensors_per_edge: Vec<u32>,
+    pub is_final_streaming_chunk: Vec<bool>,
+    /// Flat over the edges, `tensors_per_edge[i]` of them for edge i.
+    pub uuids: Vec<u64>,
+    /// Sym -> index into `signal_names`. A Vec, not a map: a node has a
+    /// handful of inputs, so a linear scan beats hashing.
+    seen: Vec<Sym>,
+}
+
+impl EdgeColumns {
+    /// One edge. `name` is interned; `it` resolves it the first time it is seen.
+    fn push(
+        &mut self,
+        it: &StrToId,
+        rid: u32,
+        name: Sym,
+        uuids: impl Iterator<Item = u64>,
+        final_chunk: bool,
+    ) {
+        let idx = match self.seen.iter().position(|&s| s == name) {
+            Some(i) => i,
+            None => {
+                self.seen.push(name);
+                self.signal_names.push(it.name(name).to_string());
+                self.seen.len() - 1
+            }
+        };
+        let before = self.uuids.len();
+        self.uuids.extend(uuids);
+        self.signal_name_idxs.push(idx as u32);
+        self.rids.push(rid);
+        self.tensors_per_edge.push((self.uuids.len() - before) as u32);
+        self.is_final_streaming_chunk.push(final_chunk);
+    }
+}
+
+/// `PopRidsOutput`.
 #[pyclass]
 #[derive(Default)]
 pub struct PopRidsOut {
     #[pyo3(get)] pub rids: Vec<u32>,
     #[pyo3(get)] pub wg_ids: Vec<u32>,
-    /// (signal, next_node, uuids, is_final_streaming_chunk)
-    #[pyo3(get)] pub input_edges: Vec<(String, String, Vec<u64>, bool)>,
-    #[pyo3(get)] pub input_edges_per_rid: Vec<usize>,
     /// The node's output edge names, sorted and deduped. Reported by the POP
     /// so the caller does not cross back once per forward pass just to ask.
     #[pyo3(get)] pub output_signals: Vec<String>,
+    /// The ready inputs as columns; see `EdgeColumns`. Flattened on rather
+    /// than nested, because a `#[pyo3(get)]` on a pyclass field clones it.
+    #[pyo3(get)] pub signal_names: Vec<String>,
+    #[pyo3(get)] pub signal_name_idxs: Vec<u32>,
+    #[pyo3(get)] pub edge_rids: Vec<u32>,
+    #[pyo3(get)] pub tensors_per_edge: Vec<u32>,
+    #[pyo3(get)] pub is_final_streaming_chunk: Vec<bool>,
+    #[pyo3(get)] pub uuids: Vec<u64>,
+}
+
+impl PopRidsOut {
+    fn set_edges(&mut self, c: EdgeColumns) {
+        self.signal_names = c.signal_names;
+        self.signal_name_idxs = c.signal_name_idxs;
+        self.edge_rids = c.rids;
+        self.tensors_per_edge = c.tensors_per_edge;
+        self.is_final_streaming_chunk = c.is_final_streaming_chunk;
+        self.uuids = c.uuids;
+    }
 }
 
 /// One edge, bound for one worker. Post-fanout, so a signal read by several
@@ -1070,18 +1130,54 @@ pub struct SpecPrepOut {
     #[pyo3(get)] pub consumed_streaming_edge_idxs: Vec<usize>,
     #[pyo3(get)] pub ready_rids: Vec<u32>,
     #[pyo3(get)] pub wg_ids: Vec<u32>,
-    /// (signal, next_node, uuids, is_final_streaming_chunk)
-    #[pyo3(get)] pub input_edges: Vec<(String, String, Vec<u64>, bool)>,
-    #[pyo3(get)] pub input_edges_per_rid: Vec<usize>,
+    /// The prepped inputs as columns; see `EdgeColumns` and `PopRidsOut`.
+    #[pyo3(get)] pub signal_names: Vec<String>,
+    #[pyo3(get)] pub signal_name_idxs: Vec<u32>,
+    #[pyo3(get)] pub edge_rids: Vec<u32>,
+    #[pyo3(get)] pub tensors_per_edge: Vec<u32>,
+    #[pyo3(get)] pub is_final_streaming_chunk: Vec<bool>,
+    #[pyo3(get)] pub uuids: Vec<u64>,
     /// Follower path only: the batch could not be built and was rolled back.
     all_or_nothing_failed: bool,
 }
 
-/// Python's `EdgeSpec`: what crosses for one arriving signal.
+impl SpecPrepOut {
+    fn set_edges(&mut self, c: EdgeColumns) {
+        self.signal_names = c.signal_names;
+        self.signal_name_idxs = c.signal_name_idxs;
+        self.edge_rids = c.rids;
+        self.tensors_per_edge = c.tensors_per_edge;
+        self.is_final_streaming_chunk = c.is_final_streaming_chunk;
+        self.uuids = c.uuids;
+    }
+}
+
+/// Python's `ColumnarEdgeSpecs`, read off the dataclass's attributes.
+///
+/// `#[pyo3(attribute)]`, not a dict: the caller already holds the block, so
+/// flattening it into a dict for the crossing would be a Python allocation per
+/// call to no end.
+#[derive(FromPyObject)]
+pub struct EdgeColumnsArg {
+    #[pyo3(attribute)] signal_names: Vec<String>,
+    #[pyo3(attribute)] signal_name_idxs: Vec<usize>,
+    #[pyo3(attribute)] rids: Vec<u32>,
+    #[pyo3(attribute)] tensors_per_edge: Vec<usize>,
+    #[pyo3(attribute)] is_final_streaming_chunk: Vec<bool>,
+    #[pyo3(attribute)] uuids: Vec<u64>,
+    /// The ingest side always fills these; a pop or a prep leaves them None.
+    #[pyo3(attribute)] next_nodes: Option<Vec<String>>,
+    #[pyo3(attribute)] next_node_idxs: Option<Vec<usize>>,
+}
+
+/// Python's `EdgeSpec`, on the ONE path that still uses it: the speculation
+/// prep's streaming edges.
+///
+/// No `next_node`: the poll that produced these filtered on it, so it is
+/// `spec_node_name` for every one of them and the prep already has that.
 #[derive(FromPyObject)]
 pub struct EdgeSpecArg {
     #[pyo3(item)] signal: String,
-    #[pyo3(item)] next_node: String,
     #[pyo3(item)] uuids: Vec<u64>,
     #[pyo3(item)] is_final_streaming_chunk: bool,
 }
@@ -1579,24 +1675,72 @@ impl GraphRuntime {
     /// Returns the INDICES of signals no worker graph claimed. The streaming
     /// path hands the original edge back to its buffer, so an index is enough
     /// and the edge never has to survive the round trip.
-    #[pyo3(signature = (rids, signals, can_buffer = true, is_streaming = false))]
+    #[pyo3(signature = (signals, can_buffer = true, is_streaming = false))]
     fn ingest_inputs_batch(
         &mut self,
-        rids: Vec<u32>,
-        signals: Vec<EdgeSpecArg>,
+        signals: EdgeColumnsArg,
         can_buffer: bool,
         is_streaming: bool,
     ) -> PyResult<Vec<usize>> {
-        if rids.len() != signals.len() {
+        let n = signals.rids.len();
+        if signals.signal_name_idxs.len() != n
+            || signals.tensors_per_edge.len() != n
+            || signals.is_final_streaming_chunk.len() != n
+        {
             return Err(PyValueError::new_err(
-                "ingest_inputs_batch: rids and signals must be the same length",
+                "ingest_inputs_batch: every per-edge column must be the same \
+                 length as rids",
             ));
         }
+        let (Some(next_nodes), Some(next_node_idxs)) =
+            (&signals.next_nodes, &signals.next_node_idxs)
+        else {
+            return Err(PyValueError::new_err(
+                "ingest_inputs_batch: the block must carry destinations",
+            ));
+        };
+        if next_node_idxs.len() != n {
+            return Err(PyValueError::new_err(
+                "ingest_inputs_batch: next_node_idxs must be as long as rids",
+            ));
+        }
+
+        // Each DISTINCT name interned once, not once per edge -- a name this
+        // worker never compiled stays None and every edge pointing at it is
+        // refused, as looking it up per edge did.
+        let sigs: Vec<Option<Sym>> =
+            signals.signal_names.iter().map(|s| self.interner.get(s)).collect();
+        let dests: Vec<Option<Sym>> =
+            next_nodes.iter().map(|s| self.interner.get(s)).collect();
+        // One acquisition for the batch. The descriptors do not depend on which
+        // worker graph ends up claiming a signal.
+        let refs: Vec<TensorRef> = {
+            let bk = self.bookkeeping.lock().unwrap();
+            signals.uuids.iter().map(|&u| bk.tensor_ref(u)).collect()
+        };
+
         let mut uningested = Vec::new();
-        for (i, (rid, spec)) in rids.iter().zip(&signals).enumerate() {
-            if !self.ingest_one(*rid, spec, can_buffer, is_streaming) {
+        let mut at = 0usize;
+        // An index loop on purpose: five parallel columns plus the cursor into
+        // `uuids`, so iterating any one of them reads worse than indexing all.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..n {
+            let end = at + signals.tensors_per_edge[i];
+            let claimed = match (
+                sigs.get(signals.signal_name_idxs[i]).copied().flatten(),
+                dests.get(next_node_idxs[i]).copied().flatten(),
+            ) {
+                (Some(signal), Some(dest)) => self.ingest_one(
+                    signals.rids[i], dest, signal, &refs[at..end],
+                    signals.is_final_streaming_chunk[i],
+                    can_buffer, is_streaming,
+                ),
+                _ => false, // a name this worker never compiled
+            };
+            if !claimed {
                 uningested.push(i);
             }
+            at = end;
         }
         Ok(uningested)
     }
@@ -1769,6 +1913,10 @@ impl GraphRuntime {
             v.dedup();
             v
         };
+        // Columns, filled as the edges are found. `next_node` is not carried:
+        // it is `node_name`, the same for every edge, and nothing downstream
+        // of a pop reads it.
+        let mut cols = EdgeColumns::default();
         for rid in request_ids {
             let Some(state) = self.state_mut(wg, rid) else {
                 continue;
@@ -1777,16 +1925,14 @@ impl GraphRuntime {
             let inputs = state.input_tensors(node, false);
             out.rids.push(rid);
             out.wg_ids.push(wg_id);
-            out.input_edges_per_rid.push(inputs.len());
             for (name, tensors, final_chunk) in inputs {
-                out.input_edges.push((
-                    self.interner.name(name).to_string(),
-                    node_name.to_string(),
-                    tensors.iter().map(|t| t.uuid).collect(),
-                    final_chunk,
-                ));
+                cols.push(
+                    &self.interner, rid, name,
+                    tensors.iter().map(|t| t.uuid), final_chunk,
+                );
             }
         }
+        out.set_edges(cols);
         Some(out)
     }
 
