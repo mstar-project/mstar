@@ -282,3 +282,18 @@ Worker scheduling
        ``remove_request``, check the KV page bookkeeping (free list, owner
        counts, seals) against the streams holding the pages. Walks every
        live stream; tests and debugging only.
+
+Compilation
+-----------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_RECOMPILE_LIMIT``
+     - ``84``
+     - Dynamo's recompile limit, clamped to [8, 256]. Raise it if the logs
+       show ``hit config.recompile_limit``.
