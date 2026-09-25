@@ -14,7 +14,8 @@ Example:
 
     CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python3 test/waypoint/benchmark_streaming.py \
         --variant 360p --physical-gpu 2 --steps 16 \
-        --artifact /tmp/waypoint-streaming-360p.json
+        --artifact /tmp/waypoint-streaming-360p.json \
+        --save-videos /tmp/waypoint-streaming-360p-videos
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -198,6 +200,39 @@ def _startup_latency_metrics(samples: Sequence[float]) -> dict | None:
     }
 
 
+def _encode_mp4(chunks: Sequence[VideoFrameChunk], out: Path, crf: int = 18) -> tuple[int, float]:
+    """Encode already-consumed chunks to an H.264 mp4 with PyAV. Called after a
+    stream's timed loop has finished, never inside it, so encoding cost is never
+    counted as stream latency."""
+    try:
+        import av
+    except ImportError as exc:
+        raise RuntimeError(
+            "--save-videos needs PyAV to encode mp4s; install with `uv pip install av`"
+        ) from exc
+    import numpy as np
+
+    width, height, fps = chunks[0].width, chunks[0].height, chunks[0].fps
+    container = av.open(str(out), mode="w")
+    stream = container.add_stream("libx264", rate=int(round(fps)))
+    stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+    stream.options = {"crf": str(crf), "preset": "medium"}
+    frame_bytes = width * height * 3
+    n = 0
+    for chunk in chunks:
+        buf = np.frombuffer(chunk.data, dtype=np.uint8)
+        assert buf.size % frame_bytes == 0
+        for frame in buf.reshape(-1, height, width, 3):
+            vf = av.VideoFrame.from_ndarray(np.ascontiguousarray(frame), format="rgb24")
+            for packet in stream.encode(vf):
+                container.mux(packet)
+            n += 1
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+    return n, fps
+
+
 def _measure_stream(
     client: MStarClient,
     seed_image: Path,
@@ -212,8 +247,14 @@ def _measure_stream(
     sleep: Callable[[float], None] = time.sleep,
     enable_nvtx: bool = False,
     start_barrier: threading.Barrier | None = None,
+    chunks_out: list[VideoFrameChunk] | None = None,
 ) -> tuple[dict, list[str]]:
-    """Consume one stream while retaining only timings and an incremental hash."""
+    """Consume one stream while retaining only timings and an incremental hash.
+
+    When ``chunks_out`` is given, each chunk's reference (not a copy) is also
+    appended to it for later encoding; callers must do that encoding outside
+    this function so it never counts toward the timings above.
+    """
     stream = client.stream(
         images=seed_image,
         input_modalities=("image",),
@@ -265,6 +306,8 @@ def _measure_stream(
         chunk_index = len(observations)
         failures.extend(_validate_chunk(event, chunk_index, variant))
         digest.update(event.data)
+        if chunks_out is not None:
+            chunks_out.append(event)
         observations.append(
             ChunkObservation(
                 arrival_seconds=arrived - started,
@@ -380,12 +423,15 @@ def _run_concurrent_wave(
     seeds: Sequence[int],
     stall_threshold_seconds: float,
     enable_nvtx: bool,
+    chunk_lists: Sequence[list[VideoFrameChunk]] | None = None,
 ) -> tuple[list[tuple[dict, list[str]]], float, float]:
     """Run ``len(request_ids)`` streams together, each opening only once every
     thread has built its request body (mirrors serve_rollout._concurrent_rollouts).
 
     Returns per-stream (metrics, failures) in ``request_ids`` order, plus wave
     start/end on the driver's own wall clock (for cross-stream aggregate timing).
+    ``chunk_lists``, if given, is one list per request id that each stream's
+    chunks are appended to (see ``_measure_stream``'s ``chunks_out``).
     """
     barrier = threading.Barrier(len(request_ids) + 1)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(request_ids)) as executor:
@@ -402,8 +448,9 @@ def _run_concurrent_wave(
                 stall_threshold_seconds=stall_threshold_seconds,
                 enable_nvtx=enable_nvtx,
                 start_barrier=barrier,
+                chunks_out=chunk_lists[index] if chunk_lists is not None else None,
             )
-            for request_id, seed in zip(request_ids, seeds, strict=True)
+            for index, (request_id, seed) in enumerate(zip(request_ids, seeds, strict=True))
         ]
         barrier.wait(timeout=30)
         wave_start = time.perf_counter()
@@ -553,10 +600,14 @@ def _run_concurrent_phase(
     request_timeout: float,
     sampler: rollout.MemorySampler,
     startup_seconds: float,
+    save_videos_dir: Path | None = None,
 ) -> tuple[dict, list[str]]:
     """N-stream concurrent phase: a discarded warmup wave (compiles the
     batch-``streams`` CUDA graph bucket), then a measured wave whose per-stream
-    metrics and server-side cadence decide whether every stream stayed realtime."""
+    metrics and server-side cadence decide whether every stream stayed realtime.
+
+    ``save_videos_dir``, if given, saves only the measured wave's streams (the
+    warmup wave is throwaway CUDA graph compilation)."""
     failures: list[str] = []
 
     warmup_ids = [f"{request_id_prefix}-concurrent-warmup-{i}" for i in range(streams)]
@@ -582,6 +633,7 @@ def _run_concurrent_phase(
     print(f"concurrent measured: {streams} streams, {num_steps} step(s) each")
     _wait_for_phase_sample(sampler, proc, "concurrent-measured")
     log_offset = log_path.stat().st_size
+    chunk_lists = [[] for _ in measured_ids] if save_videos_dir is not None else None
     measured_results, wave_start, wave_end = _run_concurrent_wave(
         client_factory,
         seed_image,
@@ -591,12 +643,19 @@ def _run_concurrent_phase(
         seeds=measured_seeds,
         stall_threshold_seconds=stall_threshold_seconds,
         enable_nvtx=enable_nvtx,
+        chunk_lists=chunk_lists,
     )
     per_stream = []
     for request_id, (metrics, stream_failures) in zip(measured_ids, measured_results, strict=True):
         failures.extend(f"concurrent-measured {request_id}: {failure}" for failure in stream_failures)
         per_stream.append(metrics)
     rollout._wait_for_cleanup(log_path, tuple(measured_ids), proc, request_timeout, offset=log_offset)
+
+    if save_videos_dir is not None:
+        for request_id, chunks in zip(measured_ids, chunk_lists, strict=True):
+            out = save_videos_dir / f"{request_id}.mp4"
+            n, _fps = _encode_mp4(chunks, out)
+            print(f"saved video: {out} ({n} frames)")
 
     total_frames = sum(metrics["frame_count"] for metrics in per_stream)
     aggregate_fps = total_frames / (wave_end - wave_start) if wave_end > wave_start else None
@@ -755,6 +814,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--artifact", type=Path, default=Path("/tmp/waypoint_streaming_benchmark.json")
     )
     parser.add_argument(
+        "--save-videos",
+        type=Path,
+        help=(
+            "write every measured stream (baseline, slow-consumer, and each "
+            "concurrent stream) as DIR/<request_id>.mp4, plus a copy of --artifact"
+        ),
+    )
+    parser.add_argument(
         "--log", type=Path, default=Path("/tmp/waypoint_streaming_benchmark_server.log")
     )
     parser.add_argument("--log-level", default="INFO")
@@ -830,6 +897,8 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
         weight_source = f"registry Hub mapping for {variant.model_variant}"
 
     stall_threshold = _resolve_stall_threshold(args)
+    if args.save_videos is not None:
+        args.save_videos.mkdir(parents=True, exist_ok=True)
 
     port = args.port or rollout._free_port()
     url = f"http://127.0.0.1:{port}"
@@ -961,6 +1030,9 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
             )
             _wait_for_phase_sample(sampler, proc, phase)
             request_id = f"{args.request_id}-{phase}"
+            saved_chunks: list[VideoFrameChunk] | None = (
+                [] if args.save_videos is not None else None
+            )
             metrics, stream_failures = _measure_stream(
                 client,
                 seed_image,
@@ -971,6 +1043,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
                 consumer_pause_seconds=pause,
                 stall_threshold_seconds=stall_threshold,
                 enable_nvtx=args.enable_nvtx,
+                chunks_out=saved_chunks,
             )
             failures.extend(f"{name}: {failure}" for failure in stream_failures)
             rollout._wait_for_cleanup(
@@ -983,6 +1056,10 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
                 f"  received {metrics['chunk_count']} chunks in "
                 f"{metrics['request_wall_seconds']:.3f}s"
             )
+            if saved_chunks:
+                out = args.save_videos / f"{request_id}.mp4"
+                n, _fps = _encode_mp4(saved_chunks, out)
+                print(f"saved video: {out} ({n} frames)")
 
         if runs["baseline"]["payload_sha256"] != runs["slow_consumer"]["payload_sha256"]:
             failures.append(
@@ -1014,6 +1091,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict:
                 request_timeout=args.request_timeout,
                 sampler=sampler,
                 startup_seconds=startup_seconds,
+                save_videos_dir=args.save_videos,
             )
             failures.extend(concurrent_failures)
     finally:
@@ -1144,6 +1222,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     _write_artifact(args.artifact, result)
+    if args.save_videos is not None:
+        shutil.copy2(args.artifact, args.save_videos / args.artifact.name)
     print(_human_summary(result, args.artifact))
     return 0 if result["correctness"]["passed"] else 1
 
