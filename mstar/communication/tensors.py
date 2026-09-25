@@ -643,8 +643,13 @@ class TensorCommunicationManager(ABC):
         ready: dict[str, list[GraphEdge]] = {}
         still_pending = []
         uuid_to_time = {}
+        # the async reader finishes a request's reads in any order, so a read
+        # that is done waits for the ones started before it: a streamed token
+        # must not reach the client ahead of the one before it
+        waiting: set[str] = set()
         for ep in self.pending:
-            if ep.future is None or ep.future.done():
+            done = ep.future is None or ep.future.done()
+            if done and ep.request_id not in waiting:
                 if ep.future is not None:
                     ep.future.result()
                 for edge in ep.graph_edges:
@@ -657,6 +662,7 @@ class TensorCommunicationManager(ABC):
                         for info in edge.tensor_info:
                             uuid_to_time[info.uuid] = ep.rx_time
             else:
+                waiting.add(ep.request_id)
                 still_pending.append(ep)
         self.pending = still_pending
 
