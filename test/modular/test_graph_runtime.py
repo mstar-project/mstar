@@ -853,7 +853,7 @@ def test_prep_reports_consumed_streaming_edges_by_index():
 
 # --- routing settles refcounts through the tensor manager -------------------
 
-def _build_on_real_manager(section, nodes, tmp_path):
+def _build_on_real_manager(section, nodes, tmp_path, loops=frozenset()):
     """A runtime over a real (file-SHM, CPU) tensor manager, so refcount
     changes run the manager's teardown rather than a stub's bookkeeping."""
     from mstar.communication.tensors import SharedMemoryCommunicationManager
@@ -870,7 +870,7 @@ def _build_on_real_manager(section, nodes, tmp_path):
         my_worker_id="worker_0",
         my_worker_graphs=[worker_graph],
         all_wg_ids_to_graph_walks={0: {"w"}},
-        all_wg_ids_to_dyn_loops={0: set()},
+        all_wg_ids_to_dyn_loops={0: set(loops)},
         all_wg_ids_to_nodes={0: set(nodes)},
         node_to_partition=dict.fromkeys(nodes, "default"),
         sharding_config=_sharding_config(),
@@ -941,3 +941,136 @@ def test_a_new_token_signal_on_two_edges_is_counted_once(tmp_path):
         tm, runtime, rid, "n", {"tok": [torch.ones(4)]}, ["tok"],
     )
     assert out.new_token_output_idxs == [0]
+
+
+# --- a loop edge carries tensors earlier batches produced -------------------
+#
+# The batch that finishes a loop is not the batch that produced everything the
+# loop emits: ``accumulated_outputs`` gathers one tensor per iteration, and a
+# ``Loop.outputs`` edge fed by a non-terminal body node was filled before the
+# terminal node ran. RouteOutput used to report these as indices into the
+# completing batch's tensors, which silently dropped exactly those -- nothing
+# staged them, and the reader (api server, or a peer worker) got a missing
+# tensor for a request that then hung.
+#
+# new_token_output_idxs stays index-based on purpose; the test below pins
+# that down rather than leaving it looking like the same oversight.
+
+def _rollout_runtime(tmp_path, accumulated_edge, max_iters=2, extra_nodes=()):
+    """encode -> loop(step) with ``pred`` accumulated across iterations.
+
+    ``extra_nodes`` are on this worker but outside the section, which is how a
+    streaming consumer gets a sharding group to fan out to.
+
+    Returns the per-iteration uuids (one per ``step`` completion, oldest
+    first) and the RouteOutput of the completion that finished the loop.
+    """
+    import torch
+
+    section = Sequential(sections=[
+        GraphNode(
+            name="encode", input_names={"video"},
+            outputs=[GraphEdge(name="pred", next_node="step")],
+        ),
+        Loop(
+            name="roll",
+            section=GraphNode(
+                name="step", input_names={"pred"},
+                outputs=[GraphEdge(name="pred", next_node="step")],
+            ),
+            outputs=[],
+            accumulated_outputs=[accumulated_edge],
+            max_iters=max_iters,
+        ),
+    ])
+    tm, runtime, rid = _build_on_real_manager(
+        section, {"encode", "step", *extra_nodes}, tmp_path, loops={"roll"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="video", next_node="encode")])
+    _complete(tm, runtime, rid, "encode", {"pred": [torch.ones(2)]}, ["pred"])
+
+    per_iter: list[int] = []
+    out = None
+    for _ in range(max_iters):
+        stored, out = _complete(
+            tm, runtime, rid, "step", {"pred": [torch.ones(2)]}, ["pred"],
+        )
+        per_iter.append(stored.flat_uuids[0])
+    return tm, runtime, rid, per_iter, out
+
+
+def test_accumulated_loop_outputs_are_staged_for_every_iteration(tmp_path):
+    """Regression: only the last iteration's tensor used to be staged, so the
+    api server read a tensor the producer had never written (vjepa2
+    prefill_video_rollout with rollout_horizon > 1)."""
+    tm, _runtime, rid, per_iter, out = _rollout_runtime(
+        tmp_path,
+        GraphEdge(name="pred", next_node=EMIT_TO_CLIENT, persist=True),
+    )
+    first, last = per_iter
+    assert first != last
+
+    assert sorted(out.register_uuids) == sorted(per_iter), (
+        "every tensor on an outgoing edge has to be staged, not just the "
+        "ones this batch produced"
+    )
+    assert out.register_rids == [rid] * len(per_iter)
+    # And really readable afterwards: staging is what writes the SHM file
+    # the reader opens, which is where the FileNotFoundError came from.
+    tm.register_for_send_uuids(ParallelList([rid], [list(out.register_uuids)]))
+    for uuid in (first, last):
+        assert tm.tensor_store.is_registered(uuid)
+
+
+def test_new_token_outputs_stay_within_the_producing_batch(tmp_path):
+    """Not the same fix: a new-token edge reports the batch that MINTED the
+    tokens, so a loop re-emitting cached tensors at completion must not count
+    them again. Indices into this batch's tensors say exactly that, and cost
+    no strings at the boundary."""
+    _tm, _runtime, _rid, per_iter, out = _rollout_runtime(
+        tmp_path,
+        GraphEdge(name="pred", next_node=EMIT_TO_CLIENT,
+                  conductor_new_token=True),
+    )
+    # The completing batch minted one tensor; the earlier iteration's is on
+    # the same edge and is deliberately not named.
+    assert out.new_token_output_idxs == [0], (
+        f"only this batch's tensor counts, not all of {per_iter}"
+    )
+
+
+def test_accumulated_local_streaming_carries_every_iteration(tmp_path):
+    """The stream buffer has to receive every iteration's chunk, in order --
+    an accumulated edge flushes them all at once and only the last was minted
+    by the completing batch."""
+    _tm, _runtime, rid, per_iter, out = _rollout_runtime(
+        tmp_path,
+        GraphEdge(name="pred", next_node="vocoder", is_streaming=True),
+        extra_nodes=("vocoder",),
+    )
+    assert list(out.local_streaming_by_signal) == ["pred"], (
+        "one key per stream is what keeps the edge name off the per-chunk path"
+    )
+    per_signal = out.local_streaming_by_signal["pred"]
+    assert per_signal.values == per_iter, "oldest chunk first"
+    assert per_signal.keys == [rid] * len(per_iter)
+
+
+def test_a_tensor_on_two_outgoing_edges_is_staged_once(tmp_path):
+    """Dedupe is by uuid across the whole batch: a tensor that both persists
+    and emits must not be staged (and D2H-copied) twice."""
+    import torch
+
+    section = GraphNode(
+        name="n", input_names={"x"},
+        outputs=[
+            GraphEdge(name="y", next_node=EMPTY_DESTINATION, persist=True),
+            GraphEdge(name="y", next_node=EMIT_TO_CLIENT),
+        ],
+    )
+    tm, runtime, rid = _build_on_real_manager(section, {"n"}, tmp_path)
+    _ingest(runtime, rid, [GraphEdge(name="x", next_node="n")])
+
+    stored, out = _complete(tm, runtime, rid, "n", {"y": [torch.ones(3)]}, ["y"])
+    assert out.register_uuids == stored.flat_uuids
+    assert out.register_rids == [rid]

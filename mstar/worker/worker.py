@@ -1168,6 +1168,9 @@ class Worker:
         """Token counts for the conductor, per rid. Needs numel(), hence the
         tensors -- which is why this stays here and not behind the contract.
 
+        Indices into this batch's columns, which also carry the rid and the
+        signal, so the runtime hands over no strings for this.
+
         The runtime already dropped repeat edges of a signal, so summing is
         safe: one output routed to two destinations is two edges carrying the
         same tensors, and counting both would double every token.
@@ -1203,7 +1206,6 @@ class Worker:
     def _register_outputs(
         self,
         route_output: RouteOutput,
-        flat_uuids: list[int],
     ):
         """Register the tensors the runtime says remote consumers (other
         workers, the api server, the conductor via persist) will read. It has
@@ -1212,12 +1214,12 @@ class Worker:
         # Uuids, not descriptors: registration only ever reads ``uuid`` off
         # them and takes the tensor from the store.
         per_rid: dict[int, list[int]] = {}
-        for idx, request_id in zip(
-            route_output.register_tensor_idxs,
+        for uuid, request_id in zip(
+            route_output.register_uuids,
             route_output.register_rids,
             strict=True,
         ):
-            per_rid.setdefault(request_id, []).append(flat_uuids[idx])
+            per_rid.setdefault(request_id, []).append(uuid)
         if not per_rid:
             return
         # One staging pass for the batch: the arena collapses what would be one
@@ -2249,7 +2251,7 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
-        self._register_outputs(route_output, flat_uuids)
+        self._register_outputs(route_output)
 
         # send outputs
         if self.enable_nvtx:
@@ -2272,20 +2274,18 @@ class Worker:
 
         # Local streaming stays here: a StreamBuffer holds real tensors, so it
         # cannot move behind the runtime's contract.
-        for idx in route_output.local_streaming_tensor_idxs:
-            rid = flat_rids[idx]
-            uuid = flat_uuids[idx]
-            req_info = self.request_state.per_request_info[rid]
-            signal = signals[signal_idxs[idx]]
-            stream_buf = req_info.stream_buffers[signal]
-            stream_buf.pre_read_register(uuid)
-            tensor = self.tensor_manager.get_tensor(uuid)
-            stream_buf.put(uuid, tensor.clone())
+        streamed: list[int] = []
+        for signal, per_signal in route_output.local_streaming_by_signal.items():
+            for rid, uuid in per_signal:
+                req_info = self.request_state.per_request_info[rid]
+                stream_buf = req_info.stream_buffers[signal]
+                stream_buf.pre_read_register(uuid)
+                tensor = self.tensor_manager.get_tensor(uuid)
+                stream_buf.put(uuid, tensor.clone())
+                streamed.append(uuid)
         # After the loop: one crossing for the batch rather than one per
         # streamed tensor.
-        self.tensor_manager.dereference_batch_uniform(
-            [flat_uuids[idx] for idx in route_output.local_streaming_tensor_idxs]
-        )
+        self.tensor_manager.dereference_batch_uniform(streamed)
 
         send_rids = list(rids)
         # numel() needs the tensors, so the counting stays on this side.
