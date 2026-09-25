@@ -11,7 +11,7 @@ from mstar.client import VideoFrameChunk
 @pytest.fixture(scope="module")
 def benchmark():
     return runpy.run_path(
-        str(Path(__file__).parents[1] / "waypoint" / "benchmark_streaming.py")
+        str(Path(__file__).parents[2] / "benchmark" / "waypoint" / "benchmark_streaming.py")
     )
 
 

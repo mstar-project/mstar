@@ -12,7 +12,7 @@ that a performance number was judged too slow.
 
 Example:
 
-    CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python3 test/waypoint/benchmark_streaming.py \
+    CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python3 benchmark/waypoint/benchmark_streaming.py \
         --variant 360p --physical-gpu 2 --steps 16 \
         --artifact /tmp/waypoint-streaming-360p.json \
         --save-videos /tmp/waypoint-streaming-360p-videos
@@ -41,10 +41,12 @@ from typing import Callable, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO = SCRIPT_DIR.parents[1]
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-if str(REPO) not in sys.path:
-    sys.path.insert(0, str(REPO))
+# serve_rollout (server launch, seed resize, action script) stays with the
+# end-to-end tests in test/waypoint.
+ROLLOUT_DIR = REPO / "test" / "waypoint"
+for path in (ROLLOUT_DIR, REPO):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 import serve_rollout as rollout  # noqa: E402
 
