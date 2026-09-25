@@ -1045,6 +1045,10 @@ def _deserialize_tensor(
     return t
 
 
+# Docker gives a container 64 MB of /dev/shm, and one video or audio tensor can outgrow that
+_SHM_DIR_WARN_BYTES = 1 << 30
+
+
 def _default_shm_dir() -> str:
     """Return the default shared-memory directory for the current platform."""
     if platform.system() == "Linux" and os.path.isdir("/dev/shm"):
@@ -1080,6 +1084,17 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
 
         self.shm_dir = shm_dir or _default_shm_dir()
         os.makedirs(self.shm_dir, exist_ok=True)
+        # at boot, not at the first large send: that failure would be the only other sign of a small dir
+        try:
+            st = os.statvfs(self.shm_dir)
+            shm_total = st.f_frsize * st.f_blocks
+        except OSError:
+            shm_total = None
+        if shm_total is not None and shm_total < _SHM_DIR_WARN_BYTES:
+            logger.warning(
+                "SHM: %s holds only %d MiB and every tensor in flight is written there, so a large one will "
+                "fail its send with ENOSPC. Give it more room (docker --shm-size), or pass "
+                "--tensor-comm-protocol TCP, which is slower", self.shm_dir, shm_total >> 20)
 
         # uuid → file path for sender-side cleanup
         self._shm_files: dict[str, str] = {}
