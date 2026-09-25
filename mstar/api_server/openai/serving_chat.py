@@ -98,5 +98,14 @@ async def _stream(api, model_name, request_id, sample_rate):
             yield chunk({"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}})
         elif c.modality == "image":
             yield chunk({"content": media_io.png_to_data_url(c.data)})
+        elif c.modality == "error":
+            # the status went out when the stream opened, so the failure goes
+            # in-band, the way vLLM sends it, and the reply gets no finish
+            yield sse({"error": {
+                "message": c.data.decode("utf-8", "replace"),
+                "code": c.metadata.get("status", 500),
+            }})
+            yield SSE_DONE
+            return
     yield chunk({}, finish="stop")
     yield SSE_DONE
