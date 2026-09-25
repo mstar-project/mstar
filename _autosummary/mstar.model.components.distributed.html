@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 23, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 25, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -588,6 +588,14 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedMLP.forward"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLP.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedMLPUnfused"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLPUnfused</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedMLPUnfused.forward"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLPUnfused.forward()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelMLP"><code class="docutils literal notranslate"><span class="pre">ParallelMLP</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelMLP.forward"><code class="docutils literal notranslate"><span class="pre">ParallelMLP.forward()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.QKVParallelLinear"><code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.QKVParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">QKVParallelLinear.weight_loader()</span></code></a></li>
 </ul>
@@ -619,7 +627,7 @@
 <p>Parallel linears (<code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code>, <code class="docutils literal notranslate"><span class="pre">RowParallelLinear</span></code>,
 <code class="docutils literal notranslate"><span class="pre">MergedColumnParallelLinear</span></code>, <code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code>), vocab-parallel
 embedding (<code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code>), and the composed parallel
-<code class="docutils literal notranslate"><span class="pre">Attention</span></code> / <code class="docutils literal notranslate"><span class="pre">GatedMLP</span></code> blocks. Each parallel parameter carries a
+<code class="docutils literal notranslate"><span class="pre">Attention</span></code> / <code class="docutils literal notranslate"><span class="pre">GatedMLP</span></code> / dense <code class="docutils literal notranslate"><span class="pre">MLP</span></code> blocks. Each parallel parameter carries a
 <code class="docutils literal notranslate"><span class="pre">weight_loader</span></code> attribute used by the model-level weight loader to
 slice checkpoint tensors per-rank on load.</p>
 <p>For vocab parallelism, pair <code class="docutils literal notranslate"><span class="pre">VocabParallelEmbedding</span></code> with
@@ -930,6 +938,98 @@ registered hooks while the latter silently ignores them.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.ParallelGatedMLPUnfused">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.distributed.</span></span><span class="sig-name descname"><span class="pre">ParallelGatedMLPUnfused</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">activation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'silu'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/mlp.html#ParallelGatedMLPUnfused"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.ParallelGatedMLPUnfused" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
+<p>SwiGLU MLP with separate (unfused) gate/up column shards.</p>
+<p>Same math and sharding as <code class="docutils literal notranslate"><span class="pre">ParallelGatedMLP</span></code>, with <code class="docutils literal notranslate"><span class="pre">gate_proj</span></code> and
+<code class="docutils literal notranslate"><span class="pre">up_proj</span></code> kept as separate <code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code> projections so the
+parameter names match a checkpoint’s <code class="docutils literal notranslate"><span class="pre">gate_proj.weight</span></code> /
+<code class="docutils literal notranslate"><span class="pre">up_proj.weight</span></code> one-to-one (plain name-matched loading, no
+stacked-parameter loader rules). A trivial comm group (world size 1)
+makes the projections plain linears.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>intermediate_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>comm_group</strong> (<em>CommGroup</em><em> | </em><em>None</em>)</p></li>
+<li><p><strong>activation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>Callable</em>)</p></li>
+<li><p><strong>bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.ParallelGatedMLPUnfused.forward">
+<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/mlp.html#ParallelGatedMLPUnfused.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.ParallelGatedMLPUnfused.forward" title="Link to this definition">#</a></dt>
+<dd><p>Define the computation performed at every call.</p>
+<p>Should be overridden by all subclasses.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Although the recipe for forward pass needs to be defined within
+this function, one should call the <code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code> instance afterwards
+instead of this since the former takes care of running the
+registered hooks while the latter silently ignores them.</p>
+</div>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.ParallelMLP">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.distributed.</span></span><span class="sig-name descname"><span class="pre">ParallelMLP</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">activation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'relu2'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/mlp.html#ParallelMLP"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.ParallelMLP" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
+<p>Dense two-projection MLP <code class="docutils literal notranslate"><span class="pre">down_proj(act(up_proj(x)))</span></code> across TP ranks.</p>
+<p>The parallel counterpart of <code class="docutils literal notranslate"><span class="pre">mstar.model.components.MLP</span></code>, named after the
+dense-LLM checkpoint convention (<code class="docutils literal notranslate"><span class="pre">up_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>) so a
+Nemotron-style FFN loads by name. <code class="docutils literal notranslate"><span class="pre">activation</span></code> accepts the HF names
+<code class="docutils literal notranslate"><span class="pre">_resolve_activation</span></code> knows (<code class="docutils literal notranslate"><span class="pre">relu2</span></code> is the Nemotron squared ReLU) or
+a callable. A trivial comm group (world size 1) makes both projections
+plain linears.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>intermediate_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>comm_group</strong> (<em>CommGroup</em><em> | </em><em>None</em>)</p></li>
+<li><p><strong>activation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>Callable</em>)</p></li>
+<li><p><strong>bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.ParallelMLP.forward">
+<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/mlp.html#ParallelMLP.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.ParallelMLP.forward" title="Link to this definition">#</a></dt>
+<dd><p>Define the computation performed at every call.</p>
+<p>Should be overridden by all subclasses.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Although the recipe for forward pass needs to be defined within
+this function, one should call the <code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code> instance afterwards
+instead of this since the former takes care of running the
+registered hooks while the latter silently ignores them.</p>
+</div>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.components.distributed.QKVParallelLinear">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.distributed.</span></span><span class="sig-name descname"><span class="pre">QKVParallelLinear</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">comm_group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">total_num_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">total_num_kv_heads</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">skip_bias_add</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">v_head_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/linear.html#QKVParallelLinear"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.QKVParallelLinear" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.model.components.distributed.linear.html#mstar.model.components.distributed.linear.ColumnParallelLinear" title="mstar.model.components.distributed.linear.ColumnParallelLinear"><code class="xref py py-class docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code></a></p>
@@ -1217,6 +1317,14 @@ registered hooks while the latter silently ignores them.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedMLP.forward"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLP.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedMLPUnfused"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLPUnfused</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelGatedMLPUnfused.forward"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLPUnfused.forward()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelMLP"><code class="docutils literal notranslate"><span class="pre">ParallelMLP</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.ParallelMLP.forward"><code class="docutils literal notranslate"><span class="pre">ParallelMLP.forward()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.QKVParallelLinear"><code class="docutils literal notranslate"><span class="pre">QKVParallelLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.QKVParallelLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">QKVParallelLinear.weight_loader()</span></code></a></li>
 </ul>
@@ -1264,7 +1372,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 23, 2026.
+  Last updated on Sep 25, 2026.
   <br/>
 </p>
   </div>

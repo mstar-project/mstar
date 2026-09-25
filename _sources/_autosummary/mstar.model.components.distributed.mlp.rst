@@ -19,6 +19,7 @@ mstar.model.components.distributed.mlp
    
       ParallelGatedMLP
       ParallelGatedMLPUnfused
+      ParallelMLP
    
    
 

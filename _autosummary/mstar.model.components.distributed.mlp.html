@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 23, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 25, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -570,6 +570,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.mlp.ParallelGatedMLPUnfused.forward"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLPUnfused.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.mlp.ParallelMLP"><code class="docutils literal notranslate"><span class="pre">ParallelMLP</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.mlp.ParallelMLP.forward"><code class="docutils literal notranslate"><span class="pre">ParallelMLP.forward()</span></code></a></li>
+</ul>
+</li>
 </ul>
             </nav>
         </div>
@@ -596,6 +600,10 @@ separately; the model’s weight loader calls
 <code class="docutils literal notranslate"><span class="pre">ColumnParallelLinear</span></code> projections so <code class="docutils literal notranslate"><span class="pre">state_dict()</span></code> keys match a
 checkpoint’s one-to-one — for loaders that stream weights by name with no
 stacked-parameter rules.</p>
+<p><code class="docutils literal notranslate"><span class="pre">ParallelMLP</span></code> is the dense, ungated two-projection FFN
+(<code class="docutils literal notranslate"><span class="pre">down(act(up(x)))</span></code>) of the Nemotron family (relu2) and of ViT/CLIP-style
+towers (gelu), sharded the same way: <code class="docutils literal notranslate"><span class="pre">up_proj</span></code> column-parallel over the
+intermediate dim, <code class="docutils literal notranslate"><span class="pre">down_proj</span></code> row-parallel with an all-reduce.</p>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -604,6 +612,9 @@ stacked-parameter rules.</p>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.components.distributed.mlp.ParallelGatedMLPUnfused" title="mstar.model.components.distributed.mlp.ParallelGatedMLPUnfused"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ParallelGatedMLPUnfused</span></code></a>(hidden_size, ...[, ...])</p></td>
 <td><p>SwiGLU MLP with separate (unfused) gate/up column shards.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.components.distributed.mlp.ParallelMLP" title="mstar.model.components.distributed.mlp.ParallelMLP"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ParallelMLP</span></code></a>(hidden_size, intermediate_size)</p></td>
+<td><p>Dense two-projection MLP <code class="docutils literal notranslate"><span class="pre">down_proj(act(up_proj(x)))</span></code> across TP ranks.</p></td>
 </tr>
 </tbody>
 </table>
@@ -694,6 +705,52 @@ registered hooks while the latter silently ignores them.</p>
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.mlp.ParallelMLP">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.components.distributed.mlp.</span></span><span class="sig-name descname"><span class="pre">ParallelMLP</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">activation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'relu2'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bias</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/mlp.html#ParallelMLP"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.mlp.ParallelMLP" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code></a></p>
+<p>Dense two-projection MLP <code class="docutils literal notranslate"><span class="pre">down_proj(act(up_proj(x)))</span></code> across TP ranks.</p>
+<p>The parallel counterpart of <code class="docutils literal notranslate"><span class="pre">mstar.model.components.MLP</span></code>, named after the
+dense-LLM checkpoint convention (<code class="docutils literal notranslate"><span class="pre">up_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>) so a
+Nemotron-style FFN loads by name. <code class="docutils literal notranslate"><span class="pre">activation</span></code> accepts the HF names
+<code class="docutils literal notranslate"><span class="pre">_resolve_activation</span></code> knows (<code class="docutils literal notranslate"><span class="pre">relu2</span></code> is the Nemotron squared ReLU) or
+a callable. A trivial comm group (world size 1) makes both projections
+plain linears.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>intermediate_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>comm_group</strong> (<em>CommGroup</em><em> | </em><em>None</em>)</p></li>
+<li><p><strong>activation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>Callable</em>)</p></li>
+<li><p><strong>bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.distributed.mlp.ParallelMLP.forward">
+<span class="sig-name descname"><span class="pre">forward</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/distributed/mlp.html#ParallelMLP.forward"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.distributed.mlp.ParallelMLP.forward" title="Link to this definition">#</a></dt>
+<dd><p>Define the computation performed at every call.</p>
+<p>Should be overridden by all subclasses.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Although the recipe for forward pass needs to be defined within
+this function, one should call the <code class="xref py py-class docutils literal notranslate"><span class="pre">Module</span></code> instance afterwards
+instead of this since the former takes care of running the
+registered hooks while the latter silently ignores them.</p>
+</div>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>x</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
 </section>
 
 
@@ -751,6 +808,10 @@ registered hooks while the latter silently ignores them.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.mlp.ParallelGatedMLPUnfused.forward"><code class="docutils literal notranslate"><span class="pre">ParallelGatedMLPUnfused.forward()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.mlp.ParallelMLP"><code class="docutils literal notranslate"><span class="pre">ParallelMLP</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.distributed.mlp.ParallelMLP.forward"><code class="docutils literal notranslate"><span class="pre">ParallelMLP.forward()</span></code></a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 
@@ -784,7 +845,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 23, 2026.
+  Last updated on Sep 25, 2026.
   <br/>
 </p>
   </div>

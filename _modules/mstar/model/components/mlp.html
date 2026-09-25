@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 23, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 25, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -878,7 +878,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_resolve_activation</span><span class="p">(</span><span class="n">activation</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Callable</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Callable</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Resolve an activation name to a callable. Accepts the canonical</span>
-<span class="sd">    HF names (``silu``, ``gelu``, ``gelu_tanh``, ``relu``) or a callable.</span>
+<span class="sd">    HF names (``silu``, ``gelu``, ``gelu_tanh``, ``relu``, ``relu2``) or a</span>
+<span class="sd">    callable.</span>
 <span class="sd">    """</span>
     <span class="k">if</span> <span class="nb">callable</span><span class="p">(</span><span class="n">activation</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">activation</span>
@@ -890,6 +891,9 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">F</span><span class="o">.</span><span class="n">gelu</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">approximate</span><span class="o">=</span><span class="s2">"tanh"</span><span class="p">)</span>
     <span class="k">if</span> <span class="n">activation</span> <span class="o">==</span> <span class="s2">"relu"</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">F</span><span class="o">.</span><span class="n">relu</span>
+    <span class="k">if</span> <span class="n">activation</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"relu2"</span><span class="p">,</span> <span class="s2">"relu_squared"</span><span class="p">):</span>
+        <span class="c1"># Squared ReLU (the dense Nemotron / Cosmos3-Edge FFN activation).</span>
+        <span class="k">return</span> <span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">square</span><span class="p">(</span><span class="n">F</span><span class="o">.</span><span class="n">relu</span><span class="p">(</span><span class="n">x</span><span class="p">))</span>
     <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Unknown activation: </span><span class="si">{</span><span class="n">activation</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
 
 
@@ -1088,7 +1092,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 23, 2026.
+  Last updated on Sep 25, 2026.
   <br/>
 </p>
   </div>

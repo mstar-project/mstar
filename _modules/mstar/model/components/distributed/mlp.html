@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 23, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 25, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -868,6 +868,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">``ColumnParallelLinear`` projections so ``state_dict()`` keys match a</span>
 <span class="sd">checkpoint's one-to-one — for loaders that stream weights by name with no</span>
 <span class="sd">stacked-parameter rules.</span>
+
+<span class="sd">``ParallelMLP`` is the dense, ungated two-projection FFN</span>
+<span class="sd">(``down(act(up(x)))``) of the Nemotron family (relu2) and of ViT/CLIP-style</span>
+<span class="sd">towers (gelu), sharded the same way: ``up_proj`` column-parallel over the</span>
+<span class="sd">intermediate dim, ``down_proj`` row-parallel with an all-reduce.</span>
 <span class="sd">"""</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -982,6 +987,42 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">down_proj</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">act</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gate_proj</span><span class="p">(</span><span class="n">x</span><span class="p">))</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">up_proj</span><span class="p">(</span><span class="n">x</span><span class="p">))</span></div>
 </div>
 
+
+
+<div class="viewcode-block" id="ParallelMLP">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.distributed.mlp.html#mstar.model.components.distributed.ParallelMLP">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ParallelMLP</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Dense two-projection MLP ``down_proj(act(up_proj(x)))`` across TP ranks.</span>
+
+<span class="sd">    The parallel counterpart of ``mstar.model.components.MLP``, named after the</span>
+<span class="sd">    dense-LLM checkpoint convention (``up_proj`` / ``down_proj``) so a</span>
+<span class="sd">    Nemotron-style FFN loads by name. ``activation`` accepts the HF names</span>
+<span class="sd">    ``_resolve_activation`` knows (``relu2`` is the Nemotron squared ReLU) or</span>
+<span class="sd">    a callable. A trivial comm group (world size 1) makes both projections</span>
+<span class="sd">    plain linears.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">intermediate_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">comm_group</span><span class="p">:</span> <span class="n">CommGroup</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">activation</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Callable</span> <span class="o">=</span> <span class="s2">"relu2"</span><span class="p">,</span>
+        <span class="n">bias</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">comm_group</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">comm_group</span> <span class="o">=</span> <span class="n">CommGroup</span><span class="o">.</span><span class="n">trivial</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">act</span> <span class="o">=</span> <span class="n">_resolve_activation</span><span class="p">(</span><span class="n">activation</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">up_proj</span> <span class="o">=</span> <span class="n">ColumnParallelLinear</span><span class="p">(</span><span class="n">comm_group</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">intermediate_size</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">down_proj</span> <span class="o">=</span> <span class="n">RowParallelLinear</span><span class="p">(</span><span class="n">comm_group</span><span class="p">,</span> <span class="n">intermediate_size</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="n">bias</span><span class="p">)</span>
+
+<div class="viewcode-block" id="ParallelMLP.forward">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.model.components.distributed.mlp.html#mstar.model.components.distributed.ParallelMLP.forward">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">down_proj</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">act</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">up_proj</span><span class="p">(</span><span class="n">x</span><span class="p">)))</span></div>
+</div>
+
 </pre></div>
 
                 </article>
@@ -1029,7 +1070,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 23, 2026.
+  Last updated on Sep 25, 2026.
   <br/>
 </p>
   </div>
