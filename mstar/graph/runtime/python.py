@@ -1179,10 +1179,10 @@ class PythonGraphRuntime(GraphRuntime):
         self.reset_outputs(input.node_name, list(rids), list(wg_ids))
 
         routing_per_rid: dict[int, NodeOutputRouting] = {}
-        register_idxs: list[int] = []
+        register_uuids: list[int] = []
         register_rids: list[int] = []
         new_token_idxs: list[int] = []
-        local_streaming_idxs: list[int] = []
+        streaming_by_signal: dict[str, ParallelList[int, int]] = {}
         staged: set[int] = set()
 
         cursor = 0
@@ -1232,20 +1232,21 @@ class PythonGraphRuntime(GraphRuntime):
                 )
                 self._tensor_manager.set_output_ref_counts(owned, routed_edges)
 
-            # What the caller has to stage for remote reads. Deduped by uuid
-            # and skipping anything already registered, so a re-emitted edge
-            # does not stage twice.
+            # What the caller has to stage for remote reads. Every tensor on
+            # an outgoing edge, not just the ones this batch produced: a loop
+            # edge carries tensors from earlier iterations, and those need
+            # staging just as much. Deduped by uuid, so a re-emitted edge does
+            # not stage twice.
             for edge in (
                 routing.persist + routing.emit_to_client
                 + sum(routing.to_workers.values(), start=[])
                 + sum(routing.streaming_to_workers.values(), start=[])
             ):
                 for info in edge.tensor_info:
-                    idx = uuid_to_idx.get(info.uuid)
-                    if idx is None or info.uuid in staged:
+                    if info.uuid in staged:
                         continue
                     staged.add(info.uuid)
-                    register_idxs.append(idx)
+                    register_uuids.append(info.uuid)
                     register_rids.append(rid)
 
             # One output routed to two destinations is two edges carrying the
@@ -1257,14 +1258,24 @@ class PythonGraphRuntime(GraphRuntime):
                     continue
                 counted.add(edge.name)
                 for info in edge.tensor_info:
+                    # Skipping what this batch did not produce is the point:
+                    # a loop re-emitting a cached tensor is not new tokens.
                     idx = uuid_to_idx.get(info.uuid)
                     if idx is not None:
                         new_token_idxs.append(idx)
+            # Grouped by edge name so the name crosses once per stream rather
+            # than once per chunk. Appended in routing order, which is the
+            # order the buffer has to see.
             for edge in routing.streaming_local:
+                if not edge.tensor_info:
+                    continue
+                per_signal = streaming_by_signal.get(edge.name)
+                if per_signal is None:
+                    per_signal = ParallelList([], [])
+                    streaming_by_signal[edge.name] = per_signal
                 for info in edge.tensor_info:
-                    idx = uuid_to_idx.get(info.uuid)
-                    if idx is not None:
-                        local_streaming_idxs.append(idx)
+                    per_signal.keys.append(rid)
+                    per_signal.values.append(info.uuid)
 
         self._completion_counter += 1
         completion_id = self._completion_counter
@@ -1276,10 +1287,10 @@ class PythonGraphRuntime(GraphRuntime):
         )
         return RouteOutput(
             completion_id=completion_id,
-            register_tensor_idxs=register_idxs,
+            register_uuids=register_uuids,
             register_rids=register_rids,
             new_token_output_idxs=new_token_idxs,
-            local_streaming_tensor_idxs=local_streaming_idxs,
+            local_streaming_by_signal=streaming_by_signal,
         )
 
     def _peek_completion(self, completion_id: int) -> "CompletionState":
@@ -1340,7 +1351,7 @@ class PythonGraphRuntime(GraphRuntime):
 
             # streaming_local is NOT here: it feeds a StreamBuffer, which holds
             # real tensors and so stays on the Python side. RouteOutput's
-            # local_streaming_tensor_idxs is how the caller finds those.
+            # local_streaming_by_signal is how the caller finds those.
             for worker_id, edges in routing.streaming_to_workers.items():
                 self._send_input_signals(rid, worker_id, edges, fwd_info, partition)
 

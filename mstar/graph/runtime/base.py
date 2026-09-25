@@ -102,17 +102,23 @@ class RouteInput(NamedTuple):
     tensors: list[int]
     num_tensors: list[int]
 
-    # TODO: function to build this object from a node batch
-
 
 class RouteOutput(NamedTuple):
     completion_id: int
-    # parallel: tensor at register_tensor_idxs[i] belongs to register_rids[i].
-    # Indices are into RouteInput.tensors. Already deduped by uuid.
-    register_tensor_idxs: list[int]
+
+    # NOTE: An outgoing edge can carry a tensor from an earlier batch via
+    # accumulated outputs and loop outputs, so register and local streaming
+    # have to be by UUID instead of indexing the UUID list passed in.
+    register_uuids: list[int]
     register_rids: list[int]
+
+    # Count these into the conductor's per-signal new-token totals. Indices
+    # into RouteInput.tensors deliberately to avoid double-counting.
     new_token_output_idxs: list[int]
-    local_streaming_tensor_idxs: list[int]
+
+    # Push these into the request's stream buffer for their edge. Keyed by
+    # edge name -> (rid, uuid) per tensor.
+    local_streaming_by_signal: dict[str, ParallelList[int, int]]
 
 
 
