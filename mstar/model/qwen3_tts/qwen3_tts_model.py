@@ -644,6 +644,12 @@ class Qwen3TTSModel(Model):
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.codec.output_sample_rate
 
+    def get_voices(self) -> list[str]:
+        return sorted(self.config.talker.spk_id)
+
+    def get_default_voice(self) -> str:
+        return self.config.default_speaker
+
     def postprocess(
         self,
         output: torch.Tensor,

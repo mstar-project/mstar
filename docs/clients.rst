@@ -108,6 +108,8 @@ Convenience wrappers:
      - PNG ``bytes`` (e.g. BAGEL text-to-image).
    * - ``tts(text, *, voice=None, **kw)``
      - An ``AudioBuffer`` (``.to_wav(path)``, ``.to_numpy()``, ``len(...)`` samples).
+   * - ``voices()``
+     - The ``voice`` ids the served speech model accepts (``GET /v1/audio/voices``).
    * - ``stream(**kw)``
      - Sugar for ``generate(stream=True, ...)``.
    * - ``health()``
@@ -164,6 +166,9 @@ Endpoints and model coverage:
    * - ``POST /v1/audio/speech``
      - ``orpheus``, ``qwen3_omni``
      - Text-to-speech.
+   * - ``GET /v1/audio/voices``
+     - speech models with a fixed voice list (``orpheus``, ``qwen3_tts``)
+     - The ``voice`` ids the served model accepts, plus its default.
    * - ``POST /v1/images/generations``
      - ``bagel``
      - Text-to-image.
@@ -181,6 +186,8 @@ Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``) return ``
 
    # text-to-speech
    client.audio.speech.create(model="orpheus", input="hello there", voice="tara")
+   # (mstar extension) the voices the served model accepts
+   requests.get("http://localhost:8000/v1/audio/voices").json()["voices"]
 
    # image generation
    client.images.generate(model="bagel", prompt="a cat in a hat")

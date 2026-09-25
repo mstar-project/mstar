@@ -95,6 +95,20 @@ class VideoGenerationRequest(BaseModel):
     video: str | None = None  # URL or data URI for video-to-video conditioning
 
 
+class VoiceCard(BaseModel):
+    """One entry of ``GET /v1/audio/voices``. ``id`` is what ``voice`` accepts;
+    ``name`` duplicates it for clients that render a voice picker."""
+
+    id: str
+    name: str
+
+
+class VoiceList(BaseModel):
+    object: str = "list"
+    voices: list[VoiceCard] = Field(default_factory=list)
+    default_voice: str | None = None
+
+
 class ModelCard(BaseModel):
     id: str
     object: str = "model"
