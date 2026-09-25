@@ -1,6 +1,8 @@
+import errno
 import logging
 import os
 import platform
+import shutil
 import time
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -1093,6 +1095,35 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
     def _shm_path(self, entity_id: str, uuid: str) -> str:
         return os.path.join(self.shm_dir, f"mstar_{entity_id}_{uuid}")
 
+    def _write_shm_file(self, path: str, data: bytes) -> None:
+        """Write one tensor's bytes to ``path``.
+
+        A full shm dir fails the write part way, and no cleanup knows the partial file: left behind, it
+        would keep the space it took, and the next request would find the dir fuller still.
+        """
+        try:
+            with open(path, "wb") as f:
+                f.write(data)
+        except OSError as exc:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            if exc.errno != errno.ENOSPC:
+                raise
+            free = shutil.disk_usage(self.shm_dir).free
+            if free < len(data):
+                reason = f"{self.shm_dir} has {free} bytes free, too few for a {len(data)}-byte tensor"
+            else:
+                reason = (
+                    f"{self.shm_dir} reported no space for a {len(data)}-byte tensor, with {free} bytes free after "
+                    "the failed write: it may be out of inodes, or other writers held the space meanwhile"
+                )
+            raise OSError(
+                errno.ENOSPC,
+                f"{reason}. Give it more room (docker --shm-size), or pass --tensor-comm-protocol TCP, which is slower",
+            ) from exc
+
     def register_for_send(
         self, request_id: str, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
@@ -1117,8 +1148,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                 t0 = time.perf_counter()
                 data = _serialize_tensor(tensor)
                 path = self._shm_path(self.my_entity_id, uuid)
-                with open(path, "wb") as f:
-                    f.write(data)
+                self._write_shm_file(path, data)
                 self._shm_files[uuid] = path
                 self.tensor_store.set_metadata(request_id, uuid, mem_registered=True)
                 if self.enable_prof:
