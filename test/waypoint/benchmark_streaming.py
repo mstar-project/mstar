@@ -818,7 +818,9 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "write every measured stream (baseline, slow-consumer, and each "
-            "concurrent stream) as DIR/<request_id>.mp4, plus a copy of --artifact"
+            "concurrent stream) as DIR/<request_id>.mp4, plus a copy of --artifact. "
+            "Raw frames are held in memory until each stream ends (~0.7 MB/frame "
+            "at 360p, ~2.8 MB at 720p, 4 frames per step, per stream)"
         ),
     )
     parser.add_argument(
