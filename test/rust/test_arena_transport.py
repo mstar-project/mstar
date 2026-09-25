@@ -448,3 +448,68 @@ def test_the_arena_location_is_readable_back_out_of_the_store(
         # copy the store never sees again.
         assert stored.shm_segment == flat[0].shm_segment
         assert stored.shm_offset == flat[0].shm_offset
+
+
+# --- placement crosses as an index, not a segment name ----------------------
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_placement_crosses_as_an_index_once_per_segment(tmp_path, backend):
+    """``_reserve`` already returns the segment INDEX, so rendering its name
+    per tensor only for the store to intern it straight back down to an id is
+    a Python str alloc, a String alloc, a memcpy and a hash per tensor for an
+    integer the caller already had.
+    """
+    prod = _manager(f"idx_{backend}", tmp_path)
+    if backend == "rust":
+        prod.tensor_store = TensorStore(RustTensorBookkeeping())
+
+    store = prod.tensor_store
+    named: list[int] = []
+    placed: list[list[int]] = []
+    real_name, real_place = store.register_shm_segment, store.set_shm_placement
+
+    def spy_name(index, name):
+        named.append(index)
+        return real_name(index, name)
+
+    def spy_place(uuids, segment_idxs, offsets):
+        placed.append(list(segment_idxs))
+        return real_place(uuids, segment_idxs, offsets)
+
+    store.register_shm_segment = spy_name
+    store.set_shm_placement = spy_place
+
+    infos = prod.store_and_return_tensor_info(
+        7, {"h": [torch.randn(4, 8) for _ in range(16)]},
+    )
+    flat = [i for il in infos.values() for i in il]
+    assert len(flat) == 16
+    prod.register_for_send_uuids(ParallelList([7], [[i.uuid for i in flat]]))
+
+    [idxs] = placed
+    assert len(idxs) == 16
+    assert all(isinstance(i, int) for i in idxs), \
+        "the segment has to cross as an index, not a name"
+    assert len(named) <= prod._arena.num_segments, (
+        f"named a segment {len(named)} times for 16 tensors; naming is once "
+        "per segment, at the grow"
+    )
+    # And the placement still landed: the store resolved every index.
+    for info in flat:
+        assert store.get_info(info.uuid).shm_segment is not None
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_an_unregistered_segment_index_is_a_loud_error(backend):
+    """Silently stamping ``shm_segment=None`` would read as "spilled to a
+    file" at the consumer, which then hunts for a file nobody wrote -- a
+    failure that surfaces far from here.
+
+    Checked before the uuid lookup, so both backends raise on a bad index
+    whether or not the tensor is still tracked.
+    """
+    store = TensorStore(
+        RustTensorBookkeeping() if backend == "rust" else None
+    )
+    with pytest.raises(ValueError, match="never registered"):
+        store.set_shm_placement([12345], [99], [0])

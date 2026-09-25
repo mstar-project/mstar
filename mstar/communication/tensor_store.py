@@ -123,14 +123,27 @@ class TensorBookkeeping(ABC):
         raise NotImplementedError("Columnar put not implemented for this backend")
 
     @abstractmethod
+    def register_shm_segment(self, index: int, name: str):
+        """Name one arena segment, once, as the arena grows into it.
+
+        Keeps the name off ``set_shm_placement``, which then crosses an index
+        the caller already had.
+        """
+        pass
+
+    @abstractmethod
     def set_shm_placement(
-        self, uuids: list[int], segments: list[str | None],
+        self, uuids: list[int], segment_idxs: list[int],
         offsets: list[int],
     ):
         """Stamp arena placement onto descriptors already held.
 
         ``register_for_send`` changes only these two fields, so only they
-        cross -- not a rebuilt descriptor.
+        cross -- not a rebuilt descriptor. Segments cross as indices from
+        ``register_shm_segment``: the caller reserved by index, and rendering
+        a name per tensor costs a string allocation on each side plus a hash,
+        to recover an integer it already had. ``-1`` is "no segment", the
+        producer having spilled that tensor to its own file.
         """
         pass
 
@@ -237,23 +250,49 @@ class PythonTensorBookkeeping(TensorBookkeeping):
     def __init__(self):
         self._ref_info: dict[int, ReferenceInfo] = {}
         self._tensor_info: dict[int, TensorPointerInfo] = {}
+        # Arena segment index -> name; see register_shm_segment.
+        self._shm_segments: list[str | None] = []
 
     def put_tensor(self, uuid: int, info: TensorPointerInfo):
         self._ref_info[uuid] = ReferenceInfo()
         self._tensor_info[uuid] = info
 
+    def register_shm_segment(self, index: int, name: str):
+        if index >= len(self._shm_segments):
+            self._shm_segments.extend(
+                [None] * (index + 1 - len(self._shm_segments))
+            )
+        self._shm_segments[index] = name
+
     def set_shm_placement(
-        self, uuids: list[int], segments: list[str | None],
+        self, uuids: list[int], segment_idxs: list[int],
         offsets: list[int],
     ):
         # The descriptor is held by reference, so stamping it in place is the
         # whole update.
-        for uuid, seg, off in zip(uuids, segments, offsets, strict=True):
+        for uuid, idx, off in zip(uuids, segment_idxs, offsets, strict=True):
+            # Resolved BEFORE the uuid lookup, so a bad index is an error
+            # whether or not that tensor is still tracked -- the Rust
+            # bookkeeper checks in this order and the two must not disagree
+            # about which calls raise.
+            seg = None if idx < 0 else self._shm_segment_name(idx)
             info = self._tensor_info.get(uuid)
             if info is None:
                 continue
             info.shm_segment = seg
             info.shm_offset = off
+
+    def _shm_segment_name(self, idx: int) -> str:
+        name = self._shm_segments[idx] if idx < len(self._shm_segments) else None
+        if name is None:
+            # Shipping shm_segment=None would read as "spilled to a file" at
+            # the consumer, which then looks for a file nobody wrote -- far
+            # harder to trace than failing here.
+            raise ValueError(
+                f"set_shm_placement: segment {idx} was never "
+                f"registered via register_shm_segment"
+            )
+        return name
 
     def get_info(self, uuid: int) -> TensorPointerInfo | None:
         return self._tensor_info.get(uuid)
@@ -423,13 +462,17 @@ class RustTensorBookkeeping(TensorBookkeeping):
         )
         return True
 
+    def register_shm_segment(self, index: int, name: str):
+        self._rust.register_shm_segment(index, name)
+
     def set_shm_placement(
-        self, uuids: list[int], segments: list[str | None],
+        self, uuids: list[int], segment_idxs: list[int],
         offsets: list[int],
     ):
-        # One crossing, primitives only -- no descriptor is rebuilt for
-        # Python and none is marshalled back.
-        self._rust.set_shm_placement(uuids, segments, offsets)
+        # One crossing, integers only -- no descriptor is rebuilt for Python,
+        # none is marshalled back, and no segment name is rendered per tensor
+        # for this side to intern straight back down to an id.
+        self._rust.set_shm_placement(uuids, segment_idxs, offsets)
 
     def get_info(self, uuid: int) -> TensorPointerInfo | None:
         out = self._rust.get_info(uuid)
@@ -614,11 +657,14 @@ class TensorStore:
     def increment_ref_batch_uniform(self, uuids: list[int], n: int = 1):
         self.bookkeeping.increment_ref_batch_uniform(uuids, n)
 
+    def register_shm_segment(self, index: int, name: str):
+        self.bookkeeping.register_shm_segment(index, name)
+
     def set_shm_placement(
-        self, uuids: list[int], segments: list[str | None],
+        self, uuids: list[int], segment_idxs: list[int],
         offsets: list[int],
     ):
-        self.bookkeeping.set_shm_placement(uuids, segments, offsets)
+        self.bookkeeping.set_shm_placement(uuids, segment_idxs, offsets)
 
     def increment_ref_batch(self, uuids: list[int], counts: list[int]):
         self.bookkeeping.increment_ref_batch(uuids, counts)
