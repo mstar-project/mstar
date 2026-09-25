@@ -453,6 +453,38 @@ class Cosmos3Adapter(OpenAIAdapter):
         )
 
 
+class Cosmos3EdgeAdapter(Cosmos3Adapter):
+    """Cosmos3-Edge: the generator surfaces of :class:`Cosmos3Adapter` plus
+    chat (the reasoner: the understanding tower served as a VLM).
+
+    Chat requests take the OpenAI ``messages`` layout with image / video
+    attachments in order; ``temperature`` / ``top_p`` / ``max_tokens`` map to
+    the reasoner's sampler, and ``extra_body`` knobs (``enable_thinking``,
+    ``top_k``, ``repetition_penalty``, ``video_fps`` / ``video_num_frames``)
+    pass through.
+    """
+
+    supports_chat = True
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
+        mk = _passthrough(req)
+        _apply_sampling(req, mk)
+        # ``chat_template_kwargs`` is how the vLLM recipe toggles thinking;
+        # accept it alongside a flat ``enable_thinking``.
+        template_kwargs = mk.pop("chat_template_kwargs", None) or {}
+        if "enable_thinking" in template_kwargs:
+            mk.setdefault("enable_thinking", bool(template_kwargs["enable_thinking"]))
+        return SubmitArgs(
+            text=text,
+            file_paths=file_paths or None,
+            input_modalities=in_mods,
+            output_modalities=["text"],
+            model_kwargs=mk,
+            prompt_parts=parts,
+        )
+
+
 class Wan22Adapter(OpenAIAdapter):
     """Wan2.2-TI2V-5B: text/image-to-video generation (video only).
 
@@ -515,7 +547,11 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "orpheus": OrpheusAdapter(),
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),
+    "cosmos3_edge": Cosmos3EdgeAdapter(),
+    "cosmos3_edge_droid": Cosmos3EdgeAdapter(),
     "cosmos3_super": Cosmos3Adapter(),
+    "cosmos3_super_i2v_4step": Cosmos3Adapter(),
+    "cosmos3_super_t2i_4step": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
 }
 

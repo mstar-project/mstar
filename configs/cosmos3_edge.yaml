@@ -1,0 +1,55 @@
+model: "cosmos3_edge"
+# Sequence-length hint for the scheduler. The conductor only asserts its
+# presence; the real per-request capacity is the KV pool below.
+max_seq_len: 8192
+# KV pool sizing. Edge is 28 layers x 8 KV heads x 128 (half of Nano's per-page
+# footprint); one pool serves both the DiT's frozen text prefixes (a few pages
+# per guidance branch) and the reasoner's chat context (up to 131k tokens per
+# request). 1024 pages x 128 tokens is ~7.5 GB in bf16.
+resources:
+  kv:
+    max_num_pages: 1024
+model_kwargs:
+  # Denoise CUDA-graph capture knobs (serving). cuda_graph=false serves eager;
+  # graph_max_latent_area caps which resolutions are captured (latent H*W).
+  # The COSMOS3_DISABLE_CUDA_GRAPH / COSMOS3_GRAPH_MAX_LATENT_AREA env vars
+  # override.
+  cuda_graph: true
+  graph_max_latent_area: 2000
+  # Video denoise steps stay eager on the dense FA3 path: capturing them
+  # (gen_capture_video) forces the paged attention into the graph, which
+  # measured 3-6% slower at 832x480 for both the 121-frame clip and the
+  # 29-frame window (H100, 2026-09-17). Add tiers here only for small,
+  # launch-bound shapes.
+  gen_capture_video: []
+  # Edge is 480p-native: the model card's generator recipe is 832x480 video
+  # (121 frames, 24 fps, 20 UniPC steps, guidance 6.0, flow shift 12.0 on the
+  # native flow schedule) and 640x640 images. Requests override any of these.
+  image_size_default: [640, 640]
+  video_size_default: [832, 480]
+  num_frames_video: 121
+  num_inference_steps_video: 20
+  guidance_scale: 6.0
+  flow_shift_video: 12.0
+  # Image-to-video conditioning follows the model card's diffusers recipe:
+  # cover-scale, antialiased resize, center crop, 8-bit rounding.
+  conditioning_resize: aspect_crop
+  # Action requests (forward/inverse dynamics, policy) follow the Edge model
+  # card: 30 steps, guidance 1.0, flow shift 10.0.
+  num_inference_steps_action: 30
+  guidance_scale_action: 1.0
+  flow_shift_action: 10.0
+  # Streaming rollout: windowed autoregressive video (the video_gen_ar walk,
+  # the vae_decoder_ar node and its streaming decoder partition). Requests opt
+  # in per call with window_mode ("chained" | "kv") and stream each finished
+  # window with stream_video; the kv-mode context horizon (context_frames)
+  # bounds the committed K/V a long rollout keeps.
+  enable_windowed_video: true
+node_groups:
+  # The DiT and the reasoner share one transformer instance and one KV pool;
+  # they must sit in the same group. The vision encoder feeds the reasoner's
+  # prefill, the VAE nodes the generator walks.
+  - node_names: ["dit", "reasoner"]
+    ranks: [0]
+  - node_names: ["vision_encoder", "vae_encoder", "vae_decoder", "vae_decoder_ar"]
+    ranks: [0]

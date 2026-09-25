@@ -98,5 +98,18 @@ async def _stream(api, model_name, request_id, sample_rate):
             yield chunk({"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}})
         elif c.modality == "image":
             yield chunk({"content": media_io.png_to_data_url(c.data)})
+        elif c.modality == "error":
+            # The request failed after the stream opened (an engine error mid
+            # generation, a delivery timeout); the HTTP status is committed, so
+            # the failure travels in-band the way the non-streaming path's
+            # error body does — not as a normal ``stop``, which a client would
+            # take for a complete answer.
+            yield sse({"error": {
+                "message": c.data.decode("utf-8", "replace"),
+                "type": "server_error",
+                "code": c.metadata.get("status", 500),
+            }})
+            yield SSE_DONE
+            return
     yield chunk({}, finish="stop")
     yield SSE_DONE

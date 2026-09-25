@@ -10,9 +10,18 @@ Each decoder layer carries two parameter sets that run side by side:
     ``post_attention_layernorm_moe_gen``. Full (non-causal) attention where
     GEN queries attend to ``cat([k_und, k_gen])`` / ``cat([v_und, v_gen])``.
 
+Two backbone families share the layout. Nano/Super (Qwen3-VL descent) use
+SwiGLU MLPs, per-head QK-norm on both pathways and the diffusers RMSNorm
+rounding. Edge (dense Nemotron descent, ``hidden_act="relu2"``) uses
+two-projection squared-ReLU MLPs, the Nemotron RMSNorm ordering, no QK-norm on
+the text pathway, and a ``k_norm_und_for_gen`` that re-normalizes the
+understanding K the generation tower attends to (the text tower's own causal
+attention keeps the raw K). ``Cosmos3Config`` selects the family.
+
 The module mirrors the published diffusers checkpoint layout one-to-one, so the
-flat ``layers.N.*`` safetensors keys load with no key remapping beyond dropping
-the unused text ``lm_head``.
+flat ``layers.N.*`` safetensors keys load with no key remapping. The text
+``lm_head`` is built only for checkpoints whose understanding tower is also
+served as a reasoner (Edge); the generator never decodes text logits.
 
 UND and GEN run together in one fused pass every denoising step. The attention
 and MLP projections are tensor-parallel: with a trivial (world-size-1) comm
@@ -36,7 +45,7 @@ from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
-from mstar.model.components.distributed.mlp import ParallelGatedMLPUnfused
+from mstar.model.components.distributed.mlp import ParallelGatedMLPUnfused, ParallelMLP
 from mstar.model.components.distributed.sequence_parallel import (
     gather_sequence,
     scatter_sequence,
@@ -69,6 +78,36 @@ class RMSNorm(nn.Module):
             hidden_states = hidden_states.to(self.weight.dtype)
             return hidden_states * self.weight
         return (hidden_states * self.weight).to(input_dtype)
+
+
+class NemotronRMSNorm(nn.Module):
+    """Weight-only RMS normalization with the Nemotron (Megatron) ordering.
+
+    Everything happens in fp32 — variance, normalize, *and* the weight
+    multiply — with a single rounding back to the input dtype at the end.
+    Replicates diffusers' ``Cosmos3NemotronRMSNorm`` bit-for-bit, which the
+    relu2 (Edge) backbone uses for every norm; the Qwen-descended checkpoints
+    keep ``RMSNorm`` above, whose extra bf16 rounding before the weight
+    multiply is what *their* reference does.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        x = hidden_states.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return (self.weight.to(torch.float32) * x).to(input_dtype)
+
+
+def norm_class_for(config) -> type[nn.Module]:
+    """The RMSNorm flavour of a checkpoint's backbone family (see the module
+    docstring): Nemotron ordering for relu2 backbones, diffusers otherwise."""
+    return NemotronRMSNorm if getattr(config, "nemotron_norm", False) else RMSNorm
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -124,8 +163,15 @@ class Cosmos3RotaryEmbedding(nn.Module):
 class TimestepEmbedder(nn.Module):
     """Two-layer MLP over sinusoidal timestep features (``linear_1``/``linear_2``).
 
-    Matches diffusers ``TimestepEmbedding`` (act = SiLU, no cond/post-act). Kept
-    in fp32 at build time, like diffusers' ``_keep_in_fp32_modules``.
+    Matches diffusers ``TimestepEmbedding`` (act = SiLU, no cond/post-act) and
+    stays fp32 like diffusers' ``_keep_in_fp32_modules`` — whatever dtype the
+    module tree around it is cast to. The transformer is shared by the DiT and
+    reasoner submodules and the worker casts each of them to bf16 in whatever
+    order it loads them; a cast that recursed into this module used to flip it
+    to bf16 whenever the reasoner's cast came after the DiT's, and the fp32
+    timestep features then failed the matmul (batched CFG and image-gen graph
+    capture). The upcast is lossless: the checkpoint stores these weights in
+    bf16.
     """
 
     def __init__(self, in_channels: int, time_embed_dim: int):
@@ -134,8 +180,16 @@ class TimestepEmbedder(nn.Module):
         self.act = nn.SiLU()
         self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim, bias=True)
 
+    def _apply(self, fn, recurse=True):
+        # ``Module.to``/``.bfloat16()`` on any ancestor lands here; keep the
+        # device move, undo the dtype change.
+        super()._apply(fn, recurse)
+        if any(t.is_floating_point() and t.dtype != torch.float32 for t in self.parameters()):
+            super()._apply(lambda t: t.float() if t.is_floating_point() else t, recurse)
+        return self
+
     def forward(self, sample: torch.Tensor) -> torch.Tensor:
-        return self.linear_2(self.act(self.linear_1(sample)))
+        return self.linear_2(self.act(self.linear_1(sample.float())))
 
 
 class Cosmos3PackedMoTAttention(nn.Module):
@@ -146,6 +200,11 @@ class Cosmos3PackedMoTAttention(nn.Module):
     *before* RoPE; the UND stream self-attends causally, the GEN stream attends
     non-causally to ``cat([und, gen])``. GQA (32 Q / 8 KV heads) is handled by
     ``F.scaled_dot_product_attention(enable_gqa=True)``.
+
+    ``qk_norm_for_text=False`` (Edge) drops the UND QK-norm; with
+    ``use_und_k_norm_for_gen`` the GEN stream attends to
+    ``k_norm_und_for_gen(k_und)`` instead of the raw ``k_und`` the UND stream
+    attends to itself (both RoPE'd the same way).
     """
 
     def __init__(
@@ -158,6 +217,9 @@ class Cosmos3PackedMoTAttention(nn.Module):
         rms_norm_eps: float,
         comm_group: CommGroup | None = None,
         sp_group: CommGroup | None = None,
+        qk_norm_for_text: bool = True,
+        use_und_k_norm_for_gen: bool = False,
+        norm_cls: type[nn.Module] = RMSNorm,
     ):
         super().__init__()
         if comm_group is None:
@@ -192,16 +254,29 @@ class Cosmos3PackedMoTAttention(nn.Module):
         self.to_k = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
         self.to_v = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
         self.to_out = RowParallelLinear(comm_group, q_dim, hidden_size, bias=attention_bias)
-        self.norm_q = RMSNorm(head_dim, eps=rms_norm_eps)
-        self.norm_k = RMSNorm(head_dim, eps=rms_norm_eps)
+        if qk_norm_for_text:
+            self.norm_q = norm_cls(head_dim, eps=rms_norm_eps)
+            self.norm_k = norm_cls(head_dim, eps=rms_norm_eps)
+        else:
+            # Parameter-free, so the state_dict matches a checkpoint that ships
+            # no ``norm_q`` / ``norm_k`` (Edge).
+            self.norm_q = nn.Identity()
+            self.norm_k = nn.Identity()
+        # Edge: the GEN-facing view of the UND K is re-normalized per head
+        # before RoPE; the diffusers reference only builds it when the text
+        # pathway has no QK-norm of its own.
+        self.k_norm_und_for_gen = (
+            norm_cls(head_dim, eps=rms_norm_eps)
+            if use_und_k_norm_for_gen and not qk_norm_for_text else None
+        )
 
         # Generation pathway.
         self.add_q_proj = ColumnParallelLinear(comm_group, hidden_size, q_dim, bias=attention_bias)
         self.add_k_proj = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
         self.add_v_proj = ColumnParallelLinear(comm_group, hidden_size, kv_dim, bias=attention_bias)
         self.to_add_out = RowParallelLinear(comm_group, q_dim, hidden_size, bias=attention_bias)
-        self.norm_added_q = RMSNorm(head_dim, eps=rms_norm_eps)
-        self.norm_added_k = RMSNorm(head_dim, eps=rms_norm_eps)
+        self.norm_added_q = norm_cls(head_dim, eps=rms_norm_eps)
+        self.norm_added_k = norm_cls(head_dim, eps=rms_norm_eps)
 
     @staticmethod
     def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -239,19 +314,26 @@ class Cosmos3PackedMoTAttention(nn.Module):
 
         q_und = self.norm_q(q_und)
         k_und = self.norm_k(k_und)
+        # The K the GEN stream reads for the text prefix: re-normalized on
+        # Edge (before RoPE, like every QK-norm here), the UND K itself else.
+        k_und_for_gen = self.k_norm_und_for_gen(k_und) if self.k_norm_und_for_gen is not None else k_und
         q_gen = self.norm_added_q(q_gen)
         k_gen = self.norm_added_k(k_gen)
 
         cos_und, sin_und, cos_gen, sin_gen = rotary_emb
         q_und = self._apply_rope(q_und, cos_und, sin_und)
         k_und = self._apply_rope(k_und, cos_und, sin_und)
+        if k_und_for_gen is not k_und:
+            k_und_for_gen = self._apply_rope(k_und_for_gen, cos_und, sin_und)
+        else:
+            k_und_for_gen = k_und
         q_gen = self._apply_rope(q_gen, cos_gen, sin_gen)
         k_gen = self._apply_rope(k_gen, cos_gen, sin_gen)
 
         # UND: causal self-attention over text.
         causal_out = self._attend(q_und, k_und, v_und, is_causal=True)
         # GEN: full attention over [und | gen].
-        all_k = torch.cat([k_und, k_gen], dim=0)
+        all_k = torch.cat([k_und_for_gen, k_gen], dim=0)
         all_v = torch.cat([v_und, v_gen], dim=0)
         full_out = self._attend(q_gen, all_k, all_v, is_causal=False)
 
@@ -276,14 +358,29 @@ class Cosmos3PackedMoTAttention(nn.Module):
 
     def forward_und(
         self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        attend: AttentionCallable,
+        attend: AttentionCallable, cache_gen_k: bool = True,
     ) -> torch.Tensor:
+        """Understanding-pathway attention over a paged cache.
+
+        ``attend`` writes this step's K/V through the KV resource and attends
+        causally. On Edge the K it wrote is the raw one the text tower itself
+        attends to, while the generation tower must read
+        ``k_norm_und_for_gen(k)``; with ``cache_gen_k`` the planned slots are
+        re-written with that GEN-facing K afterwards (same pages, same plan —
+        one extra scatter over the short text prefix), so a denoise step reads
+        exactly what the fused reference concatenates. A reasoner (text
+        decoding) prefill passes ``cache_gen_k=False`` and keeps the raw K.
+        """
         H, Hkv, D = self.num_attention_heads, self.num_key_value_heads, self.head_dim
         q = self.norm_q(self.to_q(und_seq).view(-1, H, D))
-        k = self.norm_k(self.to_k(und_seq).view(-1, Hkv, D))
+        k_raw = self.to_k(und_seq).view(-1, Hkv, D)
+        k = self.norm_k(k_raw)
         v = self.to_v(und_seq).view(-1, Hkv, D)
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
+        k_gen = None
+        if cache_gen_k and self.k_norm_und_for_gen is not None:
+            k_gen = self._apply_rope(self.k_norm_und_for_gen(k_raw), cos, sin)
         if self.sp_group.world_size > 1:
             # The UND prefix is replicated across the SP group (small text). Keep
             # this rank's head-group so the cached prefix K/V lands on the same
@@ -292,10 +389,14 @@ class Cosmos3PackedMoTAttention(nn.Module):
             q = sp_head_slice(self.sp_group, q)
             k = sp_head_slice(self.sp_group, k)
             v = sp_head_slice(self.sp_group, v)
+            if k_gen is not None:
+                k_gen = sp_head_slice(self.sp_group, k_gen)
             out = attend(q, k, v)
             out = sp_head_gather(self.sp_group, out).reshape(-1, H * D)
         else:
             out = attend(q, k, v).reshape(-1, H * D)
+        if k_gen is not None and attend.attn.requires_kv_write:
+            attend.kv.write_kv(k_gen, v)
         return self.to_out(out)
 
     def forward_gen(
@@ -337,6 +438,10 @@ class Cosmos3MoTDecoderLayer(nn.Module):
         rms_norm_eps: float,
         comm_group: CommGroup | None = None,
         sp_group: CommGroup | None = None,
+        hidden_act: str = "silu",
+        qk_norm_for_text: bool = True,
+        use_und_k_norm_for_gen: bool = False,
+        norm_cls: type[nn.Module] = RMSNorm,
     ):
         super().__init__()
         self.self_attn = Cosmos3PackedMoTAttention(
@@ -348,16 +453,29 @@ class Cosmos3MoTDecoderLayer(nn.Module):
             rms_norm_eps=rms_norm_eps,
             comm_group=comm_group,
             sp_group=sp_group,
+            qk_norm_for_text=qk_norm_for_text,
+            use_und_k_norm_for_gen=use_und_k_norm_for_gen,
+            norm_cls=norm_cls,
         )
         # Unfused (like every Cosmos3 projection) so state_dict() keys match
         # the published checkpoint one-to-one and the loader stays name-matched.
-        self.mlp = ParallelGatedMLPUnfused(hidden_size, intermediate_size, comm_group=comm_group)
-        self.mlp_moe_gen = ParallelGatedMLPUnfused(hidden_size, intermediate_size, comm_group=comm_group)
+        # relu2 (Edge) is the dense two-projection FFN; everything else the
+        # SwiGLU one.
+        if hidden_act == "relu2":
+            def _mlp():
+                return ParallelMLP(hidden_size, intermediate_size, comm_group=comm_group, activation="relu2")
+        else:
+            def _mlp():
+                return ParallelGatedMLPUnfused(
+                    hidden_size, intermediate_size, comm_group=comm_group, activation=hidden_act,
+                )
+        self.mlp = _mlp()
+        self.mlp_moe_gen = _mlp()
 
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.input_layernorm_moe_gen = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm_moe_gen = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.input_layernorm = norm_cls(hidden_size, eps=rms_norm_eps)
+        self.input_layernorm_moe_gen = norm_cls(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm = norm_cls(hidden_size, eps=rms_norm_eps)
+        self.post_attention_layernorm_moe_gen = norm_cls(hidden_size, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -379,10 +497,10 @@ class Cosmos3MoTDecoderLayer(nn.Module):
 
     def forward_und(
         self, und_seq: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-        attend: AttentionCallable,
+        attend: AttentionCallable, cache_gen_k: bool = True,
     ) -> torch.Tensor:
         und_norm = self.input_layernorm(und_seq)
-        attn_out = self.self_attn.forward_und(und_norm, cos, sin, attend)
+        attn_out = self.self_attn.forward_und(und_norm, cos, sin, attend, cache_gen_k=cache_gen_k)
         residual = und_seq + attn_out
         return residual + self.mlp(self.post_attention_layernorm(residual))
 
@@ -431,8 +549,10 @@ class Cosmos3OmniTransformer(nn.Module):
     """The full Cosmos3 generator backbone.
 
     ``state_dict()`` keys reproduce the published ``transformer/`` checkpoint
-    exactly, except the text ``lm_head`` is intentionally absent: generation
-    predicts flow velocity through ``proj_out`` and never decodes text logits.
+    exactly. The text ``lm_head`` is built only when the checkpoint's
+    understanding tower is served as a reasoner (``config.serves_reasoner``);
+    generation predicts flow velocity through ``proj_out`` and never decodes
+    text logits, so the other checkpoints leave it out.
     """
 
     def __init__(self, config, comm_group: CommGroup | None = None, sp_group: CommGroup | None = None):
@@ -446,6 +566,7 @@ class Cosmos3OmniTransformer(nn.Module):
             comm_group = CommGroup.trivial()
         self.comm_group = comm_group
 
+        norm_cls = norm_class_for(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, h)
         self.layers = nn.ModuleList(
             Cosmos3MoTDecoderLayer(
@@ -458,6 +579,10 @@ class Cosmos3OmniTransformer(nn.Module):
                 rms_norm_eps=config.rms_norm_eps,
                 comm_group=comm_group,
                 sp_group=sp_group,
+                hidden_act=config.hidden_act,
+                qk_norm_for_text=config.qk_norm_for_text,
+                use_und_k_norm_for_gen=config.use_und_k_norm_for_gen,
+                norm_cls=norm_cls,
             )
             for _ in range(config.num_hidden_layers)
         )
@@ -465,8 +590,15 @@ class Cosmos3OmniTransformer(nn.Module):
         # time; see AttentionCallable for why it must not be per layer.
         self._gen_attend: AttentionCallable | None = None
         self._und_attend: AttentionCallable | None = None
-        self.norm = RMSNorm(h, eps=config.rms_norm_eps)
-        self.norm_moe_gen = RMSNorm(h, eps=config.rms_norm_eps)
+        self.norm = norm_cls(h, eps=config.rms_norm_eps)
+        self.norm_moe_gen = norm_cls(h, eps=config.rms_norm_eps)
+        # The text head, for checkpoints whose understanding tower is served
+        # as a reasoner. Column-parallel with gathered logits so a TP
+        # deployment's sampler sees the full vocabulary.
+        if getattr(config, "serves_reasoner", False):
+            self.lm_head = ColumnParallelLinear(
+                comm_group, h, config.vocab_size, bias=False, gather_output=True,
+            )
         self.rotary_emb = Cosmos3RotaryEmbedding(
             head_dim=config.head_dim,
             rope_theta=config.rope_theta,
@@ -869,6 +1001,56 @@ class Cosmos3OmniTransformer(nn.Module):
             attend.set_layer_idx(i)
             und_seq = layer.forward_und(und_seq, cos, sin, attend)
 
+    def text_forward(
+        self, embeds: torch.Tensor, position_ids: torch.Tensor, label: str,
+    ) -> torch.Tensor:
+        """The understanding tower as a causal text model over the paged cache
+        (the reasoner): ``embeds`` are the packed token embeddings of this step
+        (text, with the vision tokens' projected features already scattered
+        in), ``position_ids`` their 3D mRoPE ids ([3, N]). Every layer writes
+        its raw K/V under ``label`` and attends over [cached prefix | this
+        step] with the plan the step declared (causal). Returns the final-normed
+        hidden states [N, hidden]; ``lm_head`` turns the rows the caller picks
+        into logits.
+        """
+        cos, sin = self._rotary(position_ids, embeds.device, embeds.dtype)
+        attend = self._und_attend
+        attend.bind_step(label)
+        x = embeds
+        for i, layer in enumerate(self.layers):
+            attend.set_layer_idx(i)
+            x = layer.forward_und(x, cos, sin, attend, cache_gen_k=False)
+        return self.norm(x)
+
+    def commit_window(
+        self, latents: torch.Tensor, position_ids_per_branch: list[torch.Tensor],
+        label: str, attn,
+    ) -> None:
+        """Run the generation tower over a finished window's clean latents so
+        its K/V lands in the cache under ``label`` — the frame-token analogue
+        of ``prefill_und`` for windowed (kv-mode) video. Clean conditioning
+        frames receive no timestep embedding, so the committed K/V is
+        denoise-step independent, exactly like i2v/v2v clean frames.
+        ``position_ids_per_branch`` carries one ``[3, N]`` mRoPE block per
+        guidance branch (the branches share content but their positions differ
+        with the prompt length); the sequence packs ``[cond | uncond]`` to
+        match the combined plan's label order. ``attn`` must be the paged
+        resource (the dense one never writes pages). No velocity is decoded —
+        the pass exists for its cache writes, which the step's commit makes
+        permanent."""
+        packed, _ = self._patchify_and_pack_latents([latents])
+        gen_seq = self.proj_in(packed)
+        if len(position_ids_per_branch) > 1:
+            gen_seq = torch.cat([gen_seq] * len(position_ids_per_branch), dim=0)
+        cos_parts, sin_parts = [], []
+        for pos in position_ids_per_branch:
+            c, s = self._rotary(pos, gen_seq.device, gen_seq.dtype)
+            cos_parts.append(c)
+            sin_parts.append(s)
+        cos = torch.cat(cos_parts, dim=0) if len(cos_parts) > 1 else cos_parts[0]
+        sin = torch.cat(sin_parts, dim=0) if len(sin_parts) > 1 else sin_parts[0]
+        self._sp_run_gen_layers(gen_seq, cos, sin, label, attn)
+
     def _sp_run_gen_layers(self, gen_seq, cos, sin, label, attn, prefer_all_gather=False):
         """Run the generation layer stack, sequence-parallel-sharded across the
         SP group when active. ``gen_seq``/``cos``/``sin`` are the FULL sequence
@@ -1016,6 +1198,7 @@ class Cosmos3OmniTransformer(nn.Module):
         sound_mse_gen_indexes: torch.Tensor | None = None,
         sound_timesteps: torch.Tensor | None = None,
         prefer_all_gather: bool = False,
+        noisy_token_mask: torch.Tensor | None = None,
     ):
         """Conditional and unconditional generation in one batched pass.
 
@@ -1029,7 +1212,15 @@ class Cosmos3OmniTransformer(nn.Module):
         positions, and let the handle's batched plan route each branch to its
         own label's pages. Returns the conditional and unconditional results in
         the same form as ``denoise_step`` (a velocity, or a (video, action) /
-        (video, sound) pair when the extra band is present)."""
+        (video, sound) pair when the extra band is present).
+
+        ``noisy_token_mask`` (one entry per token in ``vision_timesteps``
+        order) is the captured video graphs' way of carrying the clean/noisy
+        layout as data: the graph is built with every frame declared noisy,
+        and the mask zeroes the timestep embedding on the frames that are
+        actually clean — the same tokens the scatter-add would have skipped,
+        so the noisy frames' velocities are unchanged; the clean frames'
+        (meaningless) velocities are re-pinned away by the caller."""
         has_action = action_latents is not None
         has_sound = sound_latents is not None
         packed, original_latent_shapes = self._patchify_and_pack_latents([latents])
@@ -1037,6 +1228,8 @@ class Cosmos3OmniTransformer(nn.Module):
         target_dtype = packed.dtype
         timesteps = vision_timesteps * self.config.timestep_scale
         ts_embeds = self.time_embedder(self.time_proj(timesteps)).to(target_dtype)
+        if noisy_token_mask is not None:
+            ts_embeds = ts_embeds * noisy_token_mask.to(target_dtype)[:, None]
         gen_seq = self._apply_timestep_embeds_to_noisy_tokens(
             packed_tokens=packed,
             packed_timestep_embeds=ts_embeds,
@@ -1117,6 +1310,10 @@ class Cosmos3OmniTransformer(nn.Module):
             ts_embeds = self.time_embedder(
                 self.time_proj(req["vision_timesteps"] * self.config.timestep_scale)
             ).to(packed.dtype)
+            if req.get("noisy_token_mask") is not None:
+                # Captured video graphs: the clean/noisy layout as data (see
+                # denoise_step_batched_cfg).
+                ts_embeds = ts_embeds * req["noisy_token_mask"].to(packed.dtype)[:, None]
             gen_seq = self._apply_timestep_embeds_to_noisy_tokens(
                 packed_tokens=packed,
                 packed_timestep_embeds=ts_embeds,

@@ -339,7 +339,7 @@ def test_action_engine_matches_fused() -> None:
           "num_inference_steps": steps, "action_mode": "inverse_dynamics", "action_chunk_size": chunk,
           "raw_action_dim": raw, "domain_id": dom, "flow_shift": fshift}
     fwd = CurrentForwardPassInfo(request_id=rid, graph_walk="prefill", fwd_index=0,
-                                 random_seed=0, max_tokens=0, sampling_config={}, step_metadata=md)
+                                 random_seed=0, max_tokens=0, step_metadata=md)
     resources = _SdpaResources().as_dict()
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": [torch.tensor(cond_ids, dtype=torch.long, device=device)]})
     _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
@@ -512,7 +512,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
         enc = model.get_submodule("vae_encoder", device=device)
         fwd = CurrentForwardPassInfo(
             request_id=rid, graph_walk="prefill_cond_video", fwd_index=0,
-            random_seed=seeds[0], max_tokens=0, sampling_config={}, step_metadata=_md())
+            random_seed=seeds[0], max_tokens=0, step_metadata=_md())
         ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd})
         ni = enc.prepare_inputs("prefill_cond_video", fwd, {"video_inputs": [cond_videos[rid].to(device)]})
         out = enc.forward("prefill_cond_video", ei, **enc.preprocess("prefill_cond_video", ei, [ni]))
@@ -523,7 +523,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
     def _prefill(rid, idx, resources):
         fwd = CurrentForwardPassInfo(
             request_id=rid, graph_walk="prefill", fwd_index=0,
-            random_seed=seeds[idx], max_tokens=0, sampling_config={}, step_metadata=_md())
+            random_seed=seeds[idx], max_tokens=0, step_metadata=_md())
         ni = dit.prepare_inputs("prefill", fwd, {
             "text_inputs": [torch.tensor(conds[idx], dtype=torch.long, device=device)],
         })

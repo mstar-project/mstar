@@ -25,9 +25,23 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Cosmos3 action-policy fine-tune for the DROID platform (``domain_name``
        ``droid_lerobot``, 10-dim raw actions); no sound pathway. The config
        serves the released policy sampling defaults (4 steps, guidance 3.0).
+   * - ``cosmos3_edge``
+     - ``nvidia/Cosmos3-Edge``
+     - Cosmos3-Edge (4B): dense Nemotron backbone, 480p-native t2i/t2v/i2v and
+       robot-action modes, plus the reasoner (image/video chat through
+       ``/v1/chat/completions``) on the shared understanding tower.
+   * - ``cosmos3_edge_droid``
+     - ``nvidia/Cosmos3-Edge-Policy-DROID``
+     - Edge action-policy fine-tune for DROID (``domain_name``
+       ``droid_lerobot``); serves the released 4-step, guidance-3.0 policy
+       defaults.
    * - ``cosmos3_super``
      - ``nvidia/Cosmos3-Super``
      - Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.
+   * - ``cosmos3_super_t2i_4step`` / ``cosmos3_super_i2v_4step``
+     - ``nvidia/Cosmos3-Super-Text2Image-4Step`` / ``…-Image2Video-4Step``
+     - 4-step distilled Super task checkpoints (guidance baked in, fixed-sigma
+       stochastic sampler); TP=2 deployments.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
@@ -158,6 +172,124 @@ Cosmos3 environment requirements
 - The Wan-VAE decode dtype is gated on the cuDNN build: bf16 needs cuDNN >=
   9.16 (fast Hopper bf16 conv3d); older cuDNN serves the decode in fp32/TF32
   automatically.
+
+Cosmos3-Edge reasoner and action loop
+-------------------------------------
+
+``cosmos3_edge`` serves the understanding tower as a vision-language model on the
+same transformer instance and KV pool as the generator. ``/v1/chat/completions``
+takes image and video content parts (URLs or data URIs) and streams tokens; the
+chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
+``enable_thinking`` (or ``chat_template_kwargs.enable_thinking``), ``top_k``,
+``repetition_penalty``, and for video attachments ``video_fps`` / ``video_num_frames``
+(frames are sampled at 2 fps by default, each frame a timestamped span).
+
+.. code-block:: bash
+
+   curl -sN http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+     "model": "cosmos3_edge", "stream": true, "max_tokens": 256,
+     "messages": [{"role": "user", "content": [
+       {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+       {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
+     "enable_thinking": false}'
+
+The decode step is captured into CUDA graphs per batch bucket and, by default,
+compiled first (``compile_reasoner_decode: true``; ``COSMOS3_REASONER_COMPILE=0``
+turns it off): the eager step is over a thousand tiny kernels, and the fused
+step runs at the weight-streaming floor (about twice the uncompiled rate at
+batch size 1 on an H100). Concurrent chat requests share decode steps
+(continuous batching over the captured decode graphs, padded to the next batch
+bucket). Requests never see each other's data, but the batch bucket changes the
+bf16 arithmetic of the step, so a long greedy answer can part from its solo run
+where two candidate tokens tie: in every measured divergence the two tokens'
+logits were equal or one bf16 ulp apart, the first differing token came after
+tens to hundreds of identical ones, and identical prompts in one batch agreed
+with each other. Short answers (128 tokens) came out identical in 8 of 8 runs;
+256-token answers with thinking on in 2 of 8. Generation requests batch
+into one denoise pass too, which is the same maths but not the same bf16
+arithmetic — under classifier-free guidance the branch rounding is amplified,
+so an image or clip produced alongside other requests differs from its solo
+result at the kernel-drift level (~30 dB PSNR at guidance 6). Serve with one
+request at a time when outputs must be bitwise repeatable.
+
+The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
+``domain_name``) predicts a chunk of robot actions from the current observation:
+``output_modalities=action`` with ``model_kwargs``
+``{"action_mode": "policy", "domain_name": "droid_lerobot", "raw_action_dim": 10,
+"action_chunk_size": 32}``; the reply's ``action`` payload is float32
+``[chunk, action_dim_padded]`` and the first ``raw_action_dim`` columns are the
+embodiment's actions. For a control loop use ``/generate/ws`` (one connection,
+pipelined observations): ``examples/cosmos3_action_ws_client.py`` runs it and
+reports chunks/s, actions/s and latency percentiles.
+
+Cosmos3 streaming rollout (windowed video)
+------------------------------------------
+
+Long clips can be generated window by window instead of in one denoise loop,
+with each finished window streamed to the client while the next one is being
+denoised. The deployment opts in with ``enable_windowed_video: true`` in the
+config YAML (``configs/cosmos3_edge.yaml`` and ``configs/cosmos3_nano_ar.yaml``
+do), which adds the ``video_gen_ar`` walk and a ``vae_decoder_ar`` node in its
+own ``window_decoder`` partition; a request opts in per call:
+
+.. list-table:: Windowed request knobs (``model_kwargs`` or the video request body)
+   :header-rows: 1
+   :widths: 22 14 64
+
+   * - Knob
+     - Default
+     - Meaning
+   * - ``window_mode``
+     - —
+     - ``chained``: every window is a full bidirectional denoise conditioned on
+       the previous window's tail (``overlap_frames`` pinned clean). ``kv``: the
+       finished window's clean K/V is committed to the cache and later windows
+       attend to it block-causally; no overlap, and frames older than
+       ``context_frames`` behind the frontier are released from the cache
+       (the persistent world state of a long rollout stays bounded).
+   * - ``window_frames``
+     - 29
+     - Pixel frames per window (quantized to latent frames).
+   * - ``overlap_frames``
+     - 8
+     - ``chained`` only: frames re-pinned from the previous window (at least two
+       latent frames).
+   * - ``context_frames``
+     - 61
+     - ``kv`` only: committed context kept behind the frontier; ``0`` keeps all.
+   * - ``stream_video``
+     - ``false``
+     - Emit each window as its own video chunk as it is decoded instead of one
+       assembled clip. ``/generate`` streams the chunks as NDJSON lines,
+       ``/generate/ws`` as frames, ``/v1/videos/generations`` switches to an
+       NDJSON body (``video`` lines with a running ``index``, closed by ``done``).
+   * - ``session_id``
+     - —
+     - Names a world-state session: the DiT node keeps the rollout's last window
+       and the decoder its context (the most recent ``session_store_size`` sessions).
+   * - ``resume_session``
+     - ``false``
+     - Continue the named session: window 0 is conditioned on the stored last
+       frames (pinned clean, like a chained overlap) and only the ``num_frames``
+       new frames are delivered — a new prompt steers the same world.
+
+.. code-block:: bash
+
+   curl -sN http://localhost:8000/generate \
+     -F 'text=a drone flies over a coastal town at dawn' \
+     -F 'output_modalities=video' \
+     -F 'model_kwargs={"num_frames":241,"window_mode":"kv","window_frames":29,"context_frames":61,"stream_video":true}'
+
+The schedule is padded up to whole windows and the video trimmed back to
+``num_frames``; a seeded request is deterministic end to end (later windows draw
+their noise from the same generator). Windowed requests batch with each other
+and with plain requests at the same walk. ``gen_capture_video`` lists (height,
+width, frames) tiers whose denoise steps replay a per-step CUDA graph (one graph per
+latent shape, the clean/noisy frame layout carried as a mask input; plain t2v/i2v and
+``chained`` windows, never ``kv`` windows). It is empty by default: at 832x480 the
+graph, which captures the paged attention, measured 3-6% slower than the eager dense
+FA3 step for both the 121-frame clip and the 29-frame window, so it only pays for
+small, launch-bound tiers.
 
 Wan2.2 (``wan22``)
 ------------------

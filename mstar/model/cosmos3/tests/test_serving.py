@@ -691,16 +691,21 @@ def test_postprocess_finishes_captured_step() -> None:
         def step(velocity, t, latents, return_dict=False):
             return (latents + velocity,)
 
-    dit.request_state("r").add_all(gs=2.0, scheduler=_Sched())
+    # One all-noisy latent frame of 2x2 patches (the layout the captured
+    # graph's velocity mask is derived from).
+    dit.request_state("r").add_all(
+        gs=2.0, scheduler=_Sched(),
+        cond={"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])]},
+    )
     info = types.SimpleNamespace(graph_walk="image_gen")
-    lat, ti = torch.ones(1, 4), torch.tensor([1])
+    lat, ti = torch.ones(1, 1, 2, 2), torch.tensor([1])
     inp = ARNodeInputs(tensor_inputs={"latents": lat, "time_index": ti})
 
     # Captured shape: velocity = uncond + gs*(cond - uncond) = 3, latents += 3.
-    out = {"cond_v": [torch.full((1, 4), 2.0)], "uncond_v": [torch.ones(1, 4)]}
+    out = {"cond_v": [torch.full((1, 1, 2, 2), 2.0)], "uncond_v": [torch.ones(1, 1, 2, 2)]}
     dit.postprocess("r", info, out, inputs=inp)
     assert set(out) == {"latents", "time_index"}
-    assert torch.equal(out["latents"][0], torch.full((1, 4), 4.0))
+    assert torch.equal(out["latents"][0], torch.full((1, 1, 2, 2), 4.0))
     assert torch.equal(out["time_index"][0], torch.tensor([2]))
 
     # Eager shape (already finished) and non-gen walks stay untouched.
@@ -716,28 +721,19 @@ def test_postprocess_finishes_captured_step() -> None:
 def test_video_postprocess_uses_request_fps(tmp_path) -> None:
     """The mp4 container carries the request's fps (falling back to the model
     default), so playback runs at the requested rate without a mux-side retime."""
-    import subprocess
+    import io
 
-    import pytest as _pytest
+    import av
     import torch
 
     model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
     frames = torch.zeros(1, 3, 8, 32, 32, dtype=torch.uint8)
-    try:
-        data = model.postprocess(frames, "video", request_kwargs={"fps": 12})
-    except Exception as exc:  # noqa: BLE001 — encoder backend missing on this host
-        _pytest.skip(f"video encoder unavailable: {exc}")
-    out = tmp_path / "v.mp4"
-    out.write_bytes(data)
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0", str(out)],
-        capture_output=True, text=True, timeout=30, check=False,
-    )
-    if probe.returncode != 0:
-        _pytest.skip("ffprobe unavailable")
-    num, den = probe.stdout.strip().split("/")
-    assert abs(float(num) / float(den) - 12.0) < 1e-3
+    data = model.postprocess(frames, "video", request_kwargs={"fps": 12})
+    (tmp_path / "v.mp4").write_bytes(data)
+    with av.open(io.BytesIO(data)) as container:
+        stream = container.streams.video[0]
+        assert abs(float(stream.average_rate) - 12.0) < 1e-3
+        assert sum(1 for _ in container.decode(stream)) == 8
 
 
 if __name__ == "__main__":
