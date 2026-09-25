@@ -18,6 +18,7 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.utils import profiler
 
 logger = logging.getLogger(__name__)
 
@@ -521,8 +522,12 @@ class CudaGraphRunner:
             # same GPU addresses; replay writes real values into them.
             for key, value in list(static_inputs.items()):
                 if isinstance(value, torch.Tensor):
+                    seq_dim_override = (
+                        config.input_seq_dims.get(key) if config.input_seq_dims else None
+                    )
                     static_inputs[key] = self._intern_static_buffer(
-                        spec.config_idx, key, value, seq_len=spec.num_tokens,
+                        spec.config_idx, key, value,
+                        seq_len=spec.num_tokens, seq_dim_override=seq_dim_override,
                     )
             static_input_keys = tuple(
                 key for key, value in static_inputs.items()
@@ -611,7 +616,7 @@ class CudaGraphRunner:
 
     def _intern_static_buffer(
         self, config_idx: int, key: str, value: torch.Tensor,
-        seq_len: int | None = None,
+        seq_len: int | None = None, seq_dim_override: int | None = None,
     ) -> torch.Tensor:
         """Return a slice view into the shared buffer for (config_idx, key).
 
@@ -619,6 +624,10 @@ class CudaGraphRunner:
         largest-first) bucket's shape; smaller buckets reslice its leading dim.
         If ``seq_len`` is given, the seq dim is moved to the front for storage and
         back on return, so the captured forward sees the original layout.
+        ``seq_dim_override``, from the config's ``input_seq_dims``, is used
+        instead of `_seq_dim`'s size-based guess when a caller already knows
+        which dim varies with the bucket (`_seq_dim` can pick the wrong dim
+        when an unrelated axis happens to match ``seq_len``).
         """
         buf_key = (config_idx, key)
         if seq_len is None:
@@ -629,7 +638,10 @@ class CudaGraphRunner:
             # — and the buffer is shared, so its layout cannot vary anyway
             seq_dim = self._static_buffer_seq_dims[buf_key]
         else:
-            seq_dim = self._seq_dim(value, seq_len)
+            seq_dim = (
+                seq_dim_override if seq_dim_override is not None
+                else self._seq_dim(value, seq_len)
+            )
             self._static_buffer_seq_dims[buf_key] = seq_dim
         stored = value.movedim(seq_dim, 0) if seq_dim != 0 else value
         shared = self._shared_static_buffers.get(buf_key)
@@ -849,7 +861,13 @@ class CudaGraphRunner:
 
     def _replay(self, lease: SlotLease) -> dict:
         slot = self.slot_for(lease)
+        # The launch, not the GPU work: replay is async, so this range measures
+        # enqueue cost only. GPU-side duration comes from --cuda-graph-trace.
+        if self._enable_nvtx:
+            profiler.range_push(f"cg.replay.slot[{lease.slot}]")
         slot.graph.replay()
+        if self._enable_nvtx:
+            profiler.range_pop()
         return slot.static_outputs
 
     def run_forward(

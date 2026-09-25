@@ -15,7 +15,7 @@ from mstar.engine.resources.base import (
     PublishedInfo,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import fingerprint, page_key
 from mstar.engine.resources.kv.plan import (
@@ -288,7 +288,7 @@ class KVManager(AttentionResource):
 
     def __init__(
         self,
-        cfg: KVConfig,
+        cfg: PagedKVConfig,
         name: str,
         joint_comm_group: JointGroups | None,
         transfer_engine_info: TransferEngineInfo,

@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
-from mstar.engine.resources.kv.config import KVConfig
+from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.manager import PageArena
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
@@ -27,7 +27,7 @@ PAGE_SIZE = 16
 
 def _arena(max_num_pages: int = 16) -> PageArena:
     """A page arena over a CPU cache, with no manager above it."""
-    cfg = KVConfig(
+    cfg = PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
         max_num_pages=max_num_pages, page_size=PAGE_SIZE,
     )

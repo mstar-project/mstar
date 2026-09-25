@@ -536,6 +536,7 @@ class Worker:
 
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((body.request_id, node_name), None)
+        logger.info("Request cleanup complete: %s", body.request_id)
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
@@ -1356,7 +1357,12 @@ class Worker:
         from mstar.utils.profiler import range_pop, range_push
 
         engine = self.engine_manager.get_engine(batch.node_name)
-        logger.debug("Executing batch for node %s", node_batch.node_name)
+        logger.debug(
+            "Executing: %s graph_walk=%s %s",
+            node_batch.node_name,
+            batch.graph_walk,
+            node_batch.request_ids,
+        )
         if self.enable_nvtx:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)
@@ -1584,6 +1590,15 @@ class Worker:
     ) -> NameToTensorList:
         inputs = node.ready_next_iter.ready_inputs if check_next_iter \
             else node.ready_signals.ready_inputs
+        if check_next_iter:
+            # Carry over loop-external inputs sitting in ready_signals (see
+            # GraphNode.is_ready_for_speculation): they are re-injected
+            # unchanged every iteration and never land in ready_next_iter.
+            carried = {
+                name: edge for name, edge in node.ready_signals.ready_inputs.items()
+                if edge._persist_for_loop and name not in inputs
+            }
+            inputs = {**carried, **inputs}
         tensors = {}
         for input_name, edge in inputs.items():
             tensors[input_name] = [
@@ -1736,6 +1751,21 @@ class Worker:
             tp_seq=tp_seq,
         )
 
+    def _is_tearing_down(self, rid: str) -> bool:
+        """Removed, aborted or failed: no further speculative work for ``rid``.
+
+        A deferred drain only fires once the rid leaves ``_in_flight_rids``,
+        and a same-node speculation chain keeps it there every step, so a
+        drain the chain does not see would never fire and the rollout would
+        run to ``max_iters`` for a client that has gone.
+        """
+        return (
+            rid in self._pending_removes
+            or rid in self._pending_drains
+            or rid in self._draining_rids
+            or rid in self.scheduler.failed_rids
+        )
+
     def _try_speculate_next(
         self,
         pending: PendingBatch
@@ -1819,7 +1849,7 @@ class Worker:
             loop = wgio.loops.get(spec_node_info.loop_name)
 
             # check conditions where the rid cannot be furtuer speculated
-            already_removed = rid in self._pending_removes
+            already_removed = self._is_tearing_down(rid)
             already_stopped = spec_node_info.is_new_loop_iter and PendingLoopStop(
                 rid, graph_walk, spec_node_info.loop_name
             ) in self._pending_loop_stops

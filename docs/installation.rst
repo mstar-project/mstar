@@ -98,16 +98,23 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
      - V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``,
        ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
+   * - ``.[waypoint]``
+     - Index-hosted Waypoint dependencies: ``huggingface-hub``, ``safetensors``,
+       and ``tensordict`` for reference validation. The pinned TAEHV implementation
+       must be installed separately as shown below; keeping its direct URL out of
+       package metadata allows ``m-star`` to be published on PyPI. **Also needs**
+       ``flash-attn-4``, which is installed separately —
+       see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_.
    * - ``.[audio]``
      - ``soundfile`` — only needed to return **non-WAV** audio containers (mp3/flac/…)
        from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.
    * - ``.[dev]``
      - ``ruff`` + ``pytest`` for linting and the test suite.
    * - ``.[all]``
-     - The union of every model extra above — installs the full runtime for all model
-       families in one shot. Convenient for a machine that serves multiple models; heavier
-       and slower to install than a single family's extra. (Still excludes ``flash-attn`` —
-       see `flash-attn (Qwen3-Omni)`_.)
+     - The union of the index-hosted dependencies from every model extra above.
+       Convenient for a machine that serves multiple models; heavier and slower to
+       install than a single family's extra. It excludes the separately installed
+       TAEHV and ``flash-attn`` packages; see below and `flash-attn (Qwen3-Omni)`_.
 
 Combine extras as needed (keep ``--torch-backend=auto`` on every install):
 
@@ -115,11 +122,33 @@ Combine extras as needed (keep ``--torch-backend=auto`` on every install):
 
    uv pip install --torch-backend=auto -e ".[bagel,audio,dev]"
 
+Waypoint's dependencies and pinned TAEHV source are two installs. PyPI and other
+standards-conformant indices reject distributions whose metadata declares a direct-URL
+dependency, so the ``waypoint`` extra intentionally does not name TAEHV. Check the
+installer version before installing its source archive: an old pip may report success
+while producing an empty ``UNKNOWN`` wheel.
+
+.. code-block:: bash
+
+   uv --version                 # must be 0.4.0 or newer
+   uv pip install --torch-backend=auto -e ".[waypoint]"
+   uv pip install --no-deps \
+     "taehv @ https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip"
+
+Or, in an existing Python 3.12 environment:
+
+.. code-block:: bash
+
+   python -m pip install --upgrade "pip>=24.3"
+   python -m pip install -e ".[waypoint]"
+   python -m pip install --no-deps \
+     "taehv @ https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip"
+
 .. tip::
 
-   If you're just getting started or have the disk/time to spare, ``.[all]`` is the
-   recommended install — it pulls every model family's runtime so any model works out of
-   the box, with no need to track which extra goes with which model:
+   If you're just getting started or have the disk/time to spare, ``.[all]`` installs all
+   index-hosted model dependencies in one shot. Waypoint still needs the pinned TAEHV
+   command above, and Qwen3-Omni still needs ``flash-attn``:
 
    .. code-block:: bash
 
@@ -141,13 +170,15 @@ The GPU model families depend on:
   autoregressive backbones (every model with a ``KV_CACHE`` node runs attention through it).
 - **flash-attn** — used by Qwen3-Omni. **Not installed by any extra**; install it separately
   (see `flash-attn (Qwen3-Omni)`_).
+- **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
+  extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
 - **mooncake-transfer-engine** — RDMA tensor transport for multi-GPU, disaggregated
   deployments. Single-node deployments can use shared-memory (``SHM``) or ``TCP`` transport
   instead (see :doc:`serving`).
 
-Apart from ``flash-attn``, these are installed by the extras above. Your installed ``torch``
-must match your system CUDA toolkit — ``--torch-backend=auto`` handles that for you (next
-section).
+Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
+installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
+that for you (next section).
 
 omnivoice (OmniVoice)
 ---------------------
@@ -251,6 +282,40 @@ Three things to get right:
    uv pip install psutil
    FLASH_ATTN_CUDA_ARCHS="90" uv pip install flash-attn==2.8.3.post1 --no-build-isolation
    python -c "import flash_attn; print(flash_attn.__version__)"
+
+flash-attn-4 (Waypoint, FA3 sm90 kernel)
+----------------------------------------
+
+Waypoint's DiT attention runs torch flex-attention with the ``FLASH`` backend by
+default. That backend needs the **flash-attn-4** package, which provides
+``flash_attn.cute`` — the CuTe DSL rewrite of flash-attn; on H100 it runs the
+FA3-style sm90 kernel with TMA and warpgroup specialisation. It is **not on
+PyPI** as of 2026-09-17, and it is **not** pulled in by any extra.
+
+FLASH needs **torch 2.11 or newer**: older torch does not pass flash-attn-4 the
+block-sparse block size, and capture fails with ``Block sparse tensors ...
+require explicit sparse_block_size[0]``. Note this rules out the flash-attn
+prebuilt wheels above, which stop at ``torch2.10``.
+
+Install it from the upstream repo's ``flash_attn/cute`` subdirectory, pinned to
+the revision this was tested against (with ``nvidia-cutlass-dsl`` 4.7.1 and
+torch 2.12.1):
+
+.. code-block:: bash
+
+   git clone https://github.com/Dao-AILab/flash-attention
+   git -C flash-attention checkout 1bda8f9290cd48d030f1516f0e680cd464ef3554
+   uv pip install --torch-backend=auto ./flash-attention/flash_attn/cute
+
+This is pure Python plus ``nvidia-cutlass-dsl`` — there is no CUDA extension to
+build. Its kernels are JIT-compiled on first use, which adds roughly a minute to
+the first server startup.
+
+If ``flash-attn-4`` isn't importable or torch is older than 2.11, the server
+logs a warning and falls back to the previous Triton flex kernel. It is correct
+but slower — about 1.8x per attention call at 720p. Set
+``MSTAR_FLEX_BACKEND=TRITON`` to choose it explicitly, or
+``MSTAR_FLEX_BACKEND=FLASH`` to fail at startup instead of falling back.
 
 Matching your CUDA toolkit
 --------------------------

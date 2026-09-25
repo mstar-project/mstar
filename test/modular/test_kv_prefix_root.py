@@ -29,7 +29,7 @@ import torch
 from mstar.engine.engine import Engine
 from mstar.engine.resources import Resource
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.position.manager import RopeManager
@@ -102,7 +102,7 @@ def _kv(dtype=torch.float32, **overrides) -> KVManager:
     )
     cfg.update(overrides)
     return KVManager(
-        cfg=KVConfig(**cfg), name=KV, joint_comm_group=None,
+        cfg=PagedKVConfig(**cfg), name=KV, joint_comm_group=None,
         transfer_engine_info=None, device=torch.device("cpu"), dtype=dtype,
     )
 

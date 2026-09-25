@@ -12,12 +12,18 @@ import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # for type checkers / IDEs only — no runtime import cost
-    from mstar.client import AudioBuffer, GenerateResult, MStarClient  # noqa: F401
+    from mstar.client import (  # noqa: F401
+        AudioBuffer,
+        GenerateResult,
+        MStarClient,
+        VideoFrameChunk,
+    )
 
 _LAZY: dict[str, tuple[str, str]] = {
     "MStarClient": ("mstar.client", "MStarClient"),
     "GenerateResult": ("mstar.client", "GenerateResult"),
     "AudioBuffer": ("mstar.client", "AudioBuffer"),
+    "VideoFrameChunk": ("mstar.client", "VideoFrameChunk"),
 }
 
 __all__ = list(_LAZY)

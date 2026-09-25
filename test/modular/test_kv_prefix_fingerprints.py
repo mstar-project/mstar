@@ -20,7 +20,7 @@ import torch
 from mstar.engine.engine import checkpoint_identity
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig
+from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PosScheme
 from mstar.engine.resources.position.manager import RopeManager
@@ -55,7 +55,7 @@ def _kv(dtype=torch.float32, **overrides) -> KVManager:
     )
     cfg.update(overrides)
     return KVManager(
-        cfg=KVConfig(**cfg), name="kv", joint_comm_group=None,
+        cfg=PagedKVConfig(**cfg), name="kv", joint_comm_group=None,
         transfer_engine_info=None, device=torch.device("cpu"), dtype=dtype,
     )
 

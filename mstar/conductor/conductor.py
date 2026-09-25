@@ -317,6 +317,7 @@ class Conductor:
         )
         assert "max_seq_len" in self.model_config
         assert "node_groups" in self.model_config
+        model.validate_config_yaml(self.model_config, model_config_file)
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
         self.worker_graphs = {

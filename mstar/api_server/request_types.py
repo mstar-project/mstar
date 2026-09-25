@@ -11,7 +11,7 @@ from mstar.profile.worker import GraphTimings
 class ResultChunk:
     """One chunk of generated output for a request."""
     request_id: str
-    modality: str  # "text" | "image" | "audio" | "video"
+    modality: str  # "text" | "image" | "audio" | "video" | "video_frame"
     data: bytes  # raw payload (text encoded as utf-8)
     metadata: dict = field(default_factory=dict)
 

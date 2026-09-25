@@ -1,0 +1,28 @@
+model: "waypoint"
+
+model_kwargs:
+  variant: "waypoint-1.5-1b-720p"
+  reference_compat: true
+  compile_dit: true
+  cuda_graph: true
+  full_global_ring: false
+  # Rows per rollout step; must be <= resources.kv.num_sessions below.
+  step_batch_size: 1
+
+# The world state is a ring (not a paged KV cache); max_seq_len only satisfies the
+# conductor's config check and matches one frame's token count.
+max_seq_len: 512
+
+# Primary bound on the world pool; must be a positive int <= resources.kv.num_sessions.
+max_concurrent_requests: 1
+
+resources:
+  kv:
+    # ~816 MiB of ring per world at 720P. Raise together with
+    # max_concurrent_requests; the two are checked against each other.
+    num_sessions: 1
+
+# Single-GPU colocated: vae_encoder + dit on rank 0 (TAEHV decode is fused into the dit forward).
+node_groups:
+  - node_names: [vae_encoder, dit]
+    ranks: [0]

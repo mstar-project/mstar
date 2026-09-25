@@ -298,6 +298,16 @@ class Model(ABC):
             input_streams=input_streams,
         )
 
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        """Reject a deployment YAML this model cannot serve.
+
+        Called by the Conductor at startup with the parsed YAML. The model
+        sees only ``model_kwargs`` in ``__init__``, so checks on other keys
+        (``max_concurrent_requests``, ``resources``, ...) belong here. Raise
+        ``ValueError`` naming the key; ``config_path`` is for the message.
+        """
+        return
+
     def get_worker_graphs(self, config_path: str) -> list[WorkerGraph]:
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
@@ -526,7 +536,7 @@ class Model(ABC):
     def postprocess(
         self,
         output: torch.Tensor,
-        modality: str,  # text | image | video | audio
+        modality: str,  # text | image | video | video_frame | audio
         request_kwargs: dict | None = None,
     ) -> bytes:
         """
@@ -592,6 +602,23 @@ class Model(ABC):
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for
         audio. Mono default (the speech models); stereo models override."""
         return 1
+
+    def get_output_frame_rate(
+        self,
+        modality: str = "video_frame",
+        request_kwargs: dict | None = None,
+    ) -> float:
+        """Frame rate for raw RGB ``video_frame`` output.
+
+        Raw frames have no container header from which a client could recover
+        timing, so models that expose this modality must override this hook.
+        ``request_kwargs`` permits a future model with a per-request frame rate;
+        Waypoint's checkpoint uses a fixed rate.
+        """
+        del request_kwargs
+        raise ValueError(
+            f"{type(self).__name__} does not define a frame rate for {modality!r} output"
+        )
 
     # ------------------------------------------------------------------
     # Partition API (optional, backward-compatible defaults)

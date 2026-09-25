@@ -22,9 +22,9 @@ from mstar.engine.resources import (
     AttentionSpec,
     AttentionStep,
     AttnBackend,
-    KVConfig,
     KVSpec,
     KVStep,
+    PagedKVConfig,
     Segment,
     SlotLease,
     StepContext,
@@ -44,8 +44,8 @@ HEAD_DIM = 3
 MAX_PAGES = 8
 
 
-def _kv_config() -> KVConfig:
-    return KVConfig(
+def _kv_config() -> PagedKVConfig:
+    return PagedKVConfig(
         num_layers=1,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,

@@ -19,7 +19,7 @@ import torch
 
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
-from mstar.engine.resources.kv.config import KVConfig
+from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import (
     KVPlanOutput,
     KVPlanOutputs,
@@ -42,7 +42,7 @@ SHARED = 6  # pages every row names: ROWS * SHARED is past the pool
 def _manager(max_seq_len: int = 4096) -> FlashInferManager:
     return FlashInferManager(
         kv_cache=KV, device=torch.device("cuda"), dtype=torch.bfloat16,
-        kv_config=KVConfig(
+        kv_config=PagedKVConfig(
             num_layers=1, num_kv_heads=2, head_dim=128, num_qo_heads=2,
             max_seq_len=max_seq_len, max_num_pages=POOL, page_size=PAGE_SIZE,
         ),

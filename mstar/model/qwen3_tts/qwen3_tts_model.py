@@ -41,9 +41,9 @@ from mstar.conductor.request_info import (
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     ResourceReqConfig,
@@ -241,7 +241,7 @@ class Qwen3TTSModel(Model):
         Talker submodule owns it (overwritten every step)."""
         talker = self.config.talker
         cp = talker.code_predictor
-        talker_kv = KVConfig(
+        talker_kv = PagedKVConfig(
             num_layers=talker.num_hidden_layers,
             num_kv_heads=talker.num_key_value_heads,
             head_dim=talker.head_dim,

@@ -40,6 +40,7 @@ def _worker(
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid: w.cleared.append(rid),  # noqa: PLW0108
         fail_rids=lambda rids: w.failed.update(rids),  # noqa: PLW0108
+        failed_rids=w.failed,
         pending_tp_follow_count=dict.fromkeys(tp_follow, 1),
     )
     w.worker_graphs_manager = SimpleNamespace(
@@ -116,6 +117,27 @@ def test_drain_deferred_behind_inflight_gpu_step():
     assert "X" in w._draining_rids and len(_reads_done(w)) == 1
 
 
+def test_speculation_stops_for_a_rid_being_torn_down():
+    """A same-node speculation chain keeps its rids in flight every step, so a
+    drain deferred behind it only fires once the chain lets the rid go."""
+    w = _worker(known_rids=("X", "Y"), in_flight=("X", "Y"))
+    assert not w._is_tearing_down("X")
+
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert "X" in w._pending_drains
+    assert w._is_tearing_down("X")
+    assert not w._is_tearing_down("Y")
+
+    w._pending_drains.clear()
+    w._in_flight_rids.clear()
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert "X" in w._draining_rids and "X" in w.scheduler.failed_rids
+    assert w._is_tearing_down("X")
+
+    w._pending_removes.add("Y")
+    assert w._is_tearing_down("Y")
+
+
 def test_follower_ignores_conductor_drain():
     w = _worker(is_follower=True)
     Worker._drain_request(w, DrainRequest(request_id="X"))  # source=CONDUCTOR
@@ -180,6 +202,7 @@ def _preprocess(inflight_reads=False):
     wt.tensor_uuid_to_metadata_per_request = {}
     wt.request_model_kwargs = {}
     wt.in_flight_requests = set()
+    wt.request_output_state = {}
     return wt
 
 
@@ -239,12 +262,19 @@ def test_preprocess_finished_reading_gates_ack_when_not_drained():
 
 
 def test_preprocess_hard_cleanup_force_drops_and_clears():
+    from mstar.api_server.data_worker import RequestOutputState
+
     wt = _preprocess()
     wt._draining_rids.add("X")
     wt._reads_done_sent.add("X")
     wt.tensor_uuid_to_metadata_per_request["X"] = {"u": {}}
     wt.request_model_kwargs["X"] = {}
     wt.in_flight_requests.add("X")
+    # the completed-request path ends here, so the output-order state must go too
+    wt.request_output_state["X"] = RequestOutputState(
+        order={"u": (0, None)}, next_sequence=2, next_emit=1,
+        pending={1: object()}, frame_index=8,
+    )
 
     wt._hard_cleanup("X")
     assert wt.forced == ["X"]
@@ -253,3 +283,4 @@ def test_preprocess_hard_cleanup_force_drops_and_clears():
     assert "X" not in wt.tensor_uuid_to_metadata_per_request
     assert "X" not in wt.request_model_kwargs
     assert "X" not in wt.in_flight_requests
+    assert "X" not in wt.request_output_state

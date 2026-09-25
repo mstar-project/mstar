@@ -30,13 +30,23 @@ from mstar.model.multimodal import PromptPart
 from mstar.model.registry import HF_MODELS
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
+from mstar.utils import profiler
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODALITIES = frozenset({"text", "image", "audio", "video", "action", "scalar", "tensor"})
+SUPPORTED_MODALITIES = frozenset({
+    "text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor",
+})
+STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
+
+NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
+# Opt-in framing for raw binary payloads, requested via ``Accept``. Duplicated
+# rather than shared with ``mstar.client.media`` so the SDK keeps its stdlib-only
+# import contract; ``test_binary_framing.py`` asserts the two stay equal.
+BINARY_STREAM_MEDIA_TYPE = "application/vnd.mstar.frames"
 
 # Extension-based modality detection for uploaded files.
 _EXT_TO_MODALITY: dict[str, str] = {}
@@ -125,6 +135,10 @@ def _conductor_process_target(
     )
     try:
         conductor.run()
+    except KeyboardInterrupt:
+        # The API parent uses SIGINT for a graceful child shutdown. Treat that
+        # as the normal stop signal after allowing the conductor to unwind.
+        pass
     finally:
         conductor.shutdown()
 
@@ -171,6 +185,35 @@ class PendingRequest:
     error_status: int = 500
 
 
+def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
+    """Serialize one result chunk as an NDJSON line."""
+    return json.dumps({
+        "modality": chunk.modality,
+        "data": base64.b64encode(chunk.data).decode("ascii"),
+        "metadata": chunk.metadata,
+    }) + "\n"
+
+
+def _chunk_to_binary_frame(chunk: ResultChunk) -> tuple[bytes, bytes]:
+    """Serialize one result chunk as a header line plus its untouched payload.
+
+    ``nbytes`` lets the reader frame by length instead of by delimiter, and no
+    delimiter means no escaping — which is the only reason the NDJSON form has
+    to base64 the payload. A 720p video_frame chunk costs two full passes over
+    ~14.7 MB in that form (base64, then ``json.dumps`` escape-scanning every
+    character it just produced); here the payload is handed on by reference.
+
+    ``json.dumps`` escapes control characters, so the header can never contain
+    a raw newline and the reader's line split is always unambiguous.
+    """
+    header = json.dumps({
+        "modality": chunk.modality,
+        "nbytes": len(chunk.data),
+        "metadata": chunk.metadata,
+    }, separators=(",", ":"))
+    return header.encode("utf-8") + b"\n", chunk.data
+
+
 class DeadConductorError(RuntimeError):
     """The conductor process exited before the workers finished setup (it
     exits when a worker dies during init), so the server must not bind."""
@@ -191,11 +234,18 @@ class APIServer:
         model_name: str = "dummy",
         log_stats: bool = False,
         log_stats_file: str | None = None,
+        enable_nvtx: bool = False,
         model_config: dict | None = None,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_seconds = timeout_seconds
+
+        # The result-delivery path runs on this process, not the worker's, so its
+        # cost is invisible to worker-side markers. Streaming a 720p chunk means
+        # base64-encoding 11 MiB into 14.7 MiB of ASCII and copying that again
+        # through json.dumps, once per engine step.
+        self.enable_nvtx = enable_nvtx
 
         # Per-request profiling: when enabled, a RequestProfile is collected for
         # each request and pretty-printed when the request finishes. ``log_stats_file``
@@ -217,7 +267,8 @@ class APIServer:
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
-            enable_prof=self.log_stats
+            enable_prof=self.log_stats,
+            enable_nvtx=enable_nvtx,
         )
 
         # Concurrent request tracking
@@ -356,6 +407,15 @@ class APIServer:
         for m in input_modalities + output_modalities:
             if m not in SUPPORTED_MODALITIES:
                 raise ValueError(f"Unsupported modality: {m!r}")
+        if "video_frame" in input_modalities:
+            raise ValueError("'video_frame' is an output-only modality")
+        streaming_only = STREAMING_ONLY_MODALITIES.intersection(output_modalities)
+        if streaming_only and not streaming:
+            names = ", ".join(sorted(streaming_only))
+            raise ValueError(
+                f"Output modality {names} requires streaming=True; raw frame "
+                "chunks cannot be returned as an aggregated response."
+            )
 
         # Register pending request
         with self.request_lock:
@@ -634,6 +694,8 @@ class APIServer:
                         done = True
 
                 for chunk in new_chunks:
+                    if self.enable_nvtx:
+                        profiler.mark("apiserver.chunk_available")
                     yield chunk
 
                 if done:
@@ -671,18 +733,76 @@ class APIServer:
             if not finished:
                 self.abort_request(request_id)
 
-    async def async_stream_results(self, request_id: str):
-        """Yield NDJSON lines as result chunks arrive (``/generate`` format)."""
-        async for chunk in self.iter_result_chunks(request_id):
-            yield self._chunk_to_ndjson(chunk)
+    def async_stream_results(self, request_id: str, binary: bool = False):
+        """Yield the serialized body of ``/generate`` one piece at a time.
 
-    @staticmethod
-    def _chunk_to_ndjson(chunk: ResultChunk) -> str:
-        return json.dumps({
+        ``binary`` selects the length-framed form negotiated through ``Accept``.
+        The default stays NDJSON, so a client that did not negotiate — including
+        the Rust frontend, which never reads ``Accept`` — sees today's bytes.
+
+        Deliberately a plain ``def`` returning the chosen async generator rather
+        than an ``async def`` delegating to it: the branch is per-request, not
+        per-chunk, and this keeps both bodies flat.
+        """
+        if binary:
+            return self._stream_binary(request_id)
+        return self._stream_ndjson(request_id)
+
+    async def _stream_ndjson(self, request_id: str):
+        async for chunk in self.iter_result_chunks(request_id):
+            line = self._chunk_to_ndjson(chunk)
+            if not self.enable_nvtx:
+                yield line
+                continue
+            profiler.mark(f"apiserver.yield_line.bytes[{len(line)}]")
+            # Spans the handoff to Starlette/uvicorn: chunked-transfer framing
+            # and the socket writes for ~14.7 MB, plus any transport
+            # backpressure. The generator resumes only once that is done, so
+            # this range is the server's share of the client's blocking read.
+            profiler.range_push(f"apiserver.socket_write.bytes[{len(line)}]")
+            try:
+                yield line
+            finally:
+                profiler.range_pop()
+
+    async def _stream_binary(self, request_id: str):
+        async for chunk in self.iter_result_chunks(request_id):
+            header, payload = _chunk_to_binary_frame(chunk)
+            # Two yields rather than one concatenation: joining them would copy
+            # the whole payload to prepend ~100 bytes, which is the class of
+            # work this framing exists to remove.
+            yield header
+            if not self.enable_nvtx:
+                yield payload
+                continue
+            profiler.mark(f"apiserver.yield_frame.bytes[{len(payload)}]")
+            # Same range name as the NDJSON path on purpose: it is the column
+            # the gap budget in STREAMING_GAP_BUDGET.md is built from, so the
+            # two protocols stay directly comparable in one analyzer run.
+            profiler.range_push(f"apiserver.socket_write.bytes[{len(payload)}]")
+            try:
+                yield payload
+            finally:
+                profiler.range_pop()
+
+    def _chunk_to_ndjson(self, chunk: ResultChunk) -> str:
+        if not self.enable_nvtx:
+            return _chunk_to_ndjson_payload(chunk)
+
+        # Split rather than wrapped as one range: the question these markers
+        # answer is which of the two full passes over the payload dominates.
+        profiler.range_push(f"apiserver.b64encode.bytes[{len(chunk.data)}]")
+        encoded = base64.b64encode(chunk.data).decode("ascii")
+        profiler.range_pop()
+
+        profiler.range_push(f"apiserver.json_dumps.chars[{len(encoded)}]")
+        line = json.dumps({
             "modality": chunk.modality,
-            "data": base64.b64encode(chunk.data).decode("ascii"),
+            "data": encoded,
             "metadata": chunk.metadata,
         }) + "\n"
+        profiler.range_pop()
+        return line
 
     # ----------------------------------------------------------
     # Non-streaming helper
@@ -837,6 +957,16 @@ async def generate(
         raise HTTPException(status_code=503, detail="Server not ready")
 
     out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
+    streaming_only = STREAMING_ONLY_MODALITIES.intersection(out_mods)
+    if streaming_only and not streaming:
+        names = ", ".join(sorted(streaming_only))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Output modality {names} requires streaming=true; raw frame "
+                "chunks cannot be returned as an aggregated response."
+            ),
+        )
 
     # --- save uploaded files, grouped by modality ----------------
     file_paths: dict[str, list[str]] = {}
@@ -880,6 +1010,12 @@ async def generate(
     else:
         in_mods = [p.modality for p in parts]
 
+    if "video_frame" in in_mods:
+        raise HTTPException(
+            status_code=400,
+            detail="'video_frame' is an output-only modality",
+        )
+
     try:
         parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
     except json.JSONDecodeError as e:
@@ -907,10 +1043,14 @@ async def generate(
         )
 
         if streaming:
+            # Substring match, not RFC 7231 q-value parsing: the value is a
+            # private vendor type that appears in no other media range, and a
+            # client that does not ask for it keeps the historical NDJSON body.
+            binary = BINARY_STREAM_MEDIA_TYPE in request.headers.get("accept", "")
             return StreamingResponse(
-                api_server.async_stream_results(request_id),
-                media_type="application/x-ndjson",
-                headers={"Cache-Control": "no-cache"},
+                api_server.async_stream_results(request_id, binary=binary),
+                media_type=BINARY_STREAM_MEDIA_TYPE if binary else NDJSON_STREAM_MEDIA_TYPE,
+                headers={"Cache-Control": "no-cache", "Vary": "Accept"},
             )
 
         chunks = await api_server.collect_results(request_id, request)
@@ -1068,6 +1208,7 @@ def main(argv: list[str] | None = None):
         tcp_transfer_device=args.tcp_transfer_device,
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
+        enable_nvtx=args.enable_nvtx,
     )
 
     # Spawn conductor in a separate process

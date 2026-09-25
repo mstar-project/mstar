@@ -198,6 +198,21 @@ wan22 = [
     "av",
 ]
 
+waypoint = [
+    # mp4 encode for benchmark_streaming.py --save-videos.
+    "av",
+    "huggingface-hub",
+    "safetensors",
+    # TAEHV is installed separately at a pinned revision. PyPI rejects project
+    # metadata containing direct-URL dependencies; see docs/installation.rst.
+    # Only the reference needs this: world_engine passes pos_ids as a TensorDict,
+    # so the parity tests import it. Serving does not — components/dit.py uses a
+    # NamedTuple to keep tensordict out of the serving path.
+    "tensordict==0.10.0",
+    # flash-attn-4 (flash_attn.cute, the default flex attention backend) is not
+    # on PyPI; install it separately, see docs/installation.rst.
+]
+
 vjepa2_ac = [
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
@@ -245,7 +260,12 @@ all = [
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
     # wan22 (see the [wan22] extra for the rationale; av / diffusers already above)
     "accelerate",
+    # waypoint. TAEHV is intentionally installed separately because PyPI rejects
+    # direct-URL dependencies in project metadata; see docs/installation.rst.
+    "tensordict==0.10.0",
     # flash-attn is intentionally omitted (Qwen3-Omni needs it) — install it
+    # separately, see docs/installation.rst.
+    # flash-attn-4 (waypoint's default flex attention backend) is also installed
     # separately, see docs/installation.rst.
     "jiwer",
     # omnivoice is intentionally omitted for the same reason as flash-attn: it
