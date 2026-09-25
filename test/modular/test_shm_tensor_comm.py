@@ -1,6 +1,7 @@
 """Unit tests for SharedMemoryCommunicationManager and tensor serialization."""
 
 import errno
+import logging
 import os
 import shutil
 import tempfile
@@ -258,6 +259,14 @@ def test_a_failed_send_leaves_nothing_in_the_shm_dir(monkeypatch):
         path = mgr._shm_path(mgr.my_entity_id, info.uuid)
         assert full_dir.partial[path] > 0, "the write must fail part way, as a filling tmpfs does"
         assert not os.path.lexists(path), "a partial file no cleanup tracks would hold the space for good"
+
+
+def test_a_small_shm_dir_warns_at_boot(monkeypatch, caplog):
+    # 64 MiB, Docker's default
+    monkeypatch.setattr(os, "statvfs", lambda path: SimpleNamespace(f_frsize=4096, f_blocks=16384))
+    with tempfile.TemporaryDirectory() as tmpdir, caplog.at_level(logging.WARNING):
+        _make_manager(tmpdir)
+    assert "--shm-size" in caplog.text, "a small /dev/shm would show only as the first large send failing"
 
 
 def test_local_tensor_skips_shm():
