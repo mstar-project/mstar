@@ -35,6 +35,18 @@ def _worker(
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
     w._pending_removes = set()
+    # Identity interning: these tests use the rid string as its own handle, so
+    # the string/handle split is exercised without a real runtime.
+    w._graph_runtime = SimpleNamespace(
+        get_rid_handle=lambda r: r if r in known_rids else None,
+        get_rid_string=lambda h: h,
+        remove_request=lambda h: None,
+        # The TP fan-out reads the sharding config off the runtime now; no
+        # groups means no followers, which is what these tests assume.
+        get_sharding_config=lambda r: (
+            SimpleNamespace(groups=[]) if r in known_rids else None
+        ),
+    )
     w._last_active = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
@@ -42,7 +54,7 @@ def _worker(
         fail_rids=lambda rids: w.failed.update(rids),  # noqa: PLW0108
         pending_tp_follow_count=dict.fromkeys(tp_follow, 1),
     )
-    w.worker_graphs_manager = SimpleNamespace(
+    w.request_state = SimpleNamespace(
         per_request_info={
             rid: SimpleNamespace(sharding_config=SimpleNamespace(groups=[]))
             for rid in known_rids

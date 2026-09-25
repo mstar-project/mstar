@@ -25,8 +25,8 @@ class _RecordingTensorManager:
     def __init__(self):
         self.read_started = []
 
-    def start_read_tensors(self, request_id, graph_edges, graph_walk=None):
-        self.read_started.append(request_id)
+    def start_read_tensors(self, rid, graph_edges, graph_walk=None):
+        self.read_started.append(rid)
         return []
 
     def get_ready_tensors(self):
@@ -35,16 +35,16 @@ class _RecordingTensorManager:
     def cleanup_request(self, request_id):
         pass
 
-    def store_and_return_tensor_info(self, request_id, tensors):
+    def store_and_return_tensor_info(self, rid, tensors):
         return {}
 
-    def register_for_send(self, request_id, tensor_infos):
+    def register_for_send(self, rid, tensor_infos):
         pass
 
     def set_persist(self, request_id, uuid, persist):
         pass
 
-    def ack_unread_tensors(self, request_id, graph_edges):
+    def ack_unread_tensors(self, rid, graph_edges):
         pass
 
 

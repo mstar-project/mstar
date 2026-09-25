@@ -2,8 +2,21 @@ from mstar.graph.base import *
 from mstar.graph.loop_indices import NestedLoopIndices  # re-exported for backward compat
 
 
-def format_graph_edge_list(lst: list[GraphEdge]) -> str:
-    return ", ".join([f"{edge.name} -> {edge.next_node}" for edge in lst])
+class _LazyEdgeList:
+    """Formats on ``__str__``, not on construction."""
+    __slots__ = ("_lst",)
+
+    def __init__(self, lst: list[GraphEdge]):
+        self._lst = lst
+
+    def __str__(self) -> str:
+        return ", ".join([f"{edge.name} -> {edge.next_node}" for edge in self._lst])
+
+
+def format_graph_edge_list(lst: list[GraphEdge]) -> _LazyEdgeList:
+    """For logger args only — the join happens iff the record is emitted.
+    Every call site is on a per-request path where DEBUG is off."""
+    return _LazyEdgeList(lst)
 
 
 
@@ -16,7 +29,7 @@ class WorkerGraphIO:
     """
     def __init__(
         self, graph: GraphSection,
-        wg_id: str | None=None
+        wg_id: int | None=None
     ):
         self.nodes = graph.get_nodes()
         self.loops = graph.get_loops()
@@ -166,14 +179,14 @@ class WorkerGraphIO:
     def clear(self):
         self.wg_state_registry.clear()
 
-    def register_communication_info(self, communication_manager, request_id: str):
+    def register_communication_info(self, communication_manager, rid: int):
         for loop in self.loops.values():
             loop.register_communication_info(
-                communication_manager, request_id
+                communication_manager, rid
             )
         for node in self.nodes.values():
             node.register_communication_info(
-                communication_manager, request_id
+                communication_manager, rid
             )
 
     def get_loop_indices(self):

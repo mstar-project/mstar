@@ -267,7 +267,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
         **kwargs
     ) -> ARNodeInputs:
         tokens = inputs["new_token"][0].flatten()
-        self._orig_seq_len[fwd_info.request_id] = tokens.shape[0]
+        self._orig_seq_len[fwd_info.rid_handle] = tokens.shape[0]
         return ARNodeInputs(
             input_ids=self._tokens_to_codes(tokens),
             input_seq_len=tokens.shape[0]

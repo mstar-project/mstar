@@ -8,7 +8,9 @@
 //! Build: `maturin develop --release` in rust/.
 
 pub mod communicator;
+pub mod graph;
 pub mod shm;
+pub mod tensors;
 
 use std::os::raw::{c_int, c_void};
 use std::time::Duration;
@@ -25,8 +27,18 @@ use shm::{SegmentedShmArena, ShmArena};
 /// peers, and wakeup-fd polling (an eventfd wakes `recv_or_wake` instantly).
 /// Encoding is the caller's (pickle today; msgpack by swapping the codec).
 #[pyclass(name = "ZmqCommunicator")]
-struct PyZmqCommunicator {
-    inner: RawZmqCommunicator,
+pub struct PyZmqCommunicator {
+    /// Behind an Arc so the graph runtime can hold a share of the SAME
+    /// transport and send from Rust, rather than hopping back into Python for
+    /// every frame. No extra lock: RawZmqCommunicator::send takes &self and
+    /// guards its own sockets.
+    inner: std::sync::Arc<RawZmqCommunicator>,
+}
+
+impl PyZmqCommunicator {
+    pub fn share(&self) -> std::sync::Arc<RawZmqCommunicator> {
+        self.inner.clone()
+    }
 }
 
 #[pymethods]
@@ -35,8 +47,10 @@ impl PyZmqCommunicator {
     #[new]
     fn new(my_id: &str, dir: &str) -> PyResult<Self> {
         Ok(Self {
-            inner: RawZmqCommunicator::bind(my_id, dir)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            inner: std::sync::Arc::new(
+                RawZmqCommunicator::bind(my_id, dir)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            ),
         })
     }
 
@@ -44,8 +58,10 @@ impl PyZmqCommunicator {
     #[staticmethod]
     fn bind_endpoint(my_id: &str, endpoint: &str) -> PyResult<Self> {
         Ok(Self {
-            inner: RawZmqCommunicator::bind_endpoint(my_id, endpoint)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            inner: std::sync::Arc::new(
+                RawZmqCommunicator::bind_endpoint(my_id, endpoint)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            ),
         })
     }
 
@@ -304,5 +320,12 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyShmArena>()?;
     m.add_class::<PyShmSegment>()?;
     m.add_class::<PySegmentedShmArena>()?;
+    m.add_class::<crate::graph::runtime::GraphRuntime>()?;
+    m.add_class::<crate::graph::runtime::PopRidsOut>()?;
+    m.add_class::<crate::graph::runtime::SpecPrepOut>()?;
+    m.add_class::<crate::graph::runtime::RouteOut>()?;
+    m.add_class::<crate::graph::runtime::SendPlan>()?;
+    m.add_class::<crate::tensors::TensorBookkeeping>()?;
+    m.add_class::<crate::tensors::TensorInfoOut>()?;
     Ok(())
 }

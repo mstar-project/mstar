@@ -414,7 +414,7 @@ class Wan22DitSubmodule(_SingleRequestMixin, _Fp32IslandMixin, NodeSubmodule):
                 logger.info(
                     "Wan2.2 dit: skipping async-overshoot iteration %d "
                     "(request %s runs %d steps)",
-                    k, fwd_info.request_id, num_steps,
+                    k, fwd_info.rid_handle, num_steps,
                 )
                 return None
             tensor_inputs["latents"] = inputs["latents"][0]

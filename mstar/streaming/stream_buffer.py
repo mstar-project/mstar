@@ -27,7 +27,7 @@ class StreamBuffer:
     For sliding-window policies the buffer keeps old items so that
     pop_chunk can return the full window while only advancing by stride.
     """
-    request_id: str
+    rid: int  # worker-local handle; this buffer never leaves the process
     edge_name: str
     from_partition: str
     policy: ChunkPolicy

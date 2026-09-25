@@ -16,6 +16,7 @@ from mstar.communication.tensors import (
     create_tensor_communication_manager,
 )
 from mstar.graph.base import GraphEdge
+from mstar.utils.containers import ParallelList
 
 
 class _NullCommunicator:
@@ -61,7 +62,7 @@ def test_producer_to_consumer_roundtrip(tmp_path):
     cons.start_read_tensors("r1", edges)
     for name, originals in tensors.items():
         for original, info in zip(originals, infos[name], strict=True):
-            got = cons.tensor_store.get_tensor("r1", info.uuid)
+            got = cons.tensor_store.get_tensor(info.uuid)
             assert torch.equal(got, original), name
 
 
@@ -72,7 +73,7 @@ def test_reclaim_frees_arena_slots(tmp_path):
     (info,) = infos["x"]
     prod.register_for_send("r2", [info])
     assert prod._arena_locs
-    prod._cleanup_by_uuid("r2", info.uuid)
+    prod._cleanup_by_uuid(info.uuid)
     assert not prod._arena_locs
 
 
@@ -109,12 +110,12 @@ def test_arena_grows_then_spills(tmp_path):
                          tensor_info=more["more"])
         cons.start_read_tensors("r3", [edge])
         for val, info in zip(vals, more["more"], strict=True):
-            got = cons.tensor_store.get_tensor("r3", info.uuid)
+            got = cons.tensor_store.get_tensor(info.uuid)
             assert torch.equal(got, val)
         # Reclaim unlinks the spilled files.
         for info in spilled:
             path = prod._shm_files[info.uuid]
-            prod._cleanup_by_uuid("r3", info.uuid)
+            prod._cleanup_by_uuid(info.uuid)
             assert not os.path.exists(path)
     finally:
         del os.environ["MSTAR_SHM_ARENA_SPILL_AFTER_S"]
@@ -138,7 +139,7 @@ def test_mixed_edge_and_fragmentation_signature(tmp_path, caplog):
         # ...then free ALTERNATE allocations: ~1.2 MB total free, but no
         # contiguous block larger than ~300 KB.
         for info in fill["fill"][::2]:
-            prod._cleanup_by_uuid("r6", info.uuid)
+            prod._cleanup_by_uuid(info.uuid)
         st = prod.stats_summary()
         assert st["free_bytes"] > 500_000 > st["largest_free_block"]
 
@@ -163,9 +164,9 @@ def test_mixed_edge_and_fragmentation_signature(tmp_path, caplog):
                          tensor_info=mixed["mixed"])
         cons.start_read_tensors("r6", [edge])
         assert torch.equal(
-            cons.tensor_store.get_tensor("r6", s_info.uuid), small)
+            cons.tensor_store.get_tensor(s_info.uuid), small)
         assert torch.equal(
-            cons.tensor_store.get_tensor("r6", b_info.uuid), big)
+            cons.tensor_store.get_tensor(b_info.uuid), big)
     finally:
         del os.environ["MSTAR_SHM_ARENA_SPILL_AFTER_S"]
 
@@ -219,7 +220,7 @@ def test_transport_mismatch_fails_loudly(tmp_path):
     file_prod.register_for_send("rm2", [infos["y"][0]])
     edge = GraphEdge(next_node="B", name="y", tensor_info=infos["y"])
     arena_cons.start_read_tensors("rm2", [edge])
-    got = arena_cons.tensor_store.get_tensor("rm2", infos["y"][0].uuid)
+    got = arena_cons.tensor_store.get_tensor(infos["y"][0].uuid)
     assert torch.equal(got, y)
 
 
@@ -254,7 +255,7 @@ def test_instance_unique_names_no_collision(tmp_path):
     edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
     cons.start_read_tensors("r", [edge])
     assert torch.equal(
-        cons.tensor_store.get_tensor("r", infos["x"][0].uuid), x)
+        cons.tensor_store.get_tensor(infos["x"][0].uuid), x)
 
 
 def test_orphan_sweep(tmp_path):
@@ -294,7 +295,7 @@ def test_dead_peer_segments_evicted(tmp_path):
     assert seg in cons._peer_segments
     cons.pending.clear()               # no in-flight reads
     # Producer goes away gracefully: Drop unlinks its segments.
-    prod._cleanup_by_uuid("re", infos["x"][0].uuid)
+    prod._cleanup_by_uuid(infos["x"][0].uuid)
     del prod
     import gc
 
@@ -362,3 +363,84 @@ KEEP_ALIVE = m   # global reference survives to interpreter exit
     seg_path = out.stdout.strip().splitlines()[-1]
     assert seg_path.startswith("/dev/shm/mstar_arena_exitcase_")
     assert not os.path.exists(seg_path), "segment survived interpreter exit"
+
+
+def test_register_for_send_batch_matches_the_per_request_loop(tmp_path):
+    """The arena overrides the batched form to sync its D2H stream once instead
+    of once per request. That override must stage exactly what B separate
+    register_for_send calls would."""
+    looped = _manager("w0", tmp_path)
+    batched = _manager("w1", tmp_path)
+    cons = _manager("w2", tmp_path)
+
+    def _stage(mgr, use_batch):
+        per_request = {}
+        for rid in (10, 11, 12):
+            infos = mgr.store_and_return_tensor_info(
+                rid, {"h": [torch.randn(4, 8)], "e": [torch.empty(0, 3)]},
+            )
+            per_request[rid] = [i for il in infos.values() for i in il]
+        if use_batch:
+            mgr.register_for_send_batch(
+                ParallelList(list(per_request), list(per_request.values()))
+            )
+        else:
+            for rid, infos in per_request.items():
+                mgr.register_for_send(rid, infos)
+        return per_request
+
+    torch.manual_seed(0)
+    loop_out = _stage(looped, use_batch=False)
+    torch.manual_seed(0)
+    batch_out = _stage(batched, use_batch=True)
+
+    for rid in loop_out:
+        for a, b in zip(loop_out[rid], batch_out[rid], strict=True):
+            # Staged into the arena (not spilled) in both, at the same offset.
+            assert (a.shm_segment is None) == (b.shm_segment is None)
+            assert a.shm_offset == b.shm_offset
+            assert a.dims == b.dims and a.nbytes == b.nbytes
+            assert looped.tensor_store.is_registered(a.uuid)
+            assert batched.tensor_store.is_registered(b.uuid)
+
+    # And the bytes actually survive a read by a third party.
+    edges = [GraphEdge(name="h", next_node="n", tensor_info=[batch_out[10][0]])]
+    cons.start_read_tensors(10, edges)
+    assert torch.equal(
+        cons.tensor_store.get_tensor(batch_out[10][0].uuid),
+        batched.tensor_store.get_tensor(batch_out[10][0].uuid),
+    )
+
+
+# --- the stamp has to reach the STORE, not just the caller's object ---------
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("batched", [False, True])
+def test_the_arena_location_is_readable_back_out_of_the_store(
+    tmp_path, monkeypatch, backend, batched
+):
+    """Staging stamps ``shm_segment`` in place; the store has to see it.
+
+    The wire descriptor is rebuilt from the store by uuid (RouteOutput carries
+    indices, not objects), so a stamp that only lands on the caller's object
+    ships ``shm_segment=None`` -- which a consumer reads as "spilled to a file"
+    and goes looking for a file nobody wrote. The Python bookkeeper hides this
+    by keeping the caller's object; the Rust one copies it in.
+    """
+    monkeypatch.setenv("MSTAR_RUST_GRAPH", "1" if backend == "rust" else "0")
+    prod = _manager(f"wb_{backend}_{int(batched)}", tmp_path)
+    assert (type(prod.tensor_store.bookkeeping).__name__
+            == ("RustTensorBookkeeping" if backend == "rust"
+                else "PythonTensorBookkeeping"))
+
+    infos = prod.store_and_return_tensor_info(7, {"h": [torch.randn(4, 8)]})
+    flat = [i for il in infos.values() for i in il]
+    if batched:
+        prod.register_for_send_batch(ParallelList([7], [flat]))
+    else:
+        prod.register_for_send(7, flat)
+
+    stored = prod.tensor_store.get_info(flat[0].uuid)
+    assert stored.shm_segment == flat[0].shm_segment
+    assert stored.shm_offset == flat[0].shm_offset
+    assert stored.shm_segment is not None, "staged, so it must carry a segment"

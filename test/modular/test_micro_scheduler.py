@@ -27,6 +27,8 @@ from mstar.engine.resources.step import (
     AdmitRuntimeError,
     FullAdmitOutcome,
 )
+from mstar.graph.runtime.base import PopRidsOutput, ReadyNodeSpec
+from mstar.utils.containers import ParallelList
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 
 NODE = "LLM"
@@ -47,13 +49,91 @@ class _Queue:
         return [SimpleNamespace(name=node_names[0])]
 
 
+class _Runtime:
+    """Graph-level ready scan, over the manager's queues.
+
+    The real PythonGraphRuntime owns the queues and RequestStateManager shares
+    the same dict; this mirrors that by reading the manager's.
+    """
+
+    def __init__(self, manager: _Manager):
+        self._manager = manager
+
+    def _scan(self, exclude_rids, target, exclude_target):
+        target_node, target_walk = target if target is not None else (None, None)
+        walk = self._manager._walk
+        for queue in self._manager.queues.values():
+            for rid, node_names in queue.get_ready_node_names().items():
+                if rid in exclude_rids \
+                        or rid not in self._manager.per_request_info:
+                    continue
+                for node_name in node_names:
+                    if target_node is not None and node_name != target_node:
+                        continue
+                    if target_walk is not None and walk != target_walk:
+                        continue
+                    if exclude_target is not None \
+                            and (node_name, walk) == exclude_target:
+                        continue
+                    yield node_name, walk, rid
+
+    def get_ready_nodes(self, exclude_rids, target=None, exclude_target=None):
+        grouped: dict[tuple[str, str], list] = {}
+        for node_name, walk, rid in self._scan(
+            exclude_rids, target, exclude_target,
+        ):
+            grouped.setdefault((node_name, walk), []).append(rid)
+        return [
+            ReadyNodeSpec(node_name, walk, rids)
+            for (node_name, walk), rids in grouped.items()
+        ]
+
+    def has_ready_excluding(self, exclude_rids, exclude_target=None):
+        for _ in self._scan(exclude_rids, None, exclude_target):
+            return True
+        return False
+
+    def get_worker_graph_id_for_node(self, node_name, graph_walk):
+        del node_name, graph_walk
+        return "wg0"
+
+    def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):
+        del graph_walk
+        queue = self._manager.queues["wg0"]
+        if check_ready:
+            ready = queue.get_ready_node_names()
+            for rid in request_ids:
+                if node_name not in ready.get(rid, ()):
+                    return None
+        rids, wg_ids = [], []
+        for rid in request_ids:
+            if queue.pop_ready_nodes(rid, [node_name]):
+                rids.append(rid)
+                wg_ids.append("wg0")
+        return PopRidsOutput(
+            wg_ids=ParallelList(rids, wg_ids),
+            input_edges=[], input_edges_per_rid=[0] * len(rids),
+        )
+
+    def get_nodes(self, node_name, rids, wg_ids):
+        del wg_ids
+        return [SimpleNamespace(name=node_name) for _ in rids]
+
+    def push_back_node(self, node_name, rids, wg_ids):
+        del wg_ids
+        queue = self._manager.queues["wg0"]
+        for rid in rids:
+            queue._ready.setdefault(rid, set()).add(node_name)
+
+
 class _Manager:
-    """Stands in for WorkerGraphsManager: one worker graph, one node."""
+    """Stands in for RequestStateManager: one worker graph, one node."""
 
     def __init__(self, rids, node=NODE, walk=WALK):
         self.queues = {"wg0": _Queue(rids, node)}
         self.per_request_info = dict.fromkeys(rids, object())
         self._walk = walk
+        self.runtime = _Runtime(self)
 
     def get_partition_for_node(self, node_name):
         del node_name
@@ -101,10 +181,25 @@ def _scheduler(engine: _Engine) -> MicroScheduler:
     )
 
 
+def _next_batch(sched: MicroScheduler, manager: _Manager, **kwargs):
+    """Bind the runtime that scans this manager's queues, then schedule.
+
+    The worker installs the runtime once at startup; these tests build a fresh
+    manager per call, so the binding happens here instead.
+    """
+    sched.runtime = manager.runtime
+    return sched.get_next_batch(manager, **kwargs)
+
+
+def _has_ready(sched: MicroScheduler, manager: _Manager, exclude_target=None):
+    sched.runtime = manager.runtime
+    return sched.has_ready_excluding(manager, exclude_target)
+
+
 def _batch(rids, node=NODE, walk=WALK) -> ScheduledBatch:
     return ScheduledBatch(
         node_name=node, graph_walk=walk,
-        node_objects={rid: object() for rid in rids},
+        input_edges=dict.fromkeys(rids, []),
         request_to_worker_graph=dict.fromkeys(rids, "wg0"),
     )
 
@@ -117,20 +212,20 @@ def test_an_uncapped_node_takes_the_whole_ready_set():
     stay None all the way down rather than becoming an arithmetic operand."""
     sched = _scheduler(_Engine(max_bs=None))
 
-    batch = sched.get_next_batch(_Manager([f"r{i}" for i in range(5)]))
+    batch = _next_batch(sched, _Manager([f"r{i}" for i in range(5)]))
 
-    assert len(batch.node_objects) == 5
+    assert len(batch) == 5
     assert not sched.backlog
 
 
 def test_an_uncapped_node_survives_a_pre_existing_batch_size():
     sched = _scheduler(_Engine(max_bs=None))
 
-    batch = sched.get_next_batch(
+    batch = _next_batch(sched,
         _Manager([f"r{i}" for i in range(3)]), pre_existing_batch_size=2,
     )
 
-    assert len(batch.node_objects) == 3
+    assert len(batch) == 3
 
 
 def test_the_cap_counts_rows_the_caller_already_has():
@@ -138,12 +233,12 @@ def test_the_cap_counts_rows_the_caller_already_has():
     union was not, so a merged batch could pass the node's max."""
     sched = _scheduler(_Engine(max_bs=4))
 
-    batch = sched.get_next_batch(
+    batch = _next_batch(sched,
         _Manager([f"r{i}" for i in range(4)]), pre_existing_batch_size=3,
     )
 
-    assert len(batch.node_objects) == 1, "4 cap - 3 already held = 1"
-    assert len(sched.backlog[(NODE, WALK)].node_objects) == 3
+    assert len(batch) == 1, "4 cap - 3 already held = 1"
+    assert len(sched.backlog[(NODE, WALK)].request_to_worker_graph) == 3
 
 
 def test_a_full_caller_batch_schedules_nothing_and_leaves_the_queue_alone():
@@ -152,7 +247,7 @@ def test_a_full_caller_batch_schedules_nothing_and_leaves_the_queue_alone():
     sched = _scheduler(_Engine(max_bs=4))
     manager = _Manager([f"r{i}" for i in range(2)])
 
-    batch = sched.get_next_batch(manager, pre_existing_batch_size=4)
+    batch = _next_batch(sched, manager, pre_existing_batch_size=4)
 
     assert batch is None
     assert sched.backlog == {}
@@ -163,7 +258,7 @@ def test_a_fully_drained_ready_set_leaves_no_backlog_entry():
     """A None remainder must not be stored: `_drop_backlogged_rid` walks these."""
     sched = _scheduler(_Engine(max_bs=8))
 
-    sched.get_next_batch(_Manager(["r0", "r1"]))
+    _next_batch(sched, _Manager(["r0", "r1"]))
 
     assert sched.backlog == {}
     sched._drop_backlogged_rid("r0")  # would raise on a stored None
@@ -179,10 +274,10 @@ def test_a_backlogged_chunk_is_rechecked_before_going_back_out():
     sched = _scheduler(engine)
     sched.backlog[(NODE, WALK)] = _batch(["r2", "r3"])
 
-    batch = sched.get_next_batch(_Manager([]))
+    batch = _next_batch(sched, _Manager([]))
 
-    assert list(batch.node_objects) == ["r3"]
-    assert list(sched.backlog[(NODE, WALK)].node_objects) == ["r2"]
+    assert list(batch.request_to_worker_graph) == ["r3"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r2"]
 
 
 def test_an_uncapped_node_can_be_served_from_the_backlog():
@@ -191,9 +286,9 @@ def test_an_uncapped_node_can_be_served_from_the_backlog():
     sched = _scheduler(_Engine(max_bs=None))
     sched.backlog[(NODE, WALK)] = _batch(["r0", "r1"])
 
-    batch = sched.get_next_batch(_Manager([]), pre_existing_batch_size=1)
+    batch = _next_batch(sched, _Manager([]), pre_existing_batch_size=1)
 
-    assert list(batch.node_objects) == ["r0", "r1"]
+    assert list(batch.request_to_worker_graph) == ["r0", "r1"]
     assert sched.backlog == {}
 
 
@@ -202,8 +297,8 @@ def test_a_backlogged_chunk_that_is_wholly_unready_stays_put():
     sched = _scheduler(engine)
     sched.backlog[(NODE, WALK)] = _batch(["r2", "r3"])
 
-    assert sched.get_next_batch(_Manager([])) is None
-    assert list(sched.backlog[(NODE, WALK)].node_objects) == ["r2", "r3"]
+    assert _next_batch(sched, _Manager([])) is None
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r2", "r3"]
 
 
 def test_a_blocked_chunk_is_skipped_for_the_next_one():
@@ -213,11 +308,11 @@ def test_a_blocked_chunk_is_skipped_for_the_next_one():
     sched.backlog[("A", WALK)] = _batch(["r0"], node="A")
     sched.backlog[("B", WALK)] = _batch(["r1"], node="B")
 
-    batch = sched.get_next_batch(_Manager([]))
+    batch = _next_batch(sched, _Manager([]))
 
     assert batch.node_name == "B"
     # the blocked one is kept, for a later pass
-    assert list(sched.backlog[("A", WALK)].node_objects) == ["r0"]
+    assert list(sched.backlog[("A", WALK)].request_to_worker_graph) == ["r0"]
 
 
 def test_skipping_does_not_lose_a_blocked_chunk_when_nothing_else_runs():
@@ -225,7 +320,7 @@ def test_skipping_does_not_lose_a_blocked_chunk_when_nothing_else_runs():
     sched.backlog[("A", WALK)] = _batch(["r0"], node="A")
     sched.backlog[("B", WALK)] = _batch(["r1"], node="B")
 
-    assert sched.get_next_batch(_Manager([])) is None
+    assert _next_batch(sched, _Manager([])) is None
     assert set(sched.backlog) == {("A", WALK), ("B", WALK)}
 
 
@@ -237,7 +332,7 @@ def test_a_targeted_call_does_not_skip_to_another_walk():
     sched.backlog[("A", WALK)] = _batch(["r0"], node="A")
     sched.backlog[("B", WALK)] = _batch(["r1"], node="B")
 
-    assert sched.get_next_batch(_Manager([]), target=("A", WALK)) is None
+    assert _next_batch(sched, _Manager([]), target=("A", WALK)) is None
     assert set(sched.backlog) == {("A", WALK), ("B", WALK)}
 
 
@@ -248,10 +343,10 @@ def test_a_backlogged_chunk_still_respects_the_nodes_cap():
     sched = _scheduler(_Engine(max_bs=2))
     sched.backlog[(NODE, WALK)] = _batch(["r0", "r1", "r2", "r3"])
 
-    batch = sched.get_next_batch(_Manager([]))
+    batch = _next_batch(sched, _Manager([]))
 
-    assert list(batch.node_objects) == ["r0", "r1"]
-    assert list(sched.backlog[(NODE, WALK)].node_objects) == ["r2", "r3"]
+    assert list(batch.request_to_worker_graph) == ["r0", "r1"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r2", "r3"]
 
 
 def test_the_hold_backoff_expires_before_the_backlog_is_taken():
@@ -262,7 +357,7 @@ def test_the_hold_backoff_expires_before_the_backlog_is_taken():
     sched.held_until["r0"] = 0.0  # already elapsed
     sched.backlog[(NODE, WALK)] = _batch(["r0"])
 
-    sched.get_next_batch(_Manager([]))
+    _next_batch(sched, _Manager([]))
 
     assert "r0" not in sched.held_until
 
@@ -274,8 +369,8 @@ def test_the_oldest_backlog_entry_goes_first():
     sched.backlog[("A", WALK)] = _batch(["r0"], node="A")
     sched.backlog[("B", WALK)] = _batch(["r1"], node="B")
 
-    assert sched.get_next_batch(_Manager([])).node_name == "A"
-    assert sched.get_next_batch(_Manager([])).node_name == "B"
+    assert _next_batch(sched, _Manager([])).node_name == "A"
+    assert _next_batch(sched, _Manager([])).node_name == "B"
 
 
 def test_a_targeted_call_takes_only_its_own_backlog_entry():
@@ -283,7 +378,7 @@ def test_a_targeted_call_takes_only_its_own_backlog_entry():
     sched.backlog[("A", WALK)] = _batch(["r0"], node="A")
     sched.backlog[("B", WALK)] = _batch(["r1"], node="B")
 
-    batch = sched.get_next_batch(_Manager([]), target=("B", WALK))
+    batch = _next_batch(sched, _Manager([]), target=("B", WALK))
 
     assert batch.node_name == "B"
     assert ("A", WALK) in sched.backlog
@@ -300,12 +395,12 @@ def test_a_full_caller_batch_does_not_clobber_the_backlog():
     sched.backlog[(NODE, WALK)] = _batch(backlogged)
 
     # the speculative batch already holds the full cap
-    batch = sched.get_next_batch(
+    batch = _next_batch(sched,
         _Manager(["f0", "f1"]), target=(NODE, WALK), pre_existing_batch_size=16,
     )
 
     assert batch is None, "no capacity left, so nothing should be scheduled"
-    still_queued = set(sched.backlog[(NODE, WALK)].node_objects)
+    still_queued = set(sched.backlog[(NODE, WALK)].request_to_worker_graph)
     assert set(backlogged) <= still_queued, (
         f"lost {sorted(set(backlogged) - still_queued)} from the backlog"
     )
@@ -318,10 +413,10 @@ def test_fresh_work_does_not_evict_a_blocked_backlog_chunk():
     sched = _scheduler(_Engine(max_bs=2, not_ready={"b0", "b1"}))
     sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
 
-    batch = sched.get_next_batch(_Manager(["f0", "f1", "f2"]))
+    batch = _next_batch(sched, _Manager(["f0", "f1", "f2"]))
 
-    assert set(batch.node_objects) == {"f0", "f1"}
-    held = set(sched.backlog[(NODE, WALK)].node_objects)
+    assert set(batch.request_to_worker_graph) == {"f0", "f1"}
+    held = set(sched.backlog[(NODE, WALK)].request_to_worker_graph)
     assert held == {"b0", "b1", "f2"}, f"lost the blocked chunk: {held}"
 
 
@@ -329,9 +424,9 @@ def test_fresh_work_merges_into_an_existing_backlog_entry():
     sched = _scheduler(_Engine(max_bs=2))
     sched.backlog[(NODE, WALK)] = _batch(["b0", "b1"])
 
-    sched.get_next_batch(_Manager(["f0", "f1", "f2"]), pre_existing_batch_size=2)
+    _next_batch(sched, _Manager(["f0", "f1", "f2"]), pre_existing_batch_size=2)
 
-    held = set(sched.backlog[(NODE, WALK)].node_objects)
+    held = set(sched.backlog[(NODE, WALK)].request_to_worker_graph)
     assert {"b0", "b1"} <= held, "the older chunk must survive"
 
 
@@ -340,7 +435,7 @@ def test_no_capacity_leaves_the_ready_queue_alone():
     sched = _scheduler(_Engine(max_bs=16))
     manager = _Manager(["f0", "f1"])
 
-    sched.get_next_batch(manager, pre_existing_batch_size=16)
+    _next_batch(sched, manager, pre_existing_batch_size=16)
 
     assert set(manager.queues["wg0"]._ready) == {"f0", "f1"}, (
         "fresh nodes were popped off the queue with nowhere to put them"
@@ -382,11 +477,11 @@ def test_the_reserved_room_is_exactly_what_the_backlog_then_fills():
     sched.backlog[(NODE, WALK)] = _batch(backlogged)
 
     keep = sched.room_for_continuing((NODE, WALK))
-    batch = sched.get_next_batch(
+    batch = _next_batch(sched,
         _Manager([]), target=(NODE, WALK), pre_existing_batch_size=keep,
     )
 
-    assert set(batch.node_objects) == set(backlogged)
+    assert set(batch.request_to_worker_graph) == set(backlogged)
     assert sched.backlog == {}
 
 
@@ -399,7 +494,7 @@ def test_the_peek_sees_a_backlogged_walk_the_queues_cannot_show():
     sched = _scheduler(_Engine(max_bs=8))
     sched.backlog[("other", "prefill")] = _batch(["b0"], node="other", walk="prefill")
 
-    assert sched.has_ready_excluding(_Manager([]), (NODE, WALK)) is True
+    assert _has_ready(sched, _Manager([]), (NODE, WALK)) is True
 
 
 def test_the_peek_ignores_the_speculated_walks_own_backlog():
@@ -408,7 +503,7 @@ def test_the_peek_ignores_the_speculated_walks_own_backlog():
     sched = _scheduler(_Engine(max_bs=8))
     sched.backlog[(NODE, WALK)] = _batch(["b0"])
 
-    assert sched.has_ready_excluding(_Manager([]), (NODE, WALK)) is False
+    assert _has_ready(sched, _Manager([]), (NODE, WALK)) is False
 
 
 def test_the_peek_ignores_a_backlog_of_failed_rids():
@@ -416,7 +511,7 @@ def test_the_peek_ignores_a_backlog_of_failed_rids():
     sched.backlog[("other", "prefill")] = _batch(["b0"], node="other", walk="prefill")
     sched.failed_rids.add("b0")
 
-    assert sched.has_ready_excluding(_Manager([]), (NODE, WALK)) is False
+    assert _has_ready(sched, _Manager([]), (NODE, WALK)) is False
 
 
 # ── round robin ─────────────────────────────────────────────────────────
@@ -427,7 +522,7 @@ def test_scheduling_a_batch_advances_the_round_robin_cursor():
     (node, walk) stayed at 0 and `_select_node_rr` kept picking the same one."""
     sched = _scheduler(_Engine(max_bs=2))
 
-    sched.get_next_batch(_Manager([f"r{i}" for i in range(4)]))
+    _next_batch(sched, _Manager([f"r{i}" for i in range(4)]))
 
     assert sched.node_and_walk_to_last_batch_num[(NODE, WALK)] > 0
 
@@ -436,9 +531,9 @@ def test_serving_from_the_backlog_also_advances_the_cursor():
     sched = _scheduler(_Engine(max_bs=1))
     sched.backlog[(NODE, WALK)] = _batch(["r0", "r1"])
 
-    sched.get_next_batch(_Manager([]))
+    _next_batch(sched, _Manager([]))
     first = sched.node_and_walk_to_last_batch_num[(NODE, WALK)]
-    sched.get_next_batch(_Manager([]))
+    _next_batch(sched, _Manager([]))
 
     assert sched.node_and_walk_to_last_batch_num[(NODE, WALK)] > first
 
@@ -446,7 +541,7 @@ def test_serving_from_the_backlog_also_advances_the_cursor():
 def test_the_cursor_does_not_advance_when_nothing_is_scheduled():
     sched = _scheduler(_Engine(max_bs=4))
 
-    sched.get_next_batch(_Manager(["r0"]), pre_existing_batch_size=4)
+    _next_batch(sched, _Manager(["r0"]), pre_existing_batch_size=4)
 
     assert (NODE, WALK) not in sched.node_and_walk_to_last_batch_num
 
@@ -455,8 +550,8 @@ def test_the_cursor_does_not_advance_when_nothing_is_scheduled():
 def test_split_off_first_accepts_an_empty_exclusion(exclude):
     first, rest = _batch(["r0", "r1", "r2"]).split_off_first(2, exclude)
 
-    assert list(first.node_objects) == ["r0", "r1"]
-    assert list(rest.node_objects) == ["r2"]
+    assert list(first.request_to_worker_graph) == ["r0", "r1"]
+    assert list(rest.request_to_worker_graph) == ["r2"]
 
 
 # ── terminal admit failures ─────────────────────────────────────────────
@@ -468,9 +563,9 @@ def test_an_unservable_rid_is_parked_for_the_worker_to_fail():
     handed to the worker, which reports it to the conductor."""
     sched = _scheduler(_Engine(max_bs=4, unservable={"r0"}))
 
-    batch = sched.get_next_batch(_Manager(["r0", "r1"]))
+    batch = _next_batch(sched, _Manager(["r0", "r1"]))
 
-    assert list(batch.node_objects) == ["r1"]
+    assert list(batch.request_to_worker_graph) == ["r1"]
     assert sched.failed_rids == {"r0"}
     errors = sched.take_admit_errors()
     assert set(errors) == {"r0"}
@@ -483,16 +578,16 @@ def test_an_unservable_rid_is_dropped_from_the_backlog():
     sched = _scheduler(_Engine(max_bs=4, unservable={"r0"}))
     sched.backlog[(NODE, WALK)] = _batch(["r0", "r1"])
 
-    batch = sched.get_next_batch(_Manager([]))
+    batch = _next_batch(sched, _Manager([]))
 
-    assert list(batch.node_objects) == ["r1"]
+    assert list(batch.request_to_worker_graph) == ["r1"]
     assert set(sched.take_admit_errors()) == {"r0"}
     assert sched.backlog == {}
 
 
 def test_clearing_a_rid_forgets_its_undelivered_admit_error():
     sched = _scheduler(_Engine(max_bs=4, unservable={"r0"}))
-    sched.get_next_batch(_Manager(["r0"]))
+    _next_batch(sched, _Manager(["r0"]))
 
     sched.clear_rid("r0")
 

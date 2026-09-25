@@ -190,15 +190,15 @@ class EngineManager:
         return self.engine
 
     def add_request(
-        self, request_id: str,
+        self, rid: int,
         resource_configs: dict[str, ResourceReqConfig] | None = None,
     ) -> None:
         """Open resource state for a request, on the per-resource configs the
         conductor resolved for it (``Model.get_request_resource_configs``)."""
-        self.engine.add_request(request_id, resource_configs)
+        self.engine.add_request(rid, resource_configs)
 
-    def remove_request(self, request_id: str) -> None:
-        self.engine.remove_request(request_id)
+    def remove_request(self, rid: int) -> None:
+        self.engine.remove_request(rid)
 
     def evictable_nodes(self) -> list[str]:
         """Nodes whose state can be reclaimed. The worker keeps the per-request

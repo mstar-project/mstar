@@ -153,7 +153,7 @@ def test_full_sender_receiver_cycle():
         assert len(ready["req1"]) == 1
 
         # Verify tensor equality
-        received_tensor = receiver.get_tensor("req1", uuids[0])
+        received_tensor = receiver.get_tensor(uuids[0])
         assert torch.equal(received_tensor, original)
 
 
@@ -172,7 +172,7 @@ def test_full_cycle_bfloat16():
 
         receiver.start_read_tensors("req1", edges, graph_walk="decode")
         receiver.get_ready_tensors(graph_walk="decode")
-        received = receiver.get_tensor("req1", uuids[0])
+        received = receiver.get_tensor(uuids[0])
         assert torch.equal(received, original)
 
 
@@ -189,9 +189,34 @@ def test_cleanup_unlinks_file():
         assert os.path.isfile(path)
 
         # Dereference to 0 triggers cleanup
-        mgr.dereference("req1", uuid, n=0)  # ref is already 0
+        mgr.dereference(uuid, n=0)  # ref is already 0
         mgr.cleanup_request("req1")
         assert not os.path.isfile(path)
+
+
+def test_cleanup_collectable_reclaims_what_a_runtime_already_freed():
+    """A graph runtime behind the contract dereferences inside the bookkeeper
+    it shares, so nothing here ever sees the count hit zero. It hands the
+    uuids back instead -- and until that path existed, a consumed input's shm
+    file sat until the whole request was torn down."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir, request_id="req1")
+        info = mgr.store_and_return_tensor_info(
+            "req1", {"out": [torch.randn(4, 8)]}
+        )["out"][0]
+        mgr.register_for_send("req1", [info])
+        path = os.path.join(tmpdir, f"mstar_worker_0_{info.uuid}")
+        assert os.path.isfile(path)
+
+        # Exactly what cleanup_consumed_inputs does and returns.
+        freed = mgr.tensor_store.bookkeeping.dereference_batch_uniform(
+            [info.uuid], 1, True,
+        )
+        assert freed[0] == [info.uuid]
+        mgr.cleanup_collectable(*freed)
+
+        assert not os.path.isfile(path), "the shm file outlived the tensor"
+        assert not mgr.tensor_store.check_uuid_presence(info.uuid)
 
 
 def test_local_tensor_skips_shm():
@@ -210,7 +235,7 @@ def test_local_tensor_skips_shm():
         ready = mgr.get_ready_tensors(graph_walk="decode")
         assert "req1" in ready
 
-        retrieved = mgr.get_tensor("req1", uuids[0])
+        retrieved = mgr.get_tensor(uuids[0])
         assert torch.equal(retrieved, tensor)
 
 
@@ -258,7 +283,7 @@ def test_unacked_result_tensors_leak_producer_buffer():
 
         shm_path = os.path.join(tmpdir, f"mstar_worker_0_{uuid}")
         assert os.path.isfile(shm_path)
-        assert not producer.tensor_store.can_gc("req1", uuid)  # held by send ref
+        assert not producer.tensor_store.can_gc(uuid)  # held by send ref
 
         # No ack arrives; the producer's own cleanup must defer the buffer.
         producer.cleanup_request("req1")
@@ -292,7 +317,7 @@ def test_ack_unread_tensors_lets_producer_reclaim_buffer():
         # Producer applies the ack (mirrors worker._handle_tensor_received) and
         # reclaims the buffer.
         for u, n in msg.body.successful_tensors.items():
-            producer.dereference("req1", u, n=n)
+            producer.dereference(u, n=n)
         assert not os.path.isfile(shm_path)  # reclaimed -> no leak
 
 
@@ -306,7 +331,7 @@ def _store_persisted_input(mgr, request_id, name="in"):
     info = mgr.store_and_return_tensor_info(request_id, {name: [torch.randn(4, 8)]})
     tensor_info = info[name][0]
     mgr.register_for_send(request_id, [tensor_info])
-    mgr.set_persist(request_id, tensor_info.uuid, persist=True)
+    mgr.set_persist(tensor_info.uuid, persist=True)
     return tensor_info.uuid
 
 
@@ -322,7 +347,7 @@ def test_cleanup_request_defers_persisted_tensor():
         uuid = _store_persisted_input(mgr, "req1")
         path = os.path.join(tmpdir, f"mstar_api_server_preprocess_worker_{uuid}")
         assert os.path.isfile(path)
-        assert not mgr.tensor_store.can_gc("req1", uuid)  # persist holds it
+        assert not mgr.tensor_store.can_gc(uuid)  # persist holds it
 
         mgr.cleanup_request("req1")
         assert os.path.isfile(path)  # deferred, not force-unlinked
@@ -341,7 +366,7 @@ def test_force_cleanup_request_drops_persisted_tensor():
 
         mgr.force_cleanup_request("req1")
         assert not os.path.isfile(path)
-        assert not mgr.tensor_store.check_uuid_presence("req1", uuid)
+        assert not mgr.tensor_store.check_uuid_presence(uuid)
 
 
 def test_force_cleanup_request_reclaims_unacked_buffer():
@@ -352,7 +377,7 @@ def test_force_cleanup_request_reclaims_unacked_buffer():
         _, uuid = _produce_registered_output(producer, "req1")
         shm_path = os.path.join(tmpdir, f"mstar_worker_0_{uuid}")
         assert os.path.isfile(shm_path)
-        assert not producer.tensor_store.can_gc("req1", uuid)  # held by send ref
+        assert not producer.tensor_store.can_gc(uuid)  # held by send ref
 
         producer.force_cleanup_request("req1")
         assert not os.path.isfile(shm_path)  # dropped regardless of ref count
@@ -369,7 +394,7 @@ def test_has_inflight_reads_tracks_pending_futures():
 
         # Completed synchronous read (future=None) does not count.
         mgr.pending.append(
-            FutureAndPointers(future=None, graph_edges=[], request_id="req1")
+            FutureAndPointers(future=None, graph_edges=[], rid="req1")
         )
         assert not mgr.has_inflight_reads("req1")
 
@@ -379,7 +404,7 @@ def test_has_inflight_reads_tracks_pending_futures():
                 return False
 
         mgr.pending.append(
-            FutureAndPointers(future=_Fut(), graph_edges=[], request_id="req1")
+            FutureAndPointers(future=_Fut(), graph_edges=[], rid="req1")
         )
         assert mgr.has_inflight_reads("req1")
         assert not mgr.has_inflight_reads("other-req")
@@ -422,3 +447,98 @@ def test_factory_returns_mooncake_for_rdma():
     except RuntimeError:
         # Mooncake not installed — expected in CI/dev environments
         pytest.skip("mooncake not installed")
+
+
+# ---------------------------------------------------------------------------
+# descriptor bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def _descriptor_fields(info):
+    """A descriptor as VALUES, not as an object.
+
+    ``dims``/``stride`` are declared ``list[int]`` but arrive as whatever the
+    producer had -- a ``torch.Size`` from ``tensor.shape``, a list back out of
+    the Rust bookkeeper, which copies the descriptor rather than keeping the
+    caller's object. Comparing the sequences directly would be testing which
+    backend is installed.
+    """
+    return (
+        tuple(info.dims), tuple(info.stride), info.dtype, info.nbytes,
+        info.address, info.uuid, info.offset,
+        info.shm_segment, info.shm_offset,
+    )
+
+
+def test_store_keeps_a_descriptor_for_every_uuid_it_holds(tmp_path):
+    """Ingestion and routing carry uuids, so anything that has to put a
+    descriptor back on the wire — a disaggregated loop re-emitting its
+    external inputs — has to be able to recover it from the uuid alone.
+
+    Recover, not share: the Rust bookkeeper copies the descriptor in, so the
+    two are equal without being the same object, and a later in-place edit
+    reaches the store through ``update_info`` instead (see
+    ``test/rust/test_arena_transport.py``'s write-back cases)."""
+    mgr = _make_manager(str(tmp_path), request_id="r1")
+    infos = mgr.store_and_return_tensor_info(
+        "r1", {"h": [torch.randn(4, 8)], "e": [torch.empty(0, 3)]},
+    )
+    for name, info_list in infos.items():
+        for info in info_list:
+            got = mgr.tensor_store.get_info(info.uuid)
+            assert got is not None, f"no descriptor kept for {name}"
+            assert _descriptor_fields(got) == _descriptor_fields(info)
+
+
+def test_descriptor_survives_register_for_send(tmp_path):
+    """Registering a tensor for sending must not lose or stale the stored
+    descriptor: the file transport writes the bytes out and leaves the
+    descriptor alone, so what the store holds afterwards still points at the
+    same tensor."""
+    mgr = _make_manager(str(tmp_path), request_id="r1")
+    infos = mgr.store_and_return_tensor_info("r1", {"h": [torch.randn(4, 8)]})
+    info = infos["h"][0]
+    mgr.register_for_send("r1", [info])
+
+    stored = mgr.tensor_store.get_info(info.uuid)
+    assert _descriptor_fields(stored) == _descriptor_fields(info)
+
+
+def test_descriptor_is_dropped_with_the_tensor(tmp_path):
+    """Descriptors are keyed by uuid, and uuids are never reused, but a leak
+    here would grow without bound over a long-lived worker."""
+    mgr = _make_manager(str(tmp_path), request_id="r1")
+    infos = mgr.store_and_return_tensor_info("r1", {"h": [torch.randn(4, 8)]})
+    uuid = infos["h"][0].uuid
+    assert mgr.tensor_store.get_info(uuid) is not None
+
+    mgr.tensor_store.remove_tensor(uuid)
+    assert mgr.tensor_store.get_info(uuid) is None
+
+
+def test_an_edge_rebuilt_from_uuids_alone_is_readable_by_a_peer(tmp_path):
+    """The premise the graph-runtime port rests on.
+
+    ingest_inputs_batch / complete_and_route_batch carry uuids, not
+    descriptors. A disaggregated loop re-emits its ingested external inputs
+    as outputs, which can be routed to another worker -- and there the
+    descriptor IS the payload the peer RDMA-reads from. So reconstructing an
+    edge from uuids has to produce something a peer can actually read; a
+    stub carrying only the uuid would send a structurally valid but
+    unreadable message.
+    """
+    producer = _make_manager(str(tmp_path), "worker_0", request_id="r1")
+    consumer = _make_manager(str(tmp_path), "worker_1", request_id="r1")
+
+    original = torch.randn(4, 8)
+    infos = producer.store_and_return_tensor_info("r1", {"h": [original]})
+    uuid = infos["h"][0].uuid
+    producer.register_for_send("r1", [infos["h"][0]])
+
+    # Nothing kept but the uuid.
+    rebuilt = GraphEdge(
+        name="h", next_node="consumer_node",
+        tensor_info=[producer.tensor_store.get_info(uuid)],
+    )
+    consumer.start_read_tensors("r1", [rebuilt])
+    assert torch.equal(consumer.tensor_store.get_tensor(uuid), original)

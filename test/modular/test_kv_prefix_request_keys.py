@@ -48,13 +48,13 @@ class _RecordingCommunicator:
 class _StubTensorManager:
     """Stores no tensor; the request never reaches a device."""
 
-    def store_and_return_tensor_info(self, request_id, tensors):
+    def store_and_return_tensor_info(self, rid, tensors, **kwargs):
         return {}
 
-    def register_for_send(self, request_id, tensor_infos):
+    def register_for_send(self, rid, tensor_infos, **kwargs):
         pass
 
-    def set_persist(self, request_id, uuid, persist):
+    def set_persist(self, uuid, persist):
         pass
 
 

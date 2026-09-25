@@ -16,9 +16,19 @@ crate-type = ["cdylib", "rlib"]
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1.3"
+rustc-hash = "2"
 thiserror = "2"
 zmq = "0.10"
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.23" }
+rmpv = "1.3.1"
+
+[features]
+# On for the cdylib: a Python extension resolves the CPython symbols at import
+# time and must NOT link libpython. Off for `cargo test`, whose binary is an
+# executable and therefore has to link it -- hence
+# `cargo test --no-default-features`.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [dev-dependencies]
 libc = "0.2"

@@ -426,7 +426,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         node_inputs = self._get_prefill_node_inputs(cond, uncond)
         self._slim_statics(cond, uncond)
-        st = self.request_state(fwd_info.request_id)
+        st = self.request_state(fwd_info.rid_handle)
         st.add_all(
             cond=cond,
             uncond=uncond,
@@ -561,7 +561,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         node_inputs = self._get_prefill_node_inputs(cond, uncond)
         self._slim_statics(cond, uncond)
-        self.request_state(fwd_info.request_id).add_all(
+        self.request_state(fwd_info.rid_handle).add_all(
             cond=cond,
             uncond=uncond,
             gs=gs,
@@ -583,7 +583,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _prepare_image_gen(
         self, graph_walk, fwd_info, inputs, device,
     ) -> ARNodeInputs:
-        st = self.request_states[fwd_info.request_id]
+        st = self.request_states[fwd_info.rid_handle]
         if "latents" not in inputs or len(inputs["latents"]) == 0:
             self._ingest_cond_latents(st, inputs, device)
             gen = torch.Generator(device=device).manual_seed(fwd_info.random_seed)
@@ -633,7 +633,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         )
 
     def _prepare_video_sound_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
-        st = self.request_states[fwd_info.request_id]
+        st = self.request_states[fwd_info.rid_handle]
         if "latents" not in inputs or len(inputs["latents"]) == 0:
             self._ingest_cond_latents(st, inputs, device)
             # First iteration: video noise first, then sound noise from the same
@@ -672,7 +672,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         )
 
     def _prepare_action_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
-        st = self.request_states[fwd_info.request_id]
+        st = self.request_states[fwd_info.rid_handle]
         if "latents" not in inputs or len(inputs["latents"]) == 0:
             self._ingest_cond_latents(st, inputs, device)
             # First iteration: build the joint [video | action] latents. Per the

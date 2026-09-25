@@ -1,7 +1,8 @@
+import itertools
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
 from typing import NamedTuple, Type
-from uuid import uuid4
 
 import torch
 import yaml
@@ -30,10 +31,18 @@ from mstar.model.multimodal import PromptPart
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
 
+def video_metadata_dict(metadata_obj) -> dict:
+    # torchcodec>=0.9 reports pixel_aspect_ratio as a Fraction, which the wire codec rejects.
+    return {k: float(v) if isinstance(v, Fraction) else v for k, v in asdict(metadata_obj).items()}
+
+
 @dataclass
 class TensorAndMetadata:
     data: torch.Tensor
     metadata: dict = field(default_factory=dict)
+
+
+_wg_id_counter = itertools.count(1 << 20)
 
 
 class ProcessPromptOutput(NamedTuple):
@@ -83,7 +92,13 @@ class WorkerGraph:
     _instance_ranks: list[list[int]] = field(default_factory=list)
     _tp_comm_size: int = 1
     _group_id: int = field(default=-1)  # original index into config's node_groups
-    worker_graph_id: str = field(default_factory=lambda: str(uuid4()))
+
+    # Dense index over the deployment's worker graphs, reassigned by the
+    # conductor (``_assign_worker_graph_ids``) so every process agrees and the
+    # ids can index an array. The default only keeps a standalone WorkerGraph
+    # unique; it is not stable across processes, which is why the conductor --
+    # the one place that sees every graph -- owns the real numbering.
+    worker_graph_id: int = field(default_factory=lambda: next(_wg_id_counter))
 
     def __post_init__(self):
         if (self.tp_size > 1 or self.sp_size > 1) and not self._tp_ranks:
@@ -520,7 +535,7 @@ class Model(ABC):
 
         decoder = VideoDecoder(filepath, device=device)
         video = torch.stack([frame for frame in decoder]).float() / 255.0
-        return TensorAndMetadata(data=video, metadata=asdict(decoder.metadata))
+        return TensorAndMetadata(data=video, metadata=video_metadata_dict(decoder.metadata))
 
     @abstractmethod
     def postprocess(
