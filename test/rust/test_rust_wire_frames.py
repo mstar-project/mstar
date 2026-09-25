@@ -82,7 +82,9 @@ class _Mesh:
 
     def admit(self, wgs=(WG_ID,), workers=(ME,)):
         return self.rt.add_request(
-            "r1", "default", WALK, list(wgs), list(workers),
+            # Single partition, so the partition's worker graphs and the
+            # request's are the same list.
+            "r1", "default", WALK, list(wgs), list(wgs), list(workers),
             [1] * len(wgs),
         )
 
@@ -387,7 +389,8 @@ def _loop_mesh(tmp_path):
                   "tp_enabled_nodes": [], "sp_enabled_nodes": []},
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [ME, PEER], [1, 1])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
+                         [ME, PEER], [1, 1])
     return rt, rid, inboxes
 
 
@@ -436,7 +439,7 @@ def _emit_mesh(tmp_path, tp_rank, shard_dim=None):
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [ME, PEER], [2])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2])
     info = TensorPointerInfo(
         dims=[2, 3], dtype=torch.bfloat16, nbytes=12, address=1,
         stride=[3, 1], uuid=1, source_session_id="h:1", source_entity=ME,
@@ -484,7 +487,7 @@ def _persist_mesh(tmp_path, tp_rank):
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [ME, PEER], [2])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME, PEER], [2])
     info = TensorPointerInfo(
         dims=[2, 3], dtype=torch.bfloat16, nbytes=12, address=1,
         stride=[3, 1], uuid=1, source_session_id="h:1", source_entity=ME,
@@ -585,8 +588,8 @@ def _fanout_mesh(tmp_path, shard_dim=None):
         },
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [ME, PEER, P2],
-                         [1, 2])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
+                         [ME, PEER, P2], [1, 2])
     # 4 rows of 6 bytes.
     book.put_tensor(1, _info(1, dims=[4, 3], nbytes=24))
     book.increment_ref(1, 1)
@@ -672,7 +675,7 @@ def _gather_mesh(tmp_path, src_tp, dest_tp, my_rank=0, shard_dim=0,
     )
     srcs = [ME, PEER][:src_tp]
     dests = [PEER, P2][:dest_tp]
-    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1],
+    rid = rt.add_request("r1", "default", WALK, [WG_ID, 1], [WG_ID, 1],
                          srcs + dests, [src_tp, dest_tp])
     book.put_tensor(1, _info(1, dims=[4, 3], nbytes=24))
     book.increment_ref(1, 1)
@@ -773,7 +776,7 @@ def _looping_emit_mesh(tmp_path):
                   "tp_enabled_nodes": [], "sp_enabled_nodes": []},
         bookkeeping=book._rust, me=ME, communicator=comm,
     )
-    rid = rt.add_request("r1", "default", WALK, [WG_ID], [ME], [1])
+    rid = rt.add_request("r1", "default", WALK, [WG_ID], [WG_ID], [ME], [1])
     return rt, book, rid, inboxes
 
 
@@ -865,3 +868,59 @@ def test_an_output_nobody_runs_is_an_error(tmp_path):
     })
     with pytest.raises(ValueError, match="unknown node/graph walk.*nowhere"):
         _send(mesh.rt, out.completion_id, request_infos=[(rid, None)])
+
+
+def test_a_removed_rid_leaves_no_persist_signal_for_the_next_handle(tmp_path):
+    """A completion parked for a send that never ran must not keep ANY of a
+    removed rid's state.
+
+    ``remove_request`` purges the routing, so the dead rid gets no frame. Its
+    PERSIST signals are held in a separate map, and handles are RECYCLED -- so
+    a completion that survives (another rid is still in it) hands them to
+    whichever request draws that integer next, which reads as one request
+    inheriting another's output. Asserted here rather than on a frame because
+    the leaked signal shares a name with the one the new request emits, and the
+    two collapse in the frame's map.
+    """
+    mesh = _Mesh(tmp_path, [("kv", "", True)])
+    keep = mesh.admit()
+    doomed = mesh.rt.add_request(
+        "doomed", "default", WALK, [WG_ID], [WG_ID], [ME], [1],
+    )
+    _put(mesh, 1)
+    _put(mesh, 2)
+    for rid in (keep, doomed):
+        mesh.rt.ingest_inputs_batch([rid], [{
+            "signal": "prompt", "next_node": "only", "uuids": [],
+            "is_final_streaming_chunk": False,
+        }])
+    mesh.rt.pop_rids("only", WALK, [keep, doomed])
+    out = mesh.rt.complete_and_route_batch({
+        "partition": "default", "graph_walk": WALK, "node_name": "only",
+        "output_signals": ["kv"], "rids": [keep, doomed],
+        "wg_ids": [WG_ID, WG_ID], "tensors": [1, 2], "num_tensors": [1, 1],
+    })
+
+    # Torn down between the route and the send -- an exception in between is
+    # all it takes -- and the handle goes straight back out.
+    mesh.rt.remove_request(doomed)
+    reused = mesh.rt.add_request(
+        "fresh", "default", WALK, [WG_ID], [WG_ID], [ME], [1],
+    )
+    assert reused == doomed, "the handle must be recycled for this to bite"
+
+    _send(mesh.rt, out.completion_id, request_infos=[(keep, None)])
+
+    assert mesh.rt.pending_persist_signals(reused) == [], (
+        "the recycled handle inherited the removed request's persist signal"
+    )
+    # ...and the purge did not reach too far: the surviving rid's own persist
+    # signal still went out on its WORKER_GRAPHS_DONE, naming its own tensor.
+    wgds = [
+        m.body for m in _collect(mesh.inboxes["conductor"])
+        if isinstance(m.body, WorkerGraphsDone)
+    ]
+    assert [w.request_id for w in wgds] == ["r1"], (
+        "only the surviving request reports done"
+    )
+    assert [i.uuid for i in wgds[0].persist_signals["kv"]] == [1]
