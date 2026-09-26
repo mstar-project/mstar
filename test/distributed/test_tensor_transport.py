@@ -103,9 +103,18 @@ def _send(
         _total_fanin=fanin,
         _shard_dim=shard_dim
     )
-    manager.store_and_populate_graph_edges(
-        request_id, {signal: [tensor]}, [edge],
+    # Was one call to store_and_populate_graph_edges, which stored the
+    # tensors, populated the edge and took a reference per outgoing edge.
+    # The store is keyed by uuid now and no longer knows about edges, so the
+    # three steps are spelled out here.
+    infos = manager.store_and_return_tensor_info(
+        request_id, {signal: [tensor]},
     )
+    edge.tensor_info = infos[signal]
+    for info in edge.tensor_info:
+        # One reference for this edge, as the old helper took: without it the
+        # receiver's ack dereferences to zero and GCs the tensor mid-test.
+        manager.tensor_store.increment_ref(info.uuid, 1)
     for info in edge.tensor_info:
         info.source_tp_rank = source_tp_rank
         info.source_tp_size = source_tp_size
