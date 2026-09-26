@@ -232,6 +232,7 @@ dependencies = [
  "libc",
  "memmap2",
  "pyo3",
+ "rmp",
  "rmp-serde",
  "rmpv",
  "rustc-hash",

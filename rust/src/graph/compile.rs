@@ -98,6 +98,8 @@ pub fn compile_one(
         let outputs = n.outputs.iter().map(|e| mk_edge(it, e, &local)).collect();
         node_specs.push(NodeSpec {
             name, inputs, full_mask: full, streaming_mask,
+            // Filled below, once the loops exist to be asked.
+            held_mask: 0,
             async_enabled: n.async_enabled,
             only_streaming: full != 0 && streaming_mask == full,
             outputs, loop_id: None,
@@ -153,6 +155,39 @@ pub fn compile_one(
             }
             node_specs[m as usize].loop_id = Some(i as LoopId);
         }
+    }
+
+    // held_mask: which of a node's inputs an enclosing loop re-injects each
+    // iteration, so clearing its slots must not dereference them. Needs the
+    // loops, hence a second pass -- and it is worth precomputing because the
+    // alternative is rebuilding the same answer per rid per forward pass.
+    let held: Vec<u64> = node_specs
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let mut mask = 0u64;
+            let mut cur = spec.loop_id;
+            while let Some(lid) = cur {
+                let ls = &loop_specs[lid as usize];
+                for &(name, dest) in &ls.external_inputs {
+                    if dest != i as NodeId {
+                        continue;
+                    }
+                    if let Some(slot) = spec.slot_of(name) {
+                        // Belt-and-braces: `_divide_into_worker_graphs` already
+                        // strips streamed names, and carries the TODO for why.
+                        if spec.streaming_mask >> slot & 1 == 0 {
+                            mask |= 1 << slot;
+                        }
+                    }
+                }
+                cur = ls.parent;
+            }
+            mask
+        })
+        .collect();
+    for (spec, mask) in node_specs.iter_mut().zip(held) {
+        spec.held_mask = mask;
     }
 
     let owned: Vec<NodeId> = loop_specs.iter().flat_map(|l| l.member_nodes.clone()).collect();

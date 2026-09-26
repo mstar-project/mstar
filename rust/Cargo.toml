@@ -21,6 +21,11 @@ thiserror = "2"
 zmq = "0.10"
 pyo3 = { version = "0.23" }
 rmpv = "1.3.1"
+# Direct msgpack writing. rmpv builds a Value tree first, which allocates a
+# String for every map KEY -- ~13 per tensor descriptor -- and then copies the
+# whole tree again on serialise. Kept for the handful of Python-encoded values
+# that have to be re-nested (see frames.rs).
+rmp = "0.8"
 
 [features]
 # On for the cdylib: a Python extension resolves the CPython symbols at import
