@@ -394,32 +394,33 @@ pub struct GraphRuntime {
             return false; // never admitted here, or already removed
         };
 
-        let live: Vec<WgIndex> = info
-            .partitions
-            .values()
-            .flat_map(|p| p.walk_worker_graphs.iter().copied())
-            .collect();
-        for wg in live {
-            let Some(node) = self.graphs[wg as usize].by_name.get(&dest).copied()
-            else {
-                continue;
-            };
-            let Some(slot) = self.graphs[wg as usize].node(node).slot_of(signal)
-            else {
-                continue; // the node does not take this input
-            };
-            let Some(state) = self.state_mut(wg, rid) else {
-                continue;
-            };
-            // The streaming gate is re-checked per signal on purpose:
-            // ingesting one can be what makes the next node eligible.
-            if is_streaming && !state.is_ready_for_streaming(node) {
-                continue;
-            }
-            if state.ingest(
-                node, slot, tensors.to_vec(), can_buffer, final_chunk,
-            ) {
-                return true;
+        // Walked in place. Collecting the live worker graphs into a Vec first
+        // was an allocation per arriving signal, forced only by `state_mut`
+        // borrowing all of `self`; `requests`, `graphs` and `states` are
+        // disjoint fields, so `state_in` lets all three be held at once.
+        for part in info.partitions.values() {
+            for &wg in &part.walk_worker_graphs {
+                let g = &self.graphs[wg as usize];
+                let Some(node) = g.by_name.get(&dest).copied() else {
+                    continue;
+                };
+                let Some(slot) = g.node(node).slot_of(signal) else {
+                    continue; // the node does not take this input
+                };
+                let Some(state) = Self::state_in(&mut self.states, wg, rid)
+                else {
+                    continue;
+                };
+                // The streaming gate is re-checked per signal on purpose:
+                // ingesting one can be what makes the next node eligible.
+                if is_streaming && !state.is_ready_for_streaming(node) {
+                    continue;
+                }
+                if state.ingest(
+                    g, node, slot, tensors, can_buffer, final_chunk,
+                ) {
+                    return true;
+                }
             }
         }
         false
@@ -451,24 +452,31 @@ pub struct GraphRuntime {
                         continue;
                     };
                     let g = &self.graphs[wg as usize];
-                    for node in 0..g.nodes.len() as NodeId {
-                        if !state.is_ready(node) {
-                            continue;
-                        }
-                        let name = g.node(node).name;
-                        let walk = part.graph_walk;
-                        if let Some((tn, tw)) = target {
-                            if tn != Some(name) || tw != Some(walk) {
-                                continue;
+                    let walk = part.graph_walk;
+                    // The SET BITS of the ready mask, not every node index.
+                    // Python iterated its sparse ready set; sweeping the whole
+                    // graph per request made this O(requests x nodes), and it
+                    // runs more than once a pass on the speculation path.
+                    for (word, &bits) in state.ready.iter().enumerate() {
+                        let mut bits = bits;
+                        while bits != 0 {
+                            let node =
+                                (word * 64) as NodeId + bits.trailing_zeros();
+                            bits &= bits - 1; // clear the bit just taken
+                            let name = g.node(node).name;
+                            if let Some((tn, tw)) = target {
+                                if tn != Some(name) || tw != Some(walk) {
+                                    continue;
+                                }
                             }
-                        }
-                        if let Some((xn, xw)) = exclude_target {
-                            if xn == Some(name) && xw == Some(walk) {
-                                continue;
+                            if let Some((xn, xw)) = exclude_target {
+                                if xn == Some(name) && xw == Some(walk) {
+                                    continue;
+                                }
                             }
-                        }
-                        if !f(name, walk, rid) {
-                            return;
+                            if !f(name, walk, rid) {
+                                return;
+                            }
                         }
                     }
                 }
@@ -508,7 +516,7 @@ pub struct GraphRuntime {
             })
             .collect();
         let state = self.state_mut(wg, rid)?;
-        let out = state.ingest_for_speculation(source, &edges);
+        let out = state.ingest_for_speculation(&g, source, &edges);
         state.clear_speculative_inputs();
         Some(out)
     }
@@ -574,6 +582,18 @@ pub struct GraphRuntime {
             })
         };
 
+        // One acquisition for every streaming edge in the batch, not one per
+        // edge inside prep_one. The descriptors do not depend on which rid or
+        // slot ends up claiming them.
+        let all_refs: Vec<Vec<TensorRef>> = {
+            let bk = self.bookkeeping.lock().unwrap();
+            input
+                .streaming_edges
+                .iter()
+                .map(|e| e.uuids.iter().map(|&u| bk.tensor_ref(u)).collect())
+                .collect()
+        };
+
         let mut out = SpecPrepOut::default();
         let mut cols = EdgeColumns::default();
         let mut undo: Vec<(u32, Vec<(u8, bool)>)> = Vec::new();
@@ -601,7 +621,8 @@ pub struct GraphRuntime {
 
             match self.prep_one(
                 wg, rid, spec_node, curr_node, same_node,
-                &input.streaming_edges[slice.clone()], slice.start,
+                &input.streaming_edges[slice.clone()],
+                &all_refs[slice.clone()], slice.start,
             ) {
                 Some((kept, edges, ingested)) => {
                     undo.push((rid, ingested));
@@ -658,7 +679,9 @@ pub struct GraphRuntime {
     /// One rid: ingest its chunks, check readiness, gather inputs. Returns
     /// (consumed indices, input edges, what was ingested) or None after
     /// rolling its own back.
-    #[allow(clippy::type_complexity)]
+    // Flat parameters, as elsewhere here: each is already resolved by the
+    // batch loop, so grouping them would allocate per rid.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn prep_one(
         &mut self,
         wg: WgIndex,
@@ -667,20 +690,23 @@ pub struct GraphRuntime {
         curr_node: NodeId,
         same_node: bool,
         edges: &[EdgeSpecArg],
+        // Parallel to `edges`; resolved once for the whole batch by the caller,
+        // rather than taking the bookkeeping lock per edge in here.
+        refs: &[Vec<TensorRef>],
         base_idx: usize,
     ) -> Option<(Vec<usize>, Vec<(Sym, Vec<u64>, bool)>, Vec<(u8, bool)>)> {
         let g = self.graphs[wg as usize].clone();
-        let tensors_of = |spec: &EdgeSpecArg| -> Vec<TensorRef> {
-            let bk = self.bookkeeping.lock().unwrap();
-            spec.uuids.iter().map(|&u| bk.tensor_ref(u)).collect()
-        };
-        let resolved: Vec<(usize, u8, Vec<TensorRef>, bool)> = edges
+        let resolved: Vec<(usize, u8, &[TensorRef], bool)> = edges
             .iter()
+            .zip(refs)
             .enumerate()
-            .filter_map(|(k, e)| {
+            .filter_map(|(k, (e, t))| {
                 let signal = self.interner.get(&e.signal)?;
                 let slot = g.node(spec_node).slot_of(signal)?;
-                Some((base_idx + k, slot, tensors_of(e), e.is_final_streaming_chunk))
+                Some((
+                    base_idx + k, slot, t.as_slice(),
+                    e.is_final_streaming_chunk,
+                ))
             })
             .collect();
 
@@ -696,7 +722,8 @@ pub struct GraphRuntime {
         let mut ingested = Vec::new();
         for (idx, slot, tensors, final_chunk) in resolved {
             let already = state.has_input(spec_node, slot, false);
-            if state.ingest(spec_node, slot, tensors, same_node, final_chunk) {
+            if state.ingest(&g, spec_node, slot, tensors, same_node, final_chunk)
+            {
                 kept.push(idx);
                 ingested.push((slot, already));
             }
@@ -715,7 +742,7 @@ pub struct GraphRuntime {
                 worker: None,
             })
             .collect();
-        state.ingest_for_speculation(curr_node, &source_edges);
+        state.ingest_for_speculation(&g, curr_node, &source_edges);
         let ready = state.ready_for_speculation(spec_node, same_node, false);
         state.clear_speculative_inputs();
         state.set_spec_scheduled(spec_node, false); // reset if the rid drops
@@ -885,6 +912,17 @@ pub struct GraphRuntime {
 
     fn state_mut(&mut self, wg: WgIndex, rid: u32) -> Option<&mut RequestState> {
         self.states.get_mut(wg as usize)?.get_mut(rid as usize)?.as_mut()
+    }
+
+    /// `state_mut` with the field passed in rather than reached through
+    /// `self`, so a caller can hold `&self.graphs` at the same time. A method
+    /// on `&mut self` borrows the whole struct, which is what forced the walk
+    /// state to keep its own `Arc` and bump its refcount on every call.
+    /// Bounds-checked for the same reason `state_mut` is.
+    fn state_in(
+        states: &mut [Vec<Option<RequestState>>], wg: WgIndex, rid: u32,
+    ) -> Option<&mut RequestState> {
+        states.get_mut(wg as usize)?.get_mut(rid as usize)?.as_mut()
     }
 
     fn info(&self, rid: u32) -> Option<&RequestInfo> {
@@ -1811,8 +1849,9 @@ impl GraphRuntime {
         for (rid, wg_id) in rids.into_iter().zip(wg_ids) {
             let Some(wg) = self.wg_index(wg_id) else { continue };
             let Some(node) = self.nid(wg, node_name) else { continue };
-            if let Some(state) = self.state_mut(wg, rid) {
-                freed.extend(state.clear_consumed_inputs(node));
+            let g = &self.graphs[wg as usize];
+            if let Some(state) = Self::state_in(&mut self.states, wg, rid) {
+                freed.extend(state.clear_consumed_inputs(g, node));
             }
         }
         if freed.is_empty() {
@@ -2119,7 +2158,7 @@ impl GraphRuntime {
             };
             // Before complete(), which clears the flag.
             let was_speculative = state.is_spec_scheduled(node);
-            let completed = state.complete(node, &out_tensors);
+            let completed = state.complete(&g, node, &out_tensors);
             let pre_shard_edges = completed.edges;
             let freed_inputs = completed.freed;
             // A loop that cached this node's outputs holds a reference on
@@ -2305,14 +2344,19 @@ impl GraphRuntime {
                         // local_streaming_signals below.
                         took = true;
                     } else {
-                        let slot =
-                            self.graphs[owner as usize].node(d).slot_of(e.name);
+                        // `owner`, not `wg`: the consumer can live in a
+                        // SIBLING worker graph on this worker.
+                        let owner_g = &self.graphs[owner as usize];
+                        let slot = owner_g.node(d).slot_of(e.name);
                         if let Some(slot) = slot {
-                            if let Some(st) = self.state_mut(owner, rid) {
+                            if let Some(st) =
+                                Self::state_in(&mut self.states, owner, rid)
+                            {
                                 // A declining graph falls through to the wire,
                                 // as Python's `leftover` branch does.
                                 took = st.ingest(
-                                    d, slot, e.tensors.clone(), true, false,
+                                    owner_g, d, slot, &e.tensors,
+                                    true, false,
                                 );
                             }
                         }
@@ -2490,27 +2534,39 @@ impl GraphRuntime {
                 })
                 .collect();
 
+            // Every edge's contribution, accumulated in ONE pass over the
+            // edges. Asking each uuid how many times it appears on each edge
+            // instead was O(owned x edges x tensors) -- and an accumulated loop
+            // output carries one tensor per iteration, so all three grow
+            // together. Python's set_output_ref_counts is a single pass with a
+            // dict, which is what this is.
+            let mut contributed: FxHashMap<u64, i64> = local_counts;
+            for (e, &refs) in edges.iter().zip(&edge_refs) {
+                if refs == 0 {
+                    continue;
+                }
+                for t in &e.tensors {
+                    *contributed.entry(t.uuid).or_insert(0) += refs;
+                }
+            }
+            // Same for the persist marker: a set, built once.
+            let persisted: FxHashSet<u64> = persist_pre
+                .iter()
+                .flat_map(|(_, ts)| ts.iter().map(|t| t.uuid))
+                .collect();
+
             // Settle from the safety hold of 1 to the real fanout. persist is
-            // excluded: those are held by the marker, and counting them would
-            // double-count a signal whose destination is EMPTY_DESTINATION.
+            // excluded from the COUNT: those are held by the marker, and
+            // counting them would double-count a signal whose destination is
+            // EMPTY_DESTINATION.
             {
                 let mut bk = self.bookkeeping.lock().unwrap();
                 for uuid in owned {
-                    let mut count = local_counts.get(&uuid).copied().unwrap_or(0);
-                    for (e, &refs) in edges.iter().zip(&edge_refs) {
-                        if refs == 0 {
-                            continue;
-                        }
-                        count += refs
-                            * e.tensors.iter().filter(|t| t.uuid == uuid).count() as i64;
-                    }
+                    let count = contributed.get(&uuid).copied().unwrap_or(0);
                     // Pre-fanout: a rank whose persist edge the fanout
                     // dropped still holds the tensor for the conductor, and
                     // an unmarked one is dereferenced to zero right here.
-                    if persist_pre
-                        .iter()
-                        .any(|(_, ts)| ts.iter().any(|t| t.uuid == uuid))
-                    {
+                    if persisted.contains(&uuid) {
                         bk.set_persist(uuid, true);
                     }
                     let delta = count - 1;
