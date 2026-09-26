@@ -3,7 +3,7 @@
 Parallel linears (``ColumnParallelLinear``, ``RowParallelLinear``,
 ``MergedColumnParallelLinear``, ``QKVParallelLinear``), vocab-parallel
 embedding (``VocabParallelEmbedding``), and the composed parallel
-``Attention`` / ``GatedMLP`` blocks. Each parallel parameter carries a
+``Attention`` / ``GatedMLP`` / dense ``MLP`` blocks. Each parallel parameter carries a
 ``weight_loader`` attribute used by the model-level weight loader to
 slice checkpoint tensors per-rank on load.
 
@@ -21,7 +21,7 @@ from mstar.model.components.distributed.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from mstar.model.components.distributed.mlp import ParallelGatedMLP
+from mstar.model.components.distributed.mlp import ParallelGatedMLP, ParallelGatedMLPUnfused, ParallelMLP
 
 __all__ = [
     "ColumnParallelLinear",
@@ -31,5 +31,7 @@ __all__ = [
     "ParallelAttention",
     "ParallelCrossAttention",
     "ParallelGatedMLP",
+    "ParallelGatedMLPUnfused",
+    "ParallelMLP",
     "VocabParallelEmbedding",
 ]

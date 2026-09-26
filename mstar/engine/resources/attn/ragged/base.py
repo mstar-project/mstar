@@ -11,6 +11,8 @@ from mstar.engine.resources.base import AttentionResource, EngineResourceInfo
 
 
 class RaggedAttnManager(AttentionResource):
+    prefix_skip_safe = True
+
     # Remains abstract except for build; will build based on the backend.
 
     @classmethod

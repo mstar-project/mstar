@@ -5,11 +5,89 @@ import torch
 
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
-from mstar.engine.resources import ResourceReqConfig, apply_yaml_overrides
+from mstar.engine.resources import (
+    NodeResourceSpec,
+    ResourceReqConfig,
+    apply_yaml_overrides,
+)
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.position.config import PositionSpec, PosScheme
 from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
+
+
+def _refuse_uncacheable_positions(
+    specs: list[NodeResourceSpec], model: Model,
+) -> None:
+    """Refuse a keyed cache whose positions are not sequential.
+
+    A cached page is reusable only at the positions it was written at, since its
+    K is stored already rotated.
+    """
+    declared = set(model.prefix_key_streams())
+    if not declared:
+        return
+    for spec in specs:
+        if not isinstance(spec, PositionSpec):
+            continue
+        cached = declared & spec.depends_on()
+        if cached and spec.config.scheme is not PosScheme.SEQUENTIAL:
+            raise ValueError(
+                f"resource {spec.resource_key!r} places positions by "
+                f"{spec.config.scheme.value}, but it sits over "
+                f"{sorted(cached)}, which the model keyed for prefix reuse; "
+                "either drop the stream or give the resource a sequential "
+                "scheme"
+            )
+
+
+def _refuse_unskippable_resources(
+    specs: list[NodeResourceSpec], model: Model,
+) -> None:
+    """Refuse a declared node carrying a resource that cannot skip a prefix.
+
+    A hit takes the front of a request away from every resource on the node,
+    not just the ones that answered the probe, so one that cannot account for
+    tokens it never saw would plan its step against a sequence that never ran.
+    """
+    declared = set(model.prefix_key_streams())
+    if not declared:
+        return
+    cached_nodes = {
+        node for spec in specs if spec.resource_key in declared
+        for node in spec.nodes
+    }
+    for spec in specs:
+        shared = spec.nodes & cached_nodes
+        if not shared or spec.resource_class.prefix_skip_safe:
+            continue
+        raise ValueError(
+            f"resource {spec.resource_key!r} cannot serve a request whose "
+            f"prefix came from the cache, but it sits on {sorted(shared)}, "
+            "which the model keyed for prefix reuse; either drop the stream "
+            "or give the resource the prefix hooks"
+        )
+
+
+def _refuse_unknown_walks(model: Model) -> None:
+    """Refuse a declared stream that names a walk the model never runs.
+
+    Only the named walks may file pages or be probed, so a name that matches
+    nothing leaves that cache empty for good, and nothing says why.
+    """
+    walks = set(model.get_graph_walk_graphs())
+    for key, by_label in model.prefix_key_streams().items():
+        for label, stream in by_label.items():
+            unknown = sorted(
+                {stream.walk, stream.decode_walk} - walks - {None}
+            )
+            if unknown:
+                raise ValueError(
+                    f"{type(model).__name__} keys {key!r}/{label!r} on "
+                    f"{unknown}, which it never runs; its walks are "
+                    f"{sorted(walks)}"
+                )
 
 
 @dataclass
@@ -42,6 +120,9 @@ class EngineManager:
         """
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, model_config)
+        _refuse_uncacheable_positions(specs, model)
+        _refuse_unskippable_resources(specs, model)
+        _refuse_unknown_walks(model)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to
@@ -93,6 +174,7 @@ class EngineManager:
             device=device,
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
+            model=model,
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 

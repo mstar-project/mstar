@@ -16,6 +16,8 @@ from mstar.engine.resources.step import SlotLease, StepContext
 
 
 class SamplerResource(Resource):
+    prefix_skip_safe = True
+
     # TODO: this is  a light wrapper around mstar/engine/resources/sampler/utils.py. In the future,
     # we should rip out the parts we need from sampling.py and discard the rest.
     def __init__(
@@ -65,6 +67,8 @@ class SamplerResource(Resource):
         # pre-planned a step ahead, promoted by the next non-preplan plan
         self._preplan_cg_sampler: CudaGraphableSampler | None = None
         self._preplanned = False
+        # rid -> the prompt tokens a cache hit kept out of this step's inputs
+        self._cached_prefix: dict[str, torch.Tensor] = {}
 
     @property
     def _penalty_live(self) -> bool:
@@ -128,9 +132,25 @@ class SamplerResource(Resource):
                 rid, sampling_config=self._sampler._sampling_config[rid]
             )
 
+    def apply_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+        inputs, matched_len: int,
+    ) -> None:
+        """Keep the tokens the cache is about to skip, for `plan` to fold in.
+
+        A step declares its tracked tokens from inputs the prefix has already
+        been cut out of, so without these the mask would hold the prompt's tail
+        alone and the penalty would let the model repeat the rest.
+        """
+        del node_name, graph_walk
+        # a walk that prefills from embeddings has no ids to keep
+        if matched_len > 0 and inputs.input_ids is not None:
+            self._cached_prefix[rid] = inputs.input_ids[:matched_len]
+
     def remove_request(self, rid: str):
         self._sampler.remove_request(rid)
         self._penalty_rids.discard(rid)
+        self._cached_prefix.pop(rid, None)
         if self._cg_buffers is not None:
             self._cg_buffers.unregister_request(rid)
 
@@ -186,6 +206,12 @@ class SamplerResource(Resource):
         if not ctx.is_preplan and self._penalty_live:
             for rid, tokens in step.prefill_tracked_tokens.items():
                 self._sampler.get_token_mask(rid).add_tokens(tokens)
+            # dropped as they are used: `plan` runs on every step of a resident
+            # request, and these belong to the one prefill that was cut
+            for rid in ctx.request_ids:
+                skipped = self._cached_prefix.pop(rid, None)
+                if skipped is not None:
+                    self._sampler.get_token_mask(rid).add_tokens(skipped)
 
         # A step planned ahead promotes here. Its static config was gathered in
         # the preplan; the per-step state (RNG offset + seen-token mask) is NOT
