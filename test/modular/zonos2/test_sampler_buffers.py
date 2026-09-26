@@ -92,7 +92,7 @@ def _penalized(logits, rep_ids, penalty):
 @pytest.mark.parametrize("rc", [-1, 2, C])
 def test_single_request_parity_across_window(window, rc):
     params = TTSSamplingParams(
-        repetition_window=window, repetition_penalty=1.2, repetition_codebooks=rc, seed=0,
+        repetition_window=window, repetition_penalty=1.2, repetition_codebooks=rc,
     )
     ref = _RefWindow(params)
     ring = Zonos2SamplerBuffers.allocate(
@@ -126,7 +126,7 @@ def test_midbatch_join_evict_slot_reuse():
     """r0 runs; r1 joins; r0 evicted; r2 joins and reuses r0's slot fresh."""
     window = 4
     params = TTSSamplingParams(
-        repetition_window=window, repetition_penalty=1.3, repetition_codebooks=-1, seed=0,
+        repetition_window=window, repetition_penalty=1.3, repetition_codebooks=-1,
     )
     ref = _RefWindow(params)
     ring = Zonos2SamplerBuffers.allocate(
@@ -173,7 +173,7 @@ def test_padding_rows_do_not_corrupt_master():
     """padded_bs > len(rids): padding rows reuse slot 0 but must not be synced."""
     window = 4
     params = TTSSamplingParams(
-        repetition_window=window, repetition_penalty=1.25, repetition_codebooks=-1, seed=0,
+        repetition_window=window, repetition_penalty=1.25, repetition_codebooks=-1,
     )
     ref = _RefWindow(params)
     ring = Zonos2SamplerBuffers.allocate(

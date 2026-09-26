@@ -277,8 +277,11 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         real_rids = [
             r for r in engine_inputs.request_ids if not r.startswith("__cg_")
         ]
+        # The conductor's per-request seed keys the sampler noise, so sampling
+        # never touches the global CUDA generator.
+        info = engine_inputs.per_request_info
         for rid in real_rids:
-            bufs.register_request(rid)                        # idempotent
+            bufs.register_request(rid, seed=info[rid].random_seed)  # idempotent
         # (3) Gather the real slots into buf[:len(real_rids)]. Padding rows use
         # slot 0.
         bufs.gather_for_request_ids(real_rids, padded_bs=padded_bs)
@@ -338,7 +341,8 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         ``forward_batched`` graph. There is no host sync and no
         ``@torch.compiler.disable``.
 
-        ``(seed, step)`` makes each request reproducible. ``step`` is the frame
+        ``(seed, step)`` makes each request reproducible. ``seed`` is the
+        conductor's ``random_seed``, and ``step`` is the frame
         count of the request (``Zonos2SamplerBuffers.offset``). It does not
         depend on the batch position, so a batched run and a sequential run draw
         the same frame.
@@ -354,7 +358,7 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
             self.params,
             repetition_token_ids=bufs.repetition_ids(pb),
             text_placeholder=self.text_vocab,
-            seed=self.params.seed,
+            seed=bufs.seeds(pb),
             steps=bufs.steps(pb),
         )                                                     # (pb, C + 1)
         bufs.write_frame(frames, padded_bs=pb)

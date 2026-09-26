@@ -98,6 +98,21 @@ def test_batched_equals_per_request_and_position_independent():
     assert torch.equal(out[1], out[2])
 
 
+def test_per_request_seed_tensor_matches_scalar_seeds():
+    # The server passes one seed per row (the conductor's random_seed).
+    B = 4
+    logits = torch.randn(B, C, V)
+    params = TTSSamplingParams(temperature=1.0, topk=V, min_p=0.0)
+    steps = torch.tensor([0, 3, 3, 7])
+    seeds = torch.tensor([11, 22, 22, 2**40 + 5])
+    batched = sample_frame(logits, params, seed=seeds, steps=steps)
+    for i in range(B):
+        one = sample_frame(
+            logits[i:i + 1], params, seed=int(seeds[i]), steps=steps[i:i + 1],
+        )
+        assert torch.equal(one, batched[i:i + 1])
+
+
 # -- filters ----------------------------------------------------------------
 def test_apply_top_p_keeps_nucleus_and_renormalizes():
     probs = torch.tensor([[0.6, 0.3, 0.08, 0.02]])

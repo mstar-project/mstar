@@ -38,7 +38,6 @@ class TTSSamplingParams:
     # The repetition penalty applies to codebooks 0 to repetition_codebooks - 1.
     # A negative value applies it to all codebooks.
     repetition_codebooks: int = 8
-    seed: int | None = None
 
 
 def apply_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
@@ -114,7 +113,7 @@ def _fmix32(h: torch.Tensor) -> torch.Tensor:
 
 def _deterministic_uniform(
     B: int, C: int, V: int,
-    seed: int, steps: torch.Tensor,
+    seed: int | torch.Tensor, steps: torch.Tensor,
     device: torch.device, dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Return reproducible ``U[0, 1)`` noise of shape ``(B, C, V)``.
@@ -122,12 +121,16 @@ def _deterministic_uniform(
     A counter-based hash keys the noise only on ``(seed, step, codebook,
     vocab)``. It does not use the batch position. The noise for request ``b`` at
     ``steps[b]`` is therefore the same alone or in any batch. ``steps`` is the
-    step index of each request, of shape ``(B,)``.
+    step index of each request, of shape ``(B,)``. ``seed`` is one int for the
+    batch, or one per request ``(B,)``.
     """
     v = torch.arange(V, device=device, dtype=torch.int64).view(1, 1, V)
     c = torch.arange(C, device=device, dtype=torch.int64).view(1, C, 1)
     s = steps.to(device=device, dtype=torch.int64).view(B, 1, 1)
-    base = int(seed) & _M32
+    if isinstance(seed, torch.Tensor):
+        base = seed.to(device=device, dtype=torch.int64).view(B, 1, 1) & _M32
+    else:
+        base = int(seed) & _M32
     # The chained fmix32 rounds mix every field into the result.
     h = (v * 0x27D4EB2F) & _M32
     h = _fmix32(h ^ (c * 0x85EBCA77))
@@ -141,7 +144,7 @@ def sample_frame(
     params: TTSSamplingParams,
     repetition_token_ids: torch.Tensor | None = None,
     text_placeholder: int = 0,
-    seed: int | None = None,
+    seed: int | torch.Tensor | None = None,
     steps: torch.Tensor | int | None = None,
 ) -> torch.Tensor:
     """Sample one frame for each request from the per-codebook logits.
@@ -152,9 +155,10 @@ def sample_frame(
         repetition_token_ids: the recent tokens ``(B, C, W)``, or None. A ``-1``
             marks a padded or ignored slot.
         text_placeholder: the value to write into the appended text column.
-        seed: the base RNG seed, shared across the batch. ``None`` uses the
-            global RNG, which is not reproducible. This matches a request with
-            no seed.
+        seed: the base RNG seed, one int for the batch or one per request
+            ``(B,)``. ``None`` uses the global CUDA generator, which is not
+            reproducible; the server never passes it, because a failed graph
+            capture on torch 2.9 can leave that generator unusable.
         steps: the step index of each request, of shape ``(B,)``. An int or
             ``None`` maps to 0. With ``seed`` set, ``(seed, step)`` fully
             determines the draw of a request, whatever its batch position.

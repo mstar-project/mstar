@@ -25,6 +25,8 @@ Each request has two pieces of state:
   code is always ``>= 0``. The repetition penalty tests only whether a token is
   present (``counts > 0`` in :func:`apply_repetition_penalty`), so the ring
   needs no separate fill count and gives the same penalty as a plain window.
+* The seed ``seed[cap]`` (int64), the conductor's ``random_seed``. It is set at
+  register time and never changes, so the sync does not write it back.
 * The offset ``offset[cap]`` (int64). This is the frame count of the request,
   which is also the RNG ``step`` index. The code reads it before the write and
   increments it in place afterwards. It therefore does not depend on the batch
@@ -59,6 +61,9 @@ class Zonos2SamplerBuffers:
     # The frame count and RNG step of each request (int64).
     offset_master: torch.Tensor  # [capacity]
     offset_buf: torch.Tensor     # [max_bs]
+    # The RNG seed of each request (int64).
+    seed_master: torch.Tensor    # [capacity]
+    seed_buf: torch.Tensor       # [max_bs]
 
     # Static staging for the penalty input, with the exclusion mask. ``pen_buf``
     # is a masked copy of ``ring_buf``.
@@ -111,6 +116,8 @@ class Zonos2SamplerBuffers:
             cursor_buf=torch.zeros(max_batch_size, dtype=torch.int32, device=device),
             offset_master=torch.zeros(cap, dtype=torch.int64, device=device),
             offset_buf=torch.zeros(max_batch_size, dtype=torch.int64, device=device),
+            seed_master=torch.zeros(cap, dtype=torch.int64, device=device),
+            seed_buf=torch.zeros(max_batch_size, dtype=torch.int64, device=device),
             pen_buf=ring(max_batch_size),
             _rc_exclude=rc_exclude,
             _slot_idx_cpu=torch.zeros(max_batch_size, dtype=torch.int64, pin_memory=pinned),
@@ -121,8 +128,8 @@ class Zonos2SamplerBuffers:
         )
 
     # -- slot lifecycle -------------------------------------------------
-    def register_request(self, rid: str) -> None:
-        """Assign a slot to ``rid`` and reset its master state.
+    def register_request(self, rid: str, seed: int = 0) -> None:
+        """Assign a slot to ``rid``, reset its master state, and store its seed.
 
         This method runs outside the graph.
         """
@@ -135,6 +142,7 @@ class Zonos2SamplerBuffers:
         self.ring_master[slot].fill_(-1)
         self.cursor_master[slot] = 0
         self.offset_master[slot] = 0
+        self.seed_master[slot] = seed
 
     def unregister_request(self, rid: str) -> None:
         """Release the slot of ``rid``.
@@ -167,6 +175,10 @@ class Zonos2SamplerBuffers:
         new_offset[:old].copy_(self.offset_master)
         self.offset_master = new_offset
 
+        new_seed = torch.zeros(new_capacity, dtype=torch.int64, device=dev)
+        new_seed[:old].copy_(self.seed_master)
+        self.seed_master = new_seed
+
         self._free_slots.extend(range(old, new_capacity))
         self._master_capacity = new_capacity
 
@@ -192,6 +204,7 @@ class Zonos2SamplerBuffers:
         torch.index_select(self.ring_master, 0, idx, out=self.ring_buf[:padded_bs])
         torch.index_select(self.cursor_master, 0, idx, out=self.cursor_buf[:padded_bs])
         torch.index_select(self.offset_master, 0, idx, out=self.offset_buf[:padded_bs])
+        torch.index_select(self.seed_master, 0, idx, out=self.seed_buf[:padded_bs])
 
     # -- reads (graph-safe) ---------------------------------------------
     def steps(self, padded_bs: int) -> torch.Tensor:
@@ -200,6 +213,10 @@ class Zonos2SamplerBuffers:
         The step index is the frame count of the request.
         """
         return self.offset_buf[:padded_bs]
+
+    def seeds(self, padded_bs: int) -> torch.Tensor:
+        """Return the RNG seed of each request."""
+        return self.seed_buf[:padded_bs]
 
     def repetition_ids(self, padded_bs: int) -> torch.Tensor:
         """Return the recent ids ``[padded_bs, C, W]`` for the penalty.

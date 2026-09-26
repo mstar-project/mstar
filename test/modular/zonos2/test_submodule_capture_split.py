@@ -24,6 +24,7 @@ buffers), so a tiny parameter-only stand-in model supplies ``get_device()``.
 """
 from __future__ import annotations
 
+import zlib
 from types import SimpleNamespace
 
 import pytest
@@ -49,10 +50,10 @@ class _FakeModel(nn.Module):
         self._p = nn.Parameter(torch.zeros(1, device=DEVICE))
 
 
-def _params(window=4, penalty=1.3, rc=-1, seed=0) -> TTSSamplingParams:
+def _params(window=4, penalty=1.3, rc=-1) -> TTSSamplingParams:
     return TTSSamplingParams(
         repetition_window=window, repetition_penalty=penalty,
-        repetition_codebooks=rc, seed=seed, temperature=1.0, topk=0, min_p=0.0,
+        repetition_codebooks=rc, temperature=1.0, topk=0, min_p=0.0,
     )
 
 
@@ -63,8 +64,14 @@ def _sub(params: TTSSamplingParams) -> Zonos2LLMSubmodule:
     )
 
 
+def _seed(rid):
+    """A distinct conductor ``random_seed`` per request."""
+    return zlib.crc32(rid.encode())
+
+
 def _engine_inputs(request_ids):
-    return SimpleNamespace(request_ids=request_ids)
+    info = {rid: SimpleNamespace(random_seed=_seed(rid)) for rid in request_ids}
+    return SimpleNamespace(request_ids=request_ids, per_request_info=info)
 
 
 def _padded_rids(rids, padded_bs):
@@ -80,14 +87,14 @@ def _inline_step(buf, rids, logits, params):
     The frozen reference for what the deferred split must reproduce.
     """
     for rid in rids:
-        buf.register_request(rid)
+        buf.register_request(rid, seed=_seed(rid))
     pb = len(rids)
     buf.gather_for_request_ids(rids, padded_bs=pb)
     frames = sample_frame(
         logits, params,
         repetition_token_ids=buf.repetition_ids(pb),
         text_placeholder=TEXT_VOCAB,
-        seed=params.seed, steps=buf.steps(pb),
+        seed=buf.seeds(pb), steps=buf.steps(pb),
     )
     buf.write_frame(frames, padded_bs=pb)
     buf.sync_after_step(rids)
@@ -262,7 +269,7 @@ def test_captured_sampler_matches_eager_token_for_token(reals, padded_bs):
     pre-Phase-3; this pins that folding the sampler in preserves behavior.
     """
     dev = "cuda"
-    params = _params(window=4, penalty=1.3, seed=0)
+    params = _params(window=4, penalty=1.3)
     params.temperature, params.topk, params.min_p = 1.0, 8, 0.1  # exercise filters
     rids = [f"r{i}" for i in range(reals)]
     padded = _padded_rids(rids, padded_bs)
@@ -357,3 +364,52 @@ def test_batch_over_capacity_raises_instead_of_resizing():
     rids = [f"r{i}" for i in range(cap + 1)]
     with pytest.raises(RuntimeError, match="exceeds the sampler capacity"):
         sub._prepare_sampler_step(_engine_inputs(rids), padded_bs=cap + 1)
+
+
+# --------------------------------------------------------------------------
+# Seeding: the conductor's random_seed drives sampling, not the global RNG.
+def _draw(sub, rids, logits_stream, seeds):
+    ei = SimpleNamespace(
+        request_ids=rids,
+        per_request_info={
+            r: SimpleNamespace(random_seed=s) for r, s in zip(rids, seeds, strict=True)
+        },
+    )
+    out = []
+    for lg in logits_stream:
+        sub._prepare_sampler_step(ei, padded_bs=len(rids))
+        out.append(sub._sample_in_graph(lg.clone()))
+    return torch.stack(out)
+
+
+def test_sampling_never_touches_global_rng(monkeypatch):
+    # A failed capture on torch 2.9 leaves the global CUDA generator raising
+    # on every eager draw; the sampler must not depend on it.
+    def boom(*a, **kw):
+        raise AssertionError("sampler used the global RNG")
+
+    monkeypatch.setattr(torch, "rand", boom)
+    logits = [torch.randn(2, C, V) for _ in range(3)]
+    _draw(_sub(_params()), ["a", "b"], logits, [1, 2])
+
+
+def test_random_seed_controls_the_draw():
+    gen = torch.Generator(device=DEVICE).manual_seed(0)
+    logits = [torch.randn(2, C, V, generator=gen) for _ in range(6)]
+    first = _draw(_sub(_params()), ["a", "b"], logits, [7, 8])
+    again = _draw(_sub(_params()), ["x", "y"], logits, [7, 8])
+    other = _draw(_sub(_params()), ["a", "b"], logits, [9, 10])
+    assert torch.equal(first, again)       # same seeds, other rids -> same frames
+    assert not torch.equal(first, other)   # other seeds -> different frames
+
+
+def test_seed_survives_master_growth():
+    buf = Zonos2SamplerBuffers.allocate(
+        max_batch_size=4, n_codebooks=C, window=4, repetition_codebooks=-1,
+        device=DEVICE, capacity=1,
+    )
+    buf.register_request("a", seed=123)
+    buf.register_request("b", seed=456)  # grows master past capacity 1
+    buf.gather_for_request_ids(["a", "b"], padded_bs=2)
+    assert buf.seeds(2).tolist() == [123, 456]
+
