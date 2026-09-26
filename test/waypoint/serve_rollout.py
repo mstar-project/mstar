@@ -25,19 +25,21 @@ allocator warmup.
 
 Deployment details the checked-in config cannot carry are supplied here instead:
 
-  * Local mode adds ``model_kwargs.checkpoint_dir`` / ``ae_path``. Hub mode
-    omits both, exercising the registry's variant-to-repository mapping, and
-    can forward ``--cache-dir`` to Hugging Face.
+  * ``--source hub`` (default) omits ``model_kwargs.checkpoint_dir`` / ``ae_path``,
+    exercising the registry's variant-to-repository mapping, and can forward
+    ``--cache-dir`` to Hugging Face. ``--source local`` requires explicit
+    ``--checkpoint-dir`` and ``--ae-path``; there is no default local checkpoint
+    root.
   * A 16:9 seed: ``WaypointModel.load_image`` decodes without resizing and
-    ``_seed_clip`` refuses any other ratio, so the shipped asset is resized to
+    ``_seed_clip`` refuses any other ratio, so ``--seed-image`` is resized to
     the selected variant's output geometry first.
 
     CUDA_VISIBLE_DEVICES=2 python3 test/waypoint/serve_rollout.py \
         --variant 720p --steps 8 --worlds 2 --concurrent-waves 4 \
-        --measure-memory --physical-gpu 2
+        --measure-memory --physical-gpu 2 --seed-image /path/to/seed.jpg
 
     CUDA_VISIBLE_DEVICES=2 python3 test/waypoint/serve_rollout.py \
-        --variant 360p --steps 8
+        --variant 360p --steps 8 --seed-image /path/to/seed.jpg
 """
 
 from __future__ import annotations
@@ -61,7 +63,6 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = REPO / "configs/waypoint.yaml"
-DEFAULT_ROOT = Path("/mnt/storage/garv901/waypoint-1.5-1B/checkpoints")
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
@@ -74,11 +75,6 @@ class Variant:
     height: int
     width: int
     tokens_per_frame: int
-    checkpoint_name: str
-
-    @property
-    def checkpoint_dir(self) -> Path:
-        return DEFAULT_ROOT / self.checkpoint_name
 
 
 @dataclass(frozen=True)
@@ -111,14 +107,12 @@ VARIANTS = {
         height=360,
         width=640,
         tokens_per_frame=128,
-        checkpoint_name="Waypoint-1.5-1B-360P",
     ),
     "720p": Variant(
         model_variant="waypoint-1.5-1b-720p",
         height=720,
         width=1280,
         tokens_per_frame=512,
-        checkpoint_name="Waypoint-1.5-1B",
     ),
 }
 
@@ -798,17 +792,18 @@ def main() -> int:
     parser.add_argument(
         "--source",
         choices=("local", "hub"),
-        default="local",
-        help="local paths (default) or the registry's variant-specific Hub repositories",
+        default="hub",
+        help="the registry's variant-specific Hub repositories (default) or local paths, "
+        "which must then be given via --checkpoint-dir/--ae-path",
     )
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,
-        help="checkpoint override; defaults to the selected variant under the checkpoint root",
+        help="checkpoint directory; required with --source local",
     )
-    parser.add_argument("--ae-path", type=Path, help="local TAEHV override")
+    parser.add_argument("--ae-path", type=Path, help="local TAEHV override; required with --source local")
     parser.add_argument("--cache-dir", type=Path, help="Hugging Face download cache")
-    parser.add_argument("--seed-image", type=Path, default=DEFAULT_ROOT / "seed/default.jpg")
+    parser.add_argument("--seed-image", type=Path, required=True)
     parser.add_argument(
         "--steps",
         "--frames",
@@ -874,11 +869,13 @@ def main() -> int:
         parser.error("memory growth limits cannot be negative")
     if args.source == "hub" and (args.checkpoint_dir is not None or args.ae_path is not None):
         parser.error("--source hub cannot be combined with --checkpoint-dir or --ae-path")
+    if args.source == "local" and (args.checkpoint_dir is None or args.ae_path is None):
+        parser.error("--source local requires both --checkpoint-dir and --ae-path")
 
     variant = VARIANTS[args.variant]
     if args.source == "local":
-        checkpoint_dir = args.checkpoint_dir or variant.checkpoint_dir
-        ae_path = args.ae_path or DEFAULT_ROOT / "taehv1_5"
+        checkpoint_dir = args.checkpoint_dir
+        ae_path = args.ae_path
         weight_source = str(checkpoint_dir)
     else:
         checkpoint_dir = None

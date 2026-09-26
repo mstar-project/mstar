@@ -14,6 +14,7 @@ Example:
 
     CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python3 benchmark/waypoint/benchmark_streaming.py \
         --variant 360p --physical-gpu 2 --steps 16 \
+        --seed-image /path/to/seed.jpg \
         --artifact /tmp/waypoint-streaming-360p.json \
         --save-videos /tmp/waypoint-streaming-360p-videos
 """
@@ -767,13 +768,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=rollout.DEFAULT_CONFIG)
     parser.add_argument("--variant", choices=sorted(rollout.VARIANTS), required=True)
-    parser.add_argument("--source", choices=("local", "hub"), default="local")
-    parser.add_argument("--checkpoint-dir", type=Path)
-    parser.add_argument("--ae-path", type=Path)
-    parser.add_argument("--cache-dir", type=Path)
     parser.add_argument(
-        "--seed-image", type=Path, default=rollout.DEFAULT_ROOT / "seed/default.jpg"
+        "--source",
+        choices=("local", "hub"),
+        default="hub",
+        help="the registry's variant-specific Hub repositories (default) or local paths, "
+        "which must then be given via --checkpoint-dir/--ae-path",
     )
+    parser.add_argument(
+        "--checkpoint-dir", type=Path, help="checkpoint directory; required with --source local"
+    )
+    parser.add_argument(
+        "--ae-path", type=Path, help="local TAEHV override; required with --source local"
+    )
+    parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--seed-image", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=16)
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument(
@@ -880,6 +889,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--port must be between 0 and 65535")
     if args.source == "hub" and (args.checkpoint_dir is not None or args.ae_path is not None):
         parser.error("--source hub cannot be combined with --checkpoint-dir or --ae-path")
+    if args.source == "local" and (args.checkpoint_dir is None or args.ae_path is None):
+        parser.error("--source local requires both --checkpoint-dir and --ae-path")
     return args
 
 
@@ -892,8 +903,8 @@ def _resolve_stall_threshold(args: argparse.Namespace) -> float:
 def _run_benchmark(args: argparse.Namespace) -> dict:
     variant = rollout.VARIANTS[args.variant]
     if args.source == "local":
-        checkpoint_dir = args.checkpoint_dir or variant.checkpoint_dir
-        ae_path = args.ae_path or rollout.DEFAULT_ROOT / "taehv1_5"
+        checkpoint_dir = args.checkpoint_dir
+        ae_path = args.ae_path
         weight_source = str(checkpoint_dir)
     else:
         checkpoint_dir = None

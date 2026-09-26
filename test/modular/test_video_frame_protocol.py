@@ -427,20 +427,19 @@ def test_rollout_harness_requires_exactly_four_frames_per_step_from_index_zero()
 
 
 @pytest.mark.parametrize(
-    ("name", "model_variant", "height", "width", "tokens", "checkpoint_name"),
+    ("name", "model_variant", "height", "width", "tokens"),
     [
-        ("360p", "waypoint-1.5-1b-360p", 360, 640, 128, "Waypoint-1.5-1B-360P"),
-        ("720p", "waypoint-1.5-1b-720p", 720, 1280, 512, "Waypoint-1.5-1B"),
+        ("360p", "waypoint-1.5-1b-360p", 360, 640, 128),
+        ("720p", "waypoint-1.5-1b-720p", 720, 1280, 512),
     ],
 )
-def test_rollout_harness_variant_controls_config_and_checkpoint_default(
+def test_rollout_harness_variant_controls_config_and_checkpoint_paths(
     tmp_path,
     name,
     model_variant,
     height,
     width,
     tokens,
-    checkpoint_name,
 ):
     harness = runpy.run_path(str(Path(__file__).parents[1] / "waypoint" / "serve_rollout.py"))
     variant = harness["VARIANTS"][name]
@@ -472,7 +471,6 @@ def test_rollout_harness_variant_controls_config_and_checkpoint_default(
         width,
     )
     assert variant.tokens_per_frame == tokens
-    assert variant.checkpoint_dir.name == checkpoint_name
     assert generated["model_kwargs"] == {
         "variant": model_variant,
         "compile_dit": True,

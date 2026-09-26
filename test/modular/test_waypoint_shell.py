@@ -780,15 +780,17 @@ def test_validate_config_yaml_accepts_a_deployment_inside_its_pool(
     }
 
 
-def test_the_shipped_config_serializes_both_nodes_onto_one_rank(model):
-    """``configs/waypoint.yaml`` is the deployment and must pass its own gate.
+@pytest.mark.parametrize("config_name", ["waypoint.yaml", "waypoint_360p.yaml"])
+def test_the_shipped_config_serializes_both_nodes_onto_one_rank(model, config_name):
+    """``configs/waypoint.yaml`` and ``configs/waypoint_360p.yaml`` are the two
+    shipped deployments and each must pass its own gate.
 
     Both nodes in one group, on rank 0: a node missing from ``node_groups``
     has no rank to run on. There's no decoder node to put a worker boundary
     in front of -- decode is fused into the dit's forward -- so a rank split
     inside the rollout loop isn't expressible any more.
     """
-    path = pathlib.Path(__file__).resolve().parents[2] / "configs" / "waypoint.yaml"
+    path = pathlib.Path(__file__).resolve().parents[2] / "configs" / config_name
 
     _validate(model, str(path))
     graphs = model.get_worker_graphs(str(path))
