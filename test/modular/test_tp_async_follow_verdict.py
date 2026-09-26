@@ -135,7 +135,7 @@ def _pending(tp_seq, future=None, admit_error=None, failed_requests=()):
     ``ExecutingBatch`` the way the GPU thread leaves them."""
     return types.SimpleNamespace(
         node_name=NODE, graph_walk=WALK, tp_seq=tp_seq, future=future,
-        batch=types.SimpleNamespace(node_objects={"r0": object()}),
+        batch=types.SimpleNamespace(request_to_worker_graph={"r0": "wg0"}),
         node_batch=types.SimpleNamespace(
             admit_error=admit_error,
             failed_requests={rid: "boom" for rid in failed_requests},

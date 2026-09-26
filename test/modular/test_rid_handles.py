@@ -17,7 +17,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker.micro_scheduler import REMOVED_RID, MicroScheduler
 from mstar.worker.rid_table import RidTable
-from mstar.worker.worker import PendingLoopStop, Worker
+from mstar.worker.worker import Worker
 
 # ── the table ──────────────────────────────────────────────────────────────
 
@@ -110,22 +110,33 @@ def test_follow_refcount_skips_unknown_rids():
 
 
 def _worker(*rids: str) -> tuple[Worker, RidTable]:
+    """A worker whose graph runtime is only the rid table: the boundary is
+    what these tests are about, and the runtime owns the table."""
     t = RidTable()
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
     w.is_tp_follower = False
     w.sent = []
     w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
-    w._rids = t
+    w.removed_in_runtime = []
+
+    def _runtime_remove(h):
+        # The handle must be freed only after every worker-side map dropped it.
+        assert h not in w.request_state.per_request_info
+        w.removed_in_runtime.append(h)
+        t.release(h)
+
+    w._graph_runtime = SimpleNamespace(
+        get_rid_handle=t.handle, get_rid_string=t.name,
+        get_sharding_config=lambda h: SimpleNamespace(groups=[]),
+        remove_request=_runtime_remove,
+    )
     w.scheduler = MicroScheduler(engine_manager=None)
     w.scheduler.rid_of = t.handle
     handles = [t.intern(r) for r in rids]
-    w.worker_graphs_manager = SimpleNamespace(
-        per_request_info={
-            h: SimpleNamespace(sharding_config=SimpleNamespace(groups=[]))
-            for h in handles
-        },
-        remove_request=lambda h: w.worker_graphs_manager.per_request_info.pop(h),  # noqa: PLW0108
+    w.request_state = SimpleNamespace(
+        per_request_info={h: SimpleNamespace() for h in handles},
+        remove_request=lambda h: w.request_state.per_request_info.pop(h),  # noqa: PLW0108
     )
     return w, t
 
@@ -147,7 +158,6 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._in_flight_rids = set()
     w._pending_removes = set()
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w._pending_loop_stops = {PendingLoopStop(a, "w", "l"), PendingLoopStop(b, "w", "l")}
     w._last_active = {}
     w.streaming_buffers = {a: {}}
     w.engine_manager = SimpleNamespace(remove_request=lambda h: None, evictable_nodes=lambda: [])
@@ -157,7 +167,8 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
 
     w._remove_request(RemoveRequest(request_id="req-a", source=MessageSource.SELF))
 
-    assert w._pending_loop_stops == {PendingLoopStop(b, "w", "l")}
+    assert w.removed_in_runtime == [a]
+    assert b in w.request_state.per_request_info
     assert a not in w.streaming_buffers
     assert a not in w.scheduler.held_until
     # Freed last, and reused by the next request: nothing of req-a's may remain.
@@ -168,7 +179,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
 def test_remove_for_an_unknown_request_is_a_no_op():
     w, _ = _worker("req-a")
     w._remove_request(RemoveRequest(request_id="gone", source=MessageSource.SELF))
-    assert len(w.worker_graphs_manager.per_request_info) == 1
+    assert len(w.request_state.per_request_info) == 1
 
 
 def test_tensor_ack_is_keyed_by_uuid_alone():
