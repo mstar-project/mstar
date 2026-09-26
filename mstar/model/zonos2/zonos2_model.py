@@ -500,7 +500,9 @@ class Zonos2Model(Model):
     def get_default_sharding_config(self):
         from mstar.distributed.base import ShardingConfig
 
-        return ShardingConfig(groups=[], tp_enabled_nodes={_LLM}, shard_dim={})
+        # TP is suspended until expert parallelism lands. Ranks sample frames
+        # independently (noise, then a hang on EOS), and the MoE is replicated.
+        return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
 
     # ------------------------------------------------------------------
     # Model ABC: submodule construction

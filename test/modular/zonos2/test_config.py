@@ -81,3 +81,25 @@ def test_load_rejects_invalid_special_topk():
 def test_overrides_win_over_checkpoint():
     cfg = load_zonos2_config({"dim": 64, "n_layers": 4}, num_layers=99)
     assert cfg.num_layers == 99
+
+
+# -- tensor parallelism ----------------------------------------------------
+def test_tp_config_is_rejected(tmp_path):
+    # TP is suspended until expert parallelism lands: ranks would sample
+    # independently and diverge.
+    import yaml
+
+    from mstar.model.zonos2.zonos2_model import Zonos2Model
+
+    cfg = {
+        "model": "zonos2",
+        "node_groups": [{
+            "node_names": ["LLM"], "ranks": [0, 1], "tp_size": 2,
+            "graph_walks": ["prefill", "prefill_clone", "decode"],
+        }],
+    }
+    path = tmp_path / "zonos2_tp2.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+    model = Zonos2Model("Zyphra/ZONOS2", config=Zonos2Config(), skip_weight_loading=True)
+    with pytest.raises(ValueError, match="tp_enabled_nodes"):
+        model.get_sharding_config(str(path))

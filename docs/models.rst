@@ -256,3 +256,5 @@ Zonos2 environment requirements
 - Clone requests send reference audio (``audio=...`` with ``"audio"`` in
   ``input_modalities``). A client that caches the returned embedding can pass it back as the
   ``speaker_embedding`` model kwarg to skip the encoder.
+- **Single GPU only.** Tensor parallelism is disabled until expert parallelism lands; a
+  config with ``tp_size > 1`` is rejected at load.
