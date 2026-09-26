@@ -122,6 +122,7 @@ class WaypointModel(Model):
         step_batch_size: int | None = None,
         checkpoint_revision: str | None = None,
         ae_revision: str | None = None,
+        seed_capture_sizes: tuple[tuple[int, int], ...] | None = None,
     ):
         if variant not in _VARIANT_FACTORIES:
             raise NotImplementedError(
@@ -146,6 +147,7 @@ class WaypointModel(Model):
                 "capture_dit_prime": capture_dit_prime,
                 "full_global_ring": full_global_ring,
                 "step_batch_size": step_batch_size,
+                "seed_capture_sizes": seed_capture_sizes,
             }.items() if value is not None
         }
         self.config: WaypointConfig = replace(config, **overrides)
@@ -533,6 +535,7 @@ class WaypointModel(Model):
         return {
             "is_prefill": metadata.is_prefill,
             "num_steps": metadata.kwargs["num_steps"],
+            "seed_hw": metadata.kwargs.get("seed_hw"),
         }
 
     def get_initial_forward_pass_args(
@@ -563,10 +566,15 @@ class WaypointModel(Model):
             raise ValueError("Waypoint cannot start without its required seed clip.")
         schedule = [PRIME_WALK, ROLLOUT_WALK]
 
+        # ``dims`` is ``[H, W, 3]`` or ``[T, H, W, 3]``; read by the encoder's ``cg_key_info``.
+        dims = input_signals["image_inputs"][0].dims
+        seed_hw = (int(dims[-3]), int(dims[-2]))
+
         kwargs = {
             "walk_schedule": schedule,
             "walk_step": 0,
             "num_steps": self._resolve_num_steps(model_kwargs),
+            "seed_hw": seed_hw,
         }
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=["tensor"],

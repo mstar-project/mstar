@@ -125,6 +125,7 @@ def _run_config(
     out: Path,
     worlds: int = 1,
     batch: int = 1,
+    seed_capture_sizes: list[list[int]] | None = None,
 ) -> Path:
     """Build one deployment config without modifying the checked-in YAML."""
     if worlds < 1:
@@ -139,6 +140,8 @@ def _run_config(
         "variant": variant.model_variant,
         "step_batch_size": batch,
     }
+    if seed_capture_sizes is not None:
+        model_kwargs["seed_capture_sizes"] = seed_capture_sizes
     # Hub mode must not inherit checkpoint_dir/ae_path from the base config --
     # omitting both is what exercises the registry's variant -> repository
     # selection.

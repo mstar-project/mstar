@@ -696,9 +696,9 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         return {"latent": [latent.unsqueeze(1)]}
 
     @property
-    def _captured_image_shape(self) -> tuple[int, int, int, int]:
-        """The one ``image`` shape ``get_cuda_graph_configs`` captures."""
-        return (self.config.temporal_compression, *self.pixel_size, 3)
+    def _capture_hw(self) -> tuple[tuple[int, int], ...]:
+        """Native ``pixel_size`` plus ``seed_capture_sizes``; one bucket each."""
+        return tuple(sorted({self.pixel_size, *self.config.seed_capture_sizes}))
 
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
@@ -706,28 +706,41 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         del tp_world_size
         if not self.config.cuda_graph:
             return []
-        image = torch.zeros(
-            self._captured_image_shape, dtype=self.ae_dtype, device=device,
-        )
-        return [BatchedCudaGraphConfig(
-            capture_graph_walk=PRIME_WALK,
-            single_request_inputs=NodeInputs(
-                tensor_inputs={"image": image},
-                input_seq_len=self.config.temporal_compression,
-            ),
-            capture_batch_sizes=[1],
-            capture_forward_method="forward_batched",
-            compile=True,
-        )]
+        configs = []
+        for h, w in self._capture_hw:
+            image = torch.zeros(
+                (self.config.temporal_compression, h, w, 3),
+                dtype=self.ae_dtype, device=device,
+            )
+            configs.append(BatchedCudaGraphConfig(
+                capture_graph_walk=PRIME_WALK,
+                single_request_inputs=NodeInputs(
+                    tensor_inputs={"image": image},
+                    input_seq_len=self.config.temporal_compression,
+                ),
+                capture_batch_sizes=[1],
+                capture_forward_method="forward_batched",
+                compile=True,
+                additional_key_info=(h, w),
+            ))
+        return configs
 
-    def can_use_cuda_graphs(self, batch, model_inputs) -> bool:
-        """``_seed_clip`` accepts any 16:9 size, but the graph's static
-        buffer is sized for exactly one H/W (``pixel_size``). A batch with
-        any other image shape must run eager, where ``encode_seed_clip``
-        resizes it to ``encoded_size``."""
-        if not super().can_use_cuda_graphs(batch, model_inputs):
-            return False
-        return all(
-            node_inputs.tensor_inputs["image"].shape == self._captured_image_shape
-            for node_inputs in model_inputs
-        )
+    def cg_key_info(
+        self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> tuple[int, int] | None:
+        """The captured (H, W) bucket for this batch's seed, or None for eager.
+
+        The seed shape isn't on ``model_inputs`` at lease time, so it is read
+        off ``step_metadata["seed_hw"]``, set by ``get_initial_forward_pass_args``."""
+        if graph_walk != PRIME_WALK:
+            return None
+        sizes = set()
+        for info in per_request_info.values():
+            seed_hw = info.step_metadata.get("seed_hw")
+            if seed_hw is None:
+                return None
+            sizes.add(tuple(seed_hw))
+        if len(sizes) != 1:
+            return None
+        size = sizes.pop()
+        return size if size in self._capture_hw else None

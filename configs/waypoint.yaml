@@ -5,6 +5,8 @@ model_kwargs:
   reference_compat: true
   compile_dit: true
   cuda_graph: true
+  # Extra (H, W) seed shapes with their own vae_encoder graph; ~15 s startup each.
+  seed_capture_sizes: [[360, 640], [540, 960], [1080, 1920]]
   full_global_ring: false
   # Rows per rollout step; must be <= resources.kv.num_sessions below.
   step_batch_size: 1

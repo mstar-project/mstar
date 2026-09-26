@@ -28,20 +28,24 @@ import yaml
 sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionSpec,
     AttnBackend,
     KVSpec,
     RingKVConfig,
     RingKVStep,
-    StepContext,
 )
 from mstar.engine.resources.runner import topo_sort
-from mstar.graph.base import GraphEdge, Loop, Sequential, SpeculativeNodeInfo
+from mstar.graph.base import (
+    GraphEdge,
+    Loop,
+    Sequential,
+    SpeculativeNodeInfo,
+    TensorPointerInfo,
+)
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
+from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.model.waypoint.components.attention import WaypointAttention
 from mstar.model.waypoint.components.dit import WaypointDiT
 from mstar.model.waypoint.components.taehv import decode_latent, initial_decoder_histories
@@ -1190,32 +1194,82 @@ def test_the_encoder_emits_the_dit_s_priming_latent(encoder, ae_config):
     assert latent.dtype == torch.bfloat16
 
 
-def _batch(graph_walk: str) -> ExecutingBatch:
-    return ExecutingBatch(
-        node_name="Encoder",
-        step_context=StepContext(
-            request_ids=("r0",), graph_walk=graph_walk, slot=None,
-            capture=False, plan_results={},
-        ),
-        per_request_info={},
+def _seed_hw_info(
+    request_id: str = "r0", *, seed_hw, graph_walk: str = PRIME_WALK,
+) -> CurrentForwardPassInfo:
+    return CurrentForwardPassInfo(
+        request_id=request_id,
+        graph_walk=graph_walk,
+        fwd_index=0,
+        random_seed=0,
+        max_tokens=0,
+        step_metadata={"seed_hw": seed_hw},
     )
 
 
-def _image_inputs(shape: tuple[int, int, int, int]) -> list[NodeInputs]:
-    return [NodeInputs(tensor_inputs={"image": torch.zeros(shape)})]
+def test_encoder_captures_one_config_per_seed_size(taehv_weights, ae_config):
+    multi = dataclasses.replace(
+        ae_config, seed_capture_sizes=((720, 1280), (1080, 1920)),
+    )
+    encoder = WaypointVaeEncoderSubmodule(taehv_weights, multi)
+
+    configs = encoder.get_cuda_graph_configs(torch.device("cpu"))
+
+    assert {cfg.additional_key_info for cfg in configs} == {
+        (360, 640), (720, 1280), (1080, 1920),
+    }
+    for cfg in configs:
+        h, w = cfg.additional_key_info
+        image = cfg.single_request_inputs.tensor_inputs["image"]
+        assert image.shape == (ae_config.temporal_compression, h, w, 3)
+        assert cfg.capture_graph_walk == PRIME_WALK
 
 
-def test_encoder_only_replays_the_captured_image_shape(encoder, ae_config):
-    """The graph's static buffer is sized for exactly one H/W; any other
-    16:9 image, or the wrong graph walk, must fall back to eager."""
-    captured = (ae_config.temporal_compression, 360, 640, 3)
-    bigger = (ae_config.temporal_compression, 720, 1280, 3)
-    smaller = (ae_config.temporal_compression, 180, 320, 3)
+def test_cg_key_info_returns_the_captured_size_for_a_matching_seed(
+    taehv_weights, ae_config,
+):
+    multi = dataclasses.replace(ae_config, seed_capture_sizes=((720, 1280),))
+    encoder = WaypointVaeEncoderSubmodule(taehv_weights, multi)
 
-    assert encoder.can_use_cuda_graphs(_batch(PRIME_WALK), _image_inputs(captured))
-    assert not encoder.can_use_cuda_graphs(_batch(PRIME_WALK), _image_inputs(bigger))
-    assert not encoder.can_use_cuda_graphs(_batch(PRIME_WALK), _image_inputs(smaller))
-    assert not encoder.can_use_cuda_graphs(_batch(ROLLOUT_WALK), _image_inputs(captured))
+    assert encoder.cg_key_info(
+        PRIME_WALK, {"r0": _seed_hw_info(seed_hw=(720, 1280))}
+    ) == (720, 1280)
+    assert encoder.cg_key_info(
+        PRIME_WALK, {"r0": _seed_hw_info(seed_hw=(360, 640))}
+    ) == (360, 640)
+
+
+def test_cg_key_info_normalizes_a_list_seed_hw_to_a_tuple(encoder):
+    assert encoder.cg_key_info(
+        PRIME_WALK, {"r0": _seed_hw_info(seed_hw=[360, 640])}
+    ) == (360, 640)
+
+
+def test_cg_key_info_is_none_for_an_uncaptured_seed_size(encoder):
+    assert encoder.cg_key_info(
+        PRIME_WALK, {"r0": _seed_hw_info(seed_hw=(540, 960))}
+    ) is None
+
+
+def test_cg_key_info_is_none_off_the_prime_walk(encoder):
+    info = {"r0": _seed_hw_info(seed_hw=(360, 640), graph_walk=ROLLOUT_WALK)}
+    assert encoder.cg_key_info(ROLLOUT_WALK, info) is None
+
+
+def test_cg_key_info_is_none_without_a_seed_hw(encoder):
+    info = CurrentForwardPassInfo(
+        request_id="r0", graph_walk=PRIME_WALK, fwd_index=0, random_seed=0,
+        max_tokens=0, step_metadata={},
+    )
+    assert encoder.cg_key_info(PRIME_WALK, {"r0": info}) is None
+
+
+def test_cg_key_info_is_none_when_the_batch_disagrees_on_seed_hw(encoder):
+    per_request_info = {
+        "r0": _seed_hw_info("r0", seed_hw=(360, 640)),
+        "r1": _seed_hw_info("r1", seed_hw=(720, 1280)),
+    }
+    assert encoder.cg_key_info(PRIME_WALK, per_request_info) is None
 
 
 def test_the_fused_decode_turns_one_frame_into_one_raw_clip(decoder, ae_config):
@@ -1395,6 +1449,11 @@ def test_ae_nodes_declare_no_capture_when_cuda_graph_is_disabled(
     assert fused.get_cuda_graph_configs(torch.device("cpu")) == []
 
 
+def test_seed_capture_sizes_rejects_a_non_16_9_entry(ae_config):
+    with pytest.raises(ValueError, match="16:9"):
+        dataclasses.replace(ae_config, seed_capture_sizes=((100, 100),))
+
+
 def test_the_shell_builds_without_the_taehv_package(monkeypatch):
     """``taehv`` is a separate install with its own checkpoint. Every import of
     it is deferred to the call that needs weights, so the graph, the resources
@@ -1550,6 +1609,13 @@ def test_the_seed_clip_is_one_latent_frame_of_uint8_rgb(model, config):
         )
 
 
+def _pointer_info(dims: list[int]) -> TensorPointerInfo:
+    return TensorPointerInfo(
+        dims=dims, dtype="uint8", nbytes=0, address=0, stride=[1] * len(dims),
+        uuid="u-seed", source_session_id="s", source_entity="test",
+    )
+
+
 def test_the_required_prime_walk_addresses_the_seed_to_the_encoder(model):
     """The seed clip is addressed to the vae_encoder. The
     controller streams stay addressed to the dit on both walks: they are read
@@ -1558,7 +1624,7 @@ def test_the_required_prime_walk_addresses_the_seed_to_the_encoder(model):
 
     seeded = model.get_initial_forward_pass_args(
         "p", ["image"], ["video_frame"],
-        {**signals, "image_inputs": [object()]}, {"num_steps": 2},
+        {**signals, "image_inputs": [_pointer_info([720, 1280, 3])]}, {"num_steps": 2},
     )
 
     assert seeded.full_metadata.kwargs["walk_schedule"] == [PRIME_WALK, ROLLOUT_WALK]
@@ -1576,6 +1642,17 @@ def test_the_required_prime_walk_addresses_the_seed_to_the_encoder(model):
     # Nothing is unpersisted: the streams are re-read every frame, and the seed
     # clip goes with the request.
     assert seeded.unpersist_tensors == []
+
+
+def test_get_initial_forward_pass_args_reads_the_seed_hw_off_the_signal_dims(model):
+    signals = {name: [object()] for name in ("mouse", "button", "scroll")}
+
+    for dims in ([720, 1280, 3], [4, 720, 1280, 3]):
+        fwd_args = model.get_initial_forward_pass_args(
+            "p", ["image"], ["video_frame"],
+            {**signals, "image_inputs": [_pointer_info(dims)]}, {"num_steps": 2},
+        )
+        assert fwd_args.step_metadata["seed_hw"] == (720, 1280)
 
 
 def test_postprocess_emits_the_step_s_frames_as_raw_rgb_bytes(model, config):

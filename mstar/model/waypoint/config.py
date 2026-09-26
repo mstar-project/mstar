@@ -175,6 +175,9 @@ class WaypointConfig:
     # rollout paths; disabled or failed capture falls back to eager forwards.
     cuda_graph: bool = True
 
+    # Extra (H, W) seed shapes the vae_encoder captures a graph for; others run eager.
+    seed_capture_sizes: tuple[tuple[int, int], ...] = ()
+
     # Also capture the one-time DiT prime/cache pass. Subordinate to
     # cuda_graph: disabled serves prime through the compiled eager forward.
     capture_dit_prime: bool = True
@@ -220,6 +223,19 @@ class WaypointConfig:
             raise ValueError(f"Waypoint positive integer fields are invalid: {listed}.")
         if len(self.patch) != 2 or any(type(size) is not int or size <= 0 for size in self.patch):
             raise ValueError(f"patch must contain two positive integers; got {self.patch!r}.")
+        self.seed_capture_sizes = tuple(tuple(size) for size in self.seed_capture_sizes)
+        for size in self.seed_capture_sizes:
+            if len(size) != 2 or any(type(v) is not int or v <= 0 for v in size):
+                raise ValueError(
+                    f"seed_capture_sizes entries must be two positive integers; got {size!r}."
+                )
+        if self.auto_aspect_ratio:
+            bad = [size for size in self.seed_capture_sizes if size[0] * 16 != size[1] * 9]
+            if bad:
+                raise ValueError(
+                    f"seed_capture_sizes entries must be 16:9 when auto_aspect_ratio is "
+                    f"set; got {bad!r}."
+                )
         if self.tokens_per_frame != self.height * self.width:
             raise ValueError(
                 f"tokens_per_frame ({self.tokens_per_frame}) must equal "
