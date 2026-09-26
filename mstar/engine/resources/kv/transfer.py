@@ -10,6 +10,10 @@ without a GPU toolchain present.
 
 from __future__ import annotations
 
+import hashlib
+import os
+import shutil
+import threading
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -46,8 +50,27 @@ class KVTransferEngine(ABC):
         pass
 
     @abstractmethod
-    def get_kv_transfer_info(self) -> Any:
+    def get_kv_transfer_info(
+        self,
+        request_id: str | None = None,
+        label: str | None = None,
+        page_indices: list[int] | None = None,
+        seq_len: int | None = None,
+    ) -> Any:
         pass
+
+    def remove_request(self, request_id: str) -> None:
+        """Release request-scoped transfer resources, if any."""
+        del request_id
+
+    def owns_transfer_info(
+        self,
+        transfer_info: Any,
+        request_id: str,
+        label: str,
+    ) -> bool:
+        del request_id, label
+        return transfer_info == self.get_kv_transfer_info()
 
     @abstractmethod
     def shutdown(self):
@@ -84,7 +107,13 @@ class MooncakeKVTransferEngine(KVTransferEngine):
         )
         self._shut_down = False
 
-    def get_kv_transfer_info(self) -> MooncakeKVTransferInfo:
+    def get_kv_transfer_info(
+        self,
+        request_id: str | None = None,
+        label: str | None = None,
+        page_indices: list[int] | None = None,
+        seq_len: int | None = None,
+    ) -> MooncakeKVTransferInfo:
         return self._transfer_info
 
     def read_batched_async(
@@ -171,7 +200,13 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         if self._device.type == "cuda":
             torch.cuda.set_device(self._device)
 
-    def get_kv_transfer_info(self) -> CudaIpcKVTransferInfo:
+    def get_kv_transfer_info(
+        self,
+        request_id: str | None = None,
+        label: str | None = None,
+        page_indices: list[int] | None = None,
+        seq_len: int | None = None,
+    ) -> CudaIpcKVTransferInfo:
         return self._transfer_info
 
     def read_batched_async(
@@ -253,23 +288,261 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
 
 
 class LocalOnlyKVTransferEngine(KVTransferEngine):
-    """KV cache that remains local to its worker."""
+    """KV cache that never leaves its worker instance."""
 
     def read_batched_async(
         self, remote_kv_info, read_info: list[KVReadInfo]
     ) -> Future | None:
+        del remote_kv_info
         if read_info:
             raise RuntimeError(
-                "Cross-worker KV migration is unavailable for this accelerator. "
-                "Use a colocated worker graph or a remote transfer engine."
+                "Cross-worker KV migration was requested for a local-only "
+                "resource"
             )
         return None
 
-    def get_kv_transfer_info(self) -> None:
-        return None
+    def get_kv_transfer_info(
+        self,
+        request_id: str | None = None,
+        label: str | None = None,
+        page_indices: list[int] | None = None,
+        seq_len: int | None = None,
+    ) -> None:
+        del request_id, label, page_indices, seq_len
 
     def shutdown(self):
         pass
+
+
+@dataclass(frozen=True)
+class ShmKVTransferInfo:
+    path: str
+    page_indices: tuple[int, ...]
+    layout: KVLayout
+
+
+class ShmKVTransferEngine(KVTransferEngine):
+    """Host-staged KV transfer through a shared-memory filesystem.
+
+    Each producer publishes a packed tensor containing only the occupied
+    physical pages for one request label. Consumers attach by path and copy
+    the requested page/token ranges into their local accelerator cache.
+    """
+
+    def __init__(
+        self,
+        kv_cache: KVCache,
+        entity_id: str,
+        shm_dir: str,
+        resource_key: str = "kv",
+    ):
+        if not shm_dir:
+            raise ValueError(
+                "shm_dir is required for shared-memory KV transfer"
+            )
+        self._kv_cache = kv_cache
+        self._shm_dir = shm_dir
+        os.makedirs(self._shm_dir, mode=0o700, exist_ok=True)
+        os.chmod(self._shm_dir, 0o700)
+        self._entity_id = entity_id
+        self._resource_key = resource_key
+        self._published: dict[
+            tuple[str, str],
+            tuple[tuple[tuple[int, ...], int], ShmKVTransferInfo],
+        ] = {}
+
+    def _path(self, request_id: str, label: str) -> str:
+        key = (
+            f"{self._entity_id}:{self._resource_key}:{request_id}:{label}"
+        ).encode()
+        digest = hashlib.sha256(key).hexdigest()
+        return os.path.join(self._shm_dir, f"mstar_kv_{digest}.pt")
+
+    def get_kv_transfer_info(
+        self,
+        request_id: str | None = None,
+        label: str | None = None,
+        page_indices: list[int] | None = None,
+        seq_len: int | None = None,
+    ) -> ShmKVTransferInfo | None:
+        if (
+            request_id is None
+            or label is None
+            or page_indices is None
+            or seq_len is None
+        ):
+            return None
+        pages = tuple(page_indices)
+        version = (pages, seq_len)
+        key = (request_id, label)
+        previous = self._published.get(key)
+        if previous is not None and previous[0] == version:
+            return previous[1]
+
+        path = self._path(request_id, label)
+        tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        if pages:
+            packed = (
+                self._kv_cache.tensor[:, list(pages)]
+                .detach()
+                .cpu()
+                .contiguous()
+            )
+        else:
+            packed = torch.empty((0,), dtype=self._kv_cache.dtype)
+        torch.save(packed, tmp_path)
+        os.replace(tmp_path, path)
+        info = ShmKVTransferInfo(
+            path=path,
+            page_indices=pages,
+            layout=self._kv_cache.layout,
+        )
+        self._published[key] = (version, info)
+        return info
+
+    def read_batched_async(
+        self,
+        remote_kv_info: ShmKVTransferInfo | None,
+        read_info: list[KVReadInfo],
+    ) -> Future | None:
+        try:
+            return self._read_batched(remote_kv_info, read_info)
+        except Exception as error:
+            # SHM reads are synchronous, but the resource readiness contract
+            # expects transfer failures on a Future so they are latched and
+            # reported against this request rather than escaping the worker
+            # scheduler loop and failing every in-flight request.
+            failed = Future()
+            failed.set_exception(error)
+            return failed
+
+    def _read_batched(
+        self,
+        remote_kv_info: ShmKVTransferInfo | None,
+        read_info: list[KVReadInfo],
+    ) -> None:
+        if not read_info:
+            return None
+        if remote_kv_info is None:
+            raise RuntimeError("Missing SHM metadata for remote KV cache")
+        if remote_kv_info.layout != self._kv_cache.layout:
+            raise ValueError(
+                f"remote KV layout {remote_kv_info.layout} != "
+                f"local layout {self._kv_cache.layout}"
+            )
+
+        packed = torch.load(
+            remote_kv_info.path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        packed_page = {
+            remote_page: idx
+            for idx, remote_page in enumerate(remote_kv_info.page_indices)
+        }
+        page_copies = {
+            (
+                info.layer_idx,
+                info.remote_page_idx,
+                info.local_page_idx,
+                info.token_start,
+                info.token_end,
+            )
+            for info in read_info
+        }
+        for layer, remote_page, local_page, token_start, token_end in page_copies:
+            source = packed[
+                layer,
+                packed_page[remote_page],
+                :,
+                token_start:token_end,
+            ].to(self._kv_cache.device)
+            destination = self._kv_cache.chunk_view(
+                layer_idx=layer,
+                page_idx=local_page,
+                token_start=token_start,
+                token_end=token_end,
+            )
+            destination.copy_(source)
+        if self._kv_cache.device.type != "cpu":
+            torch.accelerator.synchronize(self._kv_cache.device)
+        return None
+
+    def remove_request(self, request_id: str) -> None:
+        keys = [key for key in self._published if key[0] == request_id]
+        for key in keys:
+            _, info = self._published.pop(key)
+            try:
+                os.unlink(info.path)
+            except FileNotFoundError:
+                pass
+
+    def owns_transfer_info(
+        self,
+        transfer_info: Any,
+        request_id: str,
+        label: str,
+    ) -> bool:
+        return (
+            isinstance(transfer_info, ShmKVTransferInfo)
+            and transfer_info.path == self._path(request_id, label)
+        )
+
+    def shutdown(self):
+        for request_id, _ in list(self._published):
+            self.remove_request(request_id)
+
+
+def make_deployment_kv_shm_dir(
+    socket_path_prefix: str,
+    dist_init_method: str,
+    owner_pid: int | None = None,
+) -> str:
+    """Create a private SHM directory for one local deployment.
+
+    The conductor PID plus its unique distributed-init endpoint separates
+    concurrent servers, even when both use the default worker ids and request
+    ids. On startup, directories owned by this uid whose conductor no longer
+    exists are swept so killed deployments do not leak tmpfs indefinitely.
+    """
+    base = os.getenv("MSTAR_KV_SHM_DIR")
+    if base is None:
+        base = (
+            "/dev/shm"
+            if os.path.isdir("/dev/shm")
+            else "/tmp"
+        )
+    os.makedirs(base, exist_ok=True)
+
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    owner_pid = os.getppid() if owner_pid is None else owner_pid
+    digest = hashlib.sha256(
+        f"{socket_path_prefix}\0{dist_init_method}".encode()
+    ).hexdigest()[:16]
+    prefix = f"mstar_kv_{uid}_"
+    path = os.path.join(base, f"{prefix}{owner_pid}_{digest}")
+
+    for entry in os.scandir(base):
+        if (
+            not entry.name.startswith(prefix)
+            or not entry.is_dir(follow_symlinks=False)
+            or entry.path == path
+        ):
+            continue
+        suffix = entry.name[len(prefix):]
+        pid_text, separator, _ = suffix.partition("_")
+        if not separator or not pid_text.isdigit():
+            continue
+        try:
+            os.kill(int(pid_text), 0)
+        except ProcessLookupError:
+            shutil.rmtree(entry.path, ignore_errors=True)
+        except PermissionError:
+            continue
+
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
 
 
 @dataclass
@@ -277,12 +550,15 @@ class TransferEngineInfo:
     my_entity_id: str
     my_session_id: str
     transfer_engine: TensorTransferEngine
+    shm_dir: str | None = None
 
 
 class KVTransferManager:
     def __init__(
         self, transfer_engine_info: TransferEngineInfo,
-        kv_cache: KVCache
+        kv_cache: KVCache,
+        resource_key: str = "kv",
+        needs_remote_transfer: bool = True,
     ):
         from mstar.communication.tensors import (
             LocalTransferEngine,
@@ -305,6 +581,17 @@ class KVTransferManager:
         ):
             if kv_cache.device.type == "cuda":
                 self._kv_transfer_engine = CudaIpcKVTransferEngine(kv_cache)
+            elif needs_remote_transfer:
+                if not transfer_engine_info.shm_dir:
+                    raise ValueError(
+                        "shm_dir is required for shared-memory KV transfer"
+                    )
+                self._kv_transfer_engine = ShmKVTransferEngine(
+                    kv_cache=kv_cache,
+                    entity_id=transfer_engine_info.my_entity_id,
+                    shm_dir=transfer_engine_info.shm_dir,
+                    resource_key=resource_key,
+                )
             else:
                 self._kv_transfer_engine = LocalOnlyKVTransferEngine()
         else:
@@ -365,7 +652,33 @@ class KVTransferManager:
     def cleanup(self):
         self._kv_transfer_engine.shutdown()
 
-    def get_kv_transfer_info(self):
+    def get_kv_transfer_info(
+        self,
+        request_id: str | None = None,
+        label: str | None = None,
+        page_indices: list[int] | None = None,
+        seq_len: int | None = None,
+    ):
         """Descriptor another process needs to read this cache remotely.
         ``KVCachePool.publish`` stamps it onto every ``SequenceInfo``."""
-        return self._kv_transfer_engine.get_kv_transfer_info()
+        return self._kv_transfer_engine.get_kv_transfer_info(
+            request_id=request_id,
+            label=label,
+            page_indices=page_indices,
+            seq_len=seq_len,
+        )
+
+    def remove_request(self, request_id: str) -> None:
+        self._kv_transfer_engine.remove_request(request_id)
+
+    def owns_transfer_info(
+        self,
+        transfer_info: Any,
+        request_id: str,
+        label: str,
+    ) -> bool:
+        return self._kv_transfer_engine.owns_transfer_info(
+            transfer_info=transfer_info,
+            request_id=request_id,
+            label=label,
+        )

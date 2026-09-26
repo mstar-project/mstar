@@ -1256,13 +1256,16 @@ class Conductor:
             for name, infos in body.persist_signals.items():
                 request_data.persist_signals.setdefault(name, []).extend(infos)
 
+        # Resource publish info is rank-sharded. Every TP rank contributes its
+        # own KV pages and transfer descriptor, and PublishedKVInfo.update()
+        # folds those entries by rank.
+        merge_publish_info(
+            pstate.resource_publish_info, body.resource_publish_info
+        )
+
         # Absorb-only fields are replicated across TP ranks; only the rank-0
         # message contributes.
         if body.is_first_tp_rank:
-            merge_publish_info(
-                pstate.resource_publish_info, body.resource_publish_info
-            )
-
             if body.new_token_counts:
                 for name, count in body.new_token_counts.items():
                     pstate.num_output_tokens += count

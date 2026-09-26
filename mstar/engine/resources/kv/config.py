@@ -66,6 +66,17 @@ class KVReqConfig(ResourceReqConfig):
     needed_labels: list[str] | None = None
     needed_labels_per_node: dict[str, list[str]] = field(default_factory=dict)
     needed_labels_per_node_walk: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    # None preserves the generic behavior of publishing every stream. A
+    # mapping lets a model export only labels that another instance may read;
+    # an absent key in an explicit mapping means this step publishes no KV.
+    publish_labels_per_node_walk: (
+        dict[tuple[str, str], list[str]] | None
+    ) = None
+    # Stop-time labels are exported once, after the final loop iteration has
+    # committed. None and an absent key both mean no stop-time publication.
+    final_publish_labels_per_node_walk: (
+        dict[tuple[str, str], list[str]] | None
+    ) = None
     # label -> one key per page, from the preprocess worker
     prefix_keys: dict[str, list[bytes]] | None = None
     # label -> prompt tokens past the last whole page, keyed once generation fills it
@@ -99,6 +110,26 @@ class KVReqConfig(ResourceReqConfig):
         if self.needed_labels is not None:
             return self.needed_labels
         return ["main"]
+
+    def get_publish_labels(
+        self,
+        node: str | None,
+        walk: str | None,
+        available: list[str],
+        *,
+        final: bool = False,
+    ) -> list[str]:
+        mapping = (
+            self.final_publish_labels_per_node_walk
+            if final else self.publish_labels_per_node_walk
+        )
+        if final and mapping is None:
+            return []
+        if mapping is None:
+            return available
+        if node is None or walk is None:
+            return []
+        return mapping.get((node, walk), [])
 
 
 @dataclass

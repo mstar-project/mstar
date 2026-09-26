@@ -18,13 +18,20 @@ import torch
 from mstar.api_server.request_types import APIServerMessage, ResultTensors
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
-from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
+from mstar.communication.tensors import (
+    LocalTransferEngine,
+    NameToTensorList,
+    create_tensor_communication_manager,
+)
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AllocationFailed, StepContext
-from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.kv.transfer import (
+    TransferEngineInfo,
+    make_deployment_kv_shm_dir,
+)
 from mstar.graph.base import GraphEdge, GraphNode, SpeculativeNodeInfo
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -226,6 +233,17 @@ class Worker:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=enable_prof
         )
+        kv_shm_dir = None
+        if (
+            isinstance(
+                self.tensor_manager.transfer_engine, LocalTransferEngine,
+            )
+            and self.device.type != "cuda"
+        ):
+            kv_shm_dir = make_deployment_kv_shm_dir(
+                socket_path_prefix=socket_path_prefix,
+                dist_init_method=dist_init_method,
+            )
 
         node_names = set()
         for wg in my_worker_graphs:
@@ -239,7 +257,8 @@ class Worker:
             transfer_engine_info=TransferEngineInfo(
                 my_entity_id=worker_id,
                 my_session_id=self.tensor_manager.my_session_id,
-                transfer_engine=self.tensor_manager.transfer_engine
+                transfer_engine=self.tensor_manager.transfer_engine,
+                shm_dir=kv_shm_dir,
             ),
             model=model,
             enable_nvtx=self.enable_nvtx,
@@ -2277,6 +2296,7 @@ class Worker:
             range_push("worker.postprocess.stop_loops", synchronize=False)
 
         # Stop loops, if applicable
+        stopped_rids: list[str] = []
         for rid, loop_names in stops.items():
             loop_names = set([
                 ln for ln in loop_names if \
@@ -2284,6 +2304,7 @@ class Worker:
             ])
             if not loop_names:
                 continue
+            stopped_rids.append(rid)
             self.worker_graphs_manager.stop_loops(
                 rid, partition=batch_N.partition,
                 loop_names=loop_names,
@@ -2320,6 +2341,12 @@ class Worker:
                         )
                     )
                 )
+
+        # Ordinary publication precedes stop detection on the GPU thread.
+        # Export final-only state now, after the last iteration committed and
+        # before routing reports the completed loop to the conductor.
+        if stopped_rids:
+            engine.finalize_stopped_requests(batch_N.node_batch, stopped_rids)
 
         if self.enable_nvtx:
             range_pop(synchronize=False)

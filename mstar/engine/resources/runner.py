@@ -349,7 +349,10 @@ class StepRunner:
                     range_pop()
 
     def publish(
-        self, request_ids: list[str], node_name: str | None = None,
+        self,
+        request_ids: list[str],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """durable state outward publish
 
@@ -365,13 +368,36 @@ class StepRunner:
         for rid in request_ids:
             per_key: dict[str, PublishedInfo] = {}
             for key, resource in publishers:
-                info = resource.publish(rid)
+                info = resource.publish_for_step(
+                    rid, node_name=node_name, graph_walk=graph_walk,
+                )
                 if info is not None:
                     per_key[key] = info
             out[rid] = per_key
         return out
 
-
+    def publish_after_stop(
+        self,
+        request_ids: list[str],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+    ) -> dict[str, dict[str, PublishedInfo]]:
+        """Publish resources configured for the end of a dynamic loop."""
+        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        if not order:
+            return {rid: {} for rid in request_ids}
+        publishers = [(key, self._resources[key]) for key in order]
+        out: dict[str, dict[str, PublishedInfo]] = {}
+        for rid in request_ids:
+            per_key: dict[str, PublishedInfo] = {}
+            for key, resource in publishers:
+                info = resource.publish_after_stop(
+                    rid, node_name=node_name, graph_walk=graph_walk,
+                )
+                if info is not None:
+                    per_key[key] = info
+            out[rid] = per_key
+        return out
 
     def build_cuda_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,

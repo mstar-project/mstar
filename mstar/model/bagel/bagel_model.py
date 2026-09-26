@@ -301,6 +301,9 @@ class BagelModel(Model):
 
         # Set by get_worker_graphs() when config has LLM_cfg_text/LLM_cfg_img
         self._has_cfg_parallel = False
+        # Set when graph-walk-specific node groups place LLM cache consumers
+        # in separate worker instances.
+        self._has_llm_disaggregation = False
 
     @property
     def _image_gen_walk(self) -> str:
@@ -440,13 +443,7 @@ class BagelModel(Model):
                 node_name=node_name,
             )
         elif node_name == "combine_cfg":
-            self._init_language_model_components(
-                device, autocast_dtype=autocast_dtype, tp_group=tp_group,
-            )
-            return CombineCFGSubmodule(
-                llm2vae=self.llm2vae,
-                config=self.config,
-            )
+            return CombineCFGSubmodule(config=self.config)
         elif node_name == "vit_encoder":
             self._init_vit_components(device, autocast_dtype=autocast_dtype)
             return ViTEncoderSubmodule(
@@ -811,16 +808,47 @@ class BagelModel(Model):
         model_kwargs = model_kwargs or {}
         cfg = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs["requires_cfg"]
         sampling = self.get_sampling_config("LLM", model_kwargs)
+        publish_labels: dict[tuple[str, str], list[str]] = {}
+        final_publish_labels: dict[tuple[str, str], list[str]] = {}
+        if cfg:
+            publish_labels.update({
+                ("LLM", "prefill_text"): ["cfg_text", "cfg_img"],
+                ("LLM", "prefill_vit"): ["cfg_text"],
+                ("LLM", "prefill_vae"): ["cfg_text"],
+            })
+            final_publish_labels[("LLM", "decode")] = ["cfg_img"]
+
+        if self._has_llm_disaggregation:
+            # Any prefill walk can be the last one before a remote decode or
+            # image-generation worker. Decode itself may hand off to a remote
+            # image-generation worker, but only its final state is needed.
+            for walk in ("prefill_text", "prefill_vit", "prefill_vae"):
+                publish_labels.setdefault(("LLM", walk), []).insert(0, "main")
+            final_publish_labels.setdefault(
+                ("LLM", "decode"), []
+            ).insert(0, "main")
+
         return {
             # The KV resource reads this in admit_retrieve, to know which of a
             # published request's streams to pull in. Guidance-off requests
             # name only "main", so a transfer never drags branches that this
             # request will not attend.
-            "kv": KVReqConfig(needed_labels_per_node_walk={
-                (node, walk): active_labels(walk, cfg, node)
-                for node in self._LLM_NODES
-                for walk in LLM_GRAPH_WALKS
-            }),
+            "kv": KVReqConfig(
+                needed_labels_per_node_walk={
+                    (node, walk): active_labels(walk, cfg, node)
+                    for node in self._LLM_NODES
+                    for walk in LLM_GRAPH_WALKS
+                },
+                # Only the main LLM instance creates cache branches consumed
+                # by the remote CFG replicas. Text-only requests export
+                # nothing. Think-then-image exports cfg_img once after decode
+                # stops, so image_gen_cfg sees the final KV without rewriting
+                # the SHM payload on every token. Disaggregated LLM placements
+                # additionally export main at prefill boundaries and once when
+                # decode stops.
+                publish_labels_per_node_walk=publish_labels,
+                final_publish_labels_per_node_walk=final_publish_labels,
+            ),
             "sampler": SamplingReqConfig(
                 temperature=sampling.temperature,
                 top_k=sampling.top_k,
@@ -847,7 +875,9 @@ class BagelModel(Model):
         from mstar.distributed.base import ShardingConfig
 
         return ShardingConfig(
-            groups=[], tp_enabled_nodes={"LLM"}, shard_dim={},
+            groups=[],
+            tp_enabled_nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"},
+            shard_dim={},
         )
 
     def get_worker_graphs(self, config_path: str):
@@ -859,6 +889,9 @@ class BagelModel(Model):
             name for g in node_groups for name in g["node_names"]
         }
         self._has_cfg_parallel = "LLM_cfg_text" in all_node_names
+        self._has_llm_disaggregation = sum(
+            "LLM" in group["node_names"] for group in node_groups
+        ) > 1
         return super().get_worker_graphs(config_path)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

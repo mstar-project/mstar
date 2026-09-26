@@ -279,7 +279,9 @@ def kv_manager(monkeypatch):
     from mstar.engine.resources.kv import manager as kv_manager_module
 
     monkeypatch.setattr(
-        kv_manager_module, "KVTransferManager", lambda info, kv_cache: None
+        kv_manager_module,
+        "KVTransferManager",
+        lambda info, kv_cache, **kwargs: None,
     )
     return kv_manager_module.KVManager(
         cfg=_kv_config(),
