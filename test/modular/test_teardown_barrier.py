@@ -28,8 +28,8 @@ def _request_data(workers=("w0",), persist_signals=None, ref_cnts=None):
     return RequestData(
         persist_signals=persist_signals or {},
         persist_signal_ref_cnt=ref_cnts or {},
-        worker_graph_to_workers={"wg": list(workers)},
-        all_worker_graph_ids={"wg"},
+        worker_graph_to_workers={0: list(workers)},
+        all_worker_graph_ids={0},
         max_output_tokens=1,
         random_seed=0,
         # Post-resource-pool refactor: requests carry per-resource configs

@@ -176,6 +176,9 @@ class SubmoduleManagement:
 class ExecutingBatch:
     node_name: str
 
+    # Keyed by the worker's integer rid handle. CUDA-graph capture substitutes
+    # its own synthetic string rids for padding rows; the engine only ever uses
+    # a rid as an opaque key, so the two never need to be the same type.
     per_request_info: Mapping[str, CurrentForwardPassInfo]
     step_context: StepContext
 

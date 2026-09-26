@@ -58,6 +58,22 @@ def agree_across_ranks(
     return [bool(value) for value in gathered.tolist()]
 
 
+#: Handles for padding rows. Real handles are >= 0 (they index the worker's rid
+#: table) and -1 is CurrentForwardPassInfo's unstamped default, so counting down
+#: from -2 collides with neither. Memoized per dummy rid because a submodule
+#: keys its per-request state by the handle: one shared value would collapse
+#: every padding row onto the same state.
+_DUMMY_HANDLE_BASE = -2
+_dummy_handles: dict[str, int] = {}
+
+
+def dummy_rid_handle(rid: str) -> int:
+    handle = _dummy_handles.get(rid)
+    if handle is None:
+        handle = _dummy_handles[rid] = _DUMMY_HANDLE_BASE - len(_dummy_handles)
+    return handle
+
+
 def dummy_metadata(
     rids: list[str], graph_walk: str,
 ) -> dict[str, CurrentForwardPassInfo]:
@@ -65,6 +81,7 @@ def dummy_metadata(
     return {
         rid: CurrentForwardPassInfo(
             request_id=rid,
+            rid_handle=dummy_rid_handle(rid),
             graph_walk=graph_walk,
             fwd_index=0,
             random_seed=0,

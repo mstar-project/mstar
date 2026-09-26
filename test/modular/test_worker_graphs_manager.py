@@ -89,7 +89,7 @@ def _make_ar_walk_graph():
     ])
 
 
-def _make_manager(wg_id="wg0", graph_walk="decode", worker_id="worker0"):
+def _make_manager(wg_id=0, graph_walk="decode", worker_id="worker0"):
     """Build a WorkerGraphsManager with one WorkerGraphQueues + one request."""
     graph = _make_ar_walk_graph()
     worker_graph = WorkerGraph(
@@ -263,7 +263,7 @@ def test_mark_node_complete_on_empty_outputs_node_flips_is_done():
         input_names={"text_inputs"},
         outputs=[],  # no declared outputs — KV-cache-only step
     )
-    wg_id = "wg_empty"
+    wg_id = 1
     worker_graph = WorkerGraph(
         section=empty_outputs_graph,
         graph_walks={"prefill_text"},
@@ -319,7 +319,7 @@ def test_process_node_outputs_marks_wg_done_with_all_external_outputs():
                       conductor_new_token=True, persist=True),
         ],
     )
-    wg_id = "wg_external"
+    wg_id = 2
     worker_graph = WorkerGraph(
         section=single_node_graph,
         graph_walks={"prefill"},

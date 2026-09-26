@@ -21,7 +21,7 @@ class TensorPointerInfo:
     nbytes: int
     address: int
     stride: list[int]
-    uuid: str  # for indexing storage
+    uuid: int  # (entity_index << 48) | counter; see communication/tensor_uuid.py
     source_session_id: str  # "{HOSTNAME}:{client_engine.get_rpc_port()}"
     source_entity: str  # which {worker, api_server} the tensor is on
     offset: int = 0 # offset, in bytes, of the read (e.g., for in-transport sharding
@@ -164,7 +164,7 @@ class ReadySignals:
         self._tensor_manager = None
         self._request_id = None
 
-    def register_communication_info(self, communication_manager, request_id: str):
+    def register_communication_info(self, communication_manager, request_id: int):
         self._tensor_manager = communication_manager
         self._request_id =  request_id
 
@@ -262,7 +262,7 @@ class GraphNode(GraphSection):
         self._tensor_manager = None
         self._request_id = None
 
-    def register_communication_info(self, communication_manager, request_id: str):
+    def register_communication_info(self, communication_manager, request_id: int):
         self.ready_signals.register_communication_info(
             communication_manager, request_id
         )
@@ -551,7 +551,7 @@ class Loop(GraphSection):
                 output_edges=self._ingested_external_inputs
             )
 
-    def register_communication_info(self, communication_manager, request_id: str):
+    def register_communication_info(self, communication_manager, request_id: int):
         self._tensor_manager = communication_manager
         self._request_id = request_id
 

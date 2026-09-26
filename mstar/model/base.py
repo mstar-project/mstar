@@ -1,7 +1,7 @@
+import itertools
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from typing import NamedTuple, Type
-from uuid import uuid4
 
 import torch
 import yaml
@@ -57,6 +57,9 @@ class PrefixStream(NamedTuple):
     decode_walk: str | None = None
 
 
+_wg_id_counter = itertools.count(1 << 20)
+
+
 @dataclass
 class WorkerGraph:
     section: GraphSection
@@ -83,7 +86,13 @@ class WorkerGraph:
     _instance_ranks: list[list[int]] = field(default_factory=list)
     _tp_comm_size: int = 1
     _group_id: int = field(default=-1)  # original index into config's node_groups
-    worker_graph_id: str = field(default_factory=lambda: str(uuid4()))
+
+    # Dense index over the deployment's worker graphs, reassigned by the
+    # conductor so every process agrees on it. The default only keeps a
+    # standalone WorkerGraph unique; it is not stable across processes, which
+    # is why the conductor -- the one place that sees every graph -- owns the
+    # real numbering.
+    worker_graph_id: int = field(default_factory=lambda: next(_wg_id_counter))
 
     def __post_init__(self):
         if (self.tp_size > 1 or self.sp_size > 1) and not self._tp_ranks:

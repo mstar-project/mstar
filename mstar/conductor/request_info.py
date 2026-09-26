@@ -32,6 +32,14 @@ class CurrentForwardPassInfo:
     random_seed: int
     max_tokens: int
 
+    # The worker-local integer handle for request_id, stamped by the worker on
+    # receipt (see mstar/worker/rid_table.py). Worker-internal state keys on
+    # this; ``request_id`` stays the wire identity, so this object can be
+    # forwarded to a peer without a copy. -1 means not yet stamped -- the
+    # conductor and api server never set it, and a peer overwrites whatever
+    # arrives with its own.
+    rid_handle: int = -1
+
     # resource label -> the config this request's resources were opened
     # with. Sampling params, whether it needs CFG, retention: a request's
     # knobs live here now, one entry per resource that has any.
@@ -109,8 +117,8 @@ class PartitionState:
     fwd_pass_number: int = 0
     random_seed: int = 0
     is_done: bool = False
-    completed_worker_graph_ids: set[str] = field(default_factory=set)
-    current_worker_graph_ids: set[str] = field(default_factory=set)
+    completed_worker_graph_ids: set[int] = field(default_factory=set)
+    current_worker_graph_ids: set[int] = field(default_factory=set)
     # wg_id -> count of distinct TP ranks that have reported completion
     wg_rank_completions: dict[str, int] = field(default_factory=dict)
     num_output_tokens: int = 0

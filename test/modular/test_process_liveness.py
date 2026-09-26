@@ -70,8 +70,8 @@ def _request_data(workers):
     return RequestData(
         persist_signals={},
         persist_signal_ref_cnt={},
-        worker_graph_to_workers={"wg": list(workers)},
-        all_worker_graph_ids={"wg"},
+        worker_graph_to_workers={0: list(workers)},
+        all_worker_graph_ids={0},
         max_output_tokens=1,
         random_seed=0,
         resource_configs={},

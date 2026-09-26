@@ -49,6 +49,11 @@ def _worker(known_rids=("r1", "r2")):
     w.worker_graphs_manager = SimpleNamespace(
         per_request_info={rid: object() for rid in known_rids}
     )
+    # Identity interning: the rid string doubles as its own handle here.
+    w._rids = SimpleNamespace(
+        handle=lambda r: r if r in known_rids else None,
+        name=lambda h: h,
+    )
     w.scheduler = MicroScheduler.__new__(MicroScheduler)
     w.scheduler.failed_rids = set()
     w.scheduler.held_until = {}
