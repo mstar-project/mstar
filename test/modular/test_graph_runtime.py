@@ -69,6 +69,12 @@ class StubTensorManager:
     # does; these go straight to the real store underneath.
     set_output_ref_counts = TensorCommunicationManager.set_output_ref_counts
 
+    # The runtime refreshes arena placement on every outgoing edge. The real
+    # implementation, so the early-return this stub takes is the one under
+    # test: no arena here, so nothing to copy back.
+    stamps_shm_placement = False
+    refresh_shm_placement = TensorCommunicationManager.refresh_shm_placement
+
     def set_persist(self, uuid: int, persist: bool):
         self.tensor_store.set_metadata(uuid, persist=persist)
 

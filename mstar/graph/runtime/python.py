@@ -1335,6 +1335,11 @@ class PythonGraphRuntime(GraphRuntime):
                     )
 
             if routing.emit_to_client and info is not None:
+                # As in _send_input_signals: the api server reads these
+                # tensors, so the placement has to be the store's.
+                self._tensor_manager.refresh_shm_placement(
+                    routing.emit_to_client
+                )
                 info.current_output_chunks.extend(
                     edge.name for edge in routing.emit_to_client
                 )
@@ -1383,6 +1388,10 @@ class PythonGraphRuntime(GraphRuntime):
         self, rid: int, worker_id: str, edges: list[GraphEdge],
         fwd_info: CurrentForwardPassInfo | None, partition: str,
     ):
+        # A sharded edge carries a CLONE of the store's descriptor, cloned
+        # during routing -- before staging stamped the arena placement onto the
+        # store's copy. Refresh it here, where the edge leaves the process.
+        self._tensor_manager.refresh_shm_placement(edges)
         self._communicator.send(worker_id, WorkerMessage(
             message_type=WorkerMessageType.INPUT_SIGNALS,
             body=InputSignals(
@@ -1402,6 +1411,11 @@ class PythonGraphRuntime(GraphRuntime):
         partition_done: bool,
         profiling: Profiling | None,
     ):
+        # The conductor keeps these across passes and hands them back as a
+        # later walk's inputs, so a stale placement outlives the send.
+        self._tensor_manager.refresh_shm_placement(
+            info.pending_persist_signals
+        )
         persist_signals: dict[str, list[TensorPointerInfo]] = {}
         for edge in info.pending_persist_signals:
             persist_signals[edge.name] = edge.tensor_info
