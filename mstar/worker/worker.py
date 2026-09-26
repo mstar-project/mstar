@@ -18,20 +18,24 @@ import torch
 from mstar.api_server.request_types import APIServerMessage, ResultTensors
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
-from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
+from mstar.communication.tensors import (
+    NameToTensorList,
+    StoredOutputs,
+    create_tensor_communication_manager,
+)
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AllocationFailed, StepContext
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.graph.base import GraphEdge, GraphNode, SpeculativeNodeInfo
+from mstar.graph.base import GraphEdge, GraphNode, SpeculativeNodeInfo, TensorPointerInfo
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
-from mstar.utils.containers import RecentSet
+from mstar.utils.containers import ParallelList, RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -673,15 +677,14 @@ class Worker:
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
-        request_id = self._rid(body.request_id)
-        if request_id is None:
-            # Late ack for a removed request: force_cleanup_request already
-            # dropped every tensor it held.
-            return
-        for (uuid, ref_cnt) in body.successful_tensors.items():
-            self.tensor_manager.dereference(
-                request_id, uuid, n=ref_cnt
-            )
+        # Uuids are global, so a late ack needs no rid lookup and works even
+        # after the request is gone.
+        # One crossing for the ack: a reader confirms a whole edge at a time,
+        # and the count differs per uuid (an edge read by several consumers).
+        self.tensor_manager.dereference_batch(
+            list(body.successful_tensors),
+            list(body.successful_tensors.values()),
+        )
 
     def _process_new_inputs(self, body: InputSignals) -> None:
         # Draining for teardown: don't start new reads for this rid. The
@@ -770,16 +773,9 @@ class Worker:
             range_pop()
 
     def _unpersist_tensors(self, body: UnpersistTensors):
-        request_id = self._rid(body.request_id)
-        if request_id is None:
-            return  # removed already; its tensors went with it
         for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
-            self.tensor_manager.increment_ref(
-                request_id, uuid, n=ref_cnt
-            )
-            self.tensor_manager.set_persist(
-                request_id, uuid, persist=False
-            )
+            self.tensor_manager.increment_ref(uuid, n=ref_cnt)
+            self.tensor_manager.set_persist(uuid, persist=False)
 
     def _stop_loops(self, body: StopLoops):
         request_id = self._rid(body.request_id)
@@ -856,12 +852,13 @@ class Worker:
         stream_buf = req_info.stream_buffers[edge.name]
 
         for info in edge.tensor_info:
-            tensor = self.tensor_manager.get_tensor(
-                request_id=request_id, uuid=info.uuid,
-            )
+            tensor = self.tensor_manager.get_tensor(info.uuid)
 
             stream_buf.put(info.uuid, tensor.clone())
-            self.tensor_manager.dereference(request_id, info.uuid)
+        # After the loop: one crossing for the edge rather than one per tensor.
+        self.tensor_manager.dereference_batch_uniform(
+            [info.uuid for info in edge.tensor_info]
+        )
 
     def _pop_streaming_edge(
         self, sbuf: StreamBuffer, edge_name: str, request_id: int
@@ -1051,9 +1048,8 @@ class Worker:
             ready_inputs = node.ready_signals.ready_inputs
             for input_name, edge in ready_inputs.items():
                 tensors[input_name] = [
-                    self.tensor_manager.get_tensor(
-                        request_id=request_id, uuid=info.uuid
-                    ) for info in edge.tensor_info
+                    self.tensor_manager.get_tensor(info.uuid)
+                    for info in edge.tensor_info
                 ]
                 if edge._final_stream_chunk:
                     final_stream_rids.add(request_id)
@@ -1161,27 +1157,35 @@ class Worker:
         batch: ScheduledBatch,
         routing_per_request: dict[int, NodeOutputRouting],
     ):
+        """Register the tensors remote consumers (other workers, the api
+        server, the conductor via persist) will read.
         """
-        For outputs going to other workers: register tensors for RDMA send
-        and populate tensor_info on the GraphEdges.
-        For outputs staying local: store tensors in tensor_manager.
-        Returns the output edges per request (with tensor_info filled in).
-        """
-        for request_id, _node in batch.node_objects.items():
+        # Uuids, not descriptors: registration only ever reads ``uuid`` off
+        # them and takes the tensor from the store. Deduped per request, since
+        # one tensor can ride several edges.
+        per_rid: dict[int, list[int]] = {}
+        for request_id in batch.node_objects:
             routing = routing_per_request[request_id]
-            infos_by_uuid = {}
-            for edge in (
-                routing.persist +
-                sum(routing.to_workers.values(), start=[]) +
-                routing.emit_to_client +
-                sum(routing.streaming_to_workers.values(), start=[])
-            ):
-                for info in edge.tensor_info:
-                    infos_by_uuid[info.uuid] = info
-            self.tensor_manager.register_for_send(
-                request_id=request_id, tensor_infos=list(infos_by_uuid.values()),
-                skip_cuda_sync=True,
+            uuids = dict.fromkeys(
+                info.uuid
+                for edge in (
+                    routing.persist +
+                    sum(routing.to_workers.values(), start=[]) +
+                    routing.emit_to_client +
+                    sum(routing.streaming_to_workers.values(), start=[])
+                )
+                for info in edge.tensor_info
             )
+            if uuids:
+                per_rid[request_id] = list(uuids)
+        if not per_rid:
+            return
+        # One staging pass for the batch: the arena collapses what would be one
+        # host-blocking D2H stream sync per request into one.
+        self.tensor_manager.register_for_send_uuids(
+            ParallelList(list(per_rid), list(per_rid.values())),
+            skip_cuda_sync=True,
+        )
 
 
     def _send_outputs(
@@ -1224,10 +1228,7 @@ class Worker:
                     continue  # don't double-count new tokens
                 count = 0
                 for tensor_info in signal.tensor_info:
-                    tensor = self.tensor_manager.get_tensor(
-                        request_id=request_id,
-                        uuid=tensor_info.uuid,
-                    )
+                    tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
                     count += tensor.numel()
                 name_to_count[signal.name] = count
             self.worker_graphs_manager.buffer_new_token_counts(
@@ -1672,9 +1673,7 @@ class Worker:
         tensors = {}
         for input_name, edge in inputs.items():
             tensors[input_name] = [
-                self.tensor_manager.get_tensor(
-                    request_id=rid, uuid=info.uuid,
-                )
+                self.tensor_manager.get_tensor(info.uuid)
                 for info in edge.tensor_info
             ]
         return tensors
@@ -2411,27 +2410,37 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.route_outputs", synchronize=False)
+        # Store output tensors before marking the nodes complete so that loop
+        # outputs can be buffered properly. One store call for the batch rather
+        # than one per request.
+        rids = list(batch_N.batch.request_to_worker_graph)
+        signals = self._output_signals(batch_N.batch)
+        stored = self.tensor_manager.store_and_return_tensor_info_batch(
+            rids, outputs, signals,
+            node_name=batch_N.node_name,
+            graph_walk=batch_N.graph_walk,
+            skip_cuda_sync=True,
+        )
+        # Safety hold: ref=1 until the real fanout is known, which
+        # set_output_ref_counts settles below. The count is uniform, so it
+        # crosses as a scalar rather than a list built per batch.
+        self.tensor_manager.increment_ref_batch_uniform(stored.flat_uuids, 1)
+        per_request_infos = self._output_infos_by_signal(stored, signals)
+
         # Mark nodes complete and route
         routing_per_request: dict[int, NodeOutputRouting] = {}
         per_request_uuids: dict[int, set[int]] = {}
         for rid, wg_id in batch_N.batch.request_to_worker_graph.items():
-            # Store output tensors before marking the node as complete so that
-            # loop outputs can be buffered properly.
-            req_output_tensors = outputs.get(rid)
             node = batch_N.batch.node_objects[rid]
             node.reset_outputs() # reset stale outputs
-            if req_output_tensors:
-                graph_node_info = self.tensor_manager.store_and_populate_graph_edges(
-                    request_id=rid,
-                    tensors=req_output_tensors,
-                    graph_edges=node.outputs,
-                    node_name=node.name,
-                    graph_walk=batch_N.graph_walk,
-                    skip_cuda_sync=True,
-                    skip_ref_count=True,
-                )
+            infos = per_request_infos.get(rid)
+            if infos:
+                for edge in node.outputs:
+                    if edge.name in infos:
+                        edge.tensor_info = infos[edge.name]
                 per_request_uuids[rid] = {
-                    info.uuid for infos in graph_node_info.values() for info in infos
+                    info.uuid for signal_infos in infos.values()
+                    for info in signal_infos
                 }
 
             completion_output = self.worker_graphs_manager.mark_node_complete(
@@ -2449,9 +2458,7 @@ class Worker:
 
                 for edge in routing.persist:
                     for info in edge.tensor_info:
-                        self.tensor_manager.set_persist(
-                            request_id=rid, uuid=info.uuid, persist=True
-                        )
+                        self.tensor_manager.set_persist(info.uuid, persist=True)
 
                 # NOTE: routing.persist is not included here because the tensors are
                 # (1) kept alive by the persist marker, and (2) would otherwise be
@@ -2466,7 +2473,7 @@ class Worker:
                     + sum(routing.streaming_to_workers.values(), start=[])
                 )
                 self.tensor_manager.set_output_ref_counts(
-                    rid, per_request_uuids[rid], routed_edges
+                    per_request_uuids[rid], routed_edges
                 )
 
         if self.enable_nvtx:
@@ -2507,6 +2514,36 @@ class Worker:
             range_pop(synchronize=False)
 
         return routing_per_request
+
+    @staticmethod
+    def _output_signals(batch: ScheduledBatch) -> list[str]:
+        """The names this batch's node emits on, in edge order. Every request
+        runs its own copy of the same node, so one copy answers for all."""
+        node = next(iter(batch.node_objects.values()), None)
+        if node is None:
+            return []
+        return list(dict.fromkeys(edge.name for edge in node.outputs))
+
+    def _output_infos_by_signal(
+        self, stored: StoredOutputs, signals: list[str],
+    ) -> dict[int, dict[str, list[TensorPointerInfo]]]:
+        """Regroup a batch store's flat columns per request and signal, so the
+        per-request routing below can fill each output edge's tensor_info.
+
+        The descriptors come back from the store rather than being rebuilt.
+        With the Python bookkeeper that is the very object the store holds, so
+        the arena's in-place ``shm_segment`` stamp at registration reaches the
+        edges too; that is the only bookkeeper the worker builds today.
+        """
+        per_request: dict[int, dict[str, list[TensorPointerInfo]]] = {}
+        get_info = self.tensor_manager.tensor_store.get_info
+        for uuid, rid, signal_idx in zip(
+            stored.flat_uuids, stored.flat_rids, stored.signal_idxs, strict=True,
+        ):
+            per_request.setdefault(rid, {}).setdefault(
+                signals[signal_idx], []
+            ).append(get_info(uuid))
+        return per_request
 
     def _get_pinned_d2h_buffer(
         self,

@@ -8,7 +8,9 @@
 //! Build: `maturin develop --release` in rust/.
 
 pub mod communicator;
+pub mod graph;
 pub mod shm;
+pub mod tensors;
 
 use std::os::raw::{c_int, c_void};
 use std::time::Duration;
@@ -304,5 +306,7 @@ fn mstar_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyShmArena>()?;
     m.add_class::<PyShmSegment>()?;
     m.add_class::<PySegmentedShmArena>()?;
+    m.add_class::<crate::tensors::TensorBookkeeping>()?;
+    m.add_class::<crate::tensors::TensorInfoOut>()?;
     Ok(())
 }

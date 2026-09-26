@@ -187,11 +187,15 @@ class ReadySignals:
 
     def clear(self):
         if self._tensor_manager is not None:
-            for edge in self.ready_inputs.values():
-                if edge._persist_for_loop:
-                    continue
-                for info in edge.tensor_info:
-                    self._tensor_manager.dereference(self._request_id, info.uuid)
+            # One crossing for the node's whole input set: this runs on every
+            # pass, and a node with several multi-tensor inputs pays per
+            # tensor otherwise.
+            self._tensor_manager.dereference_batch_uniform([
+                info.uuid
+                for edge in self.ready_inputs.values()
+                if not edge._persist_for_loop
+                for info in edge.tensor_info
+            ])
         self.ready_inputs.clear()
         self.ready_names.clear()
         self.is_ready = False
@@ -574,13 +578,13 @@ class Loop(GraphSection):
                 ).extend(edge.tensor_info)
                 if self._tensor_manager is not None:
                     for info in edge.tensor_info:
-                        self._tensor_manager.increment_ref(self._request_id, info.uuid)
+                        self._tensor_manager.increment_ref(info.uuid)
 
             elif edge.name in self._accumulated_output_names:
                 self._accumulated_cache.setdefault(edge.name, []).extend(edge.tensor_info)
                 if self._tensor_manager is not None:
                     for info in edge.tensor_info:
-                        self._tensor_manager.increment_ref(self._request_id, info.uuid)
+                        self._tensor_manager.increment_ref(info.uuid)
 
 
     def __post_init__(self):
@@ -619,16 +623,20 @@ class Loop(GraphSection):
 
     def _uncache_outputs(self):
         if self._tensor_manager is not None and self._request_id is not None:
-            for tensor_infos in self._cached_outputs.values():
-                for info in tensor_infos:
-                    self._tensor_manager.dereference(self._request_id, info.uuid)
+            self._tensor_manager.dereference_batch_uniform([
+                info.uuid
+                for tensor_infos in self._cached_outputs.values()
+                for info in tensor_infos
+            ])
         self._cached_outputs.clear()
 
     def _uncache_accumulated_outputs(self):
         if self._tensor_manager is not None and self._request_id is not None:
-            for tensor_infos in self._accumulated_cache.values():
-                for info in tensor_infos:
-                    self._tensor_manager.dereference(self._request_id, info.uuid)
+            self._tensor_manager.dereference_batch_uniform([
+                info.uuid
+                for tensor_infos in self._accumulated_cache.values()
+                for info in tensor_infos
+            ])
         self._accumulated_cache.clear()
 
     def reset_for_outer_iter(self):

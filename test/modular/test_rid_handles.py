@@ -171,13 +171,16 @@ def test_remove_for_an_unknown_request_is_a_no_op():
     assert len(w.worker_graphs_manager.per_request_info) == 1
 
 
-def test_late_tensor_ack_for_a_removed_request_is_dropped():
-    """The sender's tensor store is keyed by handle; a late ack's string no
-    longer resolves, and force_cleanup_request already freed its tensors."""
+def test_tensor_ack_is_keyed_by_uuid_alone():
+    """Uuids are global, so an ack -- even a late one for a request this worker
+    already removed -- needs no rid lookup; an untracked uuid is a no-op in the
+    store."""
     w, _ = _worker()
+    acked = []
     w.tensor_manager = SimpleNamespace(
-        dereference=lambda *a, **k: pytest.fail("dereferenced a removed request"),
+        dereference_batch=lambda uuids, counts: acked.append((uuids, counts)),
     )
     w._handle_tensor_received(TensorReceived(
-        request_id="gone", successful_tensors={1: 1}, failed_tensor_ids=[],
+        request_id="gone", successful_tensors={1: 2, 3: 1}, failed_tensor_ids=[],
     ))
+    assert acked == [([1, 3], [2, 1])]
