@@ -69,6 +69,12 @@ class StubTensorManager:
     # does; these go straight to the real store underneath.
     set_output_ref_counts = TensorCommunicationManager.set_output_ref_counts
 
+    # The runtime refreshes arena placement on every outgoing edge. The real
+    # implementation, so the early-return this stub takes is the one under
+    # test: no arena here, so nothing to copy back.
+    stamps_shm_placement = False
+    refresh_shm_placement = TensorCommunicationManager.refresh_shm_placement
+
     def set_persist(self, uuid: int, persist: bool):
         self.tensor_store.set_metadata(uuid, persist=persist)
 
@@ -604,7 +610,6 @@ def _send_input(runtime, rid, completion_id, fwd_info):
         completion_id=completion_id,
         per_request_info=ParallelList([rid], [fwd_info]),
         new_token_counts=ParallelList([rid], [{}]),
-        nested_loop_indices=ParallelList([rid], [None]),
     )
 
 
@@ -1074,3 +1079,59 @@ def test_a_tensor_on_two_outgoing_edges_is_staged_once(tmp_path):
     stored, out = _complete(tm, runtime, rid, "n", {"y": [torch.ones(3)]}, ["y"])
     assert out.register_uuids == stored.flat_uuids
     assert out.register_rids == [rid]
+def test_results_report_the_loop_context_from_before_the_completion(tmp_path):
+    """Marking the node complete advances its loop, so the runtime has to
+    snapshot the loop context first: a result emitted on iteration k is
+    labelled k, not k + 1."""
+    import torch
+
+    section = Loop(
+        name="gen_loop",
+        section=GraphNode(
+            name="gen", input_names={"tok"},
+            outputs=[
+                GraphEdge(name="tok", next_node="gen"),
+                GraphEdge(name="out", next_node=EMIT_TO_CLIENT),
+            ],
+        ),
+        outputs=[],
+        max_iters=10,
+    )
+    tm, runtime, rid = _build_on_real_manager(section, {"gen"}, tmp_path)
+    comm = _RecordingCommunicator()
+    runtime._communicator = comm
+    _ingest(runtime, rid, [GraphEdge(name="tok", next_node="gen")])
+    wgio = runtime._queues[0].per_request_queues[rid]
+    before = wgio.get_nested_loop_idxs_for_node("gen")
+
+    _, out = _complete(
+        tm, runtime, rid, "gen",
+        {"tok": [torch.ones(1)], "out": [torch.ones(1)]}, ["out", "tok"],
+    )
+    assert wgio.get_nested_loop_idxs_for_node("gen") != before, (
+        "the completion should have advanced the loop, or this proves nothing"
+    )
+    runtime.send_outputs(SendInput(
+        completion_id=out.completion_id,
+        per_request_info=ParallelList([rid], [_fwd_info("w")]),
+        new_token_counts=ParallelList([rid], [{}]),
+    ))
+    [result] = [
+        m for _entity, m in comm.sent if m.message_type == "result_tensors"
+    ]
+    assert result.body.loop_indices == before
+
+
+def test_cleanup_takes_the_consumed_node_out_of_the_ready_set():
+    """Its inputs are gone once consumed, so leaving the name ready would let
+    the scheduler pop it again with nothing to run on."""
+    mgr, runtime, rid = _build(
+        _make_ar_walk_graph(), 0, "decode",
+        nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
+    )
+    _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
+    wgio = runtime._queues[0].per_request_queues[rid]
+    assert "prefill" in wgio.ready_node_names
+
+    runtime.cleanup_consumed_inputs("prefill", [rid], [0])
+    assert "prefill" not in wgio.ready_node_names

@@ -79,6 +79,8 @@ class CompletionState:
     graph_walk: str
     node_name: str
     routing: dict[int, NodeOutputRouting]
+    # rid -> the node's loop context before the completion advanced it
+    nested_loop_indices: dict[int, NestedLoopIndices]
 
 
 @dataclass
@@ -386,6 +388,7 @@ class PythonGraphRuntime(GraphRuntime):
             wgio = self._queues[wg_id].per_request_queues.get(rid)
             if wgio is not None:
                 wgio.get_node(node_name).ready_signals.clear()
+                wgio.ready_node_names.discard(node_name)
 
     def mark_stream_partition_done(self, rid: int, partition: str):
         info = self._request_info.get(rid)
@@ -1036,14 +1039,6 @@ class PythonGraphRuntime(GraphRuntime):
         caller must drop from routing)."""
         return self._queues[wg_id].mark_node_complete(rid, node_name)
 
-    def get_nested_loop_idxs_for_node(
-        self, rid: int, partition: str, node_name: str
-    ) -> NestedLoopIndices:
-        graph_walk = self.get_walk(rid, partition)
-        wgid = self._walk_node_to_wg_id[(graph_walk, node_name)]
-        wgio = self._queues[wgid].per_request_queues.get(rid)
-        return wgio.get_nested_loop_idxs_for_node(node_name)
-
 
     # --------- Postprocess ----------
 
@@ -1179,6 +1174,7 @@ class PythonGraphRuntime(GraphRuntime):
         self.reset_outputs(input.node_name, list(rids), list(wg_ids))
 
         routing_per_rid: dict[int, NodeOutputRouting] = {}
+        nested_idxs: dict[int, NestedLoopIndices] = {}
         register_uuids: list[int] = []
         register_rids: list[int] = []
         new_token_idxs: list[int] = []
@@ -1194,9 +1190,8 @@ class PythonGraphRuntime(GraphRuntime):
                 per_signal[signal] = input.tensors[cursor:cursor + count]
                 cursor += count
 
-            node = self._queues[wg_id].per_request_queues[rid].get_node(
-                input.node_name
-            )
+            wgio = self._queues[wg_id].per_request_queues[rid]
+            node = wgio.get_node(input.node_name)
             # Descriptors come back from the store, which is what lets the
             # caller hand us uuids instead of TensorPointerInfo objects.
             owned: set[int] = set()
@@ -1207,6 +1202,12 @@ class PythonGraphRuntime(GraphRuntime):
                 edge.tensor_info = [tensor_store.get_info(u) for u in uuids]
                 owned.update(uuids)
 
+            # Before the completion, which advances the loop counters. A stop
+            # registered earlier in the pass only sets the finish signal, so it
+            # does not move them either.
+            nested_idxs[rid] = wgio.get_nested_loop_idxs_for_node(
+                input.node_name
+            )
             completion = self._mark_node_complete(rid, wg_id, input.node_name)
             routing = self._process_node_outputs(
                 rid, node_name=input.node_name,
@@ -1284,6 +1285,7 @@ class PythonGraphRuntime(GraphRuntime):
             graph_walk=input.graph_walk,
             node_name=input.node_name,
             routing=routing_per_rid,
+            nested_loop_indices=nested_idxs,
         )
         return RouteOutput(
             completion_id=completion_id,
@@ -1306,7 +1308,7 @@ class PythonGraphRuntime(GraphRuntime):
         partition = completion.partition
         fwd_infos = dict(iter(input.per_request_info))
         new_token_counts = dict(iter(input.new_token_counts))
-        nested_idxs = dict(iter(input.nested_loop_indices))
+        nested_idxs = completion.nested_loop_indices
         consumed = (
             {} if input.stream_tokens_consumed is None
             else dict(iter(input.stream_tokens_consumed))
@@ -1333,6 +1335,11 @@ class PythonGraphRuntime(GraphRuntime):
                     )
 
             if routing.emit_to_client and info is not None:
+                # As in _send_input_signals: the api server reads these
+                # tensors, so the placement has to be the store's.
+                self._tensor_manager.refresh_shm_placement(
+                    routing.emit_to_client
+                )
                 info.current_output_chunks.extend(
                     edge.name for edge in routing.emit_to_client
                 )
@@ -1381,6 +1388,10 @@ class PythonGraphRuntime(GraphRuntime):
         self, rid: int, worker_id: str, edges: list[GraphEdge],
         fwd_info: CurrentForwardPassInfo | None, partition: str,
     ):
+        # A sharded edge carries a CLONE of the store's descriptor, cloned
+        # during routing -- before staging stamped the arena placement onto the
+        # store's copy. Refresh it here, where the edge leaves the process.
+        self._tensor_manager.refresh_shm_placement(edges)
         self._communicator.send(worker_id, WorkerMessage(
             message_type=WorkerMessageType.INPUT_SIGNALS,
             body=InputSignals(
@@ -1400,6 +1411,11 @@ class PythonGraphRuntime(GraphRuntime):
         partition_done: bool,
         profiling: Profiling | None,
     ):
+        # The conductor keeps these across passes and hands them back as a
+        # later walk's inputs, so a stale placement outlives the send.
+        self._tensor_manager.refresh_shm_placement(
+            info.pending_persist_signals
+        )
         persist_signals: dict[str, list[TensorPointerInfo]] = {}
         for edge in info.pending_persist_signals:
             persist_signals[edge.name] = edge.tensor_info

@@ -212,9 +212,12 @@ class RequestStateManager:
         current_fwd_info: CurrentForwardPassInfo | None = None,
         resource_publish_info: dict[str, PublishedInfo] | None = None,
     ):
-        part_info = self.per_request_info[request_id].per_partition_info[
-            partition_name
-        ]
+        info = self.per_request_info.get(request_id)
+        if info is None:
+            return
+        part_info = info.per_partition_info.get(partition_name)
+        if part_info is None:
+            return
         if current_fwd_info is not None:
             part_info.current_fwd_info = current_fwd_info
         if resource_publish_info is not None:

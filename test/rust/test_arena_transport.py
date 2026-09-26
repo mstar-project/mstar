@@ -16,6 +16,11 @@ from mstar.communication.tensors import (
     SharedMemoryCommunicationManager,
     create_tensor_communication_manager,
 )
+from mstar.distributed.base import (
+    NodeAndGraphWalk,
+    ShardingConfig,
+    ShardingGroup,
+)
 from mstar.graph.base import GraphEdge
 from mstar.utils.containers import ParallelList
 
@@ -513,3 +518,123 @@ def test_an_unregistered_segment_index_is_a_loud_error(backend):
     )
     with pytest.raises(ValueError, match="never registered"):
         store.set_shm_placement([12345], [99], [0])
+
+
+# --- a sharded edge keeps the placement its clone was made before ------------
+
+
+class _RecordingCommunicator:
+    """Keeps the TENSOR_RECEIVED acks a consumer sends on read."""
+
+    def __init__(self):
+        self.sent: list[tuple[str, object]] = []
+
+    def send(self, entity_id, msg):
+        self.sent.append((entity_id, msg))
+
+    def get_all_new_messages(self):
+        return []
+
+
+def _tp1_to_tp2_config() -> ShardingConfig:
+    """A sharded signal from a single-rank producer into a two-rank consumer,
+    so the fanout slices and therefore CLONES the descriptor."""
+    cfg = ShardingConfig(
+        groups=[
+            ShardingGroup(
+                nodes=["A"], tp_size=1, graph_walks=["decode"], _tp_rank=0,
+            ),
+            ShardingGroup(nodes=["B"], tp_size=2, graph_walks=["decode"]),
+        ],
+        tp_enabled_nodes={"A", "B"},
+        shard_dim={"x": 0},
+    )
+    cfg.setup({
+        NodeAndGraphWalk("A", "decode"): ["worker_0"],
+        NodeAndGraphWalk("B", "decode"): ["worker_1", "worker_2"],
+    })
+    return cfg
+
+
+def test_a_sharded_edge_still_names_its_arena_segment(tmp_path):
+    """The wire descriptor for a sharded edge has to carry the placement.
+
+    ``fanout_graph_edges`` clones the descriptor per destination to rewrite
+    dims/nbytes/offset, and it clones during ROUTING -- before staging stamps
+    ``shm_segment`` onto the copy the store holds, which is the only copy
+    ``register_for_send_uuids`` can reach. Left alone the clone ships
+    ``shm_segment=None``, which a consumer reads as "spilled to a per-uuid
+    file" and then opens a file the arena producer never wrote.
+    """
+    prod = _manager("worker_0", tmp_path)
+    cfg = _tp1_to_tp2_config()
+    prod.register_request(7, cfg)
+
+    original = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    infos = prod.store_and_return_tensor_info(
+        7, {"x": [original]}, node_name="A", graph_walk="decode",
+    )
+    edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
+    fanout = cfg.fanout_graph_edges(
+        edge, source_node="A", source_graph_walk="decode",
+        dest_graph_walk="decode",
+    )
+    assert sorted(fanout) == ["worker_1", "worker_2"]
+
+    uuids = sorted({i.uuid for e in fanout.values() for i in e.tensor_info})
+    prod.register_for_send_uuids(ParallelList([7], [uuids]))
+    # What the runtime does at each point an edge leaves the process.
+    for wire_edge in fanout.values():
+        prod.refresh_shm_placement([wire_edge])
+
+    for worker, wire_edge in sorted(fanout.items()):
+        for info in wire_edge.tensor_info:
+            assert info.shm_segment is not None, (
+                f"{worker}'s descriptor has no segment, so its consumer would "
+                "look for a per-uuid file that was never written"
+            )
+    # The refresh must touch ONLY the placement: everything else on the clone
+    # is this destination's slice.
+    assert [
+        (i.offset, i.nbytes, tuple(i.dims))
+        for _w, e in sorted(fanout.items()) for i in e.tensor_info
+    ] == [(0, 64, (2, 8)), (64, 64, (2, 8))]
+
+
+def test_a_peer_reads_its_own_half_of_a_sharded_edge(tmp_path):
+    """End to end: the descriptor the refresh produced is one a peer can
+    actually read its shard out of."""
+    prod = _manager("worker_0", tmp_path)
+    cfg = _tp1_to_tp2_config()
+    prod.register_request(7, cfg)
+
+    original = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    infos = prod.store_and_return_tensor_info(
+        7, {"x": [original]}, node_name="A", graph_walk="decode",
+    )
+    edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
+    fanout = cfg.fanout_graph_edges(
+        edge, source_node="A", source_graph_walk="decode",
+        dest_graph_walk="decode",
+    )
+    uuids = sorted({i.uuid for e in fanout.values() for i in e.tensor_info})
+    prod.register_for_send_uuids(ParallelList([7], [uuids]))
+    for wire_edge in fanout.values():
+        prod.refresh_shm_placement([wire_edge])
+
+    # Each rank of B reads the half the fanout cut for it. `shm_offset` is the
+    # tensor's base in the segment and `offset` the shard's cut within it, so
+    # rank 1 only lands on the right rows if both survived the refresh.
+    for rank, (worker, expected) in enumerate(
+        [("worker_1", original[:2]), ("worker_2", original[2:])]
+    ):
+        cons = _manager(worker, tmp_path)
+        # get_ready_tensors acks the producer; _NullCommunicator refuses sends.
+        cons.communicator = _RecordingCommunicator()
+        wire_edge = fanout[worker]
+        for f in cons.start_read_tensors(7, [wire_edge], graph_walk="decode") or []:
+            f.result()
+        ready = cons.get_ready_tensors(graph_walk="decode")
+        assert 7 in ready and len(ready[7]) == 1, f"rank {rank} read nothing"
+        got = cons.get_tensor(ready[7][0].tensor_info[0].uuid)
+        assert torch.equal(got, expected), f"rank {rank} read the wrong rows"

@@ -643,6 +643,46 @@ class TensorCommunicationManager(ABC):
         if down_uuids:
             self.dereference_batch(down_uuids, down_counts)
 
+    # ---- shared: descriptors about to go on the wire ----
+
+    #: Whether this transport writes placement onto a descriptor AFTER routing
+    #: has already copied it. Only the SHM arena does (``shm_segment`` /
+    #: ``shm_offset``); the per-uuid file and Mooncake paths derive everything
+    #: a consumer needs from ``uuid`` and ``address``, so they leave this off
+    #: and ``refresh_shm_placement`` stays free for them.
+    stamps_shm_placement: bool = False
+
+    def refresh_shm_placement(self, edges: list[GraphEdge]) -> None:
+        """Re-read arena placement from the store onto descriptors about to be
+        sent.
+
+        Registration stamps ``shm_segment`` / ``shm_offset`` onto the
+        descriptor the STORE holds, and that is the only copy it can reach --
+        ``register_for_send_uuids`` is handed uuids, not objects. A SHARDED
+        edge does not carry the store's copy: ``fanout_graph_edges`` clones it
+        per destination to rewrite dims/nbytes/offset, and it clones during
+        routing, which runs BEFORE staging. So the clone never sees the stamp
+        and ships ``shm_segment=None``, which a consumer reads as "the producer
+        spilled this one to a per-uuid file" -- and then opens a file the arena
+        producer never wrote.
+
+        Called at each point an edge leaves this process, after
+        ``register_for_send*`` has run. Only the two placement fields are
+        copied: everything else on the clone is this destination's slice and
+        must not be overwritten.
+        """
+        if not self.stamps_shm_placement:
+            return
+        for edge in edges:
+            for info in edge.tensor_info:
+                stored = self.tensor_store.get_info(info.uuid)
+                # `is`: the replicated fanout hands on the store's own object
+                # under the Python bookkeeper, so there is nothing to copy.
+                if stored is None or stored is info:
+                    continue
+                info.shm_segment = stored.shm_segment
+                info.shm_offset = stored.shm_offset
+
     # ---- abstract: transport-specific ----
 
     @abstractmethod
