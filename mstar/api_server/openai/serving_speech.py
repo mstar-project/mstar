@@ -47,3 +47,10 @@ async def _stream_wav(api, request_id, sample_rate):
     async for c in api.iter_result_chunks(request_id):
         if c.modality == "audio" and c.data:
             yield c.data
+        elif c.modality == "error":
+            # the status went out with the header, so breaking the transfer
+            # is what tells the client this audio is cut short
+            raise RuntimeError(
+                f"speech stream {request_id} failed: "
+                f"{c.data.decode('utf-8', 'replace')}"
+            )

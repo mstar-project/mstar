@@ -227,6 +227,41 @@ def test_chat_stream(client_and_stub):
     assert lines[-1]["choices"][0]["finish_reason"] == "stop"
 
 
+def test_chat_stream_that_fails_ends_with_the_error(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [
+        _Chunk("text", b"Par"),
+        _Chunk("error", b"result delivery timed out", {"status": 504}),
+    ]
+    text = client.post(
+        "/v1/chat/completions",
+        json={"model": "bagel", "messages": [{"role": "user", "content": "go"}], "stream": True},
+    ).text
+    events = [l[6:] for l in text.splitlines() if l.startswith("data: ")]
+    assert events[-1] == "[DONE]"
+    assert json.loads(events[-2]) == {
+        "error": {"message": "result delivery timed out", "code": 504}
+    }, "the failure never reached the client"
+    assert all(
+        json.loads(e)["choices"][0]["finish_reason"] is None for e in events[:-2]
+    ), "a stream that failed still ended like a completion"
+
+
+def test_speech_stream_that_fails_breaks_the_transfer(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.next_chunks = [
+        _Chunk("audio", _pcm([100, -100]), {"sample_rate": 24000}),
+        _Chunk("error", b"worker died", {"status": 500}),
+    ]
+    with pytest.raises(RuntimeError, match="worker died"):
+        client.post(
+            "/v1/audio/speech",
+            json={"model": "orpheus", "input": "hi", "voice": "tara", "stream": True},
+        )
+
+
 def test_unsupported_model_404(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "pi05"

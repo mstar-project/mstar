@@ -556,7 +556,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self, request_id: str, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         ctx = (
             torch.cuda.stream(self._d2h_stream)
@@ -588,8 +588,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     # falls back to the file read for exactly those).
                     data = _serialize_tensor(t)
                     path = self._shm_path(self.my_entity_id, uuid)
-                    with open(path, "wb") as f:
-                        f.write(data)
+                    self._write_shm_file(path, data)
                     self._shm_files[uuid] = path
                     self._arena_ts[uuid] = time.monotonic()
                     self.tensor_store.set_metadata(

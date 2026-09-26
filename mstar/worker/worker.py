@@ -79,6 +79,18 @@ def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
     return True, frozenset(n.strip() for n in raw.split(",") if n.strip())
 
 
+def _nodes_in_graph_order(worker_graphs: list[WorkerGraph]) -> list[str]:
+    """This worker's nodes, in the order its graphs name them.
+
+    Not a set: the engine builds and captures its nodes in this order, and a
+    set of strings iterates differently in every process. When memory is
+    tight, the node that captures first decides which others fit.
+    """
+    return list(dict.fromkeys(
+        node for wg in worker_graphs for node in wg.section.get_nodes()
+    ))
+
+
 @dataclass
 class PendingBatch:
     batch: ScheduledBatch
@@ -227,9 +239,7 @@ class Worker:
             enable_prof=enable_prof
         )
 
-        node_names = set()
-        for wg in my_worker_graphs:
-            node_names.update(wg.section.get_nodes())
+        node_names = _nodes_in_graph_order(my_worker_graphs)
 
         self.engine_manager = EngineManager.build(
             node_names,
