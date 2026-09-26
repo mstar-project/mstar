@@ -55,9 +55,8 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
     submodule returns ``new_token``, the sampled frame ``(1, n_codebooks + 1)``.
     """
 
-    # The default per-step batch capacity of the sampler buffers. The eager path
-    # grows it on demand, and ``get_cuda_graph_configs`` pre-sizes it to the
-    # largest capture bucket.
+    # The fixed per-step batch capacity of the sampler buffers. ``max_batch_size``
+    # caps every walk at it, so the buffers never resize after capture.
     _DEFAULT_MAX_BS = 256
 
     def __init__(
@@ -105,8 +104,8 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         device only to read the declared walks. ``preprocess`` therefore
         allocates the sampler buffers instead. The runner calls ``preprocess``
         on the real device during the capture warmup, before the graph records
-        the buffer addresses. The ``_DEFAULT_MAX_BS`` floor covers every capture
-        bucket, so ``ensure_batch_capacity`` never runs inside a capture epoch.
+        the buffer addresses. ``max_batch_size`` caps every walk at
+        ``_DEFAULT_MAX_BS``, so the buffers are allocated once and never move.
         """
         if not _HAS_FUSED:
             return []
@@ -122,6 +121,15 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
                 ),
             ),
         ]
+
+    def max_batch_size(self, graph_walk: str) -> int:
+        """Cap every walk at the sampler-buffer capacity.
+
+        Prefill is not captured, so without this a burst packs into one
+        unbounded batch and would outgrow the buffers the decode graphs recorded.
+        """
+        del graph_walk
+        return self._DEFAULT_MAX_BS
 
     # -- input plumbing ------------------------------------------------
     def prepare_inputs(
@@ -353,25 +361,26 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         return frames
 
     def _ensure_buffers(self, device, padded_bs: int) -> Zonos2SamplerBuffers:
-        """Allocate the per-request sampler buffers, or grow them.
+        """Allocate the per-request sampler buffers once, at full capacity.
 
-        On first use the method sizes them to ``max(padded_bs,
-        _DEFAULT_MAX_BS)``. ``get_cuda_graph_configs`` calls it before the
-        capture with the largest capture bucket, so the buffers exist and their
-        addresses are fixed before the graph records them.
-        ``ensure_batch_capacity`` then grows ``buf`` only on the eager path,
-        never inside a capture epoch.
+        They are sized to ``_DEFAULT_MAX_BS`` up front and never reallocated:
+        the captured decode graphs record their addresses, and the deferred
+        sync reads the previous step's ``_slot_idx_gpu``. ``max_batch_size``
+        keeps the scheduler within that capacity; a larger batch is a bug.
         """
+        if padded_bs > self._DEFAULT_MAX_BS:
+            raise RuntimeError(
+                f"Zonos2 batch of {padded_bs} exceeds the sampler capacity "
+                f"{self._DEFAULT_MAX_BS}; max_batch_size should have split it"
+            )
         if self._sampler_buffers is None:
             self._sampler_buffers = Zonos2SamplerBuffers.allocate(
-                max_batch_size=max(padded_bs, self._DEFAULT_MAX_BS),
+                max_batch_size=self._DEFAULT_MAX_BS,
                 n_codebooks=self.n_codebooks,
                 window=self.params.repetition_window,
                 repetition_codebooks=self.params.repetition_codebooks,
                 device=device,
             )
-        else:
-            self._sampler_buffers.ensure_batch_capacity(padded_bs)
         return self._sampler_buffers
 
     # -- graph routing + stop ------------------------------------------

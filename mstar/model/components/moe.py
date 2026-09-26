@@ -197,7 +197,9 @@ def _dispatch(
 
     The fused kernel needs a bf16 or fp16 ``hidden_states`` on CUDA (see
     :func:`mstar.utils.fused_moe.fused_experts`). The ``is_cuda`` guard here
-    checks the device. The caller must run in an autocast dtype.
+    checks the device. Autocast alone is not enough: the tensor itself must be
+    bf16/fp16, so cast back after ops autocast runs in fp32 (``F.rms_norm`` on
+    torch 2.12+).
     """
     if _HAS_FUSED and hidden_states.is_cuda:
         return _fused_experts(

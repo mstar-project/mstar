@@ -430,3 +430,18 @@ def test_speaker_encoder_selects_and_pools_matching_output():
 
     with pytest.raises(ValueError, match="expects a 4-dim speaker embedding"):
         enc._select_embedding(wrong)
+
+
+def test_emb_norm_keeps_residual_dtype_when_rms_norm_upcasts(monkeypatch):
+    # Torch 2.12 autocasts F.rms_norm to fp32; fused_experts then rejects the
+    # residual stream. Emulate that upcast on any torch version.
+    import mstar.model.zonos2.components.language_model as lm
+
+    real = lm.F.rms_norm
+    monkeypatch.setattr(
+        lm.F, "rms_norm", lambda *a, **kw: real(*a, **kw).float(),
+    )
+    model = _speaker_model(speaker_enabled=False).to(torch.bfloat16)
+    with torch.no_grad():
+        out = model(_ids(model))
+    assert out.dtype == torch.bfloat16

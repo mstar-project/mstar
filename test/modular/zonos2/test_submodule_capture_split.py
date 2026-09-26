@@ -325,3 +325,35 @@ def test_captured_sampler_matches_eager_token_for_token(reals, padded_bs):
 
     for step, (e, c) in enumerate(zip(eager_frames, cap_frames, strict=True)):
         assert torch.equal(e, c), f"captured != eager at step {step} (bs={padded_bs})"
+
+
+# --------------------------------------------------------------------------
+# Batch cap: the buffers are allocated once and never move.
+@pytest.mark.parametrize("walk", ["prefill", "prefill_clone", "decode"])
+def test_max_batch_size_caps_every_walk_at_buffer_capacity(walk):
+    sub = _sub(_params())
+    assert sub.max_batch_size(walk) == Zonos2LLMSubmodule._DEFAULT_MAX_BS
+
+
+def test_sampler_buffers_never_reallocate():
+    # A resize after capture left the decode graphs on freed buffers, and the
+    # deferred sync reading a zeroed slot index.
+    sub = _sub(_params())
+    cap = Zonos2LLMSubmodule._DEFAULT_MAX_BS
+    _split_step(sub, ["r0"], torch.randn(1, C, V))
+    bufs = sub._sampler_buffers
+    addrs = (bufs.ring_buf.data_ptr(), bufs._slot_idx_gpu.data_ptr())
+    rids = [f"r{i}" for i in range(cap)]
+    _split_step(sub, rids, torch.randn(cap, C, V))
+    assert sub._sampler_buffers is bufs
+    assert (bufs.ring_buf.data_ptr(), bufs._slot_idx_gpu.data_ptr()) == addrs
+    assert bufs.max_batch_size == cap
+
+
+def test_batch_over_capacity_raises_instead_of_resizing():
+    sub = _sub(_params())
+    cap = Zonos2LLMSubmodule._DEFAULT_MAX_BS
+    _split_step(sub, ["r0"], torch.randn(1, C, V))
+    rids = [f"r{i}" for i in range(cap + 1)]
+    with pytest.raises(RuntimeError, match="exceeds the sampler capacity"):
+        sub._prepare_sampler_step(_engine_inputs(rids), padded_bs=cap + 1)

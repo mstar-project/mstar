@@ -13,7 +13,8 @@ penalty:
   row for each live request. It grows by doubling.
 * ``buf`` — the per-step tensors ``[max_bs, ...]`` at a stable address. The
   graph reads and writes them. Each step gathers the slots of the active
-  requests into them.
+  requests into them. They are never reallocated: the captured graphs and the
+  deferred sync both hold their addresses.
 * ``_slot_idx`` — pinned staging for the single H2D copy of the slot indices.
 
 Each request has two pieces of state:
@@ -168,28 +169,6 @@ class Zonos2SamplerBuffers:
 
         self._free_slots.extend(range(old, new_capacity))
         self._master_capacity = new_capacity
-
-    def ensure_batch_capacity(self, padded_bs: int) -> None:
-        """Grow the per-step (``buf``) tensors to hold ``padded_bs`` rows.
-
-        This method serves the eager path, where the batch size changes from
-        step to step. The contents of ``buf`` are transient, because the code
-        gathers them again every step. The method therefore only reallocates
-        them larger, and it does not touch ``master``, the canonical per-slot
-        state. Do not call this method inside a capture epoch, where the buffer
-        addresses must stay stable.
-        """
-        if padded_bs <= self.max_batch_size:
-            return
-        dev = self.ring_buf.device
-        C, W = self.n_codebooks, self.window
-        self.ring_buf = torch.full((padded_bs, C, W), -1, dtype=torch.int32, device=dev)
-        self.pen_buf = torch.full((padded_bs, C, W), -1, dtype=torch.int32, device=dev)
-        self.cursor_buf = torch.zeros(padded_bs, dtype=torch.int32, device=dev)
-        self.offset_buf = torch.zeros(padded_bs, dtype=torch.int64, device=dev)
-        self._slot_idx_cpu = torch.zeros(padded_bs, dtype=torch.int64, pin_memory=self._pinned)
-        self._slot_idx_gpu = torch.zeros(padded_bs, dtype=torch.int64, device=dev)
-        self.max_batch_size = padded_bs
 
     # -- gather for each step (outside the graph) -----------------------
     def gather_for_request_ids(self, request_ids: list[str], padded_bs: int) -> None:

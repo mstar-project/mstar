@@ -207,9 +207,10 @@ class Zonos2Attention(nn.Module):
         v = v.view(num_tokens, self.local_num_kv_heads, self.head_dim).contiguous()
 
         # QK-norm has no parameters. The code also scales the query by |temp|
-        # for each head.
-        q = F.rms_norm(q, (self.head_dim,), eps=_QK_NORM_EPS) * self.temp.abs().to(q.dtype)
-        k = F.rms_norm(k, (self.head_dim,), eps=_QK_NORM_EPS)
+        # for each head. Torch 2.12+ autocasts rms_norm to fp32; cast back.
+        q = F.rms_norm(q, (self.head_dim,), eps=_QK_NORM_EPS).to(q.dtype)
+        q = q * self.temp.abs().to(q.dtype)
+        k = F.rms_norm(k, (self.head_dim,), eps=_QK_NORM_EPS).to(k.dtype)
 
         # Interleaved RoPE (is_neox=False). Pass no llama3 scaling kwargs, so
         # that the position resource keeps the plain rope path — the spec
@@ -474,8 +475,9 @@ class Zonos2ForCausalLM(nn.Module):
                 projected.to(x.dtype),
             )
 
-        # emb_norm is an RMSNorm with no parameters.
-        x = F.rms_norm(x, (x.shape[-1],), eps=self._emb_norm_eps)
+        # emb_norm is an RMSNorm with no parameters. The cast keeps the residual
+        # stream bf16/fp16 under torch 2.12+ autocast, which fused_experts needs.
+        x = F.rms_norm(x, (x.shape[-1],), eps=self._emb_norm_eps).to(x.dtype)
 
         # The label and layer index are cursors on the shared resources: bind
         # the label once, advance the index per layer. Passing them as
