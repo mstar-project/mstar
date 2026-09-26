@@ -17,7 +17,9 @@ from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime import sharding
 from mstar.graph.runtime.base import (
+    ColumnarEdgeSpecs,
     EdgeSpec,
+    FreedTensors,
     GraphRuntime,
     ParallelList,
     PendingLoopStop,
@@ -67,7 +69,9 @@ class _SpecRidPrep:
     rid: int
     node: GraphNode
     consumed_idxs: list[int]
-    input_edges: list[EdgeSpec]
+    # (signal, uuids, is_final_streaming_chunk). Raw triples, not EdgeSpecs:
+    # the caller folds them straight into the columnar block.
+    input_edges: list[tuple[str, list[int], bool]]
     into_signals: list[tuple[int, str]]
     into_next_iter: list[tuple[int, str]]
 
@@ -308,6 +312,12 @@ class PythonGraphRuntime(GraphRuntime):
                 continue
             queues[rid].get_node(node)._speculatively_scheduled = speculatively_scheduled
 
+    def is_speculatively_scheduled(
+        self, node: str, wg_id: int, rid: int,
+    ) -> bool:
+        wgio = self._queues[wg_id].per_request_queues.get(rid)
+        return wgio is not None and wgio.get_node(node)._speculatively_scheduled
+
     def get_dynamic_loop_iters(
         self, request_ids: list[int],
         partition: str,
@@ -381,14 +391,16 @@ class PythonGraphRuntime(GraphRuntime):
 
     def cleanup_consumed_inputs(
         self, node_name: str, rids: list[int], wg_ids: list[int],
-    ):
-        # ``clear`` dereferences through the tensor manager this runtime was
-        # built with, which runs the teardown as it goes.
+    ) -> FreedTensors:
         for rid, wg_id in zip(rids, wg_ids, strict=True):
             wgio = self._queues[wg_id].per_request_queues.get(rid)
             if wgio is not None:
                 wgio.get_node(node_name).ready_signals.clear()
                 wgio.ready_node_names.discard(node_name)
+        # ``clear`` dereferences through the tensor manager this runtime was
+        # built with, which runs the teardown as it goes. Nothing is left for
+        # the caller.
+        return FreedTensors.none()
 
     def mark_stream_partition_done(self, rid: int, partition: str):
         info = self._request_info.get(rid)
@@ -425,6 +437,12 @@ class PythonGraphRuntime(GraphRuntime):
     def _edge_from_spec(
         self, spec: EdgeSpec, is_streaming: bool,
     ) -> GraphEdge:
+        """One ``EdgeSpec`` as a real edge.
+
+        Only the speculation prep still needs this: its streaming_edges are
+        still per-edge objects (see the TODO on ``SpeculationPrepInput``).
+        ``ingest_inputs_batch`` goes through ``ColumnarEdgeSpecs.to_edges``.
+        """
         return GraphEdge(
             name=spec.signal,
             next_node=spec.next_node,
@@ -437,17 +455,19 @@ class PythonGraphRuntime(GraphRuntime):
 
     def ingest_inputs_batch(
         self,
-        signals: ParallelList[int, EdgeSpec],
+        signals: ColumnarEdgeSpecs,
         can_buffer: bool = True,
         is_streaming: bool = False,
     ) -> list[int]:
+        # Real GraphEdges, because that is what a node's ingest takes: it
+        # checks the destination and the input name off the edge itself.
+        edges = signals.to_edges(self._tensor_store, is_streaming)
         uningested: list[int] = []
-        for i, (rid, spec) in enumerate(signals):
+        for i, (rid, edge) in enumerate(zip(signals.rids, edges, strict=True)):
             info = self._request_info.get(rid)
             if info is None:
                 uningested.append(i)  # never admitted here, or already removed
                 continue
-            edge = self._edge_from_spec(spec, is_streaming)
             # The streaming gate is re-evaluated per signal on purpose:
             # ingesting one can be what makes the next node eligible.
             if not self._ingest_one(rid, info, edge, can_buffer, is_streaming):
@@ -496,29 +516,27 @@ class PythonGraphRuntime(GraphRuntime):
 
         rids: list[int] = []
         wg_ids: list[int] = []
-        input_edges: list[EdgeSpec] = []
-        input_edges_per_rid: list[int] = []
+        # Columns filled as the edges are found; no EdgeSpec ever exists.
+        # next_node is not carried: it is `node_name`, the same for every edge,
+        # and nothing downstream of a pop reads it.
+        edges = ColumnarEdgeSpecs.empty()
         for rid in request_ids:
             popped = queue.pop_ready_nodes(rid, [node_name])
             if not popped:
                 continue
             assert len(popped) == 1
             node = popped[0]
-            ready = node.ready_signals.ready_inputs
             rids.append(rid)
             wg_ids.append(wg_id)
-            input_edges_per_rid.append(len(ready))
-            for signal, edge in ready.items():
-                input_edges.append(EdgeSpec(
-                    signal=signal,
-                    next_node=edge.next_node,
-                    uuids=[info.uuid for info in edge.tensor_info],
-                    is_final_streaming_chunk=edge._final_stream_chunk,
-                ))
+            for signal, edge in node.ready_signals.ready_inputs.items():
+                edges.add(
+                    rid, signal,
+                    [info.uuid for info in edge.tensor_info],
+                    edge._final_stream_chunk,
+                )
         return PopRidsOutput(
             wg_ids=ParallelList(rids, wg_ids),
-            input_edges=input_edges,
-            input_edges_per_rid=input_edges_per_rid,
+            input_edges=edges,
             output_signals=self.get_output_signals(node_name, graph_walk),
         )
 
@@ -722,14 +740,17 @@ class PythonGraphRuntime(GraphRuntime):
                 return None
             prepped.append(result)
 
+        edges = ColumnarEdgeSpecs.empty()
+        for p in prepped:
+            for signal, uuids, final_chunk in p.input_edges:
+                edges.add(p.rid, signal, uuids, final_chunk)
         return SpeculationPrepOutput(
             consumed_streaming_edge_idxs=[
                 idx for p in prepped for idx in p.consumed_idxs
             ],
             ready_rids=[p.rid for p in prepped],
             wg_ids=[wg_id] * len(prepped),
-            input_edges=[e for p in prepped for e in p.input_edges],
-            input_edges_per_rid=[len(p.input_edges) for p in prepped],
+            input_edges=edges,
         )
 
     def prep_spec_rids(
@@ -753,8 +774,7 @@ class PythonGraphRuntime(GraphRuntime):
         consumed_idxs: list[int] = []
         ready_rids: list[int] = []
         wg_ids: list[int] = []
-        input_edges: list[EdgeSpec] = []
-        input_edges_per_rid: list[int] = []
+        edges = ColumnarEdgeSpecs.empty()
 
         for rid, indexed_edges in per_rid_edges:
             wgio = queue.per_request_queues.get(rid)
@@ -781,15 +801,14 @@ class PythonGraphRuntime(GraphRuntime):
             consumed_idxs.extend(prepped.consumed_idxs)
             ready_rids.append(rid)
             wg_ids.append(wg_id)
-            input_edges.extend(prepped.input_edges)
-            input_edges_per_rid.append(len(prepped.input_edges))
+            for signal, uuids, final_chunk in prepped.input_edges:
+                edges.add(rid, signal, uuids, final_chunk)
 
         return SpeculationPrepOutput(
             consumed_streaming_edge_idxs=consumed_idxs,
             ready_rids=ready_rids,
             wg_ids=wg_ids,
-            input_edges=input_edges,
-            input_edges_per_rid=input_edges_per_rid,
+            input_edges=edges,
         )
 
     def _can_continue_loop(
@@ -872,11 +891,10 @@ class PythonGraphRuntime(GraphRuntime):
             node=node,
             consumed_idxs=[idx for idx, _name in into_next_iter + into_signals],
             input_edges=[
-                EdgeSpec(
-                    signal=name,
-                    next_node=edge.next_node,
-                    uuids=[info.uuid for info in edge.tensor_info],
-                    is_final_streaming_chunk=edge._final_stream_chunk,
+                (
+                    name,
+                    [info.uuid for info in edge.tensor_info],
+                    edge._final_stream_chunk,
                 ) for name, edge in slots.ready_inputs.items()
             ],
             into_signals=into_signals,

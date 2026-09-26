@@ -22,6 +22,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import (
+    ColumnarEdgeSpecs,
     EdgeSpec,
     PendingLoopStop,
     RouteInput,
@@ -455,18 +456,10 @@ def test_peer_loop_stop_compares_enclosing_loop_indices():
 
 def _ingest(runtime, rid, edges):
     """Feed edges through the runtime's contract entry point."""
-    return runtime.ingest_inputs_batch(
-        ParallelList(
-            [rid] * len(edges),
-            [
-                EdgeSpec(
-                    signal=e.name, next_node=e.next_node,
-                    uuids=[i.uuid for i in e.tensor_info],
-                ) for e in edges
-            ],
-        ),
-        can_buffer=True,
-    )
+    block = ColumnarEdgeSpecs.empty()
+    for edge in edges:
+        block.add_edge(rid, edge)
+    return runtime.ingest_inputs_batch(block, can_buffer=True)
 
 
 def _store_outputs(store, minter, rid, tensors):
@@ -760,8 +753,8 @@ def test_prep_returns_the_worker_graph_per_ready_rid():
     out = _prep(runtime, [rid])
     assert out.ready_rids == [rid]
     assert out.wg_ids == [0], "wg_ids is parallel to ready_rids"
-    assert len(out.input_edges_per_rid) == len(out.ready_rids)
-    assert sum(out.input_edges_per_rid) == len(out.input_edges)
+    # Every edge in the block belongs to a rid the prep reported ready.
+    assert {r for r, *_ in out.input_edges.edge_tuples()} <= set(out.ready_rids)
 
 
 def test_prep_respects_room_for_continuing():

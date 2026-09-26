@@ -8,7 +8,9 @@
 //!   `ready_streaming_next_iter` sets are NOT ported: they are dead
 //!   (reset_for_iter is only ever called on a LoopStateRegistry).
 
-use crate::graph::spec::{Dest, EdgeSpec, GraphRef, LoopId, NodeId, Sym};
+use crate::graph::spec::{
+    CompiledGraph, Dest, EdgeSpec, GraphRef, LoopId, NodeId, Sym,
+};
 use serde::Serialize;
 
 /// The only per-edge payload that crosses the boundary. `uuid` is a dense u64
@@ -285,8 +287,9 @@ impl RequestState {
         }
     }
 
-    /// Back to seeded membership, for the two paths where Python rebuilds the
-    /// whole set: `reset_for_iter` and `clear`.
+    /// Back to seeded membership for a node whose inputs were just cleared: a
+    /// loop member on advance or finish (Python's
+    /// `LoopStateRegistry._reseed_streaming_ready`), or any node on reset.
     fn reseed_streaming_ready(&mut self, id: NodeId) {
         let only = self.graph.node(id).only_streaming;
         let (w, b) = Self::bit(id);
@@ -302,17 +305,21 @@ impl RequestState {
     /// Python's `GraphNode.ingest_input` + the registry chain's
     /// `register_ingested_input`. Returns false when the edge is rejected
     /// (both slots already hold this input), i.e. "try the next destination".
+    /// A SLICE, not an owned vec: the caller offers the same tensors to each
+    /// live worker graph in turn and only one claims them, so taking ownership
+    /// meant an allocation per attempt -- and then another, because the slot
+    /// cloned it again on the way in.
     pub fn ingest(
-        &mut self, node: NodeId, slot: u8, tensors: Vec<TensorRef>,
-        can_buffer: bool, final_chunk: bool,
+        &mut self, g: &CompiledGraph, node: NodeId, slot: u8,
+        tensors: &[TensorRef], can_buffer: bool, final_chunk: bool,
     ) -> bool {
-        let name = self.graph.node(node).inputs[slot as usize];
+        let name = g.node(node).inputs[slot as usize];
         {
             let st = &mut self.nodes[node as usize];
             if !st.cur.has(slot) {
-                st.cur.set(slot, tensors.clone(), final_chunk);
+                st.cur.set(slot, tensors.to_vec(), final_chunk);
             } else if can_buffer && !st.next.has(slot) {
-                st.next.set(slot, tensors.clone(), final_chunk);
+                st.next.set(slot, tensors.to_vec(), final_chunk);
             } else {
                 return false;
             }
@@ -320,17 +327,24 @@ impl RequestState {
         // An ingest bubbles through every enclosing loop, each recording it if
         // it is external at that level (Loop.ingest_external_input recursing
         // via _managing_registry), then reaches the root's ready sets.
-        self.record_external(node, name, &tensors);
+        self.record_external(g, node, name, tensors);
         self.refresh_ready(node);
         self.note_ingested_for_streaming(node);
         true
     }
 
-    fn record_external(&mut self, node: NodeId, name: Sym, t: &[TensorRef]) {
-        let graph = self.graph.clone();
-        let mut cur = graph.node(node).loop_id;
+    fn record_external(
+        &mut self, g: &CompiledGraph, node: NodeId, name: Sym, t: &[TensorRef],
+    ) {
+        // Never a streamed input: each iteration takes the NEXT chunk, and
+        // re-injecting this one on advance would feed it again.
+        let spec = g.node(node);
+        if spec.slot_of(name).is_some_and(|i| spec.streaming_mask >> i & 1 == 1) {
+            return;
+        }
+        let mut cur = g.node(node).loop_id;
         while let Some(lid) = cur {
-            let ls = graph.lp(lid);
+            let ls = g.lp(lid);
             if ls.external_inputs.iter().any(|(n, d)| *n == name && *d == node) {
                 let st = &mut self.loops[lid as usize];
                 if !st.ext_names.contains(&name) {
@@ -387,37 +401,16 @@ impl RequestState {
         self.ready[w] |= 1 << b;
     }
 
-    /// Inputs of `node` that are an enclosing loop's external inputs. Python
-    /// marks those edges `_persist_for_loop` -- they are re-injected every
-    /// iteration -- and `ReadySignals.clear` does not dereference them.
-    fn held_inputs(&self, node: NodeId) -> Vec<Sym> {
-        let graph = &self.graph;
-        let mut names = Vec::new();
-        let mut cur = graph.node(node).loop_id;
-        while let Some(lid) = cur {
-            let ls = graph.lp(lid);
-            names.extend(
-                ls.external_inputs
-                    .iter()
-                    .filter(|(_, d)| *d == node)
-                    .map(|(n, _)| *n),
-            );
-            cur = ls.parent;
-        }
-        names
-    }
-
     /// `ReadySignals.clear` on one of a node's slots: every tensor it holds
     /// is released, except a held loop input's.
-    fn release_slot(&mut self, node: NodeId, next: bool) {
-        let held = self.held_inputs(node);
-        let graph = self.graph.clone();
-        let spec = graph.node(node);
+    fn release_slot(&mut self, g: &CompiledGraph, node: NodeId, next: bool) {
+        let spec = g.node(node);
+        let held = spec.held_mask;
         let st = &self.nodes[node as usize];
         let slot = if next { &st.next } else { &st.cur };
-        for (i, name) in spec.inputs.iter().enumerate() {
-            if held.contains(name) {
-                continue;
+        for i in 0..spec.inputs.len() {
+            if held >> i & 1 == 1 {
+                continue; // an enclosing loop re-injects this one
             }
             if let Some(tensors) = &slot.tensors[i] {
                 self.refs_released.extend(tensors.iter().map(|t| t.uuid));
@@ -432,16 +425,17 @@ impl RequestState {
     /// for re-injection on the next iteration (Python's `_persist_for_loop`),
     /// so they are excluded -- and that is structural, from the spec's
     /// `external_inputs`, not per-request state.
-    pub fn clear_consumed_inputs(&mut self, node: NodeId) -> Vec<u64> {
-        let graph = self.graph.clone();
-        let spec = graph.node(node);
-        let held = self.held_inputs(node);
+    pub fn clear_consumed_inputs(
+        &mut self, g: &CompiledGraph, node: NodeId,
+    ) -> Vec<u64> {
+        let spec = g.node(node);
+        let held = spec.held_mask;
 
         let st = &mut self.nodes[node as usize];
         let mut freed = Vec::new();
-        for (i, name) in spec.inputs.iter().enumerate() {
-            if held.contains(name) {
-                continue;
+        for i in 0..spec.inputs.len() {
+            if held >> i & 1 == 1 {
+                continue; // an enclosing loop re-injects this one
             }
             if let Some(tensors) = st.cur.tensors[i].take() {
                 freed.extend(tensors.iter().map(|t| t.uuid));
@@ -475,10 +469,10 @@ impl RequestState {
     /// them would leak a reference on any path where completion precedes the
     /// explicit cleanup.
     pub fn complete(
-        &mut self, node: NodeId, out_tensors: &[Vec<TensorRef>],
+        &mut self, g: &CompiledGraph, node: NodeId,
+        out_tensors: &[Vec<TensorRef>],
     ) -> Completed {
-        let graph = self.graph.clone();
-        let spec = graph.node(node);
+        let spec = g.node(node);
         let prev_done = self.is_done;
         let mut out: Vec<RoutedEdge> = Vec::with_capacity(spec.outputs.len() + 2);
 
@@ -500,6 +494,12 @@ impl RequestState {
             }
         }
         self.refresh_ready(node);
+        // The slot was just cleared, so streaming membership goes back to its
+        // seed; Python's `WorkerGraphStateRegistry.mark_entity_complete`
+        // does exactly this right after `entity.ready_signals.clear()`.
+        if spec.loop_id.is_none() {
+            self.reseed_streaming_ready(node);
+        }
 
         for (i, e) in spec.outputs.iter().enumerate() {
             out.push(routed(e, out_tensors.get(i).cloned().unwrap_or_default()));
@@ -508,7 +508,7 @@ impl RequestState {
         let mut filtered: Vec<(Sym, NodeId)> = Vec::new();
         match spec.loop_id {
             None => self.root_entity_done(),
-            Some(lid) => self.entity_completed(lid, 0, &mut out, &mut filtered),
+            Some(lid) => self.entity_completed(g, lid, 0, &mut out, &mut filtered),
         }
 
         if self.is_done && !prev_done {
@@ -534,12 +534,11 @@ impl RequestState {
     /// One entity of loop `lid` finished; `out[edges_from..]` are its outputs.
     /// Mirrors `LoopStateRegistry.mark_entity_complete` + `Loop.complete_iter`.
     fn entity_completed(
-        &mut self, lid: LoopId, edges_from: usize,
+        &mut self, g: &CompiledGraph, lid: LoopId, edges_from: usize,
         out: &mut Vec<RoutedEdge>, filtered: &mut Vec<(Sym, NodeId)>,
     ) {
-        let graph = self.graph.clone();
-        let lspec = graph.lp(lid);
-        self.cache_outputs(lid, edges_from, out);
+        let lspec = g.lp(lid);
+        self.cache_outputs(g, lid, edges_from, out);
 
         {
             let st = &mut self.loops[lid as usize];
@@ -555,9 +554,9 @@ impl RequestState {
             st.finish_signal || lspec.max_iters == st.curr_iter + 1
         };
         if finishing {
-            self.finish_loop(lid, out, filtered);
+            self.finish_loop(g, lid, out, filtered);
         } else {
-            self.advance_loop(lid, out);
+            self.advance_loop(g, lid, out);
         }
     }
 
@@ -565,9 +564,11 @@ impl RequestState {
     /// matching a declared loop output, deduped by name. Regular outputs
     /// *extend* within an iteration (cleared on advance); accumulated outputs
     /// extend across iterations.
-    fn cache_outputs(&mut self, lid: LoopId, from: usize, out: &[RoutedEdge]) {
-        let graph = self.graph.clone();
-        let lspec = graph.lp(lid);
+    fn cache_outputs(
+        &mut self, g: &CompiledGraph, lid: LoopId, from: usize,
+        out: &[RoutedEdge],
+    ) {
+        let lspec = g.lp(lid);
         let mut seen: Vec<Sym> = Vec::new();
         for e in &out[from..] {
             if seen.contains(&e.name) {
@@ -593,11 +594,10 @@ impl RequestState {
     }
 
     fn finish_loop(
-        &mut self, lid: LoopId, out: &mut Vec<RoutedEdge>,
+        &mut self, g: &CompiledGraph, lid: LoopId, out: &mut Vec<RoutedEdge>,
         filtered: &mut Vec<(Sym, NodeId)>,
     ) {
-        let graph = self.graph.clone();
-        let lspec = graph.lp(lid);
+        let lspec = g.lp(lid);
         self.loops[lid as usize].done = true;
 
         // Drop loop-back edges: the loop is over, nothing re-enters it.
@@ -609,7 +609,7 @@ impl RequestState {
 
         // Clear the body subtree. The loop's OWN curr_iter survives until a
         // parent advance (Python: inner_registry.clear() doesn't touch it).
-        self.clear_subtree(lid);
+        self.clear_subtree(g, lid);
 
         let (cached, accum) = {
             let st = &mut self.loops[lid as usize];
@@ -636,17 +636,18 @@ impl RequestState {
         //     to the same `out`.
         match lspec.parent {
             None => self.root_entity_done(),
-            Some(p) => self.entity_completed(p, own_edges_from, out, filtered),
+            Some(p) => self.entity_completed(g, p, own_edges_from, out, filtered),
         }
     }
 
-    fn advance_loop(&mut self, lid: LoopId, out: &mut Vec<RoutedEdge>) {
-        let graph = self.graph.clone();
+    fn advance_loop(
+        &mut self, g: &CompiledGraph, lid: LoopId, out: &mut Vec<RoutedEdge>,
+    ) {
         {
             let st = &mut self.loops[lid as usize];
             st.curr_iter += 1;
         }
-        self.reset_subtree_for_iter(lid);
+        self.reset_subtree_for_iter(g, lid);
         // Loop._uncache_outputs, after the reset as in `_advance_one_iter`.
         let cached = std::mem::take(&mut self.loops[lid as usize].cached);
         for (_, t) in &cached {
@@ -664,7 +665,7 @@ impl RequestState {
                 // The dest node's interned NAME, not its NodeId: `dest_sym`
                 // is what the sharding fanout looks a group up by, and the
                 // two are different namespaces that happen to share a repr.
-                dest_sym: graph.node(dest).name,
+                dest_sym: g.node(dest).name,
                 persist: false, new_token: false,
                 streaming: false, modality: 0, tensors: t,
                 persist_for_loop: true, declined_local: false,
@@ -676,13 +677,12 @@ impl RequestState {
     /// Python's `GraphStateRegistry.reset_for_iter` on a loop's inner registry:
     /// member nodes promote next-iter slots; child loops reset recursively AND
     /// have their metadata cleared (`Loop.reset_for_outer_iter`).
-    fn reset_subtree_for_iter(&mut self, lid: LoopId) {
-        let graph = self.graph.clone();
-        let lspec = graph.lp(lid);
+    fn reset_subtree_for_iter(&mut self, g: &CompiledGraph, lid: LoopId) {
+        let lspec = g.lp(lid);
         for &n in &lspec.member_nodes {
             // GraphNode.reset_for_outer_iter: ready_signals.clear(), then
             // promote the next-iter slot.
-            self.release_slot(n, false);
+            self.release_slot(g, n, false);
             {
                 let st = &mut self.nodes[n as usize];
                 st.cur.clear();
@@ -693,7 +693,7 @@ impl RequestState {
             self.reseed_streaming_ready(n);
         }
         for &c in &lspec.child_loops {
-            self.reset_subtree_for_iter(c);
+            self.reset_subtree_for_iter(g, c);
             let st = &mut self.loops[c as usize];
             st.completed_entities = 0;
             st.reset_metadata();
@@ -703,20 +703,19 @@ impl RequestState {
     /// Python's `GraphStateRegistry.clear()` on a loop's inner registry:
     /// members fully cleared; child loops cleared and metadata reset
     /// (`Loop.clear`, which also drops the accumulated cache).
-    fn clear_subtree(&mut self, lid: LoopId) {
-        let graph = self.graph.clone();
-        let lspec = graph.lp(lid);
+    fn clear_subtree(&mut self, g: &CompiledGraph, lid: LoopId) {
+        let lspec = g.lp(lid);
         for &n in &lspec.member_nodes {
             // GraphNode.clear: both registered slots release their tensors;
             // the speculative slot never held a reference.
-            self.release_slot(n, false);
-            self.release_slot(n, true);
+            self.release_slot(g, n, false);
+            self.release_slot(g, n, true);
             self.nodes[n as usize].clear();
             self.refresh_ready(n);
             self.reseed_streaming_ready(n);
         }
         for &c in &lspec.child_loops {
-            self.clear_subtree(c);
+            self.clear_subtree(g, c);
             let st = &mut self.loops[c as usize];
             st.completed_entities = 0;
             // Loop.clear un-caches the accumulated outputs. It leaves the
@@ -756,15 +755,16 @@ impl RequestState {
     // -- speculation ---------------------------------------------------------
 
     /// Python's `WorkerGraphIO.ingest_for_speculation`.
-    pub fn ingest_for_speculation(&mut self, source: NodeId, edges: &[RoutedEdge]) -> Vec<SpecNode> {
-        let graph = self.graph.clone();
-        let src_loop = graph.node(source).loop_id;
+    pub fn ingest_for_speculation(
+        &mut self, g: &CompiledGraph, source: NodeId, edges: &[RoutedEdge],
+    ) -> Vec<SpecNode> {
+        let src_loop = g.node(source).loop_id;
         let mut dests: Vec<NodeId> = Vec::new();
         let mut next_iter: Vec<NodeId> = Vec::new();
 
         for e in edges {
             let Dest::Local(d) = e.dest else { continue };
-            let Some(slot) = graph.node(d).slot_of(e.name) else { continue };
+            let Some(slot) = g.node(d).slot_of(e.name) else { continue };
             self.nodes[d as usize].spec.set(slot, e.tensors.clone(), false);
             if !self.spec_dirty.contains(&d) {
                 self.spec_dirty.push(d);
@@ -773,7 +773,7 @@ impl RequestState {
                 dests.push(d);
             }
             if let Some(lid) = src_loop {
-                if graph.lp(lid).loop_back.iter().any(|(n, dn)| *n == e.name && *dn == d)
+                if g.lp(lid).loop_back.iter().any(|(n, dn)| *n == e.name && *dn == d)
                     && !next_iter.contains(&d)
                 {
                     next_iter.push(d);
@@ -786,7 +786,7 @@ impl RequestState {
             .map(|d| SpecNode {
                 node: d,
                 is_new_loop_iter: next_iter.contains(&d),
-                loop_id: graph.node(d).loop_id,
+                loop_id: g.node(d).loop_id,
             })
             .collect()
     }
@@ -883,11 +883,11 @@ mod tests {
     fn top_level_completion_releases_unconsumed_inputs() {
         let (_, g) = decode_loop();
         let enc = 0;
-        let mut st = RequestState::new(g);
-        assert!(st.ingest(enc, 0, vec![t(1)], false, false));
+        let mut st = RequestState::new(g.clone());
+        assert!(st.ingest(&g, enc, 0, &[t(1)], false, false));
         assert!(st.is_ready(enc));
         // No cleanup ran first, so the completion itself releases `x`.
-        let done = st.complete(enc, &[vec![t(2)], vec![t(3)]]);
+        let done = st.complete(&g, enc, &[vec![t(2)], vec![t(3)]]);
         assert_eq!(done.freed, vec![1]);
         assert!(done.taken.is_empty());
         assert_eq!(done.edges.len(), 2);
@@ -900,21 +900,21 @@ mod tests {
         let (it, g) = decode_loop();
         let (enc, dec) = (0, 1);
         let (h, tok) = (it.get("h").unwrap(), it.get("tok").unwrap());
-        let mut st = RequestState::new(g);
+        let mut st = RequestState::new(g.clone());
 
-        st.ingest(enc, 0, vec![t(1)], false, false);
-        assert_eq!(st.clear_consumed_inputs(enc), vec![1]);
-        st.complete(enc, &[vec![t(2)], vec![t(3)]]);
-        st.ingest(dec, 0, vec![t(2)], true, false);
-        st.ingest(dec, 1, vec![t(3)], true, false);
+        st.ingest(&g, enc, 0, &[t(1)], false, false);
+        assert_eq!(st.clear_consumed_inputs(&g, enc), vec![1]);
+        st.complete(&g, enc, &[vec![t(2)], vec![t(3)]]);
+        st.ingest(&g, dec, 0, &[t(2)], true, false);
+        st.ingest(&g, dec, 1, &[t(3)], true, false);
 
         let mut last_tok = 3;
         for i in 0..3u64 {
             assert!(st.is_ready(dec), "iteration {i}");
             // `h` is held for re-injection; only the loop-back input goes.
-            assert_eq!(st.clear_consumed_inputs(dec), vec![last_tok]);
+            assert_eq!(st.clear_consumed_inputs(&g, dec), vec![last_tok]);
             let (new_tok, frame) = (10 * (i + 1), 10 * (i + 1) + 1);
-            let done = st.complete(dec, &[vec![t(new_tok)], vec![t(frame)]]);
+            let done = st.complete(&g, dec, &[vec![t(new_tok)], vec![t(frame)]]);
             // maybe_cache_output takes one reference per cached tensor.
             assert_eq!(done.taken, vec![new_tok, frame], "iteration {i}");
             if i < 2 {
@@ -928,8 +928,8 @@ mod tests {
                 assert!(reinjected.persist_for_loop);
                 assert_eq!(reinjected.dest_sym, it.get("dec").unwrap());
                 assert_eq!(uuids(reinjected), vec![2]);
-                st.ingest(dec, 0, reinjected.tensors.clone(), true, false);
-                st.ingest(dec, 1, done.edges[0].tensors.clone(), true, false);
+                st.ingest(&g, dec, 0, &reinjected.tensors, true, false);
+                st.ingest(&g, dec, 1, &done.edges[0].tensors, true, false);
                 last_tok = new_tok;
             } else {
                 // Finishing hands the caches to the loop's output edges: no
@@ -955,17 +955,17 @@ mod tests {
     fn advancing_releases_an_unconsumed_current_slot() {
         let (_, g) = decode_loop();
         let dec = 1;
-        let mut st = RequestState::new(g);
-        st.ingest(dec, 0, vec![t(2)], true, false);
-        st.ingest(dec, 1, vec![t(3)], true, false);
+        let mut st = RequestState::new(g.clone());
+        st.ingest(&g, dec, 0, &[t(2)], true, false);
+        st.ingest(&g, dec, 1, &[t(3)], true, false);
         // A loop-back arrival while the current slot is full is buffered.
-        assert!(st.ingest(dec, 1, vec![t(4)], true, false));
+        assert!(st.ingest(&g, dec, 1, &[t(4)], true, false));
         assert!(st.has_input(dec, 1, true));
-        assert!(!st.ingest(dec, 1, vec![t(5)], true, false), "both slots full");
+        assert!(!st.ingest(&g, dec, 1, &[t(5)], true, false), "both slots full");
 
         // No cleanup: the reset releases `tok` (not the held `h`), then
         // promotes the buffered arrival.
-        let done = st.complete(dec, &[vec![t(10)], vec![t(11)]]);
+        let done = st.complete(&g, dec, &[vec![t(10)], vec![t(11)]]);
         assert_eq!(done.freed, vec![3, 10]);
         let now: Vec<Vec<u64>> = st.input_tensors(dec, false).into_iter()
             .map(|(_, ts, _)| ts.iter().map(|t| t.uuid).collect()).collect();
@@ -977,13 +977,13 @@ mod tests {
     fn finish_signal_ends_the_loop_early() {
         let (it, g) = decode_loop();
         let dec = 1;
-        let mut st = RequestState::new(g);
-        st.ingest(dec, 0, vec![t(2)], true, false);
-        st.ingest(dec, 1, vec![t(3)], true, false);
+        let mut st = RequestState::new(g.clone());
+        st.ingest(&g, dec, 0, &[t(2)], true, false);
+        st.ingest(&g, dec, 1, &[t(3)], true, false);
         let lb = st.register_loop_finish(0).to_vec();
         assert_eq!(lb, vec![(it.get("tok").unwrap(), dec)]);
-        st.clear_consumed_inputs(dec);
-        let done = st.complete(dec, &[vec![t(10)], vec![t(11)]]);
+        st.clear_consumed_inputs(&g, dec);
+        let done = st.complete(&g, dec, &[vec![t(10)], vec![t(11)]]);
         assert!(st.loop_finished(0));
         assert_eq!(st.loop_iter(0), 0);
         assert!(done.freed.is_empty());
@@ -1001,7 +1001,7 @@ mod tests {
         ];
         let g = compile_one(&mut it, &nodes, &[]).unwrap();
         let (talker, vocoder) = (0, 1);
-        let mut st = RequestState::new(g);
+        let mut st = RequestState::new(g.clone());
         // Seeded: all-streaming nodes start streaming-ready.
         assert!(st.is_ready_for_streaming(vocoder));
         assert!(!st.is_ready_for_streaming(talker));
@@ -1009,29 +1009,85 @@ mod tests {
         // A streaming chunk alone does not make the node streaming-ready
         // while a regular input is still missing -- the old `issuperset`
         // tautology said it did.
-        st.ingest(talker, 1, vec![t(1)], false, false);
+        st.ingest(&g, talker, 1, &[t(1)], false, false);
         assert!(!st.is_ready_for_streaming(talker));
         st.remove_input(talker, 1, false);
 
-        st.ingest(talker, 0, vec![t(2)], false, false);
+        st.ingest(&g, talker, 0, &[t(2)], false, false);
         assert!(st.is_ready_for_streaming(talker));
         assert!(!st.is_ready(talker));
-        st.ingest(talker, 1, vec![t(3)], false, false);
+        st.ingest(&g, talker, 1, &[t(3)], false, false);
         assert!(st.is_ready(talker));
         assert!(!st.is_ready_for_streaming(talker), "full, so plain ready");
+    }
+
+    #[test]
+    fn completing_a_top_level_node_restores_its_streaming_membership() {
+        // Orpheus's `snac_chunk` walk: one TOP-LEVEL node whose only input is
+        // streamed. `complete` clears its slot, so streaming membership has to
+        // go back to the seed -- Python's `mark_entity_complete` reseeds right
+        // after `entity.ready_signals.clear()`. Left out, the bit stays 0 (the
+        // full slot cleared it) and `ingest_one` refuses every later chunk,
+        // handing it back to the StreamBuffer until the worker graph resets.
+        //
+        // Whether the node can be SCHEDULED again is a separate gate:
+        // `NodeState.completed` keeps it out of the ready set until `reset`,
+        // which is why this asserts membership and the ingest, not readiness.
+        let mut it = StrToId::default();
+        let nodes = vec![node(
+            "snac", &["new_token"], &["new_token"],
+            vec![edge("audio_chunk", "emit_to_client")],
+        )];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let snac = 0;
+        let mut st = RequestState::new(g.clone());
+
+        assert!(st.is_ready_for_streaming(snac), "seeded: all inputs streamed");
+        assert!(st.ingest(&g, snac, 0, &[t(1)], false, false));
+        assert!(st.is_ready(snac));
+        assert!(!st.is_ready_for_streaming(snac), "full, so plainly ready");
+
+        st.clear_consumed_inputs(&g, snac);
+        st.complete(&g, snac, &[vec![t(100)]]);
+
+        assert!(
+            st.is_ready_for_streaming(snac),
+            "the slot was cleared, so the next chunk has to be accepted"
+        );
+        assert!(st.ingest(&g, snac, 0, &[t(2)], false, false));
+    }
+
+    #[test]
+    fn completing_a_node_with_a_regular_input_leaves_it_out_of_the_set() {
+        // The reseed is seeded membership, not a blanket add: a node with any
+        // non-streaming input must NOT read as streaming-ready with nothing
+        // ingested.
+        let mut it = StrToId::default();
+        let nodes = vec![node("talker", &["text", "audio"], &["audio"], vec![])];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let talker = 0;
+        let mut st = RequestState::new(g.clone());
+        st.ingest(&g, talker, 0, &[t(1)], false, false);
+        st.ingest(&g, talker, 1, &[t(2)], false, false);
+        assert!(st.is_ready(talker));
+        st.complete(&g, talker, &[]);
+        assert!(
+            !st.is_ready_for_streaming(talker),
+            "`text` is still missing, so a chunk must not be accepted"
+        );
     }
 
     #[test]
     fn speculative_schedule_gates_the_add_not_the_removal() {
         let (_, g) = decode_loop();
         let enc = 0;
-        let mut st = RequestState::new(g);
+        let mut st = RequestState::new(g.clone());
         st.set_spec_scheduled(enc, true);
-        st.ingest(enc, 0, vec![t(1)], false, false);
+        st.ingest(&g, enc, 0, &[t(1)], false, false);
         assert!(!st.is_ready(enc), "a scheduled node is not re-queued");
 
-        let mut st = RequestState::new(st.graph.clone());
-        st.ingest(enc, 0, vec![t(1)], false, false);
+        let mut st = RequestState::new(g.clone());
+        st.ingest(&g, enc, 0, &[t(1)], false, false);
         st.set_spec_scheduled(enc, true);
         assert!(st.is_ready(enc), "marking does not withdraw a queued node");
     }
@@ -1040,10 +1096,10 @@ mod tests {
     fn reset_restores_a_fresh_request() {
         let (_, g) = decode_loop();
         let (enc, dec) = (0, 1);
-        let mut st = RequestState::new(g);
-        st.ingest(enc, 0, vec![t(1)], false, false);
-        st.complete(enc, &[vec![t(2)], vec![t(3)]]);
-        st.ingest(dec, 0, vec![t(2)], true, false);
+        let mut st = RequestState::new(g.clone());
+        st.ingest(&g, enc, 0, &[t(1)], false, false);
+        st.complete(&g, enc, &[vec![t(2)], vec![t(3)]]);
+        st.ingest(&g, dec, 0, &[t(2)], true, false);
         st.reset();
         assert!(!st.is_ready(enc) && !st.is_ready(dec));
         assert!(!st.has_input(dec, 0, false));

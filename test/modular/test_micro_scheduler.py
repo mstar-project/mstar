@@ -27,9 +27,22 @@ from mstar.engine.resources.step import (
     AdmitRuntimeError,
     FullAdmitOutcome,
 )
-from mstar.graph.runtime.base import PopRidsOutput, ReadyNodeSpec
+from mstar.graph.runtime.base import (
+    ColumnarEdgeSpecs,
+    PopRidsOutput,
+    ReadyNodeSpec,
+)
 from mstar.utils.containers import ParallelList
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+
+
+def _edge_block(rids) -> ColumnarEdgeSpecs:
+    """One ready input per rid, so the split / drop paths that re-slice the
+    columns have something to re-slice."""
+    block = ColumnarEdgeSpecs.empty()
+    for i, rid in enumerate(rids):
+        block.add(rid, "token", [i + 1], False)
+    return block
 
 NODE = "LLM"
 WALK = "decode"
@@ -112,7 +125,7 @@ class _Runtime:
                 wg_ids.append("wg0")
         return PopRidsOutput(
             wg_ids=ParallelList(rids, wg_ids),
-            input_edges=[], input_edges_per_rid=[0] * len(rids),
+            input_edges=_edge_block(rids),
         )
 
     def get_nodes(self, node_name, rids, wg_ids):
@@ -199,7 +212,7 @@ def _has_ready(sched: MicroScheduler, manager: _Manager, exclude_target=None):
 def _batch(rids, node=NODE, walk=WALK) -> ScheduledBatch:
     return ScheduledBatch(
         node_name=node, graph_walk=walk,
-        input_edges=dict.fromkeys(rids, []),
+        input_edges=_edge_block(rids),
         request_to_worker_graph=dict.fromkeys(rids, "wg0"),
     )
 

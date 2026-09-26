@@ -10,6 +10,7 @@
 //! disaggregated loop re-emitting its external inputs) looks it up here.
 
 use crate::graph::spec::{StrToId, Sym};
+use crate::graph::state::TensorRef;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
@@ -112,6 +113,17 @@ pub struct Bookkeeping {
 pub type SharedBookkeeping = Arc<Mutex<Bookkeeping>>;
 
 impl Bookkeeping {
+    /// The descriptor as stored, symbols unresolved. For a caller that is
+    /// building a wire frame and resolves them through `strings()`.
+    pub fn info_raw(&self, uuid: u64) -> Option<&TensorPointerInfo> {
+        self.tensor_info.get(&uuid)
+    }
+
+    /// The table a descriptor's symbols were interned in. Not the runtime's.
+    pub fn strings(&self) -> &StrToId {
+        &self.strings
+    }
+
     fn intern_info(&mut self, arg: &TensorInfoArg) -> TensorPointerInfo {
         TensorPointerInfo {
             dims: arg.dims.clone(),
@@ -502,13 +514,38 @@ impl Bookkeeping {
         self.ref_info.len()
     }
 
+    /// The shape facts routing needs, without rebuilding the whole descriptor.
+    ///
+    /// A uuid with no descriptor keeps its identity and zeroes the rest: the
+    /// uuid is what downstream routes on, and Python tolerates the same case
+    /// (`get_info` returning None inside a tensor_info list). It means the
+    /// store lost the descriptor, which is a bug upstream of here.
+    pub fn tensor_ref(&self, uuid: u64) -> TensorRef {
+        match self.tensor_info.get(&uuid) {
+            Some(i) => TensorRef {
+                uuid,
+                dim0: i.dims.first().copied().unwrap_or(0),
+                nbytes: i.nbytes,
+                offset: i.offset,
+            },
+            None => TensorRef { uuid, dim0: 0, nbytes: 0, offset: 0 },
+        }
+    }
+
 }
 
-/// The Python handle. Holds only a share of the state, so a Rust-side
-/// holder can take the same one.
+/// The Python handle. Holds only a share of the state, so
+/// `GraphRuntime::new` can take the same one.
 #[pyclass]
 pub struct TensorBookkeeping {
     inner: SharedBookkeeping,
+}
+
+impl TensorBookkeeping {
+    /// A second handle on the same state, for a Rust-side holder.
+    pub fn share(&self) -> SharedBookkeeping {
+        Arc::clone(&self.inner)
+    }
 }
 
 #[pymethods]
@@ -646,6 +683,22 @@ impl TensorBookkeeping {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_share_sees_the_same_state() {
+        // The point of the split: GraphRuntime holds a share of the very
+        // bookkeeper Python gave TensorStore, so a refcount either side
+        // adjusts is visible to the other.
+        let py_handle = TensorBookkeeping::new();
+        let shared = py_handle.share();
+        shared.lock().unwrap().ref_info.insert(1, ReferenceInfo::default());
+
+        py_handle.increment_ref(1, 1).unwrap();
+        assert!(
+            !shared.lock().unwrap().can_gc(1),
+            "the Rust share sees the Python handle's change"
+        );
+    }
 
     fn bk() -> Bookkeeping {
         Bookkeeping::default()

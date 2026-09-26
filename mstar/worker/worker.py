@@ -6,7 +6,7 @@ import threading
 import time
 import time as _time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -27,7 +27,9 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
+    ColumnarEdgeSpecs,
     EdgeSpec,
+    GraphRuntime,
     RouteInput,
     RouteOutput,
     SendInput,
@@ -35,6 +37,7 @@ from mstar.graph.runtime.base import (
     SpeculationPrepInput,
 )
 from mstar.graph.runtime.python import PythonGraphRuntime
+from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
@@ -68,6 +71,49 @@ logger = logging.getLogger(__name__)
 # seconds between "no offload possible" lines for one node and walk: a hold is
 # retried every backoff, and a line per retry buries the rest of the log
 _HOLD_LOG_INTERVAL = 5.0
+
+
+def _make_graph_runtime(
+    communicator,
+    tensor_manager,
+    **kwargs,
+) -> GraphRuntime:
+    """The runtime ``MSTAR_RUST_GRAPH`` selects (see
+    ``resolve_graph_runtime_type``).
+
+    Rust requires the Rust communicator and the Rust bookkeeper: it sends
+    WORKER_GRAPHS_DONE and INPUT_SIGNALS itself on an Arc to the same
+    transport, and settles refcounts on a share of the same bookkeeper, rather
+    than hopping back into Python for either. A Python one of either has no
+    such object to share, so asking for Rust with one raises.
+    """
+    if resolve_graph_runtime_type(log=True) == GraphRuntimeType.PYTHON:
+        return PythonGraphRuntime(
+            communicator=communicator,
+            tensor_manager=tensor_manager,
+            **kwargs,
+        )
+
+    from mstar.communication.rust_communicator import RustZMQCommunicator
+    from mstar.graph.runtime.rust import RustGraphRuntime
+
+    if not isinstance(communicator, RustZMQCommunicator):
+        raise ValueError(
+            "MSTAR_RUST_GRAPH=1 needs the Rust communicator, but this worker "
+            f"built a {type(communicator).__name__}. Set MSTAR_RUST_ZMQ=1."
+        )
+    bookkeeping = tensor_manager.tensor_store.bookkeeping
+    if not hasattr(bookkeeping, "_rust"):
+        raise ValueError(
+            "MSTAR_RUST_GRAPH=1 needs the Rust TensorBookkeeping: the runtime "
+            "holds a share of it, so a Python one cannot be handed over. "
+            f"Got {type(bookkeeping).__name__}."
+        )
+    return RustGraphRuntime(
+        bookkeeping=bookkeeping,
+        communicator=communicator,
+        **kwargs,
+    )
 
 
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
@@ -242,7 +288,7 @@ class Worker:
         )
 
         # The graph runtime owns the per-request queues and the graph state.
-        self._graph_runtime = PythonGraphRuntime(
+        self._graph_runtime = _make_graph_runtime(
             my_worker_id=self.worker_id,
             my_worker_graphs=my_worker_graphs,
             all_wg_ids_to_graph_walks=all_worker_graph_ids_to_graph_walks,
@@ -500,7 +546,7 @@ class Worker:
         ]
         if signal_only:
             self._graph_runtime.ingest_inputs_batch(
-                self._edge_specs(request_id, signal_only), can_buffer=True,
+                self._one_rids_edges(request_id, signal_only), can_buffer=True,
             )
         # process messages that may have came in out-of-order
         if body.request_id in self._unprocessed_messages:
@@ -757,7 +803,7 @@ class Worker:
         signal_only = [edge for edge in non_streaming if len(edge.tensor_info) == 0]
         if signal_only:
             self._graph_runtime.ingest_inputs_batch(
-                self._edge_specs(request_id, signal_only), can_buffer=True,
+                self._one_rids_edges(request_id, signal_only), can_buffer=True,
             )
         if self.enable_nvtx:
             range_pop()
@@ -890,9 +936,14 @@ class Worker:
                 result.append(edge)
         return result
 
-    def _return_speculative_streaming_edge(
+    def _return_streaming_edge(
         self, request_id: int, edge: GraphEdge
     ):
+        """Hand a chunk back to its StreamBuffer after it was refused.
+
+        Both polling paths use it: the plain one above and the speculative
+        prep, which rolls its ingests back per rid.
+        """
         req_info = self.request_state.per_request_info.get(request_id)
         if req_info is None:
             return
@@ -902,27 +953,32 @@ class Worker:
 
     def _poll_stream_buffers(self) -> None:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
+        # Every ready chunk is popped first and ingested in one call (and one
+        # Python <> Rust roundtrip)
+        polled: list[tuple[int, GraphEdge]] = []
         for request_id, req_info in list(self.request_state.per_request_info.items()):
             for edge_name, sbuf in req_info.stream_buffers.items():
                 synthetic_edge = self._pop_streaming_edge(sbuf, edge_name, request_id)
-
                 if synthetic_edge is not None:
-                    # Streaming edges go through the same path as regular ones —
-                    # ReadySignals.is_ready_for_streaming flips on as soon as
-                    # the streaming inputs are the only ones missing. Empty
-                    # leftover list means the edge was claimed. The final-chunk
-                    # signal rides the synthetic edge to the consuming pass,
-                    # which reports the partition done in _postprocess_batch —
-                    # NOT here, where an earlier in-flight pass's WGD could read
-                    # it before the final output chunk is emitted.
-                    uningested = self._graph_runtime.ingest_inputs_batch(
-                        self._edge_specs(request_id, [synthetic_edge]),
-                        # important: only ingest for this loop iter!
-                        can_buffer=False,
-                        is_streaming=True,
-                    )
-                    if uningested:
-                        sbuf.store_uningested_edge(synthetic_edge)
+                    polled.append((request_id, synthetic_edge))
+        if not polled:
+            return
+
+        # Streaming edges go through the same path as regular ones —
+        # ReadySignals.is_ready_for_streaming flips on as soon as the streaming
+        # inputs are the only ones missing. The final-chunk signal rides the
+        # synthetic edge to the consuming pass, which reports the partition done
+        # in _postprocess_batch — NOT here, where an earlier in-flight pass's
+        # WGD could read it before the final output chunk is emitted.
+        uningested = self._graph_runtime.ingest_inputs_batch(
+            self._edge_block((rid, [edge]) for rid, edge in polled),
+            # important: only ingest for this loop iter!
+            can_buffer=False,
+            is_streaming=True,
+        )
+        # Indices into the block, which is `polled` order.
+        for i in uningested:
+            self._return_streaming_edge(*polled[i])
 
 
     def _check_ready_tensors(self) -> None:
@@ -945,7 +1001,7 @@ class Worker:
 
             if normal:
                 self._graph_runtime.ingest_inputs_batch(
-                    self._edge_specs(request_id, normal), can_buffer=True,
+                    self._one_rids_edges(request_id, normal), can_buffer=True,
                 )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
@@ -1014,27 +1070,28 @@ class Worker:
     # Batch building
     # ------------------------------------------------------------------
 
-    def _tensors_for(self, edges: list[EdgeSpec]) -> NameToTensorList:
-        """Resolve a node's ready inputs to tensors. The runtime reports them
-        as uuids; only this side can turn those back into tensors."""
-        return {
-            spec.signal: [
-                self.tensor_manager.get_tensor(uuid) for uuid in spec.uuids
-            ] for spec in edges
-        }
-
     def _build_executing_batch(self, batch: ScheduledBatch) -> ExecutingBatch:
         """Gather input tensors from tensor_manager for all requests in the batch."""
-        per_request_inputs: dict[int, NameToTensorList] = {}
         per_request_info: dict[int, CurrentForwardPassInfo] = {}
-        final_stream_rids: set[int] = set()
         batch_partition = self.request_state.get_partition_for_node(batch.node_name)
 
-        for request_id, edges in batch.input_edges.items():
-            per_request_inputs[request_id] = self._tensors_for(edges)
-            if any(spec.is_final_streaming_chunk for spec in edges):
-                final_stream_rids.add(request_id)
-            per_request_info[request_id] = self.request_state.get_fwd_info(request_id, batch_partition)
+        # One walk of the columns for both: each rid's inputs as tensors, and
+        # the rids whose edge carried a stream's final chunk. Only this side can
+        # turn a uuid back into a tensor, which is why the runtime reports uuids
+        # and the resolution happens here.
+        #
+        # Seeded with the batch's rids rather than just the ones that have
+        # edges: a rid with nothing ready still needs an entry, because
+        # per_request_info is keyed off these and the engine indexes it by rid.
+        per_request_inputs, final_stream_rids = (
+            batch.input_edges.to_input_tensors(
+                self.tensor_manager.get_tensor, batch.request_to_worker_graph,
+            )
+        )
+        for request_id in per_request_inputs:
+            per_request_info[request_id] = self.request_state.get_fwd_info(
+                request_id, batch_partition
+            )
 
         return self._make_executing_batch(
             node_name=batch.node_name,
@@ -1139,23 +1196,28 @@ class Worker:
         )
 
     @staticmethod
-    def _edge_specs(rid: int, edges: list[GraphEdge]) -> ParallelList:
-        """Flatten edges into (rid, EdgeSpec) pairs for the runtime.
+    def _edge_block(
+        per_rid: Iterable[tuple[int, list[GraphEdge]]],
+    ) -> ColumnarEdgeSpecs:
+        """Arriving edges as columns, for the runtime's ingest.
 
         Only uuids cross: the runtime rebuilds the descriptors from the tensor
-        store, which is why they are kept there.
+        store, which is why they are kept there. Filled straight from the edges
+        -- an EdgeSpec per edge in between would cost as much as the columns
+        save.
         """
-        return ParallelList(
-            [rid] * len(edges),
-            [
-                EdgeSpec(
-                    signal=edge.name,
-                    next_node=edge.next_node,
-                    uuids=[info.uuid for info in edge.tensor_info],
-                    is_final_streaming_chunk=edge._final_stream_chunk,
-                ) for edge in edges
-            ],
-        )
+        block = ColumnarEdgeSpecs.empty()
+        for rid, edges in per_rid:
+            for edge in edges:
+                block.add_edge(rid, edge)
+        return block
+
+    @classmethod
+    def _one_rids_edges(
+        cls, rid: int, edges: list[GraphEdge],
+    ) -> ColumnarEdgeSpecs:
+        """``_edge_block`` for the common single-request case."""
+        return cls._edge_block(((rid, edges),))
 
     def _count_new_tokens(
         self,
@@ -1705,18 +1767,18 @@ class Worker:
         consumed = set(prep.consumed_streaming_edge_idxs)
         for i, (r, edge) in enumerate(polled):
             if i not in consumed:
-                self._return_speculative_streaming_edge(r, edge)
+                self._return_streaming_edge(r, edge)
             else:
                 consumed_streaming_edges.setdefault(r, []).append(edge)
 
         continuing = set(prep.ready_rids)
-        cursor = 0
+        # `ready_rids` seeds it, so a ready rid with no prepped edge still gets
+        # an empty mapping -- what slicing a zero-length run used to give.
+        prepped_inputs = prep.input_edges.to_input_tensors(
+            self.tensor_manager.get_tensor, prep.ready_rids,
+        ).by_rid
         for i, r in enumerate(prep.ready_rids):
-            count = prep.input_edges_per_rid[i]
-            per_request_inputs[r] = self._tensors_for(
-                prep.input_edges[cursor:cursor + count]
-            )
-            cursor += count
+            per_request_inputs[r] = prepped_inputs[r]
             new_request_to_worker_graph[r] = prep.wg_ids[i]
 
         if not continuing:
@@ -1740,6 +1802,10 @@ class Worker:
                 f"Speculation asked for {spec_node_name!r} but the "
                 f"scheduler returned {fresh_batch.node_name!r}"
             )
+            fresh_inputs = fresh_batch.input_edges.to_input_tensors(
+                self.tensor_manager.get_tensor,
+                fresh_batch.request_to_worker_graph,
+            ).by_rid
             for rid in fresh_batch.request_to_worker_graph:
                 if rid in continuing:
                     # Shouldn't happen — continuing rids are held by the
@@ -1754,9 +1820,7 @@ class Worker:
                     )
                     continue
 
-                per_request_inputs[rid] = self._tensors_for(
-                    fresh_batch.input_edges[rid]
-                )
+                per_request_inputs[rid] = fresh_inputs[rid]
                 new_request_to_worker_graph[rid] = (
                     fresh_batch.request_to_worker_graph[rid]
                 )
@@ -1811,7 +1875,7 @@ class Worker:
                 speculation.node_batch.per_request_info.pop(r, None)
                 speculation.scheduled_batch.request_to_worker_graph.pop(r, None)
                 for edge in speculation.consumed_streaming_edges.get(r, []):
-                    self._return_speculative_streaming_edge(r, edge)
+                    self._return_streaming_edge(r, edge)
                 speculation.consumed_streaming_edges.pop(r, None)
         speculation.continuing_rids = threaded_continuing
         speculation.dropped = dropped
@@ -1874,7 +1938,7 @@ class Worker:
 
         def _return_all_polled() -> None:
             for r, edge in polled:
-                self._return_speculative_streaming_edge(r, edge)
+                self._return_streaming_edge(r, edge)
 
         if popped is None:
             _return_all_polled()
@@ -1915,14 +1979,18 @@ class Worker:
             if i in consumed:
                 consumed_streaming_edges.setdefault(r, []).append(edge)
             else:
-                self._return_speculative_streaming_edge(r, edge)
+                self._return_streaming_edge(r, edge)
 
-        prep_inputs: dict[int, list[EdgeSpec]] = {}
-        cursor = 0
-        for i, r in enumerate(prep.ready_rids):
-            count = prep.input_edges_per_rid[i]
-            prep_inputs[r] = prep.input_edges[cursor:cursor + count]
-            cursor += count
+        # Both seeded with their rid lists, so the `in prep_inputs` test below
+        # still separates prepped rids from fresh ones -- a ready rid with no
+        # prepped edge gets an empty mapping, as a zero-length slice used to.
+        get_tensor = self.tensor_manager.get_tensor
+        prep_inputs = prep.input_edges.to_input_tensors(
+            get_tensor, prep.ready_rids,
+        ).by_rid
+        fresh_inputs = fresh_edges.to_input_tensors(
+            get_tensor, list(fresh_wg),
+        ).by_rid
         prep_wg = dict(zip(prep.ready_rids, prep.wg_ids, strict=True))
 
         new_request_to_worker_graph: dict[int, int] = {}
@@ -1930,10 +1998,10 @@ class Worker:
         for rid in head_rids:  # wire order == the leader's batch order
             if rid in prep_inputs:
                 new_request_to_worker_graph[rid] = prep_wg[rid]
-                per_request_inputs[rid] = self._tensors_for(prep_inputs[rid])
+                per_request_inputs[rid] = prep_inputs[rid]
             else:
                 new_request_to_worker_graph[rid] = fresh_wg[rid]
-                per_request_inputs[rid] = self._tensors_for(fresh_edges[rid])
+                per_request_inputs[rid] = fresh_inputs[rid]
 
         # Committed: the serial path must not see the head any more.
         self.scheduler.pop_tp_follow_head()
@@ -2080,9 +2148,14 @@ class Worker:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
 
         rids = list(batch_N.batch.request_to_worker_graph)
-        self._graph_runtime.cleanup_consumed_inputs(
-            batch_N.batch.node_name, rids,
-            [batch_N.batch.request_to_worker_graph[r] for r in rids],
+        # What the runtime dereferenced to zero and cannot reclaim itself: a
+        # runtime behind the contract has the bookkeeper, not the shm files or
+        # the registered memory.
+        self.tensor_manager.cleanup_collectable(
+            *self._graph_runtime.cleanup_consumed_inputs(
+                batch_N.batch.node_name, rids,
+                [batch_N.batch.request_to_worker_graph[r] for r in rids],
+            )
         )
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -2242,6 +2315,11 @@ class Worker:
             self.tensor_manager.tensor_store,
         )
 
+        # Normally empty: cleanup_consumed_inputs ran above and took them. Not
+        # empty if a completion ever precedes it, and then nobody else will.
+        if route_output.freed_inputs.uuids:
+            self.tensor_manager.cleanup_collectable(*route_output.freed_inputs)
+
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
@@ -2287,13 +2365,18 @@ class Worker:
             route_output.new_token_output_idxs,
             flat_rids, flat_uuids, signals, signal_idxs,
         )
+        needs_info = route_output.rids_needing_request_info
+        info_rids = (
+            send_rids if needs_info is None
+            else [rid for rid in send_rids if rid in needs_info]
+        )
         self._graph_runtime.send_outputs(SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
-                send_rids,
+                info_rids,
                 [
                     self.request_state.get_fwd_info(rid, batch_N.partition)
-                    for rid in send_rids
+                    for rid in info_rids
                 ],
             ),
             new_token_counts=ParallelList(
@@ -2856,7 +2939,7 @@ class Worker:
                             if not speculation.is_yield_away:
                                 for rid, edges in speculation.consumed_streaming_edges.items():
                                     for edge in edges:
-                                        self._return_speculative_streaming_edge(rid, edge)
+                                        self._return_streaming_edge(rid, edge)
                                 # Fresh rids are not re-readied by N's routing
                                 # the way continuing rids are: give them back.
                                 sb = speculation.scheduled_batch

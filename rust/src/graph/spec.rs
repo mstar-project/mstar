@@ -84,6 +84,12 @@ pub struct NodeSpec {
     pub inputs: Vec<Sym>,
     pub full_mask: u64,
     pub streaming_mask: u64,
+    /// Inputs an enclosing loop re-injects every iteration (Python's
+    /// `_persist_for_loop`), so clearing the node's slots must NOT dereference
+    /// them. Purely structural -- the loop's declared `external_inputs`, minus
+    /// the streamed ones, which are never re-injected -- so it is a mask
+    /// computed once here rather than a Vec rebuilt per rid per pass.
+    pub held_mask: u64,
     /// True when every input is streaming — Python's `only_streaming_inputs`,
     /// which seeds `ready_for_streaming`.
     pub only_streaming: bool,

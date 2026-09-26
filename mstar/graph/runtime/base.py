@@ -1,10 +1,11 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from mstar.communication.tensors import TensorStore
+from mstar.communication.tensors import NameToTensorList, TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
+from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
 from mstar.utils.containers import ParallelList
@@ -39,7 +40,277 @@ class PendingLoopStop:
     loop_name: str
 
 
+class EdgeTuple(NamedTuple):
+    """One edge of a ``ColumnarEdgeSpecs``, reassembled."""
+    rid: int
+    signal: str
+    uuids: list[int]
+    is_final_streaming_chunk: bool
+
+
+class InputTensors(NamedTuple):
+    """What a batch build needs off a block, in one walk of the columns."""
+    by_rid: dict[int, NameToTensorList]
+    # The rids whose edge carried a stream's final chunk. The CONSUMING pass
+    # reports the partition done, which is why this rides with the inputs.
+    final_stream_rids: set[int]
+
+
+@dataclass
+class ColumnarEdgeSpecs:
+    """A batch of edges as columns rather than one object per edge; minimizes
+    allocation of Strings on the Rsut end, as well as building of Python objects
+    and Python <> Rust marshalling.
+    """
+
+    # len = the number of DISTINCT signal names in the batch, which is at most
+    # the destination node's input count -- one to three in practice.
+    signal_names: list[str]
+
+    # len = the total number of tensors, flat over the edges in order
+    uuids: list[int]
+
+    # len = the number of edges
+    tensors_per_edge: list[int]
+    signal_name_idxs: list[int]
+    # Per EDGE, not per rid: it replaces a run-length column, so the
+    # "flat, rid-major" invariant stops being something every caller honours.
+    rids: list[int]
+    is_final_streaming_chunk: list[bool]
+
+    # Only the INGEST path carries a destination. A pop or a prep reports
+    # edges for a node the caller just named, so both leave these None.
+    # len = the number of distinct destinations / the number of edges
+    next_nodes: list[str] | None = None
+    next_node_idxs: list[int] | None = None
+
+    # signal name -> its index, for the dedup. A CACHE, not part of the value
+    # -- hence out of repr and eq -- and re-derived on demand, because most
+    # blocks are built without one (Rust fills the columns itself, and
+    # select_rids copies the names across).
+    _signal_idx_of: dict[str, int] = field(
+        default_factory=dict, repr=False, compare=False,
+    )
+    _next_node_idx_of: dict[str, int] = field(
+        default_factory=dict, repr=False, compare=False,
+    )
+
+    @classmethod
+    def empty(cls) -> "ColumnarEdgeSpecs":
+        return cls([], [], [], [], [], [])
+
+    def add(
+        self, rid: int, signal: str, uuids, is_final_streaming_chunk: bool,
+        next_node: str | None = None,
+    ) -> None:
+        """Append one edge. For a producer on the Python side; Rust fills the
+        same columns natively.
+
+        ``next_node`` only for the ingest side -- a pop or a prep reports edges
+        for a node the caller already named.
+        """
+        if next_node is not None:
+            if self.next_nodes is None:
+                self.next_nodes, self.next_node_idxs = [], []
+            self.next_node_idxs.append(self._next_node_idx(next_node))
+        self.signal_name_idxs.append(self._signal_idx(signal))
+        self.rids.append(rid)
+        self.is_final_streaming_chunk.append(is_final_streaming_chunk)
+        before = len(self.uuids)
+        self.uuids.extend(uuids)
+        self.tensors_per_edge.append(len(self.uuids) - before)
+
+    def __len__(self) -> int:
+        """The number of EDGES. Not the number of rids -- one rid contributes
+        one edge per ready input."""
+        return len(self.rids)
+
+    def add_edge(self, rid: int, edge: GraphEdge) -> None:
+        """Append a real ``GraphEdge``, destination and all.
+
+        The ingest side's producer: its edges arrived from elsewhere rather
+        than being read out of a runtime's own state, and unlike a pop they do
+        NOT all share a destination -- one INPUT_SIGNALS can carry edges for
+        several nodes -- so the destination is carried.
+        """
+        self.add(
+            rid, edge.name, [info.uuid for info in edge.tensor_info],
+            edge._final_stream_chunk, next_node=edge.next_node,
+        )
+
+    def to_edges(
+        self,
+        tensor_store: TensorStore,
+        is_streaming: bool,
+        next_node: str | None = None,
+    ) -> list[GraphEdge]:
+        """Rebuild real ``GraphEdge`` objects, for the Python runtime's ingest.
+
+        ``next_node`` overrides the column, for a caller whose whole batch
+        shares one destination.
+        """
+        edges = []
+        uuid_start = 0
+        for i in range(len(self.rids)):
+            uuid_end = uuid_start + self.tensors_per_edge[i]
+            edges.append(
+                GraphEdge(
+                    name=self.signal_names[self.signal_name_idxs[i]],
+                    next_node=next_node if next_node is not None
+                        else self.next_nodes[self.next_node_idxs[i]],
+                    tensor_info=[
+                        tensor_store.get_info(self.uuids[j])
+                        for j in range(uuid_start, uuid_end)
+                    ],
+                    is_streaming=is_streaming,
+                    _final_stream_chunk=self.is_final_streaming_chunk[i],
+                )
+            )
+            uuid_start = uuid_end
+        return edges
+
+    def to_input_tensors(
+        self, get_tensor, rids: list[int] | None = None,
+    ) -> InputTensors:
+        """One walk for both things a batch build needs: each rid's inputs as
+        ``{signal: [tensor]}``, and the rids whose edge carried a stream's
+        final chunk.
+
+        ``rids`` seeds the result so a rid with no ready edges still gets an
+        empty mapping -- what slicing a zero-length run used to give. Left
+        None, only the rids that actually have edges appear.
+        """
+        by_rid: dict[int, NameToTensorList] = (
+            {} if rids is None else {rid: {} for rid in rids}
+        )
+        final_rids: set[int] = set()
+        names = self.signal_names
+        uuids = self.uuids
+        at = 0
+        for i, rid in enumerate(self.rids):
+            end = at + self.tensors_per_edge[i]
+            slot = by_rid.get(rid)
+            if slot is None:
+                slot = by_rid[rid] = {}
+            slot[names[self.signal_name_idxs[i]]] = [
+                get_tensor(uuids[j]) for j in range(at, end)
+            ]
+            if self.is_final_streaming_chunk[i]:
+                final_rids.add(rid)
+            at = end
+        return InputTensors(by_rid, final_rids)
+
+    def edge_tuples(self) -> list[EdgeTuple]:
+        """One ``EdgeTuple`` per edge.
+
+        For tests and debugging; production walks the columns. Comparing two
+        blocks field by field would be sensitive to ``signal_names`` ORDER,
+        which is an implementation detail -- the Python runtime discovers names
+        in ``ready_inputs`` order and Rust in the node's input order -- so a
+        parity check wants this instead.
+        """
+        out = []
+        at = 0
+        for i, rid in enumerate(self.rids):
+            end = at + self.tensors_per_edge[i]
+            out.append(EdgeTuple(
+                rid=rid,
+                signal=self.signal_names[self.signal_name_idxs[i]],
+                uuids=self.uuids[at:end],
+                is_final_streaming_chunk=self.is_final_streaming_chunk[i],
+            ))
+            at = end
+        return out
+
+    def select_rids(self, keep) -> "ColumnarEdgeSpecs":
+        """The edges belonging to ``keep``, as a new block.
+
+        Off the hot path: a batch that fits under its cap is passed through
+        whole, and a rid is only dropped on a failure or a removal.
+        ``signal_names`` is carried over as-is -- an entry no surviving edge
+        points at is harmless.
+        """
+        out = ColumnarEdgeSpecs(
+            signal_names=list(self.signal_names),
+            uuids=[], tensors_per_edge=[], signal_name_idxs=[], rids=[],
+            is_final_streaming_chunk=[],
+            next_nodes=None if self.next_nodes is None
+                else list(self.next_nodes),
+            next_node_idxs=None if self.next_node_idxs is None else [],
+        )
+        at = 0
+        for i, rid in enumerate(self.rids):
+            end = at + self.tensors_per_edge[i]
+            if rid in keep:
+                out.rids.append(rid)
+                out.signal_name_idxs.append(self.signal_name_idxs[i])
+                out.tensors_per_edge.append(self.tensors_per_edge[i])
+                out.is_final_streaming_chunk.append(
+                    self.is_final_streaming_chunk[i]
+                )
+                out.uuids.extend(self.uuids[at:end])
+                if out.next_node_idxs is not None:
+                    out.next_node_idxs.append(self.next_node_idxs[i])
+            at = end
+        return out
+
+    def extend(self, other: "ColumnarEdgeSpecs") -> None:
+        """Fold another block in, in place.
+        ``other``'s signal names are remapped as a correctness guard.
+        """
+        remap = [self._signal_idx(name) for name in other.signal_names]
+        self.signal_name_idxs.extend(remap[i] for i in other.signal_name_idxs)
+        self.rids.extend(other.rids)
+        self.tensors_per_edge.extend(other.tensors_per_edge)
+        self.is_final_streaming_chunk.extend(other.is_final_streaming_chunk)
+        self.uuids.extend(other.uuids)
+        if other.next_node_idxs is not None:
+            if self.next_nodes is None:
+                self.next_nodes, self.next_node_idxs = [], []
+            node_remap = [
+                self._next_node_idx(n) for n in (other.next_nodes or ())
+            ]
+            self.next_node_idxs.extend(
+                node_remap[i] for i in other.next_node_idxs
+            )
+
+    def _signal_idx(self, name: str) -> int:
+        """``name``'s index, appending it if it is new.
+
+        The cache is re-derived whenever it does not cover ``signal_names``.
+        """
+        if len(self._signal_idx_of) != len(self.signal_names):
+            self._signal_idx_of = {
+                name: i for i, name in enumerate(self.signal_names)
+            }
+        idx = self._signal_idx_of.get(name)
+        if idx is None:
+            idx = self._signal_idx_of[name] = len(self.signal_names)
+            self.signal_names.append(name)
+        return idx
+
+    def _next_node_idx(self, name: str) -> int:
+        """``name``'s index among the destinations; see ``_signal_idx``, which
+        this mirrors including the cache being re-derived on demand."""
+        if len(self._next_node_idx_of) != len(self.next_nodes):
+            self._next_node_idx_of = {
+                name: i for i, name in enumerate(self.next_nodes)
+            }
+        idx = self._next_node_idx_of.get(name)
+        if idx is None:
+            idx = self._next_node_idx_of[name] = len(self.next_nodes)
+            self.next_nodes.append(name)
+        return idx
+
+
 class EdgeSpec(NamedTuple):
+    """One arriving signal, on the INGEST side only.
+
+    The pop and prep directions report ``ColumnarEdgeSpecs`` instead -- there
+    the producer is Rust and the consumer never wants a per-edge object, so an
+    object per edge was pure overhead. Ingest still starts from real
+    ``GraphEdge`` objects, so it keeps this until that path is converted too.
+    """
     signal: str
     next_node: str
     uuids: list[int]
@@ -50,11 +321,11 @@ class EdgeSpec(NamedTuple):
 
 class PopRidsOutput(NamedTuple):
     wg_ids: ParallelList[int, int]
-    # flat, rid-major over wg_ids.keys(); input_edges_per_rid[i] edges belong
-    # to rid wg_ids.keys()[i] -- same layout as SpeculationPrepOutput, so
-    # _build_executing_batch can walk either the same way.
-    input_edges: list[EdgeSpec]
-    input_edges_per_rid: list[int]
+    # Columns, and each edge carries its own rid -- so there is no run-length
+    # column to keep parallel and no rid-major invariant for callers to honour.
+    # Same shape as SpeculationPrepOutput, so _build_executing_batch walks
+    # either the same way.
+    input_edges: ColumnarEdgeSpecs
     # The node's output edge names, structural and identical for every rid in
     # the batch. Reported by the POP rather than asked for separately: it is
     # needed at completion, and deriving it from the tensors the model returned
@@ -65,6 +336,14 @@ class PopRidsOutput(NamedTuple):
 
 
 class SpeculationPrepInput(NamedTuple):
+    # TODO: streaming_edges wants to be a ColumnarEdgeSpecs like everything
+    # else -- `next_node` is redundant here (the poll filters on it, so it is
+    # always spec_node_name) and per-edge rids would retire
+    # streaming_edges_per_rid. Held back because
+    # SpeculationPrepOutput.consumed_streaming_edge_idxs index into this flat
+    # list, and the rollback in _prep_one_spec_rid works in the same index
+    # space; converting that needs care, and it is worth ~38% of a path that
+    # only runs on streaming-consumer workers.
     spec_node_name: str
     curr_node_name: str
     graph_walk: str
@@ -79,14 +358,33 @@ class SpeculationPrepOutput(NamedTuple):
     ready_rids: list[int]
     # parallel to ready_rids: the worker graph each is speculating in
     wg_ids: list[int]
-    input_edges: list[EdgeSpec]
-    input_edges_per_rid: list[int]
+    # As PopRidsOutput: columns, with the rid on each edge. A ready rid with no
+    # edges simply has none here, so callers that want an entry for it pass
+    # ready_rids to ``to_input_tensors``.
+    input_edges: ColumnarEdgeSpecs
 
 
 class ReadyNodeSpec(NamedTuple):
     node_name: str
     graph_walk: str
     rids: list[int]
+
+
+class FreedTensors(NamedTuple):
+    """Tensors a runtime dereferenced to zero and dropped from the bookkeeper,
+    for the caller to finish tearing down.
+
+    ``registered`` is each uuid's ``mem_registered`` flag, which the forget
+    took with it and the transport still needs: it is what decides whether the
+    memory has to be unregistered. Hand the pair straight to
+    ``TensorCommunicationManager.cleanup_collectable``.
+    """
+    uuids: list[int]
+    registered: list[bool]
+
+    @classmethod
+    def none(cls) -> "FreedTensors":
+        return cls([], [])
 
 
 class RouteInput(NamedTuple):
@@ -119,6 +417,21 @@ class RouteOutput(NamedTuple):
     # Push these into the request's stream buffer for their edge. Keyed by
     # edge name -> (rid, uuid) per tensor.
     local_streaming_by_signal: dict[str, ParallelList[int, int]]
+
+    # The rids this completion will actually build a frame for -- one bound
+    # for a peer worker (INPUT_SIGNALS) or the conductor (WORKER_GRAPHS_DONE).
+    # Only those need `per_request_info`, and preparing it is not free for a
+    # runtime that has to encode it: the object is mutated in place every
+    # pass, so it cannot be cached. On a single-worker deployment inside a
+    # loop neither frame goes out on most passes.
+    #
+    # ``None`` means "not computed, pass it for everyone" -- the Python
+    # runtime hands the live object over untouched, so it has nothing to save.
+    rids_needing_request_info: frozenset[int] | None = None
+    # Consumed inputs the completion itself dropped to zero, for the caller to
+    # tear down -- see ``cleanup_consumed_inputs``. Empty in the normal order,
+    # where that call has already taken them.
+    freed_inputs: FreedTensors = FreedTensors.none()
 
 
 
@@ -225,6 +538,18 @@ class GraphRuntime(ABC):
         pass
 
     @abstractmethod
+    def is_speculatively_scheduled(
+        self, node: str, wg_id: int, rid: int,
+    ) -> bool:
+        """Whether this rid's node is marked speculatively scheduled.
+
+        The flag must SURVIVE node completion: its rids are still in flight
+        for the speculative N+1 step, so the node must stay out of the ready
+        set until the speculation resolves.
+        """
+        pass
+
+    @abstractmethod
     def get_dynamic_loop_iters(
         self, request_ids: list[int],
         partition: str,
@@ -253,8 +578,16 @@ class GraphRuntime(ABC):
     @abstractmethod
     def cleanup_consumed_inputs(
         self, node_name: str, rids: list[int], wg_ids: list[int],
-    ):
-        """Release the input tensors the just-executed node consumed."""
+    ) -> FreedTensors:
+        """Release the input tensors the just-executed node consumed.
+
+        Returns the ones that became collectable and so still need the
+        transport-side teardown -- shm files, arena slots, memory
+        unregistration -- which lives on the tensor manager and not here. A
+        runtime that holds the manager itself may do that in place and return
+        ``FreedTensors.none()``; the Rust one has only the bookkeeper, so its
+        freed tensors would otherwise sit until the request is torn down.
+        """
         pass
 
     @abstractmethod
@@ -288,8 +621,9 @@ class GraphRuntime(ABC):
     @abstractmethod
     def ingest_inputs_batch(
         self,
-        # rid -> the signal arriving for it
-        signals: ParallelList[int, EdgeSpec],
+        # One column set; each edge carries the rid it arrived for and its own
+        # destination, since one message can hold edges for several nodes.
+        signals: ColumnarEdgeSpecs,
         can_buffer: bool=True,
         is_streaming: bool=False,
     ) -> list[int]:
@@ -301,11 +635,14 @@ class GraphRuntime(ABC):
         inputs have already been ingested. The gate is re-evaluated per signal,
         since ingesting one can make another node eligible.
 
-        EdgeSpec rather than a signal-only type because
-        ``is_final_streaming_chunk`` has to survive the ingest: the pass that
-        CONSUMES the chunk is the one that reports partition_done, so the flag
-        lives in the node's input slot until then.
+        ``is_final_streaming_chunk`` is a column rather than being dropped
+        because it has to survive the ingest: the pass that CONSUMES the chunk
+        is the one that reports partition_done, so the flag lives in the node's
+        input slot until then.
 
+        Returned indices are into the block's edge columns, which is the order
+        the caller built them in -- that is how a streaming caller maps a
+        refusal back to the chunk it has to hand to its StreamBuffer.
         """
         pass
 
@@ -318,7 +655,8 @@ class GraphRuntime(ABC):
         check_ready: bool=False,
     ) -> PopRidsOutput | None:
         """
-        Returns rids and worker graph ids for the batch. If check_ready is set,
+        Returns rids and worker graph ids for the batch, plus the ready inputs
+        as columns. If check_ready is set,
         then this function checks if the rids are ready and either pops all or.
         nothing (returning None if it is nothing). Otherwise, it is assumed
         that the rids are already known to be ready.
