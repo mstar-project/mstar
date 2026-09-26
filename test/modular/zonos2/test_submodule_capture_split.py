@@ -413,3 +413,51 @@ def test_seed_survives_master_growth():
     buf.gather_for_request_ids(["a", "b"], padded_bs=2)
     assert buf.seeds(2).tolist() == [123, 456]
 
+
+# --------------------------------------------------------------------------
+# Compile: new request ids must not recompile forward_batched.
+class _BreakingModel(_FakeModel):
+    """Stand-in LLM with a graph break mid-forward, like the attention calls."""
+
+    @staticmethod
+    @torch.compiler.disable
+    def _attend(x):
+        return x
+
+    def forward(self, input_ids, spk_values=None, spk_positions=None, label=None):
+        return self._attend(input_ids[:, :1].float() + self._p)
+
+    def compute_logits(self, hidden):
+        return hidden.unsqueeze(-1).expand(-1, C, V).contiguous()
+
+
+def test_new_request_ids_do_not_recompile():
+    from torch._dynamo.testing import CompileCounter
+
+    from mstar.model.submodule_base import ModelInputsFromEngine
+
+    torch._dynamo.reset()
+    sub = Zonos2LLMSubmodule(
+        model=_BreakingModel(), n_codebooks=C, text_vocab=TEXT_VOCAB, eoa_id=8,
+        params=_params(),
+    )
+    counter = CompileCounter()
+    fwd = torch.compile(sub.forward_batched, backend=counter, dynamic=None)
+    bs = 3
+    for batch in range(6):
+        rids = [f"req{batch}_{i}" for i in range(bs)]
+        ei = ModelInputsFromEngine(
+            request_ids=rids,
+            per_request_info={r: SimpleNamespace(random_seed=_seed(r)) for r in rids},
+        )
+        sub._prepare_sampler_step(ei, padded_bs=bs)
+        out = fwd(
+            "decode", ei,
+            input_ids=torch.zeros(bs, C + 1, dtype=torch.long),
+            last_indices=torch.arange(bs),
+        )
+        assert list(out) == rids
+        assert out[rids[0]]["new_token"][0].shape == (1, C + 1)
+        if batch == 0:
+            first = counter.frame_count
+    assert counter.frame_count == first

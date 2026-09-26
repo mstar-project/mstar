@@ -326,10 +326,7 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         last_hidden = hidden.index_select(0, last_indices.to(hidden.device))
         logits = self.model.compute_logits(last_hidden)       # (B, C, V)
         frames = self._sample_in_graph(logits)                # (B, C + 1)
-        return {
-            rid: {"new_token": [frames[i:i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+        return engine_inputs.split_rows("new_token", frames)
 
     def _sample_in_graph(self, logits: torch.Tensor) -> torch.Tensor:
         """Sample inside the graph. This part is fixed-shape and capture-safe.

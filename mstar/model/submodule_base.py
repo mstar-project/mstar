@@ -278,6 +278,15 @@ class ModelInputsFromEngine:
         """
         return self.per_request_info[self.request_ids[0]]
 
+    @torch.compiler.disable
+    def split_rows(self, name: str, t: torch.Tensor) -> dict[str, NameToTensorList]:
+        """Row ``i`` of ``t`` as ``{rid: {name: [t[i:i+1]]}}``, for ``forward_batched``.
+
+        Kept out of the trace: keying a dict on request ids inside a compiled
+        forward makes dynamo guard on each id and recompile per new request.
+        """
+        return {rid: {name: [t[i:i + 1]]} for i, rid in enumerate(self.request_ids)}
+
 
 class NodeSubmodule(torch.nn.Module, ABC):
     """Base class for a model's compute units: defines the prepare_inputs →
