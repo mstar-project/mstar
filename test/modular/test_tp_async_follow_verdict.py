@@ -39,7 +39,11 @@ from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import ScheduleTPNode, TPNoSpeculation  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
-from mstar.worker.worker import Worker, _parse_tp_async_sched  # noqa: E402
+from mstar.worker.worker import (  # noqa: E402
+    Worker,
+    _parse_tp_async_sched,
+    _tp_async_sched_setting,
+)
 
 NODE = "LLM"
 WALK = "decode"
@@ -176,6 +180,20 @@ def test_env_parses_master_switch_and_node_list():
     assert _parse_tp_async_sched("thinker, talker") == (
         True, frozenset({"thinker", "talker"}),
     )
+
+
+@pytest.mark.parametrize("env, config, want", [
+    (None, None, (False, None)),
+    (None, True, (True, None)),
+    (None, False, (False, None)),
+    (None, ["thinker", "talker"], (True, frozenset({"thinker", "talker"}))),
+    (None, "LLM", (True, frozenset({"LLM"}))),
+    ("0", True, (False, None)),  # the env var overrides the config
+    ("1", ["talker"], (True, None)),
+    ("", True, (True, None)),  # empty env falls through to the config
+])
+def test_config_key_and_env_override(env, config, want):
+    assert _tp_async_sched_setting(env, config) == want
 
 
 def test_node_list_narrows_which_parallel_nodes_take_part():
