@@ -309,8 +309,9 @@ Worker scheduling
      - Default
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
-     - ``0``
-     - Async scheduling for lockstep-parallel (TP / SP) nodes. ``1``: the
+     - config's ``tp_async_sched``, else ``0``
+     - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
+       deployment config's ``tp_async_sched``. ``1``: the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
        opened) and broadcasts it at once as a speculative

@@ -148,6 +148,20 @@ def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
     return True, frozenset(n.strip() for n in raw.split(",") if n.strip())
 
 
+def _tp_async_sched_setting(
+    env: str | None, config: bool | str | list[str] | None,
+) -> tuple[bool, frozenset[str] | None]:
+    """The deployment config's ``tp_async_sched`` (true/false or a node list),
+    which a non-empty ``MSTAR_TP_ASYNC_SCHED`` overrides."""
+    if env:
+        return _parse_tp_async_sched(env)
+    if isinstance(config, (list, tuple)):
+        return _parse_tp_async_sched(",".join(config))
+    if isinstance(config, bool):
+        return config, None
+    return _parse_tp_async_sched(str(config or "0"))
+
+
 @dataclass
 class PendingBatch:
     batch: ScheduledBatch
@@ -380,8 +394,8 @@ class Worker:
 
         # TP async scheduling: the leader speculates N+1 during forward N and
         # broadcasts it at once; followers rebuild it during their own N.
-        self.tp_async_sched, self.tp_async_nodes = _parse_tp_async_sched(
-            os.environ.get("MSTAR_TP_ASYNC_SCHED", "0")
+        self.tp_async_sched, self.tp_async_nodes = _tp_async_sched_setting(
+            os.environ.get("MSTAR_TP_ASYNC_SCHED"), model_config.get("tp_async_sched"),
         )
         # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
         self._tp_broadcast_seq = 0
@@ -398,9 +412,9 @@ class Worker:
             )
         elif self.tp_async_sched and self.parallel_nodes:
             logger.warning(
-                "Worker %s: MSTAR_TP_ASYNC_SCHED=%r names none of this worker's "
+                "Worker %s: TP async scheduling names %s, none of this worker's "
                 "parallel nodes %s; running the serial protocol",
-                worker_id, os.environ.get("MSTAR_TP_ASYNC_SCHED"),
+                worker_id, sorted(self.tp_async_nodes or ()),
                 sorted(self.parallel_nodes),
             )
 

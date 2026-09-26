@@ -203,6 +203,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``tp_allreduce_max_kb``
      - *(optional)* Largest message, in KiB, the symmetric-memory path takes;
        larger ones go to NCCL. Default 512; ``MSTAR_TP_SYMM_AR_MAX_KB`` overrides.
+   * - ``tp_async_sched``
+     - *(optional)* Async scheduling for the parallel nodes: ``true``, ``false``
+       (default) or a list of node names (see ``MSTAR_TP_ASYNC_SCHED``, which
+       overrides it).
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /
