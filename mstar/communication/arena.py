@@ -75,7 +75,8 @@ class _Placements(NamedTuple):
     as the arena grew into them.
 
     Empty is ``not p.uuids``, not ``not p`` -- this is a 3-tuple, so it is
-    always truthy. Same edge as ``ParallelList``.
+    always truthy. ``ParallelList`` does NOT share that edge: it defines
+    ``__len__``, which ``bool`` falls back on, so an empty one is falsey.
     """
 
     uuids: list[int]
