@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from uuid import uuid4
 
+import torch
+
 
 @dataclass(frozen=True)
 class NodeAndGraphWalk:
@@ -17,7 +19,7 @@ class NodeAndGraphWalk:
 @dataclass
 class TensorPointerInfo:
     dims: list[int]
-    dtype: str
+    dtype: torch.dtype
     nbytes: int
     address: int
     stride: list[int]

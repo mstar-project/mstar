@@ -5,6 +5,7 @@ from enum import Enum
 
 import zmq
 
+from mstar.communication.codec import Codec, decode_each, default_codec
 from mstar.communication.event import EventWakeup
 
 logger = logging.getLogger(__name__)
@@ -73,8 +74,10 @@ class ZMQCommunicator(BaseCommunicator):
         push_ids: list[str],
         protocol: CommProtocol=CommProtocol.IPC,
         ipc_socket_path_prefix: str="/tmp/mstar/",
+        codec: type[Codec] | None = None,
         # TODO: for TCP
     ):
+        self.codec = codec or default_codec()
         self.context = zmq.Context.instance()
         transport = os.getenv("MSTAR_ZMQ_TRANSPORT", protocol.value).upper()
         self.protocol = CommProtocol(transport)
@@ -143,7 +146,7 @@ class ZMQCommunicator(BaseCommunicator):
             sock.connect(self._endpoint(entity_id))
             sock.setsockopt(zmq.LINGER, 0)
             self.push_sockets[entity_id] = sock
-        self.push_sockets[entity_id].send_pyobj(msg)
+        self.push_sockets[entity_id].send(self.codec.encode(msg))
 
     def get_all_new_messages(self, blocking=False, timeout_s=None) -> list:
         messages = []
@@ -162,13 +165,14 @@ class ZMQCommunicator(BaseCommunicator):
                 # zmq.NOBLOCK means zmq doesn't wait for a new message to be
                 # available, it returns a message if it exists or raises an error
                 # if no messages are available (error is caught below)
-                messages.append(self.pull_socket.recv_pyobj(
-                    flags=zmq.NOBLOCK
-                ))
+                frame = self.pull_socket.recv(flags=zmq.NOBLOCK)
+                decoded = decode_each(self.codec, [frame], self.my_id)
+                messages.extend(decoded)
                 # no str(): the repr is ~10us and DEBUG is off here
-                logger.debug(
-                    "%s to received message %s", self.my_id, messages[-1]
-                )
+                if decoded:
+                    logger.debug(
+                        "%s to received message %s", self.my_id, decoded[0]
+                    )
             except zmq.Again:
                 # zmq.Again actually means no messages left to read
                 break
@@ -186,7 +190,7 @@ def make_communicator(*args, **kwargs) -> BaseCommunicator:
     * ``1`` — the Rust communicator; raises if the extension is missing.
     * ``0`` — always the pyzmq ``ZMQCommunicator``.
 
-    The two are wire-compatible (same endpoints, same pickle frames), so the
+    The two are wire-compatible (same endpoints, same codec), so the
     flag can be set per-process — one entity at a time — while the rest of
     the mesh stays on pyzmq.
     """
