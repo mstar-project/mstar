@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ from mstar.engine.windowing import WindowSchedule
 from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+from mstar.model.cosmos3.sessions import SessionStore
 from mstar.model.cosmos3.submodules import (
     ATTN,
     CFG_BATCHED_LABEL,
@@ -636,6 +638,30 @@ def test_session_gen_params() -> None:
         )
     # An id on a non-windowed request is simply not a session.
     assert "session_id" not in model._resolve_gen_params({"num_frames": 189, "session_id": "s"}, [], ["video"])
+    # end_session and the timeout ride along; the timeout is capped and validated.
+    assert p["end_session"] is False and "session_timeout_s" not in p
+    e = model._resolve_gen_params(
+        {"window_mode": "kv", "num_frames": 189, "session_id": "s", "end_session": True, "session_timeout_s": 1e6},
+        [], ["video"],
+    )
+    assert e["end_session"] is True and e["session_timeout_s"] == 3600.0
+    with pytest.raises(ValueError, match="end_session requires"):
+        model._resolve_gen_params({"window_mode": "kv", "num_frames": 189, "end_session": True}, [], ["video"])
+    with pytest.raises(ValueError, match="session_timeout_s"):
+        model._resolve_gen_params(
+            {"window_mode": "kv", "num_frames": 189, "session_id": "s", "session_timeout_s": 0}, [], ["video"],
+        )
+
+
+def test_overlap_rounding_to_zero_warns(caplog) -> None:
+    """An overlap below half a latent frame rounds to none; say so."""
+    model = _windowed_model()
+    with caplog.at_level(logging.WARNING, logger="mstar.model.cosmos3.cosmos3_model"):
+        p = model._resolve_gen_params(
+            {"window_mode": "chained", "num_frames": 61, "overlap_frames": 1}, [], ["video"],
+        )
+    assert p["overlap_latent_units"] == 0
+    assert "rounds to no latent frames" in caplog.text
 
 
 def test_session_tail_store_and_resume(monkeypatch) -> None:
@@ -645,7 +671,7 @@ def test_session_tail_store_and_resume(monkeypatch) -> None:
     first denoise iteration — and unknown or mismatched sessions are request
     errors."""
     sub = _dit()
-    sub.config.session_store_size = 2
+    sub._sessions.capacity = 2
     sub.transformer = SimpleNamespace(proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)))
     monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "sched")
     monkeypatch.setattr(sub, "get_device", lambda: torch.device("cpu"))
@@ -658,8 +684,8 @@ def test_session_tail_store_and_resume(monkeypatch) -> None:
         last = torch.full(shape, value)
         out = sub._finish_window(st, last, torch.tensor([3]), window_index=0)
         assert torch.equal(out["window_latents"][0], last)
-    assert list(sub._session_tails) == ["b", "c"]  # "a" evicted (store size 2)
-    assert float(sub._session_tails["c"][0, 0, 0, 0, 0]) == 3.0
+    assert sub._sessions.ids() == ["b", "c"]  # "a" evicted (store size 2)
+    assert float(sub._sessions.get("c")[0, 0, 0, 0, 0]) == 3.0
 
     with pytest.raises(ValueError, match="unknown or expired"):
         sub._session_tail("a", 2, 64, 64)
@@ -680,7 +706,8 @@ def test_session_tail_store_and_resume(monkeypatch) -> None:
     assert st["cond"]["num_noisy_vision_tokens"] == 2 * stride and st["cond"]["num_vision_tokens"] == 4 * stride
     assert st["vmask"].shape[2] == 4 and st["vmask"][0, 0, :2].sum() == 2 and st["vmask"][0, 0, 2:].sum() == 0
     assert torch.all(st["cond_video_latents"][:, :, :2] == 3.0)
-    assert list(sub._session_tails) == ["b", "c"]
+    # "c" is pinned for this request until it stores its own last window
+    assert sub._sessions.ids() == ["b", "c"] and sub._sessions.live("c") == "r"
     st.add("scheduler", SimpleNamespace(timesteps=torch.arange(3)))
     ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"cond_latents": []})
     lat = ni.tensor_inputs["latents"]
@@ -694,7 +721,7 @@ def test_session_decoder_resumes_with_context(monkeypatch) -> None:
     that context, so two requests of one session concatenate exactly to the
     whole-stream decode."""
     sub = _ar_decoder(monkeypatch)
-    sub.config.session_store_size = 4
+    sub._sessions.capacity = 4
     stream = torch.arange(16, dtype=torch.float32).view(1, 1, 16, 1, 1).expand(1, 16, 16, 4, 4).contiguous()
 
     def infos(md):
@@ -703,7 +730,7 @@ def test_session_decoder_resumes_with_context(monkeypatch) -> None:
     # Request 1: one 8-unit window under session "w".
     md1 = {"rid": "r1", "num_windows": 1, "overlap_latent_units": 0, "num_frames": 29, "session_id": "w"}
     out1 = sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md1), stream[:, :, 0:8])
-    assert "w" in sub._session_tails and sub._session_tails["w"].shape[2] == 3
+    assert "w" in sub._sessions and sub._sessions.get("w").shape[2] == 3
     # Request 2 resumes: its window re-pins units 6..8 and generates 8..16
     # (10 units), asking for the 32 new frames = 8 new units x 4.
     md2 = {
@@ -720,6 +747,105 @@ def test_session_decoder_resumes_with_context(monkeypatch) -> None:
            "session_id": "ghost", "resume_latent_units": 2}
     out3 = sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md3), stream[:, :, 6:10])
     assert out3["video_output"][0].shape[2] == 5
+
+
+def _session_dit(monkeypatch):
+    sub = _dit()
+    sub.transformer = SimpleNamespace(proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)))
+    monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "sched")
+    monkeypatch.setattr(sub, "get_device", lambda: torch.device("cpu"))
+    return sub
+
+
+_SESSION_MD = {
+    "window_mode": "kv", "total_latent_units": 8, "window_latent_units": 4,
+    "overlap_latent_units": 0, "context_latent_units": 0, "session_id": "w",
+}
+
+
+def _prefill(sub, rid, md):
+    fwd = SimpleNamespace(request_id=rid, random_seed=0)
+    sub._prepare_windowed_prefill(fwd, md, list(range(7)), None, 64, 64, 24.0, 1.0, 3, "cpu")
+
+
+def test_session_in_flight_is_pinned_and_exclusive(monkeypatch) -> None:
+    """A request that names a session pins it from its prefill: the store
+    never evicts it while other sessions churn, a second request on it is
+    refused with a clear error, and the pin goes when the rollout stores its
+    last window."""
+    sub = _session_dit(monkeypatch)
+    sub._sessions.capacity = 1
+    _prefill(sub, "r1", _SESSION_MD)
+    assert sub._sessions.live("w") == "r1"
+    with pytest.raises(ValueError, match="in use by request 'r1'"):
+        _prefill(sub, "r2", _SESSION_MD)
+    shape = sub._window_latent_shape(64, 64, 4)
+    for sid in ("x", "y"):
+        st = sub.request_state(f"r-{sid}")
+        st.add_all(ar_schedule=WindowSchedule(4, 4), ar_session_id=sid)
+        sub._finish_window(st, torch.zeros(shape), torch.tensor([3]), window_index=0)
+    assert sub._sessions.live("w") == "r1" and sub._sessions.ids() == ["w", "y"]
+    # r1's final window (the schedule has two) stores the tail and lets go.
+    sub._finish_window(sub.request_states["r1"], torch.full(shape, 5.0), torch.tensor([7]), window_index=1)
+    assert sub._sessions.live("w") is None and "w" in sub._sessions
+    _prefill(sub, "r2", {**_SESSION_MD, "resume_latent_units": 2})
+    assert sub._sessions.live("w") == "r2"
+    assert torch.all(sub.request_states["r2"]["cond_video_latents"][:, :, :2] == 5.0)
+
+
+def test_session_released_when_the_request_is_removed(monkeypatch) -> None:
+    sub = _session_dit(monkeypatch)
+    _prefill(sub, "r1", _SESSION_MD)
+    assert sub._sessions.live("w") == "r1"
+    sub.cleanup_request("r1")  # cancelled mid-rollout
+    assert sub._sessions.live("w") is None and "w" not in sub._sessions
+    assert "r1" not in sub.request_states
+
+
+def test_session_end_and_timeout(monkeypatch) -> None:
+    """``end_session`` drops the session at the final window; an idle session
+    outlives its request only for ``session_timeout_s``."""
+    clock = {"t": 0.0}
+    sub = _session_dit(monkeypatch)
+    sub._sessions = SessionStore(4, 10.0, 60.0, clock=lambda: clock["t"])
+    shape = sub._window_latent_shape(64, 64, 4)
+    st = sub.request_state("r-end")
+    st.add_all(ar_schedule=WindowSchedule(4, 4), ar_session_id="gone", ar_end_session=True)
+    sub._finish_window(st, torch.zeros(shape), torch.tensor([3]), window_index=0)
+    assert "gone" not in sub._sessions
+    st = sub.request_state("r-ttl")
+    st.add_all(ar_schedule=WindowSchedule(4, 4), ar_session_id="brief", ar_session_ttl=5.0)
+    sub._finish_window(st, torch.zeros(shape), torch.tensor([3]), window_index=0)
+    clock["t"] = 4.0
+    assert sub._session_tail("brief", 2, 64, 64).shape[2] == 2
+    clock["t"] = 6.0
+    with pytest.raises(ValueError, match="unknown or expired"):
+        sub._session_tail("brief", 2, 64, 64)
+
+
+def test_session_decoder_promotes_on_read_and_ends(monkeypatch) -> None:
+    """Reading a session's decode context promotes it, as the DiT's store
+    does, so the two nodes evict the same session first; ``end_session``
+    drops it at the last window."""
+    sub = _ar_decoder(monkeypatch)
+    sub._sessions.capacity = 2
+    stream = torch.arange(16, dtype=torch.float32).view(1, 1, 16, 1, 1).expand(1, 16, 16, 4, 4).contiguous()
+
+    def infos(md):
+        return SimpleNamespace(request_ids=[md["rid"]], per_request_info={md["rid"]: SimpleNamespace(step_metadata=md)})
+
+    base = {"num_windows": 1, "overlap_latent_units": 0, "num_frames": 29}
+    for sid in ("a", "b"):
+        sub.forward(C.VIDEO_DECODE_AR_WALK, infos({**base, "rid": f"r-{sid}", "session_id": sid}), stream[:, :, 0:8])
+    assert sub._sessions.ids() == ["a", "b"]
+    # A two-window resume of "a": its first window reads (and promotes) the
+    # context without storing anything yet.
+    md = {**base, "rid": "r-a2", "num_windows": 2, "num_frames": 40, "session_id": "a", "resume_latent_units": 2}
+    sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md), stream[:, :, 6:12])
+    assert sub._sessions.ids() == ["b", "a"]
+    md = {**base, "rid": "r-a3", "session_id": "a", "end_session": True}
+    sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md), stream[:, :, 0:8])
+    assert sub._sessions.ids() == ["b"]
 
 
 def test_long_rollout_state_stays_flat(monkeypatch) -> None:
