@@ -176,7 +176,10 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   → ``nano_llm`` (frame-synchronous decode loop: each step fuses one audio frame
   with the previous agent-text and tool-call tokens, emits one agent-text token)
   → ``eartts_talker`` (one text token → 31 RVQ codes) → ``audio_codec`` (codes →
-  PCM, decoded with a per-request left context and emitted as new frames only).
+  PCM: each 5-frame chunk is decoded with the previous 3 frames as left context,
+  which covers the decoder's receptive field, and a window's last 12 samples,
+  the inverse-STFT overlap, are held back and emitted with the next chunk, so
+  the stream equals the full-history decode sample for sample).
   The decode loops are stream-terminated: they end when the upstream stream
   closes, not on EOS, which is an ordinary per-frame token in duplex speech.
 - ``nano_llm`` declares a paged KV cache over its four attention layers with
@@ -202,10 +205,11 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (its 38-token speaker warm-up) runs eager. The talker KV pool is 512 pages
   of 128 positions (14 GiB): 64 sessions x 2 streams x 512 positions, about
   38 s of speech per session, with no sliding-window eviction yet.
-- Measured on one H100 80GB (2026-09-20, ``benchmark/nemotron_duplex/sessions.py``
-  on the 106-frame demo clip): 23.6 ms per 80 ms tick with one session, 57 ms
-  with 32 concurrent sessions, 74-80 ms with 64 (at the budget); every session
-  received all its frames. Served audio is checked for intelligibility by
+- Measured on one H100 80GB (``benchmark/nemotron_duplex/sessions.py`` on the
+  106-frame demo clip, three repeats): 23.7 ms per 80 ms tick with one session,
+  54-55 ms with 32 concurrent sessions, 84-86 ms with 64 (2026-09-27; an
+  earlier node gave 74-80 ms at 64, so 64 sits at or just over the budget
+  depending on the node); every session received all its frames. Served audio is checked for intelligibility by
   transcribing it (``test/nemotron_duplex/asr_check.py``, Whisper
   large-v3-turbo): MaskGIT sampling is knife-edge, so attention-backend
   numerics change the waveform but not the words.
