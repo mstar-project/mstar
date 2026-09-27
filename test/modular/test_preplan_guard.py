@@ -9,6 +9,8 @@ pages (KV) or dereferenced against a lease it does not hold (sampler).
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from mstar.communication.tensors import LocalTransferEngine
@@ -154,17 +156,22 @@ def _runner() -> tuple[StepRunner, _Blind, _Blind]:
     return StepRunner({"kv": kv, "attn": attn}), kv, attn
 
 
-def test_runner_drops_the_stage_on_every_resource_for_a_foreign_step() -> None:
+def test_runner_drops_the_stage_on_every_resource_for_a_foreign_step(caplog) -> None:
     runner, kv, attn = _runner()
     staged = _step("a", preplan=True)
     assert runner.pre_admit(staged).ok
     runner.pre_plan(staged)
+    assert runner.staged
     assert kv.events == ["pre_plan"] and attn.events == ["pre_plan"]
 
     # b's prefill (more rows, no lease) reaches the GPU thread first: both
     # resources drop the stage and plan b afresh — the blind promoter included.
+    # Not the normal path, so it is said out loud, naming both steps.
     foreign = _step("b", span=17, slot=None)
-    assert runner.admit(foreign).ok
+    with caplog.at_level(logging.WARNING, logger="mstar.engine.resources.runner"):
+        assert runner.admit(foreign).ok
+    assert "dropping the staged pre-plan (walk decode, 1 rows)" in caplog.text
+    assert not runner.staged
     out = runner.plan(foreign)
     assert out == {"kv": "fresh", "attn": "fresh"}
     assert kv.events == ["pre_plan", "clear", "plan"]
