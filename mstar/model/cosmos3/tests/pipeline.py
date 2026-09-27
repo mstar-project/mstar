@@ -125,6 +125,7 @@ class Cosmos3Pipeline:
         raw_mu = self.vae.encode(x.to(dtype)).latent_dist.mode()
         return ((raw_mu - mean) * inv_std).to(in_dtype)
 
+    @torch.no_grad()
     def _decode(self, latents: torch.Tensor) -> torch.Tensor:
         """Latents [1,C,T,H,W] -> pixels [1,3,T,H,W] in [0,1] (un-normalize + Wan VAE)."""
         # The VAE instance is shared with the served decoder node, which casts
@@ -136,12 +137,17 @@ class Cosmos3Pipeline:
         decoded = self.vae.decode(z).sample  # [1,3,T,H,W] in [-1,1]
         return (decoded / 2 + 0.5).clamp(0, 1).to(torch.float32)
 
+    @torch.no_grad()
     def _prepare_latents(self, image, num_frames, height, width, generator, latents, device, dtype):
         """Build the initial vision latents + whether frame 0 is a clean anchor.
 
         For image-to-video the conditioning frame anchors latent frame 0 (clean,
         VAE-encoded) and the remaining frames start from pure noise; otherwise the
-        whole tensor is noise. Mirrors the diffusers ``prepare_latents`` vision path.
+        whole tensor is noise. Mirrors the diffusers ``prepare_latents`` vision path,
+        except that only the first frame goes through the VAE: the causal encoder
+        makes latent frame 0 independent of the frames after it (bit-identical to
+        encoding the repeated clip), and it is the only frame kept. A 121-frame
+        clip at 480p does not fit through the encoder next to the model.
         """
         from diffusers.utils.torch_utils import randn_tensor
 
@@ -159,15 +165,18 @@ class Cosmos3Pipeline:
                 else torch.zeros(1, 3, 1, height, width, dtype=dtype, device=device)
             )
         else:
-            vision_tensor = torch.zeros(1, 3, num_frames, height, width, dtype=dtype, device=device)
-            if conditioning_frame_2d is not None:
-                vision_tensor[:, :, 0] = conditioning_frame_2d
-                if num_frames > 1:
-                    vision_tensor[:, :, 1:] = conditioning_frame_2d.unsqueeze(2).expand(
-                        -1, -1, num_frames - 1, -1, -1
-                    )
+            vision_tensor = (
+                conditioning_frame_2d.unsqueeze(2)
+                if conditioning_frame_2d is not None
+                else torch.zeros(1, 3, 1, height, width, dtype=dtype, device=device)
+            )
 
         x0 = self._encode_video(vision_tensor).contiguous().float()
+        if not is_image:
+            latent_t = 1 + (num_frames - 1) // self.config.vae.scale_factor_temporal
+            padded = torch.zeros((x0.shape[0], x0.shape[1], latent_t, *x0.shape[3:]), dtype=x0.dtype, device=x0.device)
+            padded[:, :, :1] = x0
+            x0 = padded
         vision_shape = tuple(x0.shape)
 
         vision_condition_mask = torch.zeros((x0.shape[2], 1, 1), device=device, dtype=dtype)
