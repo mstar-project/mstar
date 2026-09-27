@@ -1,5 +1,5 @@
-"""Tests for ``mstar.engine.windowing``: window arithmetic and the KV
-lifecycle session.
+"""Tests for ``mstar.engine.windowing``: window arithmetic and the retention
+policy a schedule hands a window commit.
 
 The schedule invariant that everything downstream leans on: commit spans
 partition ``[0, total_units)`` exactly — every unit is generated once, no
@@ -16,7 +16,7 @@ sys.path.insert(0, ".")
 
 import pytest
 
-from mstar.engine.windowing import WindowedKVSession, WindowSchedule
+from mstar.engine.windowing import WindowSchedule
 
 
 class TestWindowSchedule:
@@ -80,45 +80,18 @@ class TestWindowSchedule:
             WindowSchedule(8, 4).window(2)
 
 
-class _StubHandle:
-    """Records the retention the session installs, like the pool would."""
-
-    def __init__(self):
-        self.policies = {}
-
-    def set_retention(self, request_id, policy, label=None):
-        self.policies[(request_id, label)] = policy
-
-
-class TestWindowedKVSession:
-    def test_bind_installs_the_schedule_budget(self):
+class TestWindowRetention:
+    def test_schedule_budget_behind_the_prefix(self):
         # 60 tokens/unit, 16 units of context behind a 300-token prefix.
-        s = WindowSchedule(48, 8, context_units=16)
-        h = _StubHandle()
-        sess = WindowedKVSession(h, "r", "main", s, tokens_per_unit=60)
-        assert sess.context_tokens == 16 * 60
-        policy = sess.bind(300)
-        assert h.policies[("r", "main")] is policy
+        policy = WindowSchedule(48, 8, context_units=16).retention(60, 300)
         assert policy.context_budget == 960 and policy.protected_prefix == 300
 
-    def test_unbounded_context_installs_nothing(self):
-        s = WindowSchedule(48, 8)
-        h = _StubHandle()
-        sess = WindowedKVSession(h, "r", "main", s, tokens_per_unit=8)
-        assert sess.context_tokens is None
-        assert sess.bind(16) is None
-        assert h.policies == {}
-
-    def test_bind_once(self):
-        s = WindowSchedule(8, 8, context_units=4)
-        sess = WindowedKVSession(_StubHandle(), "r", "main", s, 8)
-        sess.bind(16)
-        with pytest.raises(RuntimeError, match="already bound"):
-            sess.bind(16)
+    def test_unbounded_context_declares_nothing(self):
+        assert WindowSchedule(48, 8).retention(8, 16) is None
 
     def test_tokens_per_unit_validation(self):
         with pytest.raises(ValueError):
-            WindowedKVSession(_StubHandle(), "r", "main", WindowSchedule(8, 8), 0)
+            WindowSchedule(8, 8, context_units=4).retention(0, 16)
 
 
 if __name__ == "__main__":
