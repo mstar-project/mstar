@@ -295,12 +295,21 @@ class StepRunner:
     def _drop_stale_preplan(self, step: SubmoduleStep) -> None:
         if self._staged is None or step.ctx.is_preplan:
             return
-        if self._staged != self._step_key(step):
-            logger.debug(
-                "dropping the staged pre-plan: a different step reached the "
-                "GPU thread first"
+        key = self._step_key(step)
+        if self._staged != key:
+            # Not the normal path: the worker meant to run the staged step
+            # next. Name both steps so the source can be traced.
+            logger.warning(
+                "dropping the staged pre-plan (walk %s, %d rows) for a different "
+                "step (walk %s, %d rows) that reached the GPU thread first",
+                self._staged[0], len(self._staged[1]), key[0], len(key[1]),
             )
             self.clear_preplan()
+
+    @property
+    def staged(self) -> bool:
+        """A pre-plan is staged and not yet promoted."""
+        return self._staged is not None
 
     def clear_preplan(self) -> None:
         """Drop the staged pre-plan on every resource, and the record of it."""
