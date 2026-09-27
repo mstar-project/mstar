@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from dataclasses import asdict
 
 from mstar.sim.calibration import load_timing
 from mstar.sim.deployment import load_deployment
@@ -157,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
                         "config": args.config,
                         "model": dep.model_key,
                         "ranks": dep.ranks,
-                        "workload": vars(spec),
+                        "workload": asdict(spec),
                         "calibrated": calibrated,
                         "report": report.to_dict(),
                     },
