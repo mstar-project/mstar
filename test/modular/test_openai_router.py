@@ -44,6 +44,7 @@ class _StubAPI:
         self._chunks: dict = {}
         self.next_chunks: list = []
         self.last_raw_request = None
+        self.aborted: list = []
 
     def submit_request(self, **kw):
         self.last_submit = kw
@@ -55,8 +56,16 @@ class _StubAPI:
         return self._chunks.get(request_id, [])
 
     async def iter_result_chunks(self, request_id):
-        for c in self._chunks.get(request_id, []):
-            yield c
+        # a consumer that leaves before the last chunk aborts the request, as
+        # the real iterator does
+        finished = False
+        try:
+            for c in self._chunks.get(request_id, []):
+                yield c
+            finished = True
+        finally:
+            if not finished:
+                self.aborted.append(request_id)
 
 
 @pytest.fixture
@@ -239,6 +248,24 @@ def test_speech_stream_that_fails_breaks_the_transfer(client_and_stub):
             "/v1/audio/speech",
             json={"model": "orpheus", "input": "hi", "voice": "tara", "stream": True},
         )
+
+
+def test_a_failed_speech_stream_leaves_the_ended_request_alone(client_and_stub):
+    """The error chunk arrives after the request has already ended, so the
+    stream reads to the end before it breaks the transfer."""
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.next_chunks = [
+        _Chunk("audio", _pcm([100, -100]), {"sample_rate": 24000}),
+        _Chunk("error", b"worker died", {"status": 500}),
+    ]
+    with pytest.raises(RuntimeError, match="worker died"):
+        client.post(
+            "/v1/audio/speech",
+            json={"model": "orpheus", "input": "hi", "voice": "tara", "stream": True},
+        )
+
+    assert stub.aborted == [], "the stream aborted a request that had already ended"
 
 
 def test_unsupported_model_404(client_and_stub):
