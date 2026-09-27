@@ -132,7 +132,8 @@ Kokoro notes
 - ``examples/livekit_kokoro.py`` and ``examples/pipecat_kokoro.py`` plug the server
   into LiveKit Agents and Pipecat through their OpenAI TTS plugins (``base_url``
   pointed at M*, ``response_format="pcm"``); ``GET /v1/audio/voices`` lists the
-  voices for a picker.
+  voices for a picker: the bundled voices whose G2P extra is installed on the server
+  (a request for one of the others gets a 400 with the ``pip install`` hint).
 
 Qwen3-TTS notes
 ---------------
