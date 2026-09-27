@@ -9,6 +9,7 @@ loop iteration.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -348,15 +349,21 @@ def test_misaki_english_g2p_if_available():
 
 
 class _StubG2P:
-    def __init__(self, chunks):
+    def __init__(self, chunks, unavailable=()):
         self.chunks = chunks
         self.calls = []
         self.backends = []
+        self.unavailable = set(unavailable)
+
+    def available(self, lang):
+        return lang not in self.unavailable
 
     def backend(self, lang):
         self.backends.append(lang)
 
     def chunk(self, text, lang):
+        if lang in self.unavailable:
+            raise ImportError(f"Kokoro G2P for language {lang!r} needs `pip install 'misaki[zh]'`")
         self.calls.append((text, lang))
         return self.chunks
 
@@ -447,6 +454,31 @@ def test_process_prompt_validation(voices_dir):
     model.g2p = _StubG2P([Chunk("", "a")] * 9)
     with pytest.raises(ValueError, match="chunks"):
         model.process_prompt("many", ["text"], ["audio"])
+
+
+def test_voices_and_requests_follow_the_installed_g2p(voices_dir):
+    torch.save(torch.randn(510, 1, 16), voices_dir / "zf_xiaobei.pt")
+    model = make_model(voices_dir)
+    model.g2p = _StubG2P([Chunk("Hi.", "ab.")], unavailable={"z"})
+    assert model.get_voices() == ["af_heart", "af_sky", "am_adam"]
+    with pytest.raises(ValueError, match="does not have.*misaki\\[zh\\].*audio/voices"):
+        model.process_prompt("你好", ["text"], ["audio"], voice="zf_xiaobei")
+    model.g2p.unavailable.clear()
+    assert model.get_voices() == ["af_heart", "af_sky", "am_adam", "zf_xiaobei"]
+    out = model.process_prompt("你好", ["text"], ["audio"], voice="zf_xiaobei")
+    assert out[PHONEME_LENS][0].tolist() == [5]  # <bos> a b . <eos>
+
+
+def test_missing_language_backend_is_reported_once(monkeypatch):
+    monkeypatch.setitem(sys.modules, "misaki.ja", None)  # `from misaki import ja` -> ImportError
+    frontend = G2PFrontend(chunk_target=40, max_phonemes=510, espeak_fallback=False)
+    assert frontend.available("j") is False
+    assert "j" in frontend._unavailable
+    monkeypatch.delitem(sys.modules, "misaki.ja")
+    assert frontend.available("j") is False  # cached: not retried
+    with pytest.raises(ImportError, match="misaki\\[ja\\]"):
+        frontend.backend("j")
+    assert frontend.available("a") is (importlib.util.find_spec("misaki.en") is not None)
 
 
 def test_warmup_builds_the_default_language_backend(voices_dir):
