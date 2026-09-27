@@ -52,6 +52,7 @@ from mstar.model.nemotron_duplex.config import (
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -63,6 +64,12 @@ logger = logging.getLogger(__name__)
 _MODE_FRAME = "frame"      # one streamed audio frame + fed-back prev_text / prev_func
 _MODE_PROMPT_FRAME = "prompt_frame"   # a session's first step: the system prompt's tokens, then its first frame
 NO_PROMPT = -1             # the ``text_inputs`` loop-back value once the prompt has been consumed (or never existed)
+
+
+def _first_row(out: BatchedModelOutput) -> NameToTensorList:
+    """The eager single-request ``forward`` contract (``{name: [tensor]}``) as
+    row 0 of a row-addressed batch output."""
+    return {name: [rows[0:1]] for name, rows in (out.row_outputs or {}).items()}
 _MODE_PROMPT = "prompt"    # system-prompt token ids (priming)
 _MODE_EMBEDS = "embeds"    # pre-fused embeddings
 
@@ -317,17 +324,25 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         input_embeds: torch.Tensor,
         seq_lens: list[int],
         **kwargs,
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         """One fused forward over the packed batch: attention over the planned
-        paged KV, Mamba-2 over each request's slot in the recurrent pool."""
+        paged KV, Mamba-2 over each request's slot in the recurrent pool.
+
+        The outputs are row-addressed (row i is request i): the engine copies
+        each batch tensor out of the graph's buffers once and hands every
+        request a view, instead of one clone per request per name. Nothing is
+        offered to ``check_stop`` (it would be copied to the host per step):
+        the decode loop ends on the audio stream's final chunk or the loop's
+        own ``max_iters``, never on a token."""
         cfg = self.config
         rids = list(engine_inputs.request_ids)
+        n = len(rids)
         hidden = self.language_model(input_embeds, label="main")
         if graph_walk != "decode":
             # Prompt priming: no sampling, the region is held at PAD (reference
             # ``_prime_prompt``), so the first audio frame follows the last PAD.
-            pad = torch.full((1,), cfg.text_pad_id, dtype=torch.long, device=hidden.device)
-            return {rid: {"prev_text": [pad], "prev_func": [pad]} for rid in rids}
+            pad = torch.full((n,), cfg.text_pad_id, dtype=torch.long, device=hidden.device)
+            return BatchedModelOutput(row_outputs={"prev_text": pad, "prev_func": pad}, check_stop_buffers={})
 
         if all(n == 1 for n in seq_lens):
             last = hidden                                   # decode: one row per request (captured shape)
@@ -335,20 +350,16 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
             ends = list(itertools.accumulate(seq_lens))
             last = hidden.index_select(0, torch.tensor([e - 1 for e in ends], device=hidden.device))
         new_token = engine_inputs.resources[NANO_SAMPLER].sample(rids, logits=self.lm_head(last))
-        new_func = None
+        rows = {
+            "new_token": new_token.reshape(n),
+            # the prompt (if any) has been consumed by this step: the loop-back
+            # carries the sentinel from here on
+            "text_inputs": torch.full((n,), NO_PROMPT, dtype=torch.long, device=hidden.device),
+        }
         if cfg.use_function_head:
             # Tool-call channel: plain argmax, as in the reference.
-            new_func = self.language_model.function_head(last).argmax(dim=-1)
-        # the prompt (if any) has been consumed by this step: the loop-back
-        # carries the sentinel from here on
-        no_prompt = torch.full((1,), NO_PROMPT, dtype=torch.long, device=hidden.device)
-        out: dict[str, NameToTensorList] = {}
-        for i, rid in enumerate(rids):
-            o: NameToTensorList = {"new_token": [new_token[i : i + 1]], "text_inputs": [no_prompt]}
-            if new_func is not None:
-                o["new_func"] = [new_func[i : i + 1]]
-            out[rid] = o
-        return out
+            rows["new_func"] = self.language_model.function_head(last).argmax(dim=-1).reshape(n)
+        return BatchedModelOutput(row_outputs=rows, check_stop_buffers={})
 
     def forward(
         self,
@@ -358,7 +369,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         seq_lens: list[int],
         **kwargs,
     ) -> NameToTensorList:
-        return self.forward_batched(graph_walk, engine_inputs, input_embeds, seq_lens)[engine_inputs.request_ids[0]]
+        return _first_row(self.forward_batched(graph_walk, engine_inputs, input_embeds, seq_lens))
 
     # -- after the forward -------------------------------------------------
 
@@ -376,22 +387,11 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         if "new_func" in outputs:
             outputs["prev_func"] = outputs["new_func"]
 
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        # Frame-synchronous duplex: exactly one agent-text token per audio
-        # frame, and text EOS is a NORMAL per-frame token (silence / turn
-        # boundary), not end-of-generation. The decode loop ends when the
-        # audio_frame stream is exhausted (final chunk); only the max-tokens
-        # backstop stops it here.
-        at_max = (
-            request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-            >= request_info.max_tokens
-        )
-        return {"decode_loop"} if at_max else set()
+    # No ``check_stop``: frame-synchronous duplex emits exactly one agent-text
+    # token per audio frame, and text EOS is a NORMAL per-frame token (silence /
+    # turn boundary), not end-of-generation. The decode loop ends when the
+    # audio_frame stream is exhausted (final chunk) or at the Loop's own
+    # ``max_iters`` (the model's max output tokens).
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +619,7 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         return {"x": x, "spans": [inp.input_seq_len for inp in inputs], **self._noise(gens, dev)}
 
     def forward_batched(self, graph_walk, engine_inputs, x=None, spans=None, noise_u=None, noise_eps=None,
-                        **kwargs) -> dict[str, NameToTensorList]:
+                        **kwargs) -> BatchedModelOutput:
         e = self.config.eartts
         rids = list(engine_inputs.request_ids)
         n = len(rids)
@@ -634,10 +634,12 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             num_iter=e.inference_num_iter, guidance_scale=e.inference_guidance_scale,
             noise_scale=e.inference_noise_scale, top_p=e.inference_top_p, noise=noise,
         ).squeeze(1)                                                      # [N, Q]
-        return {rid: {"codec_tokens": [codes[i]]} for i, rid in enumerate(rids)}
+        # row-addressed: one copy out of the graph for the batch, a [1, Q] view
+        # per request; nothing for check_stop (the stream's end stops the loop)
+        return BatchedModelOutput(row_outputs={"codec_tokens": codes}, check_stop_buffers={})
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
-        return self.forward_batched(graph_walk, engine_inputs, **kwargs)[engine_inputs.request_ids[0]]
+        return _first_row(self.forward_batched(graph_walk, engine_inputs, **kwargs))
 
     def postprocess(self, request_id, request_info, outputs, **kwargs):
         # This frame's codes are the next frame's ``prev_codes`` (metadata only:
@@ -676,7 +678,9 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
         # left context comes from per-request state, not the stream.
         codes = inputs["codec_tokens"][0]
         if codes.dim() == 3:
-            codes = codes[0]                                            # (T_new, num_q)
+            # the stream stacks the talker's [1, num_q] frames to (T_new, 1, num_q);
+            # a whole window handed over at once is (1, T_new, num_q)
+            codes = codes.reshape(-1, codes.shape[-1])                  # (T_new, num_q)
         elif codes.dim() == 1:
             codes = codes.unsqueeze(0)                                  # single frame -> (1, num_q)
         return NodeInputs(tensor_inputs={"codes": codes}, input_seq_len=codes.shape[0])
