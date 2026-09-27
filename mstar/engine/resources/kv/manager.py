@@ -15,7 +15,13 @@ from mstar.engine.resources.base import (
     PublishedInfo,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
+from mstar.engine.resources.kv.config import (
+    KVConfig,
+    KVReqConfig,
+    KVSpec,
+    KVStep,
+    RetentionPolicy,
+)
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import fingerprint, page_key
 from mstar.engine.resources.kv.plan import (
@@ -101,32 +107,6 @@ class PageArena:
         return self.allocator.num_free
 
 
-@dataclass(frozen=True)
-class RetentionPolicy:
-    """FIFO retention for a stream that keeps committing (windowed / rolling
-    generation): once the committed tokens behind ``protected_prefix`` exceed
-    ``context_budget``, the oldest unprotected pages are released at commit.
-
-    Applied inside ``KVManager.commit`` for the committing stream, so the
-    release happens between steps as far as every planner is concerned: a
-    pre-plan of the next step gates on this commit and sees the compacted
-    stream. Whole pages only (the page straddling the prefix boundary and a
-    partial tail page stay), so the realized context can run over the budget
-    by up to a page; the excess is re-offered at the next commit.
-    ``protected_prefix`` tokens at the head (a text prompt, say) are never
-    released.
-    """
-    context_budget: int
-    # front tokens the window never releases; only pages within them are indexed
-    protected_prefix: int = 0
-
-    def __post_init__(self):
-        if self.context_budget < 0:
-            raise ValueError(f"context_budget must be >= 0, got {self.context_budget}")
-        if self.protected_prefix < 0:
-            raise ValueError(f"protected_prefix must be >= 0, got {self.protected_prefix}")
-
-
 @dataclass
 class PrefixChain:
     """The keys that name a stream's pages, and how far the index holds them."""
@@ -186,6 +166,8 @@ class CacheStream:
     # the first `protected_prefix` committed tokens (a text prefix, say) are
     # never released; set once, after they commit (`protect_prefix`)
     protected_prefix: int = 0
+    # the policy the last committing step declared for this stream
+    # (`KVStep.retention`): the index caps at its prefix, `reset` clears it
     retention: RetentionPolicy | None = None
     read_pending: bool = False
     read_future: Future | None = None
@@ -238,6 +220,7 @@ class ClaimedStream:
     stored_len: int
     position: int
     released: int
+    protected_prefix: int
 
 
 LabelToStream = dict[str, CacheStream]
@@ -1113,19 +1096,23 @@ class KVManager(AttentionResource):
                     stream.stored_len += segment.span
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
+                    policy = step.retention.get((segment.request_id, segment.label))
+                    if policy is not None:
+                        self._adopt_retention(stream, policy, segment)
                     self._index_filled_pages(segment, stream, ctx)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
-                    # the stream's retention policy, if any: drop what aged
+                    # The step's retention, if it declared one: drop what aged
                     # past the context budget now that this step's tokens
                     # count. Here, under the lock and before `commit_done`
                     # lets the next step pre-plan, so no admitted plan
                     # addresses the pages this frees (this step's own kernels
                     # may still be reading them, but every later user of the
-                    # pages is enqueued behind them on the node's stream)
-                    if stream.retention is not None:
-                        self._apply_retention(stream)
+                    # pages queues behind them on the node's stream, the host
+                    # pool's copies included)
+                    if policy is not None:
+                        self._apply_retention(stream, policy)
             # post-forks copy what this step just wrote, so they land after the
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
@@ -1138,11 +1125,11 @@ class KVManager(AttentionResource):
     # request that generates in windows commits each window's K/V and, once
     # its context horizon fills, drops the oldest generated pages while the
     # prompt prefix stays. Two routes to the same page-floored front release:
-    # a `RetentionPolicy` on the stream (`set_retention`), applied by every
-    # commit — the served route, safe under pre-planning — and the explicit
-    # `protect_prefix` / `release_oldest` pair for a driver that runs between
-    # steps. Ported from #198's PagedAllocationManager (merceod) onto the
-    # pool's streams.
+    # a `RetentionPolicy` the committing step declares (`KVStep.retention`),
+    # applied inside that commit — the served route, safe under pre-planning —
+    # and the explicit `protect_prefix` / `release_oldest` pair for a driver
+    # that runs between steps. Ported from #198's PagedAllocationManager
+    # (merceod) onto the pool's streams.
 
     @torch.compiler.disable
     def protect_prefix(
@@ -1172,45 +1159,31 @@ class KVManager(AttentionResource):
                 )
             stream.protected_prefix = num_tokens
 
-    @torch.compiler.disable
-    def set_retention(
-        self, request_id: str, policy: RetentionPolicy | None, label: str | None = None,
+    def _adopt_retention(
+        self, stream: CacheStream, policy: RetentionPolicy, segment: Segment,
     ) -> None:
-        """Install (or clear, with ``None``) the stream's retention policy; see
-        ``RetentionPolicy``. The protected prefix must already have committed
-        (it is the head of the stream as it stands) and nothing may have been
-        released yet, so a policy is set once the prefix is in and before the
-        rolling part starts. Metadata only — pages move at the next commit —
-        so this is safe to call while a step is admitted."""
-        if label is None:
-            label = self._default_label
-        with self._lock:
-            stream = self._streams[request_id][label]
-            if policy is None:
-                stream.retention = None
-                return
-            if policy.protected_prefix > stream.stored_len:
-                raise ValueError(
-                    f"protected_prefix {policy.protected_prefix} outside the committed "
-                    f"{stream.stored_len} tokens of request {request_id!r} label {label!r}"
-                )
-            if stream.released:
-                raise ValueError(
-                    f"set_retention must precede any release for request "
-                    f"{request_id!r} label {label!r}"
-                )
-            if stream.protected_prefix not in (0, policy.protected_prefix):
-                raise ValueError(
-                    f"protected prefix already {stream.protected_prefix} tokens for "
-                    f"request {request_id!r} label {label!r}, got {policy.protected_prefix}"
-                )
-            stream.protected_prefix = policy.protected_prefix
-            stream.retention = policy
+        """Take the policy a committing step declares for its stream: the
+        protected prefix must be committed and agree with any earlier one
+        (`protect_prefix`, or the previous window's). The budget may change
+        between windows. Under the lock."""
+        if policy.protected_prefix > stream.stored_len:
+            raise ValueError(
+                f"retention for request {segment.request_id!r} label {segment.label!r} "
+                f"protects {policy.protected_prefix} tokens but only "
+                f"{stream.stored_len} are committed"
+            )
+        if stream.protected_prefix not in (0, policy.protected_prefix):
+            raise ValueError(
+                f"protected prefix already {stream.protected_prefix} tokens for "
+                f"request {segment.request_id!r} label {segment.label!r}, got "
+                f"{policy.protected_prefix}"
+            )
+        stream.protected_prefix = policy.protected_prefix
+        stream.retention = policy
 
-    def _apply_retention(self, stream: CacheStream) -> int:
-        """Release what the stream's policy no longer keeps. Under the lock."""
-        policy = stream.retention
-        excess = stream.stored_len - stream.protected_prefix - policy.context_budget
+    def _apply_retention(self, stream: CacheStream, policy: RetentionPolicy) -> int:
+        """Release what the step's policy no longer keeps. Under the lock."""
+        excess = stream.stored_len - policy.protected_prefix - policy.context_budget
         if excess <= 0:
             return 0
         return self._release_oldest_locked(stream, excess)
@@ -1324,6 +1297,7 @@ class KVManager(AttentionResource):
                     gpu_page_indices=claim.pages,
                     stored_len=claim.stored_len, position=claim.position,
                     released=claim.released,
+                    protected_prefix=claim.protected_prefix,
                 )
             ]
             if not moved:
@@ -1366,6 +1340,7 @@ class KVManager(AttentionResource):
                     stored_len=stream.stored_len,
                     position=stream.position,
                     released=stream.released,
+                    protected_prefix=stream.protected_prefix,
                 ))
                 if stream.read_future is not None:
                     read_futures.append(stream.read_future)
@@ -1458,6 +1433,7 @@ class KVManager(AttentionResource):
                 stream.stored_len = state.stored_len
                 stream.position = state.position
                 stream.released = state.released
+                stream.protected_prefix = state.protected_prefix
                 stream.offloaded = False
         # sync outside the lock: orders the reload H2D copies before attention
         # reads them, but the pages are already assigned so it touches no
