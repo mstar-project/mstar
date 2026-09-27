@@ -183,7 +183,11 @@ class EarTTSConfig:
     # code frames with `left_context` prior frames so the causal codec has enough
     # receptive field, emitting only the new tail (see AudioCodecDecoderSubmodule).
     codec_chunk_frames: int = 5
-    codec_left_context_frames: int = 15
+    # The decoder's receptive field is under 3 code frames (three causal kernel-7
+    # ConvNeXt blocks at 9 positions per frame in its first stage = 2 frames, a
+    # fraction of a frame in the later stages and the 16-sample iSTFT window), so
+    # 3 frames of left context reproduce the full-history decode exactly.
+    codec_left_context_frames: int = 3
 
     sample_rate: int = 22050
 
