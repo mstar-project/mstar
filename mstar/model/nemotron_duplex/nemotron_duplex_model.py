@@ -540,12 +540,19 @@ class NemotronDuplexModel(Model):
             outputs=[],
         )
         # Talker: each streamed agent token -> RVQ codes, streamed to the codec.
+        # No speculative scheduling: a frame's codes are the next frame's
+        # ``prev_codes``, carried in the node's per-request state from
+        # ``postprocess`` to the next ``preprocess`` rather than as a loop-back
+        # edge, so a step built while the previous one is still in flight would
+        # read the frame before that (measured: up to 19 steps of run-ahead at
+        # one session, silent speech).
         talker_decode = Loop(
             name="talker_decode_loop",
             section=GraphNode(
                 name="eartts_talker",
                 input_names=["new_token"],
                 consumes_stream=True,
+                enable_async_scheduling=False,
                 outputs=[StreamingGraphEdge(next_node="audio_codec", name="codec_tokens",
                                             target_partition="Codec")],
             ),
