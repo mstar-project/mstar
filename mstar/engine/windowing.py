@@ -1,20 +1,20 @@
 """Windowed (sliding-window) autoregressive generation support.
 
 ``WindowSchedule`` is pure window arithmetic over abstract sequence units
-(latent frames for video models). ``WindowedKVSession`` turns a schedule into
-the KV cache's retention policy — the immutable prefix protected, everything
-older than the context horizon released as each window commits — so a model
-drives windowed generation without hand-rolling page/token bookkeeping.
-Models own their walk, conditioning math, and step declarations; this module
-owns the schedule and the retention arithmetic. The handle is the KV resource
-(``KVManager.set_retention``); the pool applies the policy inside each commit,
-which is what makes the release safe under the engine's step pre-planning.
+(latent frames for video models), and turns its context horizon into the KV
+cache's ``RetentionPolicy`` for a stream (``WindowSchedule.retention``): the
+immutable prefix protected, everything older than the horizon released as
+each window commits. The model puts that policy on the ``KVStep`` of each
+window commit and the pool applies it inside the commit, which is what makes
+the release safe under the engine's step pre-planning. Models own their walk,
+conditioning math and step declarations; this module owns the schedule and
+the retention arithmetic.
 
 Ported from #198 (merceod) onto the resource-pool engine.
 """
 from dataclasses import dataclass
 
-from mstar.engine.resources.kv.manager import RetentionPolicy
+from mstar.engine.resources.kv.config import RetentionPolicy
 
 
 @dataclass(frozen=True)
@@ -105,60 +105,18 @@ class WindowSchedule:
             return 0
         return max(0, self.window(index).commit_end - self.context_units)
 
-
-class WindowedKVSession:
-    """KV retention for one (request, label) under a ``WindowSchedule``.
-
-    ``handle`` provides ``set_retention(request_id, policy, label=...)`` (the
-    ``KVManager`` surface). Units convert to cache tokens via
-    ``tokens_per_unit``. Releases are page-floored by the pool and the
-    shortfall re-offered at the next commit, so the realized context tracks
-    the nominal one within a page.
-    """
-
-    def __init__(
-        self,
-        handle,
-        request_id: str,
-        label: str,
-        schedule: WindowSchedule,
-        tokens_per_unit: int,
-    ):
+    def retention(self, tokens_per_unit: int, prefix_tokens: int) -> RetentionPolicy | None:
+        """The KV retention a window commit declares for its stream: the
+        context horizon in cache tokens behind ``prefix_tokens`` of protected
+        head (the text prefix, say). ``None`` when the schedule retains
+        everything, since there is never a release. Releases are page-floored
+        by the pool and the shortfall re-offered at the next commit, so the
+        realized context tracks the nominal one within a page."""
         if tokens_per_unit < 1:
-            raise ValueError(
-                f"tokens_per_unit must be >= 1, got {tokens_per_unit}"
-            )
-        self._handle = handle
-        self._request_id = request_id
-        self._label = label
-        self._schedule = schedule
-        self._tokens_per_unit = tokens_per_unit
-        self._bound = False
-
-    @property
-    def context_tokens(self) -> int | None:
-        """Committed generation tokens the cache keeps behind the prefix;
-        ``None`` when the schedule retains everything."""
-        if self._schedule.context_units == 0:
+            raise ValueError(f"tokens_per_unit must be >= 1, got {tokens_per_unit}")
+        if self.context_units == 0:
             return None
-        return self._schedule.context_units * self._tokens_per_unit
-
-    def bind(self, prefix_tokens: int) -> RetentionPolicy | None:
-        """Install the retention once the immutable stream head (e.g. the
-        text prefix) has committed and before the first window commits. A
-        schedule with unbounded context installs nothing (there is never a
-        release, so nothing to protect). Returns the installed policy."""
-        if self._bound:
-            raise RuntimeError(
-                f"retention already bound for request "
-                f"{self._request_id!r} label {self._label!r}"
-            )
-        self._bound = True
-        budget = self.context_tokens
-        if budget is None:
-            return None
-        policy = RetentionPolicy(
-            context_budget=budget, protected_prefix=prefix_tokens,
+        return RetentionPolicy(
+            context_budget=self.context_units * tokens_per_unit,
+            protected_prefix=prefix_tokens,
         )
-        self._handle.set_retention(self._request_id, policy, label=self._label)
-        return policy
