@@ -18,6 +18,7 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.utils.cuda_streams import compute_stream
 
 logger = logging.getLogger(__name__)
 
@@ -903,7 +904,7 @@ class CudaGraphRunner:
         """
         self._stage(lease, preprocessed)
         if plan_done_event is not None:
-            torch.cuda.default_stream(self._device).wait_event(plan_done_event)
+            compute_stream(self._device).wait_event(plan_done_event)
         if launch_started_event is not None:
             launch_started_event.set()
         return self._replay(lease)
@@ -920,7 +921,7 @@ class CudaGraphRunner:
     def plan_stream(self) -> torch.cuda.Stream | None:
         """Dedicated stream for pre-planning.
 
-        Pre-plan must not submit onto the default stream: whether its memcpys
+        Pre-plan must not submit onto the forward's stream: whether its memcpys
         land before or after the GPU thread records the previous batch's
         completion event is timing-dependent, and landing after delays that
         event past pre-plan's own kernels. Its own stream keeps the two
