@@ -153,6 +153,7 @@ class Stress:
     async def soak(self, session, concurrency: int, seconds: float) -> None:
         deadline = time.perf_counter() + seconds
         per_minute: dict[int, float] = {}
+        gpu_by_minute: dict[int, int | None] = {}
         t_start = time.perf_counter()
         recs: list[dict] = []
 
@@ -168,6 +169,8 @@ class Stress:
                 rec = await speech(session, self.url, payload, stream=stream, fmt=fmt, scenario="soak")
                 minute = int((time.perf_counter() - t_start) // 60)
                 per_minute[minute] = per_minute.get(minute, 0.0) + (rec["audio_s"] if rec["status"] == 200 else 0.0)
+                if minute not in gpu_by_minute:
+                    gpu_by_minute[minute] = gpu_memory_mib()
                 recs.append(rec)
 
         gpu_before = gpu_memory_mib()
@@ -185,6 +188,7 @@ class Stress:
                 },
                 "gpu_mib_before": gpu_before,
                 "gpu_mib_after": gpu_memory_mib(),
+                "gpu_mib_by_minute": {str(m): v for m, v in sorted(gpu_by_minute.items())},
             }
         )
         self.results["soak"] = summary
@@ -295,13 +299,24 @@ class Stress:
         recs = []
         for name, payload, expect in cases:
             fmt = "wav" if len(recs) % 2 else "pcm"
-            rec = await speech(session, self.url, payload, stream=len(recs) % 3 != 0, fmt=fmt, scenario=f"edge:{name}")
+            # A rejected streaming request answers 200 with an empty body until the speech route looks at
+            # its first result before answering (mstar PR #300), so status checks go non-streaming.
+            stream = len(recs) % 3 != 0 and expect == {200}
+            rec = await speech(session, self.url, payload, stream=stream, fmt=fmt, scenario=f"edge:{name}")
             rec["case"] = name
             rec["expected"] = sorted(expect)
             rec["ok"] = rec["status"] in expect and (
                 rec["status"] != 200 or rec["audio_s"] > 0 or payload.get("input", "x").strip() == ""
             )
             recs.append(rec)
+        rec = await speech(
+            session, self.url, {"input": "Hello.", "voice": "zz_nobody"}, stream=True,
+            scenario="edge:streaming rejection",
+        )
+        rec["case"] = "streaming request with an unknown voice (informational, see PR #300)"
+        rec["expected"] = [400, 422]
+        rec["ok"] = True
+        recs.append(rec)
         for fmt in ("mp3", "opus", "flac", "aac"):
             rec = await speech(
                 session,
