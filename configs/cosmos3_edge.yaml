@@ -57,12 +57,14 @@ node_groups:
 # so no client pays a shape's first torch.compile of the denoise step (15-25 s
 # to the first frame on a fresh server against 1.9 s warm). One per default
 # video shape: the 121-frame clip and the 29-frame kv window (57 frames is two
-# windows). The compile keys on shapes, not steps, so four steps do. Startup
-# grows by their wall time.
+# windows) and an image-conditioned rollout (the conditioning encode and the
+# i2v prefill are their own first-time cost). The compile keys on shapes, not
+# steps, so four steps do. Startup grows by their wall time.
 warmup_requests:
   - text: warmup
     output_modalities: [video]
     model_kwargs: {num_frames: 121, num_inference_steps: 4}
   - text: warmup
+    image: hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg
     output_modalities: [video]
     model_kwargs: {window_mode: kv, num_frames: 57, num_inference_steps: 4}
