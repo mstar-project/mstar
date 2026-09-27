@@ -109,9 +109,9 @@ class _SdpaKV(AttentionResource):
         self.pending: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         # plan label -> [(source label, span)], in packed order
         self.groups: dict[str, list[tuple[str, int]]] = {}
-        # Windowed kv mode: the stream's retention, applied at commit like the
-        # pool does (whole pages from the first page past the protected
-        # prefix; see KVManager._apply_retention).
+        # Windowed kv mode: the retention the commit step declares for each
+        # label, applied at commit like the pool does (whole pages from the
+        # first page past the protected prefix; see KVManager._apply_retention).
         self.page_size = page_size
         self.retention: dict[str, tuple[int, int]] = {}  # label -> (prefix, budget)
         self.released: dict[str, int] = {}
@@ -140,6 +140,8 @@ class _SdpaKV(AttentionResource):
     def commit(self, step, ctx):
         if step.commit:
             self.promote()
+            for (_rid, label), policy in step.retention.items():
+                self.retention[label] = (policy.protected_prefix, policy.context_budget)
             for label in {seg.label for seg in step.segments}:
                 self._apply_retention(label)
         else:
@@ -158,10 +160,6 @@ class _SdpaKV(AttentionResource):
                 else (torch.cat([prev[0], k], 0), torch.cat([prev[1], v], 0))
             )
         self.pending = {}
-
-    def set_retention(self, request_id, policy, label=None):
-        assert not self.released.get(label), "set_retention after a release"
-        self.retention[label] = (policy.protected_prefix, policy.context_budget)
 
     def _apply_retention(self, label):
         if label not in self.retention:
