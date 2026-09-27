@@ -167,7 +167,7 @@ Endpoints and model coverage:
      - ``orpheus``, ``qwen3_omni``
      - Text-to-speech.
    * - ``GET /v1/audio/voices``
-     - speech models with a fixed voice list (``orpheus``, ``qwen3_tts``)
+     - speech models that publish a voice list through their speech adapter (``orpheus``; 404 otherwise)
      - The ``voice`` ids the served model accepts, plus its default.
    * - ``POST /v1/images/generations``
      - ``bagel``
