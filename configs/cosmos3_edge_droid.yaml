@@ -31,10 +31,10 @@ node_groups:
   - node_names: ["vae_encoder", "vae_decoder"]
     ranks: [0]
 # The first policy request of a fresh server compiles the action denoise step
-# (about 9 s). To warm it at startup, point a warmup at an observation image
-# on this machine, e.g.
-# warmup_requests:
-#   - text: warmup
-#     image: /path/to/observation.jpg
-#     output_modalities: [action]
-#     model_kwargs: {action_mode: policy, domain_name: droid_lerobot, raw_action_dim: 10}
+# (about 9 s); this warms it at startup with the model card's example frame as
+# the observation.
+warmup_requests:
+  - text: warmup
+    image: hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg
+    output_modalities: [action]
+    model_kwargs: {action_mode: policy, domain_name: droid_lerobot, raw_action_dim: 10}
