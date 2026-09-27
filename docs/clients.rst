@@ -84,7 +84,9 @@ Each message is one request with the ``/generate`` fields — ``text``, ``files`
 as a msgpack binary frame (``data`` raw bytes). Replies use the same encoding as the
 message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
 then ``{"request_id", "finish": true}``. A rejected message answers
-``{"request_id", "error": ...}`` and the socket stays open. Messages may be pipelined —
+``{"request_id", "error": ...}`` and the socket stays open; a request that fails after it
+was accepted ends the same way, with the HTTP ``status`` it would have had, and no
+``finish`` follows. Messages may be pipelined —
 send the next observation before the current action chunk has returned — and the
 ``request_id`` tells the replies apart. Closing the socket aborts whatever is still in
 flight.
