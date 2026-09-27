@@ -71,7 +71,12 @@ def _pipe(dtype: torch.dtype):
             del _PIPES[other]
         torch.cuda.empty_cache()
         model = Cosmos3Model(model_path_hf=str(EDGE_DIR), compile_denoise=False, enable_reasoner=False)
-        _PIPES[dtype] = Cosmos3Pipeline.from_model(model, device="cuda", dtype=dtype)
+        pipe = Cosmos3Pipeline.from_model(model, device="cuda", dtype=dtype)
+        if dtype == torch.float32:
+            # the checkpoint loads in bf16; the parity loop runs the weights in fp32
+            pipe.transformer.float()
+            pipe.vae.float()
+        _PIPES[dtype] = pipe
     return _PIPES[dtype]
 
 
