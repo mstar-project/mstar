@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.windowing import WindowSchedule
 from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.config import Cosmos3Config
@@ -267,23 +268,13 @@ def test_windowed_kv_statics_absolute_positions() -> None:
     assert torch.equal(ch["vision_mrope_ids"], full["vision_mrope_ids"][:, : 4 * stride])
 
 
-class _FakeKV:
-    """The pool surface the windowed request touches: retention hand-off."""
-
-    def __init__(self):
-        self.policies = []
-
-    def set_retention(self, request_id, policy, label=None):
-        self.policies.append((request_id, label, policy.protected_prefix, policy.context_budget))
-
-
 def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
     """The commit iteration is prepared as a committing span of exactly the
     window's new units, declared as a paged, non-causal, committing step over
-    both guidance branches, hands the pool each branch's retention (prefix +
-    horizon) once, runs the transformer's commit pass with the window's
-    absolute positions, and stages the next window. Denoise iterations keep
-    the plain (non-committing) declaration."""
+    both guidance branches that carries each branch's retention (prefix +
+    horizon) for the pool, runs the transformer's commit pass with the
+    window's absolute positions, and stages the next window. Denoise
+    iterations keep the plain (non-committing) declaration."""
     sub = _dit()
     commits = []
     sub.transformer = SimpleNamespace(
@@ -294,7 +285,6 @@ def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
     )
     monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: "fresh")
     monkeypatch.setattr(sub, "get_device", lambda: torch.device("cpu"))  # no parameters to read it off
-    kv = _FakeKV()
 
     stride = 64  # tokens per latent frame (256p tier: pages hold 2 frames)
 
@@ -328,27 +318,32 @@ def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
     step = sub.declare_step(C.VIDEO_GEN_AR_WALK, ["r"], [ni])
     assert step.steps[KV_CACHE].commit
     assert step.steps[KV_CACHE].combined_labels == {(COND_LABEL, UNCOND_LABEL): CFG_BATCHED_LABEL}
+    # Each branch's retention rides on the commit step: the 6-unit horizon
+    # behind that branch's own text prefix.
+    assert step.steps[KV_CACHE].retention == {
+        ("r", COND_LABEL): RetentionPolicy(context_budget=6 * stride, protected_prefix=7),
+        ("r", UNCOND_LABEL): RetentionPolicy(context_budget=6 * stride, protected_prefix=9),
+    }
     assert ATTN in step.steps and not step.steps[ATTN].causal
     assert [(s.label, s.span) for s in step.segments] == [(COND_LABEL, 4 * stride), (UNCOND_LABEL, 4 * stride)]
 
-    # A denoise iteration declares the usual non-committing step, and the
-    # retention is not handed over twice.
+    # A denoise iteration declares the usual non-committing step, without a
+    # retention.
     ni2 = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x0], "time_index": [torch.tensor([2])]})
     assert ni2.input_seq_len == 4 * stride and not ni2.resource_step_info.commit
-    assert not sub.declare_step(C.VIDEO_GEN_AR_WALK, ["r"], [ni2]).steps[KV_CACHE].commit
+    step2 = sub.declare_step(C.VIDEO_GEN_AR_WALK, ["r"], [ni2]).steps[KV_CACHE]
+    assert not step2.commit and step2.retention == {}
     # Past the last iteration the loop's extra dispatch is vetoed.
     assert sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x0], "time_index": [torch.tensor([15])]}) is None
 
     # Window 0 commit forward, driven through forward() so the step's
-    # resources reach it: the retention is handed to the pool once (prefix +
-    # horizon per branch), the full window appended under the combined label
+    # resources reach it: the full window appended under the combined label
     # through the paged attention, next window staged with absolute positions
     # and a fresh scheduler.
     ei = SimpleNamespace(
-        request_ids=["r"], per_request_states=None, resources={KV_CACHE: kv, ATTN: "paged"}, step={ATTN: None},
+        request_ids=["r"], per_request_states=None, resources={ATTN: "paged"}, step={ATTN: None},
     )
     out = sub.forward(C.VIDEO_GEN_AR_WALK, ei, latents=x0, time_index=torch.tensor([4]))
-    assert kv.policies == [("r", COND_LABEL, 7, 6 * stride), ("r", UNCOND_LABEL, 9, 6 * stride)]
     assert torch.equal(out["window_latents"][0], x0)
     latents_c, positions_c, label, attn = commits[-1]
     assert label == CFG_BATCHED_LABEL and attn == "paged"
@@ -359,11 +354,10 @@ def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
     assert int(st["cond"]["vision_mrope_ids"][0, 0]) == 4 * stride
     assert out["latents"][0].shape == sub._window_latent_shape(64, 64, 4)
 
-    # Sequential guidance commits per label; the retention is not re-bound.
+    # Sequential guidance commits per label.
     sub.batched_cfg = False
     sub._commit_window("paged", st, x0, torch.tensor([9]), window_index=1)
     assert [c[2] for c in commits[-2:]] == [COND_LABEL, UNCOND_LABEL]
-    assert len(kv.policies) == 2
     # Final window: emit only.
     out = sub._commit_window("paged", st, x0, torch.tensor([14]), window_index=2)
     assert torch.equal(out["latents"][0], x0) and torch.equal(out["window_latents"][0], x0)
