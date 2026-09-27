@@ -22,9 +22,11 @@ from mstar.model.nemotron_duplex.config import (
     NemotronDuplexConfig,
 )
 from mstar.model.nemotron_duplex.submodules import (
+    NO_PROMPT,
     AudioCodecDecoderSubmodule,
     NemotronHLLMSubmodule,
 )
+from mstar.model.submodule_base import BatchedModelOutput
 
 H = 8
 
@@ -53,18 +55,40 @@ def _fuse(nano, walk, inputs):
     return inp, nano.preprocess(walk, _ENGINE, [inp])
 
 
-def test_nano_check_stop_ignores_eos():
+def test_nano_never_stops_on_a_token():
     """Text EOS is a normal per-frame token in duplex; the decode loop ends on
-    audio-frame stream exhaustion, NOT on EOS — so check_stop must not stop on it."""
+    audio-frame stream exhaustion or the Loop's own max_iters, NOT on a token
+    -- so the node offers check_stop nothing and stops on nothing."""
     nano = _make_nano()
     eos = {"new_token": [torch.tensor([nano.config.eos_token_id])]}
     assert nano.check_stop("r", _fwd_info(0, 2048), eos) == set()
+    assert nano.check_stop("r", _fwd_info(max_tokens=8, iters=7), eos) == set()
 
 
-def test_nano_check_stop_hits_max_tokens():
+def _decode_engine(rids):
+    sampler = SimpleNamespace(sample=lambda rids, logits: logits.argmax(dim=-1))
+    return SimpleNamespace(request_ids=rids, resources={NANO_SAMPLER: sampler}, per_request_states=None)
+
+
+def test_nano_forward_hands_over_row_outputs_and_nothing_for_the_stop_check():
+    """One batch tensor per output name, row i = request i (the engine clones
+    it once and hands out views), the consumed-prompt sentinel on every row,
+    and an empty stop-check set: no per-request device-to-host copy per step."""
     nano = _make_nano()
-    out = {"new_token": [torch.tensor([5])]}
-    assert nano.check_stop("r", _fwd_info(max_tokens=8, iters=7), out) == {"decode_loop"}
+    nano.language_model.forward = lambda x, label=None: x
+    torch.manual_seed(0)
+    x = torch.randn(3, H)
+    out = nano.forward_batched("decode", _decode_engine(["a", "b", "c"]), x, [1, 1, 1])
+    assert isinstance(out, BatchedModelOutput) and out.check_stop_buffers == {}
+    expect = nano.lm_head(x).argmax(dim=-1)
+    torch.testing.assert_close(out.row_outputs["new_token"], expect)
+    assert out.row_outputs["text_inputs"].tolist() == [NO_PROMPT] * 3
+    if nano.config.use_function_head:
+        torch.testing.assert_close(out.row_outputs["new_func"], nano.language_model.function_head(x).argmax(dim=-1))
+    # the eager single-request contract is row 0 of the same tensors
+    one = nano.forward("decode", _decode_engine(["a"]), x[:1], [1])
+    assert one["new_token"][0].shape == (1,) and int(one["new_token"][0]) == int(expect[0])
+    assert int(one["text_inputs"][0]) == NO_PROMPT
 
 
 def test_nano_prepare_inputs_is_host_only_and_fusion_runs_in_preprocess():
@@ -225,6 +249,19 @@ def _run_codec_batch(codec, rids, frames):
               for n, v in frames]
     pre = codec.preprocess("codec_chunk", eng, inputs)
     return codec.forward_batched("codec_chunk", eng, **pre)
+
+
+def test_codec_prepare_inputs_flattens_stacked_row_views():
+    """The talker emits one [1, num_q] row view per frame; the stream stacks a
+    chunk of them to (T, 1, num_q). A whole window arrives as (1, T, num_q)."""
+    codec = AudioCodecDecoderSubmodule(_FakeCodec(), NemotronDuplexConfig())
+    q = codec.config.eartts.num_quantizers
+    stacked = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [torch.arange(5 * q).view(5, 1, q)]})
+    whole = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [torch.arange(5 * q).view(1, 5, q)]})
+    single = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [torch.arange(q)]})
+    assert stacked.input_seq_len == whole.input_seq_len == 5 and single.input_seq_len == 1
+    torch.testing.assert_close(stacked.tensor_inputs["codes"], whole.tensor_inputs["codes"])
+    assert stacked.tensor_inputs["codes"].shape == (5, q) and single.tensor_inputs["codes"].shape == (1, q)
 
 
 def test_codec_batches_requests_with_equal_windows():
