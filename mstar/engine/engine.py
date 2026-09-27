@@ -707,6 +707,14 @@ class Engine:
                     batch.outputs = self._exec_single(batch)
             batch.outputs_ready.set()
             return batch.outputs
+        except Exception:
+            # A raise before the plan was promoted (declare, admit) would leave
+            # the stage for the next step's admit to find. Drop it here. The
+            # lease is released by _exec_single's own finally.
+            if batch.preplanned_rids is not None and self._runner.staged:
+                self._runner.clear_preplan()
+                batch.preplanned_rids = None
+            raise
         finally:
             batch.preplan_event = None
             batch.release_waiters()
