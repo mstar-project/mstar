@@ -55,7 +55,8 @@ from mstar.engine.cuda_graph_config import (
     PackedCudaGraphConfig,
 )
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.windowing import WindowedKVSession, WindowSchedule
+from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.windowing import WindowSchedule
 from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
@@ -188,6 +189,10 @@ class GenStepInfo:
     # branch and committed (paged, non-causal) instead of recomputed and
     # dropped — see ``Cosmos3DiTSubmodule._commit_step``.
     commit: bool = False
+    # ...and the retention each guidance branch (by label) declares for its
+    # stream at that commit: the schedule's context horizon behind the text
+    # prefix. The pool releases aged-out frame pages inside the commit.
+    retention: Mapping[str, RetentionPolicy] | None = None
 
 
 class Cosmos3DiTSubmodule(ARNodeSubmodule):
@@ -744,31 +749,26 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         commit = bool(st.get("ar_kv_mode")) and local == st["ar_steps"]
         return step_index // per, local, commit
 
-    def _bind_window_retention(self, st, kv) -> None:
-        """At the first kv-mode commit, before its pass runs: hand each
-        guidance branch's text prefix and the schedule's context horizon to
-        the pool as the stream's retention policy. The pool then releases
-        aged-out frame pages inside every commit (see ``KVManager.commit``) —
-        between steps as far as the planners are concerned, so nothing here
-        races the engine's pre-plan. Metadata only, so it is safe under this
-        step's own admission."""
-        if kv is None:
-            raise RuntimeError(
-                "Cosmos3 windowed kv mode needs the DiT node's KV resource"
-            )
+    def _window_retention(self, st) -> dict[str, RetentionPolicy]:
+        """Each guidance branch's retention for a kv-mode window commit: the
+        schedule's context horizon behind that branch's text prefix, declared
+        on the commit step (``GenStepInfo.retention``). The pool applies it
+        inside the commit (see ``KVManager.commit``), between steps as far as
+        the planners are concerned, so nothing here races the engine's
+        pre-plan. Empty when the schedule keeps every frame."""
+        cached = st.get("ar_retention")
+        if cached is not None:
+            return cached
+        policies: dict[str, RetentionPolicy] = {}
         branches = [(COND_LABEL, st["cond"])]
         if st["uncond"] is not None:
             branches.append((UNCOND_LABEL, st["uncond"]))
         for label, static in branches:
-            WindowedKVSession(
-                kv, st["ar_rid"], label, st["ar_schedule"],
-                tokens_per_unit=st["ar_tokens_per_unit"],
-            ).bind(static["und_len"])
-        st.add("ar_retention_bound", True)
-
-    def _kv_resource(self, engine_inputs: ModelInputsFromEngine):
-        resources = engine_inputs.resources or self.node_resources or {}
-        return resources.get(KV_CACHE)
+            policy = st["ar_schedule"].retention(st["ar_tokens_per_unit"], static["und_len"])
+            if policy is not None:
+                policies[label] = policy
+        st.add("ar_retention", policies)
+        return policies
 
     def _prepare_commit(self, st, window_index, latents, time_index) -> ARNodeInputs:
         """Inputs of a kv-mode commit iteration: the window's newly generated
@@ -782,11 +782,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             tensor_inputs={"latents": latents, "time_index": time_index},
             resource_step_info=GenStepInfo(
                 cfg=cfg, cfg_active=cfg, capture_key=None, commit=True,
+                retention=self._window_retention(st) or None,
             ),
         )
 
     def _commit_step(
         self, request_ids: list[str], spans: tuple[int, ...], cfg: bool,
+        retention: Mapping[str, RetentionPolicy] | None = None,
     ) -> SubmoduleStep:
         """A kv-mode window commit: the finished window's new span appended
         under every live guidance branch and committed — the frame-token
@@ -794,7 +796,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         later windows' steps read (the dense backend never writes them);
         non-causal like every generation plan. Both branches commit
         regardless of any guidance interval: each branch's future windows
-        read its own context."""
+        read its own context. ``retention`` (per label) rides on the step
+        for the pool to apply once the span is counted."""
         labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
         combined = cfg and self.batched_cfg
         return SubmoduleStep(
@@ -803,20 +806,24 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 KV_CACHE: KVStep(
                     commit=True,
                     combined_labels={labels: CFG_BATCHED_LABEL} if combined else {},
+                    retention={
+                        (rid, label): policy
+                        for rid in request_ids
+                        for label, policy in (retention or {}).items()
+                        if label in labels
+                    },
                 ),
                 ATTN: AttentionStep(causal=False),
             },
         )
 
-    def _commit_window(self, attn, st, latents, time_index, window_index, kv=None) -> dict:
+    def _commit_window(self, attn, st, latents, time_index, window_index) -> dict:
         """kv-mode commit iteration: run the generation tower over the
         window's finished clean latents (no timestep embedding — the clean-
         conditioning convention), appending their K/V to both guidance
         branches' cache streams, then stage the next window. The release of
         context past the horizon is the pool's, at this step's commit, under
-        the retention the first commit installs here."""
-        if not st.get("ar_retention_bound"):
-            self._bind_window_retention(st, kv)
+        the retention the step declared (``_prepare_commit``)."""
         plan = st["ar_schedule"].window(window_index)
         stride = st["ar_tokens_per_unit"]
         dtype = self.transformer.proj_in.weight.dtype
@@ -1268,7 +1275,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         if len(infos) == 1 and infos[0].commit:
             # A kv-mode windowed commit (never batched: see can_batch).
-            return self._commit_step(request_ids, spans, infos[0].cfg)
+            return self._commit_step(request_ids, spans, infos[0].cfg, infos[0].retention)
 
         # Mirrors cg_key_info: one capture bucket shared by every row. Under a
         # lease the padding rows carry the bucket's own key, which keeps `keys`
@@ -1489,9 +1496,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         states = self._states(engine_inputs)
         attn = self._gen_attn(engine_inputs)
         if graph_walk in GEN_WALKS:
-            return self._forward_image_gen(
-                attn, states[rid], kv=self._kv_resource(engine_inputs), **kwargs,
-            )
+            return self._forward_image_gen(attn, states[rid], **kwargs)
         if graph_walk in SOUND_WALKS:
             return self._forward_video_sound_gen(attn, states[rid], **kwargs)
         if graph_walk in ACTION_WALKS:
@@ -1547,7 +1552,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         t = float(sched.timesteps[step_index].item())
         return gi[0] <= t <= gi[1]
 
-    def _forward_image_gen(self, attn, st, latents, time_index, kv=None, **kwargs) -> dict:
+    def _forward_image_gen(self, attn, st, latents, time_index, **kwargs) -> dict:
         scheduler = st["scheduler"]
         step_index = int(time_index.reshape(-1)[0].item())
         windowed = "ar_schedule" in st
@@ -1559,7 +1564,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 return {"latents": [latents], "time_index": [time_index]}
             window_index, local, commit = self._window_step(st, step_index)
             if commit:
-                return self._commit_window(attn, st, latents, time_index, window_index, kv=kv)
+                return self._commit_window(attn, st, latents, time_index, window_index)
             step_index = local
         elif step_index >= len(scheduler.timesteps):
             # The loop may dispatch one step past this request's own count
