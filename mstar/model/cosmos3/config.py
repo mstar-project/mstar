@@ -340,8 +340,14 @@ class Cosmos3Config:
     # Sessions (``session_id`` on a windowed request): the DiT node keeps the
     # last window's clean latents and the streaming decoder its decode
     # context per session, so a later request with ``resume_session`` picks
-    # the rollout up where the previous one ended. Most-recent sessions kept.
+    # the rollout up where the previous one ended. This many idle sessions
+    # are kept (most recent first); a session with a request in flight is
+    # never evicted, and a second request on it is refused.
     session_store_size: int = 8
+    # Idle sessions expire after this many seconds unless the request set
+    # ``session_timeout_s`` (capped at the max); ``end_session`` drops one early.
+    session_timeout_s: float = 600.0
+    session_timeout_max_s: float = 3600.0
     video_temporal_causal: bool = False
     freeze_und: bool = False
 
