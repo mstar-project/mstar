@@ -266,12 +266,23 @@ own ``window_decoder`` partition; a request opts in per call:
    * - ``session_id``
      - —
      - Names a world-state session: the DiT node keeps the rollout's last window
-       and the decoder its context (the most recent ``session_store_size`` sessions).
+       and the decoder its context. The most recent ``session_store_size`` idle
+       sessions are kept; a session with a request in flight is never evicted, and
+       a second request on it is refused until the first finishes.
    * - ``resume_session``
      - ``false``
      - Continue the named session: window 0 is conditioned on the stored last
        frames (pinned clean, like a chained overlap) and only the ``num_frames``
        new frames are delivered — a new prompt steers the same world.
+   * - ``session_timeout_s``
+     - 600
+     - Seconds an idle session is kept after its request finishes, capped at the
+       deployment's ``session_timeout_max_s`` (3600). An expired session resumes
+       like an unknown one: the request is rejected.
+   * - ``end_session``
+     - ``false``
+     - Drop the named session once this request is done (with or without
+       ``resume_session``) instead of keeping its state.
 
 .. code-block:: bash
 
