@@ -19,3 +19,9 @@ def rid(prefix: str) -> str:
 
 def sse(obj: dict) -> str:
     return f"data: {json.dumps(obj)}\n\n"
+
+
+def error_type(status: int) -> str:
+    """The OpenAI error ``type`` for an HTTP status: a 4xx is the client's
+    (``invalid_request_error``), anything else is ours (``server_error``)."""
+    return "invalid_request_error" if 400 <= status < 500 else "server_error"
