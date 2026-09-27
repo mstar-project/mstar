@@ -1379,6 +1379,11 @@ class Cosmos3Model(Model):
                 "cross-window conditioning comes from the committed context."
             )
         overlap_units = min(max(round(overlap_frames / tf), 0), window_units - 1)
+        if overlap_frames > 0 and overlap_units == 0:
+            logger.warning(
+                "Cosmos3 overlap_frames=%d rounds to no latent frames (temporal scale %d); "
+                "windows will not overlap.", overlap_frames, tf,
+            )
         if overlap_units:
             # Two clean latent frames are the conditioning floor (the V2V
             # recipe's pin count); a single frame visibly degrades the next
@@ -1405,8 +1410,11 @@ class Cosmos3Model(Model):
         # ``num_frames`` stays the count of new frames the client receives.
         session_id = mk.get("session_id")
         resume = bool(mk.get("resume_session"))
+        end_session = bool(mk.get("end_session"))
         if resume and not session_id:
             raise ValueError("Cosmos3 resume_session requires a session_id.")
+        if end_session and not session_id:
+            raise ValueError("Cosmos3 end_session requires a session_id.")
         if resume and params.get("has_image_condition"):
             raise ValueError(
                 "Cosmos3 resume_session conditions on the session's last frames; "
@@ -1414,6 +1422,14 @@ class Cosmos3Model(Model):
             )
         if session_id is not None:
             params["session_id"] = str(session_id)
+            # Drop the session once this request is done instead of keeping it.
+            params["end_session"] = end_session
+            timeout = mk.get("session_timeout_s")
+            if timeout is not None:
+                timeout = float(timeout)
+                if not timeout > 0:
+                    raise ValueError("Cosmos3 session_timeout_s must be > 0.")
+                params["session_timeout_s"] = min(timeout, float(self.config.session_timeout_max_s))
         resume_units = max(overlap_units, 2) if resume else 0
         if resume_units and resume_units >= window_units:
             raise ValueError(
