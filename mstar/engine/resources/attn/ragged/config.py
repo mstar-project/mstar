@@ -44,9 +44,9 @@ class RaggedAttentionConfig:
     flashinfer_backend: str = "auto"
 
     # Activation dtype of the q / k / v the node hands the kernel (and of its
-    # output). A cacheless attention has no KV cache to inherit a dtype from,
-    # so a node with no KV-backed attention (a DiT, say) declares it here; when
-    # None, the engine's KV dtype is used, as before.
+    # output). A cacheless attention doesn't need to adhere to the dtype of its
+    # KV cache, so it is free to declare a separate dtype here; when None, the
+    # engine's KV dtype (which is actually a misnamed autocast dtype) is used.
     dtype: torch.dtype | None = None
 
     def __post_init__(self):
