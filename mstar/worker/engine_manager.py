@@ -103,7 +103,7 @@ class EngineManager:
     @classmethod
     def build(
         cls,
-        node_names: list[str],
+        node_names: set[str],
         device: torch.device,
         model_config: dict,
         parallel_groups: WorkerParallelGroups,
