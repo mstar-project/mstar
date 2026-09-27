@@ -44,13 +44,14 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
 
 async def _stream_wav(api, request_id, sample_rate):
     yield media_io.wav_stream_header(sample_rate)
+    error = None
     async for c in api.iter_result_chunks(request_id):
         if c.modality == "audio" and c.data:
             yield c.data
         elif c.modality == "error":
-            # the status went out with the header, so breaking the transfer
-            # is what tells the client this audio is cut short
-            raise RuntimeError(
-                f"speech stream {request_id} failed: "
-                f"{c.data.decode('utf-8', 'replace')}"
-            )
+            error = c.data.decode("utf-8", "replace")
+    if error is not None:
+        # the status went out with the header, so breaking the transfer is what
+        # tells the client this audio is cut short. after the loop, not in it:
+        # leaving the iterator early aborts a request that has already ended
+        raise RuntimeError(f"speech stream {request_id} failed: {error}")
