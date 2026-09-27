@@ -44,6 +44,9 @@ class _StubAPI:
         self._chunks: dict = {}
         self.next_chunks: list = []
         self.last_raw_request = None
+        # raised out of the stream after its chunks, like the delivery timeout
+        self.raise_after: Exception | None = None
+        self.aborted: list = []
 
     def submit_request(self, **kw):
         self.last_submit = kw
@@ -55,8 +58,18 @@ class _StubAPI:
         return self._chunks.get(request_id, [])
 
     async def iter_result_chunks(self, request_id):
-        for c in self._chunks.get(request_id, []):
-            yield c
+        # Same contract as the real one: a consumer that stops early, or an
+        # exception, aborts the request; a fully drained stream does not.
+        finished = False
+        try:
+            for c in self._chunks.get(request_id, []):
+                yield c
+            if self.raise_after is not None:
+                raise self.raise_after
+            finished = True
+        finally:
+            if not finished:
+                self.aborted.append(request_id)
 
 
 @pytest.fixture
@@ -280,6 +293,49 @@ def test_chat_stream_reports_a_failed_request_in_band(client_and_stub):
     }
     assert not any(e.get("choices", [{}])[0].get("finish_reason") for e in events)
     assert text.rstrip().endswith("data: [DONE]")
+    # The request is already gone by the time its error chunk arrives; the
+    # stream must not abort it on the way out.
+    assert stub.aborted == []
+
+
+def _stream_events(client, model="bagel"):
+    text = client.post(
+        "/v1/chat/completions",
+        json={"model": model, "messages": [{"role": "user", "content": "go"}], "stream": True},
+    ).text
+    events = [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: ") and "[DONE]" not in l]
+    return text, events
+
+
+def test_chat_stream_error_type_follows_the_status(client_and_stub):
+    """A 4xx from the data worker (a ValueError or TypeError in preprocess)
+    is the client's error, not a server_error."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("error", b"ValueError: unknown domain 'x'", {"status": 400})]
+    _, events = _stream_events(client)
+    assert events[-1]["error"] == {
+        "message": "ValueError: unknown domain 'x'", "type": "invalid_request_error", "code": 400,
+    }
+    assert stub.aborted == []
+
+
+def test_chat_stream_reports_a_timeout_in_band(client_and_stub):
+    """The delivery timeout raises an HTTPException out of the chunk iterator
+    mid-stream; the client gets an error event and [DONE], not a cut
+    connection, and the iterator's own abort still runs."""
+    from fastapi import HTTPException
+
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("text", b"Par")]
+    stub.raise_after = HTTPException(status_code=500, detail="Request timed out")
+    text, events = _stream_events(client)
+    assert events[1]["choices"][0]["delta"]["content"] == "Par"
+    assert events[-1]["error"] == {"message": "Request timed out", "type": "server_error", "code": 500}
+    assert not any(e.get("choices", [{}])[0].get("finish_reason") for e in events)
+    assert text.rstrip().endswith("data: [DONE]")
+    assert stub.aborted == [stub.last_submit["request_id"]]
 
 
 def test_unsupported_model_404(client_and_stub):
