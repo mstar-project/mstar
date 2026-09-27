@@ -238,6 +238,11 @@ class OmniVoiceModel(Model):
         self._duration_estimator = RuleDurationEstimator()
         self._refresh_from_checkpoint_config()
 
+    def warmup_preprocess(self) -> None:
+        """Load the tokenizer and duration estimator in the preprocess worker at
+        start-up, so the first request does not pay for them."""
+        self._ensure_data_worker_assets()
+
     def _refresh_from_checkpoint_config(self) -> None:
         """Pull the checkpoint's config without loading any weights."""
         from transformers import AutoConfig
