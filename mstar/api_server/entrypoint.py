@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from mstar.api_server import media_io
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
@@ -812,30 +813,70 @@ def _decode_ws_files(
     """Persist a websocket message's media (``{"name", "data"}`` entries;
     ``data`` raw bytes in a msgpack frame, base64 text in a JSON frame) under
     the upload dir, grouped by the modality of each file name, the way the
-    multipart ``/generate`` route does."""
+    multipart ``/generate`` route does. A message rejected halfway leaves no
+    files behind."""
+    if files is not None and not isinstance(files, list):
+        raise ValueError("files must be a list of {name, data} objects")
     file_paths: dict[str, list[str]] = {}
     parts: list[PromptPart] = []
-    for entry in files or []:
-        name = str(entry.get("name") or "")
-        modality = _detect_modality(name)
-        if modality == "unknown":
-            raise ValueError(f"Cannot determine modality for file: {name}")
-        data = entry.get("data")
-        if isinstance(data, str):
-            data = base64.b64decode(data)
-        if not isinstance(data, (bytes, bytearray)):
-            raise ValueError(f"file {name!r} carries no data")
-        base = os.path.basename(name) or "upload"
-        save_path = upload_dir / f"{uuid.uuid4()}_{base}"
-        save_path.write_bytes(bytes(data))
-        paths = file_paths.setdefault(modality, [])
-        parts.append(PromptPart(modality=modality, index=len(paths)))
-        paths.append(str(save_path))
+    saved: list[Path] = []
+    try:
+        for entry in files or []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                raise ValueError("each file needs a string name")
+            name = entry["name"]
+            modality = _detect_modality(name)
+            if modality == "unknown":
+                raise ValueError(f"Cannot determine modality for file: {name}")
+            data = entry.get("data")
+            if isinstance(data, str):
+                # the decoder the data-URL paths use: unpadded or wrapped
+                # base64 is fine, a bad alphabet is the client's error
+                data = media_io._decode_base64_payload(data)
+            if not isinstance(data, (bytes, bytearray)):
+                raise ValueError(f"file {name!r} carries no data")
+            base = os.path.basename(name) or "upload"
+            save_path = upload_dir / f"{uuid.uuid4()}_{base}"
+            save_path.write_bytes(bytes(data))
+            saved.append(save_path)
+            paths = file_paths.setdefault(modality, [])
+            parts.append(PromptPart(modality=modality, index=len(paths)))
+            paths.append(str(save_path))
+    except Exception:
+        for path in saved:
+            path.unlink(missing_ok=True)
+        raise
     return file_paths, parts
 
 
+def _ws_modalities(value, key: str) -> list[str] | None:
+    """A modality list as a message may spell it: a comma-separated string or
+    a list of strings. Anything else is rejected by name."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [m.strip() for m in value.split(",") if m.strip()]
+    if isinstance(value, list) and all(isinstance(m, str) for m in value):
+        return list(value)
+    raise ValueError(f"{key} must be a comma-separated string or a list of strings")
+
+
+def _schedule_upload_cleanup(file_paths: dict[str, list[str]], delay_s: float = 60.0) -> None:
+    """Delete a request's uploaded files once the preprocess worker has had
+    time to read them. Shared by the HTTP and WebSocket routes."""
+    def _cleanup(paths: dict[str, list[str]]) -> None:
+        time.sleep(delay_s)
+        for ps in paths.values():
+            for p in ps:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except OSError:
+                    pass
+    threading.Thread(target=_cleanup, args=(file_paths,), daemon=True).start()
+
+
 def _ws_input_layout(
-    text: str | None, input_modalities, parts: list[PromptPart],
+    text: str | None, input_modalities: list[str] | None, parts: list[PromptPart],
 ) -> tuple[list[str], list[PromptPart]]:
     """Resolve a websocket message's input layout the way ``/generate`` does:
     an explicit list is the layout (a text prompt keeps its slot), else the
@@ -843,10 +884,7 @@ def _ws_input_layout(
     if text:
         parts = [*parts, PromptPart(modality="text", text=text)]
     if input_modalities is not None:
-        if isinstance(input_modalities, str):
-            in_mods = [m.strip() for m in input_modalities.split(",") if m.strip()]
-        else:
-            in_mods = [str(m) for m in input_modalities]
+        in_mods = list(input_modalities)
         if text and "text" not in in_mods:
             in_mods.append("text")
         if not text:
@@ -865,8 +903,10 @@ async def generate_ws(websocket: WebSocket):
     text frame (``data`` base64) or a msgpack binary frame (``data`` raw
     bytes). Every result chunk comes back as a frame of the same encoding,
     ``{"request_id", "modality", "data", "metadata"}``, followed by
-    ``{"request_id", "finish": true}``; a rejected message answers
-    ``{"request_id", "error": ...}``. Messages may be pipelined: a client can
+    ``{"request_id", "finish": true}``. A rejected message answers
+    ``{"request_id", "error": ...}``, and so does a request that fails after
+    it was accepted (with the HTTP ``status`` it would have had); no finish
+    follows an error. Messages may be pipelined: a client can
     send the next observation before the previous action chunk has returned,
     and the ``request_id`` tells the replies apart. Closing the socket aborts
     whatever is still in flight.
@@ -890,17 +930,22 @@ async def generate_ws(websocket: WebSocket):
 
     async def serve_one(message: dict, binary: bool) -> None:
         request_id = message.get("request_id")
+        file_paths: dict[str, list[str]] | None = None
         try:
-            out_mods = message.get("output_modalities", "text")
-            if isinstance(out_mods, str):
-                out_mods = [m.strip() for m in out_mods.split(",") if m.strip()]
+            if request_id is not None and not isinstance(request_id, str):
+                raise ValueError("request_id must be a string")
+            out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or ["text"]
             text = message.get("text")
+            if text is not None and not isinstance(text, str):
+                raise ValueError("text must be a string")
             if not text and not message.get("files"):
                 raise ValueError("message carries neither text nor files")
             file_paths, parts = await run_in_threadpool(
                 _decode_ws_files, message.get("files"), api_server.upload_dir,
             )
-            in_mods, parts = _ws_input_layout(text, message.get("input_modalities"), parts)
+            in_mods, parts = _ws_input_layout(
+                text, _ws_modalities(message.get("input_modalities"), "input_modalities"), parts,
+            )
             model_kwargs = message.get("model_kwargs")
             if isinstance(model_kwargs, str):
                 model_kwargs = json.loads(model_kwargs)
@@ -918,12 +963,25 @@ async def generate_ws(websocket: WebSocket):
             )
             # Cancelling this task (socket closed mid-stream) tears the
             # iterator down, and its ``finally`` aborts the engine request.
+            failed = False
             async for chunk in api_server.iter_result_chunks(request_id):
+                if chunk.modality == "error":
+                    # The request failed after it was accepted. This is the
+                    # iterator's last chunk, so the loop ends here; the error
+                    # is the reply and no finish follows.
+                    failed = True
+                    await send({
+                        "request_id": request_id,
+                        "error": bytes(chunk.data).decode("utf-8", "replace"),
+                        "status": chunk.metadata.get("status", 500),
+                    }, binary)
+                    continue
                 await send({
                     "request_id": request_id, "modality": chunk.modality,
                     "data": bytes(chunk.data), "metadata": chunk.metadata,
                 }, binary)
-            await send({"request_id": request_id, "finish": True}, binary)
+            if not failed:
+                await send({"request_id": request_id, "finish": True}, binary)
         except (WebSocketDisconnect, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
@@ -932,6 +990,9 @@ async def generate_ws(websocket: WebSocket):
                 await send({"request_id": request_id, "error": str(exc)}, binary)
             except Exception:  # noqa: BLE001
                 pass
+        finally:
+            if file_paths:
+                _schedule_upload_cleanup(file_paths)
 
     try:
         while True:
@@ -1087,17 +1148,7 @@ async def generate(
     finally:
         # Deferred cleanup of uploaded files
         if file_paths:
-            def _cleanup(paths: dict[str, list[str]]) -> None:
-                time.sleep(60)
-                for ps in paths.values():
-                    for p in ps:
-                        try:
-                            Path(p).unlink(missing_ok=True)
-                        except OSError:
-                            pass
-            threading.Thread(
-                target=_cleanup, args=(file_paths,), daemon=True
-            ).start()
+            _schedule_upload_cleanup(file_paths)
 
 
 @app.get("/health")
