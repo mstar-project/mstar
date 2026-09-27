@@ -14,6 +14,7 @@ cost.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import re
 from dataclasses import dataclass
@@ -160,6 +161,11 @@ def chunk_phoneme_strings(
     return chunks
 
 
+def install_hint(lang: str) -> str:
+    extra = {"j": "misaki[ja]", "z": "misaki[zh]"}.get(lang, "misaki[en]")
+    return f"pip install '{extra}'"
+
+
 class G2PFrontend:
     """Lazily constructed per-language phonemizers plus chunking."""
 
@@ -171,6 +177,34 @@ class G2PFrontend:
         self.max_phonemes = max_phonemes
         self.espeak_fallback = espeak_fallback
         self._backends: dict[str, object] = {}
+        # languages whose optional backend failed to import, with the reason:
+        # a stream of requests for one of them must not retry the import each time
+        self._unavailable: dict[str, str] = {}
+
+    def available(self, lang: str) -> bool:
+        """Whether this process can phonemize ``lang``.
+
+        English is judged by the presence of ``misaki.en`` (its backend loads
+        spaCy, which the process answering ``/v1/audio/voices`` never needs);
+        the other languages by constructing their backend, which is cheap.
+        """
+        if lang in self._backends:
+            return True
+        if lang in self._unavailable:
+            return False
+        if lang in ("a", "b"):
+            try:
+                present = importlib.util.find_spec("misaki.en") is not None
+            except ImportError:
+                present = False
+            if not present:
+                self._unavailable[lang] = f"Kokoro G2P for language {lang!r} needs `{install_hint(lang)}`"
+            return present
+        try:
+            self.backend(lang)
+        except ImportError:
+            return False
+        return True
 
     def _english_fallback(self, british: bool):
         if not self.espeak_fallback:
@@ -187,6 +221,8 @@ class G2PFrontend:
         backend = self._backends.get(lang)
         if backend is not None:
             return backend
+        if lang in self._unavailable:
+            raise ImportError(self._unavailable[lang])
         try:
             if lang in ("a", "b"):
                 from misaki import en
@@ -206,8 +242,8 @@ class G2PFrontend:
 
                 backend = espeak.EspeakG2P(language=LANG_NAMES[lang])
         except ImportError as exc:
-            extra = {"j": "misaki[ja]", "z": "misaki[zh]"}.get(lang, "misaki[en]")
-            raise ImportError(f"Kokoro G2P for language {lang!r} needs `pip install '{extra}'`: {exc}") from exc
+            self._unavailable[lang] = f"Kokoro G2P for language {lang!r} needs `{install_hint(lang)}`: {exc}"
+            raise ImportError(self._unavailable[lang]) from exc
         except OSError as exc:
             # spaCy raises OSError when its tagger model is not installed; misaki
             # only downloads it when it has network access.
