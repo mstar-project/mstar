@@ -29,3 +29,15 @@ def test_warm_up_model_calls_and_survives_failures(caplog):
     with caplog.at_level(logging.ERROR):
         warm_up_model(Broken())
     assert "warmup_preprocess failed" in caplog.text
+
+
+def test_omnivoice_warms_its_data_worker_assets():
+    """OmniVoice loads its tokenizer and duration estimator on first use; the
+    preprocess warm-up pulls that forward to start-up."""
+    from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel
+
+    model = OmniVoiceModel.__new__(OmniVoiceModel)
+    calls = []
+    model._ensure_data_worker_assets = lambda: calls.append("loaded")
+    model.warmup_preprocess()
+    assert calls == ["loaded"]
