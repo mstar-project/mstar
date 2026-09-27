@@ -9,7 +9,7 @@ from typing import NamedTuple
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AdmitRuntimeError
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime
-from mstar.utils.ipc_format import ScheduleTPNode
+from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.node_manager_utils import RequestStateManager
 
@@ -199,6 +199,10 @@ class MicroScheduler:
         # exactly the one the drain must wait for. Purged by ``clear_wire_rid``.
         self.pending_tp_follow_count: dict[str, int] = defaultdict(int)
 
+        # pending resident deltas for TP follow nodes
+        self._pending_resident_deltas: dict[str, OffloadDelta] = {}
+        self._last_resident_delta: int = -1
+
     def _select_node_rr(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
     ):
@@ -249,11 +253,31 @@ class MicroScheduler:
             return None
         return self.tp_batches_pending_schedule[0]
 
+    def _apply_resident_delta(self, node_name: str, new_delta: OffloadDelta | None=None) -> bool:
+        if node_name not in self._pending_resident_deltas:
+            self._pending_resident_deltas[node_name] = OffloadDelta.new()
+        delta = self._pending_resident_deltas[node_name]
+        if new_delta is not None:
+            delta.extend(new_delta)
+
+        if not len(delta):
+            return True
+
+        engine = self.engine_manager.get_engine(node_name)
+        return engine.apply_resident_delta(node_name, delta)
+
+    def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
+        if self._last_resident_delta < message.spec_seq:
+            self._last_resident_delta = message.spec_seq
+            return self._apply_resident_delta(message.node_name, message.resident_delta)
+        return self._apply_resident_delta(message.node_name)
+
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
         # and the async follower's build / drop / void paths) pops here, so the
         # drain refcount is discharged in one place.
         message = self.tp_batches_pending_schedule.popleft()
+        self._apply_delta_from_message(message)
         for rid in message.request_ids:
             if rid not in self.pending_tp_follow_count:
                 continue
@@ -296,7 +320,7 @@ class MicroScheduler:
                     )
                 return None
             fwd_info = request_state.get_fwd_info(rid, node_partition)
-            if not self._check_ready(node_name, rid, fwd_info):
+            if not self._check_ready(node_name, rid, fwd_info,  allow_reload=False):
                 return None
 
         popped = self.runtime.pop_rids(
@@ -332,6 +356,8 @@ class MicroScheduler:
             return
         # Check readiness for every rid to pop all-or-none. Use the
         # leader's graph walk.
+        if not self._apply_delta_from_message(first_tp_node):
+            return # must apply all pending deltas first
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name,
             first_tp_node.graph_walk, self.tp_rids(first_tp_node),
@@ -733,13 +759,14 @@ class MicroScheduler:
 
     def _check_ready(
         self, node_name: str, rid: int, fwd_info: CurrentForwardPassInfo,
+        allow_reload: bool=True
     ) -> bool:
         """Engine-level readiness, with a terminal failure taken out of the
         scan. Retryable not-ready (an in-flight KV read, a reload that doesn't
         fit) just comes back False; an ``AdmitRuntimeError`` never will, so the
         rid is parked for the worker to fail instead of rescanned forever."""
         engine = self.engine_manager.get_engine(node_name)
-        outcome = engine.check_ready(node_name, rid, fwd_info)
+        outcome = engine.check_ready(node_name, rid, fwd_info, allow_reload=allow_reload)
         if isinstance(outcome.reason, AdmitRuntimeError):
             logger.error(
                 "Request %s cannot be served on node %s by resource %s: %s",

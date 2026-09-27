@@ -292,21 +292,6 @@ class Worker:
         for wg in my_worker_graphs:
             node_names.update(wg.section.get_nodes())
 
-        self.engine_manager = EngineManager.build(
-            node_names,
-            device=device,
-            model_config=model_config,
-            parallel_groups=self.parallel_groups,
-            transfer_engine_info=TransferEngineInfo(
-                my_entity_id=worker_id,
-                my_session_id=self.tensor_manager.my_session_id,
-                transfer_engine=self.tensor_manager.transfer_engine
-            ),
-            model=model,
-            enable_nvtx=self.enable_nvtx,
-            enable_prof=self.enable_prof
-        )
-
         # The graph runtime owns the per-request queues and the graph state.
         self._graph_runtime = _make_graph_runtime(
             my_worker_id=self.worker_id,
@@ -318,6 +303,22 @@ class Worker:
             sharding_config=sharding_config,
             tensor_manager=self.tensor_manager,
             communicator=self.communicator,
+        )
+
+        self.engine_manager = EngineManager.build(
+            node_names,
+            device=device,
+            model_config=model_config,
+            graph_runtime=self._graph_runtime,
+            parallel_groups=self.parallel_groups,
+            transfer_engine_info=TransferEngineInfo(
+                my_entity_id=worker_id,
+                my_session_id=self.tensor_manager.my_session_id,
+                transfer_engine=self.tensor_manager.transfer_engine
+            ),
+            model=model,
+            enable_nvtx=self.enable_nvtx,
+            enable_prof=self.enable_prof
         )
 
         self.request_state = RequestStateManager(

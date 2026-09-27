@@ -1,5 +1,7 @@
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
+from typing import NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import PublishedInfo
@@ -101,6 +103,64 @@ class StopLoops(MessageBody):
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
 
+class OffloadDelta(NamedTuple):
+    """A rank's offloads and reloads, in the order it made them.
+
+    Ordered, and that is the whole point: a set of offloads plus a set of
+    reloads cannot say whether a request ended up resident. Offload A, reload A,
+    offload A replays from sets as "resident", when the rank that recorded it has
+    A on the host. Replaying the sequence cannot get that wrong.
+
+    ``__len__`` is the queue depth, not the tuple's two fields — so an empty
+    delta is falsy, which several callers lean on.
+    """
+
+    # parallel queues: rids[i] was offloaded if is_offload[i], else reloaded
+    rids: deque[str]
+    is_offload: deque[bool]
+
+    @classmethod
+    def new(cls):
+        return cls(deque(), deque())
+
+    def add_offloaded(self, rid: str):
+        self.rids.append(rid)
+        self.is_offload.append(True)
+
+    def add_reloaded(self, rid: str):
+        self.rids.append(rid)
+        self.is_offload.append(False)
+
+    def __len__(self):
+        return len(self.rids)
+
+    def peek_left(self) -> tuple[str, bool] | None:
+        if not len(self):
+            return
+        return (self.rids[0], self.is_offload[0])
+
+    def pop_left(self) -> tuple[str, bool] | None:
+        if not len(self):
+            return None
+        return (self.rids.popleft(), self.is_offload.popleft())
+
+    def take(self) -> "OffloadDelta":
+        """Hand the queue over and leave this one empty.
+
+        Copies and clears rather than rebinding: the fields are a NamedTuple's,
+        so they cannot be reassigned — only the deques behind them can be
+        mutated.
+        """
+        taken = OffloadDelta(deque(self.rids), deque(self.is_offload))
+        self.rids.clear()
+        self.is_offload.clear()
+        return taken
+
+    def extend(self, other: "OffloadDelta") -> None:
+        self.rids.extend(other.rids)
+        self.is_offload.extend(other.is_offload)
+
+
 @dataclass
 class ScheduleTPNode(MessageBody):
     node_name: str
@@ -109,6 +169,7 @@ class ScheduleTPNode(MessageBody):
     speculative: bool = False
     spec_seq: int = -1
     spec_from_seq: int = -1
+    resident_delta: OffloadDelta = field(default_factory=OffloadDelta.new)
 
 
 @dataclass
