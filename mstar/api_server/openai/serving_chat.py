@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import base64
 
+from fastapi import HTTPException
+
 from mstar.api_server import media_io
-from mstar.api_server.openai._util import SSE_DONE, now, rid, sse
+from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
 
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
@@ -89,27 +91,36 @@ async def _stream(api, model_name, request_id, sample_rate):
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
         })
 
+    def error(message: str, status: int) -> str:
+        return sse({"error": {"message": message, "type": error_type(status), "code": status}})
+
     yield chunk({"role": "assistant"})
-    async for c in api.iter_result_chunks(request_id):
-        if c.modality == "text":
-            yield chunk({"content": c.data.decode("utf-8", "replace")})
-        elif c.modality == "audio":
-            # Streaming audio deltas are base64 16-bit PCM at the model rate.
-            yield chunk({"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}})
-        elif c.modality == "image":
-            yield chunk({"content": media_io.png_to_data_url(c.data)})
-        elif c.modality == "error":
-            # The request failed after the stream opened (an engine error mid
-            # generation, a delivery timeout); the HTTP status is committed, so
-            # the failure travels in-band the way the non-streaming path's
-            # error body does — not as a normal ``stop``, which a client would
-            # take for a complete answer.
-            yield sse({"error": {
-                "message": c.data.decode("utf-8", "replace"),
-                "type": "server_error",
-                "code": c.metadata.get("status", 500),
-            }})
-            yield SSE_DONE
-            return
-    yield chunk({}, finish="stop")
+    failed = False
+    try:
+        async for c in api.iter_result_chunks(request_id):
+            if c.modality == "text":
+                yield chunk({"content": c.data.decode("utf-8", "replace")})
+            elif c.modality == "audio":
+                # Streaming audio deltas are base64 16-bit PCM at the model rate.
+                yield chunk({"audio": {"id": rid("audio"), "data": base64.b64encode(c.data).decode("ascii")}})
+            elif c.modality == "image":
+                yield chunk({"content": media_io.png_to_data_url(c.data)})
+            elif c.modality == "error":
+                # The request failed after the stream opened (an engine error
+                # mid generation, a preprocess error); the HTTP status is
+                # committed, so the failure travels in-band the way the
+                # non-streaming path's error body does, not as a normal
+                # ``stop`` a client would take for a complete answer. The error
+                # is the iterator's last chunk, so the loop ends on its own;
+                # returning here instead would trip the iterator's abort on a
+                # request that is already gone.
+                failed = True
+                yield error(c.data.decode("utf-8", "replace"), int(c.metadata.get("status", 500)))
+    except HTTPException as exc:
+        # The delivery timeout raises out of the iterator (which aborts the
+        # request on its way out); report it the same way.
+        failed = True
+        yield error(str(exc.detail), exc.status_code)
+    if not failed:
+        yield chunk({}, finish="stop")
     yield SSE_DONE
