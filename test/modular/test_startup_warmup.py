@@ -60,3 +60,28 @@ def test_a_failing_warmup_is_logged_and_skipped(caplog) -> None:
     # not a list at all: nothing runs, one warning
     entrypoint._run_warmup_requests(fake, {"text": "x"})
     assert fake.collected == ["warmup-0", "warmup-2"]
+
+
+def test_hf_image_references_resolve_from_the_cache(monkeypatch) -> None:
+    calls = []
+
+    def fake_download(repo_id, filename):
+        calls.append((repo_id, filename))
+        return f"/cache/{repo_id}/{filename}"
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    assert entrypoint._resolve_warmup_image("/tmp/obs.jpg") == "/tmp/obs.jpg"
+    assert (
+        entrypoint._resolve_warmup_image("hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg")
+        == "/cache/nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg"
+    )
+    assert calls == [("nvidia/Cosmos3-Edge", "assets/example_i2v_input.jpg")]
+    fake = _FakeServer()
+    spec = {"image": "hf://nvidia/Cosmos3-Edge/assets/x.jpg", "output_modalities": ["video"]}
+    entrypoint._run_warmup_requests(fake, [spec])
+    assert fake.submitted[0]["file_paths"] == {"image": ["/cache/nvidia/Cosmos3-Edge/assets/x.jpg"]}
+    # a malformed reference is a failed warmup, not a crash
+    entrypoint._run_warmup_requests(fake, [{"image": "hf://nvidia", "output_modalities": ["video"]}])
+    assert len(fake.submitted) == 1
