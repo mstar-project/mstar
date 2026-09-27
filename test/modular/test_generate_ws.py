@@ -27,6 +27,8 @@ class _FakeServer:
         self.submitted = []
         self.chunks_per_request = chunks_per_request
         self.fail_for = set()
+        # request_id -> (message, status): fails in-band after one chunk
+        self.error_for: dict = {}
 
     def submit_request(self, **kwargs):
         rid = kwargs.get("request_id") or f"req-{len(self.submitted)}"
@@ -42,6 +44,13 @@ class _FakeServer:
                 request_id=request_id, modality="action",
                 data=bytes([i]) * 4, metadata={"index": i},
             )
+            if request_id in self.error_for:
+                message, status = self.error_for[request_id]
+                yield ResultChunk(
+                    request_id=request_id, modality="error",
+                    data=message.encode(), metadata={"status": status},
+                )
+                return
 
 
 def _recv_until_finish(ws, binary):
@@ -160,3 +169,77 @@ def test_disconnect_mid_stream_cancels(monkeypatch, tmp_path):
     # Leaving the block closes the socket; the pending task is cancelled and
     # the chunk iterator's cleanup (the engine abort, in production) runs.
     assert aborted == ["slow"]
+
+
+def test_unpadded_base64_is_accepted(monkeypatch, tmp_path):
+    fake = _FakeServer(tmp_path, chunks_per_request=1)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({
+            "files": [{"name": "obs.png", "data": base64.b64encode(b"PN").decode().rstrip("=")}],
+            "output_modalities": "action", "request_id": "r1",
+        }))
+        msgs = _recv_until_finish(ws, binary=False)
+    assert msgs[-1] == {"request_id": "r1", "finish": True}
+    assert open(fake.submitted[0]["file_paths"]["image"][0], "rb").read() == b"PN"
+
+
+def test_in_band_failure_replaces_the_finish(monkeypatch, tmp_path):
+    """A request that fails after it was accepted answers with the error and
+    its status, and nothing else: no finish frame follows."""
+    fake = _FakeServer(tmp_path, chunks_per_request=2)
+    fake.error_for["mid"] = ("Error in worker: ValueError: bad domain", 400)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"text": "go", "request_id": "mid"}))
+        msgs = _recv_until_finish(ws, binary=False)
+        assert [m.get("modality") for m in msgs[:-1]] == ["action"]
+        assert msgs[-1] == {"request_id": "mid", "error": "Error in worker: ValueError: bad domain", "status": 400}
+        # the next reply on the socket belongs to the next request
+        ws.send_text(json.dumps({"text": "again", "request_id": "ok"}))
+        assert json.loads(ws.receive_text())["request_id"] == "ok"
+
+
+@pytest.mark.parametrize("message, field", [
+    ({"text": 5}, "text"),
+    ({"text": "x", "request_id": 7}, "request_id"),
+    ({"text": "x", "files": "obs.png"}, "files"),
+    ({"text": "x", "files": [{"name": 3, "data": ""}]}, "name"),
+    ({"text": "x", "output_modalities": [1]}, "output_modalities"),
+    ({"text": "x", "input_modalities": {"a": 1}}, "input_modalities"),
+    ({"text": "x", "model_kwargs": [1]}, "model_kwargs"),
+])
+def test_wrongly_typed_fields_are_rejected_by_name(monkeypatch, tmp_path, message, field):
+    fake = _FakeServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps(message))
+        err = json.loads(ws.receive_text())
+    assert "error" in err and field in err["error"], err
+    assert not fake.submitted
+
+
+def test_uploads_are_cleaned_up(monkeypatch, tmp_path):
+    """Files a message carried are scheduled for deletion once the request is
+    done, as the HTTP route does; a message rejected halfway leaves none."""
+    fake = _FakeServer(tmp_path, chunks_per_request=1)
+    scheduled = []
+    monkeypatch.setattr(entrypoint, "_schedule_upload_cleanup", lambda paths, delay_s=60.0: scheduled.append(paths))
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({
+            "files": [{"name": "a.png", "data": base64.b64encode(b"A").decode()},
+                      {"name": "b.wav", "data": base64.b64encode(b"B").decode()}],
+            "output_modalities": "action", "request_id": "two",
+        }))
+        _recv_until_finish(ws, binary=False)
+        ws.send_text(json.dumps({
+            "files": [{"name": "c.png", "data": base64.b64encode(b"C").decode()},
+                      {"name": "clip.xyz", "data": ""}],
+            "request_id": "half",
+        }))
+        err = json.loads(ws.receive_text())
+    assert "Cannot determine modality" in err["error"]
+    assert scheduled == [fake.submitted[0]["file_paths"]]
+    saved = sorted(f.name.split("_", 1)[1] for f in tmp_path.iterdir())
+    assert saved == ["a.png", "b.wav"], saved
