@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 26, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 27, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -734,6 +734,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.dtype"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.flashinfer_backend"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.flashinfer_backend</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.head_dim"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.head_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.max_segments_for"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.max_segments_for()</span></code></a></li>
@@ -1889,7 +1890,7 @@ resource stays free of the manager and its kernels.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">RaggedAttentionConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sm_scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_segments_per_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_tokens_per_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flashinfer_backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">RaggedAttentionConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sm_scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_segments_per_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_tokens_per_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flashinfer_backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Varlen self-attention over segments packed into one forward, with no KV
 cache: the whole layout is this step’s, and nothing carries to the next.</p>
@@ -1905,9 +1906,15 @@ slice at build, as it does for a <code class="docutils literal notranslate"><spa
 <li><p><strong>max_segments_per_request</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>max_tokens_per_request</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>flashinfer_backend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.dtype">
+<span class="sig-name descname"><span class="pre">dtype</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><span class="pre">dtype</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.dtype" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionConfig.flashinfer_backend">
 <span class="sig-name descname"><span class="pre">flashinfer_backend</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'auto'</span></span><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionConfig.flashinfer_backend" title="Link to this definition">#</a></dt>
@@ -3385,6 +3392,7 @@ would otherwise be a silently ineffective setting.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.dtype"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.dtype</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.flashinfer_backend"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.flashinfer_backend</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.head_dim"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.head_dim</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.RaggedAttentionConfig.max_segments_for"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.max_segments_for()</span></code></a></li>
@@ -3557,7 +3565,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 26, 2026.
+  Last updated on Sep 27, 2026.
   <br/>
 </p>
   </div>
