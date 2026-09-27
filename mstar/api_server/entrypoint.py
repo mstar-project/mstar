@@ -774,6 +774,71 @@ class APIServer:
         if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
             self._msg_thread.join(timeout=2)
 
+def _run_warmup_requests(server: APIServer, specs: list) -> None:
+    """Run the deployment's ``warmup_requests`` once the workers are ready and
+    before the server binds, so the first client does not pay what a first
+    request of a shape costs (torch.compile of a denoise step, a cold
+    inductor cache). Each spec is a ``/generate`` request in yaml form:
+    ``text``, ``output_modalities``, ``model_kwargs`` and an optional
+    ``image`` path. A warmup that fails is logged and skipped; it must not
+    keep the server from coming up.
+    """
+    if not isinstance(specs, list):
+        logger.warning("warmup_requests must be a list; ignoring %r", type(specs).__name__)
+        return
+
+    def _modalities(spec: dict) -> list[str]:
+        out_mods = spec.get("output_modalities") or ["text"]
+        if isinstance(out_mods, str):
+            out_mods = [m.strip() for m in out_mods.split(",") if m.strip()]
+        return list(out_mods)
+
+    async def _one(index: int, spec: dict) -> None:
+        text = spec.get("text")
+        out_mods = _modalities(spec)
+        file_paths = None
+        parts: list[PromptPart] = []
+        in_mods: list[str] = []
+        image = spec.get("image")
+        if image:
+            file_paths = {"image": [str(image)]}
+            parts.append(PromptPart(modality="image", index=0))
+            in_mods.append("image")
+        if text:
+            parts.append(PromptPart(modality="text", text=text))
+            in_mods.append("text")
+        rid = server.submit_request(
+            text=text,
+            file_paths=file_paths,
+            input_modalities=in_mods,
+            output_modalities=out_mods,
+            model_kwargs=spec.get("model_kwargs") or None,
+            prompt_parts=parts or None,
+            streaming=False,
+            request_id=f"warmup-{index}",
+        )
+        await server.collect_results(rid)
+
+    for index, spec in enumerate(specs):
+        if not isinstance(spec, dict):
+            logger.warning("warmup_requests[%d] is not a mapping; skipped", index)
+            continue
+        t0 = time.perf_counter()
+        try:
+            asyncio.run(_one(index, spec))
+        except Exception as exc:  # noqa: BLE001 — a cold server is better than none
+            logger.warning(
+                "warmup request %d/%d failed after %.1f s: %s",
+                index + 1, len(specs), time.perf_counter() - t0,
+                getattr(exc, "detail", exc),
+            )
+            continue
+        logger.info(
+            "warmup request %d/%d (%s) done in %.1f s",
+            index + 1, len(specs), ",".join(_modalities(spec)), time.perf_counter() - t0,
+        )
+
+
 # ------------------------------------------------------------------
 # FastAPI application
 # ------------------------------------------------------------------
@@ -1097,6 +1162,12 @@ def main(argv: list[str] | None = None):
         # Block until all workers have finished setup, so the server only binds
         # (and logs "Starting…") once it can actually serve requests.
         api_server.finalize_setup()
+        # The deployment's warmup requests run here, before the bind: a
+        # client never sees the first request of a shape.
+        warmups = config.get("warmup_requests") or []
+        if warmups:
+            logger.info("Running %d warmup request(s) before binding", len(warmups))
+            _run_warmup_requests(api_server, warmups)
         if args.rust_frontend:
             import tempfile
 
