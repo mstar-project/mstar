@@ -774,14 +774,28 @@ class APIServer:
         if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
             self._msg_thread.join(timeout=2)
 
+def _resolve_warmup_image(image: str) -> str:
+    """A warmup image is a local path, or ``hf://<owner>/<repo>/<path>`` for a
+    file shipped with a model (its example inputs), taken from the HF cache."""
+    if not image.startswith("hf://"):
+        return image
+    parts = image[len("hf://"):].split("/", 2)
+    if len(parts) != 3:
+        raise ValueError(f"hf:// image needs <owner>/<repo>/<path>, got {image!r}")
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=f"{parts[0]}/{parts[1]}", filename=parts[2])
+
+
 def _run_warmup_requests(server: APIServer, specs: list) -> None:
     """Run the deployment's ``warmup_requests`` once the workers are ready and
     before the server binds, so the first client does not pay what a first
     request of a shape costs (torch.compile of a denoise step, a cold
     inductor cache). Each spec is a ``/generate`` request in yaml form:
     ``text``, ``output_modalities``, ``model_kwargs`` and an optional
-    ``image`` path. A warmup that fails is logged and skipped; it must not
-    keep the server from coming up.
+    ``image``: a path, or ``hf://<repo>/<file>`` for a file in the model's own
+    Hugging Face repo (resolved from the cache, offline). A warmup that fails
+    is logged and skipped; it must not keep the server from coming up.
     """
     if not isinstance(specs, list):
         logger.warning("warmup_requests must be a list; ignoring %r", type(specs).__name__)
@@ -801,7 +815,7 @@ def _run_warmup_requests(server: APIServer, specs: list) -> None:
         in_mods: list[str] = []
         image = spec.get("image")
         if image:
-            file_paths = {"image": [str(image)]}
+            file_paths = {"image": [_resolve_warmup_image(str(image))]}
             parts.append(PromptPart(modality="image", index=0))
             in_mods.append("image")
         if text:
