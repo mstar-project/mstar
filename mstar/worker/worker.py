@@ -1373,8 +1373,14 @@ class Worker:
                 synchronize=False,
             )
         try:
-            with self._span("worker.gpu_thread.prepare_inputs"):
-                engine.prepare_inputs(node_batch)
+            try:
+                with self._span("worker.gpu_thread.prepare_inputs"):
+                    engine.prepare_inputs(node_batch)
+            except Exception:
+                if plan_future is not None and node_batch.preplanned_rids is not None:
+                    # The stage was for this batch, which now never runs.
+                    engine.reset_pre_plan_for_batch(node_batch)
+                raise
             # call is_stale after prepare_inputs because prepare_inputs may drop rids
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
@@ -2542,6 +2548,7 @@ class Worker:
         exc: Exception,
         in_flight: "tuple[PendingBatch | None, ...]",
         batch: ScheduledBatch | None,
+        speculation: "Speculation | None" = None,
     ) -> None:
         """Fail everything the crashed iteration touched and drain its futures.
 
@@ -2587,6 +2594,29 @@ class Worker:
             failed_rids.update(batch.node_objects)
             for node in batch.node_objects.values():
                 node._speculatively_scheduled = False
+        if speculation is not None and speculation.plan_future is not None:
+            # Armed but never submitted: the plan thread may still be staging
+            # a pre-plan for a step that will now never run. Drain it, then
+            # drop the stage, or the next step to lease that slot would find
+            # it. Its fresh rids go back to their queues; the continuing ones
+            # belong to the pending batch and fail with it.
+            try:
+                speculation.plan_future.result()
+            except Exception:
+                logger.debug(
+                    "Worker %s discarding the pre-plan of the failed iteration",
+                    self.worker_id,
+                )
+            speculation.plan_future = None
+            self._reset_skip_plan_flags(speculation.node_batch)
+            sb = speculation.scheduled_batch
+            for rid, node in sb.node_objects.items():
+                node._speculatively_scheduled = False
+                if rid in speculation.continuing_rids or rid in failed_rids:
+                    continue
+                wg_id = sb.request_to_worker_graph.get(rid)
+                if wg_id is not None:
+                    self.worker_graphs_manager.queues[wg_id].push_back_node(rid, node)
 
         self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
 
@@ -2787,6 +2817,7 @@ class Worker:
         # inside the handler itself.
         batch: ScheduledBatch | None = None
         spec_pending: PendingBatch | None = None
+        speculation: Speculation | None = None
 
         while True:
             from mstar.utils.profiler import range_pop, range_push
@@ -3030,6 +3061,9 @@ class Worker:
                                 spec_batch, spec_node_batch,
                                 speculation.plan_future,
                             )
+                            # the GPU thread owns the pre-plan from here; see
+                            # _handle_main_loop_error
+                            speculation.plan_future = None
                             self.wakeup_event.register_future(spec_future)
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
@@ -3059,6 +3093,7 @@ class Worker:
                             # and resetting under a running plan races it.
                             speculation.plan_future.result()
                             self._reset_skip_plan_flags(speculation.node_batch)
+                            speculation.plan_future = None
 
                     # Post-process N (routing stage) — runs concurrently with
                     # GPU(N+1) if we submitted one above. Skipped on any admit
@@ -3141,7 +3176,7 @@ class Worker:
                     tp_seq=fallthrough_tp_seq,
                 ))
             except Exception as e:
-                self._handle_main_loop_error(e, (pending, spec_pending), batch)
+                self._handle_main_loop_error(e, (pending, spec_pending), batch, speculation)
                 # Follower: a head from a step that raised must not sit at the
                 # FIFO front with failed rids.
                 if pending is not None and self._is_tp_follow_pending(pending):
