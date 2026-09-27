@@ -106,6 +106,38 @@ def capture_into_graph(run, pool, device, autocast_dtype):
     return graph, output
 
 
+def capture_with_static_outputs(run, warm_outputs, pool, device, autocast_dtype):
+    """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
+
+    ``warm_outputs`` is what ``run`` returned on a warm-up call (``{name:
+    Tensor}``); it fixes the shapes and dtypes. The captured graph ends with a
+    device-to-device copy of each output into a buffer allocated here, before
+    the capture, from the ordinary allocator.
+
+    Why not hand out the graph's own output tensors: blocks a graph frees
+    while it is being captured go back to the pool and are handed to the
+    graphs captured after it, so an output that lived in the pool could sit
+    exactly where an earlier-captured graph keeps its scratch and be
+    overwritten by that graph's next replay. That is harmless while a pool
+    belongs to one region whose graphs replay one at a time and whose
+    outputs are consumed before the next replay, but not once a node's
+    regions share one pool and replay in data-dependent order. Buffers outside
+    the pool stay valid until this graph's own next replay, whatever else the
+    node runs in between.
+    """
+    static_outputs = {
+        name: torch.empty_like(value) for name, value in warm_outputs.items()
+    }
+
+    def captured():
+        for name, value in run().items():
+            static_outputs[name].copy_(value)
+        return static_outputs
+
+    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype)
+    return graph, static_outputs
+
+
 def fail_if_graphs_required(missing: list[str]) -> None:
     """MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
     failure, for deployments that would rather not come up than serve the
@@ -952,8 +984,10 @@ class PiecewiseOutput:
         """The leading ``real_len`` slice WITHOUT copying.
 
         The result aliases the runner-owned static output buffer and is
-        OVERWRITTEN by the next ``run``. Read it within the same step; use
-        ``get`` when you need something that outlives the step.
+        OVERWRITTEN by the next ``run`` of this runner. Nothing else writes
+        there: the buffers live outside the graph memory pool, so replays of
+        other regions sharing the node's pool leave them alone. Read it within
+        the same step; use ``get`` when you need something that outlives it.
         """
         value = self._outputs.get(key)
         if value is None:
@@ -1190,24 +1224,25 @@ class PiecewiseCudaGraphRunner:
             )
 
         def run_fn():
-            return fn(call)
+            return self._normalize_output(fn(call))
 
         try:
             self._plan(step, shape)
             torch.cuda.synchronize()
+            warm_outputs = None
             for _ in range(self.NUM_WARMUP):
                 with autocast_scope(self._autocast_dtype):
-                    run_fn()
+                    warm_outputs = run_fn()
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the shapes the first plan did
                 self._dummy_rows.reset(dummy_rids)
                 self._plan(step, shape)
             torch.cuda.synchronize()
 
-            graph, raw_outputs = capture_into_graph(
-                run_fn, self._memory_pool, self._device, self._autocast_dtype,
+            graph, static_outputs = capture_with_static_outputs(
+                run_fn, warm_outputs, self._memory_pool, self._device,
+                self._autocast_dtype,
             )
-            static_outputs = self._normalize_output(raw_outputs)
         finally:
             # pages stay with the dummy streams: replay's padding rows address
             # the same ids, so their plan finds the storage already resident
