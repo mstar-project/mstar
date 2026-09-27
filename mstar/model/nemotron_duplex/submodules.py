@@ -95,6 +95,7 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     # one transiently), so the model's pool sizing covers the largest bucket.
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     DECODE_KEY = "decode"            # the steady-state capture's bucket key (cg_key_info)
+    PROMPT_DONE_KEY = "prompt_consumed"   # set once the request's first step (prompt + frame) has run
 
     def __init__(self, language_model: nn.Module, config: NemotronDuplexConfig):
         super().__init__()
@@ -174,11 +175,16 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     def cg_key_info(self, graph_walk: str, per_request_info: Mapping[str, Any]) -> str | None:
         """The decode capture serves a batch unless a request in it still has
         its system prompt pending (its first step is prompt + frame, so it
-        runs eager); the routing marks that in ``step_metadata``."""
+        runs eager). The routing marks that in ``step_metadata`` for the
+        request's first partition pass; the loop then iterates without a new
+        pass, so the mark stays -- the node records in its request state that
+        the prompt step has been prepared, and every later step is captured."""
         if graph_walk != "decode":
             return None
-        for info in per_request_info.values():
-            if (getattr(info, "step_metadata", None) or {}).get("prompt_pending"):
+        for rid, info in per_request_info.items():
+            if (getattr(info, "step_metadata", None) or {}).get("prompt_pending") and not (
+                self.request_state(rid).get(self.PROMPT_DONE_KEY)
+            ):
                 return None
         return self.DECODE_KEY
 
@@ -382,6 +388,9 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     ):
         # Feed the sampled agent-text + function tokens back into the next
         # frame's AddFusion (the decode loop's prev_text / prev_func edges).
+        # Whatever this step was, the prompt (if any) rode it: later steps take
+        # the decode capture (``cg_key_info``).
+        self.request_state(request_id).add(self.PROMPT_DONE_KEY, True)
         if "new_token" in outputs:
             outputs["prev_text"] = outputs["new_token"]
         if "new_func" in outputs:
@@ -598,7 +607,14 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         dev = talker.embed_code.weight.device
         rids = list(engine_inputs.request_ids)
         ids = torch.cat([inp.input_ids.reshape(-1)[:1] for inp in inputs]).to(dev)
-        tokens = ids.tolist()                                           # one D2H copy for the batch
+        # One D2H read per step for the host-assembled char conditioning. It
+        # waits for the kernels queued ahead of it; reading the ids on a side
+        # stream is not safe (the routed tensors are gated for the main stream
+        # only), and conditioning from a device-side table changes the last bit
+        # of the conditioning (fixed vs batch-width char attention), which moves
+        # the talker's knife-edge turn-taking. A sync-free read needs the
+        # producer's completion event handed along with the stream chunk.
+        tokens = ids.tolist()
         firsts = [bool(inp.kwargs.get("first", False)) for inp in inputs]
         warm_c, warm_u, warm_prev = self.warmup()
         prev_codes = torch.stack([
@@ -657,8 +673,13 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
     ``PerRequestState``); a chunk of NEW frames is decoded as ``context + new``
     and only the new frames' samples are emitted. Same "decode with left
     context, emit the tail" math as the verified standalone path, but O(1) per
-    chunk instead of re-decoding the whole history. Requests whose windows have
-    the same length are decoded in one batched call. Declares no resources.
+    chunk instead of re-decoding the whole history. The inverse STFT's last
+    ``n_fft - hop`` samples of a window still lack the following frames'
+    overlap, so a chunk holds those samples back and the next chunk emits them
+    recomputed with its context: the emitted stream is the full-history decode
+    sample for sample (a session's final few samples, 0.5 ms, stay unemitted).
+    Requests whose windows have the same length are decoded in one batched
+    call. Declares no resources.
     """
 
     # Per-request context is keyed by request id -> eager; fp32 codec.
@@ -671,6 +692,8 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
         super().__init__()
         self.codec = codec
         self.config = config
+        # samples at a window's right edge without their overlap-add partners
+        self._hold = max(int(getattr(codec, "n_fft", 0)) - int(getattr(codec, "hop_length", 0)), 0)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         # ``codec_tokens`` is this chunk's NEW RVQ frames (T_new, num_q); the
@@ -716,7 +739,11 @@ class AudioCodecDecoderSubmodule(NodeSubmodule):
             spf = wav.shape[1] // tf                                    # samples per frame
             for row, i in enumerate(idxs):
                 full, n_ctx = windows[i]
-                new_wav = wav[row, n_ctx * spf:]                        # emit only the new frames
+                # the new frames' samples, less the right edge held for the next
+                # chunk, plus the previous chunk's held edge now that its
+                # overlap partners exist (a first chunk has nothing held)
+                start = n_ctx * spf - self._hold if n_ctx > 0 else 0
+                new_wav = wav[row, start : wav.shape[1] - self._hold]
                 self.request_state(rids[i]).add(self.CONTEXT_KEY, full[-lc:].detach())
                 out[rids[i]] = {"audio_chunk": [(new_wav.clamp(-1, 1) * 32767).to(torch.int16)]}
         return out
