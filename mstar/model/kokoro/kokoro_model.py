@@ -44,7 +44,7 @@ from mstar.model.kokoro.config import (
     SYNTH_WALK,
     KokoroModelConfig,
 )
-from mstar.model.kokoro.g2p import G2PFrontend, normalize_lang_code
+from mstar.model.kokoro.g2p import LANG_NAMES, G2PFrontend, normalize_lang_code
 from mstar.model.kokoro.voices import VoiceRegistry
 from mstar.model.submodule_base import NodeSubmodule
 
@@ -159,7 +159,15 @@ class KokoroModel(Model):
         else:
             if not prompt or not prompt.strip():
                 raise ValueError("Kokoro requires a non-empty text prompt")
-            chunks = self.g2p.chunk(prompt, lang)
+            try:
+                chunks = self.g2p.chunk(prompt, lang)
+            except ImportError as exc:
+                # a bundled voice whose G2P extra is not installed here: the client's
+                # request is fine, this server just cannot serve it -> 400 with the fix
+                raise ValueError(
+                    f"Voice {voice!r} needs {LANG_NAMES[lang]} G2P, which this server does not have ({exc}); "
+                    "GET /v1/audio/voices lists the voices it can serve"
+                ) from exc
         if not chunks:
             raise ValueError("Input contains no speakable text")
         if len(chunks) > self.config.max_chunks:
@@ -224,8 +232,8 @@ class KokoroModel(Model):
         return self.config.sample_rate
 
     def get_voices(self) -> list[str]:
-        """The bundled voices; blends of them are accepted too (see ``VoiceRegistry``)."""
-        return self.voices.names
+        """The bundled voices this server can phonemize for; blends of them are accepted too (see ``VoiceRegistry``)."""
+        return [v for v in self.voices.names if self.g2p.available(self.default_lang or self.voices.language_of(v))]
 
     def get_default_voice(self) -> str:
         return self.config.default_voice
