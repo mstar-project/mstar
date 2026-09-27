@@ -43,6 +43,8 @@ class Qwen3SpeakerEncoder(nn.Module):
     N_MELS = 128
     F_MIN = 0.0
     F_MAX = 12_000.0
+    # The reflect pad in ``_make_mel`` needs more samples than it pads, at 24 kHz.
+    MIN_SAMPLES = (N_FFT - HOP_LENGTH) // 2 + 1
 
     def __init__(
         self,
@@ -117,6 +119,12 @@ class Qwen3SpeakerEncoder(nn.Module):
         # Reflect-pad by half of the analysis window. The frame centres then
         # agree with center=True. Then compress with a log.
         pad = (self.N_FFT - self.HOP_LENGTH) // 2
+        if wav.shape[-1] < self.MIN_SAMPLES:
+            raise ValueError(
+                f"Reference audio is {wav.shape[-1]} samples at "
+                f"{self.TARGET_SAMPLE_RATE} Hz; the speaker encoder needs at "
+                f"least {self.MIN_SAMPLES}."
+            )
         wav = F.pad(wav.unsqueeze(1), (pad, pad), mode="reflect").squeeze(1)
         mel = self.mel_transform(wav)                    # (1, n_mels, T)
         mel = torch.log(torch.clamp(mel, min=1e-5))

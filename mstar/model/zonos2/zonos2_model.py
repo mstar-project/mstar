@@ -431,6 +431,8 @@ class Zonos2Model(Model):
 
         speaker_embedding = self._resolve_speaker_embedding(kwargs.get("speaker_embedding"))
         has_reference_audio = bool((tensors or {}).get("audio_inputs"))
+        for clip in (tensors or {}).get("audio_inputs") or []:
+            self._validate_reference_clip(clip)
         speaker = speaker_embedding is not None or has_reference_audio
         if speaker and not self.config.speaker_enabled:
             raise ValueError(
@@ -466,6 +468,28 @@ class Zonos2Model(Model):
         if speaker_embedding is not None:
             out["speaker_embedding"] = [speaker_embedding]
         return out
+
+    def _validate_reference_clip(self, clip: torch.Tensor) -> None:
+        """Reject a clip the speaker encoder cannot embed, or one that is too long.
+
+        This runs in the data worker, so a bad clip fails its own request with
+        a 400 instead of failing every clone request batched with it.
+        """
+        from mstar.model.zonos2.speaker_encoder import Qwen3SpeakerEncoder as Enc
+
+        sr = self.config.speaker_encoder_sample_rate  # load_audio decodes at this
+        seconds = clip.shape[-1] / sr
+        min_seconds = Enc.MIN_SAMPLES / Enc.TARGET_SAMPLE_RATE
+        max_seconds = self.config.speaker_clip_max_seconds
+        if seconds < min_seconds:
+            raise ValueError(
+                f"Reference audio is {seconds * 1000:.1f} ms; voice cloning needs "
+                f"at least {min_seconds * 1000:.1f} ms."
+            )
+        if seconds > max_seconds:
+            raise ValueError(
+                f"Reference audio is {seconds:.1f} s; the limit is {max_seconds:g} s."
+            )
 
     def _resolve_speaker_embedding(self, value) -> torch.Tensor | None:
         """Normalize an embedding from the caller to ``(1, speaker_embedding_dim)``.

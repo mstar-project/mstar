@@ -254,7 +254,9 @@ Zonos2 environment requirements
   :doc:`installation`. Drop the ``speaker_encoder`` node group from the config YAML to serve
   text-only; clone requests then fail instead of ignoring the reference audio.
 - Clone requests send reference audio (``audio=...`` with ``"audio"`` in
-  ``input_modalities``). A client that caches the returned embedding can pass it back as the
+  ``input_modalities``). A clip must be longer than 16 ms (the encoder's analysis window)
+  and at most 30 s (``speaker_clip_max_seconds`` in the serving YAML); others get a 400.
+  A client that caches the returned embedding can pass it back as the
   ``speaker_embedding`` model kwarg to skip the encoder.
 - **Single GPU only.** Tensor parallelism is disabled until expert parallelism lands; a
   config with ``tp_size > 1`` is rejected at load.

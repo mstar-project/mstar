@@ -93,6 +93,9 @@ class Zonos2Config:
     # them, so the defaults apply on every run.
     speaker_encoder_model_id: str = "marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B"
     speaker_encoder_sample_rate: int = 24_000
+    # The longest reference clip a clone request may send; longer ones get a
+    # 400. The encoder embeds the whole clip on the LLM's GPU.
+    speaker_clip_max_seconds: float = 30.0
 
     # ---- Text-column conditioning tokens ---------------------------
     # The conditioning tokens occupy the tail of the text vocabulary in this

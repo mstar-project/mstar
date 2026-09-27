@@ -445,3 +445,48 @@ def test_emb_norm_keeps_residual_dtype_when_rms_norm_upcasts(monkeypatch):
     with torch.no_grad():
         out = model(_ids(model))
     assert out.dtype == torch.bfloat16
+
+
+# -- reference clip validation ----------------------------------------------
+def _clone_model(**kw):
+    from mstar.model.zonos2.zonos2_model import Zonos2Model
+
+    cfg = Zonos2Config(speaker_enabled=True, **kw)
+    return Zonos2Model("Zyphra/ZONOS2", config=cfg, skip_weight_loading=True)
+
+
+def _clone(model, samples):
+    return model.process_prompt(
+        "Hello there.", ["audio", "text"], ["audio"],
+        tensors={"audio_inputs": [torch.zeros(samples)]},
+    )
+
+
+def test_reference_clip_at_encoder_floor_is_accepted():
+    from mstar.model.zonos2.speaker_encoder import Qwen3SpeakerEncoder
+
+    assert Qwen3SpeakerEncoder.MIN_SAMPLES == 385  # reflect pad is 384
+    assert "text_inputs" in _clone(_clone_model(), Qwen3SpeakerEncoder.MIN_SAMPLES)
+
+
+@pytest.mark.parametrize("samples", [0, 1, 384])
+def test_reference_clip_below_encoder_floor_is_rejected(samples):
+    # These used to crash the encoder and every clone batched with them.
+    with pytest.raises(ValueError, match="at least"):
+        _clone(_clone_model(), samples)
+
+
+def test_reference_clip_over_limit_is_rejected():
+    model = _clone_model(speaker_clip_max_seconds=2.0)
+    sr = model.config.speaker_encoder_sample_rate
+    assert "text_inputs" in _clone(model, 2 * sr)
+    with pytest.raises(ValueError, match="limit is 2 s"):
+        _clone(model, 2 * sr + 1)
+
+
+def test_speaker_encoder_rejects_short_clip_with_clear_error():
+    from mstar.model.zonos2.speaker_encoder import Qwen3SpeakerEncoder
+
+    enc = object.__new__(Qwen3SpeakerEncoder)  # skip the HF model load
+    with pytest.raises(ValueError, match="needs at least 385"):
+        enc._make_mel(torch.zeros(1, 384))
