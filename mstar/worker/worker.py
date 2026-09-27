@@ -2442,6 +2442,49 @@ class Worker:
             )
         return buffers[index]
 
+    @staticmethod
+    def _group_device_tensors(
+        outputs: dict[str, NameToTensorList], device_type: str = "cuda",
+    ) -> dict[tuple[torch.dtype, tuple[int, ...]], list[torch.Tensor]]:
+        """The device tensors in per-rid outputs, grouped by (dtype, shape) in
+        a stable order, each tensor once even when it sits under several names
+        (``postprocess`` aliases ``text_inputs`` to ``new_token``)."""
+        groups: dict[tuple[torch.dtype, tuple[int, ...]], list[torch.Tensor]] = {}
+        seen: set[int] = set()
+        for name_to_list in outputs.values():
+            if not isinstance(name_to_list, dict):
+                continue
+            for tensors in name_to_list.values():
+                if not isinstance(tensors, list):
+                    continue
+                for t in tensors:
+                    if torch.is_tensor(t) and t.device.type == device_type and id(t) not in seen:
+                        seen.add(id(t))
+                        groups.setdefault((t.dtype, tuple(t.shape)), []).append(t)
+        return groups
+
+    @staticmethod
+    def _substitute_tensors(
+        outputs: dict[str, NameToTensorList], replacement: dict[int, torch.Tensor],
+    ) -> dict[str, NameToTensorList]:
+        """``outputs`` with every tensor in ``replacement`` (by id) swapped for
+        its copy; everything else is passed through as is."""
+        out: dict[str, NameToTensorList] = {}
+        for rid, name_to_list in outputs.items():
+            if not isinstance(name_to_list, dict):
+                out[rid] = name_to_list
+                continue
+            per: dict = {}
+            for name, tensors in name_to_list.items():
+                if isinstance(tensors, list):
+                    per[name] = [
+                        replacement.get(id(t), t) if torch.is_tensor(t) else t for t in tensors
+                    ]
+                else:
+                    per[name] = tensors
+            out[rid] = per
+        return out
+
     def _prematerialize_for_check_stop(
         self,
         outputs: dict[str, NameToTensorList],
@@ -2454,17 +2497,23 @@ class Worker:
         N's outputs by the time we get here — a default-stream sync would
         block waiting for N+1 to finish, defeating the overlap.
 
+        One copy per kind of output per step, not one per row: the rows'
+        tensors of one dtype and shape are stacked (a small kernel on the side
+        stream) into one pinned buffer and each row gets a view. A tensor that
+        sits under two names is copied once. At 32 decode streams that is one
+        copy where there were 64, which was a visible share of the step's CPU
+        time.
+
         Returns per-rid outputs with the CUDA tensors replaced by CPU
         copies. Skipped (returns ``outputs`` unchanged) when there's no
         completion event (CPU execution) or when CUDA is unavailable.
-
-        AR engines emit small per-rid output dicts (sampled token + maybe
-        a code) so the cost is negligible. If a future engine emits large
-        tensors here (e.g. activations), revisit.
         """
         if not torch.cuda.is_available() or completion_event is None:
             return outputs
         if not outputs:
+            return outputs
+        groups = self._group_device_tensors(outputs)
+        if not groups:
             return outputs
 
         if self._d2h_stream is None:
@@ -2472,35 +2521,22 @@ class Worker:
         side = self._d2h_stream
         side.wait_event(completion_event)
 
-        cpu_per_rid: dict = {}
-        buffer_indices: dict[tuple[str, torch.dtype, tuple[int, ...]], int] = defaultdict(int)
+        replacement: dict[int, torch.Tensor] = {}
         with torch.cuda.stream(side):
-            for rid, name_to_list in outputs.items():
-                if not isinstance(name_to_list, dict):
-                    cpu_per_rid[rid] = name_to_list
+            for (dtype, shape), tensors in groups.items():
+                if len(tensors) == 1:
+                    cpu_t = self._get_pinned_d2h_buffer("check_stop", shape, dtype)
+                    cpu_t.copy_(tensors[0], non_blocking=True)
+                    replacement[id(tensors[0])] = cpu_t
                     continue
-                cpu_per_rid[rid] = {}
-                for name, tensors in name_to_list.items():
-                    if not isinstance(tensors, list):
-                        cpu_per_rid[rid][name] = tensors
-                        continue
-                    new_list = []
-                    for t in tensors:
-                        if torch.is_tensor(t) and t.is_cuda:
-                            key = ("check_stop", t.dtype, tuple(t.shape))
-                            idx = buffer_indices[key]
-                            buffer_indices[key] += 1
-                            cpu_t = self._get_pinned_d2h_buffer(
-                                "check_stop", t.shape, t.dtype, idx,
-                            )
-                            cpu_t.copy_(t, non_blocking=True)
-                            new_list.append(cpu_t)
-                        else:
-                            new_list.append(t)
-                    cpu_per_rid[rid][name] = new_list
+                staged = torch.stack(tensors)
+                cpu_all = self._get_pinned_d2h_buffer("check_stop", staged.shape, dtype)
+                cpu_all.copy_(staged, non_blocking=True)
+                for i, t in enumerate(tensors):
+                    replacement[id(t)] = cpu_all[i]
         side.synchronize()
 
-        return cpu_per_rid
+        return self._substitute_tensors(outputs, replacement)
 
     def _apply_pending_removes_safe_to_drop(
         self, in_flight_rids: set[str]
