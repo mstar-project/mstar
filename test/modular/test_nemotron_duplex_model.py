@@ -153,6 +153,11 @@ def test_duplex_worker_graphs_derive_all_walks():
     assert set(by_walk) == WALKS
     assert by_walk["decode"].consumes_stream is True
     assert by_walk["codec_chunk"].consumes_stream is True
+    # the talker's next step reads the codes its previous step stored in
+    # postprocess: it must not be built speculatively while that step runs
+    talker_node = by_walk["talker_decode"].section.section          # Loop -> GraphNode
+    assert talker_node.name == "eartts_talker" and talker_node.enable_async_scheduling is False
+    assert by_walk["decode"].section.section.enable_async_scheduling is True
 
 
 def test_duplex_initial_partition_routing():
