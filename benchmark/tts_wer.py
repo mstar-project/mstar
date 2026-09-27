@@ -96,7 +96,8 @@ def transcribe(wavs: list[Path], asr_model: str, device: str, batch_size: int) -
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--engine", choices=["openai", "kokoro-package"], default="openai")
+    parser.add_argument("--engine", choices=["openai", "kokoro-package", "wavs"], default="openai")
+    parser.add_argument("--wavs-dir", help="for --engine wavs: directory of rendered NNN.wav files in sentence order")
     parser.add_argument("--url", default="http://127.0.0.1:8000", help="server for --engine openai")
     parser.add_argument("--model", default="kokoro")
     parser.add_argument("--voice", default="af_heart")
@@ -125,7 +126,13 @@ def main() -> None:
 
     synth = PackageSynth(args.voice, device) if args.engine == "kokoro-package" else None
     wavs, seconds, audio_seconds = [], [], []
-    for i, text in enumerate(sentences):
+    if args.engine == "wavs":
+        # Scoring only: another harness rendered these (benchmark/kokoro_onnx_baselines.py writes them).
+        wavs = sorted(Path(args.wavs_dir).glob("*.wav"))[: len(sentences)]
+        sentences = sentences[: len(wavs)]
+        seconds = [float("nan")] * len(wavs)
+        audio_seconds = [sf.info(path).duration for path in wavs]
+    for i, text in enumerate(sentences if args.engine != "wavs" else []):
         t0 = time.perf_counter()
         audio = synth(text, args.speed) if synth else synth_openai(args.url, args.model, args.voice, args.speed, text)
         seconds.append(time.perf_counter() - t0)
@@ -148,7 +155,8 @@ def main() -> None:
             f.write(f"{i + 1}\t{w:.3f}\t{s:.3f}\t{a:.2f}\t{text}\t{hyp.strip()}\n")
     summary = {
         "engine": args.engine,
-        "url": args.url if synth is None else None,
+        "url": args.url if args.engine == "openai" else None,
+        "wavs_dir": args.wavs_dir,
         "model": args.model,
         "voice": args.voice,
         "speed": args.speed,

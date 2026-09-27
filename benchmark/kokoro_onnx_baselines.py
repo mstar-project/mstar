@@ -172,7 +172,10 @@ def main() -> None:
         engine = KokoroOnnxEngine(args.model, args.voices, args.provider, args.voice, args.threads)
     else:
         engine = SherpaOnnxEngine(args.model_dir, args.provider, args.sid, args.threads)
-    env = f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\nengine={engine.name} version={engine.version} provider={engine.provider}\npython={sys.version.split()[0]}\n"
+    env = (
+        f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\nengine={engine.name} version={engine.version} "
+        f"provider={engine.provider}\npython={sys.version.split()[0]}\n"
+    )
     (out / "env.txt").write_text(env)
     print(env.strip(), flush=True)
 
@@ -182,9 +185,11 @@ def main() -> None:
         run_dir.mkdir(exist_ok=True)
         (run_dir / "results.json").write_text(json.dumps(result, indent=2))
         agg = result["aggregate"]
+        latency = agg["ttft_s"]["audio"]
         print(
-            f"c={concurrency}: {result['completed']}/{args.num_requests} ok, latency p50={agg['ttft_s']['audio']['p50']:.3f}s "
-            f"p95={agg['ttft_s']['audio']['p95']:.3f}s, RTF p50={agg['rtf']['p50']:.4f}, {agg['audio_seconds_throughput']:.1f} audio-s/s",
+            f"c={concurrency}: {result['completed']}/{args.num_requests} ok, "
+            f"latency p50={latency['p50']:.3f}s p95={latency['p95']:.3f}s, "
+            f"RTF p50={agg['rtf']['p50']:.4f}, {agg['audio_seconds_throughput']:.1f} audio-s/s",
             flush=True,
         )
 
