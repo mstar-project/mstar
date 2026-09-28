@@ -264,6 +264,29 @@ class ForwardPassArgs:
     step_metadata: dict = field(default_factory=dict)
 
 
+def _has_transparency(image) -> bool:
+    # Mirrors vLLM's ImageMediaIO._has_transparency predicate.
+    if image.mode in ("RGBA", "LA", "PA"):
+        return True
+    return "transparency" in image.info
+
+
+def _to_rgb(image):
+    # Mirrors vLLM's convert_image_mode + rgba_to_rgb: composite over white
+    # if the image carries transparency, else a plain mode conversion.
+    from PIL import Image
+
+    if image.mode == "RGB":
+        return image
+    if _has_transparency(image):
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        background.paste(image, mask=image.split()[3])
+        return background
+    return image.convert("RGB")
+
+
 class Model(ABC):
     def _get_worker_graphs_for_graph_walk(
         self,
@@ -501,9 +524,11 @@ class Model(ABC):
         pass
 
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
-        import torchvision
+        import numpy as np
+        from PIL import Image
 
-        img = torchvision.io.decode_image(filepath).to(device)  # uint8 CxHxW
+        image = _to_rgb(Image.open(filepath))
+        img = torch.from_numpy(np.array(image)).permute(2, 0, 1).to(device)  # uint8 CxHxW
         img = img.float() / 255.0
 
         return TensorAndMetadata(img)
