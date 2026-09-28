@@ -259,6 +259,10 @@ class PreprocessWorker:
             self.thread.join()
 
 
+# Trailing ids kept as decode context once emitted; same value vLLM's slow path uses.
+PREFIX_WINDOW = 5
+
+
 class PreprocessWorkerThread:
     def __init__(
         self,
@@ -312,7 +316,7 @@ class PreprocessWorkerThread:
         # The request's model_kwargs, kept so output postprocessing can
         # honor per-request parameters (e.g. the video container fps).
         self.request_model_kwargs: dict[str, dict] = {}
-        # Text only: (accumulated token ids, utf-8 bytes emitted so far) per request; see _decode_text_incremental.
+        # Text only: (recent-ids window, ids in it already emitted) per request; see _decode_text_incremental.
         self._text_decode: dict[str, tuple[torch.Tensor, int]] = {}
 
         # Owned by PreprocessWorker (main thread); used only from this thread.
@@ -540,17 +544,21 @@ class PreprocessWorkerThread:
         )
 
     def _decode_text_incremental(self, request_id: str, tensor: torch.Tensor) -> bytes:
-        # Re-decodes all accumulated ids every step (O(n^2)/response); holds back a trailing replacement char.
-        ids, emitted = self._text_decode.get(request_id, (tensor[:0], 0))
-        ids = torch.cat([ids, tensor])
-        full = self.model.postprocess(
-            ids, "text", request_kwargs=self.request_model_kwargs.get(request_id),
-        )
+        # Bounded window (vLLM's slow-path scheme): re-decodes only the last
+        # PREFIX_WINDOW ids each step instead of the whole response.
+        window, read_len = self._text_decode.get(request_id, (tensor[:0], 0))
+        window = torch.cat([window, tensor])
+        kwargs = self.request_model_kwargs.get(request_id)
+        prefix = self.model.postprocess(window[:read_len], "text", request_kwargs=kwargs)
+        full = self.model.postprocess(window, "text", request_kwargs=kwargs)
         # surrogateescape keeps non-UTF-8 payloads (synthetic byte tokenizers) lossless.
-        text = full.decode("utf-8", "surrogateescape")
-        safe_upto = len(text.rstrip("�").encode("utf-8", "surrogateescape"))
-        self._text_decode[request_id] = (ids, safe_upto)
-        return full[emitted:safe_upto]
+        if len(full) <= len(prefix) or full.decode("utf-8", "surrogateescape").endswith("�"):
+            self._text_decode[request_id] = (window, read_len)  # unfinished tail; retry next step
+            return b""
+        emit = full[len(prefix):]
+        window = window[-PREFIX_WINDOW:]
+        self._text_decode[request_id] = (window, len(window))
+        return emit
 
     def _process_read_tensors(self):
         did_work = False

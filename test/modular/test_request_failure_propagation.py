@@ -394,3 +394,52 @@ def test_non_text_modality_bypasses_text_accumulation():
     chunk = wt.out_queue.get_nowait()
     assert chunk.modality == "video"
     assert wt._text_decode == {}
+
+
+def test_text_output_bounded_window_after_warmup():
+    """The window scheme must keep postprocess's input bounded regardless of
+    response length, unlike the old whole-sequence re-decode."""
+    from mstar.api_server.data_worker import PREFIX_WINDOW
+
+    seen_lengths = []
+
+    class _ByteModel:
+        def postprocess(self, tensor, modality, request_kwargs=None):
+            ids = tensor.tolist()
+            seen_lengths.append(len(ids))
+            return bytes(t & 0xFF for t in ids)
+
+    wt = _preprocess_thread(_ByteModel())
+    wt.tensor_uuid_to_metadata_per_request = {}
+
+    original = bytes(range(50))
+    emitted = bytearray()
+    for i, byte in enumerate(original):
+        _feed_tensor(wt, "r1", f"u{i}", [byte])
+        while not wt.out_queue.empty():
+            emitted.extend(wt.out_queue.get_nowait().data)
+
+    assert max(seen_lengths[10:]) <= PREFIX_WINDOW + 1
+    assert bytes(emitted) == original
+
+
+def test_text_output_splits_multibyte_char_across_window_boundary():
+    """A 4-byte character straddling the trimmed window boundary must still
+    come out whole, even though several steps hold it back first."""
+
+    class _ReplaceModel:
+        def postprocess(self, tensor, modality, request_kwargs=None):
+            raw = bytes(t & 0xFF for t in tensor.tolist())
+            return raw.decode("utf-8", "replace").encode("utf-8")
+
+    wt = _preprocess_thread(_ReplaceModel())
+    wt.tensor_uuid_to_metadata_per_request = {}
+
+    original = "ABCDEF🚀"
+    chunks = []
+    for i, byte in enumerate(original.encode("utf-8")):
+        _feed_tensor(wt, "r1", f"u{i}", [byte])
+        chunks.append(wt.out_queue.get_nowait().data if not wt.out_queue.empty() else None)
+
+    assert chunks == [b"A", b"B", b"C", b"D", b"E", b"F", None, None, None, b"\xf0\x9f\x9a\x80"]
+    assert b"".join(c for c in chunks if c is not None).decode("utf-8") == original
