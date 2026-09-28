@@ -540,12 +540,9 @@ class NemotronDuplexModel(Model):
             outputs=[],
         )
         # Talker: each streamed agent token -> RVQ codes, streamed to the codec.
-        # No speculative scheduling: a frame's codes are the next frame's
-        # ``prev_codes``, carried in the node's per-request state from
-        # ``postprocess`` to the next ``preprocess`` rather than as a loop-back
-        # edge, so a step built while the previous one is still in flight would
-        # read the frame before that (measured: up to 19 steps of run-ahead at
-        # one session, silent speech).
+        # No speculative scheduling here. The talker keeps the previous frame's
+        # codes in per-request state written by postprocess, so a step built
+        # while the previous one is still running would read the wrong frame.
         talker_decode = Loop(
             name="talker_decode_loop",
             section=GraphNode(
