@@ -371,17 +371,11 @@ class Worker:
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
         self._tp_leader_gap_warned = False
-        # The runtime takes an explicit set, so resolve the two special cases
-        # here: tp_async_nodes=None means "every node", and the feature being
-        # off means "none". An empty set on the runtime side is just "none".
-        self._graph_runtime.set_node_metadata(
-            parallel_nodes=self.parallel_nodes,
-            parallel_leader_nodes=self.parallel_leader_nodes,
-            tp_async_nodes={
-                n for n in node_names if self._tp_async_for(n)
-            },
-        )
-
+        # Why ``_try_follow_speculation`` last declined a matching head. Recorded
+        # rather than logged: it is called from a 20ms poll, so a line per
+        # attempt buries the log, and only the reason at the point the wait goes
+        # long is interesting. ``_await_tp_follow_step`` reports it there.
+        self._follow_block: str | None = None
         tp_async_on = sorted(n for n in self.parallel_nodes if self._tp_async_for(n))
         if tp_async_on:
             logger.info(
@@ -2279,6 +2273,7 @@ class Worker:
 
         # Committed: the serial path must not see the head any more.
         self.scheduler.pop_tp_follow_head()
+        self._follow_block = None
         # Its rids count as in flight now, so a remove landing before submit is
         # deferred like any other; ``_set_pending`` re-derives the set on submit.
         self._in_flight_rids |= set(head_rids)
@@ -2393,9 +2388,12 @@ class Worker:
                     last_warn = now
                     logger.warning(
                         "Worker %s: still waiting for the leader's decision on "
-                        "step seq %d, %.1fs after it finished (head queued: %s)",
+                        "step seq %d, %.1fs after it finished (head queued: %s, "
+                        "head seq %s, blocked on: %s)",
                         self.worker_id, s, now - t_done,
                         head is not None and head.spec_from_seq == s,
+                        "none" if head is None else head.spec_seq,
+                        self._follow_block or "nothing reported",
                     )
 
     # ------------------------------------------------------------------

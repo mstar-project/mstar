@@ -274,6 +274,9 @@ class _FakeExecEngine:
         self._fail_on = fail_on
         # ordered log, so the test can assert admit-all-then-run
         self.events: list[tuple[str, str]] = []
+        # which rids were driven with `set_launch` — the real path signals
+        # `launch_started_event` there, and the worker fences on it
+        self.launch_signals: list[str] = []
         self._runner = self
         self._device = torch.device("cpu")
         # the per-request path's slots; no fence, so no CUDA event is recorded
@@ -307,10 +310,13 @@ class _FakeExecEngine:
         lease, running_batched, step, set_launch,
     ):
         del batch, submodule_mgmt, inputs, req_info, lease, running_batched
-        del set_launch
         rid = request_ids[0]
         assert step is not None, "the step admitted for this rid must reach it"
         assert tuple(ctx.request_ids) == (rid,), "each rid drives its own ctx"
+        if set_launch:
+            # stands in for `_forward` releasing `launch_started_event`
+            self.launch_signals.append(rid)
+            self.events.append(("launch", rid))
         self.events.append(("run", rid))
         self.run_slots.append(ctx.slot)
         return {rid: {"token": 1}}, step
@@ -338,7 +344,11 @@ def test_per_request_admits_every_rid_before_running_any():
     out = engine._exec_per_request(_exec_batch(["a", "b"]))
 
     assert [e for e in engine.events if e[0] != "declare"] == [
-        ("admit", "a"), ("admit", "b"), ("run", "a"), ("run", "b"),
+        # the launch signal lands after BOTH admits, not after its own rid's.
+        # ``Worker._await_admit_settled`` fences on it and then reads
+        # ``admit_error``, so anything that could still refuse has to have run.
+        ("admit", "a"), ("admit", "b"), ("launch", "a"), ("run", "a"),
+        ("run", "b"),
     ]
     assert set(out) == {"a", "b"}
 
@@ -356,6 +366,27 @@ def test_per_request_runs_nothing_when_a_later_rid_fails_admit():
     assert not any(kind == "run" for kind, _ in engine.events)
     assert out == {"a": {}, "b": {}}
     assert isinstance(batch.admit_error, AllocationFailed)
+
+
+def test_a_refused_batch_never_signals_the_launch():
+    """``launch_started_event`` is the worker's admit fence: it waits on that,
+    then reads ``admit_error`` to decide whether to speculate on N+1. So the
+    error has to be written before anything signals.
+
+    Here nothing signals at all — the refusal returns from the admit loop before
+    the drive loop is reached, and ``_execute_on_gpu_thread``'s ``finally`` does
+    it instead, well after ``register_admit_error``. If a future change signals
+    from inside the admit loop, the worker reads ``admit_error=None``, builds and
+    broadcasts a yield-away batch for N+1, and then evicts underneath it — the
+    asymmetry that guard exists to prevent.
+    """
+    engine = _FakeExecEngine(fail_on="b")
+    batch = _exec_batch(["a", "b"])
+
+    engine._exec_per_request(batch)
+
+    assert isinstance(batch.admit_error, AllocationFailed)
+    assert engine.launch_signals == []
 
 
 def test_per_request_rotates_slots_within_the_batch():
