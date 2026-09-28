@@ -113,7 +113,7 @@ class Qwen3ASRModel(Model):
         from transformers import AutoTokenizer
 
         # The checkpoint's tokenizer.json carries the pre-tokenizer regex bug
-        # transformers warns about; the fix flag is what the reference uses.
+        # transformers warns about. The fix flag is what the reference uses.
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.local_dir, cache_dir=cache_dir, fix_mistral_regex=True,
         )
@@ -349,7 +349,7 @@ class Qwen3ASRModel(Model):
         raw_audio_inputs = (tensors or {}).get("audio_inputs", [])
         if len(raw_audio_inputs) != 1:
             raise ValueError(
-                f"Qwen3-ASR expects exactly one audio input per request; got {len(raw_audio_inputs)}."
+                f"Qwen3-ASR expects one audio input per request, got {len(raw_audio_inputs)}."
             )
         waveform = raw_audio_inputs[0].reshape(-1).to(torch.float32).cpu()
         if waveform.numel() == 0:
@@ -359,13 +359,13 @@ class Qwen3ASRModel(Model):
                 f"Qwen3-ASR takes at most {self.config.max_audio_seconds:.0f} s of audio per request; "
                 f"got {waveform.numel() / self.config.sampling_rate:.1f} s. Split the file first."
             )
-        # the encoder's first conv needs a few frames; the reference pads
+        # the encoder's first conv needs a few frames. The reference pads
         # sub-0.5 s clips with silence too
         min_samples = self.config.sampling_rate // 2
         if waveform.numel() < min_samples:
             waveform = torch.nn.functional.pad(waveform, (0, min_samples - waveform.numel()))
 
-        # The samples go to the encoder as they are; the log-mel is its first
+        # The samples go to the encoder as they are. The log-mel is its first
         # step on the GPU (spectrograms on the data worker's CPU threads were
         # the serving bottleneck). The prompt only needs the frame count.
         num_frames = self.log_mel.num_frames(waveform.numel())
