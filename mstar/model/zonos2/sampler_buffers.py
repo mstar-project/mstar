@@ -25,8 +25,12 @@ Each request has two pieces of state:
   code is always ``>= 0``. The repetition penalty tests only whether a token is
   present (``counts > 0`` in :func:`apply_repetition_penalty`), so the ring
   needs no separate fill count and gives the same penalty as a plain window.
-* The seed ``seed[cap]`` (int64), the conductor's ``random_seed``. It is set at
-  register time and never changes, so the sync does not write it back.
+* The per-request constants in ``const``: the conductor's ``random_seed`` and
+  the request's sampling knobs (temperature, top-k, top-p, min-p, penalty,
+  repetition window and codebook cutoff). They are set at register time and
+  never change, so the sync does not write them back. The ring is as wide as
+  the largest window a request may ask for; a smaller window masks the older
+  columns by age on read.
 * The offset ``offset[cap]`` (int64). This is the frame count of the request,
   which is also the RNG ``step`` index. The code reads it before the write and
   increments it in place afterwards. It therefore does not depend on the batch
@@ -41,17 +45,29 @@ from dataclasses import dataclass, field
 
 import torch
 
+from mstar.model.zonos2.tts_sampling import SamplingRows, TTSSamplingParams
+
+# Per-request constants: name -> dtype. The first five feed SamplingRows.
+_CONSTS = {
+    "temperature": torch.float32,
+    "topk": torch.int64,
+    "top_p": torch.float32,
+    "min_p": torch.float32,
+    "repetition_penalty": torch.float32,
+    "seed": torch.int64,
+    "window": torch.int64,       # repetition window, <= the ring width
+    "codebooks": torch.int64,    # the penalty covers codebooks [0, codebooks)
+}
+
 
 @dataclass
 class Zonos2SamplerBuffers:
     max_batch_size: int
     n_codebooks: int
+    # The ring width: the largest repetition window a request may use.
     window: int
-    # The repetition penalty applies to codebooks ``0`` to
-    # ``repetition_codebooks - 1``. A negative value applies it to all
-    # codebooks. On read, the code masks the codebooks at or after the cutoff
-    # to ``-1``, and the penalty then ignores them.
-    repetition_codebooks: int
+    # Used by a request registered without its own params.
+    defaults: TTSSamplingParams
 
     # The repetition ring (int32). The sentinel -1 marks an empty position.
     ring_master: torch.Tensor    # [capacity, C, W]
@@ -61,14 +77,14 @@ class Zonos2SamplerBuffers:
     # The frame count and RNG step of each request (int64).
     offset_master: torch.Tensor  # [capacity]
     offset_buf: torch.Tensor     # [max_bs]
-    # The RNG seed of each request (int64).
-    seed_master: torch.Tensor    # [capacity]
-    seed_buf: torch.Tensor       # [max_bs]
+    # The per-request constants, keyed as ``_CONSTS``.
+    const_master: dict[str, torch.Tensor]  # each [capacity]
+    const_buf: dict[str, torch.Tensor]     # each [max_bs]
 
-    # Static staging for the penalty input, with the exclusion mask. ``pen_buf``
-    # is a masked copy of ``ring_buf``.
+    # Static staging for the penalty input: a masked copy of ``ring_buf``.
     pen_buf: torch.Tensor        # [max_bs, C, W] int32
-    _rc_exclude: torch.Tensor | None  # [1, C, 1] bool, True where excluded
+    _cols: torch.Tensor          # [1, 1, W] int64, ring column index
+    _codebook_idx: torch.Tensor  # [1, C, 1] int64
 
     # Slot-index staging for the gather of each step.
     _slot_idx_cpu: torch.Tensor
@@ -90,36 +106,41 @@ class Zonos2SamplerBuffers:
         repetition_codebooks: int,
         device: torch.device | str,
         capacity: int | None = None,
+        defaults: TTSSamplingParams | None = None,
     ) -> "Zonos2SamplerBuffers":
+        """``window`` is the ring width; ``defaults`` falls back to the shipped
+        knobs with this window and codebook cutoff."""
         device = torch.device(device)
         window = max(int(window), 1)
         cap = capacity if capacity is not None else max_batch_size
         pinned = torch.cuda.is_available() and device.type == "cuda"
+        if defaults is None:
+            defaults = TTSSamplingParams(
+                repetition_window=window, repetition_codebooks=repetition_codebooks,
+            )
 
         def ring(n):
             return torch.full((n, n_codebooks, window), -1, dtype=torch.int32, device=device)
 
-        rc = repetition_codebooks
-        rc_exclude = None
-        if 0 <= rc < n_codebooks:
-            excl = torch.arange(n_codebooks, device=device) >= rc  # [C] bool
-            rc_exclude = excl.view(1, n_codebooks, 1)
+        def consts(n):
+            return {k: torch.zeros(n, dtype=dt, device=device) for k, dt in _CONSTS.items()}
 
         return cls(
             max_batch_size=max_batch_size,
             n_codebooks=n_codebooks,
             window=window,
-            repetition_codebooks=rc,
+            defaults=defaults,
             ring_master=ring(cap),
             ring_buf=ring(max_batch_size),
             cursor_master=torch.zeros(cap, dtype=torch.int32, device=device),
             cursor_buf=torch.zeros(max_batch_size, dtype=torch.int32, device=device),
             offset_master=torch.zeros(cap, dtype=torch.int64, device=device),
             offset_buf=torch.zeros(max_batch_size, dtype=torch.int64, device=device),
-            seed_master=torch.zeros(cap, dtype=torch.int64, device=device),
-            seed_buf=torch.zeros(max_batch_size, dtype=torch.int64, device=device),
+            const_master=consts(cap),
+            const_buf=consts(max_batch_size),
             pen_buf=ring(max_batch_size),
-            _rc_exclude=rc_exclude,
+            _cols=torch.arange(window, device=device).view(1, 1, window),
+            _codebook_idx=torch.arange(n_codebooks, device=device).view(1, n_codebooks, 1),
             _slot_idx_cpu=torch.zeros(max_batch_size, dtype=torch.int64, pin_memory=pinned),
             _slot_idx_gpu=torch.zeros(max_batch_size, dtype=torch.int64, device=device),
             _pinned=pinned,
@@ -128,10 +149,13 @@ class Zonos2SamplerBuffers:
         )
 
     # -- slot lifecycle -------------------------------------------------
-    def register_request(self, rid: str, seed: int = 0) -> None:
-        """Assign a slot to ``rid``, reset its master state, and store its seed.
+    def register_request(
+        self, rid: str, seed: int = 0, params: TTSSamplingParams | None = None,
+    ) -> None:
+        """Assign a slot to ``rid``, reset its state, and store its constants.
 
-        This method runs outside the graph.
+        ``params`` are the request's own knobs, or ``defaults`` when None. This
+        method runs outside the graph.
         """
         if rid in self._rid_to_slot:
             return
@@ -142,7 +166,20 @@ class Zonos2SamplerBuffers:
         self.ring_master[slot].fill_(-1)
         self.cursor_master[slot] = 0
         self.offset_master[slot] = 0
-        self.seed_master[slot] = seed
+        p = params if params is not None else self.defaults
+        if p.repetition_window > self.window:
+            raise ValueError(
+                f"repetition_window {p.repetition_window} exceeds the ring width {self.window}"
+            )
+        C = self.n_codebooks
+        values = {
+            "temperature": p.temperature, "topk": p.topk, "top_p": p.top_p,
+            "min_p": p.min_p, "repetition_penalty": p.repetition_penalty,
+            "seed": seed, "window": p.repetition_window,
+            "codebooks": C if p.repetition_codebooks < 0 else min(p.repetition_codebooks, C),
+        }
+        for k, v in values.items():
+            self.const_master[k][slot] = v
 
     def unregister_request(self, rid: str) -> None:
         """Release the slot of ``rid``.
@@ -175,9 +212,10 @@ class Zonos2SamplerBuffers:
         new_offset[:old].copy_(self.offset_master)
         self.offset_master = new_offset
 
-        new_seed = torch.zeros(new_capacity, dtype=torch.int64, device=dev)
-        new_seed[:old].copy_(self.seed_master)
-        self.seed_master = new_seed
+        for k, t in self.const_master.items():
+            grown = torch.zeros(new_capacity, dtype=t.dtype, device=dev)
+            grown[:old].copy_(t)
+            self.const_master[k] = grown
 
         self._free_slots.extend(range(old, new_capacity))
         self._master_capacity = new_capacity
@@ -204,7 +242,8 @@ class Zonos2SamplerBuffers:
         torch.index_select(self.ring_master, 0, idx, out=self.ring_buf[:padded_bs])
         torch.index_select(self.cursor_master, 0, idx, out=self.cursor_buf[:padded_bs])
         torch.index_select(self.offset_master, 0, idx, out=self.offset_buf[:padded_bs])
-        torch.index_select(self.seed_master, 0, idx, out=self.seed_buf[:padded_bs])
+        for k, t in self.const_master.items():
+            torch.index_select(t, 0, idx, out=self.const_buf[k][:padded_bs])
 
     # -- reads (graph-safe) ---------------------------------------------
     def steps(self, padded_bs: int) -> torch.Tensor:
@@ -216,19 +255,31 @@ class Zonos2SamplerBuffers:
 
     def seeds(self, padded_bs: int) -> torch.Tensor:
         """Return the RNG seed of each request."""
-        return self.seed_buf[:padded_bs]
+        return self.const_buf["seed"][:padded_bs]
+
+    def rows(self, padded_bs: int) -> SamplingRows:
+        """Return each request's sampling knobs, for :func:`sample_frame`."""
+        return SamplingRows(**{
+            k: self.const_buf[k][:padded_bs]
+            for k in ("temperature", "topk", "top_p", "min_p", "repetition_penalty")
+        })
 
     def repetition_ids(self, padded_bs: int) -> torch.Tensor:
         """Return the recent ids ``[padded_bs, C, W]`` for the penalty.
 
-        See :func:`apply_repetition_penalty`. The method sets the excluded
-        codebooks to ``-1``, and the penalty then ignores them. It writes into a
-        static buffer of fixed shape, in place, so it is safe for capture.
+        See :func:`apply_repetition_penalty`. Per request, the method sets to
+        ``-1`` the columns older than its window and the codebooks past its
+        cutoff, and the penalty then ignores them. It writes into a static
+        buffer of fixed shape, in place, so it is safe for capture.
         """
         pb = padded_bs
+        cursor = self.cursor_buf[:pb].to(torch.int64).view(pb, 1, 1)
+        age = torch.remainder(cursor - 1 - self._cols, self.window)  # 0 is newest
+        window = self.const_buf["window"][:pb].view(pb, 1, 1)
+        codebooks = self.const_buf["codebooks"][:pb].view(pb, 1, 1)
+        drop = (age >= window) | (self._codebook_idx >= codebooks)  # [pb, C, W]
         self.pen_buf[:pb].copy_(self.ring_buf[:pb])
-        if self._rc_exclude is not None:
-            self.pen_buf[:pb].masked_fill_(self._rc_exclude, -1)
+        self.pen_buf[:pb].masked_fill_(drop, -1)
         return self.pen_buf[:pb]
 
     # -- write (graph-safe) ---------------------------------------------

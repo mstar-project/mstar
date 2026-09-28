@@ -239,3 +239,36 @@ def test_in_graph_ops_are_capture_safe():
     assert torch.equal(ring.offset_buf[:pb], off0 + 4)
     # cursor stays in [0, window) after wrapping.
     assert (ring.cursor_buf[:pb] >= 0).all() and (ring.cursor_buf[:pb] < window).all()
+
+
+# -- per-request repetition window and codebook cutoff ------------------------
+def test_each_request_keeps_its_own_window_and_codebook_cutoff():
+    ring = Zonos2SamplerBuffers.allocate(
+        max_batch_size=2, n_codebooks=C, window=6, repetition_codebooks=-1, device=DEVICE,
+    )
+    ring.register_request("short", params=TTSSamplingParams(repetition_window=2))
+    ring.register_request(
+        "cut", params=TTSSamplingParams(repetition_window=6, repetition_codebooks=1),
+    )
+    rids = ["short", "cut"]
+    for step in range(8):  # wraps the 6-column ring
+        ring.gather_for_request_ids(rids, padded_bs=2)
+        ring.write_frame(torch.full((2, C + 1), step), padded_bs=2)
+        ring.sync_after_step(rids)
+    ring.gather_for_request_ids(rids, padded_bs=2)
+    ids = ring.repetition_ids(2)
+
+    def seen(row, cb):
+        return sorted(v for v in ids[row, cb].tolist() if v >= 0)
+
+    assert all(seen(0, cb) == [6, 7] for cb in range(C))     # the last 2 frames
+    assert seen(1, 0) == [2, 3, 4, 5, 6, 7]                  # the last 6 frames
+    assert all(seen(1, cb) == [] for cb in range(1, C))      # past the cutoff
+
+
+def test_register_rejects_a_window_wider_than_the_ring():
+    ring = Zonos2SamplerBuffers.allocate(
+        max_batch_size=1, n_codebooks=C, window=4, repetition_codebooks=-1, device=DEVICE,
+    )
+    with pytest.raises(ValueError, match="exceeds the ring width"):
+        ring.register_request("r", params=TTSSamplingParams(repetition_window=5))

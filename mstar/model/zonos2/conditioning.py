@@ -140,12 +140,16 @@ def resolve_speaking_rate_bucket(
     speaking_rate_bucket: int | None = None,
     speaking_rate: float | None = None,
     speed: float | None = None,
+    speaking_rate_enabled: bool = False,
 ) -> int | None:
     """Resolve a speaking-rate bucket index, or return ``None`` for no token.
 
     Give exactly one of these: an explicit bucket index, a rate in
-    bytes/second, or a ``speed`` multiplier of the model's neutral rate.
+    bytes/second, or a ``speed`` multiplier of the model's neutral rate. As in
+    the reference, all three are ignored unless ``speaking_rate_enabled``.
     """
+    if not speaking_rate_enabled:
+        return None
     supplied = [
         speaking_rate_bucket is not None,
         speaking_rate is not None,

@@ -258,6 +258,12 @@ Zonos2 environment requirements
   and at most 30 s (``speaker_clip_max_seconds`` in the serving YAML); others get a 400.
   A client that caches the returned embedding can pass it back as the
   ``speaker_embedding`` model kwarg to skip the encoder.
+- **Per-request knobs** (``model_kwargs``, the reference's names): ``temperature``
+  (``<= 0`` is greedy), ``topk``, ``top_p``, ``min_p``, ``repetition_penalty``,
+  ``repetition_window`` (at most ``max_repetition_window``, 256), ``repetition_codebooks``,
+  ``ignore_eos`` and ``seed``. ``max_output_tokens`` (or ``max_tokens``) is the frame budget
+  and must be at least 9. ``speed``, ``speaking_rate`` and ``speaking_rate_bucket`` take
+  effect only with ``speaking_rate_enabled: true``, as in the reference.
 - **Text length.** The model's context is 6144 frames: one per UTF-8 byte of text, plus the
   generated audio (~86 frames/s). Generation stops when the context is full: ~70 s of
   speech after a short prompt, less after a long one. Text too long to leave room for audio

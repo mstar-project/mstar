@@ -42,7 +42,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
-from mstar.model.zonos2.config import ATTN, KV_CACHE, ROPE
+from mstar.model.zonos2.config import ATTN, KV_CACHE, ROPE, SAMPLING
 from mstar.model.zonos2.sampler_buffers import Zonos2SamplerBuffers
 from mstar.model.zonos2.tts_sampling import TTSSamplingParams, sample_frame
 from mstar.model.zonos2.vocoder import StreamingDacDecoder
@@ -70,6 +70,7 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         eoa_id: int,
         params: TTSSamplingParams,
         max_positions: int | None = None,
+        max_repetition_window: int | None = None,
     ):
         super().__init__()
         self.model = model
@@ -80,6 +81,10 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         # The trained context; prompt plus generated frames must fit in it.
         # None disables the cap.
         self.max_positions = max_positions
+        # The ring width; a request's repetition_window must fit in it.
+        self.max_repetition_window = max(
+            max_repetition_window or 0, params.repetition_window, 1,
+        )
         self._prompt_lens: dict[str, int] = {}
 
         # The state of each request. The repetition history and the RNG step
@@ -293,7 +298,9 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         # never touches the global CUDA generator.
         info = engine_inputs.per_request_info
         for rid in real_rids:
-            bufs.register_request(rid, seed=info[rid].random_seed)  # idempotent
+            bufs.register_request(                            # idempotent
+                rid, seed=info[rid].random_seed, params=self._request_params(info[rid]),
+            )
         # (3) Gather the real slots into buf[:len(real_rids)]. Padding rows use
         # slot 0.
         bufs.gather_for_request_ids(real_rids, padded_bs=padded_bs)
@@ -364,7 +371,7 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         pb = logits.shape[0]
         frames = sample_frame(
             logits,
-            self.params,
+            bufs.rows(pb),
             repetition_token_ids=bufs.repetition_ids(pb),
             text_placeholder=self.text_vocab,
             seed=bufs.seeds(pb),
@@ -372,6 +379,11 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         )                                                     # (pb, C + 1)
         bufs.write_frame(frames, padded_bs=pb)
         return frames
+
+    def _request_params(self, info: CurrentForwardPassInfo) -> TTSSamplingParams:
+        """This request's knobs, from the conductor, or the deployment defaults."""
+        params = (getattr(info, "resource_configs", None) or {}).get(SAMPLING)
+        return params if params is not None else self.params
 
     def _ensure_buffers(self, device, padded_bs: int) -> Zonos2SamplerBuffers:
         """Allocate the per-request sampler buffers once, at full capacity.
@@ -390,9 +402,10 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
             self._sampler_buffers = Zonos2SamplerBuffers.allocate(
                 max_batch_size=self._DEFAULT_MAX_BS,
                 n_codebooks=self.n_codebooks,
-                window=self.params.repetition_window,
+                window=self.max_repetition_window,
                 repetition_codebooks=self.params.repetition_codebooks,
                 device=device,
+                defaults=self.params,
             )
         return self._sampler_buffers
 
@@ -429,7 +442,8 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         # countdown. Shift the aligned end frame back by the highest eoa
         # codebook index, because the shear delays that codebook by its index.
         # Then clamp the result at zero.
-        if not self.params.ignore_eos and st["eos_frame"] is None:
+        params = self._request_params(request_info)
+        if not params.ignore_eos and st["eos_frame"] is None:
             eos_cols = [i for i in range(self.n_codebooks) if audio[i] == self.eoa_id]
             if eos_cols:
                 st["eos_frame"] = max(0, st["step"] - max(eos_cols))
@@ -438,8 +452,9 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
             st["countdown"] -= 1
 
         finished = st["eos_frame"] is not None and st["countdown"] <= 0
+        # Count emitted frames, prefill's included, so max_tokens=N gives N.
         max_tokens = getattr(request_info, "max_tokens", None) or self.params.max_tokens
-        if request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= max_tokens:
+        if st["step"] + 1 >= max_tokens:
             finished = True
         # Cap generation at the remaining trained context, as the reference does.
         prompt_len = self._prompt_lens.get(request_id)

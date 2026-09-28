@@ -13,8 +13,6 @@ anyway, so per-position isolation is preserved.
 """
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 from torch import nn
 
@@ -385,10 +383,11 @@ def test_speaker_token_positions_are_absolute_in_packed_batch():
     position is its exclusive prefix sum of sequence lengths, not 0."""
     from mstar.model.submodule_base import ARNodeInputs
     from mstar.model.zonos2.submodules import Zonos2LLMSubmodule
+    from mstar.model.zonos2.tts_sampling import TTSSamplingParams
 
     sub = Zonos2LLMSubmodule(
         model=nn.Linear(1, 1), n_codebooks=9, text_vocab=_TEXT_VOCAB,
-        eoa_id=1024, params=SimpleNamespace(),
+        eoa_id=1024, params=TTSSamplingParams(),
     )
     seq_lens = [7, 5, 3]
     inputs = []
@@ -505,3 +504,46 @@ def test_prompt_that_leaves_no_room_to_speak_is_rejected():
     with pytest.raises(ValueError, match=f"at most {fits} bytes fit") as exc:
         frames(fits + 1)
     assert "100-position context" in str(exc.value)
+
+
+# -- per-request knobs at the API boundary ------------------------------------
+def _prompt(model, **kwargs):
+    return model.process_prompt("Hi.", ["text"], ["audio"], **kwargs)["text_inputs"][0]
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    ({"temperature": "hot"}, "must be a number"),
+    ({"max_output_tokens": 8}, "at least 9 frames"),
+    ({"max_output_tokens": 0}, "at least 9 frames"),
+    ({"max_tokens": -1}, "at least 9 frames"),
+    ({"max_output_tokens": 12.0}, "must be an integer"),
+    ({"speaking_rate_enabled": "yes"}, "must be true or false"),
+])
+def test_bad_request_knobs_are_rejected_before_the_engine(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _prompt(_clone_model(), **kwargs)
+
+
+def test_frame_budget_reads_max_tokens_as_an_alias():
+    model = _clone_model()
+    assert model.get_max_output_tokens() == model.sampling_params.max_tokens
+    assert model.get_max_output_tokens(max_tokens=50) == 50
+    assert model.get_max_output_tokens(max_tokens=50, max_output_tokens=70) == 70
+    _prompt(model, max_output_tokens=model.config.n_codebooks)  # the smallest accepted
+
+
+def test_request_knobs_reach_the_resource_config():
+    from mstar.model.zonos2.config import SAMPLING
+
+    model = _clone_model()
+    cfg = model.get_request_resource_configs({}, {"temperature": 0.3, "topk": 5})[SAMPLING]
+    assert (cfg.temperature, cfg.topk) == (0.3, 5)
+    assert cfg.min_p == model.sampling_params.min_p           # untouched knobs keep defaults
+
+
+def test_speed_is_ignored_unless_speaking_rate_is_enabled():
+    model = _clone_model(speaking_rate_num_buckets=3)
+    plain = _prompt(model)
+    assert torch.equal(_prompt(model, speaking_rate_bucket=1), plain)
+    enabled = _prompt(model, speaking_rate_bucket=1, speaking_rate_enabled=True)
+    assert enabled.shape[0] == plain.shape[0] + 1              # one rate token

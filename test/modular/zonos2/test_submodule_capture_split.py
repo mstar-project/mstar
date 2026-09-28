@@ -32,7 +32,11 @@ from torch import nn
 
 from mstar.model.zonos2.sampler_buffers import Zonos2SamplerBuffers
 from mstar.model.zonos2.submodules import Zonos2LLMSubmodule
-from mstar.model.zonos2.tts_sampling import TTSSamplingParams, sample_frame
+from mstar.model.zonos2.tts_sampling import (
+    TTSSamplingParams,
+    apply_repetition_penalty,
+    sample_frame,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -481,3 +485,66 @@ def test_prefill_records_prompt_lengths_for_the_context_cap():
     assert sub._prompt_lens == lens  # decode steps do not overwrite it
     sub.cleanup_request("a")
     assert sub._prompt_lens == {"b": 12}
+
+
+# --------------------------------------------------------------------------
+# Per-request knobs: each request samples with its own TTSSamplingParams.
+def _knob_inputs(knobs_by_rid):
+    from mstar.model.zonos2.config import SAMPLING
+
+    base = _params()
+    return SimpleNamespace(
+        request_ids=list(knobs_by_rid),
+        per_request_info={
+            rid: SimpleNamespace(
+                random_seed=_seed(rid),
+                resource_configs={SAMPLING: base.for_request(k, max_window=64)},
+            )
+            for rid, k in knobs_by_rid.items()
+        },
+    )
+
+
+def test_each_request_samples_with_its_own_knobs():
+    ei = _knob_inputs({"hot": {"temperature": 5.0}, "greedy": {"temperature": 0.0}})
+    gen = torch.Generator(device=DEVICE).manual_seed(4)
+    logits = [torch.randn(2, C, V, generator=gen) for _ in range(6)]
+    sub = _sub(_params())
+    frames = []
+    for lg in logits:
+        sub._prepare_sampler_step(ei, padded_bs=2)
+        frames.append(sub._sample_in_graph(lg.clone()))
+    # The greedy row takes the argmax of its penalized logits, every step.
+    replay = _sub(_params())
+    for lg, f in zip(logits, frames, strict=True):
+        replay._prepare_sampler_step(ei, padded_bs=2)
+        bufs = replay._sampler_buffers
+        pen = apply_repetition_penalty(
+            lg.clone(), bufs.repetition_ids(2), bufs.rows(2).repetition_penalty,
+        )
+        assert torch.equal(f[1, :C], pen[1].argmax(-1))
+        replay._sample_in_graph(lg.clone())
+    assert any(not torch.equal(f[0, :C], lg[0].argmax(-1)) for f, lg in zip(frames, logits, strict=True))
+
+
+def test_ignore_eos_and_max_tokens_are_per_request():
+    from mstar.model.zonos2.config import SAMPLING
+
+    base = _params()
+    eoa = 8
+
+    def stop_step(knobs, max_tokens):
+        sub = _sub(base)
+        info = SimpleNamespace(
+            dynamic_loop_iter_counts={}, max_tokens=max_tokens,
+            resource_configs={SAMPLING: base.for_request(knobs, max_window=64)},
+        )
+        frame = torch.full((1, C + 1), eoa)                    # eoa on every codebook
+        for step in range(50):
+            if sub.check_stop("r", info, {"new_token": [frame]}):
+                return step
+        return None
+
+    assert stop_step({}, 1000) == C                            # eoa countdown
+    assert stop_step({"ignore_eos": True}, 1000) is None
+    assert stop_step({"ignore_eos": True}, 20) == 19           # exactly 20 frames

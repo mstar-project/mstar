@@ -52,7 +52,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
-from mstar.model.zonos2.config import ATTN, KV_CACHE, ROPE, Zonos2Config
+from mstar.model.zonos2.config import ATTN, KV_CACHE, ROPE, SAMPLING, Zonos2Config
 from mstar.model.zonos2.prompt import BYTE_TEXT_VOCAB_SIZE, TTSPromptBuilder
 from mstar.model.zonos2.tts_sampling import TTSSamplingParams
 from mstar.streaming.chunk_policy import FixedChunkPolicy
@@ -175,7 +175,22 @@ class Zonos2Model(Model):
         ]
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
-        return model_kwargs.get("max_output_tokens", self.sampling_params.max_tokens)
+        """The request's frame budget. ``max_tokens`` is the reference's name."""
+        for key in ("max_output_tokens", "max_tokens"):
+            if model_kwargs.get(key) is not None:
+                return int(model_kwargs[key])
+        return self.sampling_params.max_tokens
+
+    def get_request_resource_configs(
+        self,
+        partition_fwd_args: dict[str, ForwardPassArgs],
+        model_kwargs: dict | None = None,
+    ) -> dict:
+        """The request's sampling knobs; ``process_prompt`` already validated them."""
+        del partition_fwd_args
+        return {SAMPLING: self.sampling_params.for_request(
+            model_kwargs or {}, self.config.max_repetition_window,
+        )}
 
     # ------------------------------------------------------------------
     # Model ABC: graph walks
@@ -446,6 +461,15 @@ class Zonos2Model(Model):
             resolve_speaking_rate_bucket,
         )
 
+        # Reject bad knobs here: this runs in the data worker, so it is a 400.
+        self.sampling_params.for_request(kwargs, self.config.max_repetition_window)
+        self._check_max_output_tokens(kwargs)
+        speaking_rate_enabled = kwargs.get("speaking_rate_enabled", False)
+        if not isinstance(speaking_rate_enabled, bool):
+            raise ValueError(
+                f"speaking_rate_enabled must be true or false, got {speaking_rate_enabled!r}."
+            )
+
         frames = self._prompt_builder.build(
             prompt,
             speaker=speaker,
@@ -456,6 +480,7 @@ class Zonos2Model(Model):
                 speaking_rate_bucket=kwargs.get("speaking_rate_bucket"),
                 speaking_rate=kwargs.get("speaking_rate"),
                 speed=kwargs.get("speed"),
+                speaking_rate_enabled=speaking_rate_enabled,
             ),
             quality_buckets=resolve_quality_buckets(
                 self.config,
@@ -469,6 +494,26 @@ class Zonos2Model(Model):
         if speaker_embedding is not None:
             out["speaker_embedding"] = [speaker_embedding]
         return out
+
+    def _check_max_output_tokens(self, kwargs: dict) -> None:
+        """Reject a frame budget too small to produce audio.
+
+        The DAC holds back the last ``n_codebooks - 1`` frames, so the budget
+        must be at least ``n_codebooks``. The reference rejects only ``<= 0``,
+        which would leave 1-8 returning 200 with no audio.
+        """
+        for key in ("max_output_tokens", "max_tokens"):
+            value = kwargs.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{key} must be an integer, got {value!r}.")
+            minimum = self.config.n_codebooks
+            if value < minimum:
+                raise ValueError(
+                    f"{key} is {value}; at least {minimum} frames are needed for any "
+                    f"audio, because the decoder holds back the last {minimum - 1}."
+                )
 
     def _check_prompt_fits(self, text: str, num_frames: int) -> None:
         """Reject a prompt that leaves no room in the trained context for audio.
@@ -597,6 +642,7 @@ class Zonos2Model(Model):
             eoa_id=self.config.eoa_id,
             params=self.sampling_params,
             max_positions=self.config.max_position_embeddings,
+            max_repetition_window=self.config.max_repetition_window,
         )
 
     def _create_dac_submodule(self, device):

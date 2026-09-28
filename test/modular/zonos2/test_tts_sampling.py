@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from mstar.model.zonos2.tts_sampling import (
+    SamplingRows,
     TTSSamplingParams,
     apply_min_p,
     apply_repetition_penalty,
@@ -168,3 +169,88 @@ def test_aggressive_filters_do_not_crash_and_stay_in_range():
     params = TTSSamplingParams(temperature=1.0, topk=V, top_p=1e-6, min_p=0.999)
     frame = sample_frame(_logits([5, 0, 2]), params)
     assert (frame[0, :C] >= 0).all() and (frame[0, :C] < V).all()
+
+
+# -- per-row knobs ------------------------------------------------------------
+_KNOB_SETS = [
+    {},                                                    # the shipped defaults
+    {"temperature": 0.0},                                  # greedy
+    {"temperature": 0.7, "topk": 3, "min_p": 0.0},
+    {"temperature": 1.0, "topk": 0, "top_p": 0.6, "min_p": 0.0},
+    {"temperature": 1.3, "topk": V, "top_p": 0.9, "min_p": 0.3},
+    {"repetition_penalty": 1.0},
+    {"repetition_penalty": 2.5, "min_p": 0.9},
+]
+
+
+@pytest.mark.parametrize("knobs", _KNOB_SETS)
+def test_uniform_knobs_match_the_legacy_sampler_bit_for_bit(knobs):
+    import _legacy_sampling as legacy  # pytest puts this dir on sys.path
+
+    B, W = 5, 4
+    gen = torch.Generator().manual_seed(0)
+    logits = torch.randn(B, C, V, generator=gen) * 3
+    rep_ids = torch.randint(-1, V, (B, C, W), generator=gen)
+    steps = torch.arange(B) * 3
+    new = sample_frame(
+        logits, TTSSamplingParams(**knobs), rep_ids, text_placeholder=7,
+        seed=torch.full((B,), 123), steps=steps,
+    )
+    old = legacy.sample_frame(
+        logits, legacy.TTSSamplingParams(**knobs), rep_ids, text_placeholder=7,
+        seed=123, steps=steps,
+    )
+    assert torch.equal(new, old)
+
+
+def test_per_row_knobs_match_each_row_sampled_alone():
+    B = len(_KNOB_SETS)
+    gen = torch.Generator().manual_seed(1)
+    logits = torch.randn(B, C, V, generator=gen) * 3
+    rep_ids = torch.randint(-1, V, (B, C, 4), generator=gen)
+    seeds, steps = torch.arange(B) + 40, torch.arange(B)
+    params = [TTSSamplingParams(**k) for k in _KNOB_SETS]
+    rows = SamplingRows(**{
+        f: torch.tensor([getattr(p, f) for p in params])
+        for f in ("temperature", "topk", "top_p", "min_p", "repetition_penalty")
+    })
+    rows.temperature, rows.top_p, rows.min_p, rows.repetition_penalty = (
+        t.float() for t in (rows.temperature, rows.top_p, rows.min_p, rows.repetition_penalty)
+    )
+    batched = sample_frame(logits, rows, rep_ids, seed=seeds, steps=steps)
+    for i, p in enumerate(params):
+        alone = sample_frame(
+            logits[i:i + 1], p, rep_ids[i:i + 1], seed=seeds[i:i + 1], steps=steps[i:i + 1],
+        )
+        assert torch.equal(batched[i:i + 1], alone), _KNOB_SETS[i]
+
+
+# -- per-request params -------------------------------------------------------
+def test_for_request_applies_kwargs_over_defaults_and_normalizes():
+    import pickle
+
+    base = TTSSamplingParams()
+    got = base.for_request({
+        "temperature": 0.5, "topk": -3, "top_p": 1.5, "min_p": -1,
+        "repetition_penalty": 0.5, "repetition_codebooks": -5, "repetition_window": 7,
+        "ignore_eos": True, "unrelated": "x",
+    }, max_window=64)
+    assert (got.temperature, got.topk, got.top_p, got.min_p) == (0.5, 0, 1.0, 0.0)
+    assert (got.repetition_penalty, got.repetition_codebooks) == (1.0, -1)
+    assert (got.repetition_window, got.ignore_eos) == (7, True)
+    assert base == TTSSamplingParams()                   # the defaults are untouched
+    assert base.for_request({}, max_window=64) == base   # no kwargs, no change
+    assert pickle.loads(pickle.dumps(got)) == got        # crosses to the workers
+
+
+@pytest.mark.parametrize("kwargs, match", [
+    ({"temperature": "hot"}, "must be a number"),
+    ({"temperature": True}, "must be a number"),
+    ({"temperature": float("nan")}, "must be finite"),
+    ({"topk": 2.5}, "must be an integer"),
+    ({"ignore_eos": 1}, "must be true or false"),
+    ({"repetition_window": 65}, "at most 64"),
+])
+def test_for_request_rejects_bad_values(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        TTSSamplingParams().for_request(kwargs, max_window=64)

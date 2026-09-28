@@ -14,6 +14,9 @@ from dataclasses import dataclass
 KV_CACHE = "kv_cache"
 ATTN = "attn"
 ROPE = "rope"
+# Not a resource: the key the request's TTSSamplingParams travels under on
+# ``request_info.resource_configs``. The runner ignores keys it has no resource for.
+SAMPLING = "zonos2_sampling"
 
 
 @dataclass
@@ -96,6 +99,8 @@ class Zonos2Config:
     # The longest reference clip a clone request may send; longer ones get a
     # 400. The encoder embeds the whole clip on the LLM's GPU.
     speaker_clip_max_seconds: float = 30.0
+    # The largest repetition_window a request may ask for; it sets the ring width.
+    max_repetition_window: int = 256
 
     # ---- Text-column conditioning tokens ---------------------------
     # The conditioning tokens occupy the tail of the text vocabulary in this
