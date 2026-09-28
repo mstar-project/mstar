@@ -166,11 +166,15 @@ class _HoldingWorker:
 
     _handle_allocation_failure = Worker._handle_allocation_failure
     _push_back_batch = Worker._push_back_batch
+    _is_tp_follower_node = Worker._is_tp_follower_node
 
     def __init__(self):
         self._graph_runtime = _Runtime()
         self.scheduler = SimpleNamespace(hold_requests=lambda rids: None)
         self._hold_logged = {}
+        # not a sharded node, so this rank runs its own OOM recovery
+        self.parallel_nodes = set()
+        self.parallel_leader_nodes = set()
 
     def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None):
         # no victim

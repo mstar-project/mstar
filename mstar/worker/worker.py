@@ -1170,6 +1170,12 @@ class Worker:
             return -1
         seq = self._tp_broadcast_seq
         self._tp_broadcast_seq += 1
+        # Drained once, outside the loop: every rank needs the same moves, so
+        # draining per follower would give the first one everything and the rest
+        # nothing. Each gets its own copy because each pops as it replays.
+        resident_delta = self.engine_manager.get_engine(
+            node_batch.node_name
+        ).take_resident_delta(node_batch.node_name)
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
@@ -1188,6 +1194,7 @@ class Worker:
                         speculative=speculative,
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
+                        resident_delta=resident_delta.copy(),
                     )
                 )
             )
@@ -1567,14 +1574,22 @@ class Worker:
         that invariant ever breaks. TP async scheduling leans on the same
         symmetry: a follower voids a speculative head from its own verdict.
 
-        v2 caveat: this function does not yet coordinate ``_last_active``
-        / eviction-victim selection across TP ranks. Wall-clock LRU can
-        pick different victims per rank under contention, leading to
-        request-id ↔ page-index drift and (eventually) asymmetric OOM on
-        future reloads. Today's TP configs don't enable CPU offload, so
-        the path isn't exercised; revisit when we light up offload + TP.
+        Eviction is the one decision that is NOT derivable from the broadcast,
+        since LRU orders on wall clock. So only rank 0 picks a victim; its choice
+        rides out on the next ``ScheduleTPNode`` as a resident-set delta, and a
+        follow rank returns below without evicting or holding anything. Holding
+        in particular would be wrong rather than merely useless: a follow rank
+        has no scheduling decision a backoff could improve, and rank 0 hit the
+        same OOM on the same batch and is already driving the retry.
         """
         batch_ids = set(batch.request_to_worker_graph)
+
+        # Push all batch nodes back to their queues
+        self._push_back_batch(batch)
+
+        if self._is_tp_follower_node(batch.node_name):
+            return
+
         # scope the eviction to whichever resource actually ran out, when the
         # admit named one
         failed = node_batch.failed_resource
@@ -1582,9 +1597,6 @@ class Worker:
             node_batch.node_name, batch_ids,
             affected_resources=None if failed is None else {failed},
         )
-
-        # Push all batch nodes back to their queues
-        self._push_back_batch(batch)
 
         if victim_id is not None:
             self.scheduler.hold_requests([victim_id])
@@ -1625,6 +1637,15 @@ class Worker:
                 and batch.node_name in self.parallel_leader_nodes
             )
         return True
+
+    def _is_tp_follower_node(self, node_name: str) -> bool:
+        """This rank follows ``node_name``: rank 0 of its instance decides both
+        what runs on it and what gets evicted from it. Mirrors the engine's
+        ``_tp_follower_nodes``, which refuses the eviction itself."""
+        return (
+            node_name in self.parallel_nodes
+            and node_name not in self.parallel_leader_nodes
+        )
 
     def _tp_async_for(self, node_name: str) -> bool:
         """TP async scheduling applies to this node (flag, narrowed by node list)."""

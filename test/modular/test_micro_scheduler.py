@@ -172,7 +172,8 @@ class _Engine:
         del node_name, graph_walk
         return self._max_bs
 
-    def check_ready(self, node_name, rid, fwd_info):
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        del allow_reload
         del node_name, fwd_info
         if rid in self.unservable:
             return FullAdmitOutcome(

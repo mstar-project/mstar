@@ -42,7 +42,8 @@ def _edge_block(rids) -> ColumnarEdgeSpecs:
 
 
 class _FakeEngine:
-    def check_ready(self, node_name, rid, fwd_info):
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        del allow_reload
         return FULL_ADMIT_OK
 
 

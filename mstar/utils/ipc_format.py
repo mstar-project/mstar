@@ -1,7 +1,5 @@
-from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
-from typing import NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import PublishedInfo
@@ -103,7 +101,8 @@ class StopLoops(MessageBody):
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
 
-class OffloadDelta(NamedTuple):
+@dataclass
+class OffloadDelta:
     """A rank's offloads and reloads, in the order it made them.
 
     Ordered, and that is the whole point: a set of offloads plus a set of
@@ -111,17 +110,28 @@ class OffloadDelta(NamedTuple):
     offload A replays from sets as "resident", when the rank that recorded it has
     A on the host. Replaying the sequence cannot get that wrong.
 
-    ``__len__`` is the queue depth, not the tuple's two fields — so an empty
-    delta is falsy, which several callers lean on.
+    Holds WIRE request ids, not worker-local handles: a handle is minted per
+    worker, so rank 0's would name different requests on the follower.
+
+    A dataclass of lists rather than a NamedTuple of deques because this rides on
+    every ``ScheduleTPNode``. The wire codec encodes a dataclass field by its
+    declared type; anything else falls through to the pickle path, and that would
+    be a pickle per broadcast per follower on every step. Not a ``MessageBody``:
+    it is a field, not a body, and a concrete dataclass hint takes the typed path
+    either way. ``pop_left`` is O(n) on a list, which costs nothing at the handful
+    of entries a delta ever holds.
+
+    ``__len__`` is the queue depth, so an empty delta is falsy -- several callers
+    lean on that.
     """
 
-    # parallel queues: rids[i] was offloaded if is_offload[i], else reloaded
-    rids: deque[str]
-    is_offload: deque[bool]
+    # parallel lists: rids[i] was offloaded if is_offload[i], else reloaded
+    rids: list[str] = field(default_factory=list)
+    is_offload: list[bool] = field(default_factory=list)
 
     @classmethod
-    def new(cls):
-        return cls(deque(), deque())
+    def new(cls) -> "OffloadDelta":
+        return cls()
 
     def add_offloaded(self, rid: str):
         self.rids.append(rid)
@@ -142,16 +152,22 @@ class OffloadDelta(NamedTuple):
     def pop_left(self) -> tuple[str, bool] | None:
         if not len(self):
             return None
-        return (self.rids.popleft(), self.is_offload.popleft())
+        return (self.rids.pop(0), self.is_offload.pop(0))
+
+    def copy(self) -> "OffloadDelta":
+        """An independent queue holding the same moves.
+
+        One per follower: each replays at its own pace, popping as it goes.
+        """
+        return OffloadDelta(list(self.rids), list(self.is_offload))
 
     def take(self) -> "OffloadDelta":
         """Hand the queue over and leave this one empty.
 
-        Copies and clears rather than rebinding: the fields are a NamedTuple's,
-        so they cannot be reassigned — only the deques behind them can be
-        mutated.
+        Copies and clears rather than rebinding, so a holder of this delta (the
+        engine keeps its journal in a dict) sees it emptied.
         """
-        taken = OffloadDelta(deque(self.rids), deque(self.is_offload))
+        taken = self.copy()
         self.rids.clear()
         self.is_offload.clear()
         return taken

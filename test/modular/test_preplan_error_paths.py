@@ -30,6 +30,9 @@ def _fake_worker() -> Worker:
     w._phase_period = 0
     w._phase_buf = defaultdict(list)
     w.device = torch.device("cpu")
+    # The forward runs on a side stream; None is the real value under
+    # MSTAR_FORWARD_SIDE_STREAM=0 and on CPU, so _on_compute_stream no-ops.
+    w._compute_stream = None
     w._in_flight_rids = set()
     w.failed = []
     w.resets = []

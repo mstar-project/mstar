@@ -26,6 +26,7 @@ from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import FULL_ADMIT_OK
 from mstar.utils.ipc_format import OffloadDelta
+from mstar.worker.worker import Worker
 
 
 def _entries(delta: OffloadDelta) -> list[tuple[str, bool]]:
@@ -482,3 +483,173 @@ def test_the_roles_are_per_node():
     assert engine._tp_leader_nodes == {"lead"}
     assert engine._tp_follower_nodes == {"follow"}
     assert set(engine._resident_delta) == {"lead"}
+
+
+# --- the wiring: the leader puts its moves on the wire ----------------------
+#
+# Both halves have to land together. The engine refuses a follower's own
+# eviction, so if nothing supplies the replacement the follower simply never
+# matches rank 0 — its admit keeps failing while rank 0 proceeds into the
+# collective, and the run hangs with the follower idle.
+
+
+class _Leader:
+    """``maybe_send_zmq_to_tp_followers`` over stubs."""
+
+    maybe_send_zmq_to_tp_followers = Worker.maybe_send_zmq_to_tp_followers
+    _rid_str = Worker._rid_str
+
+    def __init__(self, followers=("rank1", "rank2")):
+        self.engine = _Engine("leader")
+        self.engine_manager = SimpleNamespace(get_engine=lambda node: self.engine)
+        self.parallel_nodes = {"node"}
+        self.parallel_leader_nodes = {"node"}
+        self._tp_broadcast_seq = 0
+        group = SimpleNamespace(_workers=["rank0", *followers])
+        # The runtime owns both the sharding config and the handle table now.
+        # Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
+        # broadcast that shipped local handles instead of wire ids is visible.
+        self._graph_runtime = SimpleNamespace(
+            get_sharding_config=lambda rid: SimpleNamespace(
+                get_sharding_group=lambda n, w: group
+            ),
+            get_rid_string=_Rids().get_rid_string,
+        )
+        self.sent: list = []
+        self.communicator = SimpleNamespace(
+            send=lambda worker, msg: self.sent.append((worker, msg))
+        )
+
+
+def _node_batch():
+    return SimpleNamespace(
+        node_name="node", graph_walk="walk", request_ids=("r0",),
+    )
+
+
+def test_the_broadcast_carries_the_leaders_moves():
+    """Without this the delta is always empty and no follower ever replays."""
+    leader = _Leader(followers=("rank1",))
+    leader.engine.offload_request("node", "victim")
+
+    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+
+    assert len(leader.sent) == 1
+    body = leader.sent[0][1].body
+    # wire ids, not local handles: the follower mints its own, so a broadcast
+    # naming rank 0's would replay against the wrong requests
+    assert _entries(body.resident_delta) == [("wire-victim", True)]
+    assert body.request_ids == ["wire-r0"]
+
+
+def test_every_follower_gets_the_same_moves_in_its_own_queue():
+    """Drained once, copied per follower. Draining inside the send loop would
+    give the first follower everything and leave the rest behind forever."""
+    leader = _Leader(followers=("rank1", "rank2"))
+    leader.engine.offload_request("node", "victim")
+
+    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+
+    deltas = [msg.body.resident_delta for _, msg in leader.sent]
+    assert len(deltas) == 2
+    assert all(_entries(d) == [("wire-victim", True)] for d in deltas), (
+        "a follower was sent an empty delta"
+    )
+    # and one replaying does not drain another's
+    deltas[0].pop_left()
+    assert len(deltas[1]) == 1
+
+
+def test_the_journal_is_drained_by_the_broadcast():
+    leader = _Leader(followers=("rank1",))
+    leader.engine.offload_request("node", "victim")
+
+    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+    leader.sent.clear()
+    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+
+    assert len(leader.sent[0][1].body.resident_delta) == 0, (
+        "the same move went out twice"
+    )
+
+
+# --- the wiring: a follower does not run rank 0's OOM recovery --------------
+
+
+class _Queue:
+    """Stands in for the graph runtime, which owns the ready queues."""
+
+    def __init__(self):
+        self.pushed_back: list[str] = []
+
+    def push_back_node(self, node_name, rids, wg_ids):
+        del node_name, wg_ids
+        self.pushed_back.extend(rids)
+
+
+class _Rank:
+    """``_handle_allocation_failure`` over stubs, for one rank of ``"node"``."""
+
+    _handle_allocation_failure = Worker._handle_allocation_failure
+    _is_tp_follower_node = Worker._is_tp_follower_node
+    _push_back_batch = Worker._push_back_batch
+
+    def __init__(self, *, leader: bool):
+        self.queue = _Queue()
+        self._graph_runtime = self.queue
+        self.held: list[str] = []
+        self.scheduler = SimpleNamespace(hold_requests=self.held.extend)
+        self._hold_logged = {}
+        self.parallel_nodes = {"node"}
+        self.parallel_leader_nodes = {"node"} if leader else set()
+        self.offload_attempts: list[str] = []
+
+    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None):
+        del batch_ids, affected_resources
+        self.offload_attempts.append(node_name)
+        return "victim"
+
+
+def _oom(rank):
+    batch = SimpleNamespace(
+        node_name="node", graph_walk="walk",
+        node_objects={"r0": object(), "r1": object()},
+        request_to_worker_graph={"r0": "wg", "r1": "wg"},
+    )
+    node_batch = SimpleNamespace(node_name="node", failed_resource=None)
+    rank._handle_allocation_failure(batch, node_batch)
+
+
+def test_a_follow_rank_neither_evicts_nor_holds():
+    """What the log showed it doing instead: "no offload possible, holding 15
+    requests". The eviction is rank 0's and arrives as a delta, and a follow rank
+    has no scheduling decision a backoff could improve — the hold only delays
+    building the ScheduleTPNode that carries the fix."""
+    follower = _Rank(leader=False)
+
+    _oom(follower)
+
+    assert follower.offload_attempts == [], "a follow rank picked its own victim"
+    assert follower.held == []
+    # the batch still has to go back, or rank 0's retry finds nothing ready
+    assert sorted(follower.queue.pushed_back) == ["r0", "r1"]
+
+
+def test_rank_zero_still_evicts_and_holds_its_victim():
+    leader = _Rank(leader=True)
+
+    _oom(leader)
+
+    assert leader.offload_attempts == ["node"]
+    assert leader.held == ["victim"]
+    assert sorted(leader.queue.pushed_back) == ["r0", "r1"]
+
+
+def test_an_unsharded_node_still_runs_its_own_recovery():
+    solo = _Rank(leader=False)
+    solo.parallel_nodes = set()  # "node" is not sharded here
+
+    _oom(solo)
+
+    assert solo.offload_attempts == ["node"]
+    assert solo.held == ["victim"]
