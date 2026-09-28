@@ -9,11 +9,14 @@ was the only reason a resource could give:
 2. the worker must re-queue the batch, or the requests are never retried.
 
 Only an ``AllocationFailed`` additionally calls for an eviction;
-``RequestOffloading`` says the rid is already on its way to the host.
+``RequestOffloading`` says the rid is already on its way to the host. When
+nothing can be evicted the batch is held and retried every backoff, so the line
+saying so is kept to one per node and walk every few seconds.
 """
 
 from __future__ import annotations
 
+import logging
 import sys
 from types import SimpleNamespace
 
@@ -31,6 +34,7 @@ from mstar.engine.resources import (
     StepContext,
     SubmoduleStep,
 )
+from mstar.worker import worker as worker_mod
 from mstar.worker.worker import Worker
 
 
@@ -148,6 +152,66 @@ def test_allocation_failure_still_evicts():
     # exactly one push-back per request: the delegation must not double up
     assert sorted(worker.queue.pushed_back) == ["r0", "r1"]
     assert sorted(worker.held) == ["r0", "r1"]
+
+
+class _HoldingWorker:
+    """Binds the real allocation handler onto a worker with nothing to evict."""
+
+    _handle_allocation_failure = Worker._handle_allocation_failure
+
+    def __init__(self):
+        self.queue = _Queue()
+        self.worker_graphs_manager = SimpleNamespace(queues={"wg": self.queue})
+        self.scheduler = SimpleNamespace(hold_requests=lambda rids: None)
+        self._hold_logged = {}
+
+    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None):
+        # no victim
+        del node_name, batch_ids, affected_resources
+
+
+def _hold(worker, monkeypatch, at: float, walk: str = "walk") -> None:
+    monkeypatch.setattr(worker_mod, "_time", SimpleNamespace(monotonic=lambda: at))
+    batch, node_batch = _batches(_alloc_failed())
+    batch.graph_walk = walk
+    node_batch.failed_resource = None
+    worker._handle_allocation_failure(batch, node_batch)
+
+
+def _hold_lines(caplog) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if "no offload possible" in record.getMessage()
+    ]
+
+
+def test_a_hundred_holds_on_one_node_log_two_lines_and_count_the_rest(monkeypatch, caplog):
+    worker = _HoldingWorker()
+    step = worker_mod._HOLD_LOG_INTERVAL / 50
+
+    with caplog.at_level(logging.WARNING, logger=worker_mod.__name__):
+        # a retry every fiftieth of the interval, across two intervals
+        for tick in range(100):
+            _hold(worker, monkeypatch, tick * step)
+
+    lines = _hold_lines(caplog)
+    assert len(lines) == 2, f"a hundred holds logged {len(lines)} lines, not one per interval"
+    assert "(0 earlier holds not logged)" in lines[0], lines[0]
+    assert "(49 earlier holds not logged)" in lines[1], (
+        f"the second line lost count of the holds it stands for: {lines[1]}"
+    )
+
+
+def test_a_hold_on_another_walk_is_logged_inside_the_interval(monkeypatch, caplog):
+    worker = _HoldingWorker()
+
+    with caplog.at_level(logging.WARNING, logger=worker_mod.__name__):
+        _hold(worker, monkeypatch, 0.0, walk="prefill")
+        _hold(worker, monkeypatch, 0.1, walk="decode")
+
+    assert len(_hold_lines(caplog)) == 2, (
+        "one walk's hold silenced another's, so a stall on it would go unseen"
+    )
 
 
 # --- the unbatchable path admits everything before it runs anything --------

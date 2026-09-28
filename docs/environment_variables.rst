@@ -35,6 +35,12 @@ Communication
      - ``19000``
      - Base of the deterministic entity-id → TCP port map (``api_server``
        = base, ``conductor`` = base+1, ``worker_<rank>`` = base+100+rank).
+   * - ``MSTAR_REQUIRE_CUDA_GRAPHS``
+     - ``0``
+     - ``1`` makes a worker fail at startup when any CUDA graph bucket
+       could not be captured, instead of serving that bucket eagerly at
+       10-20x the latency. Off by default: a failed capture is logged at
+       ERROR with a per-runner summary and the rest keeps running.
    * - ``MSTAR_SHM_ARENA``
      - ``0``
      - SHM tensor-transport implementation. ``0``: per-uuid files.
@@ -270,3 +276,9 @@ Worker scheduling
      - ``0``
      - ``N > 0``: every N iterations log per-phase p50/p95/mean of the
        worker main loop (speculate, await_gpu, submit_spec, ...).
+   * - ``MSTAR_KV_DEBUG_ASSERTS``
+     - ``0``
+     - ``1``: after every ``admit``, ``commit``, ``reset_request`` and
+       ``remove_request``, check the KV page bookkeeping (free list, owner
+       counts, seals) against the streams holding the pages. Walks every
+       live stream; tests and debugging only.

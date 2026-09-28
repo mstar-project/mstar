@@ -25,7 +25,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AllocationFailed, StepContext
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.graph.base import GraphEdge, GraphNode, SpeculativeNodeInfo
+from mstar.graph.base import GraphEdge, GraphNode, GraphSection, SpeculativeNodeInfo
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import Model, WorkerGraph
@@ -64,6 +64,10 @@ from mstar.worker.node_manager_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# seconds between "no offload possible" lines for one node and walk: a hold is
+# retried every backoff, and a line per retry buries the rest of the log
+_HOLD_LOG_INTERVAL = 5.0
 
 
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
@@ -337,6 +341,8 @@ class Worker:
         # CPU offloading: LRU tracking and eviction policy
         self._last_active: dict[tuple[str, str], float] = {}  # (request_id, node_name) -> monotonic timestamp
         self.eviction_policy = EvictionPolicy.LRU
+        # (node, walk) -> when its last hold was logged, and the holds since
+        self._hold_logged: dict[tuple[str, str], tuple[float, int]] = {}
 
         # Async-scheduling cross-iter state. Initialized here (rather than in
         # run()) because _remove_request — which can be invoked indirectly
@@ -402,17 +408,42 @@ class Worker:
             conn.edge_name for conn in self._my_consumer_connections
         }
 
-        # Build consumer node cache: edge_name -> next_node name
+        # Build consumer node cache: edge_name -> consuming node name.
         self._consumer_node_cache: dict[str, str] = {}
         if self._my_consumer_connections and model:
-            walks = model.get_graph_walk_graphs()
-            for conn in self._my_consumer_connections:
-                for section in walks.values():
-                    if hasattr(section, 'input_names') and conn.edge_name in section.input_names:
-                        self._consumer_node_cache[conn.edge_name] = section.name
+            self._consumer_node_cache = self._build_consumer_node_cache(
+                self._my_consumer_connections, model.get_graph_walk_graphs(),
+            )
+
+    @staticmethod
+    def _build_consumer_node_cache(
+        connections, walks: dict[str, GraphSection],
+    ) -> dict[str, str]:
+        """Map each incoming streaming edge to the node that consumes it.
+
+        Recurses through ``get_nodes()`` so a consumer nested inside a
+        ``Loop`` / ``Sequential`` / ``Parallel`` is found too. Matching the
+        walk's top-level ``input_names`` only finds a walk that is itself a
+        single ``GraphNode``; a decode ``Loop`` whose inner node consumes the
+        streamed edge would be missed, and its chunks routed to ``next_node=""``.
+        """
+        cache: dict[str, str] = {}
+        for conn in connections:
+            for section in walks.values():
+                for node in section.get_nodes().values():
+                    if conn.edge_name in node.input_names:
+                        cache[conn.edge_name] = node.name
+        return cache
 
     def _get_node_names_for_partition(self, partition_name: str, model: Model) -> list[str]:
-        """Get the node names that belong to a partition."""
+        """Get the node names that belong to a partition.
+
+        Recurses into each walk so nodes nested in a ``Loop`` / ``Sequential``
+        / ``Parallel`` are included. Taking the section's own ``name`` would
+        return the Loop's name (e.g. ``"talker_decode_loop"``) instead of the
+        consuming node's, so its ``StreamBuffer`` would never be created and
+        routing the streamed edge would fail with a ``KeyError``.
+        """
         walks = model.get_graph_walk_graphs()
         partitions = model.get_partitions()
         for pdef in partitions:
@@ -420,8 +451,8 @@ class Worker:
                 nodes = set()
                 for walk_name in pdef.graph_walks:
                     section = walks.get(walk_name)
-                    if section and hasattr(section, 'name'):
-                        nodes.add(section.name)
+                    if section is not None:
+                        nodes.update(section.get_nodes().keys())
                 return list(nodes)
         return []
 
@@ -964,24 +995,39 @@ class Worker:
         final_stream_rids: set[str] = set()
         batch_partition = self.worker_graphs_manager.get_partition_for_node(batch.node_name)
 
+        request_ids: list[str] = []
         for request_id, node in batch.node_objects.items():
             tensors = {}
             ready_inputs = node.ready_signals.ready_inputs
-            for input_name, edge in ready_inputs.items():
-                tensors[input_name] = [
-                    self.tensor_manager.get_tensor(
-                        request_id=request_id, uuid=info.uuid
-                    ) for info in edge.tensor_info
-                ]
+            try:
+                for input_name, edge in ready_inputs.items():
+                    tensors[input_name] = [
+                        self.tensor_manager.get_tensor(
+                            request_id=request_id, uuid=info.uuid
+                        ) for info in edge.tensor_info
+                    ]
+                fwd_info = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+            except KeyError:
+                # The request was cancelled (its tensors and graph state
+                # dropped) after this batch was scheduled. It has no step to
+                # run any more; the others in the batch still do, so leave it
+                # out rather than failing them all with it.
+                logger.warning(
+                    "Worker %s: request %s was dropped before its %s step ran; leaving it out of the batch",
+                    self.worker_id, request_id, batch.node_name,
+                )
+                continue
+            for edge in ready_inputs.values():
                 if edge._final_stream_chunk:
                     final_stream_rids.add(request_id)
             per_request_inputs[request_id] = tensors
-            per_request_info[request_id] = self.worker_graphs_manager.get_fwd_info(request_id, batch_partition)
+            per_request_info[request_id] = fwd_info
+            request_ids.append(request_id)
 
         return self._make_executing_batch(
             node_name=batch.node_name,
             graph_walk=batch.graph_walk,
-            request_ids=list(batch.node_objects.keys()),
+            request_ids=request_ids,
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
             final_stream_rids=final_stream_rids,
@@ -1519,10 +1565,17 @@ class Worker:
             )
         else:
             self.scheduler.hold_requests(list(batch_ids))
+            key = (batch.node_name, batch.graph_walk)
+            now = _time.monotonic()
+            last, unlogged = self._hold_logged.get(key, (None, 0))
+            if last is not None and now - last < _HOLD_LOG_INTERVAL:
+                self._hold_logged[key] = (last, unlogged + 1)
+                return
+            self._hold_logged[key] = (now, 0)
             logger.warning(
                 "OOM on node=%s walk=%s: no offload possible, "
-                "holding %d requests",
-                batch.node_name, batch.graph_walk, len(batch_ids),
+                "holding %d requests (%d earlier holds not logged)",
+                batch.node_name, batch.graph_walk, len(batch_ids), unlogged,
             )
 
     # ------------------------------------------------------------------
@@ -2303,6 +2356,20 @@ class Worker:
         )
         _pp_stage("prematerialize")
         stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs)
+        # the same host copy, before stops, so a request ending here still indexes its pages
+        engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs)
+
+        # Stream-terminated loop: a stream-consuming node inside a loop has no
+        # internal stop signal (unlike a self-EOS loop), so when it consumes the
+        # terminal chunk of its stream (``final_stream_rids``: the StreamBuffer
+        # popped ``is_final``, which a ``continue_after_done`` policy never
+        # sets) end its innermost enclosing loop. Without this the loop would
+        # spin to ``max_iters`` and the partition would never report done.
+        for rid in batch_N.node_batch.final_stream_rids:
+            nested = per_req_nested_idxs.get(rid)
+            if nested is not None and nested.loop_name_order:
+                stops.setdefault(rid, set()).add(nested.loop_name_order[-1])
+
         if batch_N.node_batch.failed_requests:
             # A rid whose stop check raised has no trustworthy stop decision:
             # routing it would either run its loop forever or end it early.

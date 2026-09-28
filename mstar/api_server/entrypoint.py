@@ -75,6 +75,13 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    # A server started as a background job of a non-interactive shell inherits
+    # SIGINT ignored, and Python keeps an inherited ignore, so the graceful stop
+    # below (and _shutdown_conductor_process's) would be a no-op. Make it real.
+    # default_int_handler rather than SIG_DFL because it raises
+    # KeyboardInterrupt, which unwinds conductor.run() into the finally that
+    # shuts the conductor down, where SIG_DFL would kill the process on the spot.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     # Started before the model load so an API server that dies during it is
     # still caught. SIGINT is the conductor's graceful stop (run() unwinds into
     # shutdown(), terminating the workers), matching _shutdown_conductor_process.
@@ -184,6 +191,7 @@ class APIServer:
         model_name: str = "dummy",
         log_stats: bool = False,
         log_stats_file: str | None = None,
+        model_config: dict | None = None,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -204,6 +212,7 @@ class APIServer:
 
         self.preprocess_worker = PreprocessWorker(
             model=model,
+            model_config=model_config,
             hostname=hostname,
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
@@ -1055,6 +1064,7 @@ def main(argv: list[str] | None = None):
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
         model_name=model_name,
+        model_config=config,
         tcp_transfer_device=args.tcp_transfer_device,
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,

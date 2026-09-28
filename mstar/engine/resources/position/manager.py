@@ -2,12 +2,13 @@
 
 has ownership of per-(request,label) position counter"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 import torch
 
 from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, PublishedInfo, Resource
 from mstar.engine.resources.kv.config import KVSpec
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs, SequenceView
 from mstar.engine.resources.position.config import (
     PosBackend,
@@ -34,6 +35,9 @@ class PublishedPositionInfo(PublishedInfo):
 
 
 class PositionManager(Resource):
+    # only under a sequential scheme, which the load check enforces
+    prefix_skip_safe = True
+
     # NOTE: not an `AttentionResource`, so no label/layer cursors — this is
     # called once per step, not per layer. Layers reach `apply_qk` with the
     # label off `AttentionCallable.label`; make this one if that stops holding.
@@ -97,6 +101,8 @@ class RopeManager(PositionManager):
 
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
+        # rid -> tokens the prefix cache matched, until `admit`
+        self._matched: dict[str, int] = {}
 
         self._static_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
         # Host side of the same addressing, keyed the same way; see
@@ -132,15 +138,54 @@ class RopeManager(PositionManager):
             )
         return buffer
 
+    def fingerprint(self) -> bytes:
+        # every field, so a rope parameter nobody thought to list still
+        # invalidates what an older setting wrote
+        return fingerprint(*(
+            getattr(self._config, f.name) for f in fields(self._config)
+        ))
+
     def ingest_request(self, rid: str, overrides=None):
         del overrides
         self._counters[rid] = {}
 
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
+        self._matched.pop(rid, None)
 
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
+        self._matched.pop(rid, None)
+
+    def apply_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
+    ) -> None:
+        """Hold what the cache matched, until an admit seeds a counter with it."""
+        del node_name, graph_walk, inputs
+        if matched_len:
+            self._matched[rid] = matched_len
+
+    def admit(self, step: "PositionStep", ctx: StepContext) -> AdmitOutcome:
+        """Start a matched prefix's counter past it, as a retrieved one does.
+
+        The skipped tokens sit at 0 through n-1, so a counter left at 0 would write over them.
+        """
+        del ctx
+        # taken by the step it was held for: a label the request writes later
+        # has no cached prefix of its own
+        seeds = {
+            segment.request_id: self._matched.pop(segment.request_id)
+            for segment in step.segments or ()
+            if segment.request_id in self._matched
+        }
+        for segment in step.segments or ():
+            matched = seeds.get(segment.request_id)
+            if matched is None:
+                continue
+            counters = self._counters.setdefault(segment.request_id, {})
+            if matched > counters.get(segment.label, 0):
+                counters[segment.label] = matched
+        return ADMIT_OK
 
     def publish(self, request_id: str) -> "PublishedPositionInfo | None":
         counters = self._counters.get(request_id)
