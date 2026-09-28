@@ -3,7 +3,7 @@
 Two GELU convolutions (the second strided by 2) turn a ``(num_mel_bins,
 3000)`` log-mel window into 1500 frames, a fixed sinusoidal table is added,
 and a pre-norm transformer stack (bidirectional self-attention + GELU FFN)
-runs over them. Every window is exactly ``max_source_positions`` tokens, so
+runs over them. Every window is ``max_source_positions`` tokens, so
 a batch is a dense ``[bs, 1500, d_model]`` tensor: attention is plain SDPA
 with no mask, no cache and no resource, and the whole forward is a fixed
 shape per batch size — which is what lets the submodule capture it as one
@@ -78,7 +78,7 @@ class WhisperEncoderModel(nn.Module):
         self.config = config
         self.conv1 = nn.Conv1d(config.num_mel_bins, config.d_model, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(config.d_model, config.d_model, kernel_size=3, stride=2, padding=1)
-        # The sinusoidal table ships in the checkpoint; kept as a parameter so
+        # The sinusoidal table ships in the checkpoint and is kept as a parameter so
         # it loads like everything else (it is never trained here).
         self.embed_positions = nn.Embedding(config.max_source_positions, config.d_model)
         self.layers = nn.ModuleList(
