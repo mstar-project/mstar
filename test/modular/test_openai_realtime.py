@@ -188,7 +188,7 @@ def test_session_streams_partials_deltas_and_completion(client_and_stub):
         deltas = [e["delta"] for e in events if e["type"].endswith(".delta")]
         assert "".join(deltas) == " you today"
         assert events[-1]["transcript"] == "hello friend you today"
-        # the tail flush (0.5 s) was a third step; every step hears all audio so far
+        # the tail flush (0.5 s) was a third step, and every step hears all audio so far
         assert len(stub.submits) == 3
         durations = [Path(s["file_paths"]["audio"][0]).stat().st_size for s in stub.submits]
         assert durations == sorted(durations) and durations[0] < durations[-1]
