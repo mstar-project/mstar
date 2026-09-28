@@ -409,6 +409,14 @@ class Worker:
         # the handle.
         self._unprocessed_messages: dict[str, list[WorkerMessage]] = {}
 
+        # Where the main loop is, and when it last completed a step — for the
+        # watchdog thread. A phase that keeps changing is not progress: an
+        # offload/reload thrash spins the loop happily while nothing completes.
+        self._loop_phase = "starting"
+        self._loop_phase_at = _time.monotonic()
+        self._last_step_at = _time.monotonic()
+        self._stop_watchdog = threading.Event()
+
         # CPU offloading: LRU tracking and eviction policy
         self._last_active: dict[tuple[int, str], float] = {}  # (request_id, node_name) -> monotonic timestamp
         self.eviction_policy = EvictionPolicy.LRU
@@ -1638,6 +1646,65 @@ class Worker:
             )
         return True
 
+    # ------------------------------------------------------------------
+    # Stall watchdog
+    # ------------------------------------------------------------------
+
+    def _set_phase(self, phase: str) -> None:
+        """Note where the main loop is. Two attribute writes; called only from
+        ``run`` so nothing else has to know about it."""
+        self._loop_phase = phase
+        self._loop_phase_at = _time.monotonic()
+
+    def _watchdog(self, period: float) -> None:
+        """Say what this rank is doing once it stops making progress.
+
+        On its own thread on purpose: the interesting hangs are the ones where
+        the main loop is parked inside a call — a collective, a future, a lock —
+        and cannot log anything itself, so a rank that has gone quiet looks
+        exactly like a rank that is busy.
+        """
+        while not self._stop_watchdog.wait(period):
+            self._log_if_stalled(period)
+
+    def _log_if_stalled(self, period: float) -> bool:
+        """One tick of the watchdog, split out so it can be exercised without
+        driving the thread.
+
+        Fires on either of two failures, because both present as a hung job and
+        they look nothing alike in the log: a loop parked inside a call (the
+        phase stops changing), and a loop that spins without completing a step
+        (an offload/reload thrash, which changes phase constantly).
+        """
+        now = _time.monotonic()
+        phase_age = now - self._loop_phase_at
+        step_age = now - self._last_step_at
+        if phase_age < period and step_age < period:
+            return False
+        head = self.scheduler.peek_tp_follow()
+        owed = sum(
+            len(delta)
+            for delta in self.scheduler._pending_resident_deltas.values()
+        )
+        logger.warning(
+            "Worker %s not progressing: phase=%s for %.1fs, last step %.1fs ago"
+            " (%s); in-flight=%d rids, backlog=%d chunks/%d rids, "
+            "tp-follow queue=%d (head seq %s), resident delta owed=%d, "
+            "held=%d, failed=%d, pending removes=%d",
+            self.worker_id, self._loop_phase, phase_age, step_age,
+            "parked" if phase_age >= period else "spinning, nothing completing",
+            len(self._in_flight_rids),
+            len(self.scheduler.backlog),
+            sum(len(b.node_objects) for b in self.scheduler.backlog.values()),
+            len(self.scheduler.tp_batches_pending_schedule),
+            "none" if head is None else head.spec_seq,
+            owed,
+            len(self.scheduler.held_until),
+            len(self.scheduler.failed_rids),
+            len(self._pending_removes),
+        )
+        return True
+
     def _is_tp_follower_node(self, node_name: str) -> bool:
         """This rank follows ``node_name``: rank 0 of its instance decides both
         what runs on it and what gets evicted from it. Mirrors the engine's
@@ -2841,6 +2908,13 @@ class Worker:
                 "pre-runs on a dedicated thread",
                 self.worker_id,
             )
+        watchdog_period = float(os.environ.get("MSTAR_STALL_WATCHDOG_SEC", "10"))
+        if watchdog_period > 0:
+            threading.Thread(
+                target=self._watchdog, args=(watchdog_period,),
+                name=f"mstar-watchdog-{self.worker_id}", daemon=True,
+            ).start()
+
         # In-flight: (batch, node_batch, batch_partition, future) | None.
         pending: PendingBatch | None = None
 
@@ -2927,6 +3001,7 @@ class Worker:
                 # doesn't drain the in-flight GPU work and undo the overlap.
                 if self.enable_nvtx:
                     range_push("worker.process_messages", synchronize=False)
+                self._set_phase("process_messages")
                 self._process_messages()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
@@ -3053,6 +3128,7 @@ class Worker:
                         if self.enable_nvtx:
                             range_push("worker.await_gpu", synchronize=False)
                         _t0 = _time.perf_counter() if phase_period else 0.0
+                        self._set_phase("await_gpu")
                         outputs = pending.future.result()
                         if phase_period:
                             _phase_record("await_gpu", _time.perf_counter() - _t0)
@@ -3106,6 +3182,7 @@ class Worker:
                         # ``_handle_admit_failure`` pushes the GraphNodes back
                         # to the scheduler queue, and on KV-cache OOM also
                         # offloads or holds the failed rids.
+                        self._set_phase("admit_failure_recovery")
                         self._handle_admit_failure(
                             pending.batch, pending.node_batch
                         )
@@ -3192,6 +3269,8 @@ class Worker:
                     if pending.node_batch.admit_error is None:
                         with self._span("worker.postprocess_batch"):
                             self._postprocess_batch(pending, outputs)
+                        # a step that actually ran — the watchdog's progress mark
+                        self._last_step_at = _time.monotonic()
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
@@ -3216,6 +3295,7 @@ class Worker:
 
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
+                self._set_phase("schedule")
                 with self._span("worker.schedule"):
                     batch = None
                     if yield_away_from_target is not None:
@@ -3226,6 +3306,7 @@ class Worker:
                     if batch is None:
                         batch = self.scheduler.get_next_batch(self.request_state)
                 if batch is None:
+                    self._set_phase("idle")
                     self.communicator.wait_for_work(10)
                     continue
 

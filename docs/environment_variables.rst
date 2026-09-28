@@ -294,6 +294,14 @@ Worker scheduling
        against the forward (input H2D, KV reload, the events fencing a peer's
        read) names this stream — see ``mstar.utils.cuda_streams``. ``0``
        restores the default stream, and the stall with it.
+   * - ``MSTAR_STALL_WATCHDOG_SEC``
+     - ``10``
+     - Period of the per-worker stall watchdog. On its own thread, so it still
+       reports when the main loop is parked inside a collective, a future or a
+       lock. Logs one line naming the phase, how long since a step last
+       completed, the backlog, the TP-follow queue depth and head seq, any
+       resident-set delta this rank has not managed to replay, and the
+       held/failed counts. ``0`` disables it.
    * - ``MSTAR_PRE_PLAN_SPEC``
      - ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread

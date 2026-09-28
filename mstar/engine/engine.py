@@ -1627,9 +1627,15 @@ class Engine:
     def take_resident_delta(
         self, node_name: str,
     ) -> OffloadDelta:
+        """The moves on this node since the last call, ready for the wire.
+
+        Collapsed on the way out: a rank that is thrashing journals an offload
+        and the reload that undoes it, and making every follower pay both is how
+        they fall out of step. See ``OffloadDelta.collapsed``.
+        """
         if node_name not in self._resident_delta:
             return OffloadDelta.new()
-        return self._resident_delta[node_name].take()
+        return self._resident_delta[node_name].take().collapsed()
 
     def apply_resident_delta(
         self, node_name: str, delta: OffloadDelta,
@@ -1688,6 +1694,13 @@ class Engine:
                     if freed <= 0:
                         # Refused for now: a step still holds these pages and
                         # will release them when it commits.
+                        logger.warning(
+                            "Replay of rank 0's offload of %s on %s refused "
+                            "(a step still holds its pages); %d moves still "
+                            "owed. This rank cannot run rank 0's next step "
+                            "until it catches up.",
+                            rid, node_name, len(delta),
+                        )
                         return False
                     logger.info(
                         "Replayed rank 0's offload of request %s from %s "
@@ -1703,7 +1716,16 @@ class Engine:
                     for resource in resources
                     if resource.supports_eviction and resource.is_offloaded(rid)
                 ):
-                    return False  # no room yet; retry
+                    # No room yet. Silent until now, and this is the shape of a
+                    # follower that stops mid-delta and never finishes: rank 0
+                    # then waits on a collective this rank will never join.
+                    logger.warning(
+                        "Replay of rank 0's reload of %s on %s does not fit; "
+                        "%d moves still owed. This rank cannot run rank 0's "
+                        "next step until it catches up.",
+                        rid, node_name, len(delta),
+                    )
+                    return False
                 else:
                     logger.info(
                         "Replayed rank 0's reload of request %s on %s",

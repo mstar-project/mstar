@@ -161,6 +161,27 @@ class OffloadDelta:
         """
         return OffloadDelta(list(self.rids), list(self.is_offload))
 
+    def collapsed(self) -> "OffloadDelta":
+        """The same net state change, with the churn taken out.
+
+        Only the last move per request can matter: replay matches state, so an
+        offload followed by a reload of the same request is two full page copies
+        that end where they started. A thrashing rank produces mostly that, and a
+        follower paying for all of it falls behind faster than it can catch up —
+        which is what puts the ranks out of step in the first place.
+
+        Order between DIFFERENT requests is kept, each survivor staying where its
+        last move was. Dropping an earlier offload cannot starve a later reload:
+        the net state is one the recording rank actually held, so it fits.
+        """
+        rids, flags = list(self.rids), list(self.is_offload)
+        last_move = {rid: i for i, rid in enumerate(rids)}
+        out = OffloadDelta.new()
+        for i in sorted(last_move.values()):
+            out.rids.append(rids[i])
+            out.is_offload.append(flags[i])
+        return out
+
     def take(self) -> "OffloadDelta":
         """Hand the queue over and leave this one empty.
 

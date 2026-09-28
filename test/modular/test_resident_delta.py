@@ -26,6 +26,7 @@ from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import FULL_ADMIT_OK
 from mstar.utils.ipc_format import OffloadDelta
+from mstar.worker import worker as worker_mod
 from mstar.worker.worker import Worker
 
 
@@ -108,6 +109,55 @@ def test_an_empty_delta_is_falsy():
     delta = OffloadDelta.new()
     delta.add_offloaded("a")
     assert delta
+
+
+def test_churn_collapses_to_the_net_change():
+    """The measured cost: an offload and the reload that undoes it is two full
+    page copies to end where it started (~270ms on a real rank), and a thrashing
+    leader produces mostly that. A follower paying for all of it falls behind
+    faster than it can catch up."""
+    delta = OffloadDelta.new()
+    delta.add_offloaded("a")
+    delta.add_reloaded("a")
+
+    assert _entries(delta.collapsed()) == [("a", False)]
+
+
+def test_the_last_move_per_request_is_the_one_kept():
+    delta = OffloadDelta.new()
+    delta.add_offloaded("a")
+    delta.add_reloaded("a")
+    delta.add_offloaded("a")
+
+    assert _entries(delta.collapsed()) == [("a", True)], (
+        "the net state is offloaded, so that is what the follower must reach"
+    )
+
+
+def test_collapsing_keeps_the_order_between_different_requests():
+    """Only same-request churn is redundant. Two requests' moves can depend on
+    each other for room, so their relative order has to survive."""
+    delta = OffloadDelta.new()
+    delta.add_offloaded("a")
+    delta.add_reloaded("b")
+    delta.add_reloaded("a")
+
+    assert _entries(delta.collapsed()) == [("b", False), ("a", False)]
+
+
+def test_collapsing_leaves_a_delta_with_no_churn_alone():
+    delta = OffloadDelta.new()
+    delta.add_offloaded("a")
+    delta.add_reloaded("b")
+    delta.add_reloaded("c")
+
+    assert _entries(delta.collapsed()) == [
+        ("a", True), ("b", False), ("c", False),
+    ]
+
+
+def test_an_empty_delta_collapses_to_empty():
+    assert len(OffloadDelta.new().collapsed()) == 0
 
 
 # --- the engine's journal and replay ----------------------------------------
@@ -284,6 +334,10 @@ def test_both_directions_are_journalled_in_order():
 
     assert _entries(engine.take_resident_delta("node")) == [
         ("wire-a", True), ("wire-a", False), ("wire-b", True),
+    ]
+    # ...and the wire gets the net of them, so no follower pays for the churn
+    assert _entries(engine.take_resident_delta("node")) == [
+        ("a", False), ("b", True),
     ]
     assert len(engine.take_resident_delta("node")) == 0, "drained once only"
 
@@ -653,3 +707,137 @@ def test_an_unsharded_node_still_runs_its_own_recovery():
 
     assert solo.offload_attempts == ["node"]
     assert solo.held == ["victim"]
+
+
+# --- the watchdog names a rank that has gone quiet --------------------------
+
+
+class _WatchRank:
+    """``_log_if_stalled`` over the state it samples."""
+
+    _log_if_stalled = Worker._log_if_stalled
+    _set_phase = Worker._set_phase
+
+    def __init__(self):
+        self.worker_id = "w0"
+        self._in_flight_rids = {"r0"}
+        self._pending_removes = set()
+        owed = OffloadDelta.new()
+        owed.add_offloaded("victim")
+        self.scheduler = SimpleNamespace(
+            backlog={("n", "w"): SimpleNamespace(node_objects={"r9": object()})},
+            peek_tp_follow=lambda: SimpleNamespace(spec_seq=41),
+            tp_batches_pending_schedule=[object()],
+            _pending_resident_deltas={"node": owed},
+            held_until={"r1": 0.0},
+            failed_rids=set(),
+        )
+        self._loop_phase = "starting"
+        self._loop_phase_at = 0.0
+        self._last_step_at = 0.0
+
+
+def _at(monkeypatch, now: float) -> None:
+    monkeypatch.setattr(
+        worker_mod, "_time", SimpleNamespace(monotonic=lambda: now)
+    )
+
+
+def test_a_parked_rank_names_its_phase_and_what_it_is_owed(monkeypatch, caplog):
+    """The line the logs were missing: a rank parked inside a call cannot report
+    on itself, so gone-quiet looks exactly like busy."""
+    rank = _WatchRank()
+    _at(monkeypatch, 30.0)
+
+    with caplog.at_level(logging.WARNING, logger=worker_mod.__name__):
+        assert rank._log_if_stalled(period=10.0) is True
+
+    line = next(
+        r.getMessage() for r in caplog.records if "not progressing" in r.getMessage()
+    )
+    assert "phase=starting" in line and "parked" in line
+    assert "head seq 41" in line, "the follow queue has to be in the line"
+    assert "resident delta owed=1" in line, (
+        "a delta this rank has not managed to replay is the thing to see first"
+    )
+    assert "backlog=1 chunks/1 rids" in line, (
+        "a backlogged rid is off the ready queue, so nothing else reveals it"
+    )
+
+
+def test_a_spinning_rank_that_completes_nothing_is_reported(monkeypatch, caplog):
+    """The thrash: evict a victim, reload it, fail the same batch, evict again.
+    The phase changes constantly, so a phase timer alone stays quiet while the
+    job is dead."""
+    rank = _WatchRank()
+    _at(monkeypatch, 30.0)
+    rank._set_phase("schedule")   # phase is fresh...
+    rank._last_step_at = 0.0      # ...but nothing has completed
+
+    with caplog.at_level(logging.WARNING, logger=worker_mod.__name__):
+        assert rank._log_if_stalled(period=10.0) is True
+
+    line = next(
+        r.getMessage() for r in caplog.records if "not progressing" in r.getMessage()
+    )
+    assert "spinning, nothing completing" in line
+    assert "last step 30.0s ago" in line
+
+
+def test_a_rank_making_progress_stays_quiet(monkeypatch, caplog):
+    rank = _WatchRank()
+    _at(monkeypatch, 30.0)
+    rank._set_phase("await_gpu")
+    rank._last_step_at = 30.0
+
+    with caplog.at_level(logging.WARNING, logger=worker_mod.__name__):
+        assert rank._log_if_stalled(period=10.0) is False
+
+    assert not [r for r in caplog.records if "not progressing" in r.getMessage()]
+
+
+def test_an_empty_follow_queue_is_said_so(monkeypatch, caplog):
+    """Distinguishes "the follower cannot build its step" from "the follower was
+    never sent one" — the ambiguity that cost a whole round of logs."""
+    rank = _WatchRank()
+    rank.scheduler.peek_tp_follow = lambda: None
+    rank.scheduler.tp_batches_pending_schedule = []
+    _at(monkeypatch, 30.0)
+
+    with caplog.at_level(logging.WARNING, logger=worker_mod.__name__):
+        rank._log_if_stalled(period=10.0)
+
+    line = next(
+        r.getMessage() for r in caplog.records if "not progressing" in r.getMessage()
+    )
+    assert "tp-follow queue=0 (head seq none)" in line
+
+
+def test_the_broadcast_ships_a_collapsed_delta():
+    """Where it has to happen: on the way out, so no follower ever sees the
+    churn."""
+    engine = _Engine("leader")
+    engine.offload_request("node", "a")
+    engine.resource.offloaded = {"a"}
+    engine.reload_request("node", "a")
+
+    assert _entries(engine.take_resident_delta("node")) == [("a", False)], (
+        "the churn reached the wire"
+    )
+
+
+def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
+    """A follower that stops mid-delta and never finishes leaves rank 0 on a
+    collective it will never join — and until now that was silent."""
+    engine = _Engine("follower")
+    engine.resource.refuse_reload = True
+    engine.resource.offloaded = {"a"}
+    delta = OffloadDelta.new()
+    delta.add_reloaded("a")
+
+    with caplog.at_level(logging.WARNING, logger=engine_mod.__name__):
+        assert engine.apply_resident_delta("node", delta) is False
+
+    line = next(r.getMessage() for r in caplog.records if "does not fit" in r.getMessage())
+    assert "reload of a on node" in line
+    assert "1 moves still owed" in line
