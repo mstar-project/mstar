@@ -54,8 +54,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``openai/whisper-large-v3-turbo``
      - Whisper ASR: batched, CUDA-graph-captured audio encoder + paged-KV
        decoder with write-once cross-attention; language detection, forced
-       language/task, ``initial_prompt`` context; ``/v1/audio/transcriptions``.
-       The 4-decoder-layer distillation of large-v3; same class as below.
+       language/task, ``initial_prompt`` context, ``/v1/audio/transcriptions``.
+       The 4-decoder-layer distillation of large-v3, same class as below.
    * - ``whisper_large``
      - ``openai/whisper-large-v3``
      - Whisper large-v3 (32 decoder layers) on the same scaffold.
