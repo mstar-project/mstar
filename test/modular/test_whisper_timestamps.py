@@ -72,7 +72,7 @@ def test_rule_state_phases():
 @pytest.mark.parametrize("seed", range(3))
 def test_advance_reproduces_rule_state_token_by_token(seed):
     """Folding ``advance`` over a history from the first-token state lands on
-    exactly the row ``rule_state`` builds from that history."""
+    the same row ``rule_state`` builds from that history."""
     rng = random.Random(100 + seed)
     rules = TimestampRules(CFG)
     for history in _histories(rng):
@@ -80,7 +80,7 @@ def test_advance_reproduces_rule_state_token_by_token(seed):
         for i, tok in enumerate(history):
             state = rules.advance(state, torch.tensor([tok]))
             assert state[0].tolist() == rule_state(history[: i + 1], CFG), (history[: i + 1], state[0].tolist())
-    # inactive rows never move; active rows advance independently in a batch
+    # inactive rows never move, active rows advance independently in a batch
     state = torch.tensor([inactive_state(), rule_state([], CFG), rule_state([TB + 3, 7], CFG)])
     out = rules.advance(state, torch.tensor([TB + 5, TB + 2, TB + 9]))
     assert out[0].tolist() == inactive_state()
