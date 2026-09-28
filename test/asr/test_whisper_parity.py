@@ -74,7 +74,7 @@ def test_encoder_matches_hf_on_real_audio(models):
             ours = enc_sub.encoder(x).float()
             theirs = hf.model.encoder(x).last_hidden_state.float()
         worst = max(worst, (ours - theirs).abs().max().item())
-    # bf16 encoders agree to rounding; anything structural is orders larger
+    # bf16 encoders agree to rounding, anything structural is orders larger
     assert worst < 0.1, worst
 
 
@@ -91,7 +91,7 @@ class _DenseKV:
 
 def test_greedy_tokens_match_hf_generate(models):
     """Whole-pipeline parity through HF's own generate on a few utterances:
-    the token ids must agree exactly (greedy, bf16 on both sides)."""
+    the token ids must agree token for token (greedy, bf16 on both sides)."""
     model, hf = models
     from transformers import WhisperProcessor
 
@@ -109,7 +109,7 @@ def test_greedy_tokens_match_hf_generate(models):
             )
         text = processor.batch_decode(out, skip_special_tokens=True)[0]
         mismatches.append((path.name, text))
-    # The reference transcripts exist for every file; a run that produced
+    # The reference transcripts exist for every file, so a run that produced
     # nothing means the pipeline is broken, not just imprecise.
     assert all(t.strip() for _, t in mismatches), mismatches
 
@@ -152,7 +152,7 @@ def test_word_timestamps_match_hf_token_timestamps(models):
         weights = dec_sub.decoder.cross_attention_weights(seq, encoder_states, heads)
         matrix = alignment.alignment_matrix(weights[:, 3:-1], wave.numel() // 160)
         starts = alignment.token_start_frames(matrix) / alignment.FRAMES_PER_SECOND
-        # HF reports each token's *end*; a token starts where the previous one ends
+        # HF reports each token's *end*, and a token starts where the previous one ends
         for i in range(1, len(text)):
             total += 1
             within += abs(starts[i] - hf_times[i - 1]) <= 0.1
