@@ -1181,9 +1181,15 @@ class Worker:
         # Drained once, outside the loop: every rank needs the same moves, so
         # draining per follower would give the first one everything and the rest
         # nothing. Each gets its own copy because each pops as it replays.
-        resident_delta = self.engine_manager.get_engine(
-            node_batch.node_name
-        ).take_resident_delta(node_batch.node_name)
+        engine = self.engine_manager.get_engine(node_batch.node_name)
+        resident_delta = engine.take_resident_delta(node_batch.node_name)
+        # What the delta above should add up to on every rank. Cheap — a handful
+        # of live requests — and it is the only thing that can catch the ranks
+        # drifting apart, since the delta itself is never verified.
+        offloaded_after = tuple(sorted(
+            rid for rid in self.worker_graphs_manager.per_request_info
+            if engine.is_offloaded(node_batch.node_name, rid)
+        ))
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
@@ -1203,6 +1209,7 @@ class Worker:
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
                         resident_delta=resident_delta.copy(),
+                        offloaded_after=offloaded_after,
                     )
                 )
             )

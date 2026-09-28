@@ -25,8 +25,10 @@ sys.path.insert(0, ".")
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import FULL_ADMIT_OK
-from mstar.utils.ipc_format import OffloadDelta
+from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
+from mstar.worker import micro_scheduler as sched_mod
 from mstar.worker import worker as worker_mod
+from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.worker import Worker
 
 
@@ -841,3 +843,79 @@ def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
     line = next(r.getMessage() for r in caplog.records if "does not fit" in r.getMessage())
     assert "reload of a on node" in line
     assert "1 moves still owed" in line
+
+
+# --- the ranks verify each other ---------------------------------------------
+#
+# The delta says what rank 0 did; ``offloaded_after`` says where it should have
+# landed. Nothing else checks, so a drift shows up only later, as a replayed move
+# that will not fit, with nothing pointing at where it began.
+
+
+class _CheckSched:
+    """``_check_resident_set_matches`` over stubs."""
+
+    _check_resident_set_matches = MicroScheduler._check_resident_set_matches
+
+    def __init__(self, offloaded_here):
+        engine = SimpleNamespace(
+            is_offloaded=lambda node, rid: rid in set(offloaded_here)
+        )
+        self.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+
+
+def _mgr(rids):
+    return SimpleNamespace(per_request_info=dict.fromkeys(rids, object()))
+
+
+def _msg(offloaded_after, seq=7):
+    return ScheduleTPNode(
+        node_name="node", graph_walk="walk", request_ids=["r0"],
+        spec_seq=seq, offloaded_after=tuple(offloaded_after),
+    )
+
+
+def test_matching_resident_sets_say_nothing(caplog):
+    sched = _CheckSched(offloaded_here={"a"})
+
+    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
+        sched._check_resident_set_matches(_msg(["a"]), _mgr(["a", "b"]))
+
+    assert not caplog.records
+
+
+def test_a_drift_names_the_requests_and_the_step(caplog):
+    """What was missing: the page count the follower is short by, attributed to
+    specific requests, at the step where it is first observable."""
+    sched = _CheckSched(offloaded_here={"a"})
+
+    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
+        sched._check_resident_set_matches(
+            _msg(["a", "b"], seq=41), _mgr(["a", "b", "c"]),
+        )
+
+    line = next(r.getMessage() for r in caplog.records if "disagree" in r.getMessage())
+    assert "step 41" in line
+    assert "rank 0 has 2 offloaded, this rank 1" in line
+    assert "Off there but not here: ['b']" in line
+
+
+def test_a_drift_the_other_way_is_named_too(caplog):
+    sched = _CheckSched(offloaded_here={"a", "b"})
+
+    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
+        sched._check_resident_set_matches(_msg(["a"]), _mgr(["a", "b"]))
+
+    line = next(r.getMessage() for r in caplog.records if "disagree" in r.getMessage())
+    assert "Off here but not there: ['b']" in line
+
+
+def test_the_check_only_considers_requests_this_rank_knows(caplog):
+    """A request removed here and not there is a different problem; the check
+    must not read as a page-state drift."""
+    sched = _CheckSched(offloaded_here={"a"})
+
+    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
+        sched._check_resident_set_matches(_msg(["a"]), _mgr(["a"]))
+
+    assert not caplog.records

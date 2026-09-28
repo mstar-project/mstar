@@ -207,6 +207,12 @@ class ScheduleTPNode(MessageBody):
     spec_seq: int = -1
     spec_from_seq: int = -1
     resident_delta: OffloadDelta = field(default_factory=OffloadDelta.new)
+    # Which requests rank 0 had off-device when it chose this step, for a
+    # follower to check itself against once it has replayed ``resident_delta``.
+    # The delta says what rank 0 did; this says where that should have landed.
+    # Without it the ranks can drift silently and the first symptom is a move
+    # that will not fit, one step later and with nothing pointing at the cause.
+    offloaded_after: tuple[str, ...] = ()
 
 
 @dataclass

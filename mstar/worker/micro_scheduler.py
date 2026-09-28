@@ -272,6 +272,34 @@ class MicroScheduler:
             return self._apply_resident_delta(message.node_name, message.resident_delta)
         return self._apply_resident_delta(message.node_name)
 
+    def _check_resident_set_matches(
+        self, message: ScheduleTPNode,
+        worker_graphs_manager: WorkerGraphsManager,
+    ) -> None:
+        """Compare this rank's resident set to what rank 0 said its own was.
+
+        The delta says what rank 0 did; ``offloaded_after`` says where that was
+        meant to land. Nothing else checks, so without this the ranks can drift
+        apart and the first symptom is a replayed move that will not fit — a step
+        or more later, with nothing pointing at where it started. Reported, not
+        repaired: the difference is the bug, and guessing a repair would bury it.
+        """
+        engine = self.engine_manager.get_engine(message.node_name)
+        mine = {
+            rid for rid in worker_graphs_manager.per_request_info
+            if engine.is_offloaded(message.node_name, rid)
+        }
+        theirs = set(message.offloaded_after)
+        if mine == theirs:
+            return
+        logger.error(
+            "TP resident sets disagree at step %d on %s: rank 0 has %d "
+            "offloaded, this rank %d. Off here but not there: %s. Off there but "
+            "not here: %s. A step both ranks run from here can deadlock.",
+            message.spec_seq, message.node_name, len(theirs), len(mine),
+            sorted(mine - theirs) or "none", sorted(theirs - mine) or "none",
+        )
+
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
         # and the async follower's build / drop / void paths) pops here, so the
@@ -358,6 +386,10 @@ class MicroScheduler:
         # leader's graph walk.
         if not self._apply_delta_from_message(first_tp_node):
             return # must apply all pending deltas first
+        # Checked after the replay and before the build: this is the one moment
+        # the two ranks are supposed to agree, and the step below is what a
+        # disagreement turns into a deadlock.
+        self._check_resident_set_matches(first_tp_node, worker_graphs_manager)
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name,
             first_tp_node.graph_walk, self.tp_rids(first_tp_node),
