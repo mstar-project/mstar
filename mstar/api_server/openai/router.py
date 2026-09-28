@@ -157,7 +157,7 @@ async def realtime(websocket: WebSocket):
     streaming speech-to-text with partial results. See ``serving_realtime``."""
     api, model_name, adapter, err = _resolve("supports_realtime_transcription")
     if err is not None:
-        # 1008 = policy violation: the served model has no such surface
+        # 1008 is policy violation, the served model has no such endpoint
         await websocket.accept()
         await websocket.close(code=1008, reason=json.loads(bytes(err.body))["error"]["message"])
         return
