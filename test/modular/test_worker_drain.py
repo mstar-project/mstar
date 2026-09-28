@@ -47,7 +47,8 @@ def _worker(
     w._last_active = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
-        clear_rid=lambda rid: w.cleared.append(rid),  # noqa: PLW0108
+        clear_rid=lambda rid, rid_str: w.cleared.append(rid),
+        clear_wire_rid=w.cleared.append,
         fail_rids=lambda rids: w.failed.update(rids),  # noqa: PLW0108
         pending_tp_follow_count=dict.fromkeys(tp_follow, 1),
     )
@@ -112,6 +113,35 @@ def test_drain_waits_for_committed_tp_follow_batches():
     w.scheduler.pending_tp_follow_count.pop("X")
     Worker._apply_pending_drains(w, set())
     assert len(_reads_done(w)) == 1
+
+
+def test_drain_waits_for_a_follow_that_arrived_before_new_request():
+    """The follow rode a different edge and beat NEW_REQUEST, so this rank has
+    no handle for the rid yet. The count is keyed by the wire string exactly so
+    this case still gates READS_DONE -- ACKing here would bring the REMOVE that
+    strands the batch at the head of the TP FIFO."""
+    w = _worker(known_rids=(), tp_follow=("X",))
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert "X" in w._draining_rids and not _reads_done(w)
+
+    # NEW_REQUEST lands, the batch runs, the count drops.
+    w.scheduler.pending_tp_follow_count.pop("X")
+    Worker._apply_pending_drains(w, set())
+    assert len(_reads_done(w)) == 1
+
+
+def test_never_admitted_rid_with_no_follow_acks_at_once():
+    w = _worker(known_rids=())
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert len(_reads_done(w)) == 1
+
+
+def test_remove_of_a_never_admitted_rid_clears_its_wire_keyed_state():
+    """No handle to clear anything else with, but the TP-follow count is keyed
+    by the string and nothing else would ever pop it."""
+    w = _worker(known_rids=(), tp_follow=("X",))
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    assert w.cleared == ["X"]
 
 
 def test_drain_deferred_behind_inflight_gpu_step():

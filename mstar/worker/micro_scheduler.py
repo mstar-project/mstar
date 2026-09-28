@@ -157,11 +157,16 @@ class MicroScheduler:
         # Shared by reference with Worker._pending_removes.
         self.pending_removes: set[int] = set()
 
-        # rid -> number of committed (ZMQ received) tp follow batches still
-        # queued. On the fail/abort path we drain these before ACKing READS_DONE
-        # so the worker graph queues aren't torn down while a follow still needs
-        # to pop from them.
-        self.pending_tp_follow_count: dict[int, int] = defaultdict(int)
+        # WIRE STRING -> number of committed (ZMQ received) tp follow batches
+        # still queued. On the fail/abort path we drain these before ACKing
+        # READS_DONE so the worker graph queues aren't torn down while a follow
+        # still needs to pop from them.
+        #
+        # Keyed by the wire string, not the handle, unlike everything else
+        # here: a ScheduleTPNode can arrive before the NEW_REQUEST that mints
+        # the rid's handle, and a batch that went uncounted in that window is
+        # exactly the one the drain must wait for. Purged by ``clear_wire_rid``.
+        self.pending_tp_follow_count: dict[str, int] = defaultdict(int)
 
     def _select_node_rr(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
@@ -200,9 +205,11 @@ class MicroScheduler:
         self, message: ScheduleTPNode
     ):
         self.tp_batches_pending_schedule.append(message)
-        for rid in self.tp_rids(message):
-            if rid != REMOVED_RID:
-                self.pending_tp_follow_count[rid] += 1
+        # Count every rid the leader named, including ones this rank cannot
+        # resolve yet -- ``tp_rids`` would flatten those to REMOVED_RID and
+        # lose the very batch the drain has to wait for.
+        for rid in message.request_ids:
+            self.pending_tp_follow_count[rid] += 1
 
     # TP-follow FIFO accessors for the follower's async path (head only).
 
@@ -216,7 +223,7 @@ class MicroScheduler:
         # and the async follower's build / drop / void paths) pops here, so the
         # drain refcount is discharged in one place.
         message = self.tp_batches_pending_schedule.popleft()
-        for rid in self.tp_rids(message):
+        for rid in message.request_ids:
             if rid not in self.pending_tp_follow_count:
                 continue
             self.pending_tp_follow_count[rid] -= 1
@@ -716,11 +723,22 @@ class MicroScheduler:
         for rid in rids:
             self._drop_backlogged_rid(rid)
 
-    def clear_rid(self, rid: int) -> None:
-        """Forget all per-request scheduler state; called on REMOVE_REQUEST."""
+    def clear_rid(self, rid: int, rid_str: str) -> None:
+        """Forget all per-request scheduler state; called on REMOVE_REQUEST.
+
+        Takes both identities because ``pending_tp_follow_count`` is keyed by
+        the wire string and everything else by the handle."""
         self.failed_rids.discard(rid)
         self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
         self._drop_backlogged_rid(rid)
-        self.pending_tp_follow_count.pop(rid, None)
+        self.clear_wire_rid(rid_str)
+
+    def clear_wire_rid(self, rid_str: str) -> None:
+        """Forget the wire-string-keyed state for a rid.
+
+        Split out of ``clear_rid`` for the REMOVE of a rid this rank never
+        admitted: there is no handle to clear anything else with, but a
+        TP-follow batch may still be counted against the string."""
+        self.pending_tp_follow_count.pop(rid_str, None)
 

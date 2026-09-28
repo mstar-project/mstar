@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 
@@ -21,6 +22,27 @@ from mstar.model.base import WorkerGraph
 from mstar.streaming.stream_buffer import StreamBuffer
 
 logger = logging.getLogger(__name__)
+
+
+#: Renders a rid handle as its wire id. Installed by the worker, which owns the
+#: rid table; ``None`` where there is none (tests, or a manager built before the
+#: table exists). Anything that puts a rid in TEXT goes through this: handles
+#: are worker-internal and RECYCLED, so a raw one in a message that leaves the
+#: process -- a FAIL_REQUESTS body becomes the client's HTTP error detail --
+#: names whatever request holds that handle by the time someone reads it.
+RidStr = Callable[[int], str]
+
+
+def _rid_name(rid_str: RidStr | None, handle: int) -> str:
+    """Never raises. Every caller is reporting a rid the worker could not
+    find, and the rid table drops a handle's name on release -- so the lookup
+    that renders it is exactly as likely to fail as the one that got here."""
+    if rid_str is None:
+        return f"<unresolved rid handle {handle}>"
+    try:
+        return rid_str(handle)
+    except (KeyError, IndexError):
+        return f"<released rid handle {handle}>"
 
 
 @dataclass
@@ -48,6 +70,7 @@ class WorkerGraphQueues:
     worker_graph: WorkerGraph
     per_request_queues: dict[int, WorkerGraphIO]
     tensor_manager: TensorCommunicationManager
+    rid_str: RidStr | None = None
 
     def __post_init__(self):
         self.nodes = set(self.worker_graph.section.get_nodes().keys())
@@ -66,7 +89,7 @@ class WorkerGraphQueues:
         light up the streaming readiness set on its own.
         """
         assert request_id in self.per_request_queues, \
-            f"Tried to process new inputs for unknown request ID {request_id}"
+            f"Tried to process new inputs for unknown request ID {_rid_name(self.rid_str, request_id)}"
         queue = self.per_request_queues[request_id]
         not_ingested: list[GraphEdge] = []
         for inp in inputs:
@@ -79,7 +102,7 @@ class WorkerGraphQueues:
         can_buffer: bool=True
     ) -> list[GraphEdge]:
         assert request_id in self.per_request_queues, \
-            f"Tried to process new inputs for unknown request ID {request_id}"
+            f"Tried to process new inputs for unknown request ID {_rid_name(self.rid_str, request_id)}"
         queue = self.per_request_queues[request_id]
         not_ingested: list[GraphEdge] = []
         for inp in inputs:
@@ -89,7 +112,7 @@ class WorkerGraphQueues:
 
     def is_done(self, request_id) -> bool:
         assert request_id in self.per_request_queues, \
-            f"Tried to check queue done state for unknown request ID {request_id}"
+            f"Tried to check queue done state for unknown request ID {_rid_name(self.rid_str, request_id)}"
         queue = self.per_request_queues[request_id]
         return queue.wg_state_registry.is_done
 
@@ -121,7 +144,7 @@ class WorkerGraphQueues:
 
     def get_ready_for_streaming(self, request_id: int):
         assert request_id in self.per_request_queues, \
-            f"Tried to check ready for streaming for unknown request ID {request_id}"
+            f"Tried to check ready for streaming for unknown request ID {_rid_name(self.rid_str, request_id)}"
         return self.per_request_queues[request_id].ready_for_streaming
 
     def pop_ready_nodes(
@@ -161,7 +184,7 @@ class WorkerGraphQueues:
         edges from the current iter's output routing.
         """
         assert request_id in self.per_request_queues, \
-            f"Tried to stop loops for unknown request ID {request_id}"
+            f"Tried to stop loops for unknown request ID {_rid_name(self.rid_str, request_id)}"
         queue = self.per_request_queues[request_id]
         loop_back_signals: set[NameAndDest] = set()
         for name in loop_names:
@@ -177,12 +200,12 @@ class WorkerGraphQueues:
         """Complete a node in this worker graph's per-request io and return
         the registry's NodeCompletionOutput (output_edges + filtered_signals)."""
         assert request_id in self.per_request_queues, \
-            f"Tried to complete node {node_name!r} for unknown request ID {request_id}"
+            f"Tried to complete node {node_name!r} for unknown request ID {_rid_name(self.rid_str, request_id)}"
         return self.per_request_queues[request_id].mark_node_complete(node_name)
 
     def get_dynamic_loop_iters(self, request_id: int) -> dict[str, int]:
         assert request_id in self.per_request_queues, \
-            f"Tried to get dynamic loop iters for unknown request ID {request_id}"
+            f"Tried to get dynamic loop iters for unknown request ID {_rid_name(self.rid_str, request_id)}"
         queue = self.per_request_queues[request_id]
         return queue.get_loop_indices()
 
@@ -257,6 +280,9 @@ class WorkerGraphsManager:
     # all_worker_graph_ids_to_nodes. Lets get_worker_graph_id_for_node skip
     # the linear scan over the request's worker_graph_ids.
     walk_node_to_worker_graph_id: dict[tuple[str, str], int] = field(default_factory=dict)
+
+    # See ``RidStr``: renders a handle as its wire id for anything user-facing.
+    rid_str: RidStr | None = None
 
     def __post_init__(self):
         for wg_id, walks in self.all_worker_graph_ids_to_graph_walks.items():
@@ -349,7 +375,7 @@ class WorkerGraphsManager:
     def get_worker_graph_id_for_node(
         self, request_id: int, node_name: str,
         graph_walk: str | None = None,
-    ) -> str:
+    ) -> int:
         """Worker graph that owns ``node_name`` for this request.
 
         ``graph_walk`` defaults to the node's partition's current walk. Pass it
@@ -364,7 +390,8 @@ class WorkerGraphsManager:
         if wg_id is None:
             raise RuntimeError(
                 f"Could not find worker graph for node {node_name!r}, "
-                f"request {request_id!r}, graph_walk {graph_walk!r}"
+                f"request {_rid_name(self.rid_str, request_id)!r}, "
+                f"graph_walk {graph_walk!r}"
             )
         return wg_id
 

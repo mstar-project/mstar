@@ -254,7 +254,8 @@ class Worker:
                     graph_walks=worker_graph.graph_walks,
                     worker_graph=worker_graph,
                     per_request_queues={},
-                    tensor_manager=self.tensor_manager
+                    tensor_manager=self.tensor_manager,
+                    rid_str=self._rid_str,
                 )
                 for worker_graph in my_worker_graphs
             },
@@ -264,7 +265,8 @@ class Worker:
             all_worker_graph_ids_to_nodes=all_worker_graph_ids_to_nodes,
             node_to_partition=node_to_partition,
             base_sharding_config=sharding_config,
-            worker_id=self.worker_id
+            worker_id=self.worker_id,
+            rid_str=self._rid_str,
         )
 
         # The lockstep unit for a node is its whole instance: the tensor-parallel
@@ -524,7 +526,12 @@ class Worker:
         # the run loop).
         request_id = self._rid(body.request_id)
         if request_id is None:
-            return  # never admitted here, or already removed
+            # Never admitted here, or already removed: no handle-keyed state to
+            # clear. The wire-string-keyed TP-follow count is the exception --
+            # it can be non-empty for a rid that never got a handle, and no
+            # later message would ever pop it.
+            self.scheduler.clear_wire_rid(body.request_id)
+            return
         if request_id in self._in_flight_rids:
             self._pending_removes.add(request_id)
             return
@@ -565,7 +572,7 @@ class Worker:
         self.tensor_manager.force_cleanup_request(request_id)
         self.profile_info.pop_request(request_id)
         self.streaming_buffers.pop(request_id, None)
-        self.scheduler.clear_rid(request_id)
+        self.scheduler.clear_rid(request_id, body.request_id)
         self._pending_removes.discard(request_id)
         self._pending_loop_stops.difference_update([
             stop for stop in self._pending_loop_stops if stop.rid == request_id
@@ -638,13 +645,17 @@ class Worker:
         if request_id in self._reads_done_sent:
             return
         handle = self._rid(request_id)
-        # A request this worker never admitted has nothing in flight, so it
-        # can ACK straight away.
-        if handle is not None:
-            if self.tensor_manager.has_inflight_reads(handle):
-                return  # let get_ready_tensors resolve the futures; retry next iter
-            if self.scheduler.pending_tp_follow_count.get(handle, 0) > 0:
-                return  # wait for committed TP-follow batches to drain first
+        # A request this worker never admitted holds no handle-keyed state, so
+        # there is nothing in flight to wait on.
+        if handle is not None and self.tensor_manager.has_inflight_reads(handle):
+            return  # let get_ready_tensors resolve the futures; retry next iter
+        # Not under the handle guard: a ScheduleTPNode can land before the
+        # NEW_REQUEST that mints the handle, so the queued batch is counted
+        # under the wire string while ``handle`` is still None. ACKing here
+        # would let the REMOVE tear the worker-graph queues out from under a
+        # batch still sitting at the head of the TP FIFO.
+        if self.scheduler.pending_tp_follow_count.get(request_id, 0) > 0:
+            return  # wait for committed TP-follow batches to drain first
         self._reads_done_sent.add(request_id)
         self.communicator.send(
             "conductor",

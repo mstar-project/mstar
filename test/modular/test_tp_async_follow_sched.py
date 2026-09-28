@@ -233,7 +233,7 @@ def test_drain_refcount_not_resurrected_by_a_pop_after_clear_rid():
     rid must not leave a fresh entry behind (the dict is a defaultdict)."""
     sched = _sched()
     sched.register_tp_follow(_head(["r0"]))
-    sched.clear_rid("r0")
+    sched.clear_rid("r0", "r0")
     assert "r0" not in sched.pending_tp_follow_count
 
     sched.pop_tp_follow_head()

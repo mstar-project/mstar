@@ -99,6 +99,7 @@ class RustZMQCommunicator(BaseCommunicator):
 
         if self.protocol == CommProtocol.IPC:
             os.makedirs(ipc_socket_path_prefix, exist_ok=True)
+            self._lock_deployment(my_id)
             self._inner = _RustZmq(my_id, ipc_socket_path_prefix)
         elif self.protocol == CommProtocol.TCP:
             self._inner = _RustZmq.bind_endpoint(my_id, self._endpoint(my_id))

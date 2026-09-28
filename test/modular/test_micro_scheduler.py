@@ -494,7 +494,7 @@ def test_clearing_a_rid_forgets_its_undelivered_admit_error():
     sched = _scheduler(_Engine(max_bs=4, unservable={"r0"}))
     sched.get_next_batch(_Manager(["r0"]))
 
-    sched.clear_rid("r0")
+    sched.clear_rid("r0", "r0")
 
     assert sched.take_admit_errors() == {}
     assert sched.failed_rids == set()

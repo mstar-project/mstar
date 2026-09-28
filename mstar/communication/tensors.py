@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 import platform
+import stat
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -22,7 +23,11 @@ else:
     MOONCAKE_IMPORT_ERROR = None
 import torch
 
-from mstar.communication.communicator import BaseCommunicator, CommProtocol
+from mstar.communication.communicator import (
+    DEPLOYMENT_ANCHOR_ENTITY,
+    BaseCommunicator,
+    CommProtocol,
+)
 from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
@@ -1060,26 +1065,23 @@ def _default_shm_dir() -> str:
     return "/tmp/mstar_shm"
 
 
-#: The entity whose endpoint names the deployment in `_deployment_namespace`.
-#: Any fixed id works; the conductor is the one every deployment has.
-_NAMESPACE_ANCHOR = "conductor"
-
-
 def _deployment_namespace(communicator) -> str:
     """A token every process of ONE deployment derives identically, and two
     deployments on the same host never share.
 
     Tensor uuids are per-entity counters, so ``worker_0``'s uuid 5 exists in
     every deployment at once; a file named by entity and uuid alone is written
-    and unlinked by every server on the host. The conductor's endpoint is used
-    to disambiguate, as it is unique across concurrent deployments by
-    construction (otherwise ZMQ sockets would already collide).
+    and unlinked by every server on the host. The conductor's endpoint
+    disambiguates them because it is unique per concurrent deployment: over
+    TCP a second deployment on the same port fails to bind, and over IPC --
+    where libzmq would happily unlink and replace the socket file -- the
+    conductor's ``_lock_deployment`` refuses to start.
     """
     if getattr(communicator, "protocol", None) not in (
         CommProtocol.IPC, CommProtocol.TCP
     ):
         return ""
-    endpoint = communicator._endpoint(_NAMESPACE_ANCHOR)
+    endpoint = communicator._endpoint(DEPLOYMENT_ANCHOR_ENTITY)
     if endpoint.startswith("ipc://"):
         # realpath: "/tmp/mstar_x/" and "/tmp/mstar_x" are one deployment.
         endpoint = "ipc://" + os.path.realpath(endpoint.removeprefix("ipc://"))
@@ -1131,6 +1133,47 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         ns = f"{self._shm_namespace}_" if self._shm_namespace else ""
         return os.path.join(self.shm_dir, f"mstar_{ns}{entity_id}_{uuid}")
 
+    def _create_shm_file(self, path: str):
+        """Open ``path`` for writing, having created it ourselves.
+
+        O_EXCL because the name is fully predictable -- namespace, entity and
+        a per-entity counter -- in a world-writable directory. A plain
+        ``open(path, "wb")`` onto a file some other uid got there first either
+        writes through into a file we do not own or fails the batch late on
+        PermissionError; creating it is what makes the uuid a claim.
+
+        Residue we DO own is a different case and is reclaimed rather than
+        raised on: a deployment that died leaves files under its namespace,
+        and the namespace is derived from the conductor endpoint, so a restart
+        on the same ports collides with every one of them (uuid counters
+        restart at 1 too). Concurrent same-namespace deployments cannot reach
+        here -- over TCP the ports differ, and over IPC the conductor's
+        deployment lock refuses the second one at startup.
+        """
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            return os.fdopen(os.open(path, flags, 0o600), "wb")
+        except FileExistsError:
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+                raise RuntimeError(
+                    f"refusing to write tensor file {path}: it exists and is "
+                    f"not ours (owner uid {st.st_uid}, ours {os.getuid()}, "
+                    f"symlink {stat.S_ISLNK(st.st_mode)}). Another user or an "
+                    "unrelated deployment holds this path; give this "
+                    "deployment its own ZMQ endpoint so it derives a "
+                    "different namespace."
+                ) from None
+            os.unlink(path)
+            try:
+                return os.fdopen(os.open(path, flags, 0o600), "wb")
+            except FileExistsError:
+                raise RuntimeError(
+                    f"tensor file {path} was recreated while reclaiming our "
+                    "own stale copy of it -- another process is writing this "
+                    "deployment's namespace"
+                ) from None
+
     def register_for_send(
         self, request_id: Rid, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
@@ -1155,7 +1198,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                 t0 = time.perf_counter()
                 data = _serialize_tensor(tensor)
                 path = self._shm_path(self.my_entity_id, uuid)
-                with open(path, "wb") as f:
+                with self._create_shm_file(path) as f:
                     f.write(data)
                 self._shm_files[uuid] = path
                 self.tensor_store.set_metadata(request_id, uuid, mem_registered=True)

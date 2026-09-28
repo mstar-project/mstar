@@ -96,12 +96,15 @@ def test_tp_rid_this_rank_does_not_know_is_the_removed_sentinel():
     assert _scheduler(t).tp_rids(_follow("a", "gone")) == [a, REMOVED_RID]
 
 
-def test_follow_refcount_skips_unknown_rids():
+def test_follow_refcount_counts_rids_this_rank_cannot_resolve():
+    """Counted by WIRE STRING, so a rid whose NEW_REQUEST has not landed yet
+    still gates the drain. Resolving to handles here would drop it, and the
+    drain would ACK while its batch sat at the head of the TP FIFO."""
     t = RidTable()
-    a = t.intern("a")
+    t.intern("a")
     s = _scheduler(t)
     s.register_tp_follow(_follow("a", "gone"))
-    assert dict(s.pending_tp_follow_count) == {a: 1}
+    assert dict(s.pending_tp_follow_count) == {"a": 1, "gone": 1}
     s.pop_tp_follow_head()
     assert dict(s.pending_tp_follow_count) == {}
 
@@ -181,3 +184,70 @@ def test_late_tensor_ack_for_a_removed_request_is_dropped():
     w._handle_tensor_received(TensorReceived(
         request_id="gone", successful_tensors={1: 1}, failed_tensor_ids=[],
     ))
+
+
+# ── handles never leave the process in text ────────────────────────────────
+
+def test_worker_graph_errors_name_the_wire_rid_not_the_handle():
+    """A FAIL_REQUESTS body becomes the client's HTTP error detail. Handles
+    are worker-internal and recycled, so one in that text names whatever
+    request holds it by the time anyone reads it."""
+    from mstar.worker.node_manager_utils import _rid_name
+
+    t = RidTable()
+    a = t.intern("req-abc")
+    assert _rid_name(t.name, a) == "req-abc"
+
+
+def test_rendering_a_released_handle_does_not_raise():
+    """These messages report a rid the worker could not find, so the render
+    is as likely to fail as the lookup that got there."""
+    from mstar.worker.node_manager_utils import _rid_name
+
+    t = RidTable()
+    a = t.intern("req-abc")
+    t.release(a)
+    assert "released" in _rid_name(t.name, a)
+    assert "unresolved" in _rid_name(None, a)
+
+
+def test_add_new_request_hands_the_handle_to_every_subsystem():
+    """The one place a handle is minted. Nothing below NEW_REQUEST sees the
+    wire string, so a subsystem handed ``body.request_id`` instead would key
+    its state under something no later message resolves to."""
+    w, t = _worker()
+    got: dict[str, object] = {}
+    cfg = SimpleNamespace(sharding_config="cfg", stream_buffers={})
+    w.worker_graphs_manager = SimpleNamespace(
+        add_request=lambda request_id, **kw: got.__setitem__("graphs", request_id),
+        per_request_info={},
+    )
+    w.engine_manager = SimpleNamespace(
+        add_request=lambda rid, cfgs: got.__setitem__("engine", rid),
+        evictable_nodes=lambda: [],
+    )
+    w.tensor_manager = SimpleNamespace(
+        register_request=lambda rid, sc: got.__setitem__("tensors", rid),
+        start_read_tensors=lambda rid, inputs, graph_walk=None: [],
+    )
+    w._draining_rids = set()
+    w._last_active = {}
+    w._my_consumer_connections = []
+    w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    w._unprocessed_messages = {}
+    info = SimpleNamespace(
+        rid_handle=-1, resource_configs={}, graph_walk="decode",
+    )
+    body = SimpleNamespace(
+        request_id="wire-1", request_info=info,
+        partition_worker_graph_ids={}, worker_graph_to_workers={},
+        initial_inputs=[],
+    )
+    w.worker_graphs_manager.per_request_info = {0: cfg}
+
+    Worker._add_new_request(w, body)
+
+    handle = t.handle("wire-1")
+    assert handle is not None
+    assert got == {"graphs": handle, "engine": handle, "tensors": handle}
+    assert info.rid_handle == handle

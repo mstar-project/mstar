@@ -589,7 +589,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                     # falls back to the file read for exactly those).
                     data = _serialize_tensor(t)
                     path = self._shm_path(self.my_entity_id, uuid)
-                    with open(path, "wb") as f:
+                    with self._create_shm_file(path) as f:
                         f.write(data)
                     self._shm_files[uuid] = path
                     self._arena_ts[uuid] = time.monotonic()

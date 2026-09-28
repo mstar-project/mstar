@@ -9,10 +9,14 @@ Handles are RECYCLED once a request is removed, so anything keyed by one must
 be purged on the same REMOVE_REQUEST that releases it. A leaked string key was
 harmless -- the string never recurred -- but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
-MicroScheduler.{failed_rids, admit_errors, held_until, backlog,
-pending_tp_follow_count} (purged by clear_rid), Worker.{_last_active,
-_pending_removes, _pending_loop_stops, streaming_buffers}, the engine's and
-tensor manager's per-request state, and WorkerProfileInfo.
+MicroScheduler.{failed_rids, admit_errors, held_until, backlog} (purged by
+clear_rid), Worker.{_last_active, _pending_removes, _pending_loop_stops,
+streaming_buffers}, the engine's and tensor manager's per-request state, and
+WorkerProfileInfo.
+
+MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
+ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
+stays keyed by the wire string and is purged by clear_wire_rid.
 """
 
 

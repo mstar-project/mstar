@@ -497,3 +497,66 @@ def test_factory_returns_mooncake_for_rdma():
     except RuntimeError:
         # Mooncake not installed — expected in CI/dev environments
         pytest.skip("mooncake not installed")
+
+
+# ---------------------------------------------------------------------------
+# Owning the create (O_EXCL)
+# ---------------------------------------------------------------------------
+
+def test_write_reclaims_our_own_stale_file():
+    """The namespace comes from the conductor endpoint, so a deployment
+    restarted on the same ports collides with every file its last run left --
+    and its uuid counters restart at 1 too. Our own residue is reclaimed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir, request_id="req1")
+        [info] = mgr.store_and_return_tensor_info(
+            "req1", {"out": [torch.ones(4)]},
+        )["out"]
+        path = mgr._shm_path("worker_0", info.uuid)
+        with open(path, "wb") as f:
+            f.write(b"residue from the run that crashed")
+
+        mgr.register_for_send("req1", [info])
+        with open(path, "rb") as f:
+            assert f.read(4) != b"resi"
+
+
+def test_write_refuses_a_file_we_do_not_own(monkeypatch):
+    """The path is namespace + entity + counter: predictable, in a
+    world-writable directory. Writing through into someone else's file is
+    what O_EXCL is there to stop."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir, request_id="req1")
+        [info] = mgr.store_and_return_tensor_info(
+            "req1", {"out": [torch.ones(4)]},
+        )["out"]
+        path = mgr._shm_path("worker_0", info.uuid)
+        with open(path, "wb") as f:
+            f.write(b"squatted")
+        # Cheaper than actually running as a second uid.
+        monkeypatch.setattr(os, "getuid", lambda: os.stat(path).st_uid + 1)
+
+        with pytest.raises(RuntimeError, match="not ours"):
+            mgr.register_for_send("req1", [info])
+        with open(path, "rb") as f:
+            assert f.read() == b"squatted", "someone else's file was written"
+
+
+def test_write_refuses_a_symlink_planted_at_the_path():
+    """A symlink we own still points wherever its planter chose; O_EXCL fails
+    on it and the ownership check must not follow it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir, request_id="req1")
+        [info] = mgr.store_and_return_tensor_info(
+            "req1", {"out": [torch.ones(4)]},
+        )["out"]
+        path = mgr._shm_path("worker_0", info.uuid)
+        target = os.path.join(tmpdir, "elsewhere")
+        with open(target, "wb") as f:
+            f.write(b"do not clobber")
+        os.symlink(target, path)
+
+        with pytest.raises(RuntimeError, match="not ours"):
+            mgr.register_for_send("req1", [info])
+        with open(target, "rb") as f:
+            assert f.read() == b"do not clobber"

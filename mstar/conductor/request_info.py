@@ -120,7 +120,7 @@ class PartitionState:
     completed_worker_graph_ids: set[int] = field(default_factory=set)
     current_worker_graph_ids: set[int] = field(default_factory=set)
     # wg_id -> count of distinct TP ranks that have reported completion
-    wg_rank_completions: dict[str, int] = field(default_factory=dict)
+    wg_rank_completions: dict[int, int] = field(default_factory=dict)
     num_output_tokens: int = 0
     curr_forward_outputs: list[str] = field(default_factory=list)
     # resource label -> PublishedInfo, accumulated from the rank-0 worker's

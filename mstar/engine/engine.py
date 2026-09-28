@@ -176,10 +176,11 @@ class SubmoduleManagement:
 class ExecutingBatch:
     node_name: str
 
-    # Keyed by the worker's integer rid handle. CUDA-graph capture substitutes
-    # its own synthetic string rids for padding rows; the engine only ever uses
-    # a rid as an opaque key, so the two never need to be the same type.
-    per_request_info: Mapping[str, CurrentForwardPassInfo]
+    # Keyed by the worker's integer rid handle. CUDA-graph capture pads with
+    # its own rows, which carry negative handles from the same space (see
+    # cuda_graph_runner.dummy_rid_handle), so a padded batch is still int-keyed
+    # throughout.
+    per_request_info: Mapping[int, CurrentForwardPassInfo]
     step_context: StepContext
 
     running_batched: bool = False
@@ -195,7 +196,7 @@ class ExecutingBatch:
     # The rids the staged plan was built over. The plan is theirs exactly —
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
-    preplanned_rids: tuple[str, ...] | None = None
+    preplanned_rids: tuple[int, ...] | None = None
 
     # Declared once for the batch (pre-plan declares it first when it runs)
     # and driven from here on
