@@ -229,6 +229,7 @@ class OmniVoiceModel(Model):
         if self.tokenizer is not None:
             return
         from transformers import AutoTokenizer
+
         from omnivoice.utils.duration import RuleDurationEstimator
 
         self._duration_estimator = RuleDurationEstimator()
