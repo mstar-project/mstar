@@ -508,3 +508,184 @@ def test_oom_still_reports_allocation_failed():
     assert isinstance(outcome.reason, AllocationFailed)
     assert outcome.reason.pages_short > 0
     _assert_pages_conserved(mgr)
+
+
+# --- a refused admit gives its pages back -----------------------------------
+#
+# Nothing else does: ``commit`` is what normally releases a reservation, and a
+# step that never runs never commits. Left alone, every refusal shrinks the free
+# pool, and two ranks refusing a different number of times end up with different
+# page counts — which under TP is a deadlock.
+
+
+def _ctx_pre(*rids: str) -> StepContext:
+    ctx = _ctx(*rids)
+    ctx.is_preplan = True
+    return ctx
+
+
+def test_a_rolled_back_admit_returns_its_pages():
+    mgr = _make_manager(max_num_pages=8)
+    mgr.ingest_request("r0")
+    before = mgr._arena.num_free
+
+    step = KVStep(segments=(Segment("r0", "main", 2 * PAGE_SIZE),))
+    ctx = _ctx("r0")
+    assert mgr.admit(step, ctx).ok
+    assert mgr._arena.num_free < before, "admit took no pages, so nothing to test"
+
+    mgr.rollback_admit(step, ctx)
+
+    assert mgr._arena.num_free == before
+    assert _stream(mgr, "r0").page_indices == [], (
+        "pages went back to the arena but the stream still addresses them"
+    )
+
+
+def test_rolling_back_twice_releases_once():
+    """The runner unwinds the refusing resource as well as the ones ahead of it,
+    so a double call has to be harmless rather than double-free the arena."""
+    mgr = _make_manager(max_num_pages=8)
+    mgr.ingest_request("r0")
+    before = mgr._arena.num_free
+
+    step = KVStep(segments=(Segment("r0", "main", 2 * PAGE_SIZE),))
+    ctx = _ctx("r0")
+    mgr.admit(step, ctx)
+    mgr.rollback_admit(step, ctx)
+    mgr.rollback_admit(step, ctx)
+
+    assert mgr._arena.num_free == before
+
+
+def test_a_committed_admit_is_not_rolled_back():
+    """Once the step has run its reservation is real, and unwinding it would pull
+    pages out from under a stream that is addressing them."""
+    mgr = _make_manager(max_num_pages=8)
+    mgr.ingest_request("r0")
+
+    step = KVStep(segments=(Segment("r0", "main", 2 * PAGE_SIZE),))
+    ctx = _ctx("r0")
+    mgr.admit(step, ctx)
+    mgr.plan(step, ctx)
+    mgr.commit(step, ctx)
+    held = list(_stream(mgr, "r0").page_indices)
+    free_after_commit = mgr._arena.num_free
+
+    mgr.rollback_admit(step, ctx)
+
+    assert _stream(mgr, "r0").page_indices == held
+    assert mgr._arena.num_free == free_after_commit
+
+
+def test_a_preplanned_step_unwinds_what_the_preplan_reserved():
+    """The case the log keeps hitting. A pre-planned step is reserved on the
+    pre-plan pass; its later ``admit`` no-ops. So when a resource further down the
+    order refuses, the unwind arrives with the GPU pass's ctx and still has to
+    release what the pre-plan took — otherwise those pages leak on exactly the
+    path that refuses most often."""
+    mgr = _make_manager(max_num_pages=8)
+    mgr.ingest_request("r0")
+    before = mgr._arena.num_free
+
+    step = KVStep(segments=(Segment("r0", "main", 2 * PAGE_SIZE),))
+    pre_ctx = _ctx_pre("r0")
+    assert mgr.admit(step, pre_ctx).ok             # the plan thread reserves
+    # ``plan`` is what marks it pre-planned, and records WHICH step for -- the
+    # GPU pass's admit only no-ops if that key matches, so staging it by hand
+    # would take the "a different step arrived first" path instead
+    mgr.plan(step, pre_ctx)
+    assert mgr._preplanned
+    assert mgr._arena.num_free < before
+
+    gpu_ctx = _ctx("r0")
+    assert mgr.admit(step, gpu_ctx).ok              # no-ops over the reservation
+
+    mgr.rollback_admit(step, gpu_ctx)               # another resource refused
+
+    assert mgr._arena.num_free == before, (
+        "the pre-plan's pages leaked: reserved under is_preplan, unwound without"
+    )
+    assert _stream(mgr, "r0").page_indices == []
+
+
+def test_unwinding_one_step_leaves_another_streams_pages_alone():
+    mgr = _make_manager(max_num_pages=16)
+    mgr.ingest_request("r0")
+    mgr.ingest_request("r1")
+
+    committed = KVStep(segments=(Segment("r1", "main", 2 * PAGE_SIZE),))
+    ctx1 = _ctx("r1")
+    mgr.admit(committed, ctx1)
+    mgr.plan(committed, ctx1)
+    mgr.commit(committed, ctx1)
+    kept = list(_stream(mgr, "r1").page_indices)
+
+    refused = KVStep(segments=(Segment("r0", "main", 2 * PAGE_SIZE),))
+    ctx0 = _ctx("r0")
+    assert mgr.admit(refused, ctx0).ok
+    mgr.rollback_admit(refused, ctx0)
+
+    assert _stream(mgr, "r0").page_indices == []
+    assert _stream(mgr, "r1").page_indices == kept, (
+        "unwinding one step released another stream's pages"
+    )
+
+
+def test_removing_a_request_forgets_its_unwind_record():
+    """Handles are RECYCLED (see ``mstar.worker.rid_table``), so a reservation
+    record outliving its request attaches to whichever request gets that handle
+    next -- and ``rollback_admit`` would then resolve it against that request's
+    stream.
+
+    The clear at the top of ``admit`` does not cover it: a pre-planned step's
+    admit returns before reaching the clear, which is deliberate (the record is
+    what a later refusal unwinds). So the release has to purge it.
+    """
+    mgr = _make_manager(max_num_pages=8)
+    mgr.ingest_request("r0")
+
+    # admit, then neither commit nor roll back -- a step that raised in
+    # prepare_inputs, or a batch dropped before it ran
+    step = KVStep(segments=(Segment("r0", "main", 2 * PAGE_SIZE),))
+    mgr.admit(step, _ctx("r0"))
+    assert mgr._admit_reserved_pages, "nothing was reserved, so nothing to test"
+
+    mgr.remove_request("r0")
+
+    assert mgr._admit_reserved_pages == {}, (
+        "the record outlived the request; the next holder of this handle would "
+        "have its pages unwound"
+    )
+
+
+def test_resetting_a_request_forgets_its_unwind_record():
+    """A reset releases the stream's pages, so a surviving record names pages the
+    arena has already handed to someone else."""
+    mgr = _make_manager(max_num_pages=8)
+    mgr.ingest_request("r0")
+
+    step = KVStep(segments=(Segment("r0", "main", 2 * PAGE_SIZE),))
+    mgr.admit(step, _ctx("r0"))
+    assert mgr._admit_reserved_pages
+
+    mgr.reset_request("r0", free=True)
+
+    assert mgr._admit_reserved_pages == {}
+
+
+def test_an_alloc_that_needs_no_new_pages_reports_none():
+    """The common decode case: the stream already holds enough pages, so nothing
+    is acquired and there is nothing to unwind. ``_alloc`` still has to answer —
+    returning an unset ``new_pages`` raises, on the hottest path there is."""
+    mgr = _make_manager(max_num_pages=8)
+    mgr.ingest_request("r0")
+    _grow(mgr, "r0", "main", PAGE_SIZE)          # one full page
+    held = list(_stream(mgr, "r0").page_indices)
+
+    # ask for fewer tokens than the stream already covers
+    result = mgr._alloc("r0", "main", PAGE_SIZE // 2)
+
+    assert result.success
+    assert not result.new_pages
+    assert _stream(mgr, "r0").page_indices == held
