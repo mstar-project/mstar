@@ -7,7 +7,7 @@ range clamp under the clip's maximum, then ``(x + 4) / 4``. This module
 reproduces HF's ``WhisperFeatureExtractor`` torch path to ~1e-5 so a
 natively served encoder sees the features its HF oracle was tested with,
 without ``transformers`` in the serving path. It runs wherever the waveform
-lives: on the CPU of the API-server data worker, or on the GPU inside an
+is, on the CPU of the API-server data worker or on the GPU inside an
 encoder's forward (every op is fixed-shape for a fixed clip length, so it
 captures into a CUDA graph).
 """
