@@ -73,7 +73,7 @@ HF_MODELS: dict[str, dict] = {
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
     # Qwen3-ASR: AuT audio encoder + dense Qwen3 decoder. ``qwen3_asr`` is
-    # the 1.7B transcription model; ``qwen3_asr_realtime`` the 0.6B variant
+    # the 1.7B transcription model, ``qwen3_asr_realtime`` the 0.6B variant
     # trained for chunked streaming, served by the same class.
     "qwen3_asr": {"model_path_hf": "Qwen/Qwen3-ASR-1.7B"},
     "qwen3_asr_realtime": {"model_path_hf": "Qwen/Qwen3-ASR-0.6B"},
@@ -96,7 +96,7 @@ HF_MODELS: dict[str, dict] = {
     "wan22": {"model_path_hf": "Wan-AI/Wan2.2-TI2V-5B-Diffusers"},
     # Whisper works for any size (dims and token ids come from the
     # checkpoint's configs). ``whisper_large`` pins large-v3, the standard
-    # ASR-benchmark checkpoint; ``whisper_large_v3_turbo`` is the 4-decoder-
+    # ASR-benchmark checkpoint. ``whisper_large_v3_turbo`` is the 4-decoder-
     # layer distillation that serves the same encoder several times faster.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
     "whisper_large_v3_turbo": {"model_path_hf": "openai/whisper-large-v3-turbo"},
