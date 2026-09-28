@@ -431,6 +431,11 @@ class Worker:
         # _pending_removes: deferred REMOVE_REQUESTs.
         self._in_flight_rids: set[int] = set()
         self._pending_removes: set[int] = set()
+
+        # step seq -> rids rank 0 released after that step, held until this rank
+        # has consumed it. See ``_removal_step_reached``.
+        self._removes_awaiting_step: dict[int, list[str]] = {}
+
         # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
         # behind an in-flight GPU step; _draining_rids have stopped reading and
         # persist until REMOVE_REQUEST (so no read can restart after READS_DONE);
@@ -584,8 +589,22 @@ class Worker:
 
 
     def _remove_request(self, body: RemoveRequest) -> None:
-        if self.is_tp_follower and body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF):
-            return # wait for removal message from TP rank 0 to avoid race conditions
+        if self.is_tp_follower:
+            if body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF):
+                return # wait for rank 0's forward, to avoid race conditions
+            if not self._removal_step_reached(body):
+                # Rank 0 released these pages between two steps. Tearing down
+                # here before this rank has finished the earlier one would have
+                # it admit that step with pages rank 0 no longer held.
+                #
+                # Follower-only, and not merely because nothing else is stamped:
+                # ``last_consumed_tp_seq`` only advances on a rank that consumes
+                # follow steps, so a rank that leads would park a stamped
+                # teardown for good.
+                self._removes_awaiting_step.setdefault(
+                    body.after_tp_seq, []
+                ).append(body.request_id)
+                return
 
         # Async-scheduling deferral: if this rid is currently held by an
         # in-flight GPU step (or its speculation), tearing down engine /
@@ -624,6 +643,10 @@ class Worker:
                         body=RemoveRequest(
                             request_id=body.request_id,
                             source=MessageSource.TP_RANK_0,
+                            # this rank is about to release the pages, having
+                            # broadcast up to here; followers must do it in the
+                            # same gap between steps
+                            after_tp_seq=self._tp_broadcast_seq - 1,
                         )
                     )
                 )
@@ -1186,12 +1209,18 @@ class Worker:
         # What the delta above should add up to on every rank. Cheap — a handful
         # of live requests — and it is the only thing that can catch the ranks
         # drifting apart, since the delta itself is never verified.
-        live = self.worker_graphs_manager.per_request_info
+        node = node_batch.node_name
+        # Wire ids: the follower keys its own state by a handle it minted itself,
+        # so a set of this rank's handles would name different requests there.
+        live = self.request_state.per_request_info
         offloaded_after = tuple(sorted(
-            rid for rid in live
-            if engine.is_offloaded(node_batch.node_name, rid)
+            self._rid_str(rid) for rid in live if engine.is_offloaded(node, rid)
         ))
-        live_after = tuple(sorted(live))
+        holding_after = tuple(sorted(
+            self._rid_str(rid) for rid in live
+            if not engine.is_offloaded(node, rid)
+            and engine.reclaimable(node, rid) > 0
+        ))
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
@@ -1212,7 +1241,7 @@ class Worker:
                         spec_from_seq=spec_from_seq,
                         resident_delta=resident_delta.copy(),
                         offloaded_after=offloaded_after,
-                        live_after=live_after,
+                        holding_after=holding_after,
                     )
                 )
             )
@@ -1553,7 +1582,8 @@ class Worker:
                 range_pop(synchronize=False)
 
     def _handle_admit_failure(
-        self, batch: ScheduledBatch, node_batch: ExecutingBatch
+        self, batch: ScheduledBatch, node_batch: ExecutingBatch,
+        referenced_rids: frozenset[str] = frozenset(),
     ) -> None:
         """Re-queue a batch whose admit refused it, so the step can be retried.
 
@@ -1564,7 +1594,7 @@ class Worker:
         """
         reason = node_batch.admit_error
         if isinstance(reason, AllocationFailed):
-            self._handle_allocation_failure(batch, node_batch)
+            self._handle_allocation_failure(batch, node_batch, referenced_rids)
             return
 
         self._push_back_batch(batch)
@@ -1575,7 +1605,8 @@ class Worker:
         )
 
     def _handle_allocation_failure(
-        self, batch: ScheduledBatch, node_batch: ExecutingBatch
+        self, batch: ScheduledBatch, node_batch: ExecutingBatch,
+        referenced_rids: frozenset[str] = frozenset(),
     ) -> None:
         """Push back nodes and hold the rids for backoff after KV OOM.
 
@@ -1604,6 +1635,19 @@ class Worker:
 
         # Push all batch nodes back to their queues
         self._push_back_batch(batch)
+
+        # A teardown this rank has been holding releases pages, and spending one
+        # can mean no eviction is needed at all — cheaper, and nothing has to be
+        # undone later. After the push-back above, so a rid torn down here cannot
+        # be pushed onto queues that have just been dismantled.
+        #
+        # ``referenced_rids``, not ``_in_flight_rids``: this step's admit refused,
+        # so no forward ran and its own pages are fair game. What is NOT is
+        # whatever the speculation touches — its pre-plan may have pre-admitted,
+        # which marks those streams in-flight, and ``_maybe_clear_spec`` does not
+        # run until after this returns.
+        self._apply_removes_whose_step_landed()
+        self._apply_pending_removes_safe_to_drop(referenced_rids)
 
         if self._is_tp_follower_node(batch.node_name):
             return
@@ -2655,6 +2699,27 @@ class Worker:
 
         return cpu_per_rid
 
+    def _removal_step_reached(self, body: RemoveRequest) -> bool:
+        """Whether this rank has consumed the step rank 0 released these pages
+        after. Unstamped removals (``-1``) are not ordered against anything."""
+        return (
+            body.after_tp_seq < 0
+            or self.scheduler.last_consumed_tp_seq >= body.after_tp_seq
+        )
+
+    def _apply_removes_whose_step_landed(self) -> None:
+        """Tear down the requests rank 0 released once this rank reaches the step
+        it released them after. Cannot strand them: the step was broadcast before
+        the removal, so this rank gets there."""
+        if not self._removes_awaiting_step:
+            return
+        reached = self.scheduler.last_consumed_tp_seq
+        for seq in sorted(s for s in self._removes_awaiting_step if s <= reached):
+            for rid in self._removes_awaiting_step.pop(seq):
+                self._remove_request(RemoveRequest(
+                    request_id=rid, source=MessageSource.SELF,
+                ))
+
     def _apply_pending_removes_safe_to_drop(
         self, in_flight_rids: set[int]
     ) -> None:
@@ -3013,6 +3078,8 @@ class Worker:
                     range_push("worker.process_messages", synchronize=False)
                 self._set_phase("process_messages")
                 self._process_messages()
+                # Removals rank 0 stamped with a step this rank has now reached.
+                self._apply_removes_whose_step_landed()
                 if self.enable_nvtx:
                     range_pop(synchronize=False)
 
@@ -3192,12 +3259,25 @@ class Worker:
                         # ``_handle_admit_failure`` pushes the GraphNodes back
                         # to the scheduler queue, and on KV-cache OOM also
                         # offloads or holds the failed rids.
-                        self._set_phase("admit_failure_recovery")
-                        self._handle_admit_failure(
-                            pending.batch, pending.node_batch
-                        )
+                        #
+                        # The speculation is cleared FIRST, before any of that.
+                        # It is going to be cleared either way, and doing it now
+                        # pays off twice: dropping its pre-plan releases the pages
+                        # that plan reserved, so the eviction below may turn out
+                        # unnecessary; and it unmarks those streams, so the
+                        # teardown flush has nothing left to spare. What survives
+                        # the clear is a yield-away batch — still to be submitted
+                        # this iteration — and ``referenced_rids`` then names
+                        # exactly that, and nothing in any other case.
                         self._clear_speculative_flag(pending.batch)
                         _maybe_clear_spec()
+                        self._set_phase("admit_failure_recovery")
+                        self._handle_admit_failure(
+                            pending.batch, pending.node_batch,
+                            referenced_rids=frozenset(
+                                speculation.scheduled_batch.node_objects
+                            ) if speculation is not None else frozenset(),
+                        )
 
                     if pending.node_batch.failed_requests:
                         # A per-rid stage (prepare_inputs / postprocess) blamed

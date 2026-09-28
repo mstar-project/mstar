@@ -203,6 +203,13 @@ class MicroScheduler:
         self._pending_resident_deltas: dict[str, OffloadDelta] = {}
         self._last_resident_delta: int = -1
 
+    @property
+    def last_consumed_tp_seq(self) -> int:
+        """Highest leader step this rank has taken off the FIFO. What orders a
+        forwarded removal against the step stream — see
+        ``Worker._removal_step_reached``."""
+        return self._last_resident_delta
+
     def _select_node_rr(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
     ):
@@ -274,7 +281,8 @@ class MicroScheduler:
 
     def _check_resident_set_matches(
         self, message: ScheduleTPNode,
-        worker_graphs_manager: WorkerGraphsManager,
+        request_state: RequestStateManager,
+        caught_up: bool = True,
     ) -> None:
         """Compare this rank's resident set to what rank 0 said its own was.
 
@@ -284,26 +292,41 @@ class MicroScheduler:
         or more later, with nothing pointing at where it started. Reported, not
         repaired: the difference is the bug, and guessing a repair would bury it.
         """
-        engine = self.engine_manager.get_engine(message.node_name)
-        live = set(worker_graphs_manager.per_request_info)
+        node = message.node_name
+        engine = self.engine_manager.get_engine(node)
+        # Compared as WIRE ids: per_request_info is keyed by local handle, and
+        # the leader's sets are wire strings, so comparing them raw would report
+        # a disagreement on every step -- and the sets in the log below could not
+        # be matched against the other rank's.
+        to_wire = self.runtime.get_rid_string
+        live = set(request_state.per_request_info)
         offloaded = {
-            rid for rid in live
-            if engine.is_offloaded(message.node_name, rid)
+            to_wire(rid) for rid in live if engine.is_offloaded(node, rid)
         }
-        their_live = set(message.live_after)
+        holding = {
+            to_wire(rid) for rid in live
+            if not engine.is_offloaded(node, rid)
+            and engine.reclaimable(node, rid) > 0
+        }
+        their_holding = set(message.holding_after)
         their_offloaded = set(message.offloaded_after)
-        if live == their_live and offloaded == their_offloaded:
+        if holding == their_holding and offloaded == their_offloaded:
             return
-        logger.error(
-            "TP page state disagrees at step %d on %s. Live: %d here vs %d "
+        # Mid-replay this is expected, and saying so is the point: it reports how
+        # far behind this rank is rather than claiming a bug. Once the replay is
+        # done any difference is a real divergence and a coming deadlock.
+        logger.log(
+            logging.WARNING if not caught_up else logging.ERROR,
+            "TP page state %s at step %d on %s. Holding pages: %d here vs %d "
             "there (only here: %s; only there: %s). Offloaded: %d here vs %d "
-            "there (only here: %s; only there: %s). A request that is live on "
-            "one rank and gone from the other still holds its pages there, so "
-            "the two admits can differ and a step both ranks run can deadlock.",
-            message.spec_seq, message.node_name,
-            len(live), len(their_live),
-            sorted(live - their_live) or "none",
-            sorted(their_live - live) or "none",
+            "there (only here: %s; only there: %s). A request holding pages on "
+            "one rank and not the other shifts that rank's admit, so a step both "
+            "ranks run can deadlock.",
+            "still behind (replay unfinished)" if not caught_up else "disagrees",
+            message.spec_seq, node,
+            len(holding), len(their_holding),
+            sorted(holding - their_holding) or "none",
+            sorted(their_holding - holding) or "none",
             len(offloaded), len(their_offloaded),
             sorted(offloaded - their_offloaded) or "none",
             sorted(their_offloaded - offloaded) or "none",
@@ -393,12 +416,16 @@ class MicroScheduler:
             return
         # Check readiness for every rid to pop all-or-none. Use the
         # leader's graph walk.
-        if not self._apply_delta_from_message(first_tp_node):
-            return # must apply all pending deltas first
-        # Checked after the replay and before the build: this is the one moment
-        # the two ranks are supposed to agree, and the step below is what a
-        # disagreement turns into a deadlock.
-        self._check_resident_set_matches(first_tp_node, worker_graphs_manager)
+        # Checked either way. A refused replay is when the comparison is most
+        # wanted — it says how far behind this rank is and in what — and putting
+        # it after the early return below made it unreachable in exactly that
+        # case.
+        caught_up = self._apply_delta_from_message(first_tp_node)
+        self._check_resident_set_matches(
+            first_tp_node, request_state, caught_up=caught_up,
+        )
+        if not caught_up:
+            return # every pending move has to land before the step is built
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name,
             first_tp_node.graph_walk, self.tp_rids(first_tp_node),

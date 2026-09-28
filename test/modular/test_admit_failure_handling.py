@@ -124,8 +124,8 @@ class _FakeWorker:
         # whoever owns the ready queues now.
         return self._graph_runtime
 
-    def _handle_allocation_failure(self, batch, node_batch):
-        self.offload_calls.append(node_batch.node_name)
+    def _handle_allocation_failure(self, batch, node_batch, referenced_rids=frozenset()):
+        self.offload_calls.append((node_batch.node_name, referenced_rids))
         # the real one push-backs and holds; stand in for both
         self._push_back_batch(batch)
         self.scheduler.hold_requests(list(batch.request_to_worker_graph))
@@ -153,9 +153,12 @@ def test_offloading_requeues_without_evicting():
 
 def test_allocation_failure_still_evicts():
     worker = _FakeWorker()
-    worker._handle_admit_failure(*_batches(_alloc_failed()))
+    worker._handle_admit_failure(
+        *_batches(_alloc_failed()), referenced_rids=frozenset({"spec_rid"}),
+    )
 
-    assert worker.offload_calls == ["node"]
+    # the set has to reach the handler: it is what the teardown flush spares
+    assert worker.offload_calls == [("node", frozenset({"spec_rid"}))]
     # exactly one push-back per request: the delegation must not double up
     assert sorted(worker.queue.pushed_back) == ["r0", "r1"]
     assert sorted(worker.held) == ["r0", "r1"]
@@ -175,6 +178,13 @@ class _HoldingWorker:
         # not a sharded node, so this rank runs its own OOM recovery
         self.parallel_nodes = set()
         self.parallel_leader_nodes = set()
+        self._in_flight_rids: set[str] = set()
+
+    def _apply_removes_whose_step_landed(self):
+        pass
+
+    def _apply_pending_removes_safe_to_drop(self, in_flight_rids):
+        del in_flight_rids
 
     def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None):
         # no victim

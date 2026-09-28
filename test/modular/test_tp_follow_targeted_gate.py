@@ -86,6 +86,11 @@ class _FakeRuntime:
     def __init__(self, queue=None):
         self._queue = queue
 
+    def get_rid_string(self, handle):
+        # Only ``_check_resident_set_matches`` needs this, to compare page state
+        # in wire ids; these tests drive the scheduling path, not that check.
+        return f"wire-{handle}"
+
     def get_worker_graph_id_for_node(self, node_name, graph_walk):
         return "wg0"
     def pop_rids(self, node_name, graph_walk, request_ids, check_ready=False):

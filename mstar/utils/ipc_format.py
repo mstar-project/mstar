@@ -59,6 +59,14 @@ class MessageSource(IntEnum):
 class RemoveRequest(MessageBody):
     request_id: str
     source: int = MessageSource.CONDUCTOR
+    # Rank 0 forwarding a removal to its followers stamps the last step it had
+    # broadcast, so they tear the request down at the same point in the step
+    # sequence it did. A teardown releases pages, and a follower that applies it
+    # on the other side of a step admits that step against different page state —
+    # which is a deadlock, and invisible in the resident-set delta because the
+    # request is not offloaded, it is gone. ``-1`` for the unordered paths (the
+    # conductor's own sends, and a rank's own deferred re-apply).
+    after_tp_seq: int = -1
 
 
 @dataclass
@@ -113,13 +121,9 @@ class OffloadDelta:
     Holds WIRE request ids, not worker-local handles: a handle is minted per
     worker, so rank 0's would name different requests on the follower.
 
-    A dataclass of lists rather than a NamedTuple of deques because this rides on
-    every ``ScheduleTPNode``. The wire codec encodes a dataclass field by its
-    declared type; anything else falls through to the pickle path, and that would
-    be a pickle per broadcast per follower on every step. Not a ``MessageBody``:
-    it is a field, not a body, and a concrete dataclass hint takes the typed path
-    either way. ``pop_left`` is O(n) on a list, which costs nothing at the handful
-    of entries a delta ever holds.
+    A dataclass of lists rather than a NamedTuple of deques so that the wire codec
+    can automatically encode it. ``pop_left`` is O(n) on a list, which costs nothing
+    at the handful of entries a delta ever holds.
 
     ``__len__`` is the queue depth, so an empty delta is falsy -- several callers
     lean on that.
@@ -161,27 +165,6 @@ class OffloadDelta:
         """
         return OffloadDelta(list(self.rids), list(self.is_offload))
 
-    def collapsed(self) -> "OffloadDelta":
-        """The same net state change, with the churn taken out.
-
-        Only the last move per request can matter: replay matches state, so an
-        offload followed by a reload of the same request is two full page copies
-        that end where they started. A thrashing rank produces mostly that, and a
-        follower paying for all of it falls behind faster than it can catch up —
-        which is what puts the ranks out of step in the first place.
-
-        Order between DIFFERENT requests is kept, each survivor staying where its
-        last move was. Dropping an earlier offload cannot starve a later reload:
-        the net state is one the recording rank actually held, so it fits.
-        """
-        rids, flags = list(self.rids), list(self.is_offload)
-        last_move = {rid: i for i, rid in enumerate(rids)}
-        out = OffloadDelta.new()
-        for i in sorted(last_move.values()):
-            out.rids.append(rids[i])
-            out.is_offload.append(flags[i])
-        return out
-
     def take(self) -> "OffloadDelta":
         """Hand the queue over and leave this one empty.
 
@@ -212,12 +195,17 @@ class ScheduleTPNode(MessageBody):
     # says what rank 0 did; these say where it should have landed.
     #
     # Both sets, because they catch different skews. ``offloaded_after`` catches
-    # a delta that did not replay. ``live_after`` catches page movement the delta
-    # never described: a request torn down frees its pages, and if the two ranks
-    # apply that teardown on opposite sides of this step, their admits disagree
-    # while their offloaded sets look identical.
+    # a delta that did not replay. ``holding_after`` catches page movement the
+    # delta never describes: a request torn down releases its pages, and if the
+    # ranks apply that teardown on opposite sides of this step their admits
+    # disagree while their offloaded sets look identical.
+    #
+    # Requests that HOLD pages, not requests that are live. A request that has
+    # been admitted but never run holds nothing, so it cannot shift an admit —
+    # and new arrivals reach the ranks at slightly different times, so comparing
+    # live sets reports that harmless skew as a fault.
     offloaded_after: tuple[str, ...] = ()
-    live_after: tuple[str, ...] = ()
+    holding_after: tuple[str, ...] = ()
 
 
 @dataclass

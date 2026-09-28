@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 _ENGINE_STEP_SYNC = os.environ.get("MSTAR_ENGINE_STEP_SYNC", "0") == "1"
 
 
+
 def checkpoint_identity(path: str | Path) -> bytes:
     """Name the weights a cached page was produced under, without reading them.
 
@@ -1629,13 +1630,13 @@ class Engine:
     ) -> OffloadDelta:
         """The moves on this node since the last call, ready for the wire.
 
-        Collapsed on the way out: a rank that is thrashing journals an offload
-        and the reload that undoes it, and making every follower pay both is how
-        they fall out of step. See ``OffloadDelta.collapsed``.
+        Verbatim. Every move in it is one this rank executed, so a rank in the
+        same state can always apply it — which is what makes a refused replay
+        mean the states differ, and nothing else.
         """
         if node_name not in self._resident_delta:
             return OffloadDelta.new()
-        return self._resident_delta[node_name].take().collapsed()
+        return self._resident_delta[node_name].take()
 
     def apply_resident_delta(
         self, node_name: str, delta: OffloadDelta,
@@ -1699,7 +1700,7 @@ class Engine:
                             "(a step still holds its pages); %d moves still "
                             "owed. This rank cannot run rank 0's next step "
                             "until it catches up.",
-                            rid, node_name, len(delta),
+                            wire_rid, node_name, len(delta),
                         )
                         return False
                     logger.info(
@@ -1723,7 +1724,7 @@ class Engine:
                         "Replay of rank 0's reload of %s on %s does not fit; "
                         "%d moves still owed. This rank cannot run rank 0's "
                         "next step until it catches up.",
-                        rid, node_name, len(delta),
+                        wire_rid, node_name, len(delta),
                     )
                     return False
                 else:

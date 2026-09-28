@@ -25,7 +25,11 @@ sys.path.insert(0, ".")
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
 from mstar.engine.resources.step import FULL_ADMIT_OK
-from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
+from mstar.utils.ipc_format import (
+    OffloadDelta,
+    RemoveRequest,
+    ScheduleTPNode,
+)
 from mstar.worker import micro_scheduler as sched_mod
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import MicroScheduler
@@ -87,7 +91,6 @@ def test_take_hands_the_queue_over_and_leaves_it_empty():
     assert _entries(taken) == [("a", True), ("b", False)]
     assert len(delta) == 0, "the source kept the entries it handed over"
 
-    # and the two are independent afterwards
     delta.add_offloaded("c")
     assert _entries(taken) == [("a", True), ("b", False)]
 
@@ -111,55 +114,6 @@ def test_an_empty_delta_is_falsy():
     delta = OffloadDelta.new()
     delta.add_offloaded("a")
     assert delta
-
-
-def test_churn_collapses_to_the_net_change():
-    """The measured cost: an offload and the reload that undoes it is two full
-    page copies to end where it started (~270ms on a real rank), and a thrashing
-    leader produces mostly that. A follower paying for all of it falls behind
-    faster than it can catch up."""
-    delta = OffloadDelta.new()
-    delta.add_offloaded("a")
-    delta.add_reloaded("a")
-
-    assert _entries(delta.collapsed()) == [("a", False)]
-
-
-def test_the_last_move_per_request_is_the_one_kept():
-    delta = OffloadDelta.new()
-    delta.add_offloaded("a")
-    delta.add_reloaded("a")
-    delta.add_offloaded("a")
-
-    assert _entries(delta.collapsed()) == [("a", True)], (
-        "the net state is offloaded, so that is what the follower must reach"
-    )
-
-
-def test_collapsing_keeps_the_order_between_different_requests():
-    """Only same-request churn is redundant. Two requests' moves can depend on
-    each other for room, so their relative order has to survive."""
-    delta = OffloadDelta.new()
-    delta.add_offloaded("a")
-    delta.add_reloaded("b")
-    delta.add_reloaded("a")
-
-    assert _entries(delta.collapsed()) == [("b", False), ("a", False)]
-
-
-def test_collapsing_leaves_a_delta_with_no_churn_alone():
-    delta = OffloadDelta.new()
-    delta.add_offloaded("a")
-    delta.add_reloaded("b")
-    delta.add_reloaded("c")
-
-    assert _entries(delta.collapsed()) == [
-        ("a", True), ("b", False), ("c", False),
-    ]
-
-
-def test_an_empty_delta_collapses_to_empty():
-    assert len(OffloadDelta.new().collapsed()) == 0
 
 
 # --- the engine's journal and replay ----------------------------------------
@@ -336,10 +290,6 @@ def test_both_directions_are_journalled_in_order():
 
     assert _entries(engine.take_resident_delta("node")) == [
         ("wire-a", True), ("wire-a", False), ("wire-b", True),
-    ]
-    # ...and the wire gets the net of them, so no follower pays for the churn
-    assert _entries(engine.take_resident_delta("node")) == [
-        ("a", False), ("b", True),
     ]
     assert len(engine.take_resident_delta("node")) == 0, "drained once only"
 
@@ -571,6 +521,9 @@ class _Leader:
             ),
             get_rid_string=_Rids().get_rid_string,
         )
+        # Live requests moved off the worker-graph manager onto here; the
+        # broadcast reads it to say what its page state should add up to.
+        self.request_state = SimpleNamespace(per_request_info={"r0": object()})
         self.sent: list = []
         self.communicator = SimpleNamespace(
             send=lambda worker, msg: self.sent.append((worker, msg))
@@ -659,6 +612,18 @@ class _Rank:
         self.parallel_nodes = {"node"}
         self.parallel_leader_nodes = {"node"} if leader else set()
         self.offload_attempts: list[str] = []
+        self._in_flight_rids: set[str] = set()
+        # recorded rather than stubbed out: a teardown releases pages, so
+        # spending one before evicting is the cheaper move and the order matters
+        self.flushed_removes = 0
+        self.flush_protected: set[str] | None = None
+
+    def _apply_removes_whose_step_landed(self):
+        self.flushed_removes += 1
+
+    def _apply_pending_removes_safe_to_drop(self, in_flight_rids):
+        self.flushed_removes += 1
+        self.flush_protected = set(in_flight_rids)
 
     def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None):
         del batch_ids, affected_resources
@@ -666,14 +631,14 @@ class _Rank:
         return "victim"
 
 
-def _oom(rank):
+def _oom(rank, referenced_rids=frozenset()):
     batch = SimpleNamespace(
         node_name="node", graph_walk="walk",
         node_objects={"r0": object(), "r1": object()},
         request_to_worker_graph={"r0": "wg", "r1": "wg"},
     )
     node_batch = SimpleNamespace(node_name="node", failed_resource=None)
-    rank._handle_allocation_failure(batch, node_batch)
+    rank._handle_allocation_failure(batch, node_batch, referenced_rids)
 
 
 def test_a_follow_rank_neither_evicts_nor_holds():
@@ -697,6 +662,10 @@ def test_rank_zero_still_evicts_and_holds_its_victim():
     _oom(leader)
 
     assert leader.offload_attempts == ["node"]
+    assert leader.flushed_removes == 2, (
+        "a pending teardown releases pages, so it has to be spent before an "
+        "eviction is chosen — otherwise a page move happens that need not"
+    )
     assert leader.held == ["victim"]
     assert sorted(leader.queue.pushed_back) == ["r0", "r1"]
 
@@ -815,19 +784,19 @@ def test_an_empty_follow_queue_is_said_so(monkeypatch, caplog):
     assert "tp-follow queue=0 (head seq none)" in line
 
 
-def test_the_broadcast_ships_a_collapsed_delta():
-    """Where it has to happen: on the way out, so no follower ever sees the
-    churn."""
+def test_the_broadcast_ships_the_sequence_verbatim():
+    """The property this protects: every move the follower replays is one the
+    leader executed, so a move it cannot apply proves the states differ. A
+    collapsed sequence was never executed by anyone, so a refusal could be an
+    artifact of the rewrite instead."""
     engine = _Engine("leader")
     engine.offload_request("node", "a")
     engine.resource.offloaded = {"a"}
     engine.reload_request("node", "a")
 
-    assert _entries(engine.take_resident_delta("node")) == [("a", False)], (
-        "the churn reached the wire"
-    )
-
-
+    assert _entries(engine.take_resident_delta("node")) == [
+        ("wire-a", True), ("wire-a", False),
+    ]
 def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
     """A follower that stops mid-delta and never finishes leaves rank 0 on a
     collective it will never join — and until now that was silent."""
@@ -835,13 +804,13 @@ def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
     engine.resource.refuse_reload = True
     engine.resource.offloaded = {"a"}
     delta = OffloadDelta.new()
-    delta.add_reloaded("a")
+    delta.add_reloaded("wire-a")
 
     with caplog.at_level(logging.WARNING, logger=engine_mod.__name__):
         assert engine.apply_resident_delta("node", delta) is False
 
     line = next(r.getMessage() for r in caplog.records if "does not fit" in r.getMessage())
-    assert "reload of a on node" in line
+    assert "reload of wire-a on node" in line
     assert "1 moves still owed" in line
 
 
@@ -857,94 +826,362 @@ class _CheckSched:
 
     _check_resident_set_matches = MicroScheduler._check_resident_set_matches
 
-    def __init__(self, offloaded_here):
+    def __init__(self, offloaded_here=(), holds_nothing_here=()):
+        off, nothing = set(offloaded_here), set(holds_nothing_here)
         engine = SimpleNamespace(
-            is_offloaded=lambda node, rid: rid in set(offloaded_here)
+            is_offloaded=lambda node, rid: rid in off,
+            reclaimable=lambda node, rid: 0 if rid in nothing else 1,
         )
         self.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+        # The check compares wire ids, so it needs the handle table.
+        self.runtime = _Rids()
 
 
 def _mgr(rids):
+    """This rank's live requests, keyed by LOCAL handle."""
     return SimpleNamespace(per_request_info=dict.fromkeys(rids, object()))
 
 
-def _msg(offloaded_after, seq=7, live_after=None):
+def _msg(offloaded_after, seq=7, holding_after=()):
+    """What rank 0 said its own page state was, in WIRE ids."""
     return ScheduleTPNode(
         node_name="node", graph_walk="walk", request_ids=["r0"],
-        spec_seq=seq, offloaded_after=tuple(offloaded_after),
-        live_after=tuple(
-            offloaded_after if live_after is None else live_after
-        ),
+        spec_seq=seq,
+        offloaded_after=tuple(f"wire-{r}" for r in offloaded_after),
+        holding_after=tuple(f"wire-{r}" for r in holding_after),
     )
 
 
 def test_matching_page_state_says_nothing(caplog):
     sched = _CheckSched(offloaded_here={"a"})
 
-    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
+    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
         sched._check_resident_set_matches(
-            _msg(["a"], live_after=["a", "b"]), _mgr(["a", "b"]),
+            _msg(["a"], holding_after=["b"]), _mgr(["a", "b"]),
         )
 
     assert not caplog.records
+
+
+def test_a_new_arrival_one_rank_has_not_seen_is_not_a_fault(caplog):
+    """New requests reach the ranks at slightly different times and hold no pages
+    until they run, so they cannot shift an admit. Comparing live sets reported
+    that as a fault; comparing page holders does not."""
+    sched = _CheckSched(holds_nothing_here={"justarrived"})
+
+    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
+        sched._check_resident_set_matches(
+            # rank 0 has not seen "justarrived" yet
+            _msg([], holding_after=["a"]), _mgr(["a", "justarrived"]),
+        )
+
+    assert not caplog.records
+
+
+def test_a_teardown_the_ranks_applied_on_opposite_sides_is_named(caplog):
+    """The skew the offloaded sets cannot show: a request torn down on one rank
+    and still holding its pages on the other shifts that rank's admit."""
+    sched = _CheckSched()
+
+    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
+        sched._check_resident_set_matches(
+            # rank 0 still holds "stale"; this rank has released it
+            _msg([], seq=1228, holding_after=["a", "stale"]), _mgr(["a"]),
+        )
+
+    line = next(r.getMessage() for r in caplog.records if "disagrees" in r.getMessage())
+    assert "step 1228" in line
+    assert "Holding pages: 1 here vs 2 there" in line
+    assert "only there: ['wire-stale']" in line
+    assert "shifts that rank's admit" in line
 
 
 def test_an_unreplayed_delta_is_named(caplog):
     """The skew ``offloaded_after`` exists for: a move that did not land."""
     sched = _CheckSched(offloaded_here={"a"})
 
-    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
+    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
         sched._check_resident_set_matches(
-            _msg(["a", "b"], seq=41, live_after=["a", "b", "c"]),
-            _mgr(["a", "b", "c"]),
+            _msg(["a", "b"], seq=41, holding_after=[]), _mgr(["a", "b"]),
         )
 
     line = next(r.getMessage() for r in caplog.records if "disagrees" in r.getMessage())
-    assert "step 41" in line
     assert "Offloaded: 1 here vs 2 there" in line
-    assert "only there: ['b']" in line
+    assert "only there: ['wire-b']" in line
 
 
-def test_a_teardown_the_ranks_applied_on_opposite_sides_is_named(caplog):
-    """The skew the offloaded sets cannot show, and the one the watchdog pointed
-    at: a request torn down on rank 0 but still live here is still holding its
-    pages here, so the two admits differ while both offloaded sets look
-    identical."""
-    sched = _CheckSched(offloaded_here=set())
+def test_a_refused_replay_still_reports_the_page_gap(caplog):
+    """The blind spot: the comparison used to sit after the early return for a
+    refused replay, so it could never run in the one case where it says the most
+    — how far behind this rank is, and in what."""
+    sched = _CheckSched(offloaded_here={"a"})
 
-    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
+    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
         sched._check_resident_set_matches(
-            # rank 0 has torn "gone" down; this rank has not
-            _msg([], seq=8703, live_after=["a"]), _mgr(["a", "gone"]),
+            _msg(["a", "b"], seq=99), _mgr(["a", "b"]), caught_up=False,
         )
 
-    line = next(r.getMessage() for r in caplog.records if "disagrees" in r.getMessage())
-    assert "step 8703" in line
-    assert "Live: 2 here vs 1 there" in line
-    assert "only here: ['gone']" in line
-    assert "still holds its pages there" in line
+    record = next(r for r in caplog.records if "still behind" in r.getMessage())
+    assert record.levelno == logging.WARNING, (
+        "mid-replay is expected, so it must not read as a bug"
+    )
+    assert "only there: ['wire-b']" in record.getMessage()
 
 
-def test_a_drift_the_other_way_is_named_too(caplog):
-    sched = _CheckSched(offloaded_here={"a", "b"})
+def test_a_gap_after_the_replay_finished_is_an_error(caplog):
+    sched = _CheckSched(offloaded_here={"a"})
 
-    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
+    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
         sched._check_resident_set_matches(
-            _msg(["a"], live_after=["a", "b"]), _mgr(["a", "b"]),
+            _msg(["a", "b"], seq=99), _mgr(["a", "b"]), caught_up=True,
         )
 
-    line = next(r.getMessage() for r in caplog.records if "disagrees" in r.getMessage())
-    assert "only here: ['b']" in line
+    record = next(r for r in caplog.records if "disagrees" in r.getMessage())
+    assert record.levelno == logging.ERROR
 
 
-def test_the_offloaded_check_is_scoped_to_live_requests(caplog):
-    """``is_offloaded`` is only asked about requests this rank still knows, so a
-    stale entry cannot masquerade as an offload skew."""
-    sched = _CheckSched(offloaded_here={"a", "stale"})
+def test_the_follow_path_checks_even_when_the_replay_refuses(monkeypatch):
+    """Placement rather than behaviour. The comparison is worth most on the
+    refusal path, and it sat behind that path's early return — so the two tests
+    above passed while the real code could never reach it."""
+    engine = SimpleNamespace(
+        apply_resident_delta=lambda node, delta: False,  # refuses
+        is_offloaded=lambda node, rid: False,
+        check_ready=lambda *a, **kw: FULL_ADMIT_OK,
+        get_max_batch_size=lambda node, walk: None,
+    )
+    sched = MicroScheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        parallel_leader_nodes=set(),
+    )
+    message = ScheduleTPNode(
+        node_name="node", graph_walk="walk", request_ids=["r0"], spec_seq=5,
+    )
+    message.resident_delta.add_offloaded("victim")
+    sched.register_tp_follow(message)
 
-    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
-        sched._check_resident_set_matches(
-            _msg(["a"], live_after=["a"]), _mgr(["a"]),
+    seen: list[bool] = []
+    monkeypatch.setattr(
+        sched, "_check_resident_set_matches",
+        lambda msg, mgr, caught_up=True: seen.append(caught_up),
+    )
+
+    assert sched._try_schedule_tp_follow(
+        SimpleNamespace(per_request_info={"r0": object()})
+    ) is None
+    assert seen == [False], "the refusal path skipped the comparison"
+
+
+def test_the_broadcast_reports_page_holders_not_live_requests():
+    """The other half of the same rule, and the one the follower cannot enforce:
+    a request that has not run holds no pages, so it cannot shift an admit. New
+    arrivals land on the ranks at slightly different times, so sending the live
+    set makes that harmless skew read as a fault."""
+    leader = _Leader(followers=("rank1",))
+    leader.request_state.per_request_info["justarrived"] = object()
+    leader.engine.resource.holds_nothing = {"justarrived"}
+
+    leader.maybe_send_zmq_to_tp_followers(_node_batch())
+
+    body = leader.sent[0][1].body
+    assert "wire-justarrived" not in body.holding_after, (
+        "a request holding no pages was reported as a page holder"
+    )
+    assert body.holding_after == ("wire-r0",)
+
+
+# --- a forwarded teardown is ordered against the step stream -----------------
+#
+# A teardown releases pages, and the resident-set delta cannot describe it: the
+# request is not offloaded, it is gone. So it carries the step rank 0 released it
+# after, and a follower holds it until it has consumed that step.
+
+
+class _RemoveRank:
+    """``_remove_request``'s ordering, over stubs."""
+
+    _apply_removes_whose_step_landed = Worker._apply_removes_whose_step_landed
+    _removal_step_reached = Worker._removal_step_reached
+
+    def __init__(self, consumed: int):
+        self.scheduler = SimpleNamespace(last_consumed_tp_seq=consumed)
+        self._removes_awaiting_step: dict[int, list[str]] = {}
+        self.applied: list[str] = []
+
+    def _remove_request(self, body):
+        self.applied.append(body.request_id)
+
+
+def test_a_removal_for_a_step_not_yet_reached_waits():
+    rank = _RemoveRank(consumed=5)
+
+    assert rank._removal_step_reached(
+        RemoveRequest(request_id="r", after_tp_seq=7)
+    ) is False
+
+
+def test_a_removal_for_a_step_already_consumed_applies():
+    rank = _RemoveRank(consumed=7)
+
+    assert rank._removal_step_reached(
+        RemoveRequest(request_id="r", after_tp_seq=7)
+    ) is True
+
+
+def test_an_unstamped_removal_is_not_ordered():
+    """The conductor's own sends, and a rank re-applying its own deferral."""
+    rank = _RemoveRank(consumed=-1)
+
+    assert rank._removal_step_reached(RemoveRequest(request_id="r")) is True
+
+
+def test_a_held_removal_lands_once_its_step_does():
+    rank = _RemoveRank(consumed=5)
+    rank._removes_awaiting_step = {7: ["late"], 4: ["early"]}
+
+    rank._apply_removes_whose_step_landed()
+
+    assert rank.applied == ["early"], "applied a teardown from a step not reached"
+    assert rank._removes_awaiting_step == {7: ["late"]}
+
+    rank.scheduler.last_consumed_tp_seq = 7
+    rank._apply_removes_whose_step_landed()
+
+    assert rank.applied == ["early", "late"]
+    assert rank._removes_awaiting_step == {}
+
+
+def test_held_removals_land_in_step_order():
+    """Two teardowns from different gaps have to be applied in the order rank 0
+    made them, for the same reason the delta is a queue."""
+    rank = _RemoveRank(consumed=9)
+    rank._removes_awaiting_step = {8: ["second"], 3: ["first"]}
+
+    rank._apply_removes_whose_step_landed()
+
+    assert rank.applied == ["first", "second"]
+
+
+class _ForwardingLeader:
+    """Rank 0's ``_remove_request``, over stubs, to pin what it forwards."""
+
+    _remove_request = Worker._remove_request
+    _removal_step_reached = Worker._removal_step_reached
+    _rid = Worker._rid
+
+    def __init__(self, broadcast_seq: int):
+        self.is_tp_follower = False
+        self._tp_broadcast_seq = broadcast_seq
+        # handle-keyed state, per rid_table's list
+        self._in_flight_rids: set[int] = set()
+        self._pending_removes: set[int] = set()
+        self._last_active: dict = {}
+        self.streaming_buffers: dict = {}
+        # wire-string-keyed: parked teardowns and the drain bookkeeping, because
+        # a handle is recycled and would reattach to the next request to get it
+        self._removes_awaiting_step: dict[int, list[str]] = {}
+        self._draining_rids: set[str] = set()
+        self._pending_drains: set[str] = set()
+        self._reads_done_sent: set[str] = set()
+        group = SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"])
+        # The runtime owns the handle table and the sharding config now, and
+        # ``remove_request`` there is what frees the handle.
+        self._graph_runtime = SimpleNamespace(
+            get_rid_handle=lambda rid: 0 if rid == "gone" else None,
+            get_rid_string=lambda handle: "gone" if handle == 0 else None,
+            get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
+            remove_request=lambda rid: None,
+        )
+        self.request_state = SimpleNamespace(remove_request=lambda rid: None)
+        self.engine_manager = SimpleNamespace(
+            remove_request=lambda rid: None, evictable_nodes=lambda: (),
+        )
+        self.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
+        self.profile_info = SimpleNamespace(pop_request=lambda rid: None)
+        self.scheduler = SimpleNamespace(
+            clear_rid=lambda rid, wire_rid: None,
+            clear_wire_rid=lambda rid: None,
+            last_consumed_tp_seq=-1,
+        )
+        self.sent: list = []
+        self.communicator = SimpleNamespace(
+            send=lambda worker, msg: self.sent.append((worker, msg))
         )
 
-    assert not caplog.records
+
+def test_the_forwarded_teardown_carries_the_step_it_follows():
+    """Without the stamp a follower has nothing to order the teardown against,
+    and applies it on whichever side of the step its loop happens to be on."""
+    leader = _ForwardingLeader(broadcast_seq=1229)
+
+    leader._remove_request(RemoveRequest(request_id="gone"))
+
+    assert [w for w, _ in leader.sent] == ["rank1"]
+    body = leader.sent[0][1].body
+    assert body.request_id == "gone"
+    assert body.after_tp_seq == 1228, (
+        "the last step broadcast, which is the gap this rank released the pages in"
+    )
+
+
+def test_a_rank_that_leads_never_parks_a_teardown():
+    """``last_consumed_tp_seq`` only advances on a rank that consumes follow
+    steps, so a leader that parked a stamped teardown would hold it for good —
+    and hold its pages with it."""
+    leader = _ForwardingLeader(broadcast_seq=1229)
+
+    # stamped, as if it had somehow arrived ordered
+    leader._remove_request(
+        RemoveRequest(request_id="gone", after_tp_seq=9999)
+    )
+
+    assert leader._removes_awaiting_step == {}, "a leader parked a teardown"
+    assert [w for w, _ in leader.sent] == ["rank1"], "and it still forwarded"
+
+
+def test_the_teardown_flush_spares_only_what_the_speculation_touches():
+    """The failed step's own pages are fair game — its admit refused, so no
+    forward ran. What is not is whatever the speculation touches: its pre-plan
+    may have pre-admitted, marking those streams in flight, and the speculation
+    is not dropped until after this returns."""
+    leader = _Rank(leader=True)
+
+    _oom(leader, referenced_rids=frozenset({"spec_rid"}))
+
+    assert leader.flush_protected == {"spec_rid"}, (
+        "the flush protected the failed step's rids, whose pages are reclaimable"
+    )
+
+
+def test_the_teardown_flush_runs_after_the_push_back():
+    """A rid torn down by the flush must not then be pushed onto queues that the
+    teardown has just dismantled."""
+    leader = _Rank(leader=True)
+    order: list[str] = []
+    leader.queue.push_back_node = (
+        lambda node_name, rids, wg_ids: order.append("push")
+    )
+    leader._apply_pending_removes_safe_to_drop = (
+        lambda in_flight: order.append("flush")
+    )
+
+    _oom(leader)
+
+    assert order.index("push") < order.index("flush"), order
+
+
+def test_the_speculation_is_cleared_before_the_recovery_runs():
+    """Ordering, and it buys two things. Dropping the pre-plan releases the pages
+    it reserved, so the eviction that follows may be unnecessary; and it unmarks
+    those streams, so the teardown flush has nothing left to spare. Only a
+    yield-away batch survives the clear, and only that needs sparing."""
+    import inspect
+
+    src = inspect.getsource(worker_mod.Worker.run)
+    block = src[src.index("if pending.node_batch.admit_error is not None:"):]
+    clear = block.index("_maybe_clear_spec()")
+    recover = block.index("_handle_admit_failure(")
+    assert clear < recover, (
+        "recovery runs before the speculation is cleared, so it evicts to make "
+        "room the pre-plan was about to give back"
+    )
