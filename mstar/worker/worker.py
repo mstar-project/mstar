@@ -3186,6 +3186,29 @@ class Worker:
                 speculation = None
                 yield_away_from_target = None
 
+                # N's admit has already run — the fence at the top of the loop
+                # waited for it — so a refusal is knowable here, before anything
+                # is built or broadcast. Build nothing when it refused.
+                #
+                # It costs nothing: an ordinary speculation reads N's outputs and
+                # ``_maybe_clear_spec`` would drop it regardless. What it buys is
+                # the yield-away case, which is independent of N and so survives
+                # that clear — already broadcast, and unvoidable. Its rids can
+                # then be picked as the eviction victim below, and even when they
+                # are not, the eviction lands after its head went out: rank 0
+                # admits it with the freed pages, a follower replays the delta
+                # one step later and admits without them. Skipping leaves the
+                # eviction in the gap between steps, where the next head's delta
+                # carries it and both ranks admit from the same state.
+                #
+                # The marker below is deliberately outside this: a follower is
+                # waiting to settle N on exactly one of {head, marker}, and it
+                # moves no pages of its own.
+                admit_refused = (
+                    pending is not None
+                    and pending.node_batch.admit_error is not None
+                )
+
                 if pending is not None and self._can_speculate(pending.batch):
                     # Fairness check (peek-based, replaces the old iter-
                     # counter cap): only break the spec chain when there's
@@ -3204,7 +3227,7 @@ class Worker:
                         consecutive_spec_steps >= max_consecutive_spec
                         or must_yield_for_fairness
                     )
-                    if not must_yield_away:
+                    if not must_yield_away and not admit_refused:
                         if self.enable_nvtx:
                             range_push("worker.speculate", synchronize=False)
                         _t0 = _time.perf_counter() if phase_period else 0.0
@@ -3222,7 +3245,11 @@ class Worker:
                             )
                     if self._tp_lead_needs_marker(pending, speculation):
                         self._broadcast_tp_nospec(pending)
-                    if speculation is None:
+                    # ``yield_away_from_target`` stays None when the admit
+                    # refused, so the non-speculative path below schedules
+                    # without the fairness exclusion — it should be free to pick
+                    # up the batch ``_handle_admit_failure`` just pushed back.
+                    if speculation is None and not admit_refused:
                         yield_away_from_target = (
                             pending.node_name,
                             pending.graph_walk,
@@ -3344,15 +3371,17 @@ class Worker:
                         # to the scheduler queue, and on KV-cache OOM also
                         # offloads or holds the failed rids.
                         #
-                        # The speculation is cleared FIRST, before any of that.
-                        # It is going to be cleared either way, and doing it now
-                        # pays off twice: dropping its pre-plan releases the pages
-                        # that plan reserved, so the eviction below may turn out
-                        # unnecessary; and it unmarks those streams, so the
-                        # teardown flush has nothing left to spare. What survives
-                        # the clear is a yield-away batch — still to be submitted
-                        # this iteration — and ``referenced_rids`` then names
-                        # exactly that, and nothing in any other case.
+                        # Section 2 saw this same refusal and built nothing, so
+                        # there is no speculation to clear and ``referenced_rids``
+                        # is empty. Both are kept: they cost nothing, and they are
+                        # what makes the eviction below safe if a future change
+                        # ever does broadcast something on this path.
+                        #
+                        # Clearing FIRST is still the right order for that case —
+                        # dropping the pre-plan releases the pages plan reserved,
+                        # so the eviction may turn out unnecessary, and it unmarks
+                        # those streams so the teardown flush has nothing left to
+                        # spare.
                         self._clear_speculative_flag(pending.batch)
                         _maybe_clear_spec()
                         self._set_phase("admit_failure_recovery")
