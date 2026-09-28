@@ -151,6 +151,32 @@ class RopeManager(PositionManager):
         self._counters[rid].clear()
         self._matched.pop(rid, None)
 
+    # Session state: the counters move with the KV they address, or a resumed
+    # request would write positions from 0 over the pages the session holds.
+
+    @staticmethod
+    def session_rid(session_id: str) -> str:
+        return f"__mstar_session__{session_id}"
+
+    def adopt_session_state(self, rid: str, session_id: str) -> None:
+        held = self._counters.pop(self.session_rid(session_id), None)
+        if held:
+            self._counters[rid] = {**self._counters.get(rid, {}), **held}
+
+    def retain_session_state(self, rid: str, session_id: str) -> None:
+        counters = self._counters.pop(rid, None)
+        self._matched.pop(rid, None)
+        if counters:
+            self._counters[self.session_rid(session_id)] = counters
+
+    def remove_session(self, session_id: str) -> None:
+        self.remove_request(self.session_rid(session_id))
+
+    def session_state_size(self, session_id: str) -> int:
+        """Tokens the session's furthest stream has placed."""
+        counters = self._counters.get(self.session_rid(session_id)) or {}
+        return max(counters.values(), default=0)
+
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
     ) -> None:

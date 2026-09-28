@@ -13,6 +13,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "test_text_session": ("mstar.model.test_text_session.model", "TextSessionModel"),
     "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
@@ -46,6 +47,9 @@ HF_MODELS: dict[str, dict] = {
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
     "qwen3_tts": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"},
+    # BAGEL's LLM on its own, text in and text out, with its KV held across a
+    # persistent session. The deployment that exercises session semantics.
+    "test_text_session": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
     # V-JEPA 2 standard (encoder + masked predictor).  Default is ViT-L @ 256
     # (~300M); the same class loads vitl/h/g at 256 or 384 by reading
     # config.json.

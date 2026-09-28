@@ -68,8 +68,18 @@ class AudioChunk:
         return np.frombuffer(self.pcm, dtype="<i2")
 
 
+@dataclass
+class SessionInfo:
+    """The session a streaming request runs in, always the first event."""
+
+    session_id: str
+    created: bool = False
+    end_session: bool = False
+    metadata: dict = field(default_factory=dict)
+
+
 # A streaming iteration yields one of these per output chunk.
-StreamEvent = TextChunk | ImageChunk | AudioChunk
+StreamEvent = TextChunk | ImageChunk | AudioChunk | SessionInfo
 
 
 @dataclass
@@ -77,6 +87,7 @@ class GenerateResult:
     """Aggregated, decoded output of a non-streaming request."""
 
     request_id: str | None = None
+    session_id: str | None = None
     text: str | None = None
     images: list[bytes] = field(default_factory=list)  # PNG bytes, in arrival order
     audio: AudioBuffer | None = None

@@ -31,6 +31,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
 )
+from mstar.api_server.sessions import SessionRegistry
 from mstar.profile.format import RequestProfile, RequestTiming
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
@@ -172,6 +173,9 @@ def _api_server(messages):
     s.running = True
     s.conductor_proc = None
     s._liveness_interval_s = 0.5
+    s.sessions = SessionRegistry(None, teardown=lambda _sid: None)
+    s._next_session_sweep = 0.0
+    s._session_sweep_interval_s = 1.0
     s.log_stats = False
     s.cleaned = []
     s.communicator = SimpleNamespace(

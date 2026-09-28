@@ -59,12 +59,18 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
+   * - ``test_text_session``
+     - ``ByteDance-Seed/BAGEL-7B-MoT``
+     - BAGEL's LLM on its own, text in and text out, holding its KV across a
+       persistent session. The deployment that exercises :doc:`sessions`.
 
 Notes
 -----
 
 - Models marked *(Beta)* are functionally supported but not yet
   performance-optimized; treat their throughput/latency as provisional.
+- ``test_text_session`` is a narrowed view of an existing checkpoint rather than
+  a model of its own; it is there to exercise persistent sessions end to end.
 - The IDs above are representative. You may use local paths or compatible variants.
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.

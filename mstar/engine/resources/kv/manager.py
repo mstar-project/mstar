@@ -1361,6 +1361,79 @@ class KVManager(AttentionResource):
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
+    # ------------------------------------------------------------------
+    # Session state, held under a reserved rid so everything already keyed by
+    # request id (streams, offloaded host pages) carries over unchanged
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def session_rid(session_id: str) -> str:
+        return f"__mstar_session__{session_id}"
+
+    def adopt_session_state(self, rid: str, session_id: str) -> None:
+        with self._lock:
+            if not self._move_streams(self.session_rid(session_id), rid):
+                return
+            # its keys describe the new turn only, not the pages it inherited
+            overrides = self._overrides.get(rid)
+            if overrides is not None and overrides.prefix_cache:
+                overrides.prefix_cache = False
+                logger.debug(
+                    "KV %s: prefix cache off for %s; it resumes session %s",
+                    self.name, rid, session_id,
+                )
+
+    def retain_session_state(self, rid: str, session_id: str) -> None:
+        self._move_streams(rid, self.session_rid(session_id))
+
+    def remove_session(self, session_id: str) -> None:
+        self.remove_request(self.session_rid(session_id))
+
+    def session_state_size(self, session_id: str) -> int:
+        """Device pages the session holds."""
+        with self._lock:
+            streams = self._streams.get(self.session_rid(session_id), {})
+            return sum(len(stream.page_indices) for stream in streams.values())
+
+    def _move_streams(self, src: str, dst: str) -> bool:
+        """Hand every stream (and its host pages) from one rid to another.
+
+        False when the source held nothing, so a caller can tell a resumed
+        request from the session's first one.
+        """
+        streams = self._streams.get(src)
+        if not streams:
+            return False
+        # drain in-flight reads outside the lock; see reset_request
+        for stream in streams.values():
+            if stream.read_future is not None:
+                wait([stream.read_future])
+        with self._lock:
+            streams = self._streams.pop(src, None)
+            if not streams:
+                return False
+            existing = self._streams.get(dst) or {}
+            for label, stream in existing.items():
+                if label in streams:
+                    # the destination's own stream for this label is empty (a
+                    # fresh ingest) but may hold a probe's lease
+                    self._release_lease(stream)
+                    self._arena.release(stream.page_indices)
+            for stream in streams.values():
+                self._release_lease(stream)
+                stream.converted = False
+                stream.step_in_flight = False
+                # a session's pages are not keyed for cross-request reuse
+                stream.forget_chain()
+            self._streams[dst] = {**existing, **streams}
+            self._overrides.setdefault(dst, KVReqConfig())
+            if self._cpu_pool is not None and src in self._cpu_pool.offloaded:
+                self._cpu_pool.offloaded[dst] = self._cpu_pool.offloaded.pop(src)
+            self._overrides.pop(src, None)
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
+        return True
+
     def remove_request(self, rid: str):
         streams = self._streams.get(rid)
         if streams is not None:

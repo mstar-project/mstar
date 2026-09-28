@@ -26,6 +26,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.model.multimodal import PromptPart
+from mstar.model.sessions import SessionsConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -405,6 +406,14 @@ class Model(ABC):
         whose preprocessing changes shape between versions overrides this.
         """
         return type(self).__name__
+
+    def get_sessions_config(self) -> SessionsConfig | None:
+        """Declare persistent-session support, or None to refuse sessions.
+
+        Names the resources whose state survives a request teardown and lives
+        for the session, plus the deployment-facing caps (concurrency, TTL).
+        """
+        return None
 
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
         """Which input tensor keys which ``(resource, label)`` cache stream.

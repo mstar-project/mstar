@@ -25,12 +25,19 @@ from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
+from mstar.api_server.sessions import SessionError, SessionRegistry, SessionRequest
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import HF_MODELS
+from mstar.model.sessions import apply_sessions_yaml_overrides
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils.exitcode import describe_exitcode
+from mstar.utils.ipc_format import (
+    ConductorMessage,
+    ConductorMessageType,
+    TeardownSession,
+)
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 
@@ -247,11 +254,35 @@ class APIServer:
             ipc_socket_path_prefix=socket_path_prefix,
         )
 
+        # Session tracking. The registry decides what a request may name and
+        # when a session is collected; the conductor carries it out.
+        sessions_config = None
+        if model is not None:
+            sessions_config = apply_sessions_yaml_overrides(
+                model.get_sessions_config(), model_config or {},
+            )
+        self.sessions = SessionRegistry(
+            sessions_config, teardown=self._request_session_teardown,
+        )
+        self._next_session_sweep = 0.0
+        self._session_sweep_interval_s = 1.0
+
         # Background thread that drains results from the conductor. Started by
         # finalize_setup() once the workers report ready — before that there's
         # no traffic to drain and the HTTP server isn't up yet.
         self._msg_thread = threading.Thread(
             target=self._process_messages, daemon=True
+        )
+
+    def _request_session_teardown(self, session_id: str) -> None:
+        """Ask the conductor to free a session's state. The registry holds the
+        tombstone until ``session_torn_down`` comes back."""
+        self.communicator.send(
+            "conductor",
+            ConductorMessage(
+                message_type=ConductorMessageType.TEARDOWN_SESSION,
+                body=TeardownSession(session_id=session_id),
+            ),
         )
 
     def finalize_setup(self) -> None:
@@ -310,6 +341,7 @@ class APIServer:
                     req.error_status = 503
                 req.event.set()
             on_fatal = self.on_fatal
+        self.sessions.fail_all(message)
         if on_fatal is not None:
             on_fatal()
 
@@ -342,6 +374,7 @@ class APIServer:
         prompt_parts: list[PromptPart] | None = None,
         streaming: bool = True,
         request_id: str | None = None,
+        session: SessionRequest | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -370,6 +403,19 @@ class APIServer:
                     timing=RequestTiming(recv_time=time.perf_counter()),
                 ),
             )
+            if session is not None and session.session_id is not None:
+                # First chunk out, so a streaming client learns the id the
+                # server minted before any output arrives.
+                self.pending_requests[request_id].chunks.append(ResultChunk(
+                    request_id=request_id,
+                    modality="session",
+                    data=session.session_id.encode("utf-8"),
+                    metadata={
+                        "session_id": session.session_id,
+                        "created": session.created,
+                        "end_session": session.end_session,
+                    },
+                ))
 
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=request_id,
@@ -379,7 +425,13 @@ class APIServer:
             output_modalities=output_modalities,
             model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
+            session_id=session.session_id if session else None,
+            end_session=bool(session and session.end_session),
         ))
+        if session is not None and session.end_session and session.session_id:
+            # Hold the tombstone from here: the session is spoken for, so
+            # nothing else may name it while this request winds down.
+            self.sessions.note_ending(session.session_id)
 
         logger.info(
             "Request %s submitted  in=%s  out=%s",
@@ -465,9 +517,24 @@ class APIServer:
                     if len(self.recently_completed) > 0:
                         self._prune_recently_completed()
 
+                # Session bookkeeping is applied outside request_lock: the
+                # registry takes its own lock and may send to the conductor.
+                done_sessions: list[str] = []
+                failed_sessions: list[tuple[str, str]] = []
+
+                if now >= self._next_session_sweep:
+                    self._next_session_sweep = (
+                        now + self._session_sweep_interval_s
+                    )
+                    self.sessions.sweep()
+
                 for message in self.communicator.get_all_new_messages():
                     if not isinstance(message, APIServerMessage):
                         logger.warning("Unexpected message type: %s", type(message))
+                        continue
+
+                    if message.message_type == "session_torn_down":
+                        self.sessions.torn_down(message.body.session_id)
                         continue
 
                     rid = message.body.request_id
@@ -504,9 +571,13 @@ class APIServer:
                                 # rid here makes _prune_recently_completed
                                 # release it once the client lets go.
                                 self.recently_completed[rid] = time.time()
+                                failed_sessions.append(
+                                    (rid, message.body.error_message)
+                                )
                             elif message.message_type == "request_complete":
                                 logger.info("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
+                                done_sessions.append(rid)
 
                                 if not message.body.final_outputs:
                                     logger.warning(
@@ -593,6 +664,11 @@ class APIServer:
                             # the data worker's per-request state once the
                             # client lets go of the request.
                             self.recently_completed[rid] = time.time()
+                            failed_sessions.append((rid, str(req.error)))
+                for rid in done_sessions:
+                    self.sessions.finish_request(rid)
+                for rid, error in failed_sessions:
+                    self.sessions.finish_request(rid, failed=True, error=error)
             except Exception:
                 if self.running:
                     logger.exception("Error in message processing loop")
@@ -763,6 +839,11 @@ class APIServer:
             return
         logger.info("Client cancelled request %s; releasing resources", request_id)
         self.preprocess_worker.abort_request(request_id)
+        # An abandoned request leaves its session's state half-written, and v1
+        # has no rollback, so the session goes with it.
+        self.sessions.finish_request(
+            request_id, failed=True, error="its request was cancelled",
+        )
 
     # ----------------------------------------------------------
     # Cleanup
@@ -815,6 +896,11 @@ async def generate(
     streaming: bool = Form(True),
     model_kwargs: Optional[str] = Form(None),
     request_id: Optional[str] = Form(None),
+    start_session: bool = Form(False),
+    resume_session: bool = Form(False),
+    end_session: bool = Form(False),
+    session_id: Optional[str] = Form(None),
+    session_timeout_s: Optional[float] = Form(None),
 ):
     """Submit a multimodal generation request.
 
@@ -832,6 +918,15 @@ async def generate(
             server generates a fresh uuid4. Pinning this is useful for
             deterministic-noise debugging because the conductor seeds its
             per-request RNG via ``hash(request_id)``.
+        start_session: Open a persistent session and run this request in it.
+            Without a ``session_id`` the server mints one and reports it as the
+            first result chunk (modality ``"session"``).
+        resume_session: Continue an existing session, named by ``session_id``.
+            It must exist and have no request in flight.
+        end_session: Tear the session down once this request finishes.
+        session_id: The session to start with this id, or the one to resume.
+        session_timeout_s: The session's TTL. Defaults to the deployment's, and
+            may not exceed its maximum.
     """
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
@@ -894,6 +989,20 @@ async def generate(
             detail="model_kwargs must be a JSON object",
         )
 
+    if request_id is None:
+        request_id = str(uuid.uuid4())
+    try:
+        session = api_server.sessions.resolve(
+            start_session=start_session,
+            resume_session=resume_session,
+            end_session=end_session,
+            session_id=session_id,
+            session_timeout_s=session_timeout_s,
+            request_id=request_id,
+        )
+    except SessionError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
+
     try:
         request_id = api_server.submit_request(
             text=text,
@@ -904,6 +1013,7 @@ async def generate(
             prompt_parts=parts or None,
             streaming=streaming,
             request_id=request_id,
+            session=session,
         )
 
         if streaming:
@@ -920,14 +1030,25 @@ async def generate(
                 "data": base64.b64encode(chunk.data).decode("ascii"),
                 "metadata": chunk.metadata,
             })
-        return JSONResponse({
+        payload: dict[str, Any] = {
             "request_id": request_id,
             "outputs": outputs,
-        })
+        }
+        if session.session_id is not None:
+            payload["session_id"] = session.session_id
+        return JSONResponse(payload)
 
     except HTTPException:
+        if session.session_id is not None:
+            api_server.sessions.finish_request(
+                request_id, failed=True, error="the request was refused",
+            )
         raise
     except Exception as e:
+        if session.session_id is not None:
+            api_server.sessions.finish_request(
+                request_id, failed=True, error=str(e),
+            )
         raise HTTPException(status_code=500, detail=str(e)) from e
     finally:
         # Deferred cleanup of uploaded files
@@ -943,6 +1064,33 @@ async def generate(
             threading.Thread(
                 target=_cleanup, args=(file_paths,), daemon=True
             ).start()
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Tear a session down without riding on a request.
+
+    Returns as soon as the teardown is under way; the id stays refused until
+    the conductor confirms the state is gone.
+    """
+    if api_server is None:
+        raise HTTPException(status_code=503, detail="Server not ready")
+    try:
+        api_server.sessions.delete(session_id)
+    except SessionError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail) from e
+    return {"session_id": session_id, "status": "closing"}
+
+
+@app.get("/sessions")
+async def list_sessions():
+    """Every session the server holds, live or winding down."""
+    if api_server is None:
+        raise HTTPException(status_code=503, detail="Server not ready")
+    return {
+        "sessions_enabled": api_server.sessions.enabled,
+        "sessions": api_server.sessions.snapshot(),
+    }
 
 
 @app.get("/health")

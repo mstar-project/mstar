@@ -39,6 +39,7 @@ class WorkerMessageType(Enum):
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
     TP_NO_SPEC = "tp_no_spec"
+    TEARDOWN_SESSION = "teardown_session"
 
 
 @dataclass
@@ -48,6 +49,9 @@ class NewRequest(MessageBody):
     worker_graph_to_workers: dict[str, list[str]]
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
+    # The persistent session this request continues, if any: the worker's
+    # session resources hand it the state that session holds.
+    session_id: str | None = None
 
 
 class MessageSource(IntEnum):
@@ -59,6 +63,8 @@ class MessageSource(IntEnum):
 class RemoveRequest(MessageBody):
     request_id: str
     source: int = MessageSource.CONDUCTOR
+    # Tear the request's session down with it, and ACK SESSION_TORN_DOWN.
+    end_session: bool = False
 
 
 @dataclass
@@ -99,6 +105,14 @@ class StopLoops(MessageBody):
 
 
 @dataclass
+class TeardownSession(MessageBody):
+    """Free everything a session holds. Sent to every worker that ran it; each
+    ACKs with SESSION_TORN_DOWN once its state is gone."""
+    session_id: str
+    source: int = MessageSource.CONDUCTOR
+
+
+@dataclass
 class ScheduleTPNode(MessageBody):
     node_name: str
     graph_walk: str
@@ -131,6 +145,8 @@ class ConductorMessageType(Enum):
     ABORT_REQUEST = "abort_request"
     FAIL_REQUESTS = "fail_requests"
     READS_DONE = "reads_done"
+    TEARDOWN_SESSION = "teardown_session"
+    SESSION_TORN_DOWN = "session_torn_down"
 
 
 @dataclass
@@ -141,6 +157,10 @@ class NewRequestConductor(MessageBody):
     initial_output_modalities: list[str]
     input_metadata: dict[str, list[dict]]
     model_kwargs: dict
+    # The session this request belongs to, and whether it is the last one in
+    # it. The API server has already validated both.
+    session_id: str | None = None
+    end_session: bool = False
 
 
 @dataclass
@@ -177,6 +197,14 @@ class ReadsDone(MessageBody):
     start none — the conductor's gate before sending the hard RemoveRequest."""
     request_id: str
     entity_id: str
+
+
+@dataclass
+class SessionTornDown(MessageBody):
+    """A worker (or the conductor, to the API server) confirming a session's
+    state is gone. The API server holds a tombstone until it arrives."""
+    session_id: str
+    entity_id: str = ""
 
 
 @dataclass

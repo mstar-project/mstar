@@ -1,0 +1,226 @@
+Persistent sessions
+===================
+
+A **session** is a named context a client comes back to. Requests in a session
+continue from the state the previous one left behind — the KV a conversation
+built, the latents a denoising run ended on — instead of starting from an empty
+cache. Without a session, every request opens its resource state at ingest and
+frees it at teardown; a session moves that lifetime out one level, from the
+request to the session.
+
+Sessions are opt-in per model. A model that declares no
+:class:`~mstar.model.sessions.SessionsConfig` refuses every session request with
+a 400, and a deployment cannot turn them on for it.
+
+What the model declares
+-----------------------
+
+``Model.get_sessions_config()`` names the resources whose state lives for the
+session and the deployment-facing caps:
+
+.. code-block:: python
+
+   from mstar.model.sessions import (
+       SessionOverflowPolicy, SessionResourceConfig, SessionsConfig,
+   )
+
+   def get_sessions_config(self):
+       return SessionsConfig(
+           resources={
+               "kv_cache": SessionResourceConfig(
+                   max_state=512,  # pages, this resource's own unit
+                   overflow_policy=SessionOverflowPolicy.ERROR,
+               ),
+           },
+           max_concurrent_sessions=8,
+           default_timeout_s=300.0,
+           max_timeout_s=3600.0,
+       )
+
+The engine also holds session state for anything built *against* a named
+resource — the position counters over a KV cache, for instance. Their state
+addresses the state being kept, so leaving it behind would have the next
+request write positions from 0 over pages the session still holds.
+
+Prefix reuse and sessions
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A resource may do both. A session's *first* request is keyed like any other, and
+what it files stays reusable by everyone. A **resumed** request steps out of the
+index entirely: its keys cover the new turn alone, so page *k* of its stream is
+no longer page *k* of the chain those keys describe — probing would match the
+wrong span, and filing would offer the session's pages to other requests under
+keys that do not describe them. Adopting a session's state therefore turns that
+one request's prefix cache off, which shuts the probe, the apply, the extend and
+the filing together.
+
+Overflow policies
+^^^^^^^^^^^^^^^^^
+
+``max_state`` is checked when a request hands its state back to the session, not
+on every step, so an in-flight request may exceed it. When the session is over
+budget:
+
+- ``CLEAR`` (the default) drops everything the session holds. The next request
+  in it starts from scratch.
+- ``WINDOW`` keeps the most recent state that fits. A resource that cannot
+  window soundly — the KV cache, whose stored keys are already rotated — falls
+  back to ``CLEAR``.
+- ``ERROR`` drops the state *and* fails the session's next request, so a client
+  is told rather than silently served from a context it did not build.
+
+Submodule state
+^^^^^^^^^^^^^^^
+
+Alongside the per-request ``PerRequestState``, a submodule has a per-session
+one. ``self.session_state(session_id)`` reaches it directly; a forward reads
+the batch's through ``ModelInputsFromEngine.per_session_states``, keyed by
+request id (``None`` for a request in no session). The engine drops it at
+session teardown, so a submodule needs no cleanup code of its own.
+
+What a deployment tunes
+-----------------------
+
+A ``sessions:`` block in the serving config layers over the model's
+declaration. It may retune the caps and the per-resource budgets, and it may
+turn sessions off with ``enabled: false``; it may not name a resource the model
+does not hold across a session.
+
+.. code-block:: yaml
+
+   sessions:
+     max_concurrent_sessions: 32
+     default_timeout_s: 120.0
+     max_timeout_s: 900.0
+     ttl_mode: idle          # or: absolute
+     resources:
+       kv_cache:
+         max_state: 1024
+         overflow_policy: clear
+
+``ttl_mode: idle`` expires a session ``timeout_s`` after its last request
+finished; ``absolute`` expires it that long after it was started, however busy
+it is. A session with a request in flight is never collected.
+
+The HTTP API
+------------
+
+``POST /generate`` takes five session fields:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
+
+   * - Field
+     - Meaning
+   * - ``start_session``
+     - Open a session and run this request in it. With no ``session_id`` the
+       server mints one.
+   * - ``resume_session``
+     - Continue the session named by ``session_id``.
+   * - ``end_session``
+     - Tear the session down once this request finishes.
+   * - ``session_id``
+     - The id to start with, or the one to resume.
+   * - ``session_timeout_s``
+     - This session's TTL. Defaults to the deployment's, and may not exceed its
+       maximum.
+
+A started session reports its id back: as the first result chunk when
+streaming (modality ``"session"``, with ``session_id`` in its metadata), and as
+``session_id`` in the JSON body otherwise.
+
+``DELETE /sessions/{id}`` ends a session without a request, and
+``GET /sessions`` lists what the server holds.
+
+Refusals
+^^^^^^^^
+
+- ``400`` — the model does not support sessions; ``start_session`` and
+  ``resume_session`` together; a session named without either flag; a
+  ``session_timeout_s`` over the deployment's maximum.
+- ``404`` — resuming or deleting a session that does not exist.
+- ``409`` — starting a session whose id is taken; resuming or deleting one that
+  already has a request in flight, or that is being torn down.
+- ``429`` — the deployment is at ``max_concurrent_sessions``.
+
+From the SDK
+------------
+
+.. code-block:: python
+
+   from mstar import MStarClient
+
+   client = MStarClient()
+   first = client.generate(text="Who painted Guernica?", start_session=True)
+   session_id = first.session_id
+
+   second = client.generate(
+       text="And when?", resume_session=True, session_id=session_id,
+   )
+
+   client.end_session(session_id)
+
+Streaming yields a ``SessionInfo`` event first, then the output chunks.
+
+How it holds together
+---------------------
+
+The API server is the only thing that decides a session's fate. It tracks each
+session's TTL, its one in-flight request, and the tombstone that stands while
+its state is being freed; the conductor and the workers carry that out.
+
+- **Placement is pinned.** The conductor memoizes a session's replica pick and
+  reuses it for every request in the session. The state a resumed request
+  continues lives on the workers that built it, so a fresh pick would route the
+  request to workers holding nothing.
+- **Teardown is a barrier.** Freeing a session's state — on ``DELETE``, on a
+  TTL expiry, on a failed request, or riding on a request that carried
+  ``end_session`` — goes to every worker the session ran on, and each ACKs once
+  its state is gone. Until every ACK is in, the API server refuses the id. A
+  worker that never ACKs is timed out (``MSTAR_DRAIN_TTL_S``) so one faulty
+  worker cannot hold an id forever, and the API server releases a tombstone
+  that stands past ``MSTAR_SESSION_TOMBSTONE_GRACE_S`` (180s) regardless.
+- **A failure ends the session.** v1 keeps no rollback, so a request that
+  failed or was abandoned mid-generation leaves state a later request should
+  not continue from. Its session is torn down with it.
+
+Trying it
+---------
+
+``test_text_session`` is a deployment that exists to exercise this: BAGEL's LLM
+with everything else taken away, text in and text out, holding its KV for the
+session. One GPU.
+
+.. code-block:: bash
+
+   CUDA_VISIBLE_DEVICES=0 bash test/text_session/launch_server.sh
+   python test/text_session/session_request.py
+
+The client script sends a turn, resumes with a second turn whose prompt says
+nothing about the first, and checks the answer could only have come from the KV
+the session kept — a sessionless control run of the same question should not know
+it. It then walks the teardown: delete the session, wait for the id to be
+released (which happens only once the worker has confirmed its state is gone),
+and check that resuming it is a 404.
+
+Limits in this version
+----------------------
+
+- One in-flight request per session: a concurrent ``resume`` is a 409. The
+  ``interruptible`` flag names where bidirectional streaming will hook in, and
+  is refused for now — nothing routes a second request's inputs into an
+  in-progress one.
+- No rollback: a failed request ends its session rather than rewinding it.
+- State parked between a session's requests is not an eviction candidate: the
+  worker's LRU only sees live requests. Size ``max_concurrent_sessions`` times
+  each resource's ``max_state`` against the pool, leaving room for the requests
+  ``max_concurrent_requests`` allows, or a full pool will start refusing
+  admission. (A session's state does follow its request through an offload
+  while that request is running.)
+- Sessions are reachable through ``/generate`` and the SDK; the
+  OpenAI-compatible surfaces do not expose them, and neither does the optional
+  Rust frontend (``--rust-frontend``), whose submit path carries no session
+  fields.
+- Only ``test_text_session`` declares session support. Any other deployment
+  refuses sessions until its model opts in.

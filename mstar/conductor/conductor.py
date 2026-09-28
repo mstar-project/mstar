@@ -14,7 +14,12 @@ import numpy as np
 import torch
 import yaml
 
-from mstar.api_server.request_types import APIServerMessage, RequestComplete, RequestFailed
+from mstar.api_server.request_types import (
+    APIServerMessage,
+    RequestComplete,
+    RequestFailed,
+    SessionTornDown,
+)
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
@@ -42,6 +47,7 @@ from mstar.utils.ipc_format import (
     NewRequestConductor,
     ReadsDone,
     RemoveRequest,
+    TeardownSession,
     UnpersistTensors,
     WorkerGraphsDone,
     WorkerMessage,
@@ -254,6 +260,36 @@ class DrainingRequest:
     failure_status: int = 500
 
 
+@dataclass
+class SessionData:
+    """A persistent session, conductor side.
+
+    The replica pick is memoized here for the session's whole life: the state
+    a resumed request continues lives on the workers that built it, so a fresh
+    pick would send the request to workers holding nothing.
+    """
+    session_id: str
+    worker_graph_to_workers: dict[str, list[str]]
+    request_ids: set[str] = field(default_factory=set)
+    # A request carrying end_session has been ingested; the session goes when
+    # that request's teardown completes.
+    ending: bool = False
+
+    def workers(self) -> set[str]:
+        return {
+            worker_id
+            for worker_ids in self.worker_graph_to_workers.values()
+            for worker_id in worker_ids
+        }
+
+
+@dataclass
+class SessionTeardown:
+    """Barrier for a session's state: the API server is told the session is
+    gone once every worker that ran it has ACKed SESSION_TORN_DOWN."""
+    expected_acks: set[str]
+
+
 class Conductor:
     def __init__(
         self,
@@ -275,6 +311,15 @@ class Conductor:
         # barrier is force-finalized so one faulty worker can't hold a
         # concurrency slot — or the client's failure notification — forever.
         self._drain_ttl_s = float(os.environ.get("MSTAR_DRAIN_TTL_S", "120"))
+
+        # Live persistent sessions, and the teardown barriers for the ones
+        # being freed. A session in `session_teardowns` is refused by the API
+        # server until its ACK comes back.
+        self.sessions: dict[str, SessionData] = {}
+        self.session_teardowns: dict[str, SessionTeardown] = {}
+        self._session_teardown_deadlines: deque[tuple[float, str]] = deque()
+        # rid -> session, for the requests in flight right now
+        self.request_sessions: dict[str, str] = {}
 
         # READS_DONE that arrived before the barrier was registered (the
         # preprocess worker self-drains on abort before we process ABORT_REQUEST).
@@ -608,7 +653,9 @@ class Conductor:
                 ),
             )
 
-    def _assign_worker_graphs_to_workers(self) -> dict[str, list[str]]:
+    def _assign_worker_graphs_to_workers(
+        self, session_id: str | None = None,
+    ) -> dict[str, list[str]]:
         """
         For a request, assign worker graphs to workers. DP picks are
         coordinated by ``_group_id`` so all wgs derived from the same
@@ -616,10 +663,19 @@ class Conductor:
         two wgs sharing a TP group could end up on different DP replicas
         and break model topology.
 
+        A request in a session reuses that session's pick: the state it
+        continues lives on those workers.
+
         TODO: smarter assignment that minimizes cross-graph-walk tensor
         transfer (e.g., bias toward keeping prefill→decode handoff local
         for the same request).
         """
+        session = self.sessions.get(session_id) if session_id else None
+        if session is not None:
+            return {
+                wg_id: list(workers)
+                for wg_id, workers in session.worker_graph_to_workers.items()
+            }
         # _group_id -> chosen DP-replica index within that group's ranks
         group_id_to_replica_idx: dict[int, int] = {}
         result = {}
@@ -806,7 +862,14 @@ class Conductor:
         """Actually dispatch a request to workers (no admission check)."""
         logger.debug("Conductor ingesting request %s", body.request_id)
         ingest_time = time.perf_counter()
-        worker_graph_to_workers = self._assign_worker_graphs_to_workers()
+        worker_graph_to_workers = self._assign_worker_graphs_to_workers(
+            body.session_id
+        )
+        if body.session_id is not None:
+            self._register_session_request(
+                body.session_id, body.request_id, worker_graph_to_workers,
+                end_session=body.end_session,
+            )
 
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self.model.get_max_output_tokens(**model_kwargs)
@@ -931,6 +994,7 @@ class Conductor:
                     partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_workers=worker_graph_to_workers,
                     initial_inputs=inputs_per_worker.get(worker_id, []),
+                    session_id=body.session_id,
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
@@ -1010,20 +1074,195 @@ class Conductor:
             ),
         )
 
+    # ------------------------------------------------------------------
+    # Persistent sessions
+    # ------------------------------------------------------------------
+
+    def _register_session_request(
+        self, session_id: str, request_id: str,
+        worker_graph_to_workers: dict[str, list[str]],
+        end_session: bool = False,
+    ) -> None:
+        """Bind a request to its session, opening the session on the first one.
+
+        The first request's replica pick becomes the session's for good; see
+        ``_assign_worker_graphs_to_workers``.
+        """
+        session = self.sessions.get(session_id)
+        if session is None:
+            session = self.sessions[session_id] = SessionData(
+                session_id=session_id,
+                worker_graph_to_workers={
+                    wg_id: list(workers)
+                    for wg_id, workers in worker_graph_to_workers.items()
+                },
+            )
+            logger.info(
+                "Opened session %s on workers %s",
+                session_id, sorted(session.workers()),
+            )
+        session.request_ids.add(request_id)
+        session.ending = session.ending or end_session
+        self.request_sessions[request_id] = session_id
+
+    def _teardown_session(self, session_id: str) -> None:
+        """The API server asked for a session's state to go (DELETE, TTL, or a
+        failed request in it).
+
+        A request still in flight is torn down first and the session goes with
+        it; the API server refuses a resume in that window, so this only
+        happens on the failure path.
+        """
+        if session_id in self.session_teardowns:
+            return  # already in progress; one ACK covers it
+        self._drop_queued_session_requests(session_id)
+        session = self.sessions.get(session_id)
+        if session is None:
+            # Never ingested a request (or already gone): nothing holds state,
+            # so ACK straight away rather than leave the tombstone standing.
+            self._finalize_session_teardown(session_id)
+            return
+        live = [rid for rid in session.request_ids if rid in self.requests]
+        if live:
+            logger.warning(
+                "Session %s asked to tear down with %d request(s) in flight; "
+                "tearing those down first", session_id, len(live),
+            )
+            session.ending = True
+            for rid in live:
+                if rid not in self.draining:
+                    self._remove_request(rid, self.requests[rid])
+            return
+        self._begin_session_teardown(session_id, session.workers())
+
+    def _drop_queued_session_requests(self, session_id: str) -> None:
+        """Fail the session's requests that are still waiting for capacity.
+
+        Admitting one after the teardown would re-open a session the API server
+        has already forgotten, and nothing would ever free the state it built.
+        """
+        queued = [
+            body for body in self.waiting_queue
+            if body.session_id == session_id
+        ]
+        if not queued:
+            return
+        self.waiting_queue = [
+            body for body in self.waiting_queue
+            if body.session_id != session_id
+        ]
+        for body in queued:
+            logger.info(
+                "Dropping queued request %s: its session %s is being torn down",
+                body.request_id, session_id,
+            )
+            self._early_reads_done.pop(body.request_id, None)
+            self._send_remove_to_preprocess_worker(body.request_id)
+            self.communicator.send(
+                "api_server",
+                APIServerMessage(
+                    message_type="request_failed",
+                    body=RequestFailed(
+                        request_id=body.request_id,
+                        error_message=(
+                            f"session {session_id} was torn down before this "
+                            "request was admitted"
+                        ),
+                        status=409,
+                    ),
+                ),
+            )
+
+    def _begin_session_teardown(
+        self, session_id: str, workers: set[str],
+    ) -> None:
+        for worker_id in workers:
+            self.communicator.send(
+                worker_id,
+                WorkerMessage(
+                    message_type=WorkerMessageType.TEARDOWN_SESSION,
+                    body=TeardownSession(session_id=session_id),
+                ),
+            )
+        self._register_session_teardown(session_id, set(workers))
+
+    def _register_session_teardown(
+        self, session_id: str, expected_acks: set[str],
+    ) -> None:
+        self.session_teardowns[session_id] = SessionTeardown(
+            expected_acks=set(expected_acks)
+        )
+        self._session_teardown_deadlines.append(
+            (time.perf_counter() + self._drain_ttl_s, session_id)
+        )
+        logger.info(
+            "Tearing down session %s; waiting on %s",
+            session_id, sorted(expected_acks) or "nothing",
+        )
+        if not expected_acks:
+            self._finalize_session_teardown(session_id)
+
+    def _handle_session_torn_down(self, body) -> None:
+        """One worker's ACK (``ipc_format.SessionTornDown``)."""
+        teardown = self.session_teardowns.get(body.session_id)
+        if teardown is None:
+            logger.debug(
+                "SESSION_TORN_DOWN for %s from %s with no barrier open",
+                body.session_id, body.entity_id,
+            )
+            return
+        teardown.expected_acks.discard(body.entity_id)
+        if not teardown.expected_acks:
+            self._finalize_session_teardown(body.session_id)
+
+    def _finalize_session_teardown(self, session_id: str) -> None:
+        """Every worker has freed the session: drop it and lift the API
+        server's tombstone."""
+        self.session_teardowns.pop(session_id, None)
+        session = self.sessions.pop(session_id, None)
+        if session is not None:
+            for rid in session.request_ids:
+                self.request_sessions.pop(rid, None)
+        self.communicator.send(
+            "api_server",
+            APIServerMessage(
+                message_type="session_torn_down",
+                body=SessionTornDown(session_id=session_id),
+            ),
+        )
+        logger.info("Session %s torn down", session_id)
+
     def _finalize_draining(self, request_id: str):
         """Every reader has drained: send the hard RemoveRequest to all
         participants, notify the client on the fail path, then free state."""
         dr = self.draining.pop(request_id, None)
         if dr is None:
             return
+        # A session whose last request carried end_session goes with it: the
+        # workers free both on one message and ACK the session.
+        session_id = self.request_sessions.pop(request_id, None)
+        session = self.sessions.get(session_id) if session_id else None
+        if session is not None:
+            session.request_ids.discard(request_id)
+        end_session = (
+            session is not None
+            and session.ending
+            and session_id not in self.session_teardowns
+            and not session.request_ids
+        )
         for entity in dr.participants:
             self.communicator.send(
                 entity,
                 WorkerMessage(
                     message_type=WorkerMessageType.REMOVE_REQUEST,
-                    body=RemoveRequest(request_id),
+                    body=RemoveRequest(
+                        request_id,
+                        end_session=end_session and entity != self.PREPROCESS_WORKER,
+                    ),
                 ),
             )
+        if end_session:
+            self._register_session_teardown(session_id, session.workers())
         if dr.failure_error is not None:
             self.communicator.send(
                 "api_server",
@@ -1088,6 +1327,17 @@ class Conductor:
                 logger.debug(
                     "Dropping stale early READS_DONE for request %s", request_id
                 )
+        for session_id in self._pop_expired(self._session_teardown_deadlines, now):
+            teardown = self.session_teardowns.get(session_id)
+            if teardown is None:
+                continue  # ACKed normally
+            logger.error(
+                "Session teardown for %s timed out after %.0fs with no ACK "
+                "from %s; forcing it. That worker may still hold the "
+                "session's state.",
+                session_id, self._drain_ttl_s, sorted(teardown.expected_acks),
+            )
+            self._finalize_session_teardown(session_id)
 
     def _fail_requests(self, body: FailRequests):
         """Tear down requests a worker reported as unservable. Routes through the
@@ -1495,6 +1745,10 @@ class Conductor:
                         self._fail_requests(message.body)
                     elif message.message_type == ConductorMessageType.READS_DONE:
                         self._handle_reads_done(message.body)
+                    elif message.message_type == ConductorMessageType.TEARDOWN_SESSION:
+                        self._teardown_session(message.body.session_id)
+                    elif message.message_type == ConductorMessageType.SESSION_TORN_DOWN:
+                        self._handle_session_torn_down(message.body)
                     elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
                         rid = message.body.request_id
                         # Draining requests linger in self.requests (concurrency

@@ -14,6 +14,7 @@ from mstar.utils.ipc_format import (
     MessageSource,
     RemoveRequest,
 )
+from mstar.worker.sessions import WorkerSessionManager
 from mstar.worker.worker import Worker
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -35,6 +36,7 @@ def _worker(
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
     w._pending_removes = set()
+    w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
     w._last_active = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
@@ -50,7 +52,8 @@ def _worker(
         remove_request=lambda rid: None,
     )
     w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid: None, evictable_nodes=lambda: [],
+        remove_request=lambda rid, end_session=False: None,
+        evictable_nodes=lambda: [],
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.tensor_manager = SimpleNamespace(
