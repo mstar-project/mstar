@@ -332,6 +332,33 @@ class MicroScheduler:
             sorted(their_offloaded - offloaded) or "none",
         )
 
+    def settle_tp_follow_delta(
+        self, request_state: RequestStateManager,
+    ) -> bool:
+        """Replay the front head's resident delta; True once every move landed.
+
+        The one seam both consumers of this FIFO go through — the serial path
+        below and the async follower's ``_try_follow_speculation`` — so neither
+        can build a step against a half-replayed page state. The async path used
+        to skip this entirely and read the difference as "rid not ready", which
+        it then polled on for ever.
+
+        Checked either way: a refused replay is when the comparison is most
+        wanted, since it says how far behind this rank is and in what.
+        """
+        head = self.peek_tp_follow()
+        if head is None:
+            return True
+        caught_up = self._apply_delta_from_message(head)
+        self._check_resident_set_matches(
+            head, request_state, caught_up=caught_up,
+        )
+        return caught_up
+
+    def pending_resident_delta(self, node_name: str) -> OffloadDelta:
+        """The moves this rank still owes rank 0 on ``node_name``."""
+        return self._pending_resident_deltas.get(node_name) or OffloadDelta.new()
+
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
         # and the async follower's build / drop / void paths) pops here, so the
@@ -416,15 +443,7 @@ class MicroScheduler:
             return
         # Check readiness for every rid to pop all-or-none. Use the
         # leader's graph walk.
-        # Checked either way. A refused replay is when the comparison is most
-        # wanted — it says how far behind this rank is and in what — and putting
-        # it after the early return below made it unreachable in exactly that
-        # case.
-        caught_up = self._apply_delta_from_message(first_tp_node)
-        self._check_resident_set_matches(
-            first_tp_node, request_state, caught_up=caught_up,
-        )
-        if not caught_up:
+        if not self.settle_tp_follow_delta(request_state):
             return # every pending move has to land before the step is built
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name,

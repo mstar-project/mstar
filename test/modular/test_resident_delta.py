@@ -1191,3 +1191,98 @@ def test_the_speculation_is_cleared_before_the_recovery_runs():
         "recovery runs before the speculation is cleared, so it evicts to make "
         "room the pre-plan was about to give back"
     )
+
+
+class _FollowSpec:
+    """``Worker._try_follow_speculation`` over stubs, as far as the delta gate.
+
+    A real ``MicroScheduler`` so the gate is driven by a real refusal rather than
+    a stubbed return: the bug was the async path never asking, and a stub that
+    answers proves nothing about whether it asked.
+    """
+
+    _try_follow_speculation = Worker._try_follow_speculation
+    _describe_follow_head = Worker._describe_follow_head
+
+    def __init__(self, *, replay_refuses: bool):
+        self.worker_id = "worker_1"
+        self.engine = SimpleNamespace(
+            apply_resident_delta=lambda node, delta: not replay_refuses,
+            is_offloaded=lambda node, rid: False,
+            reclaimable=lambda node, rid: 0,
+            check_ready=lambda *a, **kw: FULL_ADMIT_OK,
+            get_max_batch_size=lambda node, walk: None,
+        )
+        self.engine_manager = SimpleNamespace(get_engine=lambda node: self.engine)
+        self.scheduler = MicroScheduler(
+            engine_manager=self.engine_manager, parallel_leader_nodes=set(),
+        )
+        # the worker installs this; ``_check_resident_set_matches`` needs it to
+        # compare page state in wire ids (and goes away with that check)
+        self.scheduler.runtime = _Rids()
+        # the build asks for the spec target right after reading the parent's
+        # batch; None bails it out there, just past the gate
+        self._graph_runtime = SimpleNamespace(
+            get_spec_target=lambda *a, **kw: None,
+        )
+        # live requests live on the request-state manager now
+        self.request_state = SimpleNamespace(per_request_info={})
+        self._follow_block: str | None = None
+        self.head = head = ScheduleTPNode(
+            node_name="node", graph_walk="walk", request_ids=["r0"],
+            speculative=True, spec_seq=6, spec_from_seq=5,
+        )
+        head.resident_delta.add_offloaded("victim")
+        self.scheduler.register_tp_follow(head)
+
+
+class _SpecParent:
+    """Step N on the follower: matches the head, and records whether anything
+    read its batch.
+
+    The read is the observable. Everything past the gate needs the batch and
+    nothing before it does, so "was the parent touched" says which side of the
+    gate we stopped on -- without depending on which bail comes next, which is
+    what went stale when the refactor replaced the outputs check.
+    """
+
+    node_name = "node"
+    graph_walk = "walk"
+    tp_seq = 5
+
+    def __init__(self):
+        self.reads = 0
+        parent = self
+
+        class _Batch:
+            node_name = "node"
+
+            @property
+            def request_to_worker_graph(self):
+                parent.reads += 1
+                return {"r0": 0}
+
+        self.batch = _Batch()
+
+
+def test_the_async_follow_path_will_not_build_mid_replay():
+    """The serial path waits while moves are owed; this one used to skip the delta
+    entirely, read the half-applied state as "rid not ready", and poll for ever."""
+    worker = _FollowSpec(replay_refuses=True)
+    parent = _SpecParent()
+
+    assert worker._try_follow_speculation(parent) is None
+    assert parent.reads == 0, "the build started before the replay had landed"
+    assert worker.scheduler.peek_tp_follow() is worker.head, (
+        "the head was consumed mid-replay"
+    )
+
+
+def test_the_async_follow_path_proceeds_once_the_replay_lands():
+    """The other direction: the gate must not be a permanent stop. Reaching the
+    parent is what says the delta settled and the gate passed."""
+    worker = _FollowSpec(replay_refuses=False)
+    parent = _SpecParent()
+
+    assert worker._try_follow_speculation(parent) is None
+    assert parent.reads == 1, "the gate blocked a build it should have allowed"

@@ -2156,6 +2156,29 @@ class Worker:
     # every post-N verdict is derived per rank. The leader always sends a head
     # or a TPNoSpeculation marker per step, settled before N is post-processed.
 
+    def _describe_follow_head(self, head: ScheduleTPNode) -> str:
+        """The page state behind a head this rank cannot build.
+
+        Three things in one line, because the interesting cases are told apart
+        by comparing them: what rank 0 said it did for this step, what this rank
+        still owes, and which of the head's OWN rids are off-device here.
+
+        A head that names a rid its own delta offloads is not constructible on
+        the leader — the delta is drained at send time, so the two agree by
+        construction — which makes that combination proof the divergence started
+        upstream of this wait rather than in the replay.
+        """
+        engine = self.engine_manager.get_engine(head.node_name)
+        offloaded = sorted(
+            rid for rid in head.request_ids
+            if engine.is_offloaded(head.node_name, rid)
+        )
+        return (
+            f"its delta={head.resident_delta.describe()}, "
+            f"still owed={self.scheduler.pending_resident_delta(head.node_name).describe()}, "
+            f"of its own rids offloaded here={offloaded or 'none'}"
+        )
+
     def _try_follow_speculation(self, pending: PendingBatch) -> Speculation | None:
         head = self.scheduler.peek_tp_follow()
         if head is None or not head.speculative:
@@ -2171,6 +2194,14 @@ class Worker:
                 self.worker_id, head.node_name, head.graph_walk, head.spec_seq,
                 pending.node_name, pending.graph_walk,
             )
+            return None
+
+        # Same gate as the serial path: a step must not be built against a page
+        # state that is still mid-replay. Every poll retries the owed moves, so
+        # returning here makes progress where reading the half-applied state as
+        # "not ready" never could.
+        if not self.scheduler.settle_tp_follow_delta(self.request_state):
+            self._follow_block = f"delta mid-replay; {self._describe_follow_head(head)}"
             return None
 
         batch_N = pending.batch
@@ -2209,6 +2240,14 @@ class Worker:
                 self._return_streaming_edge(r, edge)
 
         if popped is None:
+            # ``pop_ready_rids`` scans with ``allow_reload=False``, so an
+            # offloaded rid reads not-ready and stays that way until a replayed
+            # delta brings it back. The delta is settled above, so a rid still
+            # off-device here is a divergence rather than a lag.
+            self._follow_block = (
+                f"fresh rids {sorted(fresh)} not ready; "
+                f"{self._describe_follow_head(head)}"
+            )
             _return_all_polled()
             return None
 

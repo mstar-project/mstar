@@ -180,6 +180,24 @@ class OffloadDelta:
         self.rids.extend(other.rids)
         self.is_offload.extend(other.is_offload)
 
+    def describe(self, keep: int = 8) -> str:
+        """The moves in replay order, for a log line.
+
+        Order is the only thing that makes a delta meaningful, so this prints the
+        sequence rather than counts — ``-A +A`` and ``+A -A`` leave a rank in
+        opposite states. Truncated from the left: when a replay stalls it is the
+        moves still owed at the front that say why.
+        """
+        if not len(self):
+            return "empty"
+        moves = [
+            f"{'-' if off else '+'}{rid[:8]}"
+            for rid, off in zip(self.rids, self.is_offload, strict=True)
+        ]
+        if len(moves) <= keep:
+            return " ".join(moves)
+        return " ".join(moves[:keep]) + f" (+{len(moves) - keep} more)"
+
 
 @dataclass
 class ScheduleTPNode(MessageBody):
