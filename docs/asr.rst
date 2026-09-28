@@ -4,7 +4,7 @@ Speech recognition: Whisper and Qwen3-ASR
 M* serves two ASR families on one encoder-decoder scaffold: OpenAI Whisper
 (``whisper_large_v3_turbo``, ``whisper_large``) and Qwen3-ASR (``qwen3_asr``
 for the 1.7B checkpoint, ``qwen3_asr_realtime`` for the 0.6B one trained for
-streaming). Both are reached through the OpenAI surfaces described in
+streaming). Both are reached through the OpenAI endpoints described in
 :doc:`clients`: ``POST /v1/audio/transcriptions`` and, for Qwen3-ASR, the
 ``/v1/realtime`` transcription WebSocket.
 
@@ -32,7 +32,7 @@ requests batch together and are captured per batch size (1 to 64).
 ``prefill``
     encoder, then the forced prompt ``[<|startofprev|> context]
     <|startoftranscript|><|lang|><|task|>[<|notimestamps|>]`` through the
-    decoder; samples the first transcript token.
+    decoder, and samples the first transcript token.
 ``detect_language``
     the same with a prompt that stops at ``<|startoftranscript|>`` and
     sampling restricted to the language tokens; ``prefill_prompt`` then
