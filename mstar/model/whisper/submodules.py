@@ -82,7 +82,7 @@ class WhisperEncoderSubmodule(NodeSubmodule):
     """
 
     ENCODER_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
-    # Graph capture alone removes the per-layer launch gaps; inductor's
+    # Graph capture alone removes the per-layer launch gaps. Inductor's
     # fusions are a second-order gain on these GEMM-bound shapes and cost one
     # compile per bucket, so they are off until measured to win.
     ENCODER_COMPILE = False
@@ -127,7 +127,7 @@ class WhisperEncoderSubmodule(NodeSubmodule):
             BatchedCudaGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 replay_graph_walks=list(ENCODER_WALKS),
-                # one window of samples per row; the token count is a row
+                # one window of samples per row, and the token count is a row
                 # count here. ``preprocess`` turns the rows into the log-mel
                 # batch the captured forward reads.
                 single_request_inputs=NodeInputs(
@@ -155,7 +155,7 @@ class WhisperEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        # one STFT for the whole batch; the runner copies the result into the
+        # one STFT for the whole batch. The runner copies the result into the
         # captured forward's static input
         audio = torch.stack([inp.tensor_inputs["audio"] for inp in inputs], dim=0)
         return {"audio_features": self._mel(audio).to(self._param_dtype())}
@@ -229,12 +229,12 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
     # Prefill isn't captured, so the engine's capture cap doesn't bound it and
     # `can_batch` would take the whole ready set. A set too big for the context
-    # cache can't be admitted; with offload configured it evicts and retries,
+    # cache can't be admitted. With offload configured it evicts and retries,
     # without it there is nothing to evict and the batch reforms identically.
     MAX_PREFILL_BATCH_SIZE = 32
     # See the encoder: dynamo recompiled the prefill walks per request id
-    # (a 1-2 s stall each, measured at RTFx 158 -> the fix's number at c=32);
-    # decode steps are graph replays and the prefill is four eager layers.
+    # (a 1-2 s stall each, RTFx 158 at c=32 before the fix). Decode steps are
+    # graph replays and the prefill is four eager layers.
     disable_torch_compile = True
 
     def __init__(self, decoder: WhisperDecoderModel, config: WhisperModelConfig, tokenizer=None):
@@ -331,9 +331,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         else:
             state = self.request_state(fwd_info.request_id)
             # The learned position table caps prompt + transcript at
-            # max_target_positions; check_stop reads this back.
+            # max_target_positions, and check_stop reads this back.
             state.add("prompt_len", state.get("prompt_len", 0) + seq_len)
-            # Timestamps are on when the prompt omits <|notimestamps|>; the
+            # Timestamps are on when the prompt omits <|notimestamps|>. The
             # detection walk's prompt ends at <|sot|> and says nothing yet.
             prompt = token_ids.tolist() + tensor_inputs.get("prompt_tail", token_ids[:0]).tolist()
             timestamps = graph_walk != DETECT_LANGUAGE_WALK and self.config.no_timestamps_token_id not in prompt
@@ -614,7 +614,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
     ):
         # Metadata-only: rebind output name so the decode loop feeds the
         # sampled token back in as the next step's text_inputs. ``ts_rules``
-        # keeps its name; the loop routes it back under it.
+        # keeps its name and the loop routes it back under it.
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
