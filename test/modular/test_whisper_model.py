@@ -1,6 +1,6 @@
 """CPU tests for the Whisper ASR integration (turbo and large-v3 from one class).
 
-Real-weight parity lives in ``test/asr``; here everything runs on random
+Real-weight parity is in ``test/asr``. Here everything runs on random
 weights or on config JSON alone: the log-mel front end and the native
 encoder are pinned to their HF counterparts on tiny shapes, the prompt
 builder and request state machine are exercised for both the forced-language
@@ -152,7 +152,7 @@ def test_prompt_ids_cover_forced_detected_timestamped_and_prev():
     cfg = _tiny_config()
     assert cfg.decoder_prompt_ids("en") == [SOT, EN, TRANSCRIBE, NOTS]
     assert cfg.decoder_prompt_ids("de", task="translate", timestamps=True) == [SOT, DE, TRANSLATE]
-    # detection stops at <|startoftranscript|>; the tail follows the sampled language
+    # detection stops at <|startoftranscript|>, the tail follows the sampled language
     assert cfg.decoder_prompt_ids(None) == [SOT]
     assert cfg.prompt_tail_ids() == [TRANSCRIBE, NOTS]
     assert cfg.prompt_tail_ids(timestamps=True) == [TRANSCRIBE]
@@ -295,7 +295,7 @@ def test_encoder_submodule_batches_and_declares_one_capture_per_batch_size():
 
     frames = cfg.max_source_positions * 2
     assert cfg.num_frames == frames
-    # samples in, padded to the window per request; log-mel of the batch out
+    # samples in, padded to the window per request, log-mel of the batch out
     rows = [sub.prepare_inputs(PREFILL_WALK, None, {"audio": [torch.randn(n)]})
             for n in (cfg.n_samples, cfg.n_samples // 2, cfg.n_samples)]
     assert all(r.input_seq_len == 1 for r in rows)
@@ -354,7 +354,7 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     sub.timestamp_rules = TimestampRules(cfg)
     fwd = type("F", (), {"request_id": "ts"})()
     ctx = {"encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)]}
-    # a prompt without <|notimestamps|> turns the rules on; the first token must be a timestamp
+    # a prompt without <|notimestamps|> turns the rules on, so the first token must be a timestamp
     row = sub.prepare_inputs(PREFILL_WALK, fwd, {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE])], **ctx})
     assert sub.request_state("ts")["timestamps"] is True
     assert row.tensor_inputs["ts_rules"].tolist() == [1, FIRST_TOKEN, cfg.timestamp_begin - 1, cfg.timestamp_begin + 51]
@@ -390,7 +390,7 @@ def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
     fwd = type("F", (), {"request_id": "r0"})()
-    # prepare_inputs reads the module device; give it a parameter to live on
+    # prepare_inputs reads the module device, so give it a parameter
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
     row = sub.prepare_inputs(
         PREFILL_PROMPT_WALK, fwd,
@@ -592,7 +592,7 @@ def test_process_prompt_builds_window_and_prompts():
     long = torch.randn(16_000 * 45)  # beyond one window: trimmed, not rejected
     assert model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [long]}, language="en")[
         "audio"][0].shape == (model.config.n_samples,)
-    with pytest.raises(ValueError, match="exactly one audio"):
+    with pytest.raises(ValueError, match="one audio input"):
         model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": []}, language="en")
     with pytest.raises(ValueError, match="empty audio"):
         model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [torch.zeros(0)]}, language="en")
