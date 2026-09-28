@@ -17,6 +17,7 @@ from mstar.communication.tensors import (
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.special_destinations import EMPTY_DESTINATION
+from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import WorkerMessageType
 
 # ---------------------------------------------------------------------------
@@ -696,3 +697,28 @@ def test_write_refuses_a_symlink_planted_at_the_path():
             mgr.register_for_send("req1", [info])
         with open(target, "rb") as f:
             assert f.read() == b"do not clobber"
+
+
+def test_register_for_send_uuids_writes_every_request_not_just_the_first():
+    """The uuid-driven form on the FILE transport. Only the arena subclass
+    covered this before, so truncating the loop to the first request passed
+    the suite -- rb and rc would never reach a file."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = _make_manager(tmpdir)
+        per_request: dict[str, list] = {}
+        for rid in ("ra", "rb", "rc"):
+            mgr.register_request(rid, _empty_sharding_config())
+            infos = mgr.store_and_return_tensor_info(
+                rid, {"out": [torch.randn(4, 8)]},
+            )
+            per_request[rid] = [i for il in infos.values() for i in il]
+
+        mgr.register_for_send_uuids(ParallelList(
+            list(per_request),
+            [[i.uuid for i in infos] for infos in per_request.values()],
+        ))
+
+        for rid, infos in per_request.items():
+            for info in infos:
+                assert info.uuid in mgr._shm_files, f"{rid} never written"
+                assert os.path.exists(mgr._shm_files[info.uuid])

@@ -514,6 +514,7 @@ class TensorCommunicationManager(ABC):
         columnar = self.tensor_store.has_put_tensor_batch_columns
         infos: list[TensorPointerInfo] = []
         columns: ColumnarTensorInfo | None = None
+
         if columnar:
             # Invariant across one node's output batch, so carried once for
             # the whole batch and interned once on the far side.
@@ -530,61 +531,72 @@ class TensorCommunicationManager(ABC):
                 tp_rank=tp_rank,
             )
 
-        for request_id in request_ids:
-            tensors = outputs.get(request_id) or {}
-            cfg = self.sharding_configs.get(request_id)
-            source_tp_size, source_tp_rank = self._source_tp(
-                cfg, node_name, graph_walk,
-            )
-            if columnar and (source_tp_size, source_tp_rank) != (
-                columns.tp_size, columns.tp_rank
-            ):
-                raise ValueError(
-                    f"request {request_id} has sharding "
-                    f"{(source_tp_size, source_tp_rank)} for node "
-                    f"{node_name!r} walk {graph_walk!r}, but the batch was "
-                    f"built for {(columns.tp_size, columns.tp_rank)}; one "
-                    "batch is one node on one worker and cannot mix "
-                    "sharding groups"
+        try:
+            for request_id in request_ids:
+                tensors = outputs.get(request_id) or {}
+                cfg = self.sharding_configs.get(request_id)
+                source_tp_size, source_tp_rank = self._source_tp(
+                    cfg, node_name, graph_walk,
                 )
-
-            for i, signal in enumerate(signals):
-                tensor_list = tensors.get(signal)
-                if not tensor_list:
-                    num_tensors.append(0)
-                    continue
-                shard_dim = (
-                    cfg.shard_dim.get(signal) if cfg is not None else None
-                )
-                for tensor in tensor_list:
-                    tensor_uuid = self._uuid_minter.mint()
-                    canonical = self._ensure_leading_shard_dim(
-                        shard_dim, tensor,
+                if columnar and (source_tp_size, source_tp_rank) != (
+                    columns.tp_size, columns.tp_rank
+                ):
+                    raise ValueError(
+                        f"request {request_id} has sharding "
+                        f"{(source_tp_size, source_tp_rank)} for node "
+                        f"{node_name!r} walk {graph_walk!r}, but the batch was "
+                        f"built for {(columns.tp_size, columns.tp_rank)}; one "
+                        "batch is one node on one worker and cannot mix "
+                        "sharding groups"
                     )
-                    flat_uuids.append(tensor_uuid)
-                    flat_rids.append(request_id)
-                    signal_idxs.append(i)
-                    canonicals.append(canonical)
-                    if not columnar:
-                        infos.append(self._tensor_info(
-                            canonical, tensor_uuid, source_tp_size,
-                            source_tp_rank, node_name, graph_walk,
-                        ))
-                    if cfg is not None:
-                        self.uuid_to_shard_dim[tensor_uuid] = shard_dim
-                    if self.enable_prof:
-                        self.uuid_to_edge_name[tensor_uuid] = signal
-                num_tensors.append(len(tensor_list))
 
-        if columnar:
-            columns.add_tensors_canonical(flat_uuids, canonicals)
-            self.tensor_store.put_tensor_batch_columns(
-                flat_rids, canonicals, columns,
-            )
-        else:
-            self.tensor_store.put_tensor_batch_multi(
-                flat_rids, flat_uuids, canonicals, infos,
-            )
+                for i, signal in enumerate(signals):
+                    tensor_list = tensors.get(signal)
+                    if not tensor_list:
+                        num_tensors.append(0)
+                        continue
+                    shard_dim = (
+                        cfg.shard_dim.get(signal) if cfg is not None else None
+                    )
+                    for tensor in tensor_list:
+                        tensor_uuid = self._uuid_minter.mint()
+                        canonical = self._ensure_leading_shard_dim(
+                            shard_dim, tensor,
+                        )
+                        flat_uuids.append(tensor_uuid)
+                        flat_rids.append(request_id)
+                        signal_idxs.append(i)
+                        canonicals.append(canonical)
+                        if not columnar:
+                            infos.append(self._tensor_info(
+                                canonical, tensor_uuid, source_tp_size,
+                                source_tp_rank, node_name, graph_walk,
+                            ))
+                        if cfg is not None:
+                            self.uuid_to_shard_dim[tensor_uuid] = shard_dim
+                        if self.enable_prof:
+                            self.uuid_to_edge_name[tensor_uuid] = signal
+                    num_tensors.append(len(tensor_list))
+
+            if columnar:
+                columns.add_tensors_canonical(flat_uuids, canonicals)
+                self.tensor_store.put_tensor_batch_columns(
+                    flat_rids, canonicals, columns,
+                )
+            else:
+                self.tensor_store.put_tensor_batch_multi(
+                    flat_rids, flat_uuids, canonicals, infos,
+                )
+        except Exception:
+            # The per-tensor bookkeeping above is written before the store
+            # put lands, so on any raise those uuids would sit in the maps
+            # with nothing in the store -- and both cleanup paths iterate
+            # ``get_all_uuids(rid)``, so nothing could ever reach them.
+            # ``flat_uuids`` is appended before either map, so it covers them.
+            for uuid in flat_uuids:
+                self.uuid_to_shard_dim.pop(uuid, None)
+                self.uuid_to_edge_name.pop(uuid, None)
+            raise
         return StoredOutputs(flat_uuids, flat_rids, signal_idxs, num_tensors)
 
     def _tensor_info(
@@ -969,7 +981,15 @@ class TensorCommunicationManager(ABC):
             return
         self.tensor_store.mark_forgotten(collectable)
         for uuid, was_registered in zip(collectable, registered, strict=True):
-            self._cleanup_by_uuid(uuid, registered=was_registered)
+            try:
+                self._cleanup_by_uuid(uuid, registered=was_registered)
+            except Exception as e:
+                # The store already popped the record, so this uuid cannot be
+                # retried -- log and keep going so one bad tensor does not
+                # strand the rest of the batch the same way.
+                logger.error(
+                    "Error cleaning up tensor uuid %d: %s, skipping.", uuid, e,
+                )
 
     def increment_ref(self, uuid: int, n: int = 1):
         self.tensor_store.increment_ref(uuid, n=n)

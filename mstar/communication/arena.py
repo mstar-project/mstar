@@ -414,6 +414,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
 
     def _sync_segments(self) -> None:
         grew = False
+        old_len = len(self._seg_views)
         while len(self._seg_views) < self._arena.num_segments:
             i = len(self._seg_views)
             seg = self._arena.segment(i)
@@ -426,7 +427,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         if grew:
             # Once per segment ever created, so placement can cross as the
             # index the reserve already returned.
-            self._name_segments_to_store()
+            self._name_segments_to_store(start_idx=old_len)
             total, free, largest = self._arena.stats()
             if (self._shm_total is not None
                     and total > self._shm_total * 0.8):
@@ -604,12 +605,18 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             else _nullcontext()
         )
 
-    def _name_segments_to_store(self) -> None:
+    def _name_segments_to_store(self, start_idx: int = 0) -> None:
         """Tell the store what each segment index is called. Idempotent, and
         once per segment rather than once per tensor -- the whole point of
-        placement crossing as an index."""
+        placement crossing as an index.
+
+        ``start_idx`` skips the segments already named, so a grow names only
+        what it added; re-naming the whole list each grow is quadratic in
+        segment count. It must slice as well as renumber -- enumerating the
+        full list from ``start_idx`` would file every existing name under the
+        wrong index."""
         store = self.tensor_store
-        for i, name in enumerate(self._seg_names):
+        for i, name in enumerate(self._seg_names[start_idx:], start=start_idx):
             store.register_shm_segment(i, name)
         self._segments_named_to = store
 

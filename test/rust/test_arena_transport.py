@@ -499,6 +499,47 @@ def test_placement_crosses_as_an_index_once_per_segment(tmp_path, backend):
         assert store.get_info(info.uuid).shm_segment is not None
 
 
+def test_growth_names_only_new_segments_under_their_own_index(tmp_path):
+    """Two things the test above cannot see, because its 128-byte tensors
+    never grow the arena past one segment:
+
+    1. a grow must name only what it added -- re-naming the accumulated list
+       each time is quadratic in segment count;
+    2. each index must carry ITS OWN name. Renumbering the whole list from
+       the new start files every existing segment under the wrong index, so
+       a tensor placed in segment N is later read out of segment 0's file.
+    """
+    prod = _manager("w_grow", tmp_path)
+    store = prod.tensor_store
+    named: list[tuple[int, str]] = []
+    real_name = store.register_shm_segment
+
+    def spy_name(index, name):
+        named.append((index, name))
+        return real_name(index, name)
+
+    store.register_shm_segment = spy_name
+
+    # 1 MiB segments: 12 x 300 KB crosses several of them.
+    infos = prod.store_and_return_tensor_info(
+        "rg", {"big": [torch.zeros(300_000, dtype=torch.uint8)
+                       for _ in range(12)]},
+    )
+    prod.register_for_send("rg", list(infos["big"]))
+    assert prod._arena.num_segments > 1, "need a grown arena to test this"
+
+    idxs = [i for i, _ in named]
+    assert len(idxs) == len(set(idxs)), (
+        f"re-named an already-named segment: {idxs}; naming is once per "
+        "segment, at the grow"
+    )
+    for i, name in named:
+        assert name == prod._seg_names[i], (
+            f"segment {i} was registered as {name!r}, but it is "
+            f"{prod._seg_names[i]!r}"
+        )
+
+
 @pytest.mark.parametrize("backend", ["python", "rust"])
 def test_an_unregistered_segment_index_is_a_loud_error(backend):
     """Silently stamping ``shm_segment=None`` would read as "spilled to a
