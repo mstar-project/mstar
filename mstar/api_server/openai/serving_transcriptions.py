@@ -68,7 +68,7 @@ CARRY_OVER_CHARS = 1200
 TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 # a window that needed a temperature above this stops conditioning the next
 PROMPT_RESET_TEMPERATURE = 0.5
-# a seek shorter than this re-hears too much for too little; take the window
+# a seek shorter than this re-hears too much for too little, so take the window
 MIN_SEEK_SECONDS = 1.0
 # parallel mode: how far before a fixed boundary to look for the quietest cut
 CUT_SEARCH_SECONDS = 2.0
@@ -495,7 +495,7 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, audio_pa
                     yield sse({"type": "transcript.text.delta", "delta": delta})
             window.raw_text = "".join(raw_parts)
             if i + 1 < len(windows):
-                # windows are joined by a space in the final text; say so mid-stream
+                # windows are joined by a space in the final text, say so mid-stream
                 yield sse({"type": "transcript.text.delta", "delta": " "})
             await asyncio.sleep(0)
     else:
