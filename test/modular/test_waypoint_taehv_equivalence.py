@@ -12,6 +12,8 @@ from mstar.model.waypoint.components.taehv import (
     decode_latent,
     encode_seed_clip,
     initial_decoder_histories,
+    load_taehv,
+    validate_taehv_architecture,
 )
 
 taehv = pytest.importorskip("taehv")
@@ -46,8 +48,7 @@ def _rgb24(frames: tuple[torch.Tensor, ...]) -> torch.Tensor:
         (decoded.clamp(0, 1) * 255)
         .round()
         .to(torch.uint8)
-        .squeeze(0)
-        .permute(0, 2, 3, 1)[..., :3]
+        .permute(0, 1, 3, 4, 2)[..., :3]
         .contiguous()
     )
 
@@ -106,3 +107,14 @@ def test_functional_taehv_matches_upstream_init_and_steady_state():
         torch.equal(actual, expected)
         for actual, expected in zip(steady_histories, reference_histories, strict=True)
     )
+
+
+def test_load_taehv_does_not_depend_on_the_checkpoint_filename(tmp_path):
+    """A resolved Hub path is ``blobs/<sha>``, which upstream's filename sniff
+    ("taehv1_5" -> patch 2, 32 channels) misses; the loader must pin the
+    architecture itself. The symlink stands in for the blob name."""
+    link = tmp_path / "weights.pth"
+    link.symlink_to(_AE_CHECKPOINT)
+    ae = load_taehv(str(link))
+    validate_taehv_architecture(ae)
+    assert (ae.patch_size, ae.latent_channels) == (2, 32)

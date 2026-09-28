@@ -16,10 +16,12 @@ logger = logging.getLogger(__name__)
 _ENCODE_SIZES = {(720, 1280): (512, 1024), (360, 640): (256, 512)}
 _DECODE_SIZES = {v: k for k, v in _ENCODE_SIZES.items()}
 
-# ``TAEHV.__init__`` reads patch_size and latent_channels off the checkpoint
-# *filename*: "taehv1_5" means (2, 32), anything else falls back to (1, 16) and
-# the state_dict load then fails on shape. Pinned, not globbed.
+# Pinned, not globbed. ``TAEHV.__init__`` would infer the architecture from
+# "taehv1_5" in the *filename*, but a resolved Hub path is ``blobs/<sha>``, so
+# ``load_taehv`` passes the shapes explicitly.
 _CHECKPOINT_NAME = "taehv1_5.pth"
+_PATCH_SIZE = 2
+_LATENT_CHANNELS = 32
 
 DECODER_HISTORY_PREFIX = "decoder_history_"
 
@@ -59,7 +61,9 @@ def load_taehv(ae_uri: str, cache_dir: str | None = None) -> nn.Module:
         raise FileNotFoundError(
             f"No TAEHV checkpoint for ae_uri={ae_uri!r}; looked for {checkpoint}."
         )
-    return TAEHV(str(checkpoint)).eval()
+    return TAEHV(
+        str(checkpoint), patch_size=_PATCH_SIZE, latent_channels=_LATENT_CHANNELS
+    ).eval()
 
 
 def _block_kind(block: nn.Module) -> str:
@@ -86,8 +90,8 @@ def validate_taehv_architecture(ae_model: nn.Module) -> None:
         "decoder_memblocks": decoder_kinds.count("MemBlock"),
     }
     expected = {
-        "patch_size": 2,
-        "latent_channels": 32,
+        "patch_size": _PATCH_SIZE,
+        "latent_channels": _LATENT_CHANNELS,
         "t_downscale": 4,
         "t_upscale": 4,
         "frames_to_trim": 3,

@@ -9,20 +9,20 @@ model_kwargs:
   seed_capture_sizes: [[360, 640], [540, 960], [1080, 1920]]
   full_global_ring: false
   # Rows per rollout step; must be <= resources.kv.num_sessions below.
-  step_batch_size: 1
+  step_batch_size: 2
 
 # The world state is a ring (not a paged KV cache); max_seq_len only satisfies the
 # conductor's config check and matches one frame's token count.
 max_seq_len: 512
 
 # Primary bound on the world pool; must be a positive int <= resources.kv.num_sessions.
-max_concurrent_requests: 1
+max_concurrent_requests: 2
 
 resources:
   kv:
     # ~816 MiB of ring per world at 720P. Raise together with
     # max_concurrent_requests; the two are checked against each other.
-    num_sessions: 1
+    num_sessions: 2
 
 # Single-GPU colocated: vae_encoder + dit on rank 0 (TAEHV decode is fused into the dit forward).
 node_groups:

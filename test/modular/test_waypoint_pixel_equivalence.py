@@ -46,6 +46,7 @@ from test_waypoint_reference_equivalence import (
     _import_reference,
     _new_request,
     _port_frame,
+    _reference_flex_attention,
     _reference_frame,
     _reference_importable,
     _reset,
@@ -92,8 +93,6 @@ def reference():
     """The served reference, minus the fp32-island capture L0 needs.
     ``float32_matmul_precision`` is what the oracle recorded under and what the
     compat port's sigma LUT depends on; see the L1-L3 file's fixture."""
-    from mstar.engine.resources.attn.flex import flex_attention_masked
-
     WorldModel, StaticKVCache, patch_model = _import_reference()
     torch.set_float32_matmul_precision("high")
 
@@ -102,7 +101,7 @@ def reference():
         str(CHECKPOINT), cfg=cfg, device=DEVICE, dtype=DTYPE
     ).eval()
     patch_model.apply_inference_patches(model)
-    patch_model.flex_attention = flex_attention_masked
+    patch_model.flex_attention = _reference_flex_attention
     kv = StaticKVCache(cfg, batch_size=1, dtype=DTYPE).to(device=DEVICE)
     return {"cfg": cfg, "model": model, "kv": kv}
 
@@ -188,7 +187,7 @@ def _port_prime(port, session, clip, ctx):
         _admit(port, 0)
         x0 = port["dit"].append_frame(
             latent,
-            torch.tensor(0, dtype=torch.int64, device=DEVICE),
+            torch.full((latent.size(0),), 0, dtype=torch.int64, device=DEVICE),
             mouse=ctx["mouse"],
             button=ctx["button"],
             scroll=ctx["scroll"],
