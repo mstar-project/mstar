@@ -28,8 +28,16 @@ class KimiLanguageModel(nn.Module):
         )
         self.norm = build_rmsnorm(config)
 
-    def forward(self, input_ids: torch.Tensor, *, label: str) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
+        label: str,
+    ) -> torch.Tensor:
+        hidden_states = (
+            self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        )
         # The label and layer index are cursors on the shared resources: bind
         # the label once, advance the index per layer. Passing them as
         # arguments instead would make inductor specialize on the int.
@@ -51,9 +59,16 @@ class KimiForCausalLM(nn.Module):
         self.lm_head = build_lm_head(config, comm_group=comm_group)
 
     def forward(
-        self, input_ids: torch.Tensor, *, label: str, **kwargs,
+        self,
+        input_ids: torch.Tensor | None = None,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
+        label: str,
+        **kwargs,
     ) -> torch.Tensor:
-        return self.lm_head(self.model(input_ids, label=label))
+        return self.lm_head(
+            self.model(input_ids, inputs_embeds=inputs_embeds, label=label)
+        )
 
     def load_weights(self, weights, **kwargs) -> set[str]:
         from mstar.model.kimi_k2_7.weight_loader import load_kimi_hf_weights

@@ -32,9 +32,46 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     ModelInputsFromEngine,
     NodeInputs,
+    NodeSubmodule,
 )
 
 _MAIN = "main"
+
+
+class KimiVisionEncoderSubmodule(NodeSubmodule):
+    """MoonViT tower + patch-merger projector. One image per step."""
+
+    def __init__(self, vision_tower: nn.Module, mm_projector: nn.Module):
+        super().__init__()
+        self.vision_tower = vision_tower
+        self.mm_projector = mm_projector
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs,
+    ) -> NodeInputs:
+        patches = inputs["image_inputs"][0]
+        gh, gw = inputs["image_grids"][0].tolist()
+        return NodeInputs(
+            tensor_inputs={"patches": patches},
+            kwargs={"gh": gh, "gw": gw},
+        )
+
+    def forward(
+        self,
+        graph_walk: str,
+        engine_inputs: ModelInputsFromEngine,
+        patches: torch.Tensor,
+        gh: int,
+        gw: int,
+        **kwargs,
+    ) -> NameToTensorList:
+        target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
+        merged = self.vision_tower(patches.to(target_dtype), gh, gw)
+        return {"image_embeds": [self.mm_projector(merged)]}
 
 
 class KimiLLMSubmodule(ARNodeSubmodule):
@@ -43,6 +80,10 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         self.language_model = language_model  # KimiForCausalLM
         self.lm_head = language_model.lm_head
         self.config = config
+        vision = config.vision
+        self.embed_tokens = language_model.model.embed_tokens if vision else None
+        self.media_content_token_id = vision.media_content_token_id if vision else None
+        self.media_end_token_id = vision.media_end_token_id if vision else None
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
@@ -73,6 +114,32 @@ class KimiLLMSubmodule(ARNodeSubmodule):
             ),
         ]
 
+    def cg_key_info(
+        self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
+    ) -> Any:
+        """Whether every request in this batch is due to sample a token —
+        what separates the plain-text/decode captures (always sample,
+        ``additional_key_info`` defaults to ``None``) from a text-before-image
+        prefill step, which must run eager so ``forward``'s gate applies. Same
+        fact ``declare_step`` stamps on the step."""
+        del graph_walk
+        all_sampling = all(
+            info.step_metadata.get("sample_prefill_token", True)
+            for info in per_request_info.values()
+        )
+        return None if all_sampling else False
+
+    def _wrap_vision(self, image_embeds: torch.Tensor) -> torch.Tensor:
+        """Splice the media-content/media-end sentinels around one image's
+        embeddings, the way the chat template brackets its pad-token run."""
+        device = image_embeds.device
+        content_id = torch.tensor([self.media_content_token_id], device=device)
+        end_id = torch.tensor([self.media_end_token_id], device=device)
+        with torch.no_grad():
+            content_emb = self.embed_tokens(content_id).to(image_embeds.dtype)
+            end_emb = self.embed_tokens(end_id).to(image_embeds.dtype)
+        return torch.cat([content_emb, image_embeds, end_emb], dim=0)
+
     def prepare_inputs(
         self,
         graph_walk: str,
@@ -80,10 +147,21 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> ARNodeInputs:
+        # `declare_step` cannot see step_metadata, so it rides in on
+        # `resource_step_info` — the same fact `cg_key_info` reads off
+        # `per_request_info` before `prepare_inputs` runs.
+        sample_prefill_token = fwd_info.step_metadata.get("sample_prefill_token", True)
+        if graph_walk == "prefill_vision":
+            wrapped = self._wrap_vision(inputs["image_embeds"][0])
+            return ARNodeInputs(
+                input_embeds=wrapped, input_seq_len=wrapped.shape[0],
+                resource_step_info=sample_prefill_token,
+            )
         text_inputs = inputs["text_inputs"][0]
         return ARNodeInputs(
             input_ids=text_inputs,
             input_seq_len=text_inputs.shape[0],
+            resource_step_info=sample_prefill_token,
         )
 
     def declare_step(
@@ -100,7 +178,9 @@ class KimiLLMSubmodule(ARNodeSubmodule):
                 rid: inp.input_ids
                 for rid, inp in zip(request_ids, inputs, strict=True)
             }
+        all_sampling = all(bool(inp.resource_step_info) for inp in inputs)
         return SubmoduleStep(
+            cg_key_info=None if all_sampling else False,
             segments=[
                 Segment(request_id=rid, label=_MAIN, span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
@@ -124,6 +204,8 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
+        if inputs[0].input_embeds is not None:
+            return {"input_embeds": inputs[0].input_embeds}
         return {
             "input_ids": torch.cat([inp.input_ids for inp in inputs]),
         }
@@ -132,13 +214,16 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
         attn: AttentionManager = engine_inputs.resources[ATTN]
 
-        hidden = self.language_model.model(input_ids, label=_MAIN)
-        if graph_walk == "prefill":
+        hidden = self.language_model.model(
+            input_ids, inputs_embeds=input_embeds, label=_MAIN
+        )
+        if graph_walk in ("prefill", "prefill_vision"):
             hidden = attn.select_last_hidden(hidden, label=_MAIN)
         elif graph_walk != "decode":
             raise ValueError(
@@ -152,20 +237,40 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
+        if graph_walk in ("prefill", "prefill_vision"):
+            sample = engine_inputs.single_request_info.step_metadata.get(
+                "sample_prefill_token", True
+            )
+            if not sample:
+                # Extend the KV cache only — this step's request is not the
+                # one whose turn it is to sample a token yet.
+                self.language_model.model(
+                    input_ids, inputs_embeds=input_embeds, label=_MAIN
+                )
+                return {}
         return {
             "new_token": self._forward(
                 graph_walk=graph_walk,
                 engine_inputs=engine_inputs,
                 input_ids=input_ids,
+                input_embeds=input_embeds,
             )
         }
 
     def can_batch(
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs]
     ) -> bool:
+        if batch.graph_walk == "prefill_vision":
+            return False
+        if batch.graph_walk == "prefill":
+            return all(
+                info.step_metadata.get("sample_prefill_token", True)
+                for info in batch.per_request_info.values()
+            )
         return True
 
     def forward_batched(

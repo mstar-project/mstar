@@ -197,10 +197,14 @@ Per-model notes:
 - **Orpheus** — set the speaker with ``voice`` — one of ``tara`` (default), ``zoe``,
   ``zac``, ``jess``, ``leo``, ``mia``, ``julia``, ``leah`` (the ``available_voices`` list
   in the Orpheus config).
-- **Kimi-K2.7-Code** — text-only chat, thinking-only, with native tool calls. The full
-  message list (system prompt, prior assistant turns, tool calls/results) is rendered
-  with the checkpoint's own chat template; ``tools``, ``tool_choice``, and
-  ``chat_template_kwargs`` are passed straight through to it. ``/v1/chat/completions``
+- **Kimi-K2.7-Code** — chat (text and image input), thinking-only, with native tool
+  calls. The full message list (system prompt, prior assistant turns, tool calls/results)
+  is rendered with the checkpoint's own chat template; ``tools``, ``tool_choice``, and
+  ``chat_template_kwargs`` are passed straight through to it. ``image_url`` content parts
+  (data URI or a fetchable URL) are accepted alongside text; each image is resized to at
+  most 16384 patches (``in_patch_limit``) with no side over 512 patches (7168px,
+  ``patch_limit_on_one_side``) before it reaches the model, then those patches are merged
+  2x2, so the model sees at most 4096 vision tokens per image. ``/v1/chat/completions``
   (streaming and non-streaming) decodes the model's own ``<think>``/tool-call markers
   and returns ``reasoning_content``, ``content``, and ``tool_calls`` per the OpenAI
   schema, with ``finish_reason`` set to ``"tool_calls"`` when the response contains tool

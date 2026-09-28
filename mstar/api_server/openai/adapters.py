@@ -458,27 +458,47 @@ class Cosmos3Adapter(OpenAIAdapter):
 
 
 class KimiAdapter(OpenAIAdapter):
-    """Kimi-K2.7-Code: text-only chat via the checkpoint's own chat template.
+    """Kimi-K2.7-Code: chat (text + image input) via the checkpoint's own
+    chat template.
 
     Preserves per-turn structure (system prompt, prior reasoning/tool_calls, tool
-    results) for ``process_prompt``'s ``apply_chat_template`` call. ``make_output_parser``
-    decodes the model's thinking/tool-call markers; see ``mstar.model.kimi_k2_7.output_parser``.
+    results) for ``process_prompt``'s ``apply_chat_template`` call. Image message
+    parts are persisted to ``upload_dir`` and swapped for a bare ``{"type":
+    "image"}`` marker — the template renders the media placeholder from the
+    type alone, and the pixels travel to the data worker via ``file_paths``
+    like every other model's attachments. ``make_output_parser`` decodes the
+    model's thinking/tool-call markers; see ``mstar.model.kimi_k2_7.output_parser``.
     """
 
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         messages = []
+        file_paths: dict[str, list[str]] = {}
+        num_images = 0
         for m in req.messages:
             dumped = m.model_dump(exclude_none=True)
             content = dumped.get("content")
             if isinstance(content, list):
+                new_content = []
                 for part in content:
-                    if part.get("type") != "text":
+                    ptype = part.get("type")
+                    if ptype == "text":
+                        new_content.append(part)
+                    elif ptype == "image_url":
+                        url = (part.get("image_url") or {}).get("url", "")
+                        if not url:
+                            raise ValueError("Kimi-K2.7 image_url part is missing a url")
+                        _, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=True)
+                        file_paths.setdefault("image", []).append(path)
+                        num_images += 1
+                        new_content.append({"type": "image"})
+                    else:
                         raise ValueError(
-                            "Kimi-K2.7 serving is text-only; image/audio "
-                            "message parts are not supported yet"
+                            f"Kimi-K2.7 serving does not support {ptype!r} "
+                            "message parts; use 'text' or 'image_url'"
                         )
+                dumped["content"] = new_content
             messages.append(dumped)
 
         mk = _passthrough(req)
@@ -486,7 +506,8 @@ class KimiAdapter(OpenAIAdapter):
         mk["messages"] = messages
         return SubmitArgs(
             text=None,
-            input_modalities=["text"],
+            file_paths=file_paths or None,
+            input_modalities=["text"] + ["image"] * num_images,
             output_modalities=["text"],
             model_kwargs=mk,
         )

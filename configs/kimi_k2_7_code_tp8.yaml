@@ -16,7 +16,10 @@ resources:
     max_num_pages: 512
     page_size: 128
 node_groups:
+  - node_names: [vision_encoder]
+    ranks: [0]
+
   - node_names: [LLM]
     ranks: [0, 1, 2, 3, 4, 5, 6, 7]
     tp_size: 8
-    graph_walks: [prefill, decode]
+    graph_walks: [prefill, prefill_vision, decode]

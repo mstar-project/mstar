@@ -174,15 +174,34 @@ def test_kimi_chat_preserves_message_structure_and_tool_fields(tmp_path):
     assert sa.model_kwargs["temperature"] == 0.7
 
 
-def test_kimi_chat_rejects_image_parts(tmp_path):
+def test_kimi_chat_decodes_image_url_parts(tmp_path):
+    raw = b"\x89PNG-data"
+    url = "data:image/png;base64," + base64.b64encode(raw).decode()
     req = ChatCompletionRequest(
         model="kimi_k2_7",
         messages=[{"role": "user", "content": [
             {"type": "text", "text": "describe"},
-            {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+            {"type": "image_url", "image_url": {"url": url}},
         ]}],
     )
-    with pytest.raises(ValueError, match="text-only"):
+    sa = adapters.KimiAdapter().chat_to_request(req, tmp_path)
+
+    assert Path(sa.file_paths["image"][0]).read_bytes() == raw
+    assert sa.input_modalities == ["text", "image"]
+    msgs = sa.model_kwargs["messages"]
+    assert msgs[0]["content"] == [
+        {"type": "text", "text": "describe"}, {"type": "image"},
+    ]
+
+
+def test_kimi_chat_rejects_other_part_types(tmp_path):
+    req = ChatCompletionRequest(
+        model="kimi_k2_7",
+        messages=[{"role": "user", "content": [
+            {"type": "input_audio", "input_audio": {"data": "abc", "format": "wav"}},
+        ]}],
+    )
+    with pytest.raises(ValueError, match="image_url"):
         adapters.KimiAdapter().chat_to_request(req, tmp_path)
 
 

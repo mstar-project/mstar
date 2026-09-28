@@ -299,10 +299,12 @@ def test_init_repo_id_downloads_only_config_files(tmp_path, monkeypatch):
 
     def fake_hf_hub_download(repo_id, filename, cache_dir=None):
         assert repo_id == "org/kimi-checkpoint"
-        assert filename in ("config.json", "generation_config.json")
-        if filename == "generation_config.json":
+        assert filename in (
+            "config.json", "generation_config.json", "preprocessor_config.json",
+        )
+        if filename != "config.json":
             from huggingface_hub.errors import EntryNotFoundError
-            raise EntryNotFoundError("no generation_config.json")
+            raise EntryNotFoundError(f"no {filename}")
         return str(tmp_path / filename)
 
     monkeypatch.setattr(

@@ -24,15 +24,24 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
-from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
+from mstar.graph.base import (
+    GraphEdge,
+    GraphNode,
+    GraphSection,
+    Loop,
+    Sequential,
+    TensorPointerInfo,
+)
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model
 from mstar.model.kimi_k2_7.config import ATTN, KV_CACHE, ROPE, SAMPLER, KimiK2Config
+from mstar.model.multimodal import find_media_spans, split_around_spans
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
 LLM_NODE = "LLM"
+VISION_NODE = "vision_encoder"
 DECODE_LOOP = "decode_loop"
 
 
@@ -53,8 +62,9 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 
 def _resolve_checkpoint_config_dir(path: str, cache_dir: str | None = None) -> str | None:
     """Local directory holding ``config.json`` (and, if present,
-    ``generation_config.json``) for ``path``, without pulling the full
-    (multi-hundred-GB) checkpoint snapshot just to read two small JSON files."""
+    ``generation_config.json`` / ``preprocessor_config.json``) for ``path``,
+    without pulling the full (multi-hundred-GB) checkpoint snapshot just to
+    read a few small JSON files."""
     from pathlib import Path
 
     if not path:
@@ -74,12 +84,13 @@ def _resolve_checkpoint_config_dir(path: str, cache_dir: str | None = None) -> s
             "Error downloading config.json for %r from huggingface: %s", path, e,
         )
         return None
-    try:
-        hf_hub_download(
-            repo_id=path, filename="generation_config.json", cache_dir=cache_dir,
-        )
-    except EntryNotFoundError:
-        pass  # optional file — not every checkpoint ships one
+    for optional_file in ("generation_config.json", "preprocessor_config.json"):
+        try:
+            hf_hub_download(
+                repo_id=path, filename=optional_file, cache_dir=cache_dir,
+            )
+        except EntryNotFoundError:
+            pass  # optional file — not every checkpoint ships one
     return str(Path(config_path).parent)
 
 
@@ -250,7 +261,66 @@ class KimiK2Model(Model):
             outputs=[],
         )
 
-        return dict(prefill=prefill, decode=decode)
+        walks = dict(prefill=prefill, decode=decode)
+        if self.config.vision is not None:
+            walks["prefill_vision"] = Sequential([
+                GraphNode(
+                    name=VISION_NODE,
+                    input_names=["image_inputs", "image_grids"],
+                    outputs=[GraphEdge(next_node=LLM_NODE, name="image_embeds")],
+                ),
+                GraphNode(
+                    name=LLM_NODE,
+                    input_names=["image_embeds"],
+                    outputs=[
+                        GraphEdge(
+                            next_node=EMIT_TO_CLIENT,
+                            name="new_token",
+                            output_modality="text",
+                            conductor_new_token=True,
+                            persist=True,
+                        ),
+                    ],
+                ),
+            ])
+        return walks
+
+    def _prefill_schedule_from_signals(
+        self, input_signals: dict[str, list[TensorPointerInfo]],
+    ) -> list[tuple[str, dict[str, TensorPointerInfo]]]:
+        """One ``prefill`` step per text span, one ``prefill_vision`` step per
+        image, interleaved the way the chat template wrote them: text, image,
+        text, image, ..., text. Text-only requests get a single-entry, single-
+        step schedule."""
+        texts = input_signals.get("text_inputs", [])
+        images = input_signals.get("image_inputs", [])
+        grids = input_signals.get("image_grids", [])
+        schedule: list[tuple[str, dict[str, TensorPointerInfo]]] = []
+        for i in range(len(images)):
+            schedule.append(("prefill", {"text_inputs": texts[i]}))
+            schedule.append(
+                ("prefill_vision", {"image_inputs": images[i], "image_grids": grids[i]})
+            )
+        if images:
+            schedule.append(("prefill", {"text_inputs": texts[len(images)]}))
+        else:
+            # No images: reproduce the pre-vision edge exactly, the whole
+            # (possibly empty) list, since dummy/fallback signals may omit
+            # ``text_inputs`` entirely.
+            schedule.append(("prefill", {"text_inputs": texts}))
+        return schedule
+
+    def _prefill_step_inputs(
+        self, entry: tuple[str, dict[str, TensorPointerInfo]],
+    ) -> list[GraphEdge]:
+        walk_name, tensor_dict = entry
+        target_node = VISION_NODE if walk_name == "prefill_vision" else LLM_NODE
+        inputs = []
+        for name, info in tensor_dict.items():
+            edge = GraphEdge(next_node=target_node, name=name)
+            edge.tensor_info = info if isinstance(info, list) else [info]
+            inputs.append(edge)
+        return inputs
 
     def get_initial_forward_pass_args(
         self,
@@ -260,23 +330,58 @@ class KimiK2Model(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
+        schedule = self._prefill_schedule_from_signals(input_signals)
+        first_walk = schedule[0][0]
+        inputs = self._prefill_step_inputs(schedule[0])
+        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+
         full_metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            graph_walk="prefill",
+            graph_walk=first_walk,
             is_prefill=True,
+            kwargs={"prefill_schedule": schedule, "prefill_step": 0},
         )
-
-        graph_edge = GraphEdge(next_node=LLM_NODE, name="text_inputs")
-        graph_edge.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [graph_edge]
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
 
         return ForwardPassArgs(
             full_metadata=full_metadata,
             inputs=inputs,
             unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
+            step_metadata={
+                "is_prefill": True,
+                "sample_prefill_token": len(schedule) == 1,
+            },
+        )
+
+    def _advance_prefill_schedule(
+        self,
+        metadata: CurrentForwardConductorMetadata,
+        schedule: list[tuple[str, dict[str, TensorPointerInfo]]],
+        persist_signals: dict[str, list[TensorPointerInfo]],
+    ) -> ForwardPassArgs:
+        step = metadata.kwargs["prefill_step"] + 1
+        if step < len(schedule):
+            metadata.kwargs["prefill_step"] = step
+            metadata.graph_walk = schedule[step][0]
+            inputs = self._prefill_step_inputs(schedule[step])
+            sample_prefill_token = step == len(schedule) - 1
+        else:
+            metadata.is_prefill = False
+            metadata.graph_walk = "decode"
+            graph_edge = GraphEdge(next_node=LLM_NODE, name="text_inputs")
+            graph_edge.tensor_info = persist_signals.get("new_token", [])
+            inputs = [graph_edge]
+            sample_prefill_token = True
+
+        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
+        return ForwardPassArgs(
+            full_metadata=metadata,
+            inputs=inputs,
+            unpersist_tensors=unpersist_tensors,
+            step_metadata={
+                "is_prefill": metadata.is_prefill,
+                "sample_prefill_token": sample_prefill_token,
+            },
         )
 
     def get_partition_forward_pass_args(
@@ -287,8 +392,11 @@ class KimiK2Model(Model):
         incoming_connections: list[StreamingConnectionState] | None = None,
     ) -> ForwardPassArgs:
         metadata = partition_metadata
-        request_done = False
+        schedule = metadata.kwargs.get("prefill_schedule")
+        if metadata.is_prefill and schedule is not None:
+            return self._advance_prefill_schedule(metadata, schedule, persist_signals)
 
+        request_done = False
         if metadata.is_prefill:
             metadata.is_prefill = False
             metadata.graph_walk = "decode"
@@ -324,7 +432,15 @@ class KimiK2Model(Model):
         tensors: NameToTensorList | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        messages = kwargs.get("messages")
+        messages = kwargs.pop("messages", None)
+        raw_images = (tensors or {}).get("image_inputs") or []
+        if raw_images:
+            if messages is None:
+                raise ValueError(
+                    "Kimi-K2.7: image input requires the chat-template "
+                    "(messages) path."
+                )
+            return self._process_image_messages(messages, raw_images, **kwargs)
         if messages is not None:
             if self._tokenizer_mode == "byte":
                 raise ValueError(
@@ -360,6 +476,60 @@ class KimiK2Model(Model):
             return {"text_inputs": [input_ids]}
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
         return {"text_inputs": [input_ids]}
+
+    def _process_image_messages(
+        self, messages: list, raw_images: list[torch.Tensor], **kwargs,
+    ) -> NameToTensorList:
+        """Render the chat template's own ``image`` marker, then splice each
+        attachment's patches in for the single ``<|media_pad|>`` token the
+        template leaves per image."""
+        from mstar.model.kimi_k2_7.components.vision import preprocess_image
+
+        vision_cfg = self.config.vision
+        tools = kwargs.get("tools")
+        if kwargs.get("tool_choice") == "none":
+            tools = None
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            add_generation_prompt=True,
+            tokenize=False,
+            **(kwargs.get("chat_template_kwargs") or {}),
+        )
+        token_ids = self.tokenizer(
+            text, add_special_tokens=False, return_tensors="pt"
+        ).input_ids[0].tolist()
+
+        patches, grids = [], []
+        for image in raw_images:
+            image_patches, gh, gw = preprocess_image(image, vision_cfg)
+            patches.append(image_patches)
+            grids.append(torch.tensor([gh, gw]))
+
+        pad_id, merge = vision_cfg.media_pad_token_id, vision_cfg.merge_kernel_size
+        expanded, image_idx = [], 0
+        for token_id in token_ids:
+            if token_id == pad_id:
+                gh, gw = grids[image_idx].tolist()
+                expanded.extend([pad_id] * ((gh // merge) * (gw // merge)))
+                image_idx += 1
+            else:
+                expanded.append(token_id)
+        input_ids = torch.tensor(expanded, dtype=torch.long)
+
+        specs = {
+            "image": (
+                vision_cfg.media_content_token_id, pad_id, vision_cfg.media_end_token_id,
+            )
+        }
+        spans = find_media_spans(input_ids, specs)
+        segments = split_around_spans(input_ids, spans)
+        if len(segments) != len(raw_images) + 1:
+            raise ValueError(
+                f"Kimi-K2.7: expected {len(raw_images) + 1} text segments around "
+                f"{len(raw_images)} image(s), found {len(segments)}"
+            )
+        return {"text_inputs": segments, "image_inputs": patches, "image_grids": grids}
 
     def postprocess(
         self,
@@ -406,6 +576,8 @@ class KimiK2Model(Model):
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule | None:
+        if node_name == VISION_NODE:
+            return self._create_vision_submodule(device)
         if node_name != LLM_NODE:
             return None
 
@@ -447,6 +619,38 @@ class KimiK2Model(Model):
 
         logger.info("Successfully loaded Kimi-K2.7 submodule for %s", node_name)
         return KimiLLMSubmodule(language_model=language_model, config=self.config)
+
+    def _create_vision_submodule(self, device: str) -> NodeSubmodule | None:
+        source = self._resolve_checkpoint()
+        if source is None:
+            logger.info(
+                "KimiK2Model: no checkpoint resolved for node %r — dummy mode (None).",
+                VISION_NODE,
+            )
+            return None
+
+        from mstar.model.kimi_k2_7.components.vision import KimiMMProjector, KimiVisionTower
+        from mstar.model.kimi_k2_7.submodules import KimiVisionEncoderSubmodule
+        from mstar.model.utils import ModuleAndPrefix, load_weights_from_hf_shards
+
+        with torch.device("meta"):
+            vision_tower = KimiVisionTower(self.config.vision)
+            mm_projector = KimiMMProjector(self.config.vision)
+        vision_tower.to_empty(device=device)
+        mm_projector.to_empty(device=device)
+        load_weights_from_hf_shards(
+            repo_dir=source,
+            modules=[
+                ModuleAndPrefix(vision_tower, prefix="vision_tower"),
+                ModuleAndPrefix(mm_projector, prefix="mm_projector"),
+            ],
+            device=device,
+        )
+        vision_tower.eval()
+        mm_projector.eval()
+
+        logger.info("Successfully loaded Kimi-K2.7 submodule for %s", VISION_NODE)
+        return KimiVisionEncoderSubmodule(vision_tower=vision_tower, mm_projector=mm_projector)
 
     def _resolve_checkpoint(self) -> str | None:
         from pathlib import Path

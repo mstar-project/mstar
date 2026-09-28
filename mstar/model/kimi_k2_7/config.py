@@ -38,6 +38,73 @@ def _quant_raw_from_config_dict(raw: dict) -> dict | None:
 
 
 @dataclass
+class KimiVisionConfig:
+    """MoonViT tower + patch-merger projector, plus the media preprocessing
+    it expects its pixel input in."""
+
+    hidden_size: int = 1152
+    num_hidden_layers: int = 27
+    num_attention_heads: int = 16
+    intermediate_size: int = 4304
+    patch_size: int = 14
+    pos_emb_height: int = 64
+    pos_emb_width: int = 64
+    merge_kernel_size: int = 2
+    text_hidden_size: int = 7168
+    projector_ln_eps: float = 1e-5
+
+    in_patch_limit: int = 16384
+    patch_limit_on_one_side: int = 512
+    image_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    image_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
+
+    media_begin_token_id: int = 163602
+    media_content_token_id: int = 163603
+    media_end_token_id: int = 163604
+    media_pad_token_id: int = 163605
+
+    _VISION_CONFIG_FIELDS = {
+        "vt_hidden_size": "hidden_size",
+        "vt_num_hidden_layers": "num_hidden_layers",
+        "vt_num_attention_heads": "num_attention_heads",
+        "vt_intermediate_size": "intermediate_size",
+        "patch_size": "patch_size",
+        "init_pos_emb_height": "pos_emb_height",
+        "init_pos_emb_width": "pos_emb_width",
+        "text_hidden_size": "text_hidden_size",
+        "projector_ln_eps": "projector_ln_eps",
+    }
+
+    @classmethod
+    def from_checkpoint_dicts(
+        cls, vision_raw: dict, media_proc_cfg: dict | None
+    ) -> "KimiVisionConfig":
+        """Build from ``config.json``'s ``vision_config`` (architecture,
+        ``vt_*``-and-unprefixed keys) and ``preprocessor_config.json``'s
+        ``media_proc_cfg`` (preprocessing, optional)."""
+        overrides = {
+            field: vision_raw[key]
+            for key, field in cls._VISION_CONFIG_FIELDS.items()
+            if key in vision_raw
+        }
+        merge_kernel_size = vision_raw.get("merge_kernel_size")
+        if isinstance(merge_kernel_size, list):
+            overrides["merge_kernel_size"] = merge_kernel_size[0]
+        elif merge_kernel_size is not None:
+            overrides["merge_kernel_size"] = merge_kernel_size
+
+        if media_proc_cfg:
+            for key in ("in_patch_limit", "patch_limit_on_one_side"):
+                if key in media_proc_cfg:
+                    overrides[key] = media_proc_cfg[key]
+            for key in ("image_mean", "image_std"):
+                if key in media_proc_cfg:
+                    overrides[key] = tuple(media_proc_cfg[key])
+
+        return cls(**overrides)
+
+
+@dataclass
 class KimiK2Config:
     vocab_size: int = 163840
     hidden_size: int = 7168
@@ -109,6 +176,9 @@ class KimiK2Config:
 
     prefill_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
+
+    # None for text-only checkpoints/variants; set for Kimi-K2.7-Code.
+    vision: KimiVisionConfig | None = None
 
     @property
     def qk_head_dim(self) -> int:
@@ -202,6 +272,7 @@ class KimiK2Config:
     def k27_code(cls) -> "KimiK2Config":
         cfg = cls()
         cfg.moe_in_kernel_dequant = True
+        cfg.vision = KimiVisionConfig()
         return cfg
 
     @classmethod
@@ -272,5 +343,16 @@ class KimiK2Config:
                 overrides["temperature"] = gen_raw["temperature"]
             if "top_p" in gen_raw:
                 overrides["top_p"] = gen_raw["top_p"]
+
+        vision_raw = raw.get("vision_config")
+        if vision_raw:
+            media_proc_cfg = None
+            preproc_json = Path(source) / "preprocessor_config.json"
+            if preproc_json.is_file():
+                with open(preproc_json) as f:
+                    media_proc_cfg = json.load(f).get("media_proc_cfg")
+            overrides["vision"] = KimiVisionConfig.from_checkpoint_dicts(
+                vision_raw, media_proc_cfg
+            )
 
         return replace(base, **overrides)
