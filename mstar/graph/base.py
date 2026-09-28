@@ -537,20 +537,27 @@ class Loop(GraphSection):
             # register_ingested_input before termination — cleaning those up is deferred
             # (they're harmless since reset_for_iter won't be called after the loop is done).
             self.inner_registry.clear()
-            # FIXME: cascades before the outputs below are populated, and
-            # discards the result; nested loops stall.
-            self._managing_registry.mark_entity_complete(self.name)
             for edge in self.outputs:
                 edge.tensor_info = self._cached_outputs.get(edge.name, [])
             for edge in self.accumulated_outputs:
                 edge.tensor_info = self._accumulated_cache.get(edge.name, [])
+            # Cascade only once our tensor_info is populated -- the parent
+            # caches these edges on the way through -- and keep what it hands
+            # back. Both matter only for NESTED loops: cascading first makes a
+            # parent cache still-empty tensor_info, and discarding the result
+            # means a parent that finishes in this same event never routes its
+            # own outputs. Our declared outputs come back inside ``outer``
+            # (the parent reads them off ``managed_entities``) already filtered
+            # by its loop-back, so they are not added again here; the
+            # accumulated ones are disjoint by name and ride separately.
+            outer = self._managing_registry.mark_entity_complete(self.name)
 
             # Don't dereference, becaue the tensors will be used downstream
             self._cached_outputs.clear()
             self._accumulated_cache.clear()
             return NodeCompletionOutput(
-                output_edges=self.outputs + self.accumulated_outputs,
-                filtered_signals=self._loop_back_inputs
+                output_edges=list(outer.output_edges) + self.accumulated_outputs,
+                filtered_signals=self._loop_back_inputs | outer.filtered_signals,
             )
         else:
             self._advance_one_iter()
