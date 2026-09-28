@@ -30,7 +30,6 @@ from mstar.utils.ipc_format import (
     RemoveRequest,
     ScheduleTPNode,
 )
-from mstar.worker import micro_scheduler as sched_mod
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.worker import Worker
@@ -680,114 +679,7 @@ def test_an_unsharded_node_still_runs_its_own_recovery():
     assert solo.held == ["victim"]
 
 
-# --- the watchdog names a rank that has gone quiet --------------------------
-
-
-class _WatchRank:
-    """``_log_if_stalled`` over the state it samples."""
-
-    _log_if_stalled = Worker._log_if_stalled
-    _set_phase = Worker._set_phase
-
-    def __init__(self):
-        self.worker_id = "w0"
-        self._in_flight_rids = {"r0"}
-        self._pending_removes = set()
-        owed = OffloadDelta.new()
-        owed.add_offloaded("victim")
-        self.scheduler = SimpleNamespace(
-            backlog={("n", "w"): SimpleNamespace(node_objects={"r9": object()})},
-            peek_tp_follow=lambda: SimpleNamespace(spec_seq=41),
-            tp_batches_pending_schedule=[object()],
-            _pending_resident_deltas={"node": owed},
-            last_consumed_tp_seq=8702,
-            held_until={"r1": 0.0},
-            failed_rids=set(),
-        )
-        self._loop_phase = "starting"
-        self._loop_phase_at = 0.0
-        self._last_step_at = 0.0
-        self._removes_awaiting_step = {8703: ["gone"]}
-
-
-def _at(monkeypatch, now: float) -> None:
-    monkeypatch.setattr(
-        worker_mod, "_time", SimpleNamespace(monotonic=lambda: now)
-    )
-
-
-def test_a_parked_rank_names_its_phase_and_what_it_is_owed(monkeypatch, caplog):
-    """The line the logs were missing: a rank parked inside a call cannot report
-    on itself, so gone-quiet looks exactly like busy."""
-    rank = _WatchRank()
-    _at(monkeypatch, 30.0)
-
-    with caplog.at_level(logging.WARNING, logger=worker_mod.__name__):
-        assert rank._log_if_stalled(period=10.0) is True
-
-    line = next(
-        r.getMessage() for r in caplog.records if "not progressing" in r.getMessage()
-    )
-    assert "phase=starting" in line and "parked" in line
-    assert "head seq 41" in line, "the follow queue has to be in the line"
-    assert "resident delta owed=1" in line, (
-        "a delta this rank has not managed to replay is the thing to see first"
-    )
-    assert "teardowns waiting on a step=1 (for seqs [8703], consumed" in line, (
-        "a teardown held for a step this rank has not reached keeps that "
-        "request's pages, and it lives in neither `pending removes` nor `held`"
-    )
-    assert "backlog=1 chunks/1 rids" in line, (
-        "a backlogged rid is off the ready queue, so nothing else reveals it"
-    )
-
-
-def test_a_spinning_rank_that_completes_nothing_is_reported(monkeypatch, caplog):
-    """The thrash: evict a victim, reload it, fail the same batch, evict again.
-    The phase changes constantly, so a phase timer alone stays quiet while the
-    job is dead."""
-    rank = _WatchRank()
-    _at(monkeypatch, 30.0)
-    rank._set_phase("schedule")   # phase is fresh...
-    rank._last_step_at = 0.0      # ...but nothing has completed
-
-    with caplog.at_level(logging.WARNING, logger=worker_mod.__name__):
-        assert rank._log_if_stalled(period=10.0) is True
-
-    line = next(
-        r.getMessage() for r in caplog.records if "not progressing" in r.getMessage()
-    )
-    assert "spinning, nothing completing" in line
-    assert "last step 30.0s ago" in line
-
-
-def test_a_rank_making_progress_stays_quiet(monkeypatch, caplog):
-    rank = _WatchRank()
-    _at(monkeypatch, 30.0)
-    rank._set_phase("await_gpu")
-    rank._last_step_at = 30.0
-
-    with caplog.at_level(logging.WARNING, logger=worker_mod.__name__):
-        assert rank._log_if_stalled(period=10.0) is False
-
-    assert not [r for r in caplog.records if "not progressing" in r.getMessage()]
-
-
-def test_an_empty_follow_queue_is_said_so(monkeypatch, caplog):
-    """Distinguishes "the follower cannot build its step" from "the follower was
-    never sent one" — the ambiguity that cost a whole round of logs."""
-    rank = _WatchRank()
-    rank.scheduler.peek_tp_follow = lambda: None
-    rank.scheduler.tp_batches_pending_schedule = []
-    _at(monkeypatch, 30.0)
-
-    with caplog.at_level(logging.WARNING, logger=worker_mod.__name__):
-        rank._log_if_stalled(period=10.0)
-
-    line = next(
-        r.getMessage() for r in caplog.records if "not progressing" in r.getMessage()
-    )
-    assert "tp-follow queue=0 (head seq none)" in line
+# --- the replay is verbatim, and says where it stopped ----------------------
 
 
 def test_the_broadcast_ships_the_sequence_verbatim():
@@ -820,136 +712,16 @@ def test_a_refused_replay_says_which_move_it_stopped_on(caplog):
     assert "1 moves still owed" in line
 
 
-# --- the ranks verify each other ---------------------------------------------
+# --- neither consumer of the follow FIFO builds mid-replay -------------------
 #
-# The delta says what rank 0 did; ``offloaded_after`` says where it should have
-# landed. Nothing else checks, so a drift shows up only later, as a replayed move
-# that will not fit, with nothing pointing at where it began.
+# A step admitted against a half-replayed page state is one the other rank
+# admits differently, which deadlocks the next collective. Both the serial
+# path and the async follower go through ``settle_tp_follow_delta``.
 
 
-class _CheckSched:
-    """``_check_resident_set_matches`` over stubs."""
-
-    _check_resident_set_matches = MicroScheduler._check_resident_set_matches
-
-    def __init__(self, offloaded_here=(), holds_nothing_here=()):
-        off, nothing = set(offloaded_here), set(holds_nothing_here)
-        engine = SimpleNamespace(
-            is_offloaded=lambda node, rid: rid in off,
-            reclaimable=lambda node, rid: 0 if rid in nothing else 1,
-        )
-        self.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-        # The check compares wire ids, so it needs the handle table.
-        self.runtime = _Rids()
-
-
-def _mgr(rids):
-    """This rank's live requests, keyed by LOCAL handle."""
-    return SimpleNamespace(per_request_info=dict.fromkeys(rids, object()))
-
-
-def _msg(offloaded_after, seq=7, holding_after=()):
-    """What rank 0 said its own page state was, in WIRE ids."""
-    return ScheduleTPNode(
-        node_name="node", graph_walk="walk", request_ids=["r0"],
-        spec_seq=seq,
-        offloaded_after=tuple(f"wire-{r}" for r in offloaded_after),
-        holding_after=tuple(f"wire-{r}" for r in holding_after),
-    )
-
-
-def test_matching_page_state_says_nothing(caplog):
-    sched = _CheckSched(offloaded_here={"a"})
-
-    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
-        sched._check_resident_set_matches(
-            _msg(["a"], holding_after=["b"]), _mgr(["a", "b"]),
-        )
-
-    assert not caplog.records
-
-
-def test_a_new_arrival_one_rank_has_not_seen_is_not_a_fault(caplog):
-    """New requests reach the ranks at slightly different times and hold no pages
-    until they run, so they cannot shift an admit. Comparing live sets reported
-    that as a fault; comparing page holders does not."""
-    sched = _CheckSched(holds_nothing_here={"justarrived"})
-
-    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
-        sched._check_resident_set_matches(
-            # rank 0 has not seen "justarrived" yet
-            _msg([], holding_after=["a"]), _mgr(["a", "justarrived"]),
-        )
-
-    assert not caplog.records
-
-
-def test_a_teardown_the_ranks_applied_on_opposite_sides_is_named(caplog):
-    """The skew the offloaded sets cannot show: a request torn down on one rank
-    and still holding its pages on the other shifts that rank's admit."""
-    sched = _CheckSched()
-
-    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
-        sched._check_resident_set_matches(
-            # rank 0 still holds "stale"; this rank has released it
-            _msg([], seq=1228, holding_after=["a", "stale"]), _mgr(["a"]),
-        )
-
-    line = next(r.getMessage() for r in caplog.records if "disagrees" in r.getMessage())
-    assert "step 1228" in line
-    assert "Holding pages: 1 here vs 2 there" in line
-    assert "only there: ['wire-stale']" in line
-    assert "shifts that rank's admit" in line
-
-
-def test_an_unreplayed_delta_is_named(caplog):
-    """The skew ``offloaded_after`` exists for: a move that did not land."""
-    sched = _CheckSched(offloaded_here={"a"})
-
-    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
-        sched._check_resident_set_matches(
-            _msg(["a", "b"], seq=41, holding_after=[]), _mgr(["a", "b"]),
-        )
-
-    line = next(r.getMessage() for r in caplog.records if "disagrees" in r.getMessage())
-    assert "Offloaded: 1 here vs 2 there" in line
-    assert "only there: ['wire-b']" in line
-
-
-def test_a_refused_replay_still_reports_the_page_gap(caplog):
-    """The blind spot: the comparison used to sit after the early return for a
-    refused replay, so it could never run in the one case where it says the most
-    — how far behind this rank is, and in what."""
-    sched = _CheckSched(offloaded_here={"a"})
-
-    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
-        sched._check_resident_set_matches(
-            _msg(["a", "b"], seq=99), _mgr(["a", "b"]), caught_up=False,
-        )
-
-    record = next(r for r in caplog.records if "still behind" in r.getMessage())
-    assert record.levelno == logging.WARNING, (
-        "mid-replay is expected, so it must not read as a bug"
-    )
-    assert "only there: ['wire-b']" in record.getMessage()
-
-
-def test_a_gap_after_the_replay_finished_is_an_error(caplog):
-    sched = _CheckSched(offloaded_here={"a"})
-
-    with caplog.at_level(logging.WARNING, logger=sched_mod.__name__):
-        sched._check_resident_set_matches(
-            _msg(["a", "b"], seq=99), _mgr(["a", "b"]), caught_up=True,
-        )
-
-    record = next(r for r in caplog.records if "disagrees" in r.getMessage())
-    assert record.levelno == logging.ERROR
-
-
-def test_the_follow_path_checks_even_when_the_replay_refuses(monkeypatch):
-    """Placement rather than behaviour. The comparison is worth most on the
-    refusal path, and it sat behind that path's early return — so the two tests
-    above passed while the real code could never reach it."""
+def test_the_serial_follow_path_will_not_build_mid_replay():
+    """A refused replay leaves moves owed, so the rids the head names do not mean
+    here what they meant on the leader. Wait rather than build."""
     engine = SimpleNamespace(
         apply_resident_delta=lambda node, delta: False,  # refuses
         is_offloaded=lambda node, rid: False,
@@ -963,37 +735,13 @@ def test_the_follow_path_checks_even_when_the_replay_refuses(monkeypatch):
     message = ScheduleTPNode(
         node_name="node", graph_walk="walk", request_ids=["r0"], spec_seq=5,
     )
-    message.resident_delta.add_offloaded("victim")
+    message.resident_delta.add_offloaded("wire-victim")
     sched.register_tp_follow(message)
-
-    seen: list[bool] = []
-    monkeypatch.setattr(
-        sched, "_check_resident_set_matches",
-        lambda msg, mgr, caught_up=True: seen.append(caught_up),
-    )
 
     assert sched._try_schedule_tp_follow(
         SimpleNamespace(per_request_info={"r0": object()})
     ) is None
-    assert seen == [False], "the refusal path skipped the comparison"
-
-
-def test_the_broadcast_reports_page_holders_not_live_requests():
-    """The other half of the same rule, and the one the follower cannot enforce:
-    a request that has not run holds no pages, so it cannot shift an admit. New
-    arrivals land on the ranks at slightly different times, so sending the live
-    set makes that harmless skew read as a fault."""
-    leader = _Leader(followers=("rank1",))
-    leader.request_state.per_request_info["justarrived"] = object()
-    leader.engine.resource.holds_nothing = {"justarrived"}
-
-    leader.maybe_send_zmq_to_tp_followers(_node_batch())
-
-    body = leader.sent[0][1].body
-    assert "wire-justarrived" not in body.holding_after, (
-        "a request holding no pages was reported as a page holder"
-    )
-    assert body.holding_after == ("wire-r0",)
+    assert sched.peek_tp_follow() is message, "the head was consumed mid-replay"
 
 
 # --- a forwarded teardown is ordered against the step stream -----------------
@@ -1202,7 +950,6 @@ class _FollowSpec:
     """
 
     _try_follow_speculation = Worker._try_follow_speculation
-    _describe_follow_head = Worker._describe_follow_head
 
     def __init__(self, *, replay_refuses: bool):
         self.worker_id = "worker_1"
@@ -1219,7 +966,6 @@ class _FollowSpec:
         )
         # the worker installs this; ``_check_resident_set_matches`` needs it to
         # compare page state in wire ids (and goes away with that check)
-        self.scheduler.runtime = _Rids()
         # the build asks for the spec target right after reading the parent's
         # batch; None bails it out there, just past the gate
         self._graph_runtime = SimpleNamespace(
@@ -1227,7 +973,6 @@ class _FollowSpec:
         )
         # live requests live on the request-state manager now
         self.request_state = SimpleNamespace(per_request_info={})
-        self._follow_block: str | None = None
         self.head = head = ScheduleTPNode(
             node_name="node", graph_walk="walk", request_ids=["r0"],
             speculative=True, spec_seq=6, spec_from_seq=5,

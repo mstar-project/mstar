@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import torch
 
@@ -1707,31 +1707,30 @@ class Engine:
                         "Replayed rank 0's offload of request %s from %s "
                         "(%d reclaimed)", wire_rid, node_name, freed,
                     )
-            else:
-                if not self.is_offloaded(node_name, rid):
-                    logger.debug(
-                        "Replay: %s already resident on %s", wire_rid, node_name,
-                    )
-                elif not all(
-                    resource.reload(rid)
-                    for resource in resources
-                    if resource.supports_eviction and resource.is_offloaded(rid)
-                ):
+            elif not self.is_offloaded(node_name, rid):
+                logger.debug(
+                    "Replay: %s already resident on %s", wire_rid, node_name,
+                )
+            elif not all(
+                resource.reload(rid)
+                for resource in resources
+                if resource.supports_eviction and resource.is_offloaded(rid)
+            ):
                     # No room yet. Silent until now, and this is the shape of a
                     # follower that stops mid-delta and never finishes: rank 0
                     # then waits on a collective this rank will never join.
-                    logger.warning(
-                        "Replay of rank 0's reload of %s on %s does not fit; "
-                        "%d moves still owed. This rank cannot run rank 0's "
-                        "next step until it catches up.",
-                        wire_rid, node_name, len(delta),
-                    )
-                    return False
-                else:
-                    logger.info(
-                        "Replayed rank 0's reload of request %s on %s",
-                        wire_rid, node_name,
-                    )
+                logger.warning(
+                    "Replay of rank 0's reload of %s on %s does not fit; "
+                    "%d moves still owed. This rank cannot run rank 0's "
+                    "next step until it catches up.",
+                    wire_rid, node_name, len(delta),
+                )
+                return False
+            else:
+                logger.info(
+                    "Replayed rank 0's reload of request %s on %s",
+                    wire_rid, node_name,
+                )
             delta.pop_left()
         return True
 

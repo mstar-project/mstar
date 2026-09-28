@@ -279,62 +279,7 @@ class MicroScheduler:
             return self._apply_resident_delta(message.node_name, message.resident_delta)
         return self._apply_resident_delta(message.node_name)
 
-    def _check_resident_set_matches(
-        self, message: ScheduleTPNode,
-        request_state: RequestStateManager,
-        caught_up: bool = True,
-    ) -> None:
-        """Compare this rank's resident set to what rank 0 said its own was.
-
-        The delta says what rank 0 did; ``offloaded_after`` says where that was
-        meant to land. Nothing else checks, so without this the ranks can drift
-        apart and the first symptom is a replayed move that will not fit — a step
-        or more later, with nothing pointing at where it started. Reported, not
-        repaired: the difference is the bug, and guessing a repair would bury it.
-        """
-        node = message.node_name
-        engine = self.engine_manager.get_engine(node)
-        # Compared as WIRE ids: per_request_info is keyed by local handle, and
-        # the leader's sets are wire strings, so comparing them raw would report
-        # a disagreement on every step -- and the sets in the log below could not
-        # be matched against the other rank's.
-        to_wire = self.runtime.get_rid_string
-        live = set(request_state.per_request_info)
-        offloaded = {
-            to_wire(rid) for rid in live if engine.is_offloaded(node, rid)
-        }
-        holding = {
-            to_wire(rid) for rid in live
-            if not engine.is_offloaded(node, rid)
-            and engine.reclaimable(node, rid) > 0
-        }
-        their_holding = set(message.holding_after)
-        their_offloaded = set(message.offloaded_after)
-        if holding == their_holding and offloaded == their_offloaded:
-            return
-        # Mid-replay this is expected, and saying so is the point: it reports how
-        # far behind this rank is rather than claiming a bug. Once the replay is
-        # done any difference is a real divergence and a coming deadlock.
-        logger.log(
-            logging.WARNING if not caught_up else logging.ERROR,
-            "TP page state %s at step %d on %s. Holding pages: %d here vs %d "
-            "there (only here: %s; only there: %s). Offloaded: %d here vs %d "
-            "there (only here: %s; only there: %s). A request holding pages on "
-            "one rank and not the other shifts that rank's admit, so a step both "
-            "ranks run can deadlock.",
-            "still behind (replay unfinished)" if not caught_up else "disagrees",
-            message.spec_seq, node,
-            len(holding), len(their_holding),
-            sorted(holding - their_holding) or "none",
-            sorted(their_holding - holding) or "none",
-            len(offloaded), len(their_offloaded),
-            sorted(offloaded - their_offloaded) or "none",
-            sorted(their_offloaded - offloaded) or "none",
-        )
-
-    def settle_tp_follow_delta(
-        self, request_state: RequestStateManager,
-    ) -> bool:
+    def settle_tp_follow_delta(self) -> bool:
         """Replay the front head's resident delta; True once every move landed.
 
         The one seam both consumers of this FIFO go through — the serial path
@@ -343,21 +288,11 @@ class MicroScheduler:
         to skip this entirely and read the difference as "rid not ready", which
         it then polled on for ever.
 
-        Checked either way: a refused replay is when the comparison is most
-        wanted, since it says how far behind this rank is and in what.
         """
         head = self.peek_tp_follow()
         if head is None:
             return True
-        caught_up = self._apply_delta_from_message(head)
-        self._check_resident_set_matches(
-            head, request_state, caught_up=caught_up,
-        )
-        return caught_up
-
-    def pending_resident_delta(self, node_name: str) -> OffloadDelta:
-        """The moves this rank still owes rank 0 on ``node_name``."""
-        return self._pending_resident_deltas.get(node_name) or OffloadDelta.new()
+        return self._apply_delta_from_message(head)
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
@@ -443,7 +378,7 @@ class MicroScheduler:
             return
         # Check readiness for every rid to pop all-or-none. Use the
         # leader's graph walk.
-        if not self.settle_tp_follow_delta(request_state):
+        if not self.settle_tp_follow_delta():
             return # every pending move has to land before the step is built
         popped = self.pop_ready_rids(
             request_state, first_tp_node.node_name,

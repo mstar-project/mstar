@@ -180,24 +180,6 @@ class OffloadDelta:
         self.rids.extend(other.rids)
         self.is_offload.extend(other.is_offload)
 
-    def describe(self, keep: int = 8) -> str:
-        """The moves in replay order, for a log line.
-
-        Order is the only thing that makes a delta meaningful, so this prints the
-        sequence rather than counts — ``-A +A`` and ``+A -A`` leave a rank in
-        opposite states. Truncated from the left: when a replay stalls it is the
-        moves still owed at the front that say why.
-        """
-        if not len(self):
-            return "empty"
-        moves = [
-            f"{'-' if off else '+'}{rid[:8]}"
-            for rid, off in zip(self.rids, self.is_offload, strict=True)
-        ]
-        if len(moves) <= keep:
-            return " ".join(moves)
-        return " ".join(moves[:keep]) + f" (+{len(moves) - keep} more)"
-
 
 @dataclass
 class ScheduleTPNode(MessageBody):
@@ -208,22 +190,6 @@ class ScheduleTPNode(MessageBody):
     spec_seq: int = -1
     spec_from_seq: int = -1
     resident_delta: OffloadDelta = field(default_factory=OffloadDelta.new)
-    # What rank 0's page state was when it chose this step, for a follower to
-    # check itself against once it has replayed ``resident_delta``. The delta
-    # says what rank 0 did; these say where it should have landed.
-    #
-    # Both sets, because they catch different skews. ``offloaded_after`` catches
-    # a delta that did not replay. ``holding_after`` catches page movement the
-    # delta never describes: a request torn down releases its pages, and if the
-    # ranks apply that teardown on opposite sides of this step their admits
-    # disagree while their offloaded sets look identical.
-    #
-    # Requests that HOLD pages, not requests that are live. A request that has
-    # been admitted but never run holds nothing, so it cannot shift an admit —
-    # and new arrivals reach the ranks at slightly different times, so comparing
-    # live sets reports that harmless skew as a fault.
-    offloaded_after: tuple[str, ...] = ()
-    holding_after: tuple[str, ...] = ()
 
 
 @dataclass

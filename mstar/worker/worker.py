@@ -371,11 +371,6 @@ class Worker:
         # leader said so (TPNoSpeculation) or this rank closed the step.
         self._tp_nospec: RecentSet[int] = RecentSet(self._TP_NOSPEC_KEEP)
         self._tp_leader_gap_warned = False
-        # Why ``_try_follow_speculation`` last declined a matching head. Recorded
-        # rather than logged: it is called from a 20ms poll, so a line per
-        # attempt buries the log, and only the reason at the point the wait goes
-        # long is interesting. ``_await_tp_follow_step`` reports it there.
-        self._follow_block: str | None = None
         tp_async_on = sorted(n for n in self.parallel_nodes if self._tp_async_for(n))
         if tp_async_on:
             logger.info(
@@ -406,14 +401,6 @@ class Worker:
         # Keyed by the string: these arrive before the NEW_REQUEST that mints
         # the handle.
         self._unprocessed_messages: dict[str, list[WorkerMessage]] = {}
-
-        # Where the main loop is, and when it last completed a step — for the
-        # watchdog thread. A phase that keeps changing is not progress: an
-        # offload/reload thrash spins the loop happily while nothing completes.
-        self._loop_phase = "starting"
-        self._loop_phase_at = _time.monotonic()
-        self._last_step_at = _time.monotonic()
-        self._stop_watchdog = threading.Event()
 
         # CPU offloading: LRU tracking and eviction policy
         self._last_active: dict[tuple[int, str], float] = {}  # (request_id, node_name) -> monotonic timestamp
@@ -1224,21 +1211,6 @@ class Worker:
         # nothing. Each gets its own copy because each pops as it replays.
         engine = self.engine_manager.get_engine(node_batch.node_name)
         resident_delta = engine.take_resident_delta(node_batch.node_name)
-        # What the delta above should add up to on every rank. Cheap — a handful
-        # of live requests — and it is the only thing that can catch the ranks
-        # drifting apart, since the delta itself is never verified.
-        node = node_batch.node_name
-        # Wire ids: the follower keys its own state by a handle it minted itself,
-        # so a set of this rank's handles would name different requests there.
-        live = self.request_state.per_request_info
-        offloaded_after = tuple(sorted(
-            self._rid_str(rid) for rid in live if engine.is_offloaded(node, rid)
-        ))
-        holding_after = tuple(sorted(
-            self._rid_str(rid) for rid in live
-            if not engine.is_offloaded(node, rid)
-            and engine.reclaimable(node, rid) > 0
-        ))
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
@@ -1258,8 +1230,6 @@ class Worker:
                         spec_seq=seq,
                         spec_from_seq=spec_from_seq,
                         resident_delta=resident_delta.copy(),
-                        offloaded_after=offloaded_after,
-                        holding_after=holding_after,
                     )
                 )
             )
@@ -1767,69 +1737,6 @@ class Worker:
             )
         return True
 
-    # ------------------------------------------------------------------
-    # Stall watchdog
-    # ------------------------------------------------------------------
-
-    def _set_phase(self, phase: str) -> None:
-        """Note where the main loop is. Two attribute writes; called only from
-        ``run`` so nothing else has to know about it."""
-        self._loop_phase = phase
-        self._loop_phase_at = _time.monotonic()
-
-    def _watchdog(self, period: float) -> None:
-        """Say what this rank is doing once it stops making progress.
-
-        On its own thread on purpose: the interesting hangs are the ones where
-        the main loop is parked inside a call — a collective, a future, a lock —
-        and cannot log anything itself, so a rank that has gone quiet looks
-        exactly like a rank that is busy.
-        """
-        while not self._stop_watchdog.wait(period):
-            self._log_if_stalled(period)
-
-    def _log_if_stalled(self, period: float) -> bool:
-        """One tick of the watchdog, split out so it can be exercised without
-        driving the thread.
-
-        Fires on either of two failures, because both present as a hung job and
-        they look nothing alike in the log: a loop parked inside a call (the
-        phase stops changing), and a loop that spins without completing a step
-        (an offload/reload thrash, which changes phase constantly).
-        """
-        now = _time.monotonic()
-        phase_age = now - self._loop_phase_at
-        step_age = now - self._last_step_at
-        if phase_age < period and step_age < period:
-            return False
-        head = self.scheduler.peek_tp_follow()
-        owed = sum(
-            len(delta)
-            for delta in self.scheduler._pending_resident_deltas.values()
-        )
-        logger.warning(
-            "Worker %s not progressing: phase=%s for %.1fs, last step %.1fs ago"
-            " (%s); in-flight=%d rids, backlog=%d chunks/%d rids, "
-            "tp-follow queue=%d (head seq %s), resident delta owed=%d, "
-            "held=%d, failed=%d, pending removes=%d, "
-            "teardowns waiting on a step=%d (for seqs %s, consumed %d)",
-            self.worker_id, self._loop_phase, phase_age, step_age,
-            "parked" if phase_age >= period else "spinning, nothing completing",
-            len(self._in_flight_rids),
-            len(self.scheduler.backlog),
-            sum(len(b.node_objects) for b in self.scheduler.backlog.values()),
-            len(self.scheduler.tp_batches_pending_schedule),
-            "none" if head is None else head.spec_seq,
-            owed,
-            len(self.scheduler.held_until),
-            len(self.scheduler.failed_rids),
-            len(self._pending_removes),
-            sum(len(r) for r in self._removes_awaiting_step.values()),
-            sorted(self._removes_awaiting_step) or "none",
-            self.scheduler.last_consumed_tp_seq,
-        )
-        return True
-
     def _is_tp_follower_node(self, node_name: str) -> bool:
         """This rank follows ``node_name``: rank 0 of its instance decides both
         what runs on it and what gets evicted from it. Mirrors the engine's
@@ -2156,29 +2063,6 @@ class Worker:
     # every post-N verdict is derived per rank. The leader always sends a head
     # or a TPNoSpeculation marker per step, settled before N is post-processed.
 
-    def _describe_follow_head(self, head: ScheduleTPNode) -> str:
-        """The page state behind a head this rank cannot build.
-
-        Three things in one line, because the interesting cases are told apart
-        by comparing them: what rank 0 said it did for this step, what this rank
-        still owes, and which of the head's OWN rids are off-device here.
-
-        A head that names a rid its own delta offloads is not constructible on
-        the leader — the delta is drained at send time, so the two agree by
-        construction — which makes that combination proof the divergence started
-        upstream of this wait rather than in the replay.
-        """
-        engine = self.engine_manager.get_engine(head.node_name)
-        offloaded = sorted(
-            rid for rid in head.request_ids
-            if engine.is_offloaded(head.node_name, rid)
-        )
-        return (
-            f"its delta={head.resident_delta.describe()}, "
-            f"still owed={self.scheduler.pending_resident_delta(head.node_name).describe()}, "
-            f"of its own rids offloaded here={offloaded or 'none'}"
-        )
-
     def _try_follow_speculation(self, pending: PendingBatch) -> Speculation | None:
         head = self.scheduler.peek_tp_follow()
         if head is None or not head.speculative:
@@ -2200,8 +2084,7 @@ class Worker:
         # state that is still mid-replay. Every poll retries the owed moves, so
         # returning here makes progress where reading the half-applied state as
         # "not ready" never could.
-        if not self.scheduler.settle_tp_follow_delta(self.request_state):
-            self._follow_block = f"delta mid-replay; {self._describe_follow_head(head)}"
+        if not self.scheduler.settle_tp_follow_delta():
             return None
 
         batch_N = pending.batch
@@ -2240,14 +2123,9 @@ class Worker:
                 self._return_streaming_edge(r, edge)
 
         if popped is None:
-            # ``pop_ready_rids`` scans with ``allow_reload=False``, so an
-            # offloaded rid reads not-ready and stays that way until a replayed
-            # delta brings it back. The delta is settled above, so a rid still
-            # off-device here is a divergence rather than a lag.
-            self._follow_block = (
-                f"fresh rids {sorted(fresh)} not ready; "
-                f"{self._describe_follow_head(head)}"
-            )
+            # ``pop_ready_rids`` scans with ``allow_reload=False``: an offloaded
+            # rid reads not-ready and waits for a replayed delta. The delta is
+            # settled above, so a rid still off-device is a divergence, not a lag.
             _return_all_polled()
             return None
 
@@ -2312,7 +2190,6 @@ class Worker:
 
         # Committed: the serial path must not see the head any more.
         self.scheduler.pop_tp_follow_head()
-        self._follow_block = None
         # Its rids count as in flight now, so a remove landing before submit is
         # deferred like any other; ``_set_pending`` re-derives the set on submit.
         self._in_flight_rids |= set(head_rids)
@@ -2427,12 +2304,9 @@ class Worker:
                     last_warn = now
                     logger.warning(
                         "Worker %s: still waiting for the leader's decision on "
-                        "step seq %d, %.1fs after it finished (head queued: %s, "
-                        "head seq %s, blocked on: %s)",
+                        "step seq %d, %.1fs after it finished (head queued: %s)",
                         self.worker_id, s, now - t_done,
                         head is not None and head.spec_from_seq == s,
-                        "none" if head is None else head.spec_seq,
-                        self._follow_block or "nothing reported",
                     )
 
     # ------------------------------------------------------------------
@@ -3097,13 +2971,6 @@ class Worker:
                 "pre-runs on a dedicated thread",
                 self.worker_id,
             )
-        watchdog_period = float(os.environ.get("MSTAR_STALL_WATCHDOG_SEC", "10"))
-        if watchdog_period > 0:
-            threading.Thread(
-                target=self._watchdog, args=(watchdog_period,),
-                name=f"mstar-watchdog-{self.worker_id}", daemon=True,
-            ).start()
-
         # In-flight: (batch, node_batch, batch_partition, future) | None.
         pending: PendingBatch | None = None
 
@@ -3181,7 +3048,6 @@ class Worker:
                 # and the readiness scans through ``check_ready``'s reload. None
                 # of it may run while N's admit is outstanding on the GPU
                 # thread; see ``_await_admit_settled``.
-                self._set_phase("await_admit")
                 self._await_admit_settled(pending)
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
@@ -3197,7 +3063,6 @@ class Worker:
                 # doesn't drain the in-flight GPU work and undo the overlap.
                 if self.enable_nvtx:
                     range_push("worker.process_messages", synchronize=False)
-                self._set_phase("process_messages")
                 self._process_messages()
                 # Removals rank 0 stamped with a step this rank has now reached.
                 self._apply_removes_whose_step_landed()
@@ -3353,7 +3218,6 @@ class Worker:
                         if self.enable_nvtx:
                             range_push("worker.await_gpu", synchronize=False)
                         _t0 = _time.perf_counter() if phase_period else 0.0
-                        self._set_phase("await_gpu")
                         outputs = pending.future.result()
                         if phase_period:
                             _phase_record("await_gpu", _time.perf_counter() - _t0)
@@ -3421,7 +3285,6 @@ class Worker:
                         # spare.
                         self._clear_speculative_flag(pending.batch)
                         _maybe_clear_spec()
-                        self._set_phase("admit_failure_recovery")
                         self._handle_admit_failure(
                             pending.batch, pending.node_batch,
                             referenced_rids=frozenset(
@@ -3509,8 +3372,6 @@ class Worker:
                     if pending.node_batch.admit_error is None:
                         with self._span("worker.postprocess_batch"):
                             self._postprocess_batch(pending, outputs)
-                        # a step that actually ran — the watchdog's progress mark
-                        self._last_step_at = _time.monotonic()
 
                     # Removes for any rid not in the in-flight spec step
                     # are safe to apply now.
@@ -3535,7 +3396,6 @@ class Worker:
 
                 # 4. Non-speculative path: no pending or speculation skipped
                 # (e.g., non-AR engine, or loop ended). Run MicroScheduler.
-                self._set_phase("schedule")
                 with self._span("worker.schedule"):
                     batch = None
                     if yield_away_from_target is not None:
@@ -3546,7 +3406,6 @@ class Worker:
                     if batch is None:
                         batch = self.scheduler.get_next_batch(self.request_state)
                 if batch is None:
-                    self._set_phase("idle")
                     self.communicator.wait_for_work(10)
                     continue
 
