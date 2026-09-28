@@ -1,8 +1,8 @@
 model: "kimi_k2_7"
 # Reduced synthetic serve config — random weights, NOT a production deployment.
-# Generate the checkpoint first, then point at it:
-#   mstar-serve --config configs/synthetic/kimi_k2_7_repro.yaml \
-#               --model-path tools/kimi_goldens/repro/checkpoint
+# Write the random-weight checkpoint first (CPU is fine), then point at it:
+#   python test/integration/kimi_write_checkpoint.py --out /tmp/kimi_k2_7_reduced
+#   mstar-serve --config configs/synthetic/kimi_k2_7_repro.yaml --model-path /tmp/kimi_k2_7_reduced
 max_seq_len: 512
 model_kwargs:
   config_variant: reduced

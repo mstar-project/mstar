@@ -22,7 +22,7 @@ from mstar.model.kimi_k2_7.components.rope import (
 from mstar.model.kimi_k2_7.config import ATTN, KV_CACHE, ROPE
 from mstar.model.kimi_k2_7.kimi_model import KimiK2Model
 
-DEVICE = torch.device("cuda")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ── reference math ──────────────────────────────────────────────────────
@@ -130,7 +130,7 @@ def ref_mla_latent_step(q_nope_new, q_pe_new, kv_c_all, k_pe_all, scale):
 
 # ── checkpoint fixtures ─────────────────────────────────────────────────
 
-def fill_layer(layer, cfg):
+def fill_layer(layer, cfg, device=DEVICE):
     a = layer.self_attn
     for lin in (a.q_a_proj, a.q_b_proj, a.kv_a_proj_with_mqa, a.kv_b_proj, a.o_proj):
         lin.weight.data.normal_(0, 0.03)
@@ -142,7 +142,7 @@ def fill_layer(layer, cfg):
     if isinstance(mlp, KimiSparseMoeBlock):
         mlp.gate.weight.data.normal_(0, 1)
         mlp.gate.e_score_correction_bias.data = torch.randn(
-            cfg.n_routed_experts, device=DEVICE, dtype=torch.float32
+            cfg.n_routed_experts, device=device, dtype=torch.float32
         )
         mlp.experts.gate_up_proj.data.normal_(0, 0.05)
         mlp.experts.down_proj.data.normal_(0, 0.05)
@@ -153,13 +153,13 @@ def fill_layer(layer, cfg):
         mlp.down_proj.weight.data.normal_(0, 0.05)
 
 
-def build_reference(cfg):
-    model = KimiForCausalLM(cfg).to(device=DEVICE, dtype=torch.bfloat16)
+def build_reference(cfg, device=DEVICE):
+    model = KimiForCausalLM(cfg).to(device=device, dtype=torch.bfloat16)
     model.model.embed_tokens.weight.data.normal_(0, 0.05)
     model.model.norm.weight.data.normal_(1.0, 0.02)
     model.lm_head.weight.data.normal_(0, 0.02)
     for layer in model.model.layers:
-        fill_layer(layer, cfg)
+        fill_layer(layer, cfg, device=device)
     return model.eval()
 
 
@@ -203,12 +203,12 @@ def hf_checkpoint(model, cfg):
     return {k: v.detach().cpu().clone().contiguous() for k, v in sd.items()}
 
 
-def write_checkpoint(tmp_path, cfg, seed=0):
+def write_checkpoint(tmp_path, cfg, seed=0, device=DEVICE):
     """A reduced Kimi checkpoint on disk, plus the model it was built from."""
     from safetensors.torch import save_file
 
     torch.manual_seed(seed)
-    ref = build_reference(cfg)
+    ref = build_reference(cfg, device=device)
     save_file(hf_checkpoint(ref, cfg), str(tmp_path / "model.safetensors"))
     return ref
 

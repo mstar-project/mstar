@@ -28,6 +28,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``cosmos3_super``
      - ``nvidia/Cosmos3-Super``
      - Cosmos3-Super (64B) variant of the above; TP/SP for multi-GPU serving.
+   * - ``kimi_k2_7``
+     - ``moonshotai/Kimi-K2.7-Code``
+     - Kimi-K2.7-Code: 1T INT4 MoE (DeepSeek-V3 backbone with MLA) + MoonViT vision
+       tower; thinking-only with native tool calls; TP8.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.

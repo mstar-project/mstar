@@ -542,9 +542,11 @@ class KimiK2Model(Model):
             if self._tokenizer_mode == "byte":
                 # Synthetic reduced models emit arbitrary byte ids; return raw bytes.
                 return bytes((t & 0xFF) for t in token_ids)
-            # Keeps <think>/tool-call markers (skip_special_tokens=False); eos ids are dropped.
+            # eos ids are dropped; a kwarg-less decode routes to tiktoken's Rust decoder (renders
+            # <think>/tool-call markers verbatim), while any kwarg falls back to HF's slow per-id
+            # path (~17x slower, adds spaces around special tokens).
             new_ids = [t for t in token_ids if t not in self.config.eos_token_ids]
-            text = self.tokenizer.decode(new_ids, skip_special_tokens=False)
+            text = self.tokenizer.decode(new_ids)
             return text.encode("utf-8")
         raise ValueError(f"Unsupported modality for Kimi-K2.7: {modality!r}")
 

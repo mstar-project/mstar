@@ -128,6 +128,15 @@ cosmos3 = [
     "transformers",
 ]
 
+# The checkpoint's tokenization_kimi.py imports tiktoken and tiktoken.load,
+# which needs blobfile for local file reads; Pillow is for image loading
+# (MoonViT vision tower).
+kimi_k2_7 = [
+    "tiktoken",
+    "blobfile",
+    "Pillow",
+]
+
 qwen3_omni = [
     # NOTE: flash-attn is required by Qwen3-Omni but is NOT listed here — its
     # prebuilt wheels aren't on PyPI, so a plain install compiles from source
@@ -239,6 +248,8 @@ all = [
     "transformers",
     "safetensors",
     "triton",
+    "tiktoken",
+    "blobfile",
     "qwen-omni-utils",
     "qwen-tts==0.1.1",
     "numba>=0.61",

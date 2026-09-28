@@ -246,8 +246,7 @@ class _DecodeStubTokenizer:
     """decode() echoes the ids as a marker string so the test can see exactly
     what postprocess passed through (special tokens included)."""
 
-    def decode(self, ids, skip_special_tokens=False):
-        assert skip_special_tokens is False
+    def decode(self, ids):
         return "".join(f"<{i}>" for i in ids)
 
 
@@ -272,3 +271,24 @@ def test_postprocess_byte_mode_unchanged():
     model._tokenizer_mode = "byte"
     out = model.postprocess(torch.tensor([65, 66]), "text")
     assert out == b"AB"
+
+
+class _NoKwargsDecodeStubTokenizer:
+    """decode() rejects any kwarg, matching the checkpoint's TikTokenTokenizer
+    (a kwarg-less call routes to tiktoken's fast Rust decoder)."""
+
+    def decode(self, ids, **kwargs):
+        if kwargs:
+            raise AssertionError(f"decode() called with kwargs: {kwargs}")
+        return "".join(f"<{i}>" for i in ids)
+
+
+def test_postprocess_decodes_without_kwargs():
+    model = _make_model()
+    model._tokenizer_mode = "hf"
+    model._tokenizer = _NoKwargsDecodeStubTokenizer()
+    model.config.eos_token_ids = [9]
+
+    out = model.postprocess(torch.tensor([9, 1, 2]), "text")
+
+    assert out == "<1><2>".encode("utf-8")
