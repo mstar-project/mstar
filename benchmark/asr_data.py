@@ -109,7 +109,7 @@ def build(out: Path, raw_dir: Path, num_utterances: int, long_form_minutes: floa
     # Long form: one speaker's utterances in id order (chapters back to back),
     # joined with 0.5 s silence, until the target length is reached — the
     # speaker with the most audio, so the file stays one voice. test-clean
-    # speakers hold ~8 min each; if none reaches the target the id-ordered
+    # speakers hold ~8 min each. If none reaches the target the id-ordered
     # split as a whole is used instead.
     long_dir = out / "long_form"
     long_dir.mkdir(parents=True, exist_ok=True)
