@@ -362,19 +362,29 @@ class LocalOnlyKVTransferEngine(KVTransferEngine):
 
 
 @dataclass(frozen=True)
+class ShmKVSnapshotChunk:
+    path: str
+    start_len: int
+    end_len: int
+    page_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class ShmKVTransferInfo:
     path: str
     page_indices: tuple[int, ...]
     layout: KVLayout
     reset_generation: int | None = None
+    # None accepts descriptors produced before chunked SHM publication.
+    chunks: tuple[ShmKVSnapshotChunk, ...] | None = None
 
 
 class ShmKVTransferEngine(KVTransferEngine):
     """Host-staged KV transfer through a shared-memory filesystem.
 
-    Each producer publishes a packed tensor containing only the occupied
-    physical pages for one request label. Consumers attach by path and copy
-    the requested page/token ranges into their local accelerator cache.
+    Appends save only the changed tail pages. Descriptors retain immutable
+    chunks for earlier tokens, so a delayed reader can still use an older
+    descriptor without keeping a full copy of every growing snapshot.
     """
 
     def __init__(
@@ -431,11 +441,21 @@ class ShmKVTransferEngine(KVTransferEngine):
         if previous is not None and previous[0] == version:
             return previous[1]
 
+        append = (
+            previous is not None
+            and previous[0][2] == reset_generation
+            and seq_len > previous[0][1]
+            and pages[:len(previous[0][0])] == previous[0][0]
+        )
+        start_len = previous[0][1] if append else 0
+        first_page = start_len // self._kv_cache.page_size
+        last_page = (seq_len - 1) // self._kv_cache.page_size
+        chunk_pages = pages[first_page:last_page + 1]
         path = f"{self._path(request_id, label)}_{uuid.uuid4().hex}.pt"
         tmp_path = f"{path}.tmp"
-        if pages:
+        if chunk_pages:
             packed = (
-                self._kv_cache.tensor[:, list(pages)]
+                self._kv_cache.tensor[:, list(chunk_pages)]
                 .detach()
                 .cpu()
                 .contiguous()
@@ -448,11 +468,19 @@ class ShmKVTransferEngine(KVTransferEngine):
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+        chunk = ShmKVSnapshotChunk(
+            path=path,
+            start_len=start_len,
+            end_len=seq_len,
+            page_indices=chunk_pages,
+        )
+        earlier_chunks = previous[1].chunks if append else None
         info = ShmKVTransferInfo(
             path=path,
             page_indices=pages,
             layout=self._kv_cache.layout,
             reset_generation=reset_generation,
+            chunks=(*earlier_chunks, chunk) if earlier_chunks else (chunk,),
         )
         self._published[key] = (version, info)
         self._published_paths.setdefault(key, set()).add(path)
@@ -489,14 +517,17 @@ class ShmKVTransferEngine(KVTransferEngine):
                 f"local layout {self._kv_cache.layout}"
             )
 
-        packed = torch.load(
-            remote_kv_info.path,
-            map_location="cpu",
-            weights_only=True,
-        )
-        packed_page = {
-            remote_page: idx
-            for idx, remote_page in enumerate(remote_kv_info.page_indices)
+        page_size = self._kv_cache.page_size
+        chunks = remote_kv_info.chunks
+        if chunks is None:
+            chunks = (ShmKVSnapshotChunk(
+                path=remote_kv_info.path,
+                start_len=0,
+                end_len=len(remote_kv_info.page_indices) * page_size,
+                page_indices=remote_kv_info.page_indices,
+            ),)
+        page_positions = {
+            page: idx for idx, page in enumerate(remote_kv_info.page_indices)
         }
         page_copies = {
             (
@@ -508,20 +539,41 @@ class ShmKVTransferEngine(KVTransferEngine):
             )
             for info in read_info
         }
-        for layer, remote_page, local_page, token_start, token_end in page_copies:
-            source = packed[
-                layer,
-                packed_page[remote_page],
-                :,
-                token_start:token_end,
-            ].to(self._kv_cache.device)
-            destination = self._kv_cache.chunk_view(
-                layer_idx=layer,
-                page_idx=local_page,
-                token_start=token_start,
-                token_end=token_end,
+        for chunk in chunks:
+            chunk_copies = []
+            chunk_page_positions = {
+                page: idx for idx, page in enumerate(chunk.page_indices)
+            }
+            for layer, remote_page, local_page, token_start, token_end in page_copies:
+                page_start = page_positions[remote_page] * page_size
+                overlap_start = max(page_start + token_start, chunk.start_len)
+                overlap_end = min(page_start + token_end, chunk.end_len)
+                if overlap_start < overlap_end:
+                    chunk_copies.append((
+                        layer,
+                        chunk_page_positions[remote_page],
+                        local_page,
+                        overlap_start - page_start,
+                        overlap_end - page_start,
+                    ))
+            if not chunk_copies:
+                continue
+            packed = torch.load(
+                chunk.path,
+                map_location="cpu",
+                weights_only=True,
             )
-            destination.copy_(source)
+            for layer, packed_page, local_page, token_start, token_end in chunk_copies:
+                source = packed[
+                    layer, packed_page, :, token_start:token_end,
+                ].to(self._kv_cache.device)
+                destination = self._kv_cache.chunk_view(
+                    layer_idx=layer,
+                    page_idx=local_page,
+                    token_start=token_start,
+                    token_end=token_end,
+                )
+                destination.copy_(source)
         if self._kv_cache.device.type != "cpu":
             torch.accelerator.synchronize(self._kv_cache.device)
         return None

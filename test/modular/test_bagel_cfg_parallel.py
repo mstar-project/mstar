@@ -274,6 +274,63 @@ def test_shm_earlier_descriptor_keeps_its_snapshot_after_republish(tmp_path):
     assert not Path(later.path).exists()
 
 
+def test_shm_repeated_prefill_stores_only_changed_tail_pages(tmp_path):
+    source = torch.zeros((1, 3, 2, 4, 1, 1), dtype=torch.float32)
+    producer_cache = _kv_cache(source)
+    consumer_cache = _kv_cache(source)
+    producer = ShmKVTransferEngine(
+        producer_cache, "producer", str(tmp_path),
+    )
+    consumer = ShmKVTransferEngine(
+        consumer_cache, "consumer", str(tmp_path),
+    )
+
+    publications = []
+    for token in range(1, 13):
+        page, offset = divmod(token - 1, 4)
+        producer_cache.tensor[:, page, :, offset].fill_(token)
+        publications.append(producer.get_kv_transfer_info(
+            request_id="request",
+            label="main",
+            page_indices=list(range(page + 1)),
+            seq_len=token,
+            reset_generation=0,
+        ))
+
+    latest = publications[-1]
+    assert len(latest.chunks) == 12
+    assert all(len(chunk.page_indices) == 1 for chunk in latest.chunks)
+    assert sum(
+        torch.load(chunk.path, weights_only=True).shape[1]
+        for chunk in latest.chunks
+    ) == 12
+    assert consumer.read_batched_async(
+        latest, [KVReadInfo(0, page, page, 0, 4) for page in range(3)],
+    ) is None
+    torch.testing.assert_close(
+        consumer_cache.tensor[:, :3],
+        producer_cache.tensor[:, :3],
+    )
+
+    consumer_cache.tensor.zero_()
+    assert consumer.read_batched_async(
+        publications[5],
+        [KVReadInfo(0, 0, 0, 0, 4), KVReadInfo(0, 1, 1, 0, 2)],
+    ) is None
+    torch.testing.assert_close(
+        consumer_cache.tensor[:, 0],
+        producer_cache.tensor[:, 0],
+    )
+    torch.testing.assert_close(
+        consumer_cache.tensor[:, 1, :, :2],
+        producer_cache.tensor[:, 1, :, :2],
+    )
+    assert torch.count_nonzero(consumer_cache.tensor[:, 1, :, 2:]) == 0
+
+    producer.remove_request("request")
+    assert all(not Path(chunk.path).exists() for chunk in latest.chunks)
+
+
 def test_shm_publications_are_namespaced_by_resource(tmp_path):
     source = torch.zeros((1, 1, 2, 4, 1, 1), dtype=torch.float32)
     source_cache = _kv_cache(source)
