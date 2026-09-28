@@ -133,7 +133,7 @@ class WhisperDetokenizer(ByteLevelDetokenizer):
 class WhisperModel(Model):
     """Whisper ASR: native batched encoder + native AR decoder."""
 
-    # Concurrency the default cache sizing targets; a deployment retunes the
+    # Concurrency the default cache sizing targets. A deployment retunes the
     # page counts under ``resources:`` in its YAML.
     MAX_CONCURRENT_REQUESTS = 64
 
@@ -183,7 +183,7 @@ class WhisperModel(Model):
         """
         page_size = 128
         concurrency = self.MAX_CONCURRENT_REQUESTS
-        # Sequences cap at max_target_positions (448) = 4 pages per request;
+        # Sequences cap at max_target_positions (448) = 4 pages per request, and
         # the decode captures' padding rows hold one page each on first use.
         kv_config = KVConfig(
             num_layers=self.config.decoder_layers,
@@ -260,7 +260,7 @@ class WhisperModel(Model):
 
     def get_max_output_tokens(self, **model_kwargs):
         # The learned position table caps prompt + generated tokens at
-        # max_target_positions (448); the shortest forced prompt takes 4.
+        # max_target_positions (448), the shortest forced prompt takes 4.
         # A longer prompt (``<|startofprev|>`` context) is accounted per
         # request in the decoder's ``check_stop``.
         limit = self.config.max_target_positions - 4
@@ -362,8 +362,8 @@ class WhisperModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
     ) -> ForwardPassArgs:
-        # ``process_prompt`` emits ``prompt_tail`` exactly when the language
-        # is to be detected; it is held back for the second prefill walk.
+        # ``process_prompt`` emits ``prompt_tail`` only when the language
+        # is to be detected. It is held back for the second prefill walk.
         prompt_tail = input_signals.get("prompt_tail", [])
         detect = bool(prompt_tail)
         full_metadata = CurrentForwardConductorMetadata(
@@ -406,7 +406,7 @@ class WhisperModel(Model):
 
         if metadata.is_prefill:
             if metadata.graph_walk == DETECT_LANGUAGE_WALK:
-                # the sampled language token leads the rest of the prompt;
+                # the sampled language token leads the rest of the prompt, and
                 # the detection step's rule state is inactive by construction
                 # and is dropped, the prompt step builds the real one
                 metadata.graph_walk = PREFILL_PROMPT_WALK
@@ -423,7 +423,7 @@ class WhisperModel(Model):
             metadata.is_prefill = False
             metadata.graph_walk = DECODE_WALK
         elif metadata.graph_walk == DECODE_WALK and word_timestamps:
-            # The loop is done; align the transcript (every generated token
+            # The loop is done. Align the transcript (every generated token
             # is still persisted) against the persisted encoder output.
             metadata.graph_walk = ALIGN_WALK
             inputs = [
@@ -498,7 +498,7 @@ class WhisperModel(Model):
         raw_audio_inputs = (tensors or {}).get("audio_inputs", [])
         if len(raw_audio_inputs) != 1:
             raise ValueError(
-                f"Whisper expects exactly one audio input per request; "
+                f"Whisper expects one audio input per request, "
                 f"got {len(raw_audio_inputs)}."
             )
         waveform = raw_audio_inputs[0].reshape(-1).to(torch.float32).cpu()
@@ -507,7 +507,7 @@ class WhisperModel(Model):
 
         # One fixed 30 s window: audio beyond it is dropped (long-form
         # chunking is the transcription route's job). The samples go to the
-        # encoder as they are; the log-mel is its first step on the GPU. (On
+        # encoder as they are. The log-mel is its first step on the GPU. (On
         # the data worker's CPU threads the spectrogram was the serving
         # bottleneck: torch's intra-op pool spun a whole core per thread.)
         window = waveform[: self.config.n_samples].contiguous()
@@ -523,7 +523,7 @@ class WhisperModel(Model):
         out: NameToTensorList = {
             "audio": [window],
             "text_inputs": [torch.tensor(prompt_ids, dtype=torch.long)],
-            # mel frames that carry audio; word timestamps align within them
+            # mel frames that carry audio, word timestamps align within them
             "audio_frames": [torch.tensor([self.log_mel.num_frames(window.numel())], dtype=torch.long)],
         }
         if language is None:
