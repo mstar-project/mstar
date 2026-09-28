@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 27, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 28, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -865,8 +865,10 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPException</span>
+
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">SSE_DONE</span><span class="p">,</span> <span class="n">now</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">sse</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">SSE_DONE</span><span class="p">,</span> <span class="n">error_type</span><span class="p">,</span> <span class="n">now</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">sse</span>
 
 
 <div class="viewcode-block" id="create_chat_completion">
@@ -947,16 +949,38 @@ window.runMermaid = runMermaid;</script>
             <span class="s2">"choices"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"index"</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">"delta"</span><span class="p">:</span> <span class="n">delta</span><span class="p">,</span> <span class="s2">"finish_reason"</span><span class="p">:</span> <span class="n">finish</span><span class="p">}],</span>
         <span class="p">})</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">error</span><span class="p">(</span><span class="n">message</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">status</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">sse</span><span class="p">({</span><span class="s2">"error"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"message"</span><span class="p">:</span> <span class="n">message</span><span class="p">,</span> <span class="s2">"type"</span><span class="p">:</span> <span class="n">error_type</span><span class="p">(</span><span class="n">status</span><span class="p">),</span> <span class="s2">"code"</span><span class="p">:</span> <span class="n">status</span><span class="p">}})</span>
+
     <span class="k">yield</span> <span class="n">chunk</span><span class="p">({</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"assistant"</span><span class="p">})</span>
-    <span class="k">async</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">request_id</span><span class="p">):</span>
-        <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"text"</span><span class="p">:</span>
-            <span class="k">yield</span> <span class="n">chunk</span><span class="p">({</span><span class="s2">"content"</span><span class="p">:</span> <span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">,</span> <span class="s2">"replace"</span><span class="p">)})</span>
-        <span class="k">elif</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span><span class="p">:</span>
-            <span class="c1"># Streaming audio deltas are base64 16-bit PCM at the model rate.</span>
-            <span class="k">yield</span> <span class="n">chunk</span><span class="p">({</span><span class="s2">"audio"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"id"</span><span class="p">:</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">)}})</span>
-        <span class="k">elif</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"image"</span><span class="p">:</span>
-            <span class="k">yield</span> <span class="n">chunk</span><span class="p">({</span><span class="s2">"content"</span><span class="p">:</span> <span class="n">media_io</span><span class="o">.</span><span class="n">png_to_data_url</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)})</span>
-    <span class="k">yield</span> <span class="n">chunk</span><span class="p">({},</span> <span class="n">finish</span><span class="o">=</span><span class="s2">"stop"</span><span class="p">)</span>
+    <span class="n">failed</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">async</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">request_id</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"text"</span><span class="p">:</span>
+                <span class="k">yield</span> <span class="n">chunk</span><span class="p">({</span><span class="s2">"content"</span><span class="p">:</span> <span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">,</span> <span class="s2">"replace"</span><span class="p">)})</span>
+            <span class="k">elif</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span><span class="p">:</span>
+                <span class="c1"># Streaming audio deltas are base64 16-bit PCM at the model rate.</span>
+                <span class="k">yield</span> <span class="n">chunk</span><span class="p">({</span><span class="s2">"audio"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"id"</span><span class="p">:</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">)}})</span>
+            <span class="k">elif</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"image"</span><span class="p">:</span>
+                <span class="k">yield</span> <span class="n">chunk</span><span class="p">({</span><span class="s2">"content"</span><span class="p">:</span> <span class="n">media_io</span><span class="o">.</span><span class="n">png_to_data_url</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">)})</span>
+            <span class="k">elif</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"error"</span><span class="p">:</span>
+                <span class="c1"># The request failed after the stream opened (an engine error</span>
+                <span class="c1"># mid generation, a preprocess error); the HTTP status is</span>
+                <span class="c1"># committed, so the failure travels in-band the way the</span>
+                <span class="c1"># non-streaming path's error body does, not as a normal</span>
+                <span class="c1"># ``stop`` a client would take for a complete answer. The error</span>
+                <span class="c1"># is the iterator's last chunk, so the loop ends on its own;</span>
+                <span class="c1"># returning here instead would trip the iterator's abort on a</span>
+                <span class="c1"># request that is already gone.</span>
+                <span class="n">failed</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="k">yield</span> <span class="n">error</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">,</span> <span class="s2">"replace"</span><span class="p">),</span> <span class="nb">int</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">metadata</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"status"</span><span class="p">,</span> <span class="mi">500</span><span class="p">)))</span>
+    <span class="k">except</span> <span class="n">HTTPException</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+        <span class="c1"># The delivery timeout raises out of the iterator (which aborts the</span>
+        <span class="c1"># request on its way out); report it the same way.</span>
+        <span class="n">failed</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">yield</span> <span class="n">error</span><span class="p">(</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="o">.</span><span class="n">detail</span><span class="p">),</span> <span class="n">exc</span><span class="o">.</span><span class="n">status_code</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">failed</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">chunk</span><span class="p">({},</span> <span class="n">finish</span><span class="o">=</span><span class="s2">"stop"</span><span class="p">)</span>
     <span class="k">yield</span> <span class="n">SSE_DONE</span>
 </pre></div>
 
@@ -1005,7 +1029,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 27, 2026.
+  Last updated on Sep 28, 2026.
   <br/>
 </p>
   </div>
