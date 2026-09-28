@@ -876,6 +876,35 @@ window.runMermaid = runMermaid;</script>
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 
+<span class="c1"># The head dims FlashInfer instantiates its paged prefill/decode kernels (and</span>
+<span class="c1"># the split-KV merge, DISPATCH_HEAD_DIM) for. Other sizes raise inside</span>
+<span class="c1"># FlashInfer (32, 48), crash with an illegal memory access (80, 96, 112) or --</span>
+<span class="c1"># worst -- run and return wrong values: head_dim 72 gives max |diff| 2.25</span>
+<span class="c1"># against a torch reference where 128 gives 0.004 (FlashInfer 0.6.18, H100,</span>
+<span class="c1"># 2026-09-20; 192 computes exactly but has no merge kernel). Refuse them up front.</span>
+<span class="n">FLASHINFER_HEAD_DIMS</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">})</span>
+
+
+<div class="viewcode-block" id="check_flashinfer_head_dim">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.check_flashinfer_head_dim">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">check_flashinfer_head_dim</span><span class="p">(</span><span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Raise unless FlashInfer's paged attention computes ``head_dim`` exactly.</span>
+<span class="sd">    Only CUDA runs FlashInfer, so a non-CUDA ``device`` (CPU tests driving the</span>
+<span class="sd">    wrappers with a stand-in module and toy head dims) is not checked."""</span>
+    <span class="k">if</span> <span class="n">device</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">device</span><span class="o">.</span><span class="n">type</span> <span class="o">!=</span> <span class="s2">"cuda"</span><span class="p">:</span>
+        <span class="k">return</span>
+    <span class="k">if</span> <span class="n">head_dim</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">FLASHINFER_HEAD_DIMS</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"FlashInfer paged attention: head_dim </span><span class="si">{</span><span class="n">head_dim</span><span class="si">}</span><span class="s2"> is not one of "</span>
+            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">FLASHINFER_HEAD_DIMS</span><span class="p">)</span><span class="si">}</span><span class="s2">. FlashInfer builds its paged prefill/decode and "</span>
+            <span class="s2">"split-KV merge kernels for these sizes only; other head dims fail inside FlashInfer "</span>
+            <span class="s2">"or run and return wrong values (72 does). Zero-pad the model's q/k/v to the next "</span>
+            <span class="s2">"supported size (exact: the padded dims add nothing to the scores, the padded output "</span>
+            <span class="s2">"dims are zeros to drop) and declare that size as the KV cache's head_dim."</span>
+        <span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="FlashInferPrefillWrapper">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.wrappers.html#mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">FlashInferPrefillWrapper</span><span class="p">:</span>
@@ -912,6 +941,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">enable_nvtx</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span><span class="p">,</span>
     <span class="p">):</span>
+        <span class="n">check_flashinfer_head_dim</span><span class="p">(</span><span class="n">head_dim</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">device</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span> <span class="o">=</span> <span class="n">use_cuda_graph</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">enable_nvtx</span> <span class="o">=</span> <span class="n">enable_nvtx</span>
@@ -1073,6 +1103,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">enable_nvtx</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
         <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"auto"</span><span class="p">,</span>
     <span class="p">):</span>
+        <span class="n">check_flashinfer_head_dim</span><span class="p">(</span><span class="n">head_dim</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">device</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">use_cuda_graph</span> <span class="o">=</span> <span class="n">use_cuda_graph</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">enable_nvtx</span> <span class="o">=</span> <span class="n">enable_nvtx</span>

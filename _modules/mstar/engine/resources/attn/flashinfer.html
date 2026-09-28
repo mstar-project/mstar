@@ -867,6 +867,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.wrappers</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">FlashInferDecodeWrapper</span><span class="p">,</span>
     <span class="n">FlashInferPrefillWrapper</span><span class="p">,</span>
+    <span class="n">check_flashinfer_head_dim</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">CGSlotKey</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVConfig</span>
@@ -901,6 +902,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_kv_config</span> <span class="o">=</span> <span class="n">kv_config</span>
+        <span class="n">check_flashinfer_head_dim</span><span class="p">(</span><span class="n">kv_config</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span> <span class="n">device</span><span class="p">)</span>     <span class="c1"># at load, not at the first plan</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_wrapper_kv_kwargs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
             <span class="n">num_qo_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_qo_heads</span><span class="p">,</span>
             <span class="n">num_kv_heads</span><span class="o">=</span><span class="n">kv_config</span><span class="o">.</span><span class="n">num_kv_heads</span><span class="p">,</span>
