@@ -385,8 +385,16 @@ class StepRunner:
         """admit over the pre-planning subset, a step ahead
 
         the later full `admit` covers the rest; these resources see their own
-        state as already reserved and no-op"""
+        state as already reserved and no-op
+
+        Unwound on refusal exactly as ``admit`` is, and for the same reason: the
+        pre-planned step never runs, so nothing commits and nothing else gives
+        the reservation back. ``clear_preplan`` is the other half of the recovery
+        here, but it only releases labels the pre-plan created — pages appended
+        to a stream that already existed are this method's to return.
+        """
         ready = True
+        admitted: list[str] = []
         for key in self._preplan_keys_for(step):
             if self._nvtx:
                 range_push(f"res.pre_admit.{key}")
@@ -400,7 +408,12 @@ class StepRunner:
                     "Admit for pre-planning resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
+                for done in reversed([*admitted, key]):
+                    self._resources[done].rollback_admit(
+                        step.get(done), step.ctx,
+                    )
                 return FullAdmitOutcome(outcome, key)
+            admitted.append(key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 

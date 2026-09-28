@@ -1097,6 +1097,17 @@ class Worker:
         ]
 
         if not candidates:
+            # Nothing holds pages of the resource that ran out. Eviction is the
+            # wrong tool here — the working set does not fit — and saying so
+            # separates it from the host pool being full, which looks identical
+            # from the caller and wants the opposite response.
+            logger.warning(
+                "No eviction candidate on %s for %s: nothing holds reclaimable "
+                "pages of it. The working set does not fit; eviction cannot "
+                "help.", node_name,
+                "any resource" if affected_resources is None
+                else ", ".join(sorted(affected_resources)),
+            )
             return None
 
         # prefer evicting requests that aren't currently executing
@@ -1104,6 +1115,15 @@ class Worker:
         victim_id = self._select_eviction_victim(node_name, external or candidates)
         freed = engine.offload_request(node_name, victim_id)
         if freed <= 0:
+            # A victim was found and would not move. The usual cause is the host
+            # pool being full (see ``CPUPagePool.offload_stream``) — different
+            # from having no candidate, and fixed by a larger
+            # ``cpu_offload_pages`` rather than by scheduling less.
+            logger.warning(
+                "Eviction victim %s on %s freed nothing — the host pool is "
+                "most likely full. Raise cpu_offload_pages for the resource "
+                "that ran out.", victim_id, node_name,
+            )
             return None
         logger.info(
             "Offloaded request %s from %s (%d reclaimed, policy=%s, in_batch=%s)",
@@ -1669,7 +1689,19 @@ class Worker:
                 len(batch_ids) - (1 if victim_id in batch_ids else 0),
             )
         else:
-            self.scheduler.hold_requests(list(batch_ids))
+            # Nothing could be evicted, so the batch has to get smaller or it
+            # will refuse identically for ever. Hold the one request the admit
+            # named, not the whole batch: shedding it leaves the rest to try
+            # again a request shorter, and repeated refusals shed one more each
+            # time until what is left fits. Holding all of them just reassembles
+            # the same batch after the backoff — which is the 250-holds-a-second
+            # spin this replaced.
+            #
+            # Symmetric across a TP instance without coordinating: both ranks
+            # refuse the same batch for the same request, so both shed that one.
+            blamed = getattr(node_batch.admit_error, "request_id", None)
+            shed = [blamed] if blamed in batch_ids else list(batch_ids)
+            self.scheduler.hold_requests(shed)
             key = (batch.node_name, batch.graph_walk)
             now = _time.monotonic()
             last, unlogged = self._hold_logged.get(key, (None, 0))
@@ -1678,9 +1710,11 @@ class Worker:
                 return
             self._hold_logged[key] = (now, 0)
             logger.warning(
-                "OOM on node=%s walk=%s: no offload possible, "
-                "holding %d requests (%d earlier holds not logged)",
-                batch.node_name, batch.graph_walk, len(batch_ids), unlogged,
+                "OOM on node=%s walk=%s: no offload possible, holding %s of %d "
+                "requests so the retry is smaller (%d earlier holds not logged)",
+                batch.node_name, batch.graph_walk,
+                blamed if len(shed) == 1 else f"all {len(shed)}",
+                len(batch_ids), unlogged,
             )
 
     # ------------------------------------------------------------------
@@ -1744,7 +1778,8 @@ class Worker:
             "Worker %s not progressing: phase=%s for %.1fs, last step %.1fs ago"
             " (%s); in-flight=%d rids, backlog=%d chunks/%d rids, "
             "tp-follow queue=%d (head seq %s), resident delta owed=%d, "
-            "held=%d, failed=%d, pending removes=%d",
+            "held=%d, failed=%d, pending removes=%d, "
+            "teardowns waiting on a step=%d (for seqs %s, consumed %d)",
             self.worker_id, self._loop_phase, phase_age, step_age,
             "parked" if phase_age >= period else "spinning, nothing completing",
             len(self._in_flight_rids),
@@ -1756,6 +1791,9 @@ class Worker:
             len(self.scheduler.held_until),
             len(self.scheduler.failed_rids),
             len(self._pending_removes),
+            sum(len(r) for r in self._removes_awaiting_step.values()),
+            sorted(self._removes_awaiting_step) or "none",
+            self.scheduler.last_consumed_tp_seq,
         )
         return True
 

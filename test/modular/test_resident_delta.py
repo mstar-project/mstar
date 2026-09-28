@@ -700,12 +700,14 @@ class _WatchRank:
             peek_tp_follow=lambda: SimpleNamespace(spec_seq=41),
             tp_batches_pending_schedule=[object()],
             _pending_resident_deltas={"node": owed},
+            last_consumed_tp_seq=8702,
             held_until={"r1": 0.0},
             failed_rids=set(),
         )
         self._loop_phase = "starting"
         self._loop_phase_at = 0.0
         self._last_step_at = 0.0
+        self._removes_awaiting_step = {8703: ["gone"]}
 
 
 def _at(monkeypatch, now: float) -> None:
@@ -730,6 +732,10 @@ def test_a_parked_rank_names_its_phase_and_what_it_is_owed(monkeypatch, caplog):
     assert "head seq 41" in line, "the follow queue has to be in the line"
     assert "resident delta owed=1" in line, (
         "a delta this rank has not managed to replay is the thing to see first"
+    )
+    assert "teardowns waiting on a step=1 (for seqs [8703], consumed" in line, (
+        "a teardown held for a step this rank has not reached keeps that "
+        "request's pages, and it lives in neither `pending removes` nor `held`"
     )
     assert "backlog=1 chunks/1 rids" in line, (
         "a backlogged rid is off the ready queue, so nothing else reveals it"

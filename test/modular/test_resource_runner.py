@@ -41,7 +41,9 @@ class _Stub(Resource):
         admit_outcome: AdmitOutcome | None = None,
         published=None,
         retrieve_outcome: AdmitOutcome | None = None,
+        preplans: bool = False,
     ):
+        self._preplans = preplans
         self.name = name
         self._deps = set(deps)
         self._plan_value = plan_value if plan_value is not None else f"{name}-plan"
@@ -55,6 +57,10 @@ class _Stub(Resource):
     @classmethod
     def build(cls, spec, device, comm_group, **engine_kwargs):
         raise NotImplementedError("stub is constructed directly")
+
+    @property
+    def supports_preplan(self):
+        return self._preplans
 
     def depends_on(self) -> set[str]:
         return set(self._deps)
@@ -526,3 +532,24 @@ def test_reassigning_the_same_rids_keeps_the_padded_list():
     batch.request_ids = ["a", "b"]
 
     assert ctx.padded_request_ids == padded
+
+
+def test_a_refused_pre_admit_gives_back_what_it_reserved():
+    """Same reason as ``admit``: the pre-planned step never runs, so nothing
+    commits and nothing else returns the reservation. ``clear_preplan`` covers
+    only the labels the pre-plan created, not pages appended to streams that were
+    already there — and this matters more once speculation is on, since that is
+    the path that pre-plans."""
+    reason = AllocationFailed(
+        message="Not enough free pages", pages_short=3, label="main", request_id="r1",
+    )
+    # only pre-planning resources are in the pre-admit sweep
+    kv = _Stub("kv", preplans=True)
+    attn = _Stub("attn", deps=("kv",), preplans=True,
+                 admit_outcome=AdmitOutcome(ok=False, reason=reason))
+    runner = StepRunner({"attn": attn, "kv": kv})
+
+    assert runner.pre_admit(_step(["kv", "attn"])).ok is False
+
+    assert kv.calls.count("rollback") == 1
+    assert attn.calls.count("rollback") == 1, "the refusing resource too"
