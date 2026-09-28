@@ -74,7 +74,7 @@ class Qwen3ASREncoderSubmodule(NodeSubmodule):
     # per-request Python around the tensor work and guards on request ids
     # and batch composition, so batches kept recompiling (1-2 s stalls each,
     # measured on Whisper's decoder). The encoder's kernels are the ragged
-    # attention and cuBLAS GEMMs; there is nothing for inductor to fuse.
+    # attention and cuBLAS GEMMs, there is nothing for inductor to fuse.
     disable_torch_compile = True
 
     def __init__(self, encoder: AuTEncoder, config: Qwen3ASRModelConfig):
@@ -208,7 +208,7 @@ class Qwen3ASRLLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
-    # Prefill and decode are graph replays; the compiled path only served the
+    # Prefill and decode are graph replays. The compiled path only served the
     # uncaptured shapes and recompiled per request id (see the encoder).
     disable_torch_compile = True
 
