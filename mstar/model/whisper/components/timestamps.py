@@ -90,7 +90,7 @@ class TimestampRules:
         phase = state[:, 1:2]
         last_ts = state[:, 2:3]
         ceil = state[:, 3:4]
-        # the pair may repeat the segment end; otherwise never emit an
+        # the pair may repeat the segment end. Otherwise never emit an
         # earlier (or the same) timestamp again
         floor = torch.where(phase == AFTER_SEGMENT_END, last_ts, last_ts + 1)
 
