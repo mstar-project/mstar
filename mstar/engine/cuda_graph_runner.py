@@ -1046,12 +1046,6 @@ class PiecewiseCudaGraphRunner:
         )
 
         self._graphs: dict[PiecewiseGraphKey, PiecewiseGraphData] = {}
-        # The graph memory pool every bucket of this region captures into. A
-        # node's regions never replay concurrently and their outputs are
-        # cloned before the next replay, so the engine hands all of them one
-        # pool: a region's intermediates then reuse another's instead of each
-        # region keeping its own peak resident (nineteen regions of a 82M TTS
-        # model filled an 80 GB card). None: allocate a private pool at capture.
         self._memory_pool = memory_pool
         # (bs, total_tokens) shapes that failed to capture and run eagerly
         self.dropped_shapes: list[tuple[int, int]] = []
