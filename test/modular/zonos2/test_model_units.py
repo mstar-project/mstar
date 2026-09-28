@@ -490,3 +490,18 @@ def test_speaker_encoder_rejects_short_clip_with_clear_error():
     enc = object.__new__(Qwen3SpeakerEncoder)  # skip the HF model load
     with pytest.raises(ValueError, match="needs at least 385"):
         enc._make_mel(torch.zeros(1, 384))
+
+
+# -- prompt length vs the trained context -------------------------------------
+def test_prompt_that_leaves_no_room_to_speak_is_rejected():
+    model = _clone_model(max_position_embeddings=100)
+
+    def frames(n):
+        return model.process_prompt("a" * n, ["text"], ["audio"])["text_inputs"][0]
+
+    overhead = frames(1).shape[0] - 1
+    fits = 100 - (model.config.n_codebooks + 1) - overhead
+    assert frames(fits).shape[0] + model.config.n_codebooks + 1 == 100
+    with pytest.raises(ValueError, match=f"at most {fits} bytes fit") as exc:
+        frames(fits + 1)
+    assert "100-position context" in str(exc.value)

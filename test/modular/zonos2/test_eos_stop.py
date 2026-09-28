@@ -73,3 +73,30 @@ def test_countdown_generates_delay_flush():
     # frames so the delayed codebooks of the last real frame are emitted.
     stop = _first_stop_step(_sub(), {12: [0]})
     assert stop is not None and stop - 12 >= C - 1
+
+
+# -- context cap -------------------------------------------------------------
+def _capped_sub(max_positions, prompt_len):
+    sub = Zonos2LLMSubmodule(
+        model=nn.Identity(), n_codebooks=C, text_vocab=512, eoa_id=EOA,
+        params=TTSSamplingParams(max_tokens=100_000, ignore_eos=False),
+        max_positions=max_positions,
+    )
+    sub._prompt_lens["r"] = prompt_len
+    return sub
+
+
+def test_generation_stops_at_remaining_context():
+    # 30 prompt frames in a 50-position context leave room for 20 frames.
+    assert _first_stop_step(_capped_sub(50, 30), {}) == 19
+
+
+def test_eos_before_the_context_limit_still_wins():
+    sub = _capped_sub(1000, 30)
+    assert _first_stop_step(sub, {5: [0]}) == _first_stop_step(_sub(), {5: [0]})
+
+
+def test_no_cap_without_a_recorded_prompt():
+    sub = _capped_sub(50, 30)
+    sub._prompt_lens.clear()
+    assert _first_stop_step(sub, {}) is None

@@ -461,3 +461,23 @@ def test_new_request_ids_do_not_recompile():
         if batch == 0:
             first = counter.frame_count
     assert counter.frame_count == first
+
+
+def test_prefill_records_prompt_lengths_for_the_context_cap():
+    from mstar.model.submodule_base import ARNodeInputs
+
+    sub = _sub(_params())
+    lens = {"a": 7, "b": 12}
+    inputs = [
+        ARNodeInputs(input_ids=torch.zeros(n, C + 1, dtype=torch.long), input_seq_len=n)
+        for n in lens.values()
+    ]
+    sub.preprocess("prefill", _engine_inputs(list(lens)), inputs)
+    assert sub._prompt_lens == lens
+    sub.preprocess("decode", _engine_inputs(list(lens)), [
+        ARNodeInputs(input_ids=torch.zeros(1, C + 1, dtype=torch.long), input_seq_len=1)
+        for _ in lens
+    ])
+    assert sub._prompt_lens == lens  # decode steps do not overwrite it
+    sub.cleanup_request("a")
+    assert sub._prompt_lens == {"b": 12}

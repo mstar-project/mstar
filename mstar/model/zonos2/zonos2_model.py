@@ -463,11 +463,29 @@ class Zonos2Model(Model):
                 quality_values=kwargs.get("quality_values"),
             ),
         )  # (num_frames, n_codebooks + 1)
+        self._check_prompt_fits(prompt, frames.shape[0])
 
         out: NameToTensorList = {"text_inputs": [frames]}
         if speaker_embedding is not None:
             out["speaker_embedding"] = [speaker_embedding]
         return out
+
+    def _check_prompt_fits(self, text: str, num_frames: int) -> None:
+        """Reject a prompt that leaves no room in the trained context for audio.
+
+        The DAC drops the last ``n_codebooks - 1`` frames, so fewer than
+        ``n_codebooks + 1`` generated frames give empty audio.
+        """
+        limit = self.config.max_position_embeddings
+        budget = limit - (self.config.n_codebooks + 1)
+        if num_frames > budget:
+            n_bytes = len(text.encode("utf-8"))
+            raise ValueError(
+                f"Text is {n_bytes} bytes ({num_frames} prompt frames); at most "
+                f"{max(n_bytes - (num_frames - budget), 0)} bytes fit in the model's "
+                f"{limit}-position context with room to speak. Split long text "
+                "into shorter requests."
+            )
 
     def _validate_reference_clip(self, clip: torch.Tensor) -> None:
         """Reject a clip the speaker encoder cannot embed, or one that is too long.
@@ -578,6 +596,7 @@ class Zonos2Model(Model):
             text_vocab=self.config.text_vocab,
             eoa_id=self.config.eoa_id,
             params=self.sampling_params,
+            max_positions=self.config.max_position_embeddings,
         )
 
     def _create_dac_submodule(self, device):

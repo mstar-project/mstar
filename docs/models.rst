@@ -258,5 +258,9 @@ Zonos2 environment requirements
   and at most 30 s (``speaker_clip_max_seconds`` in the serving YAML); others get a 400.
   A client that caches the returned embedding can pass it back as the
   ``speaker_embedding`` model kwarg to skip the encoder.
+- **Text length.** The model's context is 6144 frames: one per UTF-8 byte of text, plus the
+  generated audio (~86 frames/s). Generation stops when the context is full: ~70 s of
+  speech after a short prompt, less after a long one. Text too long to leave room for audio
+  gets a 400. Split long text into sentences or paragraphs.
 - **Single GPU only.** Tensor parallelism is disabled until expert parallelism lands; a
   config with ``tp_size > 1`` is rejected at load.

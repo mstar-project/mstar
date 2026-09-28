@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any
 
@@ -46,6 +47,8 @@ from mstar.model.zonos2.sampler_buffers import Zonos2SamplerBuffers
 from mstar.model.zonos2.tts_sampling import TTSSamplingParams, sample_frame
 from mstar.model.zonos2.vocoder import StreamingDacDecoder
 
+logger = logging.getLogger(__name__)
+
 
 class Zonos2LLMSubmodule(ARNodeSubmodule):
     """Autoregressive multi-codebook LLM wrapper.
@@ -66,6 +69,7 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         text_vocab: int,
         eoa_id: int,
         params: TTSSamplingParams,
+        max_positions: int | None = None,
     ):
         super().__init__()
         self.model = model
@@ -73,6 +77,10 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         self.text_vocab = text_vocab
         self.eoa_id = eoa_id
         self.params = params
+        # The trained context; prompt plus generated frames must fit in it.
+        # None disables the cap.
+        self.max_positions = max_positions
+        self._prompt_lens: dict[str, int] = {}
 
         # The state of each request. The repetition history and the RNG step
         # live in slot-indexed static buffers, which are graph-safe.
@@ -202,6 +210,10 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         # and ``forward_batched`` reads. ``padded_bs`` agrees with the logits
         # batch, which the capture can pad.
         self._prepare_sampler_step(engine_inputs, padded_bs=len(inputs))
+        if graph_walk != "decode":
+            # Prefill: remember each prompt's length for the context cap.
+            for rid, n in zip(engine_inputs.request_ids, seq_lens, strict=True):
+                self._prompt_lens[rid] = n
         speaker_values, speaker_positions = self._collect_speaker_inputs(inputs, seq_lens)
         return {
             "input_ids": input_ids,
@@ -429,12 +441,24 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
         max_tokens = getattr(request_info, "max_tokens", None) or self.params.max_tokens
         if request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1 >= max_tokens:
             finished = True
+        # Cap generation at the remaining trained context, as the reference does.
+        prompt_len = self._prompt_lens.get(request_id)
+        if (
+            not finished and self.max_positions is not None and prompt_len is not None
+            and prompt_len + st["step"] + 1 >= self.max_positions
+        ):
+            logger.info(
+                "Zonos2: %s reached the %d-position context (prompt %d frames); stopping",
+                request_id, self.max_positions, prompt_len,
+            )
+            finished = True
         return {"decode_loop"} if finished else set()
 
     def cleanup_request(self, request_id: str):
         if self._sampler_buffers is not None:
             self._sampler_buffers.unregister_request(request_id)
         self._eos.pop(request_id, None)
+        self._prompt_lens.pop(request_id, None)
 
 
 class Zonos2DACSubmodule(NodeSubmodule):
