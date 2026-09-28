@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from mstar.communication.tensors import TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -473,7 +472,6 @@ class GraphRuntime(ABC):
     @abstractmethod
     def complete_and_route_batch(
         self, input: RouteInput,
-        tensor_store: TensorStore
     ) -> RouteOutput:
         """
         (1) Mark node complete, do _cleanup_consumed_inputs

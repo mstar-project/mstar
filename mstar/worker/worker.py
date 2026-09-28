@@ -1180,17 +1180,20 @@ class Worker:
         Indices into this batch's columns, which also carry the rid and the
         signal, so the runtime hands over no strings for this.
 
-        The runtime already dropped repeat edges of a signal, so summing is
-        safe: one output routed to two destinations is two edges carrying the
-        same tensors, and counting both would double every token.
+        First edge of a signal wins, per rid. The runtime does NOT drop repeat
+        edges (``new_token_outputs`` is a bare filter), and one output routed
+        to two destinations is two edges carrying the same tensors, so summing
+        them would double every token.
         """
         counts: dict[int, dict[str, int]] = {}
         for idx in new_token_idxs:
             per_rid = counts.setdefault(flat_rids[idx], {})
             signal = signals[signal_idxs[idx]]
-            per_rid[signal] = per_rid.get(signal, 0) + (
-                self.tensor_manager.get_tensor(flat_uuids[idx]).numel()
-            )
+            if signal in per_rid:
+                continue
+            per_rid[signal] = self.tensor_manager.get_tensor(
+                flat_uuids[idx]
+            ).numel()
         return counts
 
     def _stream_consumption(self, rid: int) -> dict[str, int]:
@@ -2260,7 +2263,6 @@ class Worker:
                 tensors=flat_uuids,
                 num_tensors=num_tensors,
             ),
-            self.tensor_manager.tensor_store,
         )
 
         if self.enable_nvtx:

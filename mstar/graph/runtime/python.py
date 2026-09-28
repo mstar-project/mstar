@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 from mstar.api_server.request_types import APIServerMessage, ResultTensors
 from mstar.communication.communicator import BaseCommunicator
-from mstar.communication.tensors import TensorCommunicationManager, TensorStore
+from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import (
@@ -1138,7 +1138,7 @@ class PythonGraphRuntime(GraphRuntime):
         for name, stop_time in loop_stop_times.items():
             if name not in mine or stop_time.label_context_gt(mine[name], name):
                 newer.add(name)
-            mine[name] = stop_time
+                mine[name] = stop_time
         if newer:
             # No last_node_run and no fan-out: the originating rank already
             # took the snapshot and told everyone.
@@ -1168,7 +1168,6 @@ class PythonGraphRuntime(GraphRuntime):
 
     def complete_and_route_batch(
         self, input: RouteInput,
-        tensor_store: TensorStore
     ) -> RouteOutput:
         rids, wg_ids = input.wg_ids.keys, input.wg_ids.values
         n_signals = len(input.output_signals)
@@ -1204,7 +1203,7 @@ class PythonGraphRuntime(GraphRuntime):
                 uuids = per_signal.get(edge.name)
                 if not uuids:
                     continue
-                edge.tensor_info = [tensor_store.get_info(u) for u in uuids]
+                edge.tensor_info = [self._tensor_store.get_info(u) for u in uuids]
                 owned.update(uuids)
 
             completion = self._mark_node_complete(rid, wg_id, input.node_name)

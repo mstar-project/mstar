@@ -503,7 +503,9 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
         _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")]
         )
 
-    store, minter = TensorStore(), TensorUuidMinter("worker_0")
+    # The runtime resolves uuids through its own store now, so stage into
+    # that one rather than a second store nothing else can see.
+    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
     # Two signals with asymmetric counts: with one signal, or with matching
     # counts, a rid-major and a signal-major read give the SAME answer and the
     # test proves nothing.
@@ -531,7 +533,6 @@ def test_route_batch_decodes_the_flat_rid_major_layout():
             tensors=flat,
             num_tensors=num_tensors,
         ),
-        store,
     )
     completion = runtime._peek_completion(out.completion_id)
 
@@ -553,7 +554,9 @@ def test_route_batch_parks_routing_under_a_fresh_completion_id():
         nodes={"prefill", "ar_decode"}, loops={"ar_loop"},
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
-    store, minter = TensorStore(), TensorUuidMinter("worker_0")
+    # The runtime resolves uuids through its own store now, so stage into
+    # that one rather than a second store nothing else can see.
+    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
     uuids = _store_outputs(store, minter, rid, {"token": [torch.ones(2)]})["token"]
 
     out = runtime.complete_and_route_batch(
@@ -563,7 +566,6 @@ def test_route_batch_parks_routing_under_a_fresh_completion_id():
             wg_ids=ParallelList([rid], [0]),
             tensors=uuids, num_tensors=[1],
         ),
-        store,
     )
     assert out.completion_id not in (0,), "ids start above the unset sentinel"
     state = runtime._peek_completion(out.completion_id)
@@ -594,7 +596,6 @@ def _route_one(runtime, mgr, rid, store, minter, signal="token"):
             wg_ids=ParallelList([rid], [0]),
             tensors=uuids, num_tensors=[1],
         ),
-        store,
     )
     return out, uuids
 
@@ -618,7 +619,9 @@ def test_send_outputs_consumes_the_completion():
     )
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
     runtime._communicator = _RecordingCommunicator()
-    store, minter = TensorStore(), TensorUuidMinter("worker_0")
+    # The runtime resolves uuids through its own store now, so stage into
+    # that one rather than a second store nothing else can see.
+    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
 
     out, _ = _route_one(runtime, mgr, rid, store, minter)
     # Peeking must not consume.
@@ -642,7 +645,9 @@ def test_persist_signals_are_buffered_until_a_worker_graph_finishes():
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
     comm = _RecordingCommunicator()
     runtime._communicator = comm
-    store, minter = TensorStore(), TensorUuidMinter("worker_0")
+    # The runtime resolves uuids through its own store now, so stage into
+    # that one rather than a second store nothing else can see.
+    store, minter = runtime._tensor_store, TensorUuidMinter("worker_0")
 
     out, uuids = _route_one(runtime, mgr, rid, store, minter)
     runtime.send_outputs(_send_input(runtime, rid, out.completion_id, _fwd_info("decode")))
@@ -898,7 +903,6 @@ def _complete(tm, runtime, rid, node, outputs, signals):
             output_signals=signals, wg_ids=ParallelList([rid], [0]),
             tensors=stored.flat_uuids, num_tensors=stored.num_tensors,
         ),
-        tm.tensor_store,
     )
     return stored, out
 
