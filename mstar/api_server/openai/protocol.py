@@ -70,7 +70,7 @@ class TranscriptionRequest(BaseModel):
     model_config = _CFG
 
     model: str | None = None
-    # ISO-639-1 code (``"en"``); ``None`` lets a model that can detect the
+    # ISO-639-1 code (``"en"``). ``None`` lets a model that can detect the
     # language do so.
     language: str | None = None
     # Text the model conditions on before transcribing (Whisper's ``<|prev|>``
@@ -79,7 +79,7 @@ class TranscriptionRequest(BaseModel):
     # ``json`` | ``text`` | ``verbose_json`` | ``srt`` | ``vtt``
     response_format: str = "json"
     temperature: float | None = 0.0
-    # ``["segment"]`` and/or ``["word"]``; only read for ``verbose_json``.
+    # ``["segment"]`` and/or ``["word"]``, only read for ``verbose_json``.
     timestamp_granularities: list[str] | None = None
     stream: bool | None = False
     seed: int | None = None
