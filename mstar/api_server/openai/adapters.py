@@ -206,8 +206,8 @@ class OpenAIAdapter:
     supports_videos: bool = False   # POST /v1/videos/generations
     supports_realtime: bool = False  # /v1/realtime (bidirectional speech WebSocket)
     supports_transcriptions: bool = False  # POST /v1/audio/transcriptions
-    # Longest clip the model transcribes in one request; longer uploads are cut
-    # into windows of this length by the transcription route (None: unlimited).
+    # Longest clip the model transcribes in one request. Longer uploads are cut
+    # into windows of this length by the transcription route (None means unlimited).
     max_audio_seconds: float | None = None
     # How the windows of a long upload run: "sequential" feeds each window the
     # previous transcript as ``initial_prompt`` (openai-whisper's carry-over),
@@ -220,7 +220,7 @@ class OpenAIAdapter:
     # segments and ``unfinished``.
     seeks_by_timestamps: bool = False
     # Sequential long form: a window whose text compresses better than this
-    # (gzip bytes ratio) is a repetition loop; it is decoded again at rising
+    # (gzip bytes ratio) is a repetition loop and is decoded again at rising
     # temperatures (openai-whisper's fallback). None disables the check.
     compression_ratio_threshold: float | None = 2.4
     # Streaming transcription over /v1/realtime: the model must be able to
@@ -572,7 +572,7 @@ class Wan22Adapter(OpenAIAdapter):
 # Whisper-style control tokens: ``<|en|>`` (language), ``<|12.34|>`` (timestamp),
 # and the task/format markers. ASR models render the ones that carry
 # information (language, timestamps) into their text stream so the adapter can
-# lift them out here; everything else is dropped.
+# lift them out here. Everything else is dropped.
 _CONTROL_TOKEN = re.compile(r"<\|([^|<>]*)\|>")
 _TIMESTAMP = re.compile(r"^\d+\.\d{2}$")
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
@@ -618,14 +618,14 @@ class WhisperAdapter(OpenAIAdapter):
     """
 
     supports_transcriptions = True
-    # Whisper hears one 30 s window; the route cuts longer uploads into them,
+    # Whisper hears one 30 s window. The route cuts longer uploads into them,
     # each starting where the previous window's last segment closed.
     max_audio_seconds = 30.0
     seeks_by_timestamps = True
 
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
         return SubmitArgs(
-            # Whisper is conditioned by its forced token prompt, not free text;
+            # Whisper is conditioned by its forced token prompt, not free text, so
             # ``prompt`` reaches the model as the ``initial_prompt`` kwarg
             # (``<|startofprev|>`` context).
             text="",
@@ -717,7 +717,7 @@ class Qwen3ASRAdapter(OpenAIAdapter):
         return args
 
     def stream_delta(self, text: str) -> str:
-        # the language line and the tag are structure, not speech; they are
+        # the language line and the tag are structure, not speech. They are
         # short and arrive as whole tokens, so hide them token by token
         return "" if text.strip().startswith(("language", ASR_TEXT_TAG)) or ASR_TEXT_TAG in text else text
 
