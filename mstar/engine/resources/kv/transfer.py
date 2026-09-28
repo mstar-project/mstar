@@ -56,7 +56,7 @@ class KVTransferEngine(ABC):
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
-        generation: int | None = None,
+        reset_generation: int | None = None,
     ) -> Any:
         pass
 
@@ -84,7 +84,7 @@ class MooncakeKVTransferInfo:
     session_id: str
     data_ptr: int
     layout: KVLayout
-    generation: int | None = None
+    reset_generation: int | None = None
 
 
 class MooncakeKVTransferEngine(KVTransferEngine):
@@ -115,14 +115,14 @@ class MooncakeKVTransferEngine(KVTransferEngine):
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
-        generation: int | None = None,
+        reset_generation: int | None = None,
     ) -> MooncakeKVTransferInfo:
         return MooncakeKVTransferInfo(
             entity_id=self._transfer_info.entity_id,
             session_id=self._transfer_info.session_id,
             data_ptr=self._transfer_info.data_ptr,
             layout=self._transfer_info.layout,
-            generation=generation,
+            reset_generation=reset_generation,
         )
 
     def owns_transfer_info(
@@ -189,7 +189,7 @@ class CudaIpcKVTransferInfo:
     dtype: str
     requires_grad: bool
     layout: KVLayout
-    generation: int | None = None
+    reset_generation: int | None = None
 
 
 
@@ -230,7 +230,7 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
-        generation: int | None = None,
+        reset_generation: int | None = None,
     ) -> CudaIpcKVTransferInfo:
         return CudaIpcKVTransferInfo(
             cuda_share=self._transfer_info.cuda_share,
@@ -240,7 +240,7 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
             dtype=self._transfer_info.dtype,
             requires_grad=self._transfer_info.requires_grad,
             layout=self._transfer_info.layout,
-            generation=generation,
+            reset_generation=reset_generation,
         )
 
     def owns_transfer_info(
@@ -353,9 +353,9 @@ class LocalOnlyKVTransferEngine(KVTransferEngine):
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
-        generation: int | None = None,
+        reset_generation: int | None = None,
     ) -> None:
-        del request_id, label, page_indices, seq_len, generation
+        del request_id, label, page_indices, seq_len, reset_generation
 
     def shutdown(self):
         pass
@@ -366,7 +366,7 @@ class ShmKVTransferInfo:
     path: str
     page_indices: tuple[int, ...]
     layout: KVLayout
-    generation: int | None = None
+    reset_generation: int | None = None
 
 
 class ShmKVTransferEngine(KVTransferEngine):
@@ -412,7 +412,7 @@ class ShmKVTransferEngine(KVTransferEngine):
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
-        generation: int | None = None,
+        reset_generation: int | None = None,
     ) -> ShmKVTransferInfo | None:
         if (
             request_id is None
@@ -422,7 +422,7 @@ class ShmKVTransferEngine(KVTransferEngine):
         ):
             return None
         pages = tuple(page_indices)
-        version = (pages, seq_len, generation)
+        version = (pages, seq_len, reset_generation)
         key = (request_id, label)
         previous = self._published.get(key)
         if previous is not None and previous[0] == version:
@@ -445,7 +445,7 @@ class ShmKVTransferEngine(KVTransferEngine):
             path=path,
             page_indices=pages,
             layout=self._kv_cache.layout,
-            generation=generation,
+            reset_generation=reset_generation,
         )
         self._published[key] = (version, info)
         return info
@@ -716,7 +716,7 @@ class KVTransferManager:
         label: str | None = None,
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
-        generation: int | None = None,
+        reset_generation: int | None = None,
     ):
         """Descriptor another process needs to read this cache remotely.
         ``KVCachePool.publish`` stamps it onto every ``SequenceInfo``."""
@@ -725,7 +725,7 @@ class KVTransferManager:
             label=label,
             page_indices=page_indices,
             seq_len=seq_len,
-            generation=generation,
+            reset_generation=reset_generation,
         )
 
     def remove_request(self, request_id: str) -> None:

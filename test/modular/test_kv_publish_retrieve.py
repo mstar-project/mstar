@@ -185,6 +185,24 @@ def test_publish_copies_the_page_list():
     assert published.get(0)["main"].page_indices == pages
 
 
+def test_transfer_reset_generation_does_not_move_on_append():
+    kv = _manager()
+    kv.ingest_request("r0")
+
+    _grow(kv, "r0", 16)
+    kv.publish("r0")
+    initial = _StubTransfer.published[-1]["reset_generation"]
+
+    _grow(kv, "r0", 16)
+    kv.publish("r0")
+    assert _StubTransfer.published[-1]["reset_generation"] == initial
+
+    kv.reset_request("r0")
+    _grow(kv, "r0", 16)
+    kv.publish("r0")
+    assert _StubTransfer.published[-1]["reset_generation"] == initial + 1
+
+
 def test_publish_exports_only_labels_declared_for_remote_consumers():
     kv = _manager()
     kv.ingest_request(
