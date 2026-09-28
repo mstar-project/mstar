@@ -283,7 +283,7 @@ class RealtimeTranscription:
         prefix = "" if s.chunk_id < s.unfixed_chunks else stable_prefix(s.raw_hypothesis, tokenizer, s.unfixed_tokens)
         try:
             s.raw_hypothesis = await _run_step(self.api, self.adapter, s, prefix)
-        except Exception as exc:  # noqa: BLE001 — surface as an event, keep the session
+        except Exception as exc:  # noqa: BLE001 — report it as an event, keep the session
             logger.exception("realtime step failed")
             await self.send(_error(str(exc), kind="server_error"))
             return
