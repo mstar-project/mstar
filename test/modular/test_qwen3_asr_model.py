@@ -207,7 +207,7 @@ def test_process_prompt_builds_features_and_prompt():
     with pytest.raises(ValueError, match="at most"):
         model.process_prompt(None, ["audio"], ["text"],
                              {"audio_inputs": [torch.zeros(model.config.max_audio_samples + 16_000)]})
-    with pytest.raises(ValueError, match="exactly one"):
+    with pytest.raises(ValueError, match="one audio input"):
         model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": []})
 
 
