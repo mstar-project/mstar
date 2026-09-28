@@ -142,7 +142,7 @@ def test_encode_runs_through_a_bound_ragged_resource():
         def run(self, q, k, v):
             calls.append(q.shape)
             # dense attention over the whole packed batch stands in for the
-            # planned kernel; only the call is under test
+            # planned kernel, only the call is under test
             o = torch.nn.functional.scaled_dot_product_attention(
                 q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1),
             )
