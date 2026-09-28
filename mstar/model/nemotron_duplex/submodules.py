@@ -173,12 +173,10 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
         )
 
     def cg_key_info(self, graph_walk: str, per_request_info: Mapping[str, Any]) -> str | None:
-        """The decode capture serves a batch unless a request in it still has
-        its system prompt pending (its first step is prompt + frame, so it
-        runs eager). The routing marks that in ``step_metadata`` for the
-        request's first partition pass; the loop then iterates without a new
-        pass, so the mark stays -- the node records in its request state that
-        the prompt step has been prepared, and every later step is captured."""
+        """Decode capture unless a request still has its prompt pending (its first
+        step is prompt + frame and runs eager). The routing sets that flag once
+        for the whole loop, so the node also checks whether the request's first
+        step has already run."""
         if graph_walk != "decode":
             return None
         for rid, info in per_request_info.items():
@@ -388,19 +386,16 @@ class NemotronHLLMSubmodule(ARNodeSubmodule):
     ):
         # Feed the sampled agent-text + function tokens back into the next
         # frame's AddFusion (the decode loop's prev_text / prev_func edges).
-        # Whatever this step was, the prompt (if any) rode it: later steps take
-        # the decode capture (``cg_key_info``).
+        # The prompt, if any, went with this step. Later steps use the capture.
         self.request_state(request_id).add(self.PROMPT_DONE_KEY, True)
         if "new_token" in outputs:
             outputs["prev_text"] = outputs["new_token"]
         if "new_func" in outputs:
             outputs["prev_func"] = outputs["new_func"]
 
-    # No ``check_stop``: frame-synchronous duplex emits exactly one agent-text
-    # token per audio frame, and text EOS is a NORMAL per-frame token (silence /
-    # turn boundary), not end-of-generation. The decode loop ends when the
-    # audio_frame stream is exhausted (final chunk) or at the Loop's own
-    # ``max_iters`` (the model's max output tokens).
+    # No ``check_stop``. Duplex emits one text token per audio frame and EOS is
+    # an ordinary per-frame token (silence, turn boundary), not the end of
+    # generation. The loop ends with the audio stream or at the Loop's max_iters.
 
 
 # ---------------------------------------------------------------------------
@@ -607,13 +602,11 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         dev = talker.embed_code.weight.device
         rids = list(engine_inputs.request_ids)
         ids = torch.cat([inp.input_ids.reshape(-1)[:1] for inp in inputs]).to(dev)
-        # One D2H read per step for the host-assembled char conditioning. It
-        # waits for the kernels queued ahead of it; reading the ids on a side
-        # stream is not safe (the routed tensors are gated for the main stream
-        # only), and conditioning from a device-side table changes the last bit
-        # of the conditioning (fixed vs batch-width char attention), which moves
-        # the talker's knife-edge turn-taking. A sync-free read needs the
-        # producer's completion event handed along with the stream chunk.
+        # One D2H read per step for the host-built char conditioning. It waits for
+        # the queued kernels, but the alternatives were worse: a side-stream read
+        # is not ordered against the producer, and a device-side char table
+        # changes the conditioning by a bf16 ulp, which moves the talker's
+        # turn-taking on some clips.
         tokens = ids.tolist()
         firsts = [bool(inp.kwargs.get("first", False)) for inp in inputs]
         warm_c, warm_u, warm_prev = self.warmup()
@@ -650,8 +643,8 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
             num_iter=e.inference_num_iter, guidance_scale=e.inference_guidance_scale,
             noise_scale=e.inference_noise_scale, top_p=e.inference_top_p, noise=noise,
         ).squeeze(1)                                                      # [N, Q]
-        # row-addressed: one copy out of the graph for the batch, a [1, Q] view
-        # per request; nothing for check_stop (the stream's end stops the loop)
+        # One copy out of the graph for the batch, a [1, Q] view per request.
+        # Nothing for check_stop, the stream's end stops the loop.
         return BatchedModelOutput(row_outputs={"codec_tokens": codes}, check_stop_buffers={})
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
