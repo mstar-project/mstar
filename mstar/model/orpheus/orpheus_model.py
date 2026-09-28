@@ -283,7 +283,15 @@ class OrpheusModel(Model):
         if prompt is None:
             return {}
 
-        voice = kwargs.get("voice", "tara")
+        # An explicit empty/None voice keeps the unprefixed prompt.
+        voice = kwargs.get("voice", self.config.default_voice)
+        if voice:
+            voice = str(voice).lower()
+            if voice not in self.config.available_voices:
+                supported = ", ".join(self.config.available_voices)
+                raise ValueError(
+                    f"Unsupported Orpheus voice {voice!r}; supported: {supported}"
+                )
 
         # Format: "{voice}: {text}"
         adapted_prompt = f"{voice}: {prompt}" if voice else prompt
@@ -429,7 +437,7 @@ class OrpheusModel(Model):
         return list(self.config.available_voices)
 
     def get_default_voice(self) -> str:
-        return self.config.available_voices[0]
+        return self.config.default_voice
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
