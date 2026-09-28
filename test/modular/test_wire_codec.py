@@ -296,6 +296,25 @@ def test_required_field_that_is_none_survives():
     assert roundtrip(msg).body.request_info.step_metadata["probe"].layout is None
 
 
+def test_none_in_a_field_with_a_non_none_default_survives():
+    """Regression: an omitted None decoded to the field's default, so
+    SamplingReqConfig(top_k=None) came back with top_k=0."""
+    from mstar.engine.resources.sampler.config import SamplingReqConfig
+
+    cfg = SamplingReqConfig(top_k=None, temperature=None)
+    fi = _fwd_info()
+    fi.resource_configs = {"sampler": cfg}
+    msg = WorkerMessage(
+        message_type=WorkerMessageType.INPUT_SIGNALS,
+        body=InputSignals(request_id="r", partition_name="p",
+                          request_info=fi, inputs=[]),
+    )
+    out = roundtrip(msg).body.request_info.resource_configs["sampler"]
+    assert out.top_k is None
+    assert out.temperature is None
+    assert out.top_p == 1
+
+
 def test_non_mstar_types_are_refused_rather_than_imported_from_the_wire():
     from dataclasses import dataclass
 

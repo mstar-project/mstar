@@ -114,11 +114,9 @@ def _plan(cls) -> tuple:
                 f.name,
                 _encoder(hints.get(f.name, Any)),
                 _decoder(hints.get(f.name, Any)),
-                # Omitting None keeps frames small, but only a field with a
-                # default can be reconstructed from its absence. A REQUIRED
-                # field that is legitimately None has to go on the wire.
-                f.default is not dataclasses.MISSING
-                or f.default_factory is not dataclasses.MISSING,
+                # Omit None only where absence decodes back to None, i.e. a
+                # None default; otherwise top_k=None would come back as 0.
+                f.default is None,
             )
             for f in dataclasses.fields(cls)
         )
