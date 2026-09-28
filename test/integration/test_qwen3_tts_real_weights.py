@@ -164,7 +164,9 @@ def test_real_tokenizer_and_prefill_build_expected_hidden_width(model, talker):
     )
     prepared = talker.prepare_inputs(
         "talker_prefill",
-        SimpleNamespace(request_id="integration-prefill"),
+        SimpleNamespace(
+            request_id="integration-prefill", rid_handle="integration-prefill"
+        ),
         tensors,
     )
 

@@ -14,6 +14,7 @@ from mstar.utils.ipc_format import (
     MessageSource,
     RemoveRequest,
 )
+from mstar.worker.rid_table import RidTable
 from mstar.worker.worker import Worker
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -168,6 +169,48 @@ def test_add_new_request_skips_draining_rid():
     w = _worker(draining=("X",))
     # Bails before touching engine/graph managers (out-of-order NEW after DRAIN).
     Worker._add_new_request(w, SimpleNamespace(request_id="X"))
+
+
+def test_add_new_request_hands_off_the_handle_not_the_string():
+    w = Worker.__new__(Worker)
+    w.worker_id = "w0"
+    w._draining_rids = set()
+    w._unprocessed_messages = {}
+    w._my_consumer_connections = []
+    w._last_active = {}
+    w._rids = RidTable()
+    w._rids.intern("other")  # so X's handle is 1, not 0
+    seen = {}
+
+    def _graphs_add(request_id, **kw):
+        seen["graphs"] = request_id
+        w.worker_graphs_manager.per_request_info[request_id] = SimpleNamespace(
+            sharding_config=None, stream_buffers={},
+        )
+
+    w.worker_graphs_manager = SimpleNamespace(
+        per_request_info={}, add_request=_graphs_add,
+    )
+    w.engine_manager = SimpleNamespace(
+        evictable_nodes=lambda: ["n"],
+        add_request=lambda rid, cfgs: seen.setdefault("engine", rid),
+    )
+    w.tensor_manager = SimpleNamespace(
+        register_request=lambda rid, cfg: seen.setdefault("tensors", rid),
+        start_read_tensors=lambda rid, inputs, graph_walk: [],
+    )
+    w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    info = SimpleNamespace(resource_configs={}, graph_walk="g")
+    Worker._add_new_request(w, SimpleNamespace(
+        request_id="X", request_info=info, initial_inputs=[],
+        partition_worker_graph_ids=[], worker_graph_to_workers={},
+    ))
+
+    handle = w._rids.handle("X")
+    assert handle == 1
+    assert info.rid_handle == handle
+    assert seen == {"graphs": handle, "engine": handle, "tensors": handle}
+    assert set(w._last_active) == {(handle, "n")}
 
 
 # ── preprocess worker ───────────────────────────────────────────────────────
