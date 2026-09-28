@@ -962,6 +962,9 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># capture-time buffer allocation, likewise scoped: a node's runner has</span>
         <span class="c1"># no business sizing a resource it never plans against</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_node_order</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_per_node</span><span class="p">(</span><span class="n">node_resources</span><span class="p">,</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">))</span>
+        <span class="c1"># the step whose pre-plan is staged across the pre-planning resources,</span>
+        <span class="c1"># as `_step_key` describes it; None when nothing is staged</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span><span class="p">:</span> <span class="nb">tuple</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="StepRunner.resolve_cached_prefix">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.resolve_cached_prefix">[docs]</a>
@@ -1138,10 +1141,68 @@ window.runMermaid = runMermaid;</script>
 
 
 
+    <span class="c1"># ── Pre-plan bookkeeping ─────────────────────────────────────────────</span>
+    <span class="c1">#</span>
+    <span class="c1"># A pre-plan is staged across every pre-planning resource for one step,</span>
+    <span class="c1"># and each resource promotes its share when that step's full `plan`</span>
+    <span class="c1"># arrives. Only the runner sees the whole step, so it is the one that</span>
+    <span class="c1"># decides whether the step reaching `admit`/`plan` is the staged one. Any</span>
+    <span class="c1"># other step — a new request's prefill dispatched while a decode step sits</span>
+    <span class="c1"># pre-planned, or the same rows re-declared without their lease — drops</span>
+    <span class="c1"># the stage on every resource first. Otherwise a resource that promotes</span>
+    <span class="c1"># blindly (the attention wrappers, positions) would run against the KV</span>
+    <span class="c1"># layout its dependency just discarded and planned afresh.</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_step_key</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""What identifies the step a pre-plan was staged for: its walk, the</span>
+<span class="sd">        rows it runs (padding included), the replay slot it was leased on,</span>
+<span class="sd">        its capture key, and every resource's segments."""</span>
+        <span class="n">ctx</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span>
+        <span class="n">lease</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span>
+        <span class="k">return</span> <span class="p">(</span>
+            <span class="n">ctx</span><span class="o">.</span><span class="n">graph_walk</span><span class="p">,</span>
+            <span class="nb">tuple</span><span class="p">(</span><span class="n">ctx</span><span class="o">.</span><span class="n">padded_request_ids</span><span class="p">),</span>
+            <span class="kc">None</span> <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="p">,</span>
+            <span class="n">step</span><span class="o">.</span><span class="n">cg_key_info</span><span class="p">,</span>
+            <span class="nb">tuple</span><span class="p">(</span>
+                <span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">()))</span>
+                <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
+            <span class="p">),</span>
+        <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_drop_stale_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_step_key</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span> <span class="o">!=</span> <span class="n">key</span><span class="p">:</span>
+            <span class="c1"># Not the normal path: the worker meant to run the staged step</span>
+            <span class="c1"># next. Name both steps so the source can be traced.</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">"dropping the staged pre-plan (walk </span><span class="si">%s</span><span class="s2">, </span><span class="si">%d</span><span class="s2"> rows) for a different "</span>
+                <span class="s2">"step (walk </span><span class="si">%s</span><span class="s2">, </span><span class="si">%d</span><span class="s2"> rows) that reached the GPU thread first"</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_staged</span><span class="p">[</span><span class="mi">1</span><span class="p">]),</span> <span class="n">key</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">len</span><span class="p">(</span><span class="n">key</span><span class="p">[</span><span class="mi">1</span><span class="p">]),</span>
+            <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">staged</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A pre-plan is staged and not yet promoted."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
+<div class="viewcode-block" id="StepRunner.clear_preplan">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.clear_preplan">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">clear_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Drop the staged pre-plan on every resource, and the record of it."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_order</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span></div>
+
+
 <div class="viewcode-block" id="StepRunner.admit">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.StepRunner.admit">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">SubmoduleStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">FullAdmitOutcome</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""reserve capacity for step"""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_drop_stale_preplan</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
         <span class="n">ready</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
@@ -1168,6 +1229,11 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        place plan in `step.ctx.plan_results` before next plan runs</span>
 <span class="sd">        again could possibly move that into `plan` itself"""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_drop_stale_preplan</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">:</span>
+            <span class="c1"># the resources promote their staged share below (or plan afresh</span>
+            <span class="c1"># if nothing was staged): either way nothing stays staged</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="n">results</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">plan_results</span>
         <span class="n">results</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_keys_for</span><span class="p">(</span><span class="n">step</span><span class="p">):</span>
@@ -1224,6 +1290,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">finally</span><span class="p">:</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_nvtx</span><span class="p">:</span>
                     <span class="n">range_pop</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_staged</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_step_key</span><span class="p">(</span><span class="n">step</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">results</span></div>
 
 

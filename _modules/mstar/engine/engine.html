@@ -1614,6 +1614,14 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">batch</span><span class="o">.</span><span class="n">outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_exec_single</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
             <span class="n">batch</span><span class="o">.</span><span class="n">outputs_ready</span><span class="o">.</span><span class="n">set</span><span class="p">()</span>
             <span class="k">return</span> <span class="n">batch</span><span class="o">.</span><span class="n">outputs</span>
+        <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+            <span class="c1"># A raise before the plan was promoted (declare, admit) would leave</span>
+            <span class="c1"># the stage for the next step's admit to find. Drop it here. The</span>
+            <span class="c1"># lease is released by _exec_single's own finally.</span>
+            <span class="k">if</span> <span class="n">batch</span><span class="o">.</span><span class="n">preplanned_rids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_runner</span><span class="o">.</span><span class="n">staged</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_runner</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span>
+                <span class="n">batch</span><span class="o">.</span><span class="n">preplanned_rids</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">raise</span>
         <span class="k">finally</span><span class="p">:</span>
             <span class="n">batch</span><span class="o">.</span><span class="n">preplan_event</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="n">batch</span><span class="o">.</span><span class="n">release_waiters</span><span class="p">()</span>
@@ -2435,8 +2443,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">cg_runner</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodules</span><span class="p">[</span><span class="n">batch</span><span class="o">.</span><span class="n">node_name</span><span class="p">]</span><span class="o">.</span><span class="n">cuda_graph_runner</span>
             <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">cg_runner</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">cg_runner</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">lease</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">batch</span><span class="o">.</span><span class="n">request_ids</span><span class="p">))</span>
-        <span class="k">for</span> <span class="n">resource</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
-            <span class="n">resource</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span></div>
+        <span class="c1"># through the runner, so its record of the staged step goes too</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_runner</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span></div>
 
 
     <span class="c1"># ── Eviction ────────────────────────────────────────────────────────</span>

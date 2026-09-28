@@ -848,6 +848,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">StepRunner.build_cuda_graph_buffers()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.clear_preplan"><code class="docutils literal notranslate"><span class="pre">StepRunner.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.commit"><code class="docutils literal notranslate"><span class="pre">StepRunner.commit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.extend_prefix_chains"><code class="docutils literal notranslate"><span class="pre">StepRunner.extend_prefix_chains()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.ingest_request"><code class="docutils literal notranslate"><span class="pre">StepRunner.ingest_request()</span></code></a></li>
@@ -859,6 +860,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.remove_request"><code class="docutils literal notranslate"><span class="pre">StepRunner.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.resolve_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.resources"><code class="docutils literal notranslate"><span class="pre">StepRunner.resources</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.staged"><code class="docutils literal notranslate"><span class="pre">StepRunner.staged</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -2860,6 +2862,17 @@ batch size say nothing about a resource this node’s graphs never touch.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.StepRunner.clear_preplan">
+<span class="sig-name descname"><span class="pre">clear_preplan</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.clear_preplan"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.StepRunner.clear_preplan" title="Link to this definition">#</a></dt>
+<dd><p>Drop the staged pre-plan on every resource, and the record of it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.StepRunner.commit">
 <span class="sig-name descname"><span class="pre">commit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.commit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.StepRunner.commit" title="Link to this definition">#</a></dt>
 <dd><p>record step consumption</p>
@@ -3020,6 +3033,12 @@ A resource with no opinion is not an answer of zero.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.StepRunner.resources">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">resources</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><span class="pre">Mapping</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.Resource" title="mstar.engine.resources.base.Resource"><span class="pre">Resource</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.StepRunner.resources" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.StepRunner.staged">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">staged</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.StepRunner.staged" title="Link to this definition">#</a></dt>
+<dd><p>A pre-plan is staged and not yet promoted.</p>
+</dd></dl>
 
 </dd></dl>
 
@@ -3506,6 +3525,7 @@ would otherwise be a silently ineffective setting.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.admit_retrieve"><code class="docutils literal notranslate"><span class="pre">StepRunner.admit_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.apply_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.apply_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.build_cuda_graph_buffers"><code class="docutils literal notranslate"><span class="pre">StepRunner.build_cuda_graph_buffers()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.clear_preplan"><code class="docutils literal notranslate"><span class="pre">StepRunner.clear_preplan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.commit"><code class="docutils literal notranslate"><span class="pre">StepRunner.commit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.extend_prefix_chains"><code class="docutils literal notranslate"><span class="pre">StepRunner.extend_prefix_chains()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.ingest_request"><code class="docutils literal notranslate"><span class="pre">StepRunner.ingest_request()</span></code></a></li>
@@ -3517,6 +3537,7 @@ would otherwise be a silently ineffective setting.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.remove_request"><code class="docutils literal notranslate"><span class="pre">StepRunner.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.resolve_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.resources"><code class="docutils literal notranslate"><span class="pre">StepRunner.resources</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.staged"><code class="docutils literal notranslate"><span class="pre">StepRunner.staged</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SubmoduleStep"><code class="docutils literal notranslate"><span class="pre">SubmoduleStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

@@ -1276,6 +1276,7 @@ window.runMermaid = runMermaid;</script>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KVPlanState</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_key</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_cached_plan_output</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KVPlanOutput</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
         <span class="c1"># (rid, to_label, stored_len, generation) for pre-forks appliedb by</span>
@@ -1726,8 +1727,13 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.admit">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">admit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">AdmitOutcome</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">:</span>
-            <span class="c1"># pages were already reserved by the preplan pass</span>
-            <span class="k">return</span> <span class="n">ADMIT_OK</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_key</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_key</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">):</span>
+                <span class="c1"># pages were already reserved by the preplan pass</span>
+                <span class="k">return</span> <span class="n">ADMIT_OK</span>
+            <span class="c1"># a different step arrived first (see `plan`): drop the staged</span>
+            <span class="c1"># plan and reserve for this step normally. The staged step's own</span>
+            <span class="c1"># span pages stay with its stream, where its re-admit finds them.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span>
         <span class="c1"># forks reserve here and copy later (plan for pre-, commit for post-),</span>
         <span class="c1"># so a step that never runs leaves pages resident but no page contents</span>
         <span class="c1"># moved — re-admitting it allocates nothing and re-copies nothing.</span>
@@ -1958,17 +1964,19 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">reset_default_cursors</span><span class="p">()</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span>
-            <span class="n">res</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cached_plan_output</span>
-            <span class="c1"># promotion, not abandonment: the staged forks and marks are kept,</span>
-            <span class="c1"># so drop the undo records before clear_preplan replays them</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_fork_undo</span> <span class="o">=</span> <span class="p">[]</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_new_labels</span> <span class="o">=</span> <span class="p">[]</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_marked</span> <span class="o">=</span> <span class="p">[]</span>
-            <span class="c1"># must reset here: otherwise the *next* step's admit still sees</span>
-            <span class="c1"># `_preplanned` and skips its allocation</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_key</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_key</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">):</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_current_plan_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span>
+                <span class="n">res</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cached_plan_output</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_fork_undo</span> <span class="o">=</span> <span class="p">[]</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_new_labels</span> <span class="o">=</span> <span class="p">[]</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_marked</span> <span class="o">=</span> <span class="p">[]</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span>
+                <span class="k">return</span> <span class="n">res</span>
+            <span class="c1"># A different step reached the GPU thread before the one planned</span>
+            <span class="c1"># ahead (e.g. a new request's prefill while a decode step sits</span>
+            <span class="c1"># pre-planned): it must not be served the staged plan's pages.</span>
+            <span class="c1"># Undo the staged plan's side effects and plan inline.</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">clear_preplan</span><span class="p">()</span>
-            <span class="k">return</span> <span class="n">res</span>
         <span class="n">undo</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_fork_undo</span> <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="k">for</span> <span class="p">(</span><span class="n">from_label</span><span class="p">,</span> <span class="n">to_label</span><span class="p">)</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">pre_forks</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">ctx</span><span class="o">.</span><span class="n">padded_request_ids</span><span class="p">:</span>
@@ -1985,6 +1993,7 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_setup_plan_states</span><span class="p">(</span><span class="n">res</span><span class="p">,</span> <span class="n">ctx</span><span class="p">,</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">ctx</span><span class="o">.</span><span class="n">is_preplan</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_key</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_plan_key</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">True</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_cached_plan_output</span> <span class="o">=</span> <span class="n">res</span>
         <span class="k">return</span> <span class="n">res</span></div>
@@ -1993,6 +2002,13 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">supports_preplan</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="kc">True</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_plan_key</span><span class="p">(</span><span class="n">step</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""What identifies the step a pre-plan was staged for: its segments</span>
+<span class="sd">        and the replay slot it was leased on."""</span>
+        <span class="n">lease</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span>
+        <span class="k">return</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">step</span><span class="o">.</span><span class="n">segments</span><span class="p">),</span> <span class="p">(</span><span class="n">lease</span><span class="o">.</span><span class="n">slot</span> <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
 
 <div class="viewcode-block" id="KVManager.clear_preplan">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.clear_preplan">[docs]</a>
@@ -2024,6 +2040,7 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_marked</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="c1"># rebind rather than clear: a consumed preplan dict is the live one</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplanned</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_key</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_preplan_states</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_cached_plan_output</span> <span class="o">=</span> <span class="kc">None</span></div>
 
