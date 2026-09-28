@@ -285,19 +285,28 @@ class MicroScheduler:
         repaired: the difference is the bug, and guessing a repair would bury it.
         """
         engine = self.engine_manager.get_engine(message.node_name)
-        mine = {
-            rid for rid in worker_graphs_manager.per_request_info
+        live = set(worker_graphs_manager.per_request_info)
+        offloaded = {
+            rid for rid in live
             if engine.is_offloaded(message.node_name, rid)
         }
-        theirs = set(message.offloaded_after)
-        if mine == theirs:
+        their_live = set(message.live_after)
+        their_offloaded = set(message.offloaded_after)
+        if live == their_live and offloaded == their_offloaded:
             return
         logger.error(
-            "TP resident sets disagree at step %d on %s: rank 0 has %d "
-            "offloaded, this rank %d. Off here but not there: %s. Off there but "
-            "not here: %s. A step both ranks run from here can deadlock.",
-            message.spec_seq, message.node_name, len(theirs), len(mine),
-            sorted(mine - theirs) or "none", sorted(theirs - mine) or "none",
+            "TP page state disagrees at step %d on %s. Live: %d here vs %d "
+            "there (only here: %s; only there: %s). Offloaded: %d here vs %d "
+            "there (only here: %s; only there: %s). A request that is live on "
+            "one rank and gone from the other still holds its pages there, so "
+            "the two admits can differ and a step both ranks run can deadlock.",
+            message.spec_seq, message.node_name,
+            len(live), len(their_live),
+            sorted(live - their_live) or "none",
+            sorted(their_live - live) or "none",
+            len(offloaded), len(their_offloaded),
+            sorted(offloaded - their_offloaded) or "none",
+            sorted(their_offloaded - offloaded) or "none",
         )
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:

@@ -868,54 +868,83 @@ def _mgr(rids):
     return SimpleNamespace(per_request_info=dict.fromkeys(rids, object()))
 
 
-def _msg(offloaded_after, seq=7):
+def _msg(offloaded_after, seq=7, live_after=None):
     return ScheduleTPNode(
         node_name="node", graph_walk="walk", request_ids=["r0"],
         spec_seq=seq, offloaded_after=tuple(offloaded_after),
+        live_after=tuple(
+            offloaded_after if live_after is None else live_after
+        ),
     )
 
 
-def test_matching_resident_sets_say_nothing(caplog):
-    sched = _CheckSched(offloaded_here={"a"})
-
-    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
-        sched._check_resident_set_matches(_msg(["a"]), _mgr(["a", "b"]))
-
-    assert not caplog.records
-
-
-def test_a_drift_names_the_requests_and_the_step(caplog):
-    """What was missing: the page count the follower is short by, attributed to
-    specific requests, at the step where it is first observable."""
+def test_matching_page_state_says_nothing(caplog):
     sched = _CheckSched(offloaded_here={"a"})
 
     with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
         sched._check_resident_set_matches(
-            _msg(["a", "b"], seq=41), _mgr(["a", "b", "c"]),
+            _msg(["a"], live_after=["a", "b"]), _mgr(["a", "b"]),
         )
 
-    line = next(r.getMessage() for r in caplog.records if "disagree" in r.getMessage())
+    assert not caplog.records
+
+
+def test_an_unreplayed_delta_is_named(caplog):
+    """The skew ``offloaded_after`` exists for: a move that did not land."""
+    sched = _CheckSched(offloaded_here={"a"})
+
+    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
+        sched._check_resident_set_matches(
+            _msg(["a", "b"], seq=41, live_after=["a", "b", "c"]),
+            _mgr(["a", "b", "c"]),
+        )
+
+    line = next(r.getMessage() for r in caplog.records if "disagrees" in r.getMessage())
     assert "step 41" in line
-    assert "rank 0 has 2 offloaded, this rank 1" in line
-    assert "Off there but not here: ['b']" in line
+    assert "Offloaded: 1 here vs 2 there" in line
+    assert "only there: ['b']" in line
+
+
+def test_a_teardown_the_ranks_applied_on_opposite_sides_is_named(caplog):
+    """The skew the offloaded sets cannot show, and the one the watchdog pointed
+    at: a request torn down on rank 0 but still live here is still holding its
+    pages here, so the two admits differ while both offloaded sets look
+    identical."""
+    sched = _CheckSched(offloaded_here=set())
+
+    with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
+        sched._check_resident_set_matches(
+            # rank 0 has torn "gone" down; this rank has not
+            _msg([], seq=8703, live_after=["a"]), _mgr(["a", "gone"]),
+        )
+
+    line = next(r.getMessage() for r in caplog.records if "disagrees" in r.getMessage())
+    assert "step 8703" in line
+    assert "Live: 2 here vs 1 there" in line
+    assert "only here: ['gone']" in line
+    assert "still holds its pages there" in line
 
 
 def test_a_drift_the_other_way_is_named_too(caplog):
     sched = _CheckSched(offloaded_here={"a", "b"})
 
     with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
-        sched._check_resident_set_matches(_msg(["a"]), _mgr(["a", "b"]))
+        sched._check_resident_set_matches(
+            _msg(["a"], live_after=["a", "b"]), _mgr(["a", "b"]),
+        )
 
-    line = next(r.getMessage() for r in caplog.records if "disagree" in r.getMessage())
-    assert "Off here but not there: ['b']" in line
+    line = next(r.getMessage() for r in caplog.records if "disagrees" in r.getMessage())
+    assert "only here: ['b']" in line
 
 
-def test_the_check_only_considers_requests_this_rank_knows(caplog):
-    """A request removed here and not there is a different problem; the check
-    must not read as a page-state drift."""
-    sched = _CheckSched(offloaded_here={"a"})
+def test_the_offloaded_check_is_scoped_to_live_requests(caplog):
+    """``is_offloaded`` is only asked about requests this rank still knows, so a
+    stale entry cannot masquerade as an offload skew."""
+    sched = _CheckSched(offloaded_here={"a", "stale"})
 
     with caplog.at_level(logging.ERROR, logger=sched_mod.__name__):
-        sched._check_resident_set_matches(_msg(["a"]), _mgr(["a"]))
+        sched._check_resident_set_matches(
+            _msg(["a"], live_after=["a"]), _mgr(["a"]),
+        )
 
     assert not caplog.records

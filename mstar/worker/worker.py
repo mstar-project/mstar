@@ -1186,10 +1186,12 @@ class Worker:
         # What the delta above should add up to on every rank. Cheap — a handful
         # of live requests — and it is the only thing that can catch the ranks
         # drifting apart, since the delta itself is never verified.
+        live = self.worker_graphs_manager.per_request_info
         offloaded_after = tuple(sorted(
-            rid for rid in self.worker_graphs_manager.per_request_info
+            rid for rid in live
             if engine.is_offloaded(node_batch.node_name, rid)
         ))
+        live_after = tuple(sorted(live))
         # this worker is only a part of one TP group for this node,
         # so, we can just look at the sharding_config for the first
         # request to get the relevant workers
@@ -1210,6 +1212,7 @@ class Worker:
                         spec_from_seq=spec_from_seq,
                         resident_delta=resident_delta.copy(),
                         offloaded_after=offloaded_after,
+                        live_after=live_after,
                     )
                 )
             )

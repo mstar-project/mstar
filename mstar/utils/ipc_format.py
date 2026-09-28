@@ -207,12 +207,17 @@ class ScheduleTPNode(MessageBody):
     spec_seq: int = -1
     spec_from_seq: int = -1
     resident_delta: OffloadDelta = field(default_factory=OffloadDelta.new)
-    # Which requests rank 0 had off-device when it chose this step, for a
-    # follower to check itself against once it has replayed ``resident_delta``.
-    # The delta says what rank 0 did; this says where that should have landed.
-    # Without it the ranks can drift silently and the first symptom is a move
-    # that will not fit, one step later and with nothing pointing at the cause.
+    # What rank 0's page state was when it chose this step, for a follower to
+    # check itself against once it has replayed ``resident_delta``. The delta
+    # says what rank 0 did; these say where it should have landed.
+    #
+    # Both sets, because they catch different skews. ``offloaded_after`` catches
+    # a delta that did not replay. ``live_after`` catches page movement the delta
+    # never described: a request torn down frees its pages, and if the two ranks
+    # apply that teardown on opposite sides of this step, their admits disagree
+    # while their offloaded sets look identical.
     offloaded_after: tuple[str, ...] = ()
+    live_after: tuple[str, ...] = ()
 
 
 @dataclass
