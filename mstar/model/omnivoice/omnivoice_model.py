@@ -229,13 +229,12 @@ class OmniVoiceModel(Model):
         if self.tokenizer is not None:
             return
         from transformers import AutoTokenizer
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_path_hf, cache_dir=self.cache_dir
-        )
         from omnivoice.utils.duration import RuleDurationEstimator
 
         self._duration_estimator = RuleDurationEstimator()
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_path_hf, cache_dir=self.cache_dir
+        )
         self._refresh_from_checkpoint_config()
 
     def warmup_preprocess(self) -> None:
