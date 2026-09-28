@@ -34,10 +34,10 @@ CONTEXT_LABEL = "main"
 ENCODER_NODE = "audio_encoder"
 DECODER_NODE = "decoder"
 
-# Graph walks. ``prefill`` runs the encoder and the whole forced prompt;
+# Graph walks. ``prefill`` runs the encoder and the whole forced prompt.
 # ``detect_language`` runs the encoder and ``<|startoftranscript|>`` alone,
-# sampling only among language tokens; ``prefill_prompt`` then appends the
-# rest of the forced prompt to that detected token; ``decode`` is the loop.
+# sampling only among language tokens. ``prefill_prompt`` then appends the
+# rest of the forced prompt to that detected token. ``decode`` is the loop.
 PREFILL_WALK = "prefill"
 DETECT_LANGUAGE_WALK = "detect_language"
 PREFILL_PROMPT_WALK = "prefill_prompt"
@@ -83,7 +83,7 @@ class WhisperModelConfig:
     suppress_tokens: list[int] = field(default_factory=list)
     begin_suppress_tokens: list[int] = field(default_factory=list)
     # (layer, head) pairs of the cross-attention heads whose weights align
-    # text to audio; used for word-level timestamps (DTW).
+    # text to audio, used for word-level timestamps (DTW).
     alignment_heads: list[list[int]] = field(default_factory=list)
 
     # log-mel front end (preprocessor_config.json)
