@@ -189,12 +189,17 @@ def test_shm_publication_refreshes_when_seq_len_changes(tmp_path):
         request_id="request", label="main", page_indices=[0], seq_len=2,
     )
 
-    assert refreshed.path == info.path
+    assert refreshed.path != info.path
+    assert Path(info.path).exists()
+    assert producer.get_kv_transfer_info(
+        request_id="request", label="main", page_indices=[0], seq_len=2,
+    ) == refreshed
     torch.testing.assert_close(
         torch.load(refreshed.path, weights_only=True),
         source_cache.tensor,
     )
     producer.remove_request("request")
+    assert not Path(info.path).exists()
     assert not Path(refreshed.path).exists()
 
 
@@ -219,12 +224,54 @@ def test_shm_publication_refreshes_when_reset_generation_changes(tmp_path):
         reset_generation=1,
     )
 
-    assert refreshed.path == info.path
+    assert refreshed.path != info.path
     assert refreshed.reset_generation == 1
+    assert producer.owns_transfer_info(info, "request", "main")
+    assert producer.owns_transfer_info(refreshed, "request", "main")
     torch.testing.assert_close(
         torch.load(refreshed.path, weights_only=True),
         source_cache.tensor,
     )
+    producer.remove_request("request")
+    assert not Path(info.path).exists()
+    assert not Path(refreshed.path).exists()
+
+
+def test_shm_earlier_descriptor_keeps_its_snapshot_after_republish(tmp_path):
+    source = torch.zeros((1, 2, 2, 4, 1, 1), dtype=torch.float32)
+    producer_cache = _kv_cache(source)
+    consumer_cache = _kv_cache(source)
+    producer = ShmKVTransferEngine(
+        producer_cache, "producer", str(tmp_path),
+    )
+    consumer = ShmKVTransferEngine(
+        consumer_cache, "consumer", str(tmp_path),
+    )
+
+    producer_cache.tensor[:, 0].fill_(1)
+    earlier = producer.get_kv_transfer_info(
+        request_id="request", label="main", page_indices=[0],
+        seq_len=4, reset_generation=0,
+    )
+    producer_cache.tensor[:, 1].fill_(2)
+    later = producer.get_kv_transfer_info(
+        request_id="request", label="main", page_indices=[1],
+        seq_len=4, reset_generation=1,
+    )
+
+    assert earlier.path != later.path
+    assert consumer.read_batched_async(
+        earlier, [KVReadInfo(0, 0, 0, 0, 4)],
+    ) is None
+    assert torch.all(consumer_cache.tensor[:, 0] == 1)
+    assert consumer.read_batched_async(
+        later, [KVReadInfo(0, 0, 1, 0, 4)],
+    ) is None
+    assert torch.all(consumer_cache.tensor[:, 0] == 2)
+
+    producer.shutdown()
+    assert not Path(earlier.path).exists()
+    assert not Path(later.path).exists()
 
 
 def test_shm_publications_are_namespaced_by_resource(tmp_path):

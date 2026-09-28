@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-import threading
+import uuid
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -398,13 +398,16 @@ class ShmKVTransferEngine(KVTransferEngine):
             tuple[str, str],
             tuple[tuple[tuple[int, ...], int, int | None], ShmKVTransferInfo],
         ] = {}
+        # A descriptor must keep naming the same bytes while a consumer may
+        # still be using it, even after this label is published again.
+        self._published_paths: dict[tuple[str, str], set[str]] = {}
 
     def _path(self, request_id: str, label: str) -> str:
         key = (
             f"{self._entity_id}:{self._resource_key}:{request_id}:{label}"
         ).encode()
         digest = hashlib.sha256(key).hexdigest()
-        return os.path.join(self._shm_dir, f"mstar_kv_{digest}.pt")
+        return os.path.join(self._shm_dir, f"mstar_kv_{digest}")
 
     def get_kv_transfer_info(
         self,
@@ -428,8 +431,8 @@ class ShmKVTransferEngine(KVTransferEngine):
         if previous is not None and previous[0] == version:
             return previous[1]
 
-        path = self._path(request_id, label)
-        tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        path = f"{self._path(request_id, label)}_{uuid.uuid4().hex}.pt"
+        tmp_path = f"{path}.tmp"
         if pages:
             packed = (
                 self._kv_cache.tensor[:, list(pages)]
@@ -439,8 +442,12 @@ class ShmKVTransferEngine(KVTransferEngine):
             )
         else:
             packed = torch.empty((0,), dtype=self._kv_cache.dtype)
-        torch.save(packed, tmp_path)
-        os.replace(tmp_path, path)
+        try:
+            torch.save(packed, tmp_path)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         info = ShmKVTransferInfo(
             path=path,
             page_indices=pages,
@@ -448,6 +455,7 @@ class ShmKVTransferEngine(KVTransferEngine):
             reset_generation=reset_generation,
         )
         self._published[key] = (version, info)
+        self._published_paths.setdefault(key, set()).add(path)
         return info
 
     def read_batched_async(
@@ -519,13 +527,14 @@ class ShmKVTransferEngine(KVTransferEngine):
         return None
 
     def remove_request(self, request_id: str) -> None:
-        keys = [key for key in self._published if key[0] == request_id]
+        keys = [key for key in self._published_paths if key[0] == request_id]
         for key in keys:
-            _, info = self._published.pop(key)
-            try:
-                os.unlink(info.path)
-            except FileNotFoundError:
-                pass
+            self._published.pop(key, None)
+            for path in self._published_paths.pop(key):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
 
     def owns_transfer_info(
         self,
@@ -535,11 +544,13 @@ class ShmKVTransferEngine(KVTransferEngine):
     ) -> bool:
         return (
             isinstance(transfer_info, ShmKVTransferInfo)
-            and transfer_info.path == self._path(request_id, label)
+            and transfer_info.path in self._published_paths.get(
+                (request_id, label), ()
+            )
         )
 
     def shutdown(self):
-        for request_id, _ in list(self._published):
+        for request_id, _ in list(self._published_paths):
             self.remove_request(request_id)
 
 
