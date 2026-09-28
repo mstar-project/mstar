@@ -74,6 +74,10 @@ logger = logging.getLogger(__name__)
 # retried every backoff, and a line per retry buries the rest of the log
 _HOLD_LOG_INTERVAL = 5.0
 
+# ``_await_admit_settled``'s safety net, not a tuning knob: the GPU thread
+# releases the event on every exit, so this only fires if that thread died.
+_ADMIT_FENCE_TIMEOUT_S = 10.0
+
 
 def _make_graph_runtime(
     communicator,
@@ -1601,6 +1605,41 @@ class Worker:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
+    def _await_admit_settled(self, pending: "PendingBatch | None") -> None:
+        """Block until the in-flight step's admit has run.
+
+        Admit is on the GPU thread; every offload and reload is on this one. A
+        page move in the window between a step's broadcast and its admit lands
+        in the NEXT step's resident delta, so the follower applies it after
+        admitting this step while the leader admitted with it already applied.
+        Same step, two free-page counts, and the ranks part company on the
+        first collective.
+
+        ``launch_started_event`` is the tightest fence available: on both exec
+        paths every admit in the batch precedes the launch — ``_exec_single``
+        admits before ``_drive_step``, and ``_exec_per_request`` admits every
+        rid in its first loop. ``commit_done`` would serve too, but on the
+        per-request path it sits behind a CUDA event sync, which would drag a
+        GPU wait into scheduling.
+
+        Separate from the submitter's ``MSTAR_LAUNCH_WAIT_MS`` wait on the same
+        event: that one is a GIL throttle and is meant to expire early. This
+        one is for correctness, so it waits out the step.
+        """
+        if pending is None:
+            return
+        event = pending.node_batch.launch_started_event
+        if event is None or event.is_set():
+            return
+        with self._span("worker.await_admit_settled"):
+            settled = event.wait(timeout=_ADMIT_FENCE_TIMEOUT_S)
+        if not settled:
+            logger.warning(
+                "Worker %s: timed out waiting for node=%s walk=%s to admit "
+                "before scheduling; page moves may diverge across TP ranks",
+                self.worker_id, pending.node_name, pending.graph_walk,
+            )
+
     def _handle_admit_failure(
         self, batch: ScheduledBatch, node_batch: ExecutingBatch,
         referenced_rids: frozenset[str] = frozenset(),
@@ -3100,6 +3139,13 @@ class Worker:
                 batch = None
                 spec_pending = None
                 _iter_start = _time.perf_counter() if phase_period else 0.0
+                # Everything below here can move pages — the removes and drains
+                # directly, ``_process_messages`` through a follower's delta,
+                # and the readiness scans through ``check_ready``'s reload. None
+                # of it may run while N's admit is outstanding on the GPU
+                # thread; see ``_await_admit_settled``.
+                self._set_phase("await_admit")
+                self._await_admit_settled(pending)
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
@@ -3459,6 +3505,10 @@ class Worker:
                 broadcast_seq = self.maybe_send_zmq_to_tp_followers(node_batch)
                 fallthrough_tp_seq = broadcast_seq if broadcast_seq >= 0 else batch.tp_seq
 
+                # Unlike the spec submit, this path doesn't hold off the GIL for
+                # the launch — but it still has to be fenceable, or the next
+                # iteration schedules against an admit that hasn't run.
+                node_batch.launch_started_event = threading.Event()
                 future = gpu_executor.submit(
                     self._execute_on_gpu_thread, batch, node_batch, None,
                 )
