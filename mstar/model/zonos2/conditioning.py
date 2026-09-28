@@ -295,21 +295,33 @@ def _quality_control_to_feature_list(value: Any, features: tuple[str, ...]) -> l
     raise ValueError("quality_buckets and quality_values must be a list or feature-name object.")
 
 
+# The reference server's default quality conditioning: 0.25-0.5 s of trailing
+# silence (``conditioning.py`` there). Applied when a request gives neither.
+DEFAULT_QUALITY_BUCKETS = {"trailing_silence_s": 3}
+
+
 def resolve_quality_buckets(
     config: Zonos2Config,
     *,
     quality_buckets: Any = None,
     quality_values: Any = None,
+    quality_enabled: bool = True,
 ) -> list[int | None] | None:
     """Resolve the quality bucket index of each feature, or ``None`` for no tokens.
 
     Give either explicit bucket indices or raw metric values (``lufs``,
     ``trailing_silence_s``, and others). Key them by feature name, or give them
     in ``config.quality_features`` order. A ``None`` entry emits no token for
-    that feature.
+    that feature. With neither, a checkpoint that has the default features gets
+    ``DEFAULT_QUALITY_BUCKETS``, as in the reference; ``quality_enabled=False``
+    emits no quality tokens at all.
     """
-    if quality_buckets is None and quality_values is None:
+    if not quality_enabled:
         return None
+    if quality_buckets is None and quality_values is None:
+        if not set(DEFAULT_QUALITY_BUCKETS) <= set(config.quality_features):
+            return None
+        quality_buckets = DEFAULT_QUALITY_BUCKETS
     if quality_buckets is not None and quality_values is not None:
         raise ValueError("Provide only one of quality_buckets or quality_values.")
 

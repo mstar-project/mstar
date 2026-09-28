@@ -41,30 +41,27 @@ def main() -> int:
     ap.add_argument("--url", default="http://127.0.0.1:20002/generate")
     ap.add_argument("--text", default="And now for something completely different.")
     ap.add_argument("--output", default="zonos2_out.wav")
-    # Generous safety cap only — the model stops at its natural EOS well before
-    # this. Raise it if you feed very long text; it is not a target length.
-    ap.add_argument("--max-tokens", type=int, default=4096,
-                    help="generous upper bound on frames; natural EOS stops first")
+    # Unset, the server's defaults apply (the reference's): the whole context.
+    ap.add_argument("--max-tokens", type=int, default=None,
+                    help="upper bound on frames; natural EOS stops first")
     ap.add_argument("--ref-audio", default=None,
                     help="reference clip to clone the voice from; needs a "
                          "speaker-conditioned checkpoint")
-    ap.add_argument("--accurate-mode", action="store_true",
-                    help="favour a closer clone over expressiveness")
-    ap.add_argument("--noisy-background", action="store_true",
-                    help="tell the model the reference clip has background noise")
+    ap.add_argument("--accurate-mode", action=argparse.BooleanOptionalAction,
+                    help="favour a closer clone over expressiveness (server default: on)")
+    ap.add_argument("--clean-background", action=argparse.BooleanOptionalAction,
+                    help="mark the reference clip as clean (server default: off)")
     args = ap.parse_args()
 
     data = {
         "text": args.text,
         "output_modalities": "audio",
-        # ignore_eos=False => natural EOS (not forced-length). max_output_tokens
-        # is only a generous cap.
-        "model_kwargs": json.dumps({
+        # Send only what was asked for, so the server's defaults apply.
+        "model_kwargs": json.dumps({k: v for k, v in {
             "max_output_tokens": args.max_tokens,
-            "ignore_eos": False,
             "accurate_mode": args.accurate_mode,
-            "clean_speaker_background": not args.noisy_background,
-        }),
+            "clean_speaker_background": args.clean_background,
+        }.items() if v is not None}),
     }
     files = None
     if args.ref_audio:
@@ -99,7 +96,8 @@ def main() -> int:
     write_wav(pcm, args.output)
     audio_s = len(pcm) / (SAMPLE_RATE * SAMPLE_WIDTH)
     frames = len(pcm) // (SAMPLE_WIDTH * 512)  # 512 audio samples per frame
-    capped = " (HIT CAP — raise --max-tokens)" if frames >= args.max_tokens else ""
+    capped = (" (HIT CAP — raise --max-tokens)"
+              if args.max_tokens is not None and frames >= args.max_tokens else "")
     print(f"Received {chunks} chunks, {len(pcm)} bytes, "
           f"{audio_s:.2f}s (~{frames} frames){capped} -> {args.output}")
     return 0

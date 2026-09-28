@@ -167,6 +167,12 @@ zonos2 = [
     "safetensors",
 ]
 
+# Text normalization for Zonos2 ("$5.32" -> "five dollars ..."); optional and
+# kept out of `all`: it pins pynini and pulls pandas.
+zonos2-norm = [
+    "nemo_text_processing>=1.1",
+]
+
 pi05 = [
     "flashinfer-python>=0.6.4",
     "huggingface-hub",

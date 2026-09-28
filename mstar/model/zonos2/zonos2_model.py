@@ -24,6 +24,7 @@ the LLM, and ``dac_chunk`` on the DAC.
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 
@@ -90,7 +91,9 @@ class Zonos2Model(Model):
         # They override the checkpoint config. This follows the pi05 pattern.
         self._yaml_overrides = dict(kwargs)
         self.config = config or self._load_config()
-        self.sampling_params = TTSSamplingParams()
+        # The reference's default budget is the whole context; check_stop clamps
+        # it to what the prompt leaves.
+        self.sampling_params = TTSSamplingParams(max_tokens=self.config.max_position_embeddings)
         self._prompt_builder = TTSPromptBuilder(
             n_codebooks=self.config.n_codebooks,
             audio_pad_id=self.config.audio_pad_id,
@@ -101,6 +104,7 @@ class Zonos2Model(Model):
             accurate_mode_num_buckets=self.config.accurate_mode_num_buckets,
         )
         self._submodule_cache: dict[str, torch.nn.Module | None] = {}
+        self._text_normalizer = None  # built on the first request that needs it
 
     def _load_config(self) -> Zonos2Config:
         """Build the config from the ``params.json`` of the checkpoint.
@@ -464,28 +468,26 @@ class Zonos2Model(Model):
         # Reject bad knobs here: this runs in the data worker, so it is a 400.
         self.sampling_params.for_request(kwargs, self.config.max_repetition_window)
         self._check_max_output_tokens(kwargs)
-        speaking_rate_enabled = kwargs.get("speaking_rate_enabled", False)
-        if not isinstance(speaking_rate_enabled, bool):
-            raise ValueError(
-                f"speaking_rate_enabled must be true or false, got {speaking_rate_enabled!r}."
-            )
+        flags = self._request_flags(kwargs)
 
+        prompt = self._normalize_text(prompt, kwargs.get("language"), flags)
         frames = self._prompt_builder.build(
             prompt,
             speaker=speaker,
-            clean_speaker_background=bool(kwargs.get("clean_speaker_background", True)),
-            accurate_mode=bool(kwargs.get("accurate_mode", False)),
+            clean_speaker_background=flags["clean_speaker_background"],
+            accurate_mode=flags["accurate_mode"],
             speaking_rate_bucket=resolve_speaking_rate_bucket(
                 self.config,
                 speaking_rate_bucket=kwargs.get("speaking_rate_bucket"),
                 speaking_rate=kwargs.get("speaking_rate"),
                 speed=kwargs.get("speed"),
-                speaking_rate_enabled=speaking_rate_enabled,
+                speaking_rate_enabled=flags["speaking_rate_enabled"],
             ),
             quality_buckets=resolve_quality_buckets(
                 self.config,
                 quality_buckets=kwargs.get("quality_buckets"),
                 quality_values=kwargs.get("quality_values"),
+                quality_enabled=flags["quality_enabled"],
             ),
         )  # (num_frames, n_codebooks + 1)
         self._check_prompt_fits(prompt, frames.shape[0])
@@ -494,6 +496,43 @@ class Zonos2Model(Model):
         if speaker_embedding is not None:
             out["speaker_embedding"] = [speaker_embedding]
         return out
+
+    def _normalize_text(self, text: str, language, flags: dict[str, bool]) -> str:
+        """Spoken-form text when normalization is on for the deployment and request."""
+        language = "en_us" if language is None else language
+        if not isinstance(language, str):
+            raise ValueError(f"language must be a string, got {language!r}.")
+        if not (self.config.text_normalization and flags["text_normalization"]):
+            return text
+        if self._text_normalizer is None:
+            from mstar.model.zonos2.textnorm import TextNormalizer
+
+            root = os.path.join(
+                self.cache_dir or os.path.expanduser("~/.cache"), "zonos2_textnorm",
+            )
+            self._text_normalizer = TextNormalizer(root)
+        return self._text_normalizer.normalize(text, language)
+
+    # Boolean request flags and their defaults, which are the reference's.
+    _FLAG_DEFAULTS = {
+        "accurate_mode": True,
+        "clean_speaker_background": False,
+        "quality_enabled": True,
+        "speaking_rate_enabled": False,
+        "text_normalization": True,
+    }
+
+    def _request_flags(self, kwargs: dict) -> dict[str, bool]:
+        """The request's boolean flags over the defaults; reject a non-bool."""
+        flags = {}
+        for name, default in self._FLAG_DEFAULTS.items():
+            value = kwargs.get(name)
+            if value is None:
+                value = default
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be true or false, got {value!r}.")
+            flags[name] = value
+        return flags
 
     def _check_max_output_tokens(self, kwargs: dict) -> None:
         """Reject a frame budget too small to produce audio.
@@ -564,6 +603,8 @@ class Zonos2Model(Model):
             return None
         tensor = value if isinstance(value, torch.Tensor) else torch.tensor(value)
         tensor = tensor.to(torch.float32).reshape(-1)
+        if not torch.isfinite(tensor).all():
+            raise ValueError("speaker_embedding contains NaN or infinite values.")
         expected = self.config.speaker_embedding_dim
         if tensor.numel() != expected:
             raise ValueError(

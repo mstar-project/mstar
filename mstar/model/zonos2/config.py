@@ -99,6 +99,9 @@ class Zonos2Config:
     # The longest reference clip a clone request may send; longer ones get a
     # 400. The encoder embeds the whole clip on the LLM's GPU.
     speaker_clip_max_seconds: float = 30.0
+    # Written-to-spoken text normalization (the zonos2-norm extra). On by
+    # default, as in the reference; a request can still turn it off.
+    text_normalization: bool = True
     # The largest repetition_window a request may ask for; it sets the ring width.
     max_repetition_window: int = 256
 

@@ -94,6 +94,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
        vocoder), which is installed separately — see `descript-audio-codec (Zonos2)`_.
        **Voice cloning additionally needs** ``transformers`` and ``torchcodec``, which the
        extra does not pull in — see `Qwen speech encoder (Zonos2 voice cloning)`_.
+   * - ``.[zonos2-norm]``
+     - Optional Zonos2 text normalization ("$5.32" → "five dollars thirty two cents"):
+       ``nemo_text_processing`` (pins ``pynini``; pulls ``pandas``). Not part of ``.[all]``.
+       Without it, text is spoken as written. See `Text normalization (Zonos2)`_.
    * - ``.[pi05]``
      - Pi0.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``.
@@ -286,6 +290,22 @@ module files at load time; the shared ``HF_HOME`` default is often read-only):
 
 ``test/zonos2/launch_server_zonos2.sh`` sets ``HF_MODULES_CACHE`` for you. Text-only serving
 needs none of this — drop the ``speaker_encoder`` node group from the config YAML.
+
+Text normalization (Zonos2)
+---------------------------
+
+Like the reference server, Zonos2 reads numbers, money, times and abbreviations in spoken
+form when ``.[zonos2-norm]`` is installed:
+
+.. code-block:: bash
+
+   pip install -e ".[zonos2-norm]"
+
+The first request in each language builds NeMo's grammars (about 20 s for English) and caches
+them under ``<cache dir>/zonos2_textnorm``; later server starts load them in under a second.
+Normalization never fails a request: without the extra, or on a normalizer error, the text
+is spoken as written. Turn it off per request with ``"text_normalization": false``, or for
+a deployment with ``text_normalization: false`` in the YAML ``model_kwargs``.
 
 Matching your CUDA toolkit
 --------------------------

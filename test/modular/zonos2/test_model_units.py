@@ -450,6 +450,7 @@ def test_emb_norm_keeps_residual_dtype_when_rms_norm_upcasts(monkeypatch):
 def _clone_model(**kw):
     from mstar.model.zonos2.zonos2_model import Zonos2Model
 
+    kw.setdefault("text_normalization", False)  # keep prompts independent of NeMo
     cfg = Zonos2Config(speaker_enabled=True, **kw)
     return Zonos2Model("Zyphra/ZONOS2", config=cfg, skip_weight_loading=True)
 
@@ -547,3 +548,98 @@ def test_speed_is_ignored_unless_speaking_rate_is_enabled():
     assert torch.equal(_prompt(model, speaking_rate_bucket=1), plain)
     enabled = _prompt(model, speaking_rate_bucket=1, speaking_rate_enabled=True)
     assert enabled.shape[0] == plain.shape[0] + 1              # one rate token
+
+
+# -- defaults match the reference server ---------------------------------------
+_TS_BUCKETS = ("0-0.1", "0.1-0.25", "0.25-0.4", "0.4-0.5", "0.5+")
+
+
+def _reference_shaped_model(**kw):
+    """Quality features, background and accurate-mode markers, like the release."""
+    quality = {"lufs": ("-1000--20", "-20+"), "trailing_silence_s": _TS_BUCKETS}
+    return _clone_model(
+        text_vocab=448 + 2 + len(_TS_BUCKETS) + 2 + 1,
+        quality_features=tuple(quality), quality_buckets=quality,
+        quality_num_buckets=2 + len(_TS_BUCKETS),
+        speaker_background_token_enabled=True, accurate_mode_token_enabled=True, **kw,
+    )
+
+
+def _clone_prompt(model, **kwargs):
+    return model.process_prompt(
+        "Hi.", ["audio", "text"], ["audio"],
+        tensors={"audio_inputs": [torch.zeros(24_000)]}, **kwargs,
+    )["text_inputs"][0]
+
+
+def test_defaults_are_the_reference_servers():
+    model = _reference_shaped_model()
+    reference = {
+        "accurate_mode": True, "clean_speaker_background": False,
+        "quality_buckets": {"trailing_silence_s": 3},
+    }
+    assert torch.equal(_clone_prompt(model), _clone_prompt(model, **reference))
+    old = {"accurate_mode": False, "clean_speaker_background": True, "quality_enabled": False}
+    assert not torch.equal(_clone_prompt(model), _clone_prompt(model, **old))
+    assert model.get_max_output_tokens() == model.config.max_position_embeddings
+
+
+def test_quality_default_needs_the_feature_and_can_be_turned_off():
+    model = _reference_shaped_model()
+    off = _clone_prompt(model, quality_enabled=False)
+    assert off.shape[0] == _clone_prompt(model).shape[0] - 1   # the silence token
+    bare = _clone_model()                                      # no quality features
+    assert torch.equal(_clone_prompt(bare), _clone_prompt(bare, quality_enabled=False))
+
+
+@pytest.mark.parametrize("flag", ["accurate_mode", "quality_enabled", "text_normalization"])
+def test_flags_must_be_booleans(flag):
+    with pytest.raises(ValueError, match=f"{flag} must be true or false"):
+        _prompt(_clone_model(), **{flag: "yes"})
+
+
+def test_non_finite_speaker_embedding_is_rejected():
+    model = _clone_model()
+    emb = [float("nan")] + [0.0] * (model.config.speaker_embedding_dim - 1)
+    with pytest.raises(ValueError, match="NaN or infinite"):
+        _prompt(model, speaker_embedding=emb)
+
+
+# -- text normalization ----------------------------------------------------------
+class _Upper:
+    def normalize(self, text, language):
+        return f"{text.upper()}|{language}"
+
+
+def _normalized(model, **kwargs):
+    """The text the prompt builder was given."""
+    model._text_normalizer = _Upper()
+    seen = []
+    build = model._prompt_builder.build
+    model._prompt_builder.build = lambda text, **kw: seen.append(text) or build(text, **kw)
+    _prompt(model, **kwargs)
+    return seen[0]
+
+
+def test_text_is_normalized_unless_the_request_or_deployment_turns_it_off():
+    assert "HI.|en_us" in _normalized(_clone_model(text_normalization=True))
+    assert "HI.|de" in _normalized(_clone_model(text_normalization=True), language="de")
+    assert "Hi." in _normalized(_clone_model(text_normalization=True), text_normalization=False)
+    assert "Hi." in _normalized(_clone_model(text_normalization=False))
+
+
+def test_normalizer_passes_text_through_without_nemo(monkeypatch):
+    from mstar.model.zonos2 import textnorm
+
+    monkeypatch.setattr(textnorm, "available", lambda: False)
+    n = textnorm.TextNormalizer("/nonexistent")
+    assert n.normalize("It costs $5.", "en_us") == "It costs $5."
+    assert n.normalize("It costs $5.", "xx") == "It costs $5."   # unsupported language
+
+
+def test_real_normalizer_reads_money_and_time(tmp_path):
+    pytest.importorskip("nemo_text_processing")
+    from mstar.model.zonos2.textnorm import TextNormalizer
+
+    out = TextNormalizer(str(tmp_path)).normalize("It costs $1,250.75 at 5:30 PM.", "en_us")
+    assert "dollars" in out and "five thirty" in out
