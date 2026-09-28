@@ -296,7 +296,7 @@ def test_transcription_rejects_unknown_format(client_and_stub):
     assert stub.last_submit is None
 
 
-def test_transcription_404_for_models_without_the_surface(client_and_stub):
+def test_transcription_404_for_models_without_the_endpoint(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
     r = _post(client)
@@ -450,7 +450,7 @@ def test_sequential_seeks_to_the_last_closed_segment(client_and_stub):
     # the unfinished segment neither reaches the transcript nor conditions the next window
     assert stub.submits[1]["model_kwargs"]["initial_prompt"] == "First."
     assert stub.submits[2]["model_kwargs"]["initial_prompt"] == "First. Second."
-    # window 2 starts at 20 s and is a full window; window 3 starts where it ended (50 s)
+    # window 2 starts at 20 s and is a full window, window 3 starts where it ended (50 s)
     assert [round(_wav_seconds(s["file_paths"]["audio"][0]), 2) for s in stub.submits] == [30.0, 30.0, 15.0]
 
 
@@ -516,7 +516,7 @@ def test_pinned_temperature_is_not_escalated(client_and_stub):
     stub.queued_chunks = [_text("<|en|>", "<|0.00|>", loop, "<|29.00|>"), _text("<|0.00|>", " two", "<|15.00|>")]
     r = _post(client, {"model": "whisper_large", "temperature": "0.3"}, filename="long.wav", content=_wav_bytes(45))
     assert r.status_code == 200
-    # window 1 has no prompt to drop, so its loop is kept as is; nothing escalates
+    # window 1 has no prompt to drop, so its loop is kept as is and nothing escalates
     assert [s["model_kwargs"]["temperature"] for s in stub.submits] == [0.3, 0.3]
 
 
