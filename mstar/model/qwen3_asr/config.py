@@ -31,7 +31,7 @@ PREFILL_WALK = "prefill"
 DECODE_WALK = "decode"
 DECODE_LOOP = "decode_loop"
 
-# The model writes ``language {Name}<asr_text>{transcript}``; a forced
+# The model writes ``language {Name}<asr_text>{transcript}``. A forced
 # language is pre-filled into the assistant turn in that same form.
 LANGUAGE_PREFIX = "language "
 ASR_TEXT_TAG = "<asr_text>"
@@ -70,7 +70,7 @@ class Qwen3ASRModelConfig:
     hop_length: int = 160
     n_fft: int = 400
     # one request holds at most this much audio (the reference SDK's
-    # MAX_ASR_INPUT_SECONDS); longer files are split by the caller
+    # MAX_ASR_INPUT_SECONDS). Longer files are split by the caller
     max_audio_seconds: float = 1200.0
     # the reference decodes at most this many tokens per request
     max_new_tokens: int = 4096
