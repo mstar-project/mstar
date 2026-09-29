@@ -200,7 +200,9 @@ class OpenAIAdapter:
         raise NotImplementedError("video generation is not supported by this model")
 
     def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:  # noqa: ARG002
-        raise NotImplementedError("image editing is not supported by this model")
+        # reachable: supports_images also opens /edits, so this is a bad
+        # request (400), not a server error
+        raise ValueError("image editing is not supported by this model")
 
 
 class BagelAdapter(OpenAIAdapter):

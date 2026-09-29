@@ -236,6 +236,18 @@ def test_intake_rejection_is_a_bad_request_on_every_route(
     assert "does not support" in r.json()["error"]["message"]
 
 
+def test_image_edit_on_a_model_without_edits_is_a_bad_request(client_and_stub):
+    # cosmos3 serves /images/generations, which also opens /edits
+    client, stub = client_and_stub
+    stub.model_name = "cosmos3"
+    r = client.post(
+        "/v1/images/edits",
+        files={"image": ("in.png", b"\x89PNG", "image/png")}, data={"prompt": "x"},
+    )
+    assert r.status_code == 400
+    assert "not supported" in r.json()["error"]["message"]
+
+
 def test_chat_stream(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
