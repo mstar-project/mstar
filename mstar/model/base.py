@@ -243,15 +243,17 @@ class ForwardPassArgs:
     step_metadata: dict = field(default_factory=dict)
 
 
+# Every modality a request can name; each model narrows it per direction
+MODALITIES: frozenset[str] = frozenset(
+    {"text", "image", "audio", "video", "action", "scalar", "tensor"}
+)
+
+
 class Model(ABC):
     # Input/output modalities the model handles at intake. The base is the full
     # universe, so a model that doesn't narrow it behaves as before
-    SUPPORTED_INPUT_MODALITIES: frozenset[str] = frozenset(
-        {"text", "image", "audio", "video", "action", "scalar", "tensor"}
-    )
-    SUPPORTED_OUTPUT_MODALITIES: frozenset[str] = frozenset(
-        {"text", "image", "audio", "video", "action", "scalar", "tensor"}
-    )
+    SUPPORTED_INPUT_MODALITIES: frozenset[str] = MODALITIES
+    SUPPORTED_OUTPUT_MODALITIES: frozenset[str] = MODALITIES
 
     def unsupported_modalities(
         self, input_modalities: list[str], output_modalities: list[str],

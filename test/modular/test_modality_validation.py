@@ -56,6 +56,26 @@ def test_submit_request_rejects_unsupported_modality_for_the_model():
     assert server.pending_requests == {}  # nothing dispatched downstream
 
 
+def test_submit_request_checks_the_uploaded_files_too():
+    # the data worker loads every file_paths key, so a declared text-only
+    # request carrying a .wav would still feed BAGEL audio
+    server = _server(BagelModel.__new__(BagelModel))
+    with pytest.raises(UnsupportedModalityError, match="'audio' \\(input\\)"):
+        server.submit_request(
+            text="hi", file_paths={"audio": ["/tmp/x.wav"]},
+            input_modalities=["text"], output_modalities=["text"],
+        )
+    assert server.pending_requests == {}
+
+
+def test_rejection_is_a_400_that_names_what_is_supported():
+    server = _server(BagelModel.__new__(BagelModel))
+    with pytest.raises(UnsupportedModalityError) as e:
+        server.submit_request(input_modalities=["audio"], output_modalities=["text"])
+    assert e.value.status_code == 400
+    assert "it takes image, text in and image, text out" in str(e.value)
+
+
 def test_submit_request_accepts_a_supported_combination():
     server = _server(BagelModel.__new__(BagelModel))
     rid = server.submit_request(
@@ -96,6 +116,9 @@ ACCEPTED = [
     ("qwen3_omni", ["image", "text"], ["text"]),
     ("qwen3_omni", ["audio", "text"], ["text"]),
     ("qwen3_omni", ["video", "text"], ["text"]),
+    # benchmark/base.py asks for audio alone; text still comes with it
+    ("qwen3_omni", ["audio", "text"], ["audio"]),
+    ("qwen3_omni", ["image", "text"], ["audio"]),
     ("orpheus", ["text"], ["audio"]),
     ("qwen3_tts", ["text"], ["audio"]),
     ("cosmos3", ["text"], ["image"]),
@@ -107,6 +130,10 @@ ACCEPTED = [
     ("wan22", ["image", "text"], ["video"]),
     ("vjepa2", ["video"], ["video"]),
     ("vjepa2_ac", ["video"], ["video"]),
+    # benchmark/request.py appends text to every non-text input list
+    ("vjepa2_ac", ["video", "text"], ["video"]),
+    # test/vjepa2/video_request_mpc.sh
+    ("vjepa2_ac", ["video"], ["scalar", "tensor", "video"]),
     ("whisper_large", ["audio"], ["text"]),
     # The chat adapter derives in_mods from the parts as written, so a text
     # prompt can ride along with the attachment. Whisper ignores it
@@ -130,7 +157,10 @@ REJECTED = [
     ("higgs_audio", ["audio"], ["audio"]),
     ("orpheus", ["audio"], ["audio"]),
     ("qwen3_tts", ["text"], ["video"]),
-    ("vjepa2", ["text"], ["video"]),
+    ("vjepa2", ["image"], ["video"]),
+    # only the AC predictor's MPC walk emits these
+    ("vjepa2", ["video"], ["scalar"]),
+    ("vjepa2", ["video"], ["tensor"]),
     ("wan22", ["text"], ["audio"]),
     ("pi05", ["audio"], ["action"]),
     ("pi05", ["image", "text"], ["text"]),
@@ -171,3 +201,22 @@ def test_declarations_stay_inside_the_known_universe(name):
     cls = _model_cls(name)
     assert cls.SUPPORTED_INPUT_MODALITIES <= SUPPORTED_MODALITIES
     assert cls.SUPPORTED_OUTPUT_MODALITIES <= SUPPORTED_MODALITIES
+
+
+def test_vjepa2_fails_a_request_with_no_video():
+    # text passes intake (the benchmark sends it with the video); alone it must
+    # fail in process_prompt, not hang the walk
+    cls = _model_cls("vjepa2")
+    with pytest.raises(ValueError, match="video"):
+        cls.__new__(cls).process_prompt("describe", ["text"], ["video"], tensors={})
+
+
+def test_cosmos3_audio_out_means_the_sound_walk():
+    # audio is the sound band of a video, so asking for it turns sound on, and
+    # asking for it without a video fails instead of returning an image
+    cls = _model_cls("cosmos3")
+    model = cls(model_path_hf="unused", skip_weight_loading=True)
+    params = model._resolve_gen_params({"num_frames": 17}, ["text"], ["video", "audio"])
+    assert params["generate_sound"] is True
+    with pytest.raises(ValueError, match="sound"):
+        model._resolve_gen_params({}, ["text"], ["audio"])

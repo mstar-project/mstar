@@ -24,6 +24,7 @@ from starlette.concurrency import run_in_threadpool
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.model.base import MODALITIES
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import HF_MODELS
 from mstar.profile.display import pretty_print_profile
@@ -32,13 +33,15 @@ from mstar.utils.logging_config import quiet_noisy_loggers
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MODALITIES = frozenset({"text", "image", "audio", "video", "action", "scalar", "tensor"})
+SUPPORTED_MODALITIES = MODALITIES
 
 
 class UnsupportedModalityError(ValueError):
     """A request asked for a modality the loaded model can't handle. Raised at
     intake so the HTTP layer returns 400 instead of accepting it and failing
     downstream."""
+
+    status_code = 400
 
 
 # Extension-based modality detection for uploaded files.
@@ -278,18 +281,20 @@ class APIServer:
         if request_id is None:
             request_id = str(uuid.uuid4())
 
-        # Reject at intake anything the loaded model has no encoder/decoder for
+        # Reject at intake anything the loaded model has no encoder/decoder for.
+        # Uploads count too: the data worker loads every file_paths key
+        arrived = list(dict.fromkeys([*input_modalities, *(file_paths or {})]))
         if self.model is not None:
-            bad = self.model.unsupported_modalities(
-                input_modalities, output_modalities
-            )
+            bad = self.model.unsupported_modalities(arrived, output_modalities)
             if bad:
                 detail = ", ".join(f"{m!r} ({direction})" for m, direction in bad)
                 raise UnsupportedModalityError(
-                    f"model {self.model_name!r} does not support: {detail}"
+                    f"model {self.model_name!r} does not support: {detail}; it takes "
+                    f"{', '.join(sorted(self.model.SUPPORTED_INPUT_MODALITIES))} in and "
+                    f"{', '.join(sorted(self.model.SUPPORTED_OUTPUT_MODALITIES))} out"
                 )
         else:
-            for m in input_modalities + output_modalities:
+            for m in arrived + output_modalities:
                 if m not in SUPPORTED_MODALITIES:
                     raise UnsupportedModalityError(f"unsupported modality: {m!r}")
 
