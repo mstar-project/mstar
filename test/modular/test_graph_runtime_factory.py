@@ -22,6 +22,7 @@ sys.path.insert(0, ".")
 
 import torch  # noqa: F401  (import order: torch before mstar internals)
 
+from mstar.communication.codec import WireCodec
 from mstar.communication.tensor_store import (
     PythonTensorBookkeeping,
     TensorStore,
@@ -68,8 +69,10 @@ def test_the_default_is_auto_and_takes_rust_where_it_is_built(monkeypatch):
     from mstar.communication.tensor_store import RustTensorBookkeeping
     from mstar.graph.runtime.rust import RustGraphRuntime
 
+    comm = RustZMQCommunicator.__new__(RustZMQCommunicator)
+    comm.codec = WireCodec
     runtime = _make_graph_runtime(**_kwargs(
-        communicator=RustZMQCommunicator.__new__(RustZMQCommunicator),
+        communicator=comm,
         bookkeeping=RustTensorBookkeeping(),
     ))
     assert isinstance(runtime, RustGraphRuntime)
@@ -145,6 +148,7 @@ def test_rust_refuses_a_python_bookkeeper(monkeypatch):
     from mstar.communication.rust_communicator import RustZMQCommunicator
 
     comm = RustZMQCommunicator.__new__(RustZMQCommunicator)
+    comm.codec = WireCodec
     with pytest.raises(ValueError, match="Rust TensorBookkeeping"):
         _make_graph_runtime(**_kwargs(
             communicator=comm, bookkeeping=PythonTensorBookkeeping(),
@@ -162,6 +166,7 @@ def test_one_selects_the_rust_runtime(monkeypatch):
     from mstar.graph.runtime.rust import RustGraphRuntime
 
     comm = RustZMQCommunicator.__new__(RustZMQCommunicator)
+    comm.codec = WireCodec
     bookkeeping = RustTensorBookkeeping()
     runtime = _make_graph_runtime(**_kwargs(
         communicator=comm, bookkeeping=bookkeeping,

@@ -2230,13 +2230,11 @@ class Worker:
         # TODO: may need to refine this based on how it affects performance?
         if self.device.type != "cpu" and batch_N.batch.request_to_worker_graph:
             if batch_N.node_batch.completion_event is not None:
-                if self.enable_nvtx:
-                    range_push("worker.postprocess.completion_event_sync", synchronize=False)
-                batch_N.node_batch.completion_event.synchronize()
-                if self.enable_nvtx:
-                    range_pop(synchronize=False)
+                with self._span("worker.postprocess.event_sync"):
+                    batch_N.node_batch.completion_event.synchronize()
             else:
-                torch.accelerator.synchronize(self.device)
+                with self._span("worker.postprocess.device_sync"):
+                    torch.accelerator.synchronize(self.device)
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
@@ -2251,12 +2249,18 @@ class Worker:
         ):
             per_request_info[rid].dynamic_loop_iter_counts.update(new_iters)
 
-        # Check for stops
+        # Check for stops. Prematerialising pulls sampled tokens to the host,
+        # so this can carry a device transfer as well as the stop logic.
+        _t_stop = _time.perf_counter() if self._phase_period else 0.0
         engine = self.engine_manager.get_engine(batch_N.node_name)
         cpu_outputs = self._prematerialize_for_check_stop(
             outputs, batch_N.node_batch.completion_event,
         )
         stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs)
+        if self._phase_period:
+            self._phase_record(
+                "worker.postprocess.check_stop", _time.perf_counter() - _t_stop,
+            )
         # the same host copy, before stops, so a request ending here still indexes its pages
         engine.extend_prefix_chains(batch_N.node_batch, cpu_outputs)
         if batch_N.node_batch.failed_requests:
@@ -2310,6 +2314,7 @@ class Worker:
         # flat columns come back already built: the manager fills them as it
         # mints, so nothing is keyed by request and signal only to be taken
         # apart again here.
+        _t_store = _time.perf_counter() if self._phase_period else 0.0
         stored = self.tensor_manager.store_and_return_tensor_info_batch(
             rids, outputs, signals,
             node_name=batch_N.node_name,
@@ -2326,7 +2331,14 @@ class Worker:
         # and a 128-request batch has hundreds of them. The count is uniform,
         # so it crosses as a scalar rather than a list built per batch.
         self.tensor_manager.increment_ref_batch_uniform(flat_uuids, 1)
+        if self._phase_period:
+            self._phase_record(
+                "worker.postprocess.store_tensors",
+                _time.perf_counter() - _t_store,
+            )
 
+        # The graph runtime's own share of postprocess: the routing call.
+        _t_route = _time.perf_counter() if self._phase_period else 0.0
         route_output = self._graph_runtime.complete_and_route_batch(
             RouteInput(
                 partition=batch_N.partition,
@@ -2341,6 +2353,10 @@ class Worker:
                 num_tensors=num_tensors,
             ),
         )
+        if self._phase_period:
+            self._phase_record(
+                "worker.postprocess.route", _time.perf_counter() - _t_route,
+            )
 
         # Normally empty: cleanup_consumed_inputs ran above and took them. Not
         # empty if a completion ever precedes it, and then nobody else will.
@@ -2350,7 +2366,8 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
-        self._register_outputs(route_output)
+        with self._span("worker.postprocess.register_outputs"):
+            self._register_outputs(route_output)
 
         # send outputs
         if self.enable_nvtx:
@@ -2392,15 +2409,15 @@ class Worker:
             route_output.new_token_output_idxs,
             flat_rids, flat_uuids, signals, signal_idxs,
         )
+        # Timed apart from the send: these comprehensions are per rid, and
+        # building them is the worker's cost, not the runtime's.
+        _t_prep = _time.perf_counter() if self._phase_period else 0.0
         needs_info = route_output.rids_needing_request_info
         info_rids = (
             send_rids if needs_info is None
             else [rid for rid in send_rids if rid in needs_info]
         )
-        # Main loop only: the runtime holds `&mut self` across its GIL
-        # release, so a concurrent caller gets "Already mutably
-        # borrowed" rather than blocking.
-        self._graph_runtime.send_outputs(SendInput(
+        send_input = SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
                 info_rids,
@@ -2419,7 +2436,18 @@ class Worker:
             ),
             profiling=self._profiling_payloads(send_rids) if self.enable_prof
             else None,
-        ))
+        )
+        _t_send = _time.perf_counter() if self._phase_period else 0.0
+        if self._phase_period:
+            self._phase_record("worker.postprocess.send_prep", _t_send - _t_prep)
+        # Main loop only: the runtime holds `&mut self` across its GIL
+        # release, so a concurrent caller gets "Already mutably
+        # borrowed" rather than blocking.
+        self._graph_runtime.send_outputs(send_input)
+        if self._phase_period:
+            self._phase_record(
+                "worker.postprocess.send", _time.perf_counter() - _t_send,
+            )
 
         if self.enable_nvtx:
             range_pop(synchronize=False)
@@ -2791,6 +2819,12 @@ class Worker:
         phase_iter = [0]
         _phase_record = self._phase_record
 
+        # Requests in flight per iteration over the window. Reported beside
+        # the timings because it is what separates ramp-up, steady state and
+        # drain: a phase mean averaged across those is not a measurement of
+        # anything. ``benchmark/worker_phases`` segments on it.
+        phase_bs: list[int] = []
+
         def _phase_flush() -> None:
             if phase_period <= 0 or phase_iter[0] % phase_period != 0:
                 return
@@ -2805,11 +2839,13 @@ class Worker:
                 p95 = vs[min(n - 1, int(n * 0.95))] * 1000
                 mean = (sum(vs) / n) * 1000
                 parts.append(f"{name}: p50={p50:.2f}ms p95={p95:.2f}ms mean={mean:.2f}ms n={n}")
+            bs = (sum(phase_bs) / len(phase_bs)) if phase_bs else 0.0
             logger.info(
-                "Worker %s phase-timing iter=%d: %s",
-                self.worker_id, phase_iter[0], " | ".join(parts),
+                "Worker %s phase-timing iter=%d bs=%.2f: %s",
+                self.worker_id, phase_iter[0], bs, " | ".join(parts),
             )
             phase_buf.clear()
+            phase_bs.clear()
 
         # Reset per iteration (not just where they're first used) so the
         # error handler below sees only this iteration's work — a stale
@@ -3120,6 +3156,7 @@ class Worker:
                         consecutive_spec_steps += 1
                     if phase_period:
                         _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                        phase_bs.append(len(spec_pending.batch.request_to_worker_graph))
                         phase_iter[0] += 1
                         _phase_flush()
                     _set_pending(spec_pending)
@@ -3179,6 +3216,7 @@ class Worker:
                 # Same accounting as the speculative path above
                 if phase_period:
                     _phase_record("iter_total", _time.perf_counter() - _iter_start)
+                    phase_bs.append(len(batch.request_to_worker_graph))
                     phase_iter[0] += 1
                     _phase_flush()
             except Exception as e:
