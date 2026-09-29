@@ -26,7 +26,7 @@ from mstar.api_server.request_types import (
 )
 from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
-from mstar.engine.resources.kv.config import KVSpec
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.model.base import Model, ProcessPromptOutput
@@ -100,7 +100,8 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     apply_yaml_overrides(specs, model_config)
     return {
         spec.resource_key: spec.config.page_size
-        for spec in specs if isinstance(spec, KVSpec)
+        for spec in specs
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
     }
 
 

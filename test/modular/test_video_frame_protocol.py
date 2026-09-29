@@ -208,11 +208,14 @@ class _ReadyTensorManager:
     def start_read_tensors(self, request_id, graph_edges):
         pass
 
-    def get_tensor(self, request_id, uuid):
-        return self.tensors_by_request[request_id][uuid]
+    def get_tensor(self, uuid):
+        for tensors in self.tensors_by_request.values():
+            if uuid in tensors:
+                return tensors[uuid]
+        raise KeyError(uuid)
 
-    def dereference(self, request_id, uuid):
-        self.dereferenced.append((request_id, uuid))
+    def dereference(self, uuid):
+        self.dereferenced.append(uuid)
 
     def cleanup_request(self, request_id):
         self.cleaned.append(request_id)
@@ -266,10 +269,7 @@ def test_data_worker_emits_complete_metadata_and_monotonic_frame_indices():
     assert all(chunk.metadata["pixel_format"] == "rgb24" for chunk in chunks)
     assert all(chunk.metadata["producer"] == "decoder" for chunk in chunks)
     assert worker.request_output_state["request"].frame_index == 8
-    assert worker.tensor_manager.dereferenced == [
-        ("request", "first"),
-        ("request", "second"),
-    ]
+    assert worker.tensor_manager.dereferenced == ["first", "second"]
 
 
 def test_data_worker_tracks_interleaved_frame_indices_per_request():

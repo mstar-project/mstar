@@ -23,7 +23,7 @@ import pytest
 import torch
 
 from mstar.engine.resources import (
-    KVConfig,
+    PagedKVConfig,
     PositionConfig,
     StepContext,
     StepRunner,
@@ -126,7 +126,7 @@ class _Node:
         ).eval()
         _initialise(self.llm)
 
-        kv_config = KVConfig(
+        kv_config = PagedKVConfig(
             num_layers=config.num_hidden_layers,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.hidden_size // config.num_attention_heads,

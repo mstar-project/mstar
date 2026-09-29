@@ -323,8 +323,8 @@ def test_a_failed_output_releases_the_outputs_held_behind_it():
     )
     wt.tensor_manager = SimpleNamespace(
         get_ready_tensors=lambda: {"r1": [edge]},
-        get_tensor=lambda request_id, uuid: object(),
-        dereference=lambda request_id, uuid: None,
+        get_tensor=lambda uuid: object(),
+        dereference=lambda uuid: None,
     )
 
     assert wt._process_read_tensors() is True

@@ -148,7 +148,6 @@ def _fwd_info(
         resource_configs={},
         step_metadata={"is_prefill": graph_walk == PRIME_WALK, "num_steps": num_steps},
         resource_publish_info={},
-        loop_stop_times={},
         dynamic_loop_iter_counts=(
             {} if loop_iter is None else {ROLLOUT_LOOP_NAME: loop_iter}
         ),
