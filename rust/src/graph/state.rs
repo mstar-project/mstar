@@ -1030,18 +1030,6 @@ mod tests {
         let mut it = StrToId::default();
         let nodes = vec![node("vocoder", &["codes"], &["codes"], vec![])];
         let g = compile_one(&mut it, &nodes, &[]).unwrap();
-<<<<<<< HEAD
-        let vocoder = 0;
-        let mut st = RequestState::new(g);
-        assert!(st.is_ready_for_streaming(vocoder), "seeded at construction");
-
-        // Chunk 1 fills it: plain-ready now, so the streaming bit is dropped.
-        assert!(st.ingest(vocoder, 0, vec![t(1)], true, false));
-        assert!(st.is_ready(vocoder));
-        assert!(!st.is_ready_for_streaming(vocoder));
-
-        st.complete(vocoder, &[]);
-=======
         let snac = 0;
         let mut st = RequestState::new(g.clone());
 
@@ -1052,20 +1040,15 @@ mod tests {
 
         st.clear_consumed_inputs(&g, snac);
         st.complete(&g, snac, &[vec![t(100)]]);
->>>>>>> f62daa77a (More perf improvements on the rust side)
 
         // Inputs are gone, so it is no longer plain-ready -- but it takes
         // only streaming inputs, so it must be open to the next chunk.
-        assert!(!st.is_ready(vocoder));
+        assert!(!st.is_ready(snac));
         assert!(
-            st.is_ready_for_streaming(vocoder),
+            st.is_ready_for_streaming(snac),
             "an only-streaming node must accept its next chunk after completing",
         );
-<<<<<<< HEAD
-        assert!(st.ingest(vocoder, 0, vec![t(2)], true, false), "chunk 2 refused");
-=======
         assert!(st.ingest(&g, snac, 0, &[t(2)], false, false));
->>>>>>> f62daa77a (More perf improvements on the rust side)
     }
 
     #[test]
@@ -1076,15 +1059,6 @@ mod tests {
         let nodes = vec![node("talker", &["text", "audio"], &["audio"], vec![])];
         let g = compile_one(&mut it, &nodes, &[]).unwrap();
         let talker = 0;
-<<<<<<< HEAD
-        let mut st = RequestState::new(g);
-        st.ingest(talker, 0, vec![t(1)], false, false);
-        st.ingest(talker, 1, vec![t(2)], true, false);
-        assert!(st.is_ready(talker));
-
-        st.complete(talker, &[]);
-        assert!(!st.is_ready_for_streaming(talker));
-=======
         let mut st = RequestState::new(g.clone());
         st.ingest(&g, talker, 0, &[t(1)], false, false);
         st.ingest(&g, talker, 1, &[t(2)], false, false);
@@ -1094,7 +1068,6 @@ mod tests {
             !st.is_ready_for_streaming(talker),
             "`text` is still missing, so a chunk must not be accepted"
         );
->>>>>>> f62daa77a (More perf improvements on the rust side)
     }
 
     #[test]
