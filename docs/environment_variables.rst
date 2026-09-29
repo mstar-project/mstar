@@ -37,6 +37,17 @@ Communication
        mode to fall back to. ``0``: always the Python runtime. Resolved once
        per process, because it also selects the tensor bookkeeper the
        runtime and the tensor store must share.
+   * - ``MSTAR_WIRE_CODEC``
+     - ``msgpack``
+     - How messages are encoded on every communicator edge (see
+       :func:`mstar.communication.codec.default_codec`). ``msgpack``: the
+       typed encoding in :mod:`mstar.communication.wire`, language-neutral
+       so an edge can terminate in a Rust process. ``pickle``: the old
+       Python-only wire, kept for bisecting a wire problem. Both ends of an
+       edge must agree, so this is all-or-nothing for a mesh -- one process
+       set differently cannot talk to its peers. ``pickle`` is incompatible
+       with the Rust graph runtime, which builds its frames as typed
+       msgpack; that pairing fails at startup rather than mixing wires.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a

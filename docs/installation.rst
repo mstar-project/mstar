@@ -309,6 +309,16 @@ runs on the pure-Python paths as before. Migrated so far (see
   transport; requires the extension, interoperates on the same descriptor
   wire (and depends on the transport above only in the sense that both ship
   in the same extension).
+* **Message encoding** — ``MSTAR_WIRE_CODEC``: typed msgpack rather than
+  pickle, which is what lets one end of an edge be Rust. On by default,
+  extension or not; ``pickle`` is kept for bisecting a wire problem.
+* **Graph runtime** — ``MSTAR_RUST_GRAPH``: graph state, scheduling,
+  routing and speculation, and the frames a worker sends. Unlike the others
+  this is not free-standing — it holds a share of the Rust transport and of
+  the Rust tensor bookkeeper, so it runs only where ``MSTAR_RUST_ZMQ``
+  resolved to Rust and the msgpack codec is in use. ``AUTO`` takes it
+  wherever that holds, so on a machine with the extension built, installing
+  it is what moves a worker onto the Rust runtime.
 
 Build the extension into your environment with `maturin
 <https://www.maturin.rs>`_ (needs a Rust toolchain; ``rustup`` works):
@@ -324,7 +334,23 @@ costs real latency on the hot receive path. Verify with:
 .. code-block:: bash
 
    python -c "import mstar_rust; print('mstar_rust OK')"
-   pytest test/rust/test_rust_communicator.py
+   pytest test/rust
+
+``test/rust`` is skipped wholesale when the extension is not importable, so
+a green run there without the build above proves nothing.
+
+The Rust-side tests need one extra flag. The crate's default features turn on
+``pyo3/extension-module``, which tells pyo3 *not* to link libpython — right
+for the cdylib, which resolves CPython symbols from the interpreter that
+imports it, wrong for ``cargo test``, which is an executable and has to link
+it itself. Without this the link fails on ``undefined symbol:
+PyEval_RestoreThread``:
+
+.. code-block:: bash
+
+   export LD_LIBRARY_PATH="$(python -c 'import sysconfig
+   print(sysconfig.get_config_var("LIBDIR"))')"
+   cargo test --release --no-default-features --manifest-path rust/Cargo.toml
 
 Optional: the Rust HTTP frontend
 --------------------------------
