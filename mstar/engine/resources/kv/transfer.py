@@ -84,7 +84,6 @@ class MooncakeKVTransferInfo:
     session_id: str
     data_ptr: int
     layout: KVLayout
-    reset_generation: int | None = None
 
 
 class MooncakeKVTransferEngine(KVTransferEngine):
@@ -122,7 +121,6 @@ class MooncakeKVTransferEngine(KVTransferEngine):
             session_id=self._transfer_info.session_id,
             data_ptr=self._transfer_info.data_ptr,
             layout=self._transfer_info.layout,
-            reset_generation=reset_generation,
         )
 
     def owns_transfer_info(
@@ -189,7 +187,6 @@ class CudaIpcKVTransferInfo:
     dtype: str
     requires_grad: bool
     layout: KVLayout
-    reset_generation: int | None = None
 
 
 
@@ -240,7 +237,6 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
             dtype=self._transfer_info.dtype,
             requires_grad=self._transfer_info.requires_grad,
             layout=self._transfer_info.layout,
-            reset_generation=reset_generation,
         )
 
     def owns_transfer_info(
@@ -374,7 +370,6 @@ class ShmKVTransferInfo:
     path: str
     page_indices: tuple[int, ...]
     layout: KVLayout
-    reset_generation: int | None = None
     # None accepts descriptors produced before chunked SHM publication.
     chunks: tuple[ShmKVSnapshotChunk, ...] | None = None
 
@@ -479,7 +474,6 @@ class ShmKVTransferEngine(KVTransferEngine):
             path=path,
             page_indices=pages,
             layout=self._kv_cache.layout,
-            reset_generation=reset_generation,
             chunks=(*earlier_chunks, chunk) if earlier_chunks else (chunk,),
         )
         self._published[key] = (version, info)

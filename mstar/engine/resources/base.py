@@ -342,6 +342,11 @@ class PublishedInfo(ABC):
     def update(self, other: "PublishedInfo") -> None:
         ...
 
+    @abstractmethod
+    def clone(self) -> "PublishedInfo":
+        """Return independent publication metadata for deferred sending."""
+        ...
+
 
 def build_resource(spec: NodeResourceSpec, info: EngineResourceInfo) -> Resource:
     return spec.resource_class.build(spec, info)

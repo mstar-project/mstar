@@ -10,6 +10,7 @@ from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVConfig, KVReqConfig
 from mstar.engine.resources.kv.manager import (
+    CacheStream,
     KVManager,
     KVSequenceInfo,
     PublishedKVInfo,
@@ -25,6 +26,14 @@ from mstar.engine.resources.kv.transfer import (
 )
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.bagel.submodules import CombineCFGSubmodule
+
+
+def test_offload_reset_preserves_remote_content_epoch():
+    stream = CacheStream(remote_reset_generation=7)
+    stream.reset(content_reset=False)
+    assert stream.remote_reset_generation == 7
+    stream.reset()
+    assert stream.remote_reset_generation is None
 
 
 def _bare_model() -> BagelModel:
@@ -225,7 +234,6 @@ def test_shm_publication_refreshes_when_reset_generation_changes(tmp_path):
     )
 
     assert refreshed.path != info.path
-    assert refreshed.reset_generation == 1
     assert producer.owns_transfer_info(info, "request", "main")
     assert producer.owns_transfer_info(refreshed, "request", "main")
     torch.testing.assert_close(
@@ -502,9 +510,9 @@ def _shm_publication(
                     path=str(path),
                     page_indices=(0,),
                     layout=manager.kv_cache.layout,
-                    reset_generation=reset_generation,
                 ),
                 page_indices=[0],
+                reset_generation=reset_generation,
             )
         },
     )
