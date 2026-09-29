@@ -246,7 +246,7 @@ class Lockstep:
                     wg_ids=ParallelList([rid], [WG_ID]),
                     tensors=list(uuids),
                     num_tensors=[len(uuids)] * len(signals),
-                ), s)
+                ))
             _finish_teardown(s, out.freed_inputs)
             return (sorted(out.register_uuids), sorted(out.register_rids),
                     sorted(out.new_token_output_idxs),

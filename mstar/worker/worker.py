@@ -15,6 +15,7 @@ from time import sleep
 
 import torch
 
+from mstar.communication.codec import WireCodec
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
@@ -101,6 +102,12 @@ def _make_graph_runtime(
         raise ValueError(
             "MSTAR_RUST_GRAPH=1 needs the Rust communicator, but this worker "
             f"built a {type(communicator).__name__}. Set MSTAR_RUST_ZMQ=1."
+        )
+    if not issubclass(communicator.codec, WireCodec):
+        raise ValueError(
+            "MSTAR_RUST_GRAPH=1 needs the msgpack codec, but this worker "
+            f"built a {communicator.codec.__name__}. Set "
+            "MSTAR_WIRE_CODEC=msgpack."
         )
     bookkeeping = tensor_manager.tensor_store.bookkeeping
     if not hasattr(bookkeeping, "_rust"):

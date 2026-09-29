@@ -332,7 +332,6 @@ def test_routing_agrees(pair):
             wg_ids=ParallelList([rid], [WG_ID]),
             tensors=[1, 2], num_tensors=[1, 1],
         ),
-        store,
     )
     assert out.completion_id > 0
     # Both route prefill's outputs into ar_decode locally.
@@ -558,7 +557,6 @@ def test_an_input_is_released_whichever_order_runs(pair, cleanup_first):
                 wg_ids=ParallelList([rid], [WG_ID]),
                 tensors=[200, 201], num_tensors=[1, 1],
             ),
-            store,
         )
 
     if cleanup_first:
@@ -595,7 +593,6 @@ def test_whoever_frees_a_consumed_input_names_it(pair, cleanup_first):
                 output_signals=[], wg_ids=ParallelList([rid], [WG_ID]),
                 tensors=[], num_tensors=[],
             ),
-            store,
         )
         return list(out.freed_inputs.uuids)
 
@@ -627,7 +624,6 @@ def test_removal_purges_routing_parked_for_a_send_that_never_ran(pair):
                 output_signals=[], wg_ids=ParallelList([rid], [WG_ID]),
                 tensors=[], num_tensors=[],
             ),
-            store,
         )
         rt.remove_request(rid)  # aborted before the send
 
@@ -779,7 +775,6 @@ def _one_pass(rt, book, store, rid, uuid):
             wg_ids=ParallelList([rid], [WG_ID]),
             tensors=[uuid], num_tensors=[1],
         ),
-        store,
     )
     return out
 
@@ -878,7 +873,6 @@ def test_a_tensor_read_by_two_workers_holds_two_references(two_consumers):
             wg_ids=ParallelList([rid], [WG_ID]),
             tensors=[1], num_tensors=[1],
         ),
-        store,
     )
 
     # Two outstanding reads: one release must not free it.
@@ -925,7 +919,6 @@ def test_a_batch_of_three_routes_and_stays_schedulable(pair):
             wg_ids=ParallelList(rids, [WG_ID] * len(rids)),
             tensors=uuids, num_tensors=num,
         ),
-        store,
     )
     assert out.completion_id > 0
     # Each rid's outputs went to its OWN ar_decode, so all three are ready.
@@ -964,7 +957,6 @@ def test_a_batch_completes_every_request_not_just_the_first(pair):
             wg_ids=ParallelList(rids, [WG_ID] * len(rids)),
             tensors=uuids, num_tensors=num,
         ),
-        store,
     )
     # Now run the loop body for all three at once and do it again.
     rt.pop_rids("ar_decode", WALK, rids)
@@ -1021,7 +1013,6 @@ def _run_walk(rt, book, store, rid, walk, wg_id, uuid):
             wg_ids=ParallelList([rid], [wg_id]),
             tensors=[uuid], num_tensors=[1],
         ),
-        store,
     )
     return ready
 
@@ -1076,7 +1067,6 @@ def test_a_batch_transitions_together(two_walks):
             wg_ids=ParallelList(rids, [0] * len(rids)),
             tensors=uuids, num_tensors=[1] * len(rids),
         ),
-        store,
     )
     for rid in rids:
         rt.set_walk(rid, "default", "decode")
@@ -1158,7 +1148,6 @@ def test_an_edge_into_a_sibling_local_graph_is_ingested_not_only_sent(
             wg_ids=ParallelList([rid], [0]),
             tensors=[1], num_tensors=[1],
         ),
-        store,
     )
 
     # The sibling graph's node got the input.
@@ -1234,7 +1223,6 @@ def test_a_stream_to_a_sibling_graph_is_reported_local(streams_to_sibling):
             wg_ids=ParallelList([rid], [0]),
             tensors=[1], num_tensors=[1],
         ),
-        store,
     )
     assert out.local_streaming_by_signal.keys() == {"new_token"}, \
         "the chunk was not local"
@@ -1270,7 +1258,6 @@ def test_a_sibling_graph_chunk_is_held_once_not_twice(streams_to_sibling):
             wg_ids=ParallelList([rid], [0]),
             tensors=[1], num_tensors=[1],
         ),
-        store,
     )
     book.dereference(1, 1)
     assert book.can_gc(1), "still held after its only reader released"
@@ -1360,7 +1347,6 @@ def test_a_purely_local_completion_needs_no_request_info():
             wg_ids=ParallelList([rid], [WG_ID]),
             tensors=[1], num_tensors=[1, 0],
         ),
-        store,
     )
     assert out.rids_needing_request_info == frozenset()
 
@@ -1396,7 +1382,6 @@ def test_a_finished_worker_graph_asks_for_request_info(streams_to_sibling):
             wg_ids=ParallelList([rid], [0]),
             tensors=[1], num_tensors=[1],
         ),
-        store,
     )
     assert rid in out.rids_needing_request_info
 
@@ -1551,7 +1536,6 @@ def test_a_loop_inside_a_loop_runs_every_iteration(nested):
                 tensors=[fresh() for _ in signals],
                 num_tensors=[1] * len(signals),
             ),
-            store,
         )
     assert log == [
         "denoiser", "denoiser", "denoiser", "refiner",
@@ -1580,7 +1564,6 @@ def test_the_inner_loop_is_the_one_that_advances(nested):
             wg_ids=ParallelList([rid], [WG_ID]),
             tensors=[901], num_tensors=[1],
         ),
-        store,
     )
     assert rt.get_dynamic_loop_iters([rid], "default").values == [
         {"denoise_loop": 1, "refine_loop": 0}
@@ -1750,7 +1733,7 @@ def _drive_tp(rt, book, store, steps=8):
             partition="default", graph_walk=walk, node_name=node,
             output_signals=("latent",), wg_ids=ParallelList([rid], [wg_id]),
             tensors=[uuid], num_tensors=[1],
-        ), store)
+        ))
     return log
 
 
@@ -1845,7 +1828,6 @@ def _route_one(rt, book, store, rid, node, signal, uuid):
             output_signals=[signal], wg_ids=ParallelList([rid], [WG_ID]),
             tensors=[uuid], num_tensors=[1],
         ),
-        store,
     )
 
 

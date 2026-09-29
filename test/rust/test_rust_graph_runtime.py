@@ -743,7 +743,6 @@ def _route(runtime, rids, node, signals, per_rid_uuids, walk=WALK):
             wg_ids=ParallelList(list(rids), [WG_ID] * len(rids)),
             tensors=flat, num_tensors=counts,
         ),
-        None,
     )
 
 
