@@ -399,7 +399,13 @@ def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
     assert row.input_seq_len == 3
     batch = sub.preprocess(PREFILL_PROMPT_WALK, _engine_inputs(["r0"]), [row])
     assert batch["input_ids"].tolist() == [DE, TRANSCRIBE, NOTS] and "encoder_states" not in batch
-    assert sub.request_state("r0")["prompt_len"] == 3
+    assert sub.request_state("r0")["prompt_lens"] == {PREFILL_PROMPT_WALK: 3}
+    # a retried admit prepares the same walk again and must not count it twice
+    sub.prepare_inputs(
+        PREFILL_PROMPT_WALK, fwd,
+        {"text_inputs": [torch.tensor([DE])], "prompt_tail": [torch.tensor([TRANSCRIBE, NOTS])]},
+    )
+    assert sub.request_state("r0")["prompt_lens"] == {PREFILL_PROMPT_WALK: 3}
 
     detect_row = sub.prepare_inputs(
         DETECT_LANGUAGE_WALK, fwd,
@@ -438,7 +444,7 @@ def test_decoder_check_stop_honors_eos_max_tokens_and_position_table():
             "dynamic_loop_iter_counts": {"decode_loop": decoded},
         })()
 
-    sub.request_state("r").add("prompt_len", 4)
+    sub.request_state("r").add("prompt_lens", {PREFILL_WALK: 4})
     eos = {"new_token": [torch.tensor([EOT])]}
     word = {"new_token": [torch.tensor([1234])]}
     assert sub.check_stop("r", info(PREFILL_WALK, 0), eos) == set()

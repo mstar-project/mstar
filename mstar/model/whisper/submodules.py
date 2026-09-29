@@ -331,8 +331,9 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         else:
             state = self.request_state(fwd_info.rid_handle)
             # The learned position table caps prompt + transcript at
-            # max_target_positions, and check_stop reads this back.
-            state.add("prompt_len", state.get("prompt_len", 0) + seq_len)
+            # max_target_positions, and check_stop reads this back. Set per
+            # walk, not added: a batch whose admit fails is prepared again.
+            state.add("prompt_lens", {**state.get("prompt_lens", {}), graph_walk: seq_len})
             # Timestamps are on when the prompt omits <|notimestamps|>. The
             # detection walk's prompt ends at <|sot|> and says nothing yet.
             prompt = token_ids.tolist() + tensor_inputs.get("prompt_tail", token_ids[:0]).tolist()
@@ -633,7 +634,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         decoded_tokens = request_info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0) + 1
         # prompt + first token + decoded tokens must fit the position table
-        prompt_len = self.request_state(request_id).get("prompt_len", 0)
+        prompt_len = sum(self.request_state(request_id).get("prompt_lens", {}).values())
         positions_left = self.config.max_target_positions - prompt_len - 1 - decoded_tokens
         if (not ignore_eos and token == self.config.eos_token_id) or \
                 decoded_tokens >= request_info.max_tokens or positions_left <= 0:
