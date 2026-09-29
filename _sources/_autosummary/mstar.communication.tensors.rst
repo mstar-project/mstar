@@ -30,9 +30,8 @@ mstar.communication.tensors
       MooncakeCommunicationManager
       MooncakeTransferEngine
       SharedMemoryCommunicationManager
-      TensorAndReferenceInfo
+      StoredOutputs
       TensorCommunicationManager
-      TensorStore
       TensorTransferEngine
       TransferReadInfo
    

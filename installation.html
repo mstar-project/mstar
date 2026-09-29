@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 28, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 29, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -220,13 +220,20 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.tensor_uuid.html">mstar.communication.tensor_uuid</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.wire.html">mstar.communication.wire</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.wire_types.html">mstar.communication.wire_types</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -338,7 +345,10 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 </ul>
 </details></li>
-<li class="toctree-l2"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="environment_variables.html">Environment variables</a></li>
@@ -884,6 +894,16 @@ format as pyzmq.</p></li>
 transport; requires the extension, interoperates on the same descriptor
 wire (and depends on the transport above only in the sense that both ship
 in the same extension).</p></li>
+<li><p><strong>Message encoding</strong> — <code class="docutils literal notranslate"><span class="pre">MSTAR_WIRE_CODEC</span></code>: typed msgpack rather than
+pickle, which is what lets one end of an edge be Rust. On by default,
+extension or not; <code class="docutils literal notranslate"><span class="pre">pickle</span></code> is kept for bisecting a wire problem.</p></li>
+<li><p><strong>Graph runtime</strong> — <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_GRAPH</span></code>: graph state, scheduling,
+routing and speculation, and the frames a worker sends. Unlike the others
+this is not free-standing — it holds a share of the Rust transport and of
+the Rust tensor bookkeeper, so it runs only where <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code>
+resolved to Rust and the msgpack codec is in use. <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> takes it
+wherever that holds, so on a machine with the extension built, installing
+it is what moves a worker onto the Rust runtime.</p></li>
 </ul>
 <p>Build the extension into your environment with <a class="reference external" href="https://www.maturin.rs">maturin</a> (needs a Rust toolchain; <code class="docutils literal notranslate"><span class="pre">rustup</span></code> works):</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>maturin
@@ -893,7 +913,20 @@ maturin<span class="w"> </span>develop<span class="w"> </span>--release<span cla
 <p>Build with <code class="docutils literal notranslate"><span class="pre">--release</span></code> — an unoptimized debug build (maturin’s default)
 costs real latency on the hot receive path. Verify with:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import mstar_rust; print('mstar_rust OK')"</span>
-pytest<span class="w"> </span>test/rust/test_rust_communicator.py
+pytest<span class="w"> </span>test/rust
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">test/rust</span></code> is skipped wholesale when the extension is not importable, so
+a green run there without the build above proves nothing.</p>
+<p>The Rust-side tests need one extra flag. The crate’s default features turn on
+<code class="docutils literal notranslate"><span class="pre">pyo3/extension-module</span></code>, which tells pyo3 <em>not</em> to link libpython — right
+for the cdylib, which resolves CPython symbols from the interpreter that
+imports it, wrong for <code class="docutils literal notranslate"><span class="pre">cargo</span> <span class="pre">test</span></code>, which is an executable and has to link
+it itself. Without this the link fails on <code class="docutils literal notranslate"><span class="pre">undefined</span> <span class="pre">symbol:</span>
+<span class="pre">PyEval_RestoreThread</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">LD_LIBRARY_PATH</span><span class="o">=</span><span class="s2">"</span><span class="k">$(</span>python<span class="w"> </span>-c<span class="w"> </span><span class="s1">'import sysconfig</span>
+<span class="s1">print(sysconfig.get_config_var("LIBDIR"))'</span><span class="k">)</span><span class="s2">"</span>
+cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--release<span class="w"> </span>--no-default-features<span class="w"> </span>--manifest-path<span class="w"> </span>rust/Cargo.toml
 </pre></div>
 </div>
 </section>
@@ -1035,7 +1068,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 28, 2026.
+  Last updated on Sep 29, 2026.
   <br/>
 </p>
   </div>

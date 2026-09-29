@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 28, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 29, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -573,13 +573,20 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensor_uuid.html">mstar.communication.tensor_uuid</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.wire.html">mstar.communication.wire</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.wire_types.html">mstar.communication.wire_types</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -691,7 +698,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 </ul>
 </details></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../environment_variables.html">Environment variables</a></li>
@@ -919,15 +929,47 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="c1">#: Handles for padding rows. Real handles are &gt;= 0 (they index the worker's rid</span>
+<span class="c1">#: table) and -1 is CurrentForwardPassInfo's unstamped default, so counting down</span>
+<span class="c1">#: from -2 collides with neither. A padding row IS its handle everywhere the</span>
+<span class="c1">#: engine keys by rid; the name it was minted from is kept only so logs and</span>
+<span class="c1">#: CurrentForwardPassInfo.request_id stay readable. Memoized per name because a</span>
+<span class="c1">#: submodule keys its per-request state by the handle: one shared value would</span>
+<span class="c1">#: collapse every padding row onto the same state.</span>
+<span class="n">_DUMMY_HANDLE_BASE</span> <span class="o">=</span> <span class="o">-</span><span class="mi">2</span>
+<span class="n">_dummy_handles</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="n">_dummy_names</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+
+
+<div class="viewcode-block" id="dummy_rid_handle">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.dummy_rid_handle">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">dummy_rid_handle</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="n">handle</span> <span class="o">=</span> <span class="n">_dummy_handles</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">handle</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">handle</span> <span class="o">=</span> <span class="n">_dummy_handles</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">_DUMMY_HANDLE_BASE</span> <span class="o">-</span> <span class="nb">len</span><span class="p">(</span><span class="n">_dummy_handles</span><span class="p">)</span>
+        <span class="n">_dummy_names</span><span class="p">[</span><span class="n">handle</span><span class="p">]</span> <span class="o">=</span> <span class="n">name</span>
+    <span class="k">return</span> <span class="n">handle</span></div>
+
+
+
+<div class="viewcode-block" id="dummy_rid_name">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.dummy_rid_name">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">dummy_rid_name</span><span class="p">(</span><span class="n">handle</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The name a padding-row handle was minted from. Debug/logging only."""</span>
+    <span class="k">return</span> <span class="n">_dummy_names</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">handle</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"__cg_unknown_</span><span class="si">{</span><span class="n">handle</span><span class="si">}</span><span class="s2">__"</span><span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="dummy_metadata">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.dummy_metadata">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">dummy_metadata</span><span class="p">(</span>
-    <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">]:</span>
+    <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""Stand-in request info for padding rows, which have no real request."""</span>
     <span class="k">return</span> <span class="p">{</span>
         <span class="n">rid</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">(</span>
-            <span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span>
+            <span class="n">request_id</span><span class="o">=</span><span class="n">dummy_rid_name</span><span class="p">(</span><span class="n">rid</span><span class="p">),</span>
+            <span class="n">rid_handle</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span>
             <span class="n">graph_walk</span><span class="o">=</span><span class="n">graph_walk</span><span class="p">,</span>
             <span class="n">fwd_index</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
             <span class="n">random_seed</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
@@ -1020,29 +1062,35 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_prefix</span> <span class="o">=</span> <span class="n">prefix</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_step_runner</span> <span class="o">=</span> <span class="n">step_runner</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span> <span class="o">=</span> <span class="n">resources</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_held</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_held</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
 
-<div class="viewcode-block" id="DummyRowPool.names">
-<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.names">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">names</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
-        <span class="k">return</span> <span class="p">[</span><span class="sa">f</span><span class="s2">"__cg_</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_prefix</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">__"</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">bs</span><span class="p">)]</span></div>
+<div class="viewcode-block" id="DummyRowPool.handles">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.handles">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">handles</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""``bs`` padding-row handles for ``key``. Negative and stable per</span>
+<span class="sd">        (prefix, key, index), so they never collide with a real request's</span>
+<span class="sd">        handle nor with another pool's rows."""</span>
+        <span class="k">return</span> <span class="p">[</span>
+            <span class="n">dummy_rid_handle</span><span class="p">(</span><span class="sa">f</span><span class="s2">"__cg_</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_prefix</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">__"</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">bs</span><span class="p">)</span>
+        <span class="p">]</span></div>
 
 
 <div class="viewcode-block" id="DummyRowPool.ensure">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.ensure">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">ensure</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">ensure</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""``bs`` rows for ``key``, ingesting any this pool hasn't opened yet."""</span>
         <span class="n">held</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_held</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="p">[])</span>
-        <span class="n">names</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">names</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">bs</span><span class="p">)</span>
-        <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">names</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">held</span><span class="p">):]:</span>
+        <span class="n">rids</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">handles</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">bs</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">held</span><span class="p">):]:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_step_runner</span><span class="o">.</span><span class="n">ingest_request</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
             <span class="n">held</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">names</span></div>
+        <span class="k">return</span> <span class="n">rids</span></div>
 
 
 <div class="viewcode-block" id="DummyRowPool.reset">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.DummyRowPool.reset">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">reset</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">free</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">reset</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">free</span><span class="p">:</span> <span class="nb">bool</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">resource</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_resources</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
                 <span class="n">resource</span><span class="o">.</span><span class="n">reset_request</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="n">free</span><span class="o">=</span><span class="n">free</span><span class="p">)</span></div>
@@ -1076,8 +1124,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">static_input_keys</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
     <span class="n">static_outputs</span><span class="p">:</span> <span class="nb">dict</span>
     <span class="c1"># padding rows address these; their streams stay resident between steps</span>
-    <span class="n">dummy_rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
-    <span class="n">dummy_metadata</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">]</span>
+    <span class="n">dummy_rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">dummy_metadata</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">]</span>
     <span class="n">config_idx</span><span class="p">:</span> <span class="nb">int</span></div>
 
 
@@ -1487,7 +1535,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_compiled_forwards</span><span class="p">[</span><span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">]</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_dummy_engine_inputs</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">dummy_rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">dummy_rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ModelInputsFromEngine</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">ModelInputsFromEngine</span><span class="p">(</span>
             <span class="n">request_ids</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">dummy_rids</span><span class="p">),</span>
@@ -1741,7 +1789,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="CudaGraphRunner.step_ids">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.step_ids">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">step_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">step_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
 <span class="w">        </span><span class="sd">"""The padded addressing for one step: real ids first, then the slot's</span>
 <span class="sd">        padding ids. Plans, commits, and advances address real request state by</span>
 <span class="sd">        its own id; only the padding rows run against the slot's own state."""</span>
@@ -1752,9 +1800,9 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="CudaGraphRunner.step_metadata">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.step_metadata">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">step_metadata</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
-        <span class="n">per_request_info</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">]:</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+        <span class="n">per_request_info</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">]:</span>
         <span class="n">slot</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">slot_for</span><span class="p">(</span><span class="n">lease</span><span class="p">)</span>
         <span class="n">meta</span> <span class="o">=</span> <span class="p">{</span><span class="n">rid</span><span class="p">:</span> <span class="n">per_request_info</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">}</span>
         <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">slot</span><span class="o">.</span><span class="n">dummy_rids</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">request_ids</span><span class="p">):</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">bs</span><span class="p">]:</span>
@@ -1858,7 +1906,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">graph</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span>
     <span class="n">static_inputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
     <span class="n">static_outputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span>
-    <span class="n">dummy_rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+    <span class="n">dummy_rids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
     <span class="n">shape</span><span class="p">:</span> <span class="n">PiecewiseCaptureShape</span>
     <span class="n">bucket</span><span class="p">:</span> <span class="n">BucketKey</span></div>
 
@@ -1993,10 +2041,10 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_slots</span> <span class="o">&lt;=</span> <span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="k">for</span> <span class="n">shape</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">get_capture_shapes</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_capture_batch_sizes</span><span class="p">):</span>
-            <span class="c1"># names, not `ensure`: the declaration only labels its rows, and</span>
+            <span class="c1"># handles, not `ensure`: the declaration only labels its rows, and</span>
             <span class="c1"># ingesting here would run before the buffers are built</span>
             <span class="n">step</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_config</span><span class="o">.</span><span class="n">declare_step</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">names</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_dummy_key</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">),</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">handles</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_dummy_key</span><span class="p">(</span><span class="n">shape</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="n">shape</span><span class="o">.</span><span class="n">bs</span><span class="p">),</span>
                 <span class="nb">list</span><span class="p">(</span><span class="n">shape</span><span class="o">.</span><span class="n">seq_lens</span><span class="p">),</span>
             <span class="p">)</span>
             <span class="k">if</span> <span class="n">step</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">any</span><span class="p">(</span>
@@ -2190,7 +2238,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_call_inputs</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">static_inputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
-        <span class="n">step_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+        <span class="n">step_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PiecewiseCallInputs</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""What the region is handed, over the padded capture batch.</span>
 
@@ -2209,7 +2257,7 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_declare</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">seq_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">seq_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
         <span class="n">bucket</span><span class="p">:</span> <span class="n">BucketKey</span><span class="p">,</span> <span class="n">capture</span><span class="p">:</span> <span class="nb">bool</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">real_bs</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
@@ -2332,7 +2380,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">static_inputs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
-        <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">seq_lens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">real_bs</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PiecewiseOutput</span><span class="p">:</span>
@@ -2450,7 +2498,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 28, 2026.
+  Last updated on Sep 29, 2026.
   <br/>
 </p>
   </div>

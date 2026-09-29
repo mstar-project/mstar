@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 28, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 29, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -573,13 +573,20 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensor_uuid.html">mstar.communication.tensor_uuid</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.wire.html">mstar.communication.wire</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.wire_types.html">mstar.communication.wire_types</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -691,7 +698,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 </ul>
 </details></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../environment_variables.html">Environment variables</a></li>
@@ -853,13 +863,15 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.communication.communicator</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">fcntl</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">zmq</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.codec</span><span class="w"> </span><span class="kn">import</span> <span class="n">Codec</span><span class="p">,</span> <span class="n">decode_each</span><span class="p">,</span> <span class="n">default_codec</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.event</span><span class="w"> </span><span class="kn">import</span> <span class="n">EventWakeup</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
@@ -869,6 +881,13 @@ window.runMermaid = runMermaid;</script>
 <span class="c1">#: install - e.g. a stale wheel after an upgrade - takes over the mesh</span>
 <span class="c1">#: silently, so the factory warns when the imported version differs.</span>
 <span class="n">EXPECTED_MSTAR_RUST_VERSION</span> <span class="o">=</span> <span class="s2">"0.1.0"</span>
+
+
+<span class="c1">#: The entity whose endpoint stands for the whole deployment: the one every</span>
+<span class="c1">#: deployment has exactly one of. Two deployments that agree on this endpoint</span>
+<span class="c1">#: ARE the same deployment as far as anything keyed off it is concerned --</span>
+<span class="c1">#: notably the tensor-file namespace in ``mstar.communication.tensors``.</span>
+<span class="n">DEPLOYMENT_ANCHOR_ENTITY</span> <span class="o">=</span> <span class="s2">"conductor"</span>
 
 
 <div class="viewcode-block" id="CommProtocol">
@@ -912,6 +931,43 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="sa">f</span><span class="s2">"tcp://</span><span class="si">{</span><span class="n">host</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_tcp_port</span><span class="p">(</span><span class="n">entity_id</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
         <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Protocol </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">protocol</span><span class="si">}</span><span class="s2"> not yet supported yet"</span><span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_lock_deployment</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">my_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Claim this deployment, so a second one on the same IPC prefix fails</span>
+<span class="sd">        here instead of corrupting the first.</span>
+
+<span class="sd">        Only the anchor entity locks, and only over IPC. TCP needs no lock: two</span>
+<span class="sd">        deployments sharing a base port collide on ``bind`` already. IPC does</span>
+<span class="sd">        not -- libzmq UNLINKS an existing socket file and binds a fresh one, so</span>
+<span class="sd">        the second conductor comes up, silently steals every connection aimed</span>
+<span class="sd">        at the first, and derives the same tensor-file namespace (uuids are</span>
+<span class="sd">        per-entity counters, so both deployments then write, read and unlink</span>
+<span class="sd">        each other's ``mstar_&lt;ns&gt;_worker_0_&lt;n&gt;``).</span>
+
+<span class="sd">        An ``flock`` on a file beside the socket is what turns that into an</span>
+<span class="sd">        error. It is released by the kernel when the process exits however it</span>
+<span class="sd">        exits, so a crashed deployment leaves nothing to clean up; the fd is</span>
+<span class="sd">        kept on the instance purely so it outlives this call.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">!=</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">IPC</span> <span class="ow">or</span> <span class="n">my_id</span> <span class="o">!=</span> <span class="n">DEPLOYMENT_ANCHOR_ENTITY</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_endpoint</span><span class="p">(</span><span class="n">my_id</span><span class="p">)</span><span class="o">.</span><span class="n">removeprefix</span><span class="p">(</span><span class="s2">"ipc://"</span><span class="p">)</span> <span class="o">+</span> <span class="s2">".lock"</span>
+        <span class="n">fd</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">os</span><span class="o">.</span><span class="n">O_CREAT</span> <span class="o">|</span> <span class="n">os</span><span class="o">.</span><span class="n">O_RDWR</span><span class="p">,</span> <span class="mo">0o644</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">fcntl</span><span class="o">.</span><span class="n">flock</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span> <span class="n">fcntl</span><span class="o">.</span><span class="n">LOCK_EX</span> <span class="o">|</span> <span class="n">fcntl</span><span class="o">.</span><span class="n">LOCK_NB</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">OSError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"another mstar deployment already holds </span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2">: its "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">my_id</span><span class="si">}</span><span class="s2"> is bound to the same IPC prefix "</span>
+                <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">ipc_socket_path_prefix</span><span class="si">!r}</span><span class="s2">). Two deployments cannot "</span>
+                <span class="s2">"share a prefix -- the second would take over the first's "</span>
+                <span class="s2">"sockets and tensor files. Give this one its own "</span>
+                <span class="s2">"ipc_socket_path_prefix, or run it over TCP."</span>
+            <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
+        <span class="c1"># Never unlinked: another process may already hold an fd on this inode,</span>
+        <span class="c1"># and removing it would let a third lock a different one.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_deployment_lock_fd</span> <span class="o">=</span> <span class="n">fd</span>
+
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_tcp_port</span><span class="p">(</span><span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="n">base_port</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_ZMQ_TCP_BASE_PORT"</span><span class="p">,</span> <span class="s2">"19000"</span><span class="p">))</span>
@@ -942,8 +998,10 @@ window.runMermaid = runMermaid;</script>
         <span class="n">push_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
         <span class="n">protocol</span><span class="p">:</span> <span class="n">CommProtocol</span><span class="o">=</span><span class="n">CommProtocol</span><span class="o">.</span><span class="n">IPC</span><span class="p">,</span>
         <span class="n">ipc_socket_path_prefix</span><span class="p">:</span> <span class="nb">str</span><span class="o">=</span><span class="s2">"/tmp/mstar/"</span><span class="p">,</span>
+        <span class="n">codec</span><span class="p">:</span> <span class="nb">type</span><span class="p">[</span><span class="n">Codec</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="c1"># TODO: for TCP</span>
     <span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">codec</span> <span class="o">=</span> <span class="n">codec</span> <span class="ow">or</span> <span class="n">default_codec</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">context</span> <span class="o">=</span> <span class="n">zmq</span><span class="o">.</span><span class="n">Context</span><span class="o">.</span><span class="n">instance</span><span class="p">()</span>
         <span class="n">transport</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_ZMQ_TRANSPORT"</span><span class="p">,</span> <span class="n">protocol</span><span class="o">.</span><span class="n">value</span><span class="p">)</span><span class="o">.</span><span class="n">upper</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">=</span> <span class="n">CommProtocol</span><span class="p">(</span><span class="n">transport</span><span class="p">)</span>
@@ -958,6 +1016,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">ipc_socket_path_prefix</span> <span class="o">=</span> <span class="n">ipc_socket_path_prefix</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">IPC</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_lock_deployment</span><span class="p">(</span><span class="n">my_id</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span><span class="o">.</span><span class="n">bind</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_endpoint</span><span class="p">(</span><span class="n">my_id</span><span class="p">))</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">LINGER</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">==</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">TCP</span><span class="p">:</span>
@@ -1013,16 +1072,17 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.ZMQCommunicator.send">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">send</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">msg</span><span class="p">):</span>
         <span class="c1"># TODO: maybe serialize to JSON instead if more efficient</span>
+        <span class="c1"># no str(): the repr is ~10us on an InputSignals and DEBUG is off here</span>
         <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
             <span class="s2">"</span><span class="si">%s</span><span class="s2"> to send a message </span><span class="si">%s</span><span class="s2"> to entity </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">my_id</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">msg</span><span class="p">),</span> <span class="n">entity_id</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">my_id</span><span class="p">,</span> <span class="n">msg</span><span class="p">,</span> <span class="n">entity_id</span>
         <span class="p">)</span>
         <span class="k">if</span> <span class="n">entity_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">:</span>
             <span class="n">sock</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">context</span><span class="o">.</span><span class="n">socket</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">PUSH</span><span class="p">)</span>
             <span class="n">sock</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_endpoint</span><span class="p">(</span><span class="n">entity_id</span><span class="p">))</span>
             <span class="n">sock</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">zmq</span><span class="o">.</span><span class="n">LINGER</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">[</span><span class="n">entity_id</span><span class="p">]</span> <span class="o">=</span> <span class="n">sock</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">[</span><span class="n">entity_id</span><span class="p">]</span><span class="o">.</span><span class="n">send_pyobj</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">push_sockets</span><span class="p">[</span><span class="n">entity_id</span><span class="p">]</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">codec</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">msg</span><span class="p">))</span></div>
 
 
 <div class="viewcode-block" id="ZMQCommunicator.get_all_new_messages">
@@ -1044,13 +1104,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># zmq.NOBLOCK means zmq doesn't wait for a new message to be</span>
                 <span class="c1"># available, it returns a message if it exists or raises an error</span>
                 <span class="c1"># if no messages are available (error is caught below)</span>
-                <span class="n">messages</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span><span class="o">.</span><span class="n">recv_pyobj</span><span class="p">(</span>
-                    <span class="n">flags</span><span class="o">=</span><span class="n">zmq</span><span class="o">.</span><span class="n">NOBLOCK</span>
-                <span class="p">))</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
-                    <span class="s2">"</span><span class="si">%s</span><span class="s2"> to received message </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">my_id</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">messages</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
-                <span class="p">)</span>
+                <span class="n">frame</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pull_socket</span><span class="o">.</span><span class="n">recv</span><span class="p">(</span><span class="n">flags</span><span class="o">=</span><span class="n">zmq</span><span class="o">.</span><span class="n">NOBLOCK</span><span class="p">)</span>
+                <span class="n">decoded</span> <span class="o">=</span> <span class="n">decode_each</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">codec</span><span class="p">,</span> <span class="p">[</span><span class="n">frame</span><span class="p">],</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_id</span><span class="p">)</span>
+                <span class="n">messages</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">decoded</span><span class="p">)</span>
+                <span class="c1"># no str(): the repr is ~10us and DEBUG is off here</span>
+                <span class="k">if</span> <span class="n">decoded</span><span class="p">:</span>
+                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+                        <span class="s2">"</span><span class="si">%s</span><span class="s2"> to received message </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">my_id</span><span class="p">,</span> <span class="n">decoded</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                    <span class="p">)</span>
             <span class="k">except</span> <span class="n">zmq</span><span class="o">.</span><span class="n">Again</span><span class="p">:</span>
                 <span class="c1"># zmq.Again actually means no messages left to read</span>
                 <span class="k">break</span>
@@ -1072,7 +1133,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    * ``1`` — the Rust communicator; raises if the extension is missing.</span>
 <span class="sd">    * ``0`` — always the pyzmq ``ZMQCommunicator``.</span>
 
-<span class="sd">    The two are wire-compatible (same endpoints, same pickle frames), so the</span>
+<span class="sd">    The two are wire-compatible (same endpoints, same codec), so the</span>
 <span class="sd">    flag can be set per-process — one entity at a time — while the rest of</span>
 <span class="sd">    the mesh stays on pyzmq.</span>
 <span class="sd">    """</span>
@@ -1153,7 +1214,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 28, 2026.
+  Last updated on Sep 29, 2026.
   <br/>
 </p>
   </div>

@@ -17,6 +17,8 @@ mstar.engine.cuda\_graph\_runner
       autocast_scope
       capture_into_graph
       dummy_metadata
+      dummy_rid_handle
+      dummy_rid_name
       fail_if_graphs_required
    
    

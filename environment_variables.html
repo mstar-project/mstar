@@ -51,11 +51,11 @@
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
     <link rel="next" title="Adding a New Model" href="adding_models.html" />
-    <link rel="prev" title="mstar.worker" href="_autosummary/mstar.worker.html" />
+    <link rel="prev" title="mstar.worker.rid_table" href="_autosummary/mstar.worker.rid_table.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 28, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 29, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -220,13 +220,20 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.tensor_uuid.html">mstar.communication.tensor_uuid</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.wire.html">mstar.communication.wire</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.communication.wire_types.html">mstar.communication.wire_types</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -338,7 +345,10 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 </ul>
 </details></li>
-<li class="toctree-l2"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Environment variables</a></li>
@@ -609,7 +619,33 @@ documented here as they are introduced.</p>
 <code class="docutils literal notranslate"><span class="pre">1</span></code>: the Rust communicator, raising if the extension is missing.
 <code class="docutils literal notranslate"><span class="pre">0</span></code>: always pyzmq. The two transports are wire-compatible, so
 this can be set per-process while the rest of the mesh stays on
-pyzmq.</p></td>
+pyzmq. Under <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_GRAPH=AUTO</span></code>, <code class="docutils literal notranslate"><span class="pre">0</span></code> also keeps that
+worker’s graph runtime on Python – the Rust one cannot share a
+pyzmq transport.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_GRAPH</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">AUTO</span></code></p></td>
+<td><p>Which graph runtime a worker builds (see
+<code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.graph.runtime.utils.resolve_graph_runtime_type()</span></code>).
+<code class="docutils literal notranslate"><span class="pre">AUTO</span></code>: Rust where the vendored <code class="docutils literal notranslate"><span class="pre">rust/</span></code> extension imports <em>and</em>
+the Rust transport is in use, Python otherwise. <code class="docutils literal notranslate"><span class="pre">1</span></code>: the Rust
+runtime, failing at startup if the transport or the tensor bookkeeper
+is a Python one – it holds a share of both, so there is no degraded
+mode to fall back to. <code class="docutils literal notranslate"><span class="pre">0</span></code>: always the Python runtime. Resolved once
+per process, because it also selects the tensor bookkeeper the
+runtime and the tensor store must share.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_WIRE_CODEC</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">msgpack</span></code></p></td>
+<td><p>How messages are encoded on every communicator edge (see
+<a class="reference internal" href="_autosummary/mstar.communication.codec.html#mstar.communication.codec.default_codec" title="mstar.communication.codec.default_codec"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.communication.codec.default_codec()</span></code></a>). <code class="docutils literal notranslate"><span class="pre">msgpack</span></code>: the
+typed encoding in <a class="reference internal" href="_autosummary/mstar.communication.wire.html#module-mstar.communication.wire" title="mstar.communication.wire"><code class="xref py py-mod docutils literal notranslate"><span class="pre">mstar.communication.wire</span></code></a>, language-neutral
+so an edge can terminate in a Rust process. <code class="docutils literal notranslate"><span class="pre">pickle</span></code>: the old
+Python-only wire, kept for bisecting a wire problem. Both ends of an
+edge must agree, so this is all-or-nothing for a mesh – one process
+set differently cannot talk to its peers. <code class="docutils literal notranslate"><span class="pre">pickle</span></code> is incompatible
+with the Rust graph runtime, which builds its frames as typed
+msgpack; that pairing fails at startup rather than mixing wires.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ZMQ_TRANSPORT</span></code></p></td>
 <td><p>constructor’s protocol</p></td>
@@ -949,12 +985,12 @@ live stream; tests and debugging only.</p></td>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="_autosummary/mstar.worker.html"
+       href="_autosummary/mstar.worker.rid_table.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.worker</p>
+        <p class="prev-next-title">mstar.worker.rid_table</p>
       </div>
     </a>
     <a class="right-next"
@@ -1025,7 +1061,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 28, 2026.
+  Last updated on Sep 29, 2026.
   <br/>
 </p>
   </div>

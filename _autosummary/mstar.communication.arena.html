@@ -50,12 +50,12 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.communication.communicator" href="mstar.communication.communicator.html" />
+    <link rel="next" title="mstar.communication.codec" href="mstar.communication.codec.html" />
     <link rel="prev" title="mstar.communication" href="mstar.communication.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 28, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 29, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -220,13 +220,20 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.communication.html">mstar.communication</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.communicator.html">mstar.communication.communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.tensor_uuid.html">mstar.communication.tensor_uuid</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.wire.html">mstar.communication.wire</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.communication.wire_types.html">mstar.communication.wire_types</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -338,7 +345,10 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 </ul>
 </details></li>
-<li class="toctree-l2"><a class="reference internal" href="mstar.worker.html">mstar.worker</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../environment_variables.html">Environment variables</a></li>
@@ -565,6 +575,8 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.close"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.close()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.register_for_send()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.register_for_send_uuids()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stamps_shm_placement"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stamps_shm_placement</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.start_read_tensors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stats_summary"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stats_summary()</span></code></a></li>
 </ul>
@@ -663,7 +675,7 @@ syncs to 1 when registering many tensors in a row.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>tensor_infos</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.TensorPointerInfo" title="mstar.graph.base.TensorPointerInfo"><em>TensorPointerInfo</em></a><em>]</em>)</p></li>
 <li><p><strong>skip_cuda_sync</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
@@ -672,12 +684,39 @@ syncs to 1 when registering many tensors in a row.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.communication.arena.ArenaShmCommunicationManager.register_for_send_uuids">
+<span class="sig-name descname"><span class="pre">register_for_send_uuids</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">per_request</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">skip_cuda_sync</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/arena.html#ArenaShmCommunicationManager.register_for_send_uuids"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send_uuids" title="Link to this definition">#</a></dt>
+<dd><p>Uuid-driven staging: no descriptor is rebuilt to be read for its
+uuid, and placement goes back as two columns rather than a whole
+descriptor. The whole batch stages inside one stream context and syncs
+once at the end, rather than one host-blocking sync per request.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>per_request</strong> (<a class="reference internal" href="mstar.utils.containers.html#mstar.utils.containers.ParallelList" title="mstar.utils.containers.ParallelList"><em>ParallelList</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>]</em>)</p></li>
+<li><p><strong>skip_cuda_sync</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.communication.arena.ArenaShmCommunicationManager.stamps_shm_placement">
+<span class="sig-name descname"><span class="pre">stamps_shm_placement</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager.stamps_shm_placement" title="Link to this definition">#</a></dt>
+<dd><p>Whether this transport writes placement onto a descriptor AFTER routing
+has already copied it. Only the SHM arena does (<code class="docutils literal notranslate"><span class="pre">shm_segment</span></code> /
+<code class="docutils literal notranslate"><span class="pre">shm_offset</span></code>); the per-uuid file and Mooncake paths derive everything
+a consumer needs from <code class="docutils literal notranslate"><span class="pre">uuid</span></code> and <code class="docutils literal notranslate"><span class="pre">address</span></code>, so they leave this off
+and <code class="docutils literal notranslate"><span class="pre">refresh_shm_placement</span></code> stays free for them.</p>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors">
 <span class="sig-name descname"><span class="pre">start_read_tensors</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_edges</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/arena.html#ArenaShmCommunicationManager.start_read_tensors"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>graph_edges</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><em>GraphEdge</em></a><em>]</em>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
@@ -723,11 +762,11 @@ syncs to 1 when registering many tensors in a row.</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.communication.communicator.html"
+       href="mstar.communication.codec.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.communication.communicator</p>
+        <p class="prev-next-title">mstar.communication.codec</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -752,6 +791,8 @@ syncs to 1 when registering many tensors in a row.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.close"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.close()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.register_for_send()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send_uuids"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.register_for_send_uuids()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stamps_shm_placement"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stamps_shm_placement</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.start_read_tensors()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.arena.ArenaShmCommunicationManager.stats_summary"><code class="docutils literal notranslate"><span class="pre">ArenaShmCommunicationManager.stats_summary()</span></code></a></li>
 </ul>
@@ -789,7 +830,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 28, 2026.
+  Last updated on Sep 29, 2026.
   <br/>
 </p>
   </div>

@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 28, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 29, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -573,13 +573,20 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensor_uuid.html">mstar.communication.tensor_uuid</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.wire.html">mstar.communication.wire</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.wire_types.html">mstar.communication.wire_types</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -691,7 +698,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 </ul>
 </details></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../environment_variables.html">Environment variables</a></li>
@@ -857,6 +867,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">uuid</span><span class="w"> </span><span class="kn">import</span> <span class="n">uuid4</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
 
 <div class="viewcode-block" id="NodeAndGraphWalk">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.NodeAndGraphWalk">[docs]</a>
@@ -877,11 +889,11 @@ window.runMermaid = runMermaid;</script>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">TensorPointerInfo</span><span class="p">:</span>
     <span class="n">dims</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
-    <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span>
     <span class="n">nbytes</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">address</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">stride</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
-    <span class="n">uuid</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># for indexing storage</span>
+    <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span>  <span class="c1"># (entity_index &lt;&lt; 48) | counter; see communication/tensor_uuid.py</span>
     <span class="n">source_session_id</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># "{HOSTNAME}:{client_engine.get_rpc_port()}"</span>
     <span class="n">source_entity</span><span class="p">:</span> <span class="nb">str</span>  <span class="c1"># which {worker, api_server} the tensor is on</span>
     <span class="n">offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span> <span class="c1"># offset, in bytes, of the read (e.g., for in-transport sharding</span>
@@ -1059,7 +1071,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="ReadySignals.register_communication_info">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.register_communication_info">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">register_communication_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">communication_manager</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">register_communication_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">communication_manager</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span> <span class="o">=</span> <span class="n">communication_manager</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_request_id</span> <span class="o">=</span>  <span class="n">request_id</span></div>
 
@@ -1077,10 +1089,11 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_ready</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">is_ready</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_names</span><span class="o">.</span><span class="n">issubset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">ready_names</span><span class="p">)</span>
-        <span class="c1"># ready once the only missing inputs are streaming ones (which arrive incrementally)</span>
+        <span class="c1"># Ready once the only missing inputs are streaming ones, which arrive</span>
+        <span class="c1"># incrementally</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">is_ready_for_streaming</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_ready</span> <span class="ow">or</span> \
             <span class="bp">self</span><span class="o">.</span><span class="n">is_ready_for_streaming</span> <span class="ow">or</span> <span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">input_names</span><span class="o">.</span><span class="n">issuperset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">ready_names</span><span class="o">.</span><span class="n">union</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">streaming_inputs</span><span class="p">))</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">input_names</span><span class="o">.</span><span class="n">issubset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">ready_names</span><span class="o">.</span><span class="n">union</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">streaming_inputs</span><span class="p">))</span>
         <span class="p">)</span></div>
 
 
@@ -1088,11 +1101,15 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.ReadySignals.clear">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">clear</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">ready_inputs</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
-                <span class="k">if</span> <span class="n">edge</span><span class="o">.</span><span class="n">_persist_for_loop</span><span class="p">:</span>
-                    <span class="k">continue</span>
-                <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span><span class="o">.</span><span class="n">dereference</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
+            <span class="c1"># One crossing for the node's whole input set: this runs on every</span>
+            <span class="c1"># pass, and a node with several multi-tensor inputs pays per</span>
+            <span class="c1"># tensor otherwise.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span><span class="o">.</span><span class="n">dereference_batch_uniform</span><span class="p">([</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">uuid</span>
+                <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">ready_inputs</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">edge</span><span class="o">.</span><span class="n">_persist_for_loop</span>
+                <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span>
+            <span class="p">])</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ready_inputs</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ready_names</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">is_ready</span> <span class="o">=</span> <span class="kc">False</span>
@@ -1117,7 +1134,7 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ready_names</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">edge_name</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">is_ready</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_names</span><span class="o">.</span><span class="n">issubset</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">ready_names</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">is_ready_for_streaming</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_ready</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_names</span><span class="o">.</span><span class="n">issuperset</span><span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_ready_for_streaming</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_ready</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_names</span><span class="o">.</span><span class="n">issubset</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">ready_names</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">streaming_inputs</span>
         <span class="p">)</span>
         <span class="k">return</span> <span class="n">edge</span></div>
@@ -1172,7 +1189,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="GraphNode.register_communication_info">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.register_communication_info">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">register_communication_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">communication_manager</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">register_communication_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">communication_manager</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ready_signals</span><span class="o">.</span><span class="n">register_communication_info</span><span class="p">(</span>
             <span class="n">communication_manager</span><span class="p">,</span> <span class="n">request_id</span>
         <span class="p">)</span>
@@ -1487,14 +1504,21 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Loop.ingest_external_input">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.ingest_external_input">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ingest_external_input</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_edge</span><span class="p">:</span> <span class="n">GraphEdge</span><span class="p">):</span>
-        <span class="c1"># track one copy of each external input for re-injection on the next iteration</span>
+        <span class="c1"># track one copy of each external input for re-injection on the next</span>
+        <span class="c1"># iteration -- except a streamed one: each iteration takes the NEXT</span>
+        <span class="c1"># chunk, and re-injecting this one would feed it again.</span>
         <span class="k">if</span> <span class="p">(</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">next_node</span><span class="p">)</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_external_inputs</span> \
-                <span class="ow">and</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ingested_external_input_names</span><span class="p">:</span>
+                <span class="ow">and</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ingested_external_input_names</span> \
+                <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_streamed_input</span><span class="p">(</span><span class="n">graph_edge</span><span class="p">):</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_ingested_external_inputs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">graph_edge</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_ingested_external_input_names</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
             <span class="n">graph_edge</span><span class="o">.</span><span class="n">_persist_for_loop</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_managing_registry</span><span class="o">.</span><span class="n">register_ingested_input</span><span class="p">(</span><span class="n">graph_edge</span><span class="p">)</span></div>
 
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_is_streamed_input</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_edge</span><span class="p">:</span> <span class="n">GraphEdge</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="n">node</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">section</span><span class="o">.</span><span class="n">get_nodes</span><span class="p">()</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">next_node</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">node</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">graph_edge</span><span class="o">.</span><span class="n">name</span> <span class="ow">in</span> <span class="n">node</span><span class="o">.</span><span class="n">_streaming_inputs</span>
 
 <div class="viewcode-block" id="Loop.complete_iter">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.complete_iter">[docs]</a>
@@ -1514,18 +1538,27 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># register_ingested_input before termination — cleaning those up is deferred</span>
             <span class="c1"># (they're harmless since reset_for_iter won't be called after the loop is done).</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">inner_registry</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_managing_registry</span><span class="o">.</span><span class="n">mark_entity_complete</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">outputs</span><span class="p">:</span>
                 <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cached_outputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="p">[])</span>
             <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">accumulated_outputs</span><span class="p">:</span>
                 <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_cache</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="p">[])</span>
+            <span class="c1"># Cascade only once our tensor_info is populated -- the parent</span>
+            <span class="c1"># caches these edges on the way through -- and keep what it hands</span>
+            <span class="c1"># back. Both matter only for NESTED loops: cascading first makes a</span>
+            <span class="c1"># parent cache still-empty tensor_info, and discarding the result</span>
+            <span class="c1"># means a parent that finishes in this same event never routes its</span>
+            <span class="c1"># own outputs. Our declared outputs come back inside ``outer``</span>
+            <span class="c1"># (the parent reads them off ``managed_entities``) already filtered</span>
+            <span class="c1"># by its loop-back, so they are not added again here; the</span>
+            <span class="c1"># accumulated ones are disjoint by name and ride separately.</span>
+            <span class="n">outer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_managing_registry</span><span class="o">.</span><span class="n">mark_entity_complete</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
 
             <span class="c1"># Don't dereference, becaue the tensors will be used downstream</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_cached_outputs</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_cache</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
             <span class="k">return</span> <span class="n">NodeCompletionOutput</span><span class="p">(</span>
-                <span class="n">output_edges</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">outputs</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">accumulated_outputs</span><span class="p">,</span>
-                <span class="n">filtered_signals</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_loop_back_inputs</span>
+                <span class="n">output_edges</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">outer</span><span class="o">.</span><span class="n">output_edges</span><span class="p">)</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">accumulated_outputs</span><span class="p">,</span>
+                <span class="n">filtered_signals</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_loop_back_inputs</span> <span class="o">|</span> <span class="n">outer</span><span class="o">.</span><span class="n">filtered_signals</span><span class="p">,</span>
             <span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_advance_one_iter</span><span class="p">()</span>
@@ -1536,7 +1569,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="Loop.register_communication_info">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.Loop.register_communication_info">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">register_communication_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">communication_manager</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">register_communication_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">communication_manager</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span> <span class="o">=</span> <span class="n">communication_manager</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_request_id</span> <span class="o">=</span> <span class="n">request_id</span></div>
 
@@ -1562,13 +1595,13 @@ window.runMermaid = runMermaid;</script>
                 <span class="p">)</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
 
             <span class="k">elif</span> <span class="n">edge</span><span class="o">.</span><span class="n">name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_output_names</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_cache</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">edge</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="p">[])</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">)</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span></div>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span></div>
 
 
 
@@ -1608,16 +1641,20 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_uncache_outputs</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_request_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">for</span> <span class="n">tensor_infos</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cached_outputs</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
-                <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">tensor_infos</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span><span class="o">.</span><span class="n">dereference</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span><span class="o">.</span><span class="n">dereference_batch_uniform</span><span class="p">([</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">uuid</span>
+                <span class="k">for</span> <span class="n">tensor_infos</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cached_outputs</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+                <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">tensor_infos</span>
+            <span class="p">])</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_cached_outputs</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_uncache_accumulated_outputs</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_request_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">for</span> <span class="n">tensor_infos</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_cache</span><span class="o">.</span><span class="n">values</span><span class="p">():</span>
-                <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">tensor_infos</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span><span class="o">.</span><span class="n">dereference</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span><span class="o">.</span><span class="n">dereference_batch_uniform</span><span class="p">([</span>
+                <span class="n">info</span><span class="o">.</span><span class="n">uuid</span>
+                <span class="k">for</span> <span class="n">tensor_infos</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_cache</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
+                <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">tensor_infos</span>
+            <span class="p">])</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_accumulated_cache</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
 
 <div class="viewcode-block" id="Loop.reset_for_outer_iter">
@@ -1731,7 +1768,34 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.LoopStateRegistry.register_ingested_input">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">register_ingested_input</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_edge</span><span class="p">:</span> <span class="n">GraphEdge</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="o">.</span><span class="n">ingest_external_input</span><span class="p">(</span><span class="n">graph_edge</span><span class="p">)</span></div>
-</div>
+
+
+<div class="viewcode-block" id="LoopStateRegistry.reset_for_iter">
+<a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.LoopStateRegistry.reset_for_iter">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">reset_for_iter</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">reset_for_iter</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_reseed_streaming_ready</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="LoopStateRegistry.clear">
+<a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.LoopStateRegistry.clear">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">clear</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_reseed_streaming_ready</span><span class="p">()</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_reseed_streaming_ready</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""The member nodes' inputs were just cleared, so their streaming</span>
+<span class="sd">        readiness goes back to its seed. Without this a node whose inputs are</span>
+<span class="sd">        ALL streaming leaves the set when it first fills and nothing puts it</span>
+<span class="sd">        back -- no non-streaming input will ever arrive to -- so every chunk</span>
+<span class="sd">        after the first iteration's is refused."""</span>
+        <span class="n">root</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">loop</span><span class="o">.</span><span class="n">_managing_registry</span>
+        <span class="k">while</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">root</span><span class="p">,</span> <span class="n">LoopStateRegistry</span><span class="p">):</span>
+            <span class="n">root</span> <span class="o">=</span> <span class="n">root</span><span class="o">.</span><span class="n">loop</span><span class="o">.</span><span class="n">_managing_registry</span>
+        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">entity</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">managed_entities</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">entity</span><span class="p">,</span> <span class="n">GraphNode</span><span class="p">):</span>
+                <span class="n">root</span><span class="o">.</span><span class="n">reseed_streaming_ready</span><span class="p">(</span><span class="n">name</span><span class="p">)</span></div>
 
 
 
@@ -1791,7 +1855,22 @@ window.runMermaid = runMermaid;</script>
         <span class="n">entity</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">managed_entities</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">entity_name</span><span class="p">)</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">entity</span><span class="p">,</span> <span class="n">GraphNode</span><span class="p">):</span>
             <span class="n">entity</span><span class="o">.</span><span class="n">ready_signals</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
+            <span class="c1"># The registry's set has to follow the node-level clear down.</span>
+            <span class="c1"># Left alone, the name lingers after its inputs are gone and the</span>
+            <span class="c1"># node reads as streaming-ready with nothing ingested.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">reseed_streaming_ready</span><span class="p">(</span><span class="n">entity_name</span><span class="p">)</span>
         <span class="k">return</span> <span class="n">output</span></div>
+
+
+<div class="viewcode-block" id="WorkerGraphStateRegistry.reseed_streaming_ready">
+<a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.WorkerGraphStateRegistry.reseed_streaming_ready">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">reseed_streaming_ready</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Back to the seeded membership for a node whose inputs were just</span>
+<span class="sd">        cleared: in the set only if its inputs are ALL streaming."""</span>
+        <span class="k">if</span> <span class="n">node_name</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">only_streaming_inputs</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ready_for_streaming</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">node_name</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ready_for_streaming</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">node_name</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="WorkerGraphStateRegistry.reset_for_iter">
@@ -1817,7 +1896,10 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">ready_names</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ready_for_streaming</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">only_streaming_inputs</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">ready_next_iter</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">ready_for_streaming</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">only_streaming_inputs</span><span class="p">)</span></div>
+        <span class="c1"># The NEXT-iter set, not `ready_for_streaming` a second time: the</span>
+        <span class="c1"># duplicate assignment left ready_streaming_next_iter holding names</span>
+        <span class="c1"># from before the clear.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ready_streaming_next_iter</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">only_streaming_inputs</span><span class="p">)</span></div>
 </div>
 
 </pre></div>
@@ -1867,7 +1949,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 28, 2026.
+  Last updated on Sep 29, 2026.
   <br/>
 </p>
   </div>

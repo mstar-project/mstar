@@ -17,6 +17,7 @@ mstar.utils.containers
 
    .. autosummary::
    
+      ParallelList
       RecentSet
    
    

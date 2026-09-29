@@ -10,6 +10,7 @@ mstar.communication.communicator
    .. autosummary::
    
       EXPECTED_MSTAR_RUST_VERSION
+      DEPLOYMENT_ANCHOR_ENTITY
    
    
 

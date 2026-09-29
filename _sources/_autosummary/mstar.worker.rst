@@ -30,5 +30,6 @@
    engine_manager
    micro_scheduler
    node_manager_utils
+   rid_table
    worker
 

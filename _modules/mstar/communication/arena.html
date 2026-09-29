@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 28, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 29, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -573,13 +573,20 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensor_uuid.html">mstar.communication.tensor_uuid</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.wire.html">mstar.communication.wire</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.communication.wire_types.html">mstar.communication.wire_types</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -691,7 +698,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
 </ul>
 </details></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+</ul>
+</details></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../environment_variables.html">Environment variables</a></li>
@@ -898,22 +908,55 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">Future</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.communicator</span><span class="w"> </span><span class="kn">import</span> <span class="n">BaseCommunicator</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensors</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">FutureAndPointers</span><span class="p">,</span>
+    <span class="n">Rid</span><span class="p">,</span>
     <span class="n">SharedMemoryCommunicationManager</span><span class="p">,</span>
     <span class="n">_deserialize_tensor</span><span class="p">,</span>
     <span class="n">_nullcontext</span><span class="p">,</span>
     <span class="n">_serialize_tensor</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">TensorPointerInfo</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.containers</span><span class="w"> </span><span class="kn">import</span> <span class="n">ParallelList</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 <span class="n">_CUDA_HOST_ALREADY_REGISTERED</span> <span class="o">=</span> <span class="mi">712</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_Placements</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Where a batch's staged tensors landed, as columns.</span>
+
+<span class="sd">    Index-parallel, one entry per staged tensor, in the layout</span>
+<span class="sd">    ``set_shm_placement`` takes -- so staging fills three lists rather than</span>
+<span class="sd">    minting an object per tensor that ``_write_back`` then takes apart again.</span>
+
+<span class="sd">    The segment is its INDEX, not its name: the store learned the names once,</span>
+<span class="sd">    as the arena grew into them.</span>
+
+<span class="sd">    Empty is ``not p.uuids``, not ``not p`` -- this is a 3-tuple, so it is</span>
+<span class="sd">    always truthy. ``ParallelList`` does NOT share that edge: it defines</span>
+<span class="sd">    ``__len__``, which ``bool`` falls back on, so an empty one is falsey.</span>
+<span class="sd">    """</span>
+
+    <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">segment_idxs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">offsets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">empty</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"_Placements"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">([],</span> <span class="p">[],</span> <span class="p">[])</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">add</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">segment_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">offset</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""All three at once: they mean nothing out of lockstep."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">uuids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">segment_idxs</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">segment_idx</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">offsets</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">offset</span><span class="p">)</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">_CudaEventFuture</span><span class="p">:</span>
@@ -1009,6 +1052,12 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">ArenaShmCommunicationManager</span><span class="p">(</span><span class="n">SharedMemoryCommunicationManager</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""Tensor transport via the Rust shared-memory arena (``mstar_rust``)."""</span>
+
+    <span class="c1"># Staging writes the segment and offset onto the descriptor the store</span>
+    <span class="c1"># holds, which routing may already have copied -- so every outgoing edge</span>
+    <span class="c1"># has to be refreshed from the store before it is sent. See</span>
+    <span class="c1"># ``TensorCommunicationManager.refresh_shm_placement``.</span>
+    <span class="n">stamps_shm_placement</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -1145,12 +1194,20 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># Producer-side segment views (memoryviews are stable: segments</span>
         <span class="c1"># never move or resize) + how many segments are already pinned.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">memoryview</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="c1"># Index -&gt; name, so staging never calls back into the arena for a</span>
+        <span class="c1"># name it would only hand straight to the store.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_seg_names</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="c1"># The store we last named our segments to. The table lives in the</span>
+        <span class="c1"># bookkeeper, so a store swapped in after construction starts empty</span>
+        <span class="c1"># and has to be re-told -- otherwise placement cites an index it</span>
+        <span class="c1"># cannot resolve.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_segments_named_to</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_pinned_segments</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_sync_segments</span><span class="p">()</span>
         <span class="c1"># uuid -&gt; (segment_idx, offset) for sender-side reclaim.</span>
         <span class="c1"># (register_for_send receives the TensorPointerInfos directly and</span>
         <span class="c1"># stamps them in place — no side-table needed.)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="c1"># uuid -&gt; stage time, for the TTL backstop: a request aborted after</span>
         <span class="c1"># staging but before every consumer ACKs defers reclaim forever</span>
         <span class="c1"># (cleanup_request waits for ACKs that will never come). A slot</span>
@@ -1159,7 +1216,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># above it cannot race a real consumer. Default OFF pending review</span>
         <span class="c1"># discussion; enable with MSTAR_SHM_ARENA_SLOT_TTL_S (recommend</span>
         <span class="c1"># &gt;= 2x the request timeout).</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_slot_ttl_s</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span>
             <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">"MSTAR_SHM_ARENA_SLOT_TTL_S"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_ttl_reclaimed_total</span> <span class="o">=</span> <span class="mi">0</span>
@@ -1230,15 +1287,20 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_sync_segments</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">grew</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">old_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">)</span>
         <span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">)</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">num_segments</span><span class="p">:</span>
             <span class="n">i</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">)</span>
             <span class="n">seg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">segment</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_own_segment_paths</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"/dev/shm/</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">segment_name</span><span class="p">(</span><span class="n">i</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+            <span class="n">name</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">segment_name</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_own_segment_paths</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">"/dev/shm/</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_seg_names</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">memoryview</span><span class="p">(</span><span class="n">seg</span><span class="p">))</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_maybe_pin</span><span class="p">(</span><span class="o">*</span><span class="n">seg</span><span class="o">.</span><span class="n">ptr_len</span><span class="p">())</span>
             <span class="n">grew</span> <span class="o">=</span> <span class="kc">True</span>
         <span class="k">if</span> <span class="n">grew</span><span class="p">:</span>
+            <span class="c1"># Once per segment ever created, so placement can cross as the</span>
+            <span class="c1"># index the reserve already returned.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_name_segments_to_store</span><span class="p">(</span><span class="n">start_idx</span><span class="o">=</span><span class="n">old_len</span><span class="p">)</span>
             <span class="n">total</span><span class="p">,</span> <span class="n">free</span><span class="p">,</span> <span class="n">largest</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">stats</span><span class="p">()</span>
             <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_shm_total</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
                     <span class="ow">and</span> <span class="n">total</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_total</span> <span class="o">*</span> <span class="mf">0.8</span><span class="p">):</span>
@@ -1412,91 +1474,176 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_sync_segments</span><span class="p">()</span>
             <span class="k">return</span> <span class="n">seg</span><span class="p">,</span> <span class="n">off</span>
 
-<div class="viewcode-block" id="ArenaShmCommunicationManager.register_for_send">
-<a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">register_for_send</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">tensor_infos</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">],</span>
-        <span class="n">skip_cuda_sync</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-    <span class="p">):</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
-        <span class="n">ctx</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_d2h_ctx</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">(</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span><span class="p">)</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
             <span class="k">else</span> <span class="n">_nullcontext</span><span class="p">()</span>
         <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_name_segments_to_store</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">start_idx</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Tell the store what each segment index is called. Idempotent, and</span>
+<span class="sd">        once per segment rather than once per tensor -- the whole point of</span>
+<span class="sd">        placement crossing as an index.</span>
+
+<span class="sd">        ``start_idx`` skips the segments already named, so a grow names only</span>
+<span class="sd">        what it added; re-naming the whole list each grow is quadratic in</span>
+<span class="sd">        segment count. It must slice as well as renumber -- enumerating the</span>
+<span class="sd">        full list from ``start_idx`` would file every existing name under the</span>
+<span class="sd">        wrong index."""</span>
+        <span class="n">store</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span>
+        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">name</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_seg_names</span><span class="p">[</span><span class="n">start_idx</span><span class="p">:],</span> <span class="n">start</span><span class="o">=</span><span class="n">start_idx</span><span class="p">):</span>
+            <span class="n">store</span><span class="o">.</span><span class="n">register_shm_segment</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_segments_named_to</span> <span class="o">=</span> <span class="n">store</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_stage_one</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">info_arg</span><span class="p">:</span> <span class="n">TensorPointerInfo</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">placements</span><span class="p">:</span> <span class="n">_Placements</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Stage one tensor into the arena. Returns whether a D2H was queued.</span>
+
+<span class="sd">        The caller owns the CUDA sync, the ``_d2h_ctx`` context and the</span>
+<span class="sd">        trailing stream sync, so a batch pays for each of those once -- and</span>
+<span class="sd">        the writeback of ``placements``, which is why they are collected here</span>
+<span class="sd">        rather than stored one at a time.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">is_registered</span><span class="p">(</span><span class="n">uuid</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="n">tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span>
+        <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
+        <span class="n">t</span> <span class="o">=</span> <span class="n">tensor</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+        <span class="n">nbytes</span> <span class="o">=</span> <span class="n">t</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">t</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
+        <span class="n">loc</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reserve</span><span class="p">(</span><span class="n">nbytes</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">loc</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">is_registered</span><span class="p">(</span><span class="n">uuid</span><span class="p">):</span>
+            <span class="c1"># Lost a concurrent-duplicate race: another thread registered this</span>
+            <span class="c1"># uuid while our reserve released the GIL. Return our slot instead</span>
+            <span class="c1"># of orphaning it.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="o">*</span><span class="n">loc</span><span class="p">)</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="k">if</span> <span class="n">loc</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># Arena saturated: spill THIS tensor to the per-uuid file protocol</span>
+            <span class="c1"># (infos keep shm_segment=None — the consumer falls back to the</span>
+            <span class="c1"># file read for exactly those).</span>
+            <span class="n">data</span> <span class="o">=</span> <span class="n">_serialize_tensor</span><span class="p">(</span><span class="n">t</span><span class="p">)</span>
+            <span class="n">path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
+            <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_create_shm_file</span><span class="p">(</span><span class="n">path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_shm_files</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">path</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_record_tx</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">),</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: spilled </span><span class="si">%s</span><span class="s2"> to </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%d</span><span class="s2"> bytes)"</span><span class="p">,</span>
+                         <span class="n">uuid</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">))</span>
+            <span class="k">return</span> <span class="kc">False</span>
+        <span class="n">seg</span><span class="p">,</span> <span class="n">off</span> <span class="o">=</span> <span class="n">loc</span>
         <span class="n">queued</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">nbytes</span><span class="p">:</span>
+                <span class="n">host</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">[</span><span class="n">seg</span><span class="p">][</span><span class="n">off</span><span class="p">:</span><span class="n">off</span> <span class="o">+</span> <span class="n">nbytes</span><span class="p">],</span>
+                    <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span>
+                <span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+                <span class="c1"># Async D2H into the pinned segment when a copy stream exists</span>
+                <span class="c1"># (the caller's single sync covers the batch); blocking</span>
+                <span class="c1"># otherwise, so the descriptor can never ship ahead of the bytes.</span>
+                <span class="n">host</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="n">queued</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">seg</span><span class="p">,</span> <span class="n">off</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
+        <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
+            <span class="c1"># Anything that unwinds between reserve and the _arena_locs record</span>
+            <span class="c1"># would orphan the slot forever (cleanup can only free what is</span>
+            <span class="c1"># recorded).</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="n">seg</span><span class="p">,</span> <span class="n">off</span><span class="p">)</span>
+            <span class="k">raise</span>
+        <span class="c1"># A list index, not a call back into the arena: this used to mint a</span>
+        <span class="c1"># Python str per tensor that the store then interned straight back</span>
+        <span class="c1"># down to an id it already had.</span>
+        <span class="n">seg_name</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_seg_names</span><span class="p">[</span><span class="n">seg</span><span class="p">]</span>
+        <span class="c1"># Still stamped in place when the caller handed one in: that contract</span>
+        <span class="c1"># is relied on (test_descriptor_survives_register_for_send). The</span>
+        <span class="c1"># uuid-driven path has no caller object and needs none.</span>
+        <span class="k">if</span> <span class="n">info_arg</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">info_arg</span><span class="o">.</span><span class="n">shm_segment</span> <span class="o">=</span> <span class="n">seg_name</span>
+            <span class="n">info_arg</span><span class="o">.</span><span class="n">shm_offset</span> <span class="o">=</span> <span class="n">off</span>
+        <span class="c1"># The store must learn the segment, not just the caller's object. With</span>
+        <span class="c1"># the Python bookkeeper those are the same object and this is a</span>
+        <span class="c1"># re-assign; with the Rust one the descriptor was COPIED in, so without</span>
+        <span class="c1"># this the stamp dies on a throwaway and the tensor ships with</span>
+        <span class="c1"># shm_segment=None -- which the consumer reads as "spilled to a file"</span>
+        <span class="c1"># and goes looking for a file that was never written.</span>
+        <span class="c1">#</span>
+        <span class="c1"># Only the two fields travel, not the descriptor: rebuilding one for</span>
+        <span class="c1"># Python and marshalling it back costs ~3.5us per tensor to write two</span>
+        <span class="c1"># integers the store already holds. The segment goes as its INDEX --</span>
+        <span class="c1"># the store learned the name once, at the grow.</span>
+        <span class="n">placements</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="n">seg</span><span class="p">,</span> <span class="n">off</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_record_tx</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
+        <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: staged </span><span class="si">%s</span><span class="s2"> at </span><span class="si">%s</span><span class="s2">+</span><span class="si">%d</span><span class="s2"> (</span><span class="si">%d</span><span class="s2"> bytes)"</span><span class="p">,</span>
+                     <span class="n">uuid</span><span class="p">,</span> <span class="n">seg_name</span><span class="p">,</span> <span class="n">off</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">queued</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_write_back</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">placements</span><span class="p">:</span> <span class="n">_Placements</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""One crossing for the batch, not one per tensor."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">placements</span><span class="o">.</span><span class="n">uuids</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span> <span class="ow">is</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_segments_named_to</span><span class="p">:</span>
+            <span class="c1"># Swapped store: it has never heard of our segments, and an index</span>
+            <span class="c1"># it cannot resolve is an error it would raise here.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_name_segments_to_store</span><span class="p">()</span>
+        <span class="c1"># The columns go straight across, already in the callee's layout.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_shm_placement</span><span class="p">(</span>
+            <span class="n">placements</span><span class="o">.</span><span class="n">uuids</span><span class="p">,</span> <span class="n">placements</span><span class="o">.</span><span class="n">segment_idxs</span><span class="p">,</span> <span class="n">placements</span><span class="o">.</span><span class="n">offsets</span><span class="p">,</span>
+        <span class="p">)</span>
+
+<div class="viewcode-block" id="ArenaShmCommunicationManager.register_for_send">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">register_for_send</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">tensor_infos</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">],</span>
+        <span class="n">skip_cuda_sync</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+        <span class="n">queued</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">placements</span> <span class="o">=</span> <span class="n">_Placements</span><span class="o">.</span><span class="n">empty</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_maybe_log_stats</span><span class="p">()</span>
-        <span class="k">with</span> <span class="n">ctx</span><span class="p">:</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_d2h_ctx</span><span class="p">():</span>
             <span class="k">for</span> <span class="n">info_arg</span> <span class="ow">in</span> <span class="n">tensor_infos</span><span class="p">:</span>
-                <span class="n">uuid</span> <span class="o">=</span> <span class="n">info_arg</span><span class="o">.</span><span class="n">uuid</span>
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">is_registered</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">):</span>
-                    <span class="k">continue</span>
-                <span class="n">tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
-                <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
-                <span class="n">t</span> <span class="o">=</span> <span class="n">tensor</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
-                <span class="n">nbytes</span> <span class="o">=</span> <span class="n">t</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">*</span> <span class="n">t</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
-                <span class="n">loc</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_reserve</span><span class="p">(</span><span class="n">nbytes</span><span class="p">)</span>
-                <span class="k">if</span> <span class="n">loc</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">is_registered</span><span class="p">(</span>
-                        <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">):</span>
-                    <span class="c1"># Lost a concurrent-duplicate race: another thread</span>
-                    <span class="c1"># registered this uuid while our reserve released the</span>
-                    <span class="c1"># GIL. Return our slot instead of orphaning it.</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="o">*</span><span class="n">loc</span><span class="p">)</span>
-                    <span class="k">continue</span>
-                <span class="k">if</span> <span class="n">loc</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-                    <span class="c1"># Arena saturated: spill THIS tensor to the per-uuid file</span>
-                    <span class="c1"># protocol (infos keep shm_segment=None — the consumer</span>
-                    <span class="c1"># falls back to the file read for exactly those).</span>
-                    <span class="n">data</span> <span class="o">=</span> <span class="n">_serialize_tensor</span><span class="p">(</span><span class="n">t</span><span class="p">)</span>
-                    <span class="n">path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
-                    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s2">"wb"</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_shm_files</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">path</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span>
-                        <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">_record_tx</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">),</span>
-                                        <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
-                    <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: spilled </span><span class="si">%s</span><span class="s2"> to </span><span class="si">%s</span><span class="s2"> (</span><span class="si">%d</span><span class="s2"> bytes)"</span><span class="p">,</span>
-                                 <span class="n">uuid</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">))</span>
-                    <span class="k">continue</span>
-                <span class="n">seg</span><span class="p">,</span> <span class="n">off</span> <span class="o">=</span> <span class="n">loc</span>
-                <span class="k">try</span><span class="p">:</span>
-                    <span class="k">if</span> <span class="n">nbytes</span><span class="p">:</span>
-                        <span class="n">host</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span>
-                            <span class="bp">self</span><span class="o">.</span><span class="n">_seg_views</span><span class="p">[</span><span class="n">seg</span><span class="p">][</span><span class="n">off</span><span class="p">:</span><span class="n">off</span> <span class="o">+</span> <span class="n">nbytes</span><span class="p">],</span>
-                            <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">uint8</span><span class="p">,</span>
-                        <span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
-                        <span class="c1"># Async D2H into the pinned segment when a copy</span>
-                        <span class="c1"># stream exists (one sync below covers the batch);</span>
-                        <span class="c1"># blocking otherwise, so the descriptor can never</span>
-                        <span class="c1"># ship ahead of the bytes.</span>
-                        <span class="n">host</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span>
-                            <span class="n">t</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
-                        <span class="n">queued</span> <span class="o">=</span> <span class="kc">True</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">seg</span><span class="p">,</span> <span class="n">off</span><span class="p">)</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
-                <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
-                    <span class="c1"># Anything that unwinds between reserve and the</span>
-                    <span class="c1"># _arena_locs record would orphan the slot forever</span>
-                    <span class="c1"># (cleanup can only free what is recorded).</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="n">seg</span><span class="p">,</span> <span class="n">off</span><span class="p">)</span>
-                    <span class="k">raise</span>
-                <span class="n">seg_name</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">segment_name</span><span class="p">(</span><span class="n">seg</span><span class="p">)</span>
-                <span class="n">info_arg</span><span class="o">.</span><span class="n">shm_segment</span> <span class="o">=</span> <span class="n">seg_name</span>
-                <span class="n">info_arg</span><span class="o">.</span><span class="n">shm_offset</span> <span class="o">=</span> <span class="n">off</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span>
-                    <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">_record_tx</span><span class="p">(</span>
-                        <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">,</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">t0</span><span class="p">)</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"ARENA: staged </span><span class="si">%s</span><span class="s2"> at </span><span class="si">%s</span><span class="s2">+</span><span class="si">%d</span><span class="s2"> (</span><span class="si">%d</span><span class="s2"> bytes)"</span><span class="p">,</span>
-                             <span class="n">uuid</span><span class="p">,</span> <span class="n">seg_name</span><span class="p">,</span> <span class="n">off</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">)</span>
+                <span class="n">queued</span> <span class="o">|=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stage_one</span><span class="p">(</span>
+                    <span class="n">request_id</span><span class="p">,</span> <span class="n">info_arg</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="n">info_arg</span><span class="p">,</span> <span class="n">placements</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_write_back</span><span class="p">(</span><span class="n">placements</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">queued</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># The control message referencing these bytes is sent after we</span>
             <span class="c1"># return; the consumer must never observe a partial copy.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="ArenaShmCommunicationManager.register_for_send_uuids">
+<a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.register_for_send_uuids">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">register_for_send_uuids</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">per_request</span><span class="p">:</span> <span class="n">ParallelList</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
+        <span class="n">skip_cuda_sync</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+    <span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Uuid-driven staging: no descriptor is rebuilt to be read for its</span>
+<span class="sd">        uuid, and placement goes back as two columns rather than a whole</span>
+<span class="sd">        descriptor. The whole batch stages inside one stream context and syncs</span>
+<span class="sd">        once at the end, rather than one host-blocking sync per request."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+            <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+        <span class="n">queued</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">placements</span> <span class="o">=</span> <span class="n">_Placements</span><span class="o">.</span><span class="n">empty</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_maybe_log_stats</span><span class="p">()</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_d2h_ctx</span><span class="p">():</span>
+            <span class="k">for</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">uuids</span> <span class="ow">in</span> <span class="n">per_request</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">uuids</span><span class="p">:</span>
+                    <span class="n">queued</span> <span class="o">|=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stage_one</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">placements</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_write_back</span><span class="p">(</span><span class="n">placements</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">queued</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span></div>
 
 
@@ -1505,7 +1652,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="ArenaShmCommunicationManager.start_read_tensors">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.arena.html#mstar.communication.arena.ArenaShmCommunicationManager.start_read_tensors">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">start_read_tensors</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span>
         <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="c1"># Increment races are benign here: a torn count can only make</span>
@@ -1539,13 +1686,10 @@ window.runMermaid = runMermaid;</script>
                             <span class="n">next_node</span><span class="o">=</span><span class="n">graph_edge</span><span class="o">.</span><span class="n">next_node</span><span class="p">,</span>
                             <span class="n">graph_walk</span><span class="o">=</span><span class="n">graph_walk</span><span class="p">,</span> <span class="n">info</span><span class="o">=</span><span class="n">info</span><span class="p">,</span>
                         <span class="p">)</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span>
-                            <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
                         <span class="k">continue</span>
-                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">check_uuid_presence</span><span class="p">(</span>
-                            <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">):</span>
-                        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span>
-                            <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">check_uuid_presence</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">):</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
                         <span class="k">continue</span>
                     <span class="k">if</span> <span class="n">info</span><span class="o">.</span><span class="n">shm_segment</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
                         <span class="c1"># Spilled at the producer (arena saturated): read the</span>
@@ -1560,12 +1704,11 @@ window.runMermaid = runMermaid;</script>
                         <span class="n">tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_read_from_arena</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
                     <span class="n">h2d_did_work</span> <span class="o">=</span> <span class="n">h2d_did_work</span> <span class="ow">or</span> <span class="n">tensor</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">0</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">put_tensor</span><span class="p">(</span>
-                        <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="n">tensor</span><span class="p">)</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span>
-                        <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+                        <span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="n">tensor</span><span class="p">,</span> <span class="n">info</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
                     <span class="c1"># +1 transit (released by get_ready_tensors), +1 usage</span>
                     <span class="c1"># (released by _cleanup_consumed_inputs).</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">increment_ref</span><span class="p">(</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
                 <span class="n">read_edges</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
                     <span class="p">(</span><span class="n">graph_edge</span><span class="p">,</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span> <span class="o">-</span> <span class="n">rx_t0</span><span class="p">))</span>
         <span class="n">future</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1660,10 +1803,11 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_wake_q</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_cleanup_by_uuid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_cleanup_by_uuid</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uuid</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">registered</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="c1"># Grandparent cleanup (refcounts): skip the file manager's unlink.</span>
         <span class="nb">super</span><span class="p">(</span><span class="n">SharedMemoryCommunicationManager</span><span class="p">,</span> <span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="n">_cleanup_by_uuid</span><span class="p">(</span>
-            <span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
+            <span class="n">uuid</span><span class="p">,</span> <span class="n">registered</span><span class="p">,</span>
+        <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="p">(</span><span class="n">loc</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_arena_locs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="kc">None</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">free</span><span class="p">(</span><span class="o">*</span><span class="n">loc</span><span class="p">)</span>
@@ -1673,9 +1817,9 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">os</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>   <span class="c1"># spilled tensor: reclaim the file</span>
             <span class="k">except</span> <span class="ne">FileNotFoundError</span><span class="p">:</span>
                 <span class="k">pass</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">check_uuid_presence</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">check_uuid_presence</span><span class="p">(</span><span class="n">uuid</span><span class="p">):</span>
             <span class="k">return</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">remove_tensor</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">remove_tensor</span><span class="p">(</span><span class="n">uuid</span><span class="p">)</span></div>
 
 </pre></div>
 
@@ -1724,7 +1868,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 28, 2026.
+  Last updated on Sep 29, 2026.
   <br/>
 </p>
   </div>
