@@ -954,6 +954,10 @@ class PythonGraphRuntime(GraphRuntime):
         for edge in non_streaming_outputs:
             wg_id = self._walk_node_to_wg_id.get((graph_walk, edge.next_node))
             if wg_id is not None and wg_id in self._queues:
+                if edge.next_node == node_name and not self._node_reads(rid, wg_id, edge):
+                    # Only feeds the loop's accumulated outputs, which already
+                    # cached it; routed, it would bounce off this worker.
+                    continue
                 fanout = sharding_config.fanout_graph_edges(
                     edge, source_node=node_name,
                     source_graph_walk=graph_walk,
@@ -1065,6 +1069,11 @@ class PythonGraphRuntime(GraphRuntime):
             is_first_tp_rank=is_first_tp_rank
         )
 
+
+    def _node_reads(self, rid: int, wg_id: int, edge: GraphEdge) -> bool:
+        wgio = self._queues[wg_id].per_request_queues.get(rid)
+        node = wgio.nodes.get(edge.next_node) if wgio is not None else None
+        return node is None or edge.name in node.input_names
 
     def _mark_node_complete(
         self, rid: int, wg_id: int, node_name: str,

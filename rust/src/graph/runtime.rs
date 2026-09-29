@@ -2164,7 +2164,7 @@ impl GraphRuntime {
             // Before complete(), which clears the flag.
             let was_speculative = state.is_spec_scheduled(node);
             let completed = state.complete(&g, node, &out_tensors);
-            let pre_shard_edges = completed.edges;
+            let mut pre_shard_edges = completed.edges;
             let freed_inputs = completed.freed;
             // A loop that cached this node's outputs holds a reference on
             // each, as `Loop.maybe_cache_output` takes one. Applied before
@@ -2207,6 +2207,13 @@ impl GraphRuntime {
                     );
                 }
             }
+            // A loop-back the node never reads only feeds the loop's accumulated
+            // outputs. Dropped after persist_pre and the new-token count read it.
+            pre_shard_edges.retain(|e| {
+                !(matches!(e.dest, Dest::Local(d) if d == node)
+                    && !e.streaming
+                    && g.node(node).slot_of(e.name).is_none())
+            });
             let me_sym = self.shard.me;
             let mut edges = if let Some(info) = &self.requests[rid as usize] {
                 if let Some(sharding) = &info.shard {
