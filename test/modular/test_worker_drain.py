@@ -14,6 +14,7 @@ from mstar.utils.ipc_format import (
     MessageSource,
     RemoveRequest,
 )
+from mstar.worker.rid_table import RidTable
 from mstar.worker.worker import Worker
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -35,14 +36,27 @@ def _worker(
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
     w._pending_removes = set()
+    # Identity interning: these tests use the rid string as its own handle, so
+    # the string/handle split is exercised without a real runtime.
+    w._graph_runtime = SimpleNamespace(
+        get_rid_handle=lambda r: r if r in known_rids else None,
+        get_rid_string=lambda h: h,
+        remove_request=lambda h: None,
+        # The TP fan-out reads the sharding config off the runtime now; no
+        # groups means no followers, which is what these tests assume.
+        get_sharding_config=lambda r: (
+            SimpleNamespace(groups=[]) if r in known_rids else None
+        ),
+    )
     w._last_active = {}
     w.streaming_buffers = {}
     w.scheduler = SimpleNamespace(
-        clear_rid=lambda rid: w.cleared.append(rid),  # noqa: PLW0108
+        clear_rid=lambda rid, rid_str: w.cleared.append(rid),
+        clear_wire_rid=w.cleared.append,
         fail_rids=lambda rids: w.failed.update(rids),  # noqa: PLW0108
         pending_tp_follow_count=dict.fromkeys(tp_follow, 1),
     )
-    w.worker_graphs_manager = SimpleNamespace(
+    w.request_state = SimpleNamespace(
         per_request_info={
             rid: SimpleNamespace(sharding_config=SimpleNamespace(groups=[]))
             for rid in known_rids
@@ -105,6 +119,35 @@ def test_drain_waits_for_committed_tp_follow_batches():
     assert len(_reads_done(w)) == 1
 
 
+def test_drain_waits_for_a_follow_that_arrived_before_new_request():
+    """The follow rode a different edge and beat NEW_REQUEST, so this rank has
+    no handle for the rid yet. The count is keyed by the wire string exactly so
+    this case still gates READS_DONE -- ACKing here would bring the REMOVE that
+    strands the batch at the head of the TP FIFO."""
+    w = _worker(known_rids=(), tp_follow=("X",))
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert "X" in w._draining_rids and not _reads_done(w)
+
+    # NEW_REQUEST lands, the batch runs, the count drops.
+    w.scheduler.pending_tp_follow_count.pop("X")
+    Worker._apply_pending_drains(w, set())
+    assert len(_reads_done(w)) == 1
+
+
+def test_never_admitted_rid_with_no_follow_acks_at_once():
+    w = _worker(known_rids=())
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert len(_reads_done(w)) == 1
+
+
+def test_remove_of_a_never_admitted_rid_clears_its_wire_keyed_state():
+    """No handle to clear anything else with, but the TP-follow count is keyed
+    by the string and nothing else would ever pop it."""
+    w = _worker(known_rids=(), tp_follow=("X",))
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    assert w.cleared == ["X"]
+
+
 def test_drain_deferred_behind_inflight_gpu_step():
     w = _worker(in_flight=("X",))
     Worker._drain_request(w, DrainRequest(request_id="X"))
@@ -160,6 +203,53 @@ def test_add_new_request_skips_draining_rid():
     w = _worker(draining=("X",))
     # Bails before touching engine/graph managers (out-of-order NEW after DRAIN).
     Worker._add_new_request(w, SimpleNamespace(request_id="X"))
+
+
+def test_add_new_request_hands_off_the_handle_not_the_string():
+    w = Worker.__new__(Worker)
+    w.worker_id = "w0"
+    w._draining_rids = set()
+    w._unprocessed_messages = {}
+    w._my_consumer_connections = []
+    w._last_active = {}
+    rids = RidTable()
+    rids.intern("other")  # so X's handle is 1, not 0
+    w._graph_runtime = SimpleNamespace(
+        add_request=lambda request_id, **kw: rids.intern(request_id),
+        get_rid_handle=rids.handle, get_rid_string=rids.name,
+        get_sharding_config=lambda h: None,
+    )
+    seen = {}
+
+    def _state_add(request_id, request_info):
+        seen["state"] = request_id
+        w.request_state.per_request_info[request_id] = SimpleNamespace(
+            sharding_config=None, stream_buffers={},
+        )
+
+    w.request_state = SimpleNamespace(
+        per_request_info={}, add_request=_state_add,
+    )
+    w.engine_manager = SimpleNamespace(
+        evictable_nodes=lambda: ["n"],
+        add_request=lambda rid, cfgs: seen.setdefault("engine", rid),
+    )
+    w.tensor_manager = SimpleNamespace(
+        register_request=lambda rid, cfg: seen.setdefault("tensors", rid),
+        start_read_tensors=lambda rid, inputs, graph_walk: [],
+    )
+    w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
+    Worker._add_new_request(w, SimpleNamespace(
+        request_id="X", request_info=info, initial_inputs=[],
+        partition_worker_graph_ids=[], worker_graph_to_workers={},
+    ))
+
+    handle = w._graph_runtime.get_rid_handle("X")
+    assert handle == 1
+    assert info.rid_handle == handle
+    assert seen == {"state": handle, "engine": handle, "tensors": handle}
+    assert set(w._last_active) == {(handle, "n")}
 
 
 # ── preprocess worker ───────────────────────────────────────────────────────

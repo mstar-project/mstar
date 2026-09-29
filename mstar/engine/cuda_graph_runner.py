@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, NamedTuple
@@ -57,19 +58,104 @@ def agree_across_ranks(
     return [bool(value) for value in gathered.tolist()]
 
 
+#: Handles for padding rows. Real handles are >= 0 (they index the worker's rid
+#: table) and -1 is CurrentForwardPassInfo's unstamped default, so counting down
+#: from -2 collides with neither. A padding row IS its handle everywhere the
+#: engine keys by rid; the name it was minted from is kept only so logs and
+#: CurrentForwardPassInfo.request_id stay readable. Memoized per name because a
+#: submodule keys its per-request state by the handle: one shared value would
+#: collapse every padding row onto the same state.
+_DUMMY_HANDLE_BASE = -2
+_dummy_handles: dict[str, int] = {}
+_dummy_names: dict[int, str] = {}
+
+
+def dummy_rid_handle(name: str) -> int:
+    handle = _dummy_handles.get(name)
+    if handle is None:
+        handle = _dummy_handles[name] = _DUMMY_HANDLE_BASE - len(_dummy_handles)
+        _dummy_names[handle] = name
+    return handle
+
+
+def dummy_rid_name(handle: int) -> str:
+    """The name a padding-row handle was minted from. Debug/logging only."""
+    return _dummy_names.get(handle, f"__cg_unknown_{handle}__")
+
+
 def dummy_metadata(
-    rids: list[str], graph_walk: str,
-) -> dict[str, CurrentForwardPassInfo]:
+    rids: list[int], graph_walk: str,
+) -> dict[int, CurrentForwardPassInfo]:
     """Stand-in request info for padding rows, which have no real request."""
     return {
         rid: CurrentForwardPassInfo(
-            request_id=rid,
+            request_id=dummy_rid_name(rid),
+            rid_handle=rid,
             graph_walk=graph_walk,
             fwd_index=0,
             random_seed=0,
             max_tokens=1,
         ) for rid in rids
     }
+
+
+def capture_into_graph(run, pool, device, autocast_dtype):
+    """Capture ``run`` into a new CUDA graph allocated from ``pool``.
+
+    Returns the graph and what ``run`` returned. A capture that fails part
+    way leaves two things behind that would sink every later capture on the
+    same pool: the caching allocator keeps routing this thread's allocations
+    into the pool (the next capture_begin fails with "already recording to
+    mempool_id"), and torch.cuda.graph never switches the thread back off its
+    capture stream. Undo both before re-raising, so the buckets after a
+    failed one still capture and the thread keeps running on the stream it
+    came in on.
+
+    A torch.compile'd forward that would recompile inside the capture is
+    failed up front with the guard that broke: dynamo saves the CUDA RNG state
+    before it compiles, which CUDA refuses during capture, so such a capture
+    cannot succeed and would otherwise die with an unrelated error.
+    """
+    prev_stream = torch.cuda.current_stream(device)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.compiler.set_stance("fail_on_recompile"), \
+                autocast_scope(autocast_dtype):
+            with torch.cuda.graph(graph, pool=pool):
+                output = run()
+    except BaseException:
+        torch.cuda.set_stream(prev_stream)
+        torch.cuda.synchronize(device)
+        _stop_recording_to_pool(device, pool)
+        raise
+    torch.cuda.synchronize(device)
+    return graph, output
+
+
+def fail_if_graphs_required(missing: list[str]) -> None:
+    """MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
+    failure, for deployments that would rather not come up than serve the
+    eager path at 10-20x the latency."""
+    if not missing or os.environ.get("MSTAR_REQUIRE_CUDA_GRAPHS", "0") != "1":
+        return
+    raise RuntimeError(
+        "CUDA graph capture failed for " + ", ".join(missing)
+        + " and MSTAR_REQUIRE_CUDA_GRAPHS=1"
+    )
+
+
+def _stop_recording_to_pool(device, pool) -> None:
+    end = getattr(torch._C, "_cuda_endAllocateToPool", None)
+    if end is None:
+        return
+    index = torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    try:
+        end(index, pool)
+    except RuntimeError:
+        # the capture failed before the allocator started recording
+        pass
 
 
 class DummyRowPool:
@@ -88,21 +174,27 @@ class DummyRowPool:
         self._prefix = prefix
         self._step_runner = step_runner
         self._resources = resources
-        self._held: dict[str, list[str]] = {}
+        self._held: dict[str, list[int]] = {}
 
-    def names(self, key: str, bs: int) -> list[str]:
-        return [f"__cg_{self._prefix}_{key}_{i}__" for i in range(bs)]
+    def handles(self, key: str, bs: int) -> list[int]:
+        """``bs`` padding-row handles for ``key``. Negative and stable per
+        (prefix, key, index), so they never collide with a real request's
+        handle nor with another pool's rows."""
+        return [
+            dummy_rid_handle(f"__cg_{self._prefix}_{key}_{i}__")
+            for i in range(bs)
+        ]
 
-    def ensure(self, key: str, bs: int) -> list[str]:
+    def ensure(self, key: str, bs: int) -> list[int]:
         """``bs`` rows for ``key``, ingesting any this pool hasn't opened yet."""
         held = self._held.setdefault(key, [])
-        names = self.names(key, bs)
-        for rid in names[len(held):]:
+        rids = self.handles(key, bs)
+        for rid in rids[len(held):]:
             self._step_runner.ingest_request(rid)
             held.append(rid)
-        return names
+        return rids
 
-    def reset(self, rids: list[str], free: bool=False) -> None:
+    def reset(self, rids: list[int], free: bool=False) -> None:
         for rid in rids:
             for resource in self._resources.values():
                 resource.reset_request(rid, free=free)
@@ -129,8 +221,8 @@ class CudaGraphSlot:
     static_input_keys: tuple[str, ...]
     static_outputs: BatchedModelOutput
     # padding rows address these; their streams stay resident between steps
-    dummy_rids: list[str]
-    dummy_metadata: dict[str, CurrentForwardPassInfo]
+    dummy_rids: list[int]
+    dummy_metadata: dict[int, CurrentForwardPassInfo]
     config_idx: int
 
 
@@ -179,6 +271,8 @@ class CudaGraphRunner:
         self._buckets: dict[BucketKey, CudaGraphBucket] = {}
 
         self._memory_pool = None
+        # buckets that failed to capture (here or on a peer rank) and run eagerly
+        self.dropped_buckets: list[BucketKey] = []
         # set by prepare_for_capture; capture reuses it rather than re-deriving
         self._prepared_slot_specs: list[CGSlotSpec] | None = None
 
@@ -305,7 +399,7 @@ class CudaGraphRunner:
             try:
                 slot = self._capture_one(spec)
             except Exception:
-                logger.warning(
+                logger.error(
                     "Failed to capture CUDA graph for %s: %s",
                     self._submodule_name, spec, exc_info=True
                 )
@@ -321,7 +415,7 @@ class CudaGraphRunner:
         agreed = self._buckets_captured_everywhere(slot_specs, captured)
         for bucket_key, slots in captured.items():
             if bucket_key not in agreed:
-                logger.warning(
+                logger.error(
                     "Dropping CUDA graph bucket %s for %s: captured %d of %d "
                     "slots here, or fewer on another rank",
                     bucket_key, self._submodule_name, len(slots), self._num_slots,
@@ -337,9 +431,25 @@ class CudaGraphRunner:
                 self.declare_inputs_for(SlotLease(slot=0, bucket=bucket_key))
 
         self._dummy_rows.release_all()
+        self._report_dropped(
+            [spec.bucket for spec in slot_specs if spec.slot == 0], agreed
+        )
 
         mem_after = torch.cuda.memory_allocated(self._device)
         self._log_memory(mem_before, mem_after)
+
+    def _report_dropped(self, wanted: list, kept) -> None:
+        """Say loudly which buckets run eagerly. A dropped bucket is a silent
+        10-20x latency cliff otherwise, and one failure used to take every
+        later bucket with it."""
+        self.dropped_buckets = [key for key in wanted if key not in kept]
+        if self.dropped_buckets:
+            logger.error(
+                "CudaGraphRunner[%s]: captured %d of %d buckets; these run "
+                "eagerly: %s",
+                self._submodule_name, len(wanted) - len(self.dropped_buckets),
+                len(wanted), self.dropped_buckets,
+            )
 
     def _buckets_captured_everywhere(
         self,
@@ -471,13 +581,10 @@ class CudaGraphRunner:
                 prepare()
             torch.cuda.synchronize()
 
-            graph = torch.cuda.CUDAGraph()
-            with autocast_scope(self._autocast_dtype):
-                with torch.cuda.graph(graph, pool=self._memory_pool):
-                    output = BatchedModelOutput.coerce(
-                        run_forward()
-                    )
-            torch.cuda.synchronize()
+            graph, output = capture_into_graph(
+                run_forward, self._memory_pool, self._device, self._autocast_dtype,
+            )
+            output = output = BatchedModelOutput.coerce(output)
 
             return self._build_slot_from_capture(
                 output=output,
@@ -516,7 +623,7 @@ class CudaGraphRunner:
         return self._compiled_forwards[spec.config_idx]
 
     def _dummy_engine_inputs(
-        self, dummy_rids: list[str], graph_walk: str,
+        self, dummy_rids: list[int], graph_walk: str,
     ) -> ModelInputsFromEngine:
         return ModelInputsFromEngine(
             request_ids=list(dummy_rids),
@@ -741,7 +848,7 @@ class CudaGraphRunner:
         )
         return [*inputs, *padding]
 
-    def step_ids(self, lease: SlotLease, request_ids: list[str]) -> list[str]:
+    def step_ids(self, lease: SlotLease, request_ids: list[int]) -> list[int]:
         """The padded addressing for one step: real ids first, then the slot's
         padding ids. Plans, commits, and advances address real request state by
         its own id; only the padding rows run against the slot's own state."""
@@ -749,9 +856,9 @@ class CudaGraphRunner:
         return [*request_ids, *dummy_rids[len(request_ids):lease.bucket.bs]]
 
     def step_metadata(
-        self, lease: SlotLease, request_ids: list[str],
-        per_request_info: Mapping[str, CurrentForwardPassInfo],
-    ) -> dict[str, CurrentForwardPassInfo]:
+        self, lease: SlotLease, request_ids: list[int],
+        per_request_info: Mapping[int, CurrentForwardPassInfo],
+    ) -> dict[int, CurrentForwardPassInfo]:
         slot = self.slot_for(lease)
         meta = {rid: per_request_info[rid] for rid in request_ids}
         for rid in slot.dummy_rids[len(request_ids):lease.bucket.bs]:
@@ -846,7 +953,7 @@ class PiecewiseGraphData:
     graph: torch.cuda.CUDAGraph
     static_inputs: dict[str, torch.Tensor]
     static_outputs: dict[str, torch.Tensor]
-    dummy_rids: list[str]
+    dummy_rids: list[int]
     shape: PiecewiseCaptureShape
     bucket: BucketKey
 
@@ -944,6 +1051,8 @@ class PiecewiseCudaGraphRunner:
 
         self._graphs: dict[PiecewiseGraphKey, PiecewiseGraphData] = {}
         self._memory_pool = None
+        # (bs, total_tokens) shapes that failed to capture and run eagerly
+        self.dropped_shapes: list[tuple[int, int]] = []
         self._dummy_rows = DummyRowPool(
             prefix=f"pw_{label}", step_runner=step_runner, resources=resources,
         )
@@ -961,10 +1070,10 @@ class PiecewiseCudaGraphRunner:
         if self._max_slots <= 1 or self._config.declare_step is None:
             return
         for shape in self._config.get_capture_shapes(self._capture_batch_sizes):
-            # names, not `ensure`: the declaration only labels its rows, and
+            # handles, not `ensure`: the declaration only labels its rows, and
             # ingesting here would run before the buffers are built
             step = self._config.declare_step(
-                self._dummy_rows.names(self._dummy_key(shape, 0), shape.bs),
+                self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
                 list(shape.seq_lens),
             )
             if step is not None and any(
@@ -1051,7 +1160,7 @@ class PiecewiseCudaGraphRunner:
                     self._capture_one(shape, slot)
                 except Exception:
                     shape_captured = False
-                    logger.warning(
+                    logger.error(
                         "PiecewiseCudaGraphRunner[%s]: failed to capture bs=%d "
                         "total_tokens=%d slot=%d", self._label, shape.bs,
                         shape.total_tokens, slot, exc_info=True,
@@ -1080,11 +1189,19 @@ class PiecewiseCudaGraphRunner:
                 ), None) is not None
             ]
             if dropped:
-                logger.warning(
+                logger.error(
                     "PiecewiseCudaGraphRunner[%s]: dropping bs=%d total_tokens=%d "
                     "slots=%s, not captured on every rank / for every slot",
                     self._label, shape.bs, shape.total_tokens, dropped,
                 )
+            self.dropped_shapes.append((shape.bs, shape.total_tokens))
+        if self.dropped_shapes:
+            logger.error(
+                "PiecewiseCudaGraphRunner[%s]: captured %d of %d shapes; these "
+                "run eagerly: %s", self._label,
+                len(ordered) - len(self.dropped_shapes), len(ordered),
+                self.dropped_shapes,
+            )
 
     def _capture_one(self, shape: PiecewiseCaptureShape, slot: int) -> None:
         dummy_rids = self._dummy_rows.ensure(
@@ -1118,11 +1235,10 @@ class PiecewiseCudaGraphRunner:
                 self._plan(step, shape)
             torch.cuda.synchronize()
 
-            graph = torch.cuda.CUDAGraph()
-            with autocast_scope(self._autocast_dtype):
-                with torch.cuda.graph(graph, pool=self._memory_pool):
-                    static_outputs = self._normalize_output(run_fn())
-            torch.cuda.synchronize()
+            graph, raw_outputs = capture_into_graph(
+                run_fn, self._memory_pool, self._device, self._autocast_dtype,
+            )
+            static_outputs = self._normalize_output(raw_outputs)
         finally:
             # pages stay with the dummy streams: replay's padding rows address
             # the same ids, so their plan finds the storage already resident
@@ -1142,7 +1258,7 @@ class PiecewiseCudaGraphRunner:
     def _call_inputs(
         self,
         static_inputs: dict[str, torch.Tensor],
-        step_ids: list[str],
+        step_ids: list[int],
     ) -> PiecewiseCallInputs:
         """What the region is handed, over the padded capture batch.
 
@@ -1161,7 +1277,7 @@ class PiecewiseCudaGraphRunner:
         )
 
     def _declare(
-        self, request_ids: list[str], seq_lens: list[int],
+        self, request_ids: list[int], seq_lens: list[int],
         bucket: BucketKey, capture: bool, slot: int,
         real_bs: int | None = None,
     ):
@@ -1276,7 +1392,7 @@ class PiecewiseCudaGraphRunner:
     def run(
         self,
         static_inputs: dict[str, torch.Tensor],
-        request_ids: list[str] | None = None,
+        request_ids: list[int] | None = None,
         seq_lens: list[int] | None = None,
         real_bs: int | None = None,
     ) -> PiecewiseOutput:
