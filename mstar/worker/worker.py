@@ -2207,7 +2207,7 @@ class Worker:
 
     def _postprocess_batch(
         self, batch_N: PendingBatch,
-        outputs: dict[int, NameToTensorList],
+        outputs: BatchedModelOutput,
     ):
         # Stage stopwatch, same names as the NVTX ranges below. A stamp rather
         # than a nested `_span` per stage: this function has two early returns,
@@ -2399,10 +2399,6 @@ class Worker:
                 "worker.postprocess.store_tensors",
                 _time.perf_counter() - _t_store,
             )
-            if self._phase_period:
-                _now = _time.perf_counter()
-                self._phase_buf["worker.route.process_outputs"].append(_now - _rt)
-                _rt = _now
 
         # The graph runtime's own share of postprocess: the routing call.
         _t_route = _time.perf_counter() if self._phase_period else 0.0
@@ -2436,6 +2432,7 @@ class Worker:
             range_push("worker.postprocess.register_outputs", synchronize=False)
         with self._span("worker.postprocess.register_outputs"):
             self._register_outputs(route_output)
+        _pp_stage("register_outputs")
 
         # send outputs
         if self.enable_nvtx:
@@ -2516,10 +2513,6 @@ class Worker:
             self._phase_record(
                 "worker.postprocess.send", _time.perf_counter() - _t_send,
             )
-            if self._phase_period:
-                self._phase_buf["worker.send_outputs.per_rid"].append(
-                    _time.perf_counter() - _so
-                )
 
         _pp_stage("send_outputs")
         if self.enable_nvtx:
@@ -2545,8 +2538,8 @@ class Worker:
         self,
         buffers: dict,
         side: torch.cuda.Stream,
-        request_ids: list[str],
-    ) -> dict[str, NameToTensorList]:
+        request_ids: list[int],
+    ) -> dict[int, NameToTensorList]:
         """One device-to-host copy per named buffer, sliced per request after.
 
         The per-rid form costs a copy per tensor per request — 48 of them at a
@@ -2579,11 +2572,11 @@ class Worker:
 
     @staticmethod
     def _rows_to_per_rid(
-        host: dict, request_ids: list[str],
-    ) -> dict[str, NameToTensorList]:
+        host: dict, request_ids: list[int],
+    ) -> dict[int, NameToTensorList]:
         """Slice row-addressed buffers into the per-rid form ``check_stop``
         reads: row i goes to ``request_ids[i]``."""
-        out: dict[str, NameToTensorList] = {}
+        out: dict[int, NameToTensorList] = {}
         for i, rid in enumerate(request_ids):
             per_rid: NameToTensorList = {}
             for name, buf in host.items():
@@ -2597,7 +2590,7 @@ class Worker:
         outputs: "BatchedModelOutput",
         completion_event: torch.cuda.Event | None,
         request_ids: list[int] | None = None,
-    ) -> dict[str, NameToTensorList]:
+    ) -> dict[int, NameToTensorList]:
         """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
         don't trigger a default-stream sync. With same-thread async,
@@ -2976,10 +2969,15 @@ class Worker:
             for name, vs in samples:
                 vs = sorted(vs)
                 n = len(vs)
-                p50 = vs[n // 2] * 1000
-                p95 = vs[min(n - 1, int(n * 0.95))] * 1000
-                mean = (sum(vs) / n) * 1000
-                parts.append(f"{name}: p50={p50:.2f}ms p95={p95:.2f}ms mean={mean:.2f}ms n={n}")
+                # a trailing '#' marks a count, not a duration
+                scale, unit = (1, "") if name.endswith("#") else (1000, "ms")
+                p50 = vs[n // 2] * scale
+                p95 = vs[min(n - 1, int(n * 0.95))] * scale
+                mean = (sum(vs) / n) * scale
+                parts.append(
+                    f"{name}: p50={p50:.2f}{unit} p95={p95:.2f}{unit} "
+                    f"mean={mean:.2f}{unit} n={n}"
+                )
             bs = (sum(phase_bs) / len(phase_bs)) if phase_bs else 0.0
             logger.info(
                 "Worker %s phase-timing iter=%d bs=%.2f: %s",

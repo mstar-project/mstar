@@ -1065,7 +1065,12 @@ class KVManager(AttentionResource):
             if self._preplan_key == self._plan_key(step, ctx):
                 self._current_plan_states = self._preplan_states
                 res = self._cached_plan_output
-                self._preplan_fork_undo = []
+
+                # Promotion. The staged addressing already reads as though the
+                # fork had happened; this is the copy itself, which staging left
+                # undone. `_pending_fork_state` says why.
+                self._maybe_apply_forks(step, ctx)
+
                 self._preplan_new_labels = []
                 self._preplan_marked = []
                 self.clear_preplan()
@@ -1075,7 +1080,7 @@ class KVManager(AttentionResource):
             # pre-planned): it must not be served the staged plan's pages.
             # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
-        
+
         # Both run ahead of the views, which record each stream's length and
         # generation. Staging only reads what the fork will land; running for
         # real applies it.

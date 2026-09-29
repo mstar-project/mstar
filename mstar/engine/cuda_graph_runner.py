@@ -584,7 +584,7 @@ class CudaGraphRunner:
             graph, output = capture_into_graph(
                 run_forward, self._memory_pool, self._device, self._autocast_dtype,
             )
-            output = output = BatchedModelOutput.coerce(output)
+            output = BatchedModelOutput.coerce(output)
 
             return self._build_slot_from_capture(
                 output=output,

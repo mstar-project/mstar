@@ -1131,43 +1131,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         if not skip_cuda_sync:
             torch.cuda.default_stream().synchronize()
         for info in tensor_infos:
-<<<<<<< HEAD
-            uuid = info.uuid
-            already_registered = self.tensor_store.is_registered(request_id, uuid)
-            if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
-                if already_registered:
-                    continue
-                logger.debug("Registering %s for send", uuid)
-                tensor = self.tensor_store.get_tensor(
-                    request_id=request_id, uuid=uuid
-                )
-                t0 = time.perf_counter()
-                ret_value = self.transfer_engine.register_memory(
-                    tensor.data_ptr(), tensor.nbytes
-                )
-                if PHASE_PERIOD:
-                    phase_record(
-                        "tensors.register_memory", time.perf_counter() - t0,
-                    )
-                if ret_value != 0:
-                    raise RuntimeError(
-                        f"Mooncake memory registration failed for request id {request_id}, uuid {uuid}."
-                    )
-                if self.enable_prof:
-                    # RDMA: the receiver does the actual read, so the sender-side
-                    # cost is the memory-pinning (register) time.
-                    self._record_tx(
-                        request_id, uuid, tensor.nbytes, time.perf_counter() - t0
-                    )
-            elif self.enable_prof and not already_registered:
-                tensor = self.tensor_store.get_tensor(request_id, uuid)
-                self._record_tx(request_id, uuid, tensor.nbytes, 0.0)
-            self.tensor_store.set_metadata(
-                request_id, uuid, mem_registered=True
-            )
-=======
             self._register_one(request_id, info.uuid)
->>>>>>> main
 
     def register_for_send_uuids(
         self,
@@ -1195,6 +1159,10 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             ret_value = self.transfer_engine.register_memory(
                 tensor.data_ptr(), tensor.nbytes
             )
+            if PHASE_PERIOD:
+                phase_record(
+                    "tensors.register_memory", time.perf_counter() - t0,
+                )
             if ret_value != 0:
                 raise RuntimeError(
                     f"Mooncake memory registration failed for request id "
