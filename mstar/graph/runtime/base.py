@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
+from mstar.communication.tensors import NameToTensorList, TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge
@@ -571,7 +572,12 @@ class GraphRuntime(ABC):
     def reset_outputs(
         self, node_name: str, rids: list[int], wg_ids: list[int],
     ):
-        """Drop stale output tensor_info before a pass writes new ones."""
+        """Drop stale output tensor_info before a pass writes new ones.
+
+        Internal to the Python runtime, which calls it from its own
+        completion; no worker call site. A no-op in Rust, which derives
+        outputs from the tensors it is handed and caches nothing to drop.
+        """
         pass
 
     @abstractmethod

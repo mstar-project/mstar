@@ -2274,6 +2274,9 @@ class Worker:
         # Stop loops, if applicable. The runtime filters rids whose walk does
         # not contain the loop, snapshots the stop times, records the pending
         # stops and fans out to peers.
+        # Main loop only: the runtime holds `&mut self` across its GIL
+        # release, so a concurrent caller gets "Already mutably
+        # borrowed" rather than blocking.
         if stops:
             self._graph_runtime.stop_loops_batched(
                 partition=batch_N.partition,
@@ -2387,6 +2390,9 @@ class Worker:
             send_rids if needs_info is None
             else [rid for rid in send_rids if rid in needs_info]
         )
+        # Main loop only: the runtime holds `&mut self` across its GIL
+        # release, so a concurrent caller gets "Already mutably
+        # borrowed" rather than blocking.
         self._graph_runtime.send_outputs(SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(

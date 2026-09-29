@@ -2964,7 +2964,9 @@ impl GraphRuntime {
     ///
     /// Returns per rid: the peer edges (grouped by worker), the persist
     /// signals, the emit-to-client edges, and whether a worker graph finished.
-    /// Frames are built by the caller -- see stop_loops_batched.
+    /// The caller decides what to do with them; the frames Rust builds for
+    /// itself are in `frames.rs` (INPUT_SIGNALS, WORKER_GRAPHS_DONE,
+    /// STOP_LOOPS).
     fn take_send_plan(&mut self, completion_id: u64) -> PyResult<SendPlan> {
         let c = self.completions.remove(&completion_id).ok_or_else(|| {
             PyValueError::new_err(format!("unknown completion {completion_id}"))

@@ -339,6 +339,11 @@ fn graph_edge(
         w_str(m.key("next_node"), next_node);
         w_str(m.key("name"), name);
         tensor_infos(m.key("tensor_info"), bk, infos);
+        // Always false, and that is checked against the receivers: `persist`
+        // and `conductor_new_token` are producer-side (read in route_outputs
+        // on the SENDER, never off an arriving edge), `_persist_for_loop` is
+        // set by the ingesting loop itself, and `_final_stream_chunk` is
+        // stamped by the receiver's own StreamBuffer. Same as Python sends.
         w_bool(m.key("persist"), false);
         w_bool(m.key("conductor_new_token"), false);
         w_bool(m.key("is_streaming"), is_streaming);
@@ -402,6 +407,7 @@ impl InputSignals<'_> {
             }
             w_str(m.key("partition_name"), self.partition_name);
             // A set, which msgpack cannot express; the codec sends a list.
+            // Always empty: only the conductor ever populates it.
             w_arr(m.key("producer_done"), 0);
         });
         out

@@ -531,6 +531,12 @@ def _build_tensor_bookkeeping() -> TensorBookkeeping:
     Not worth taking on its own. A descriptor is copied into Rust on the way
     in and rebuilt on the way out, which the Python runtime pays for and gets
     nothing back -- the saving is in the crossings the Rust runtime avoids.
+
+    Deliberately NOT gated on being in a worker, so the api server's data
+    worker takes it too and pays that copy with no Rust runtime behind it.
+    Small next to its per-request work, and the api server is a candidate for
+    Rust itself; ``TensorStore(bookkeeping=...)`` is the override if that
+    stops being true.
     """
     if resolve_graph_runtime_type(log=False) == GraphRuntimeType.RUST:
         return RustTensorBookkeeping()

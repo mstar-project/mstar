@@ -209,6 +209,12 @@ class RustGraphRuntime(GraphRuntime):
     Handles, worker graph ids and tensor uuids are already integers on both
     sides, so they cross as-is; only node, walk and partition NAMES are
     strings, and Rust interns those on arrival.
+
+    A Rust panic surfaces as ``PanicException``, a ``BaseException``, so the
+    worker's ``except Exception`` does not swallow it and the process dies
+    with the traceback. Intended: a panic poisons the bookkeeper mutex, so
+    every later call would fail anyway, and dying lets the conductor's
+    liveness path take the deployment down instead of wedging a worker.
     """
 
     def __init__(
