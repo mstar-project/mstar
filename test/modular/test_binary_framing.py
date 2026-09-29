@@ -249,7 +249,7 @@ def test_generate_streams_binary_frames_when_negotiated(monkeypatch):
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith(BINARY_STREAM_MEDIA_TYPE)
-    assert response.headers["vary"] == "Accept"
+    assert "Accept" in response.headers["vary"].split(", ")
     frames = list(iter_binary_frames(io.BytesIO(response.content)))
     assert [f["bytes"] for f in frames] == [c.data for c in chunks]
     assert len(response.content) < len(b"".join(

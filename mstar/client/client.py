@@ -72,9 +72,10 @@ class MStarClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._session = session or requests.Session()
-        # Opt in to ask for length-framed binary payloads (e.g. waypoint's
-        # large video frames), but decide how to parse from the response's
-        # Content-Type. A server that does not implement the framing — an
+        # Ask for length-framed binary payloads. ``video_frame`` requests ask
+        # by default (base64 NDJSON is not realtime at 720p); other modalities
+        # opt in here. How to parse is decided from the response's
+        # Content-Type: a server that does not implement the framing — an
         # older build, or the Rust frontend, neither of which reads
         # ``Accept`` — answers NDJSON and the historical path handles it.
         self._prefer_binary = prefer_binary
@@ -136,7 +137,7 @@ class MStarClient:
 
         url = f"{self.base_url}/generate"
         if stream:
-            return self._stream(url, data, files)
+            return self._stream(url, data, files, output_modalities=output_modalities)
         resp = self._session.post(url, data=data, files=files or None, timeout=self.timeout)
         resp.raise_for_status()
         return self._parse_result(resp.json())
@@ -256,8 +257,8 @@ class MStarClient:
             return item[0], bytes(item[1])
         raise TypeError(f"Unsupported {kind} item type: {type(item)!r}")
 
-    def _stream_headers(self) -> dict[str, str]:
-        if not self._prefer_binary:
+    def _stream_headers(self, output_modalities=()) -> dict[str, str]:
+        if not (self._prefer_binary or "video_frame" in output_modalities):
             return {}
         return {
             "Accept": f"{BINARY_STREAM_MEDIA_TYPE}, {NDJSON_STREAM_MEDIA_TYPE};q=0.9",
@@ -299,14 +300,14 @@ class MStarClient:
             range_pop()
             yield event
 
-    def _stream(self, url, data, files) -> Iterator[StreamEvent]:
+    def _stream(self, url, data, files, output_modalities=()) -> Iterator[StreamEvent]:
         with self._session.post(
             url,
             data=data,
             files=files or None,
             stream=True,
             timeout=self.timeout,
-            headers=self._stream_headers(),
+            headers=self._stream_headers(output_modalities),
         ) as resp:
             resp.raise_for_status()
             # Branch on what the server actually sent, not on what was asked

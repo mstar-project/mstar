@@ -225,6 +225,26 @@ def test_stream_sends_no_negotiation_headers_when_binary_is_disabled():
     assert post.call_args.kwargs["headers"] == {}
 
 
+def test_video_frame_streams_ask_for_binary_framing_without_opting_in():
+    """A plain SDK caller does not know to pass ``prefer_binary``; base64
+    NDJSON is not realtime at 720p, so ``video_frame`` asks by itself. The
+    fallback stays safe: the response Content-Type still decides the parser."""
+    from mstar.client.media import BINARY_STREAM_MEDIA_TYPE
+
+    line = json.dumps({"modality": "text", "data": base64.b64encode(b"hi").decode(), "metadata": {}})
+    resp = _fake_response("application/x-ndjson", (line + "\n").encode())
+    client = MStarClient("http://x")
+    ctx = mock.MagicMock()
+    ctx.__enter__.return_value = resp
+    with mock.patch.object(client._session, "post", return_value=ctx) as post:
+        events = list(
+            client._stream("http://x/generate", {}, None, output_modalities=("video_frame",))
+        )
+
+    assert [e.text for e in events] == ["hi"]
+    assert BINARY_STREAM_MEDIA_TYPE in post.call_args.kwargs["headers"]["Accept"]
+
+
 def test_stream_names_content_encoding_as_the_cause_on_a_compressed_binary_body():
     """``resp.raw.read`` bypasses urllib3's decoder, so a gzipped body would
     otherwise surface as an unreadable frame header."""

@@ -778,9 +778,8 @@ class APIServer:
                 yield payload
                 continue
             profiler.mark(f"apiserver.yield_frame.bytes[{len(payload)}]")
-            # Same range name as the NDJSON path on purpose: it is the column
-            # the gap budget in STREAMING_GAP_BUDGET.md is built from, so the
-            # two protocols stay directly comparable in one analyzer run.
+            # Same range name as the NDJSON path on purpose, so the two
+            # protocols stay directly comparable in one analyzer run.
             profiler.range_push(f"apiserver.socket_write.bytes[{len(payload)}]")
             try:
                 yield payload

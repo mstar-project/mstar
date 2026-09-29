@@ -58,7 +58,11 @@ A non-streaming response groups outputs by modality, each payload base64-encoded
    }
 
 A streaming response is ``application/x-ndjson`` — one JSON object per line as chunks
-arrive. ``GET /health`` returns ``{"status": "healthy"}``.
+arrive. A client that sends ``Accept: application/vnd.mstar.frames`` receives
+length-framed binary chunks instead, which skips the base64 pass on multi-megabyte
+``video_frame`` payloads; a server without the framing keeps answering NDJSON, so a
+client must parse by the response ``Content-Type``. ``GET /health`` returns
+``{"status": "healthy"}``.
 
 .. code-block:: bash
 
@@ -167,7 +171,12 @@ Result and event types live in ``mstar.client``:
   ``AudioChunk(pcm, sample_rate)``, and ``VideoFrameChunk(data, metadata)``. A
   video-frame chunk validates its width, height, fps, pixel format and frame range;
   ``.to_numpy()`` returns a zero-copy ``[frame_count, height, width, 3]`` uint8 view.
-  Raw ``video_frame`` requests require ``stream=True``.
+  Raw ``video_frame`` requests require ``stream=True``. The SDK asks for the binary
+  framing automatically for ``video_frame``; other modalities opt in with
+  ``MStarClient(prefer_binary=True)``. The server does not pace generation to the
+  consumer: frames are produced at model speed and buffered by the API server until
+  read, bounded by the request's frame count, so a consumer slower than realtime
+  accumulates that backlog in server memory (about 11 MiB per chunk at 720p).
 
 .. code-block:: python
 

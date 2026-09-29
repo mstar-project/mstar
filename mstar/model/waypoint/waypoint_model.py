@@ -481,7 +481,9 @@ class WaypointModel(Model):
         round trip through the request would round twice on the way there."""
         import torchvision
 
-        img = torchvision.io.decode_image(filepath).to(device)  # uint8 [C, H, W]
+        img = torchvision.io.decode_image(
+            filepath, mode=torchvision.io.ImageReadMode.RGB
+        ).to(device)  # uint8 [3, H, W]
         return TensorAndMetadata(img.permute(1, 2, 0).contiguous())
 
     def postprocess(
