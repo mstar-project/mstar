@@ -58,13 +58,39 @@ def agree_across_ranks(
     return [bool(value) for value in gathered.tolist()]
 
 
+#: Handles for padding rows. Real handles are >= 0 (they index the worker's rid
+#: table) and -1 is CurrentForwardPassInfo's unstamped default, so counting down
+#: from -2 collides with neither. A padding row IS its handle everywhere the
+#: engine keys by rid; the name it was minted from is kept only so logs and
+#: CurrentForwardPassInfo.request_id stay readable. Memoized per name because a
+#: submodule keys its per-request state by the handle: one shared value would
+#: collapse every padding row onto the same state.
+_DUMMY_HANDLE_BASE = -2
+_dummy_handles: dict[str, int] = {}
+_dummy_names: dict[int, str] = {}
+
+
+def dummy_rid_handle(name: str) -> int:
+    handle = _dummy_handles.get(name)
+    if handle is None:
+        handle = _dummy_handles[name] = _DUMMY_HANDLE_BASE - len(_dummy_handles)
+        _dummy_names[handle] = name
+    return handle
+
+
+def dummy_rid_name(handle: int) -> str:
+    """The name a padding-row handle was minted from. Debug/logging only."""
+    return _dummy_names.get(handle, f"__cg_unknown_{handle}__")
+
+
 def dummy_metadata(
-    rids: list[str], graph_walk: str,
-) -> dict[str, CurrentForwardPassInfo]:
+    rids: list[int], graph_walk: str,
+) -> dict[int, CurrentForwardPassInfo]:
     """Stand-in request info for padding rows, which have no real request."""
     return {
         rid: CurrentForwardPassInfo(
-            request_id=rid,
+            request_id=dummy_rid_name(rid),
+            rid_handle=rid,
             graph_walk=graph_walk,
             fwd_index=0,
             random_seed=0,
@@ -148,21 +174,27 @@ class DummyRowPool:
         self._prefix = prefix
         self._step_runner = step_runner
         self._resources = resources
-        self._held: dict[str, list[str]] = {}
+        self._held: dict[str, list[int]] = {}
 
-    def names(self, key: str, bs: int) -> list[str]:
-        return [f"__cg_{self._prefix}_{key}_{i}__" for i in range(bs)]
+    def handles(self, key: str, bs: int) -> list[int]:
+        """``bs`` padding-row handles for ``key``. Negative and stable per
+        (prefix, key, index), so they never collide with a real request's
+        handle nor with another pool's rows."""
+        return [
+            dummy_rid_handle(f"__cg_{self._prefix}_{key}_{i}__")
+            for i in range(bs)
+        ]
 
-    def ensure(self, key: str, bs: int) -> list[str]:
+    def ensure(self, key: str, bs: int) -> list[int]:
         """``bs`` rows for ``key``, ingesting any this pool hasn't opened yet."""
         held = self._held.setdefault(key, [])
-        names = self.names(key, bs)
-        for rid in names[len(held):]:
+        rids = self.handles(key, bs)
+        for rid in rids[len(held):]:
             self._step_runner.ingest_request(rid)
             held.append(rid)
-        return names
+        return rids
 
-    def reset(self, rids: list[str], free: bool=False) -> None:
+    def reset(self, rids: list[int], free: bool=False) -> None:
         for rid in rids:
             for resource in self._resources.values():
                 resource.reset_request(rid, free=free)
@@ -189,8 +221,8 @@ class CudaGraphSlot:
     static_input_keys: tuple[str, ...]
     static_outputs: dict
     # padding rows address these; their streams stay resident between steps
-    dummy_rids: list[str]
-    dummy_metadata: dict[str, CurrentForwardPassInfo]
+    dummy_rids: list[int]
+    dummy_metadata: dict[int, CurrentForwardPassInfo]
     config_idx: int
 
 
@@ -588,7 +620,7 @@ class CudaGraphRunner:
         return self._compiled_forwards[spec.config_idx]
 
     def _dummy_engine_inputs(
-        self, dummy_rids: list[str], graph_walk: str,
+        self, dummy_rids: list[int], graph_walk: str,
     ) -> ModelInputsFromEngine:
         return ModelInputsFromEngine(
             request_ids=list(dummy_rids),
@@ -813,7 +845,7 @@ class CudaGraphRunner:
         )
         return [*inputs, *padding]
 
-    def step_ids(self, lease: SlotLease, request_ids: list[str]) -> list[str]:
+    def step_ids(self, lease: SlotLease, request_ids: list[int]) -> list[int]:
         """The padded addressing for one step: real ids first, then the slot's
         padding ids. Plans, commits, and advances address real request state by
         its own id; only the padding rows run against the slot's own state."""
@@ -821,9 +853,9 @@ class CudaGraphRunner:
         return [*request_ids, *dummy_rids[len(request_ids):lease.bucket.bs]]
 
     def step_metadata(
-        self, lease: SlotLease, request_ids: list[str],
-        per_request_info: Mapping[str, CurrentForwardPassInfo],
-    ) -> dict[str, CurrentForwardPassInfo]:
+        self, lease: SlotLease, request_ids: list[int],
+        per_request_info: Mapping[int, CurrentForwardPassInfo],
+    ) -> dict[int, CurrentForwardPassInfo]:
         slot = self.slot_for(lease)
         meta = {rid: per_request_info[rid] for rid in request_ids}
         for rid in slot.dummy_rids[len(request_ids):lease.bucket.bs]:
@@ -914,7 +946,7 @@ class PiecewiseGraphData:
     graph: torch.cuda.CUDAGraph
     static_inputs: dict[str, torch.Tensor]
     static_outputs: dict[str, torch.Tensor]
-    dummy_rids: list[str]
+    dummy_rids: list[int]
     shape: PiecewiseCaptureShape
     bucket: BucketKey
 
@@ -1031,10 +1063,10 @@ class PiecewiseCudaGraphRunner:
         if self._max_slots <= 1 or self._config.declare_step is None:
             return
         for shape in self._config.get_capture_shapes(self._capture_batch_sizes):
-            # names, not `ensure`: the declaration only labels its rows, and
+            # handles, not `ensure`: the declaration only labels its rows, and
             # ingesting here would run before the buffers are built
             step = self._config.declare_step(
-                self._dummy_rows.names(self._dummy_key(shape, 0), shape.bs),
+                self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
                 list(shape.seq_lens),
             )
             if step is not None and any(
@@ -1219,7 +1251,7 @@ class PiecewiseCudaGraphRunner:
     def _call_inputs(
         self,
         static_inputs: dict[str, torch.Tensor],
-        step_ids: list[str],
+        step_ids: list[int],
     ) -> PiecewiseCallInputs:
         """What the region is handed, over the padded capture batch.
 
@@ -1238,7 +1270,7 @@ class PiecewiseCudaGraphRunner:
         )
 
     def _declare(
-        self, request_ids: list[str], seq_lens: list[int],
+        self, request_ids: list[int], seq_lens: list[int],
         bucket: BucketKey, capture: bool, slot: int,
         real_bs: int | None = None,
     ):
@@ -1353,7 +1385,7 @@ class PiecewiseCudaGraphRunner:
     def run(
         self,
         static_inputs: dict[str, torch.Tensor],
-        request_ids: list[str] | None = None,
+        request_ids: list[int] | None = None,
         seq_lens: list[int] | None = None,
         real_bs: int | None = None,
     ) -> PiecewiseOutput:

@@ -1,3 +1,4 @@
+import fcntl
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -14,6 +15,13 @@ logger = logging.getLogger(__name__)
 #: install - e.g. a stale wheel after an upgrade - takes over the mesh
 #: silently, so the factory warns when the imported version differs.
 EXPECTED_MSTAR_RUST_VERSION = "0.1.0"
+
+
+#: The entity whose endpoint stands for the whole deployment: the one every
+#: deployment has exactly one of. Two deployments that agree on this endpoint
+#: ARE the same deployment as far as anything keyed off it is concerned --
+#: notably the tensor-file namespace in ``mstar.communication.tensors``.
+DEPLOYMENT_ANCHOR_ENTITY = "conductor"
 
 
 class CommProtocol(Enum):
@@ -45,6 +53,43 @@ class BaseCommunicator(ABC):
             host = os.getenv("MSTAR_ZMQ_TCP_HOST", "127.0.0.1")
             return f"tcp://{host}:{self._tcp_port(entity_id)}"
         raise NotImplementedError(f"Protocol {self.protocol} not yet supported yet")
+
+    def _lock_deployment(self, my_id: str) -> None:
+        """Claim this deployment, so a second one on the same IPC prefix fails
+        here instead of corrupting the first.
+
+        Only the anchor entity locks, and only over IPC. TCP needs no lock: two
+        deployments sharing a base port collide on ``bind`` already. IPC does
+        not -- libzmq UNLINKS an existing socket file and binds a fresh one, so
+        the second conductor comes up, silently steals every connection aimed
+        at the first, and derives the same tensor-file namespace (uuids are
+        per-entity counters, so both deployments then write, read and unlink
+        each other's ``mstar_<ns>_worker_0_<n>``).
+
+        An ``flock`` on a file beside the socket is what turns that into an
+        error. It is released by the kernel when the process exits however it
+        exits, so a crashed deployment leaves nothing to clean up; the fd is
+        kept on the instance purely so it outlives this call.
+        """
+        if self.protocol != CommProtocol.IPC or my_id != DEPLOYMENT_ANCHOR_ENTITY:
+            return
+        path = self._endpoint(my_id).removeprefix("ipc://") + ".lock"
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            raise RuntimeError(
+                f"another mstar deployment already holds {path}: its "
+                f"{my_id} is bound to the same IPC prefix "
+                f"({self.ipc_socket_path_prefix!r}). Two deployments cannot "
+                "share a prefix -- the second would take over the first's "
+                "sockets and tensor files. Give this one its own "
+                "ipc_socket_path_prefix, or run it over TCP."
+            ) from exc
+        # Never unlinked: another process may already hold an fd on this inode,
+        # and removing it would let a third lock a different one.
+        self._deployment_lock_fd = fd
 
     @staticmethod
     def _tcp_port(entity_id: str) -> int:
@@ -89,6 +134,7 @@ class ZMQCommunicator(BaseCommunicator):
         self.ipc_socket_path_prefix = ipc_socket_path_prefix
 
         if self.protocol == CommProtocol.IPC:
+            self._lock_deployment(my_id)
             self.pull_socket.bind(self._endpoint(my_id))
             self.pull_socket.setsockopt(zmq.LINGER, 0)
         elif self.protocol == CommProtocol.TCP:

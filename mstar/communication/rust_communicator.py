@@ -16,7 +16,13 @@ import pickle
 import time
 from collections import deque
 
-from mstar_rust import ZmqCommunicator as _RustZmq
+try:
+    from mstar_rust import ZmqCommunicator as _RustZmq
+except ModuleNotFoundError:
+    # Only RustZMQCommunicator needs the extension; the codecs above it are
+    # pure Python and are imported by suites that never build rust/ (the
+    # CPU-only CI job). Failing here would break collection for all of them.
+    _RustZmq = None
 
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.event import EventWakeup
@@ -88,6 +94,12 @@ class RustZMQCommunicator(BaseCommunicator):
         ipc_socket_path_prefix: str = "/tmp/mstar/",
         codec: type[Codec] = PickleCodec,
     ):
+        if _RustZmq is None:
+            raise RuntimeError(
+                "RustZMQCommunicator needs the mstar_rust extension; build it "
+                "with `maturin develop --release` in rust/ "
+                "(see docs/installation.rst)"
+            )
         transport = os.getenv("MSTAR_ZMQ_TRANSPORT", protocol.value).upper()
         self.protocol = CommProtocol(transport)
         self.my_id = my_id
@@ -99,6 +111,7 @@ class RustZMQCommunicator(BaseCommunicator):
 
         if self.protocol == CommProtocol.IPC:
             os.makedirs(ipc_socket_path_prefix, exist_ok=True)
+            self._lock_deployment(my_id)
             self._inner = _RustZmq(my_id, ipc_socket_path_prefix)
         elif self.protocol == CommProtocol.TCP:
             self._inner = _RustZmq.bind_endpoint(my_id, self._endpoint(my_id))
