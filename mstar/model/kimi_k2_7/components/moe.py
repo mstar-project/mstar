@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 _BACKEND_LOGGED = False
 
+# Tokens per slice when running routed dispatch over a large prefill, to bound
+# the MoE working set (partial expert output, all-reduce buffer, Marlin
+# internals) instead of letting it scale with the full prompt length.
+MOE_PREFILL_SLICE = 8192
+
 
 def _gate_up_packed_loader(
     tp_rank: int, tp_size: int, full_inter: int,
@@ -171,6 +176,7 @@ class KimiSparseMoeBlock(nn.Module):
         self.quant_kernel = getattr(config, "quant_kernel", "auto")
         self._marlin_method = None
         self._use_marlin = False
+        self.moe_prefill_slice = MOE_PREFILL_SLICE
 
         self.gate = KimiMoEGate(
             hidden_size=config.hidden_size,
@@ -274,27 +280,45 @@ class KimiSparseMoeBlock(nn.Module):
         flat = hidden_states.view(-1, self.hidden_size).contiguous()
 
         topk_weights, topk_ids = self.gate(flat)
+        num_tokens = flat.shape[0]
+        if num_tokens <= self.moe_prefill_slice:
+            routed = self._route(flat, topk_weights, topk_ids)
+        else:
+            # Bound the MoE working set for long prefills: the naive one-shot
+            # dispatch allocates partial expert output, all-reduce buffers, and
+            # Marlin internals that scale with the full token count.
+            routed = torch.empty_like(flat)
+            for start in range(0, num_tokens, self.moe_prefill_slice):
+                end = min(start + self.moe_prefill_slice, num_tokens)
+                routed[start:end] = self._route(
+                    flat[start:end], topk_weights[start:end], topk_ids[start:end]
+                )
+        shared = self.shared_expert(flat)
+        return (routed + shared).view(input_shape)
+
+    def _route(
+        self,
+        flat: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
         if self._use_marlin:
             # Marlin's GEMM takes fp32 combine weights — pass them BEFORE the bf16
             # cast the other paths need. Otherwise identical TP story.
-            routed = self._dispatch_marlin(flat, topk_weights, topk_ids)
-        else:
-            topk_weights = topk_weights.to(flat.dtype)
-            if self.packed_experts:
-                routed = self._dispatch_packed_experts(flat, topk_weights, topk_ids)
-            elif self.tp_size == 1:
-                routed = _dispatch(
-                    flat,
-                    self.experts.gate_up_proj,
-                    self.experts.down_proj,
-                    self.num_experts,
-                    topk_ids,
-                    topk_weights,
-                )
-            else:
-                routed = self._dispatch_tp(flat, topk_weights, topk_ids)
-        shared = self.shared_expert(flat)
-        return (routed + shared).view(input_shape)
+            return self._dispatch_marlin(flat, topk_weights, topk_ids)
+        topk_weights = topk_weights.to(flat.dtype)
+        if self.packed_experts:
+            return self._dispatch_packed_experts(flat, topk_weights, topk_ids)
+        if self.tp_size == 1:
+            return _dispatch(
+                flat,
+                self.experts.gate_up_proj,
+                self.experts.down_proj,
+                self.num_experts,
+                topk_ids,
+                topk_weights,
+            )
+        return self._dispatch_tp(flat, topk_weights, topk_ids)
 
     def _dispatch_packed_experts(
         self,

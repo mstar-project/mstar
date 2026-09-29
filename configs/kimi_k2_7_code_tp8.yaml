@@ -16,7 +16,9 @@ resources:
     # Absorbed MLA caches one 576-wide bf16 latent per token (kv_lora_rank 512 +
     # qk_rope_head_dim 64) over 61 layers: 9.0 MB per 128-token page, replicated
     # on every TP rank. 3072 pages = 27.6 GB per rank = 393k tokens: one 262k
-    # request plus headroom. Raise after measuring free memory on H200.
+    # request plus headroom. Needs more than 80 GB per rank: on 8x H100 the full
+    # checkpoint does not fit at TP8, and the 192-expert pruned checkpoint serves
+    # with 1536 pages (59 GB per rank after load).
     max_num_pages: 3072
     page_size: 128
 node_groups:
