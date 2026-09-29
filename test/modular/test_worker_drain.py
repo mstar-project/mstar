@@ -36,13 +36,17 @@ def _worker(
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
     w._pending_removes = set()
-    w._pending_loop_stops = set()
     # Identity interning: these tests use the rid string as its own handle, so
-    # the string/handle split is exercised without a real table.
-    w._rids = SimpleNamespace(
-        handle=lambda r: r if r in known_rids else None,
-        name=lambda h: h,
-        release=lambda h: None,
+    # the string/handle split is exercised without a real runtime.
+    w._graph_runtime = SimpleNamespace(
+        get_rid_handle=lambda r: r if r in known_rids else None,
+        get_rid_string=lambda h: h,
+        remove_request=lambda h: None,
+        # The TP fan-out reads the sharding config off the runtime now; no
+        # groups means no followers, which is what these tests assume.
+        get_sharding_config=lambda r: (
+            SimpleNamespace(groups=[]) if r in known_rids else None
+        ),
     )
     w._last_active = {}
     w.streaming_buffers = {}
@@ -52,7 +56,7 @@ def _worker(
         fail_rids=lambda rids: w.failed.update(rids),  # noqa: PLW0108
         pending_tp_follow_count=dict.fromkeys(tp_follow, 1),
     )
-    w.worker_graphs_manager = SimpleNamespace(
+    w.request_state = SimpleNamespace(
         per_request_info={
             rid: SimpleNamespace(sharding_config=SimpleNamespace(groups=[]))
             for rid in known_rids
@@ -208,18 +212,23 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w._unprocessed_messages = {}
     w._my_consumer_connections = []
     w._last_active = {}
-    w._rids = RidTable()
-    w._rids.intern("other")  # so X's handle is 1, not 0
+    rids = RidTable()
+    rids.intern("other")  # so X's handle is 1, not 0
+    w._graph_runtime = SimpleNamespace(
+        add_request=lambda request_id, **kw: rids.intern(request_id),
+        get_rid_handle=rids.handle, get_rid_string=rids.name,
+        get_sharding_config=lambda h: None,
+    )
     seen = {}
 
-    def _graphs_add(request_id, **kw):
-        seen["graphs"] = request_id
-        w.worker_graphs_manager.per_request_info[request_id] = SimpleNamespace(
+    def _state_add(request_id, request_info):
+        seen["state"] = request_id
+        w.request_state.per_request_info[request_id] = SimpleNamespace(
             sharding_config=None, stream_buffers={},
         )
 
-    w.worker_graphs_manager = SimpleNamespace(
-        per_request_info={}, add_request=_graphs_add,
+    w.request_state = SimpleNamespace(
+        per_request_info={}, add_request=_state_add,
     )
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: ["n"],
@@ -230,16 +239,16 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         start_read_tensors=lambda rid, inputs, graph_walk: [],
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    info = SimpleNamespace(resource_configs={}, graph_walk="g")
+    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={},
     ))
 
-    handle = w._rids.handle("X")
+    handle = w._graph_runtime.get_rid_handle("X")
     assert handle == 1
     assert info.rid_handle == handle
-    assert seen == {"graphs": handle, "engine": handle, "tensors": handle}
+    assert seen == {"state": handle, "engine": handle, "tensors": handle}
     assert set(w._last_active) == {(handle, "n")}
 
 
