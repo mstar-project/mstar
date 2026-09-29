@@ -76,6 +76,9 @@ pub struct RequestInfo {
     /// (node, walk) -> the workers running it for THIS request. Per request
     /// because data-parallel replicas put the same node on different workers.
     pub node_to_workers: FxHashMap<(Sym, Sym), Vec<Sym>>,
+    /// Whether any node of this request runs on another worker. Without one,
+    /// a persisted tensor is only ever read back from this worker's store.
+    pub has_remote_workers: bool,
     pub dyn_loop_to_workers: FxHashMap<(Sym, Sym), Vec<Sym>>,
     /// Loop name -> the stop observation this rank has. Worker-only, so it
     /// does not ride CurrentForwardPassInfo across the wire.

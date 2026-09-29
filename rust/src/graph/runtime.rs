@@ -1469,6 +1469,11 @@ impl GraphRuntime {
                     }
                 }
             }
+            let me = self.shard.me;
+            info.has_remote_workers = info
+                .node_to_workers
+                .values()
+                .any(|ws| ws.iter().any(|&w| w != me));
             // clone_empty() + setup(node_to_workers), per Python.
             info.shard = Some(
                 self.shard
@@ -2416,8 +2421,9 @@ impl GraphRuntime {
 
             // Staged before the routed edges, so a persist signal is
             // registered for a remote read whether or not the fanout kept an
-            // edge for it -- Python stages `routing.persist` unconditionally.
-            for (_name, tensors) in &persist_pre {
+            // edge for it. Skipped with no remote worker, as in Python.
+            let has_remote = self.info(rid).is_none_or(|i| i.has_remote_workers);
+            for (_name, tensors) in persist_pre.iter().filter(|_| has_remote) {
                 for t in tensors {
                     if staged.insert(t.uuid) {
                         out.register_uuids.push(t.uuid);
@@ -2457,7 +2463,7 @@ impl GraphRuntime {
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
-                let remote = e.persist
+                let remote = (e.persist && has_remote)
                     || e.declined_local
                     || (!is_local
                         && matches!(e.dest, Dest::External(_) | Dest::EmitToClient));
