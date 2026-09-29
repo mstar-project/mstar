@@ -2484,6 +2484,17 @@ impl GraphRuntime {
                 }
             }
 
+            // Every persisted tensor, including earlier iterations' on an accumulated
+            // output: the client's read releases them before a later walk reads them.
+            if !persist_pre.is_empty() {
+                let mut bk = self.bookkeeping.lock().unwrap();
+                for (_, tensors) in &persist_pre {
+                    for t in tensors {
+                        bk.set_persist(t.uuid, true);
+                    }
+                }
+            }
+
             // Inputs the completion cleared, and tensors a loop reset or
             // un-cached. Dereferenced here so the result
             // does not depend on whether cleanup_consumed_inputs ran first --
@@ -2562,12 +2573,6 @@ impl GraphRuntime {
                     *contributed.entry(t.uuid).or_insert(0) += refs;
                 }
             }
-            // Same for the persist marker: a set, built once.
-            let persisted: FxHashSet<u64> = persist_pre
-                .iter()
-                .flat_map(|(_, ts)| ts.iter().map(|t| t.uuid))
-                .collect();
-
             // Settle from the safety hold of 1 to the real fanout. persist is
             // excluded from the COUNT: those are held by the marker, and
             // counting them would double-count a signal whose destination is
@@ -2578,10 +2583,7 @@ impl GraphRuntime {
                     let count = contributed.get(&uuid).copied().unwrap_or(0);
                     // Pre-fanout: a rank whose persist edge the fanout
                     // dropped still holds the tensor for the conductor, and
-                    // an unmarked one is dereferenced to zero right here.
-                    if persisted.contains(&uuid) {
-                        bk.set_persist(uuid, true);
-                    }
+                    // an unmarked one would be dereferenced to zero right here.
                     let delta = count - 1;
                     if delta > 0 {
                         bk.increment_ref(uuid, delta)?;
