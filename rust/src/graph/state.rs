@@ -500,6 +500,17 @@ impl RequestState {
             }
         }
         self.refresh_ready(node);
+        if spec.loop_id.is_none() {
+            // `refresh_ready` only writes `ready`. The inputs were just
+            // cleared, so the streaming bit has to follow them down --
+            // `note_ingested_for_streaming` dropped it when the node filled
+            // up, and an only-streaming node needs it BACK or its second
+            // chunk is refused and the stream stalls. Same re-seed Python
+            // does on this path (WorkerGraphStateRegistry.mark_entity_complete),
+            // and same top-level-only scope: a loop member keeps `cur` until
+            // its loop advances, and `reset_subtree_for_iter` re-seeds it then.
+            self.reseed_streaming_ready(node);
+        }
 
         for (i, e) in spec.outputs.iter().enumerate() {
             out.push(routed(e, out_tensors.get(i).cloned().unwrap_or_default()));
@@ -1019,6 +1030,53 @@ mod tests {
         st.ingest(talker, 1, vec![t(3)], false, false);
         assert!(st.is_ready(talker));
         assert!(!st.is_ready_for_streaming(talker), "full, so plain ready");
+    }
+
+    #[test]
+    fn an_only_streaming_node_is_streaming_ready_again_after_completing() {
+        // The stall this guards: chunk 1 fills the node, which drops the
+        // streaming bit; completing clears the inputs but `refresh_ready`
+        // only writes `ready`, so without the re-seed chunk 2 is refused and
+        // the stream never advances. Python re-seeds on the same path.
+        let mut it = StrToId::default();
+        let nodes = vec![node("vocoder", &["codes"], &["codes"], vec![])];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let vocoder = 0;
+        let mut st = RequestState::new(g);
+        assert!(st.is_ready_for_streaming(vocoder), "seeded at construction");
+
+        // Chunk 1 fills it: plain-ready now, so the streaming bit is dropped.
+        assert!(st.ingest(vocoder, 0, vec![t(1)], true, false));
+        assert!(st.is_ready(vocoder));
+        assert!(!st.is_ready_for_streaming(vocoder));
+
+        st.complete(vocoder, &[]);
+
+        // Inputs are gone, so it is no longer plain-ready -- but it takes
+        // only streaming inputs, so it must be open to the next chunk.
+        assert!(!st.is_ready(vocoder));
+        assert!(
+            st.is_ready_for_streaming(vocoder),
+            "an only-streaming node must accept its next chunk after completing",
+        );
+        assert!(st.ingest(vocoder, 0, vec![t(2)], true, false), "chunk 2 refused");
+    }
+
+    #[test]
+    fn a_node_with_a_regular_input_is_not_streaming_ready_after_completing() {
+        // The other half of the re-seed: it CLEARS the bit for a node that
+        // still needs a non-streaming input, rather than leaving it set.
+        let mut it = StrToId::default();
+        let nodes = vec![node("talker", &["text", "audio"], &["audio"], vec![])];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let talker = 0;
+        let mut st = RequestState::new(g);
+        st.ingest(talker, 0, vec![t(1)], false, false);
+        st.ingest(talker, 1, vec![t(2)], true, false);
+        assert!(st.is_ready(talker));
+
+        st.complete(talker, &[]);
+        assert!(!st.is_ready_for_streaming(talker));
     }
 
     #[test]
