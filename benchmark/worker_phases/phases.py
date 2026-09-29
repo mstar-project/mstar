@@ -137,6 +137,15 @@ class Segment:
                 a["p50s"].append(ph.p50)
                 a["p95s"].append(ph.p95)
         work = self.request_steps
+        # Passes that ran a batch. request_steps only counts these, so a phase
+        # sampled MORE often than this also ran on passes that did no work --
+        # an idle poll through worker.schedule, say. Its total time is then
+        # divided by work it was not all spent on and us/1k reads high, so the
+        # renderer marks those rows rather than quietly reporting them.
+        batch_iters = sum(
+            it.n for rec in self.records
+            if (it := rec.phases.get("iter_total")) is not None
+        )
         return {
             name: {
                 "mean_ms": a["sum"] / a["n"] if a["n"] else 0.0,
@@ -147,6 +156,7 @@ class Segment:
                 # us of this phase per 1000 request-steps; 0.0 when the log
                 # has no bs (older workers), which the renderer omits.
                 "us_per_1k": a["sum"] / work * 1e6 if work else 0.0,
+                "off_batch": a["n"] > batch_iters,
             }
             for name, a in sorted(acc.items())
         }
@@ -229,9 +239,14 @@ def render(segments: list[Segment], phases: list[str] | None = None) -> str:
         buf.append(head)
         buf.append("-" * len(head))
         for name, v in rows.items():
+            marked = f"{v['us_per_1k']:.1f}" + ("*" if v["off_batch"] else " ")
             buf.append(
                 f"{name:<40}{v['mean_ms']:>10.3f}{v['p50_ms']:>9.3f}"
                 f"{v['p95_ms']:>9.3f}{v['samples']:>9}"
-                + (f"{v['us_per_1k']:>11.1f}" if work else "")
+                + (f"{marked:>11}" if work else "")
             )
+        if work and any(v["off_batch"] for v in rows.values()):
+            buf.append("    * sampled on passes that ran no batch, so its "
+                       "time is spread over work it did not all do: us/1k is "
+                       "an upper bound for this row")
     return "\n".join(buf)

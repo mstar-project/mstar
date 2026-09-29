@@ -62,8 +62,10 @@ Phases that are WAITS, not work -- a larger number is not automatically worse:
 A closed-loop run ramps up, holds at max concurrency, then drains stragglers.
 Those are three different regimes, and one mean across all of them describes
 none of them. Each record carries `bs=`, the mean in-flight requests over its
-window; a record whose `bs` differs from the running mean by more than
-`--bs-tolerance` starts a new segment. The drain therefore lands in its own
+window; a record whose `bs` differs from the segment's FIRST record by more
+than `--bs-tolerance` starts a new segment. Anchoring on the first record
+rather than the running mean is what stops a slow ramp -- where every step is
+under the tolerance -- from collapsing into one segment. The drain lands in its own
 table instead of being averaged into steady state, with no per-workload
 guessing about how much to trim.
 

@@ -128,6 +128,19 @@ def main(argv: list[str] | None = None) -> int:
     out = sys.stdout if args.out == "-" else open(args.out, "w")
     port = _port_of(args.command)
 
+    # A server left over from an earlier run answers /health too, and the
+    # watcher cannot tell whose it is: it would print SERVER READY before this
+    # child had bound anything and the run would measure the old process.
+    # `proc.poll()` does not catch that -- the child is alive, it just never
+    # owned the port.
+    if _healthy(port, timeout=2):
+        print(f"[worker_phases] something is already serving /health on port "
+              f"{port}; stop it first, or this run will measure it",
+              file=sys.stderr, flush=True)
+        if out is not sys.stdout:
+            out.close()
+        return 1
+
     print(f"[worker_phases] MSTAR_PHASE_TIMING={args.period}; server log -> "
           f"{args.server_log}", flush=True)
     log = open(args.server_log, "w")
@@ -140,6 +153,15 @@ def main(argv: list[str] | None = None) -> int:
         target=_watch_health, args=(port, proc, args.health_timeout),
         daemon=True,
     ).start()
+
+    # Default SIGTERM/SIGHUP exit without unwinding, so the finally below --
+    # and with it the killpg -- never runs and the workers are orphaned
+    # holding their GPU memory. Route both into the KeyboardInterrupt path
+    # the loop already handles.
+    def _interrupt(signum, _frame):
+        raise KeyboardInterrupt
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(_sig, _interrupt)
 
     tab = Tabulator(out, args.every, args.skip_warmup, args.bs_tolerance,
                     args.min_records, args.phases)
