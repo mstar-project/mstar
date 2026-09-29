@@ -130,8 +130,12 @@ class SamplerResource(Resource):
         # Read off the resolved config rather than `overrides`, so a request
         # that leaves the penalty unset takes the same default the sampler will.
         resolved = self._sampler._sampling_config[rid]
-        if resolved.repetition_penalty != 1.0:
-            self._penalty_rids.add(rid)
+        # written so NaN fails too; NaN would also slip past the `> 0` check below
+        if not 0.0 <= resolved.min_p <= 1.0:
+            self._sampler.remove_request(rid)
+            raise ValueError(
+                f"request {rid!r} asks for min_p={resolved.min_p}; it must be in [0, 1]"
+            )
         if resolved.min_p > 0 and not self._enable_min_p:
             # the graph-captured sampler has no min-p buffer, so honouring it
             # eagerly but not in graph would make sampling depend on the path
@@ -140,6 +144,9 @@ class SamplerResource(Resource):
                 f"request {rid!r} asks for min_p={resolved.min_p} but the node's "
                 "SamplerSpec has enable_min_p=False"
             )
+        # after the refusals, so a refused request leaves no stale entry
+        if resolved.repetition_penalty != 1.0:
+            self._penalty_rids.add(rid)
         if self._cg_buffers is not None:
             self._cg_buffers.register_request(
                 rid, sampling_config=self._sampler._sampling_config[rid]

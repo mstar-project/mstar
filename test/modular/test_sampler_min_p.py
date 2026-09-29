@@ -96,8 +96,10 @@ def test_graph_buffers_carry_min_p_only_when_enabled():
 def test_resource_refuses_min_p_without_the_capability():
     plain = SamplerResource(vocab_size=None, enable_repetion_penalty=False, device=CPU)
     with pytest.raises(ValueError, match="enable_min_p=False"):
-        plain.ingest_request("r", SamplingReqConfig(min_p=0.05))
+        plain.ingest_request("r", SamplingReqConfig(min_p=0.05, repetition_penalty=1.2))
     assert "r" not in plain._sampler._sampling_config
+    # a stale entry would pin `_penalty_live` on for the node's lifetime
+    assert "r" not in plain._penalty_rids
 
     plain.ingest_request("ok", SamplingReqConfig(min_p=0.0))  # default stays fine
     assert plain._sampler._sampling_config["ok"].min_p == 0.0
@@ -107,6 +109,27 @@ def test_resource_refuses_min_p_without_the_capability():
     )
     capable.ingest_request("r", SamplingReqConfig(min_p=0.05))
     assert capable._sampler._sampling_config["r"].min_p == 0.05
+
+
+@pytest.mark.parametrize("bad", [1.5, -0.1, float("nan"), float("inf")])
+def test_resource_refuses_min_p_out_of_range(bad):
+    # checked before the capability, so a plain node rejects NaN rather than admitting it
+    for enable in (False, True):
+        res = SamplerResource(
+            vocab_size=None, enable_repetion_penalty=True, device=CPU, enable_min_p=enable,
+        )
+        with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
+            res.ingest_request("r", SamplingReqConfig(min_p=bad, repetition_penalty=1.2))
+        assert "r" not in res._sampler._sampling_config
+        assert "r" not in res._penalty_rids
+
+
+def test_resource_accepts_min_p_bounds():
+    res = SamplerResource(
+        vocab_size=None, enable_repetion_penalty=False, device=CPU, enable_min_p=True,
+    )
+    res.ingest_request("zero", SamplingReqConfig(min_p=0.0))
+    res.ingest_request("one", SamplingReqConfig(min_p=1.0))
 
 
 def test_spec_capability_defaults_off():
