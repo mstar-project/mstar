@@ -362,16 +362,14 @@ class KVManager(AttentionResource):
         self._preplan_marked: list[tuple[str, str]] = []
 
         # (rid, label) -> pages the live reservation freshly acquired, for
-        # ``rollback_admit``. One record, not one per pass: the plan thread waits
-        # on the previous step's commit before pre-admitting and the GPU thread's
-        # admit no-ops over a pre-planned step, so only one of them holds a
-        # reservation at a time — and the unwind has to find it whichever it was.
+        # ``rollback_admit``. One record, not one per pass: only the plan thread
+        # or the GPU thread holds a reservation at a time, and the unwind has to
+        # find it whichever it was.
         #
         # Handle-keyed, so it MUST be purged when the handle is released: handles
         # are recycled, and a stale entry would resolve against whichever request
-        # gets that handle next. ``admit`` clears the whole record, but a
-        # pre-planned step's admit returns before doing so, so the clear alone is
-        # not enough -- see ``remove_request`` / ``reset_request``.
+        # gets that handle next. ``admit`` clears the record, but a pre-planned
+        # step's admit returns first -- see ``remove_request`` / ``reset_request``.
         self._admit_reserved_pages: dict[tuple[int, str], list[int]] = {}
 
     @classmethod
@@ -898,16 +896,12 @@ class KVManager(AttentionResource):
         return ADMIT_OK
 
     def rollback_admit(self, step: KVStep, ctx: StepContext) -> None:
-        """Give back the pages this admit freshly acquired.
-
-        Only those. A page retained from a shared prefix, or a lease converted
-        onto the stream, was already owned by someone else and is theirs to
-        release.
+        """Give back the pages this admit freshly acquired. Does not touch pages
+        retained by a shared prefix or a lease converted onto the stream.
 
         ``page_indices`` maps token position to page, so the reserved pages can
         only be dropped off the tail. If something else has extended the stream
-        since, the tail is no longer ours and removing anything would mis-map the
-        rest — so that case is reported and left alone rather than corrupted.
+        since, the tail can no longer be safely removed.
         """
         del step, ctx
         with self._lock:

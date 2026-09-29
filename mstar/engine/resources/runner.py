@@ -318,17 +318,8 @@ class StepRunner:
             self._resources[key].clear_preplan()
 
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
-        """reserve capacity for step
-
-        A refused admit gives back everything the step reserved. Nothing else
-        would: ``commit`` is what normally releases a reservation, and a step
-        that never runs never commits — so without this, every refusal leaks
-        whatever the resources ahead of the refusing one had already taken, and
-        the free pool shrinks on a path a loaded worker hits constantly.
-
-        NOT unwound for a merely ``ready=False`` outcome. That means admitted and
-        waiting — on an in-flight KV read, say — and the step holds its
-        reservation legitimately until it can run.
+        """Reserve capacity for step. A refused admit gives back everything
+        the step reserved.
         """
         self._drop_stale_preplan(step)
         ready = True
@@ -346,10 +337,6 @@ class StepRunner:
                     "Admit for resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
-                # The refusing resource is unwound too, not only the ones ahead
-                # of it: it reserves per request, so it can have taken pages for
-                # several before the one it refused. Reverse order, so a resource
-                # gives its pages back before whatever it depends on does.
                 for done in reversed([*admitted, key]):
                     self._resources[done].rollback_admit(
                         step.get(done), step.ctx,
@@ -387,11 +374,7 @@ class StepRunner:
         the later full `admit` covers the rest; these resources see their own
         state as already reserved and no-op
 
-        Unwound on refusal exactly as ``admit`` is, and for the same reason: the
-        pre-planned step never runs, so nothing commits and nothing else gives
-        the reservation back. ``clear_preplan`` is the other half of the recovery
-        here, but it only releases labels the pre-plan created — pages appended
-        to a stream that already existed are this method's to return.
+        Unwound on refusal exactly as ``admit`` is.
         """
         ready = True
         admitted: list[str] = []

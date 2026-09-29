@@ -172,11 +172,6 @@ class Resource(ABC):
         Called on a refused admit, for every resource the step reached including
         the one that refused.
 
-        The reservation being unwound is not always the one the matching
-        ``admit`` made: a pre-planned step is reserved on the pre-plan pass and
-        its later ``admit`` no-ops, so this has to release what the pre-plan
-        took.
-
         Only what was freshly taken. A page retained from a shared prefix, or a
         lease converted onto a stream, belongs to whoever else holds it.
         """

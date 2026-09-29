@@ -61,11 +61,7 @@ class RemoveRequest(MessageBody):
     source: int = MessageSource.CONDUCTOR
     # Rank 0 forwarding a removal to its followers stamps the last step it had
     # broadcast, so they tear the request down at the same point in the step
-    # sequence it did. A teardown releases pages, and a follower that applies it
-    # on the other side of a step admits that step against different page state —
-    # which is a deadlock, and invisible in the resident-set delta because the
-    # request is not offloaded, it is gone. ``-1`` for the unordered paths (the
-    # conductor's own sends, and a rank's own deferred re-apply).
+    # sequence it did, maintaining KV cache state symmetry.
     after_tp_seq: int = -1
 
 
@@ -113,10 +109,8 @@ class StopLoops(MessageBody):
 class OffloadDelta:
     """A rank's offloads and reloads, in the order it made them.
 
-    Ordered, and that is the whole point: a set of offloads plus a set of
-    reloads cannot say whether a request ended up resident. Offload A, reload A,
-    offload A replays from sets as "resident", when the rank that recorded it has
-    A on the host. Replaying the sequence cannot get that wrong.
+    Ordered so the follower replays the leader's decisions in the same order: a
+    sequence that worked for the leader works for the followers too.
 
     Holds WIRE request ids, not worker-local handles: a handle is minted per
     worker, so rank 0's would name different requests on the follower.

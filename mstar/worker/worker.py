@@ -578,14 +578,11 @@ class Worker:
             if body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF):
                 return # wait for rank 0's forward, to avoid race conditions
             if not self._removal_step_reached(body):
-                # Rank 0 released these pages between two steps. Tearing down
-                # here before this rank has finished the earlier one would have
-                # it admit that step with pages rank 0 no longer held.
-                #
-                # Follower-only, and not merely because nothing else is stamped:
-                # ``last_consumed_tp_seq`` only advances on a rank that consumes
-                # follow steps, so a rank that leads would park a stamped
-                # teardown for good.
+                # Rank 0 released these pages between two steps; tearing down
+                # before this rank finishes the earlier one would have it admit
+                # that step with pages rank 0 no longer held. Follower-only:
+                # ``last_consumed_tp_seq`` never advances on a leader, which
+                # would park a stamped teardown for good.
                 self._removes_awaiting_step.setdefault(
                     body.after_tp_seq, []
                 ).append(body.request_id)
@@ -1570,21 +1567,12 @@ class Worker:
                 range_pop(synchronize=False)
 
     def _await_admit_settled(self, pending: "PendingBatch | None") -> None:
-        """Block until the in-flight step's admit has run.
+        """Block until the in-flight step's admit has run (for TP leaders).
 
         Admit is on the GPU thread; every offload and reload is on this one. A
         page move in the window between a step's broadcast and its admit lands
         in the NEXT step's resident delta, so the follower applies it after
         admitting this step while the leader admitted with it already applied.
-        Same step, two free-page counts, and the ranks part company on the
-        first collective.
-
-        ``launch_started_event`` is the tightest fence available: on both exec
-        paths every admit in the batch precedes the launch — ``_exec_single``
-        admits before ``_drive_step``, and ``_exec_per_request`` admits every
-        rid in its first loop. ``commit_done`` would serve too, but on the
-        per-request path it sits behind a CUDA event sync, which would drag a
-        GPU wait into scheduling.
 
         Separate from the submitter's ``MSTAR_LAUNCH_WAIT_MS`` wait on the same
         event: that one is a GIL throttle and is meant to expire early. This
@@ -1660,16 +1648,14 @@ class Worker:
         self._push_back_batch(batch)
 
         # A teardown this rank has been holding releases pages, and spending one
-        # can mean no eviction is needed at all — cheaper, and nothing has to be
-        # undone later. After the push-back above, so a rid torn down here cannot
-        # be pushed onto queues that have just been dismantled.
-        #
-        # ``referenced_rids``, not ``_in_flight_rids``: this step's admit refused,
-        # so no forward ran and its own pages are fair game. What is NOT is
-        # whatever the speculation touches — its pre-plan may have pre-admitted,
-        # which marks those streams in-flight, and ``_maybe_clear_spec`` does not
-        # run until after this returns.
+        # can mean no eviction is needed at all. After the push-back above, so a
+        # rid torn down here cannot be pushed onto queues that have just been dismantled.
         self._apply_removes_whose_step_landed()
+
+        # ``referenced_rids``, not ``_in_flight_rids``: this step's admit refused,
+        # so no forward ran and its own pages are fair game. Empty in practice —
+        # nothing is speculated on a refusal — so it only guards a future caller
+        # that broadcasts something here.
         self._apply_pending_removes_safe_to_drop(referenced_rids)
 
         if self._is_tp_follower_node(batch.node_name):
@@ -1692,16 +1678,10 @@ class Worker:
                 len(batch_ids) - (1 if victim_id in batch_ids else 0),
             )
         else:
-            # Nothing could be evicted, so the batch has to get smaller or it
-            # will refuse identically for ever. Hold the one request the admit
-            # named, not the whole batch: shedding it leaves the rest to try
-            # again a request shorter, and repeated refusals shed one more each
-            # time until what is left fits. Holding all of them just reassembles
-            # the same batch after the backoff — which is the 250-holds-a-second
-            # spin this replaced.
-            #
-            # Symmetric across a TP instance without coordinating: both ranks
-            # refuse the same batch for the same request, so both shed that one.
+            # Nothing could be evicted, so the batch has to get smaller or it will
+            # refuse identically for ever. Hold the one request the admit named,
+            # not the whole batch, so the retry is immediate. Symmetric without
+            # coordinating: both ranks refuse the same batch for the same request.
             blamed = getattr(node_batch.admit_error, "request_id", None)
             shed = [blamed] if blamed in batch_ids else list(batch_ids)
             self.scheduler.hold_requests(shed)
@@ -3043,11 +3023,10 @@ class Worker:
                 batch = None
                 spec_pending = None
                 _iter_start = _time.perf_counter() if phase_period else 0.0
-                # Everything below here can move pages — the removes and drains
-                # directly, ``_process_messages`` through a follower's delta,
-                # and the readiness scans through ``check_ready``'s reload. None
-                # of it may run while N's admit is outstanding on the GPU
-                # thread; see ``_await_admit_settled``.
+                # Everything below moves pages — the removes and drains directly,
+                # ``_process_messages`` through a follower's delta, the readiness
+                # scans through ``check_ready``'s reload — and none of it may run
+                # while N's admit is outstanding. See ``_await_admit_settled``.
                 self._await_admit_settled(pending)
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
@@ -3088,24 +3067,15 @@ class Worker:
                 speculation = None
                 yield_away_from_target = None
 
-                # N's admit has already run — the fence at the top of the loop
-                # waited for it — so a refusal is knowable here, before anything
-                # is built or broadcast. Build nothing when it refused.
+                # Build nothing on a refusal; the fence above is what makes it
+                # knowable here. Ordinary speculation would be dropped anyway,
+                # but a yield-away batch survives ``_maybe_clear_spec`` and is
+                # already broadcast — so the eviction below would land after its
+                # head went out, and the follower would admit it a delta behind.
+                # Skipping keeps that eviction in the gap between steps.
                 #
-                # It costs nothing: an ordinary speculation reads N's outputs and
-                # ``_maybe_clear_spec`` would drop it regardless. What it buys is
-                # the yield-away case, which is independent of N and so survives
-                # that clear — already broadcast, and unvoidable. Its rids can
-                # then be picked as the eviction victim below, and even when they
-                # are not, the eviction lands after its head went out: rank 0
-                # admits it with the freed pages, a follower replays the delta
-                # one step later and admits without them. Skipping leaves the
-                # eviction in the gap between steps, where the next head's delta
-                # carries it and both ranks admit from the same state.
-                #
-                # The marker below is deliberately outside this: a follower is
-                # waiting to settle N on exactly one of {head, marker}, and it
-                # moves no pages of its own.
+                # The marker below stays outside this: a follower settles N on
+                # exactly one of {head, marker}, and it moves no pages.
                 admit_refused = (
                     pending is not None
                     and pending.node_batch.admit_error is not None
@@ -3268,21 +3238,11 @@ class Worker:
 
                     if pending.node_batch.admit_error is not None:
                         # Admit refused pending, so no forward ran.
-                        # ``_handle_admit_failure`` pushes the GraphNodes back
-                        # to the scheduler queue, and on KV-cache OOM also
-                        # offloads or holds the failed rids.
-                        #
-                        # Section 2 saw this same refusal and built nothing, so
-                        # there is no speculation to clear and ``referenced_rids``
-                        # is empty. Both are kept: they cost nothing, and they are
-                        # what makes the eviction below safe if a future change
-                        # ever does broadcast something on this path.
-                        #
-                        # Clearing FIRST is still the right order for that case —
-                        # dropping the pre-plan releases the pages plan reserved,
-                        # so the eviction may turn out unnecessary, and it unmarks
-                        # those streams so the teardown flush has nothing left to
-                        # spare.
+                        # ``_handle_admit_failure`` pushes the nodes back and on
+                        # KV-cache OOM offloads or holds. Clearing the speculation
+                        # first drops its pre-plan, releasing pages the eviction
+                        # would otherwise go looking for. Nothing is speculated on
+                        # a refusal, so in practice there is nothing to clear.
                         self._clear_speculative_flag(pending.batch)
                         _maybe_clear_spec()
                         self._handle_admit_failure(

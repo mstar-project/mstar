@@ -1557,11 +1557,8 @@ class Engine:
         """
         if node_name in self._tp_follower_nodes:
             # Rank 0 decides what this instance evicts, and its decision arrives
-            # as a resident-set delta. A follower choosing for itself is the
-            # deadlock the delta exists to prevent: LRU orders on wall clock, so
-            # the ranks pick different victims and then a step one of them
-            # scheduled is one the other cannot join. ``apply_resident_delta``
-            # goes to the resources directly, so replay is unaffected.
+            # as a resident-set delta. TP followers can deadlock if they are not
+            # given a single source of truth for eviction.
             return 0
         freed = sum(
             resource.offload(request_id)
@@ -1641,19 +1638,11 @@ class Engine:
     def apply_resident_delta(
         self, node_name: str, delta: OffloadDelta,
     ) -> bool:
-        """Match the leader's resident set on this node.
-
-        Resumable rather than idempotent: each entry is popped once it has
-        landed, so a caller that has to retry (an offload is refused while a step
-        still holds the pages; a reload needs room that is not free yet) calls
-        again and picks up at the entry that refused. False means not all of it
-        landed and the caller must retry before trying the next step.
+        """Match the leader's resident set on this node. Mutates OffloadDelta
+        by popping off the steps that have already landed. False means not all
+        has landed and the caller must retry before trying the next step.
         """
 
-        # Bounded by the entry count rather than ``while len(delta)``: every
-        # iteration either pops or returns, so the bound is never reached — but a
-        # queue that stopped popping would otherwise spin here forever, inside
-        # the engine, with nothing logged.
         resources = self._submodules[node_name].resources.values()
         for _ in range(len(delta)):
             wire_rid, is_offload = delta.peek_left()
