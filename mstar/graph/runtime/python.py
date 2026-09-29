@@ -94,6 +94,9 @@ class GraphRuntimeRequestInfo:
     node_to_workers: dict[NodeAndGraphWalk, list[str]]
     dyn_loop_to_workers: dict[NodeAndGraphWalk, list[str]]
     sharding_config: ShardingConfig
+    # Whether any node of this request runs on another worker. Without one, a
+    # persisted tensor is only ever read back from this worker's own store.
+    has_remote_workers: bool = True
     # Per-loop stop indices. Worker-only, so it lives here rather than riding
     # on CurrentForwardPassInfo across the wire.
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
@@ -230,7 +233,11 @@ class PythonGraphRuntime(GraphRuntime):
                 worker_graph_ids=[],
                 node_to_workers=node_to_workers,
                 dyn_loop_to_workers=dyn_loop_to_workers,
-                sharding_config=sharding_config
+                sharding_config=sharding_config,
+                has_remote_workers=any(
+                    worker != self._my_worker_id
+                    for workers in node_to_workers.values() for worker in workers
+                ),
             )
 
         for graph_id in partition_worker_graph_ids:
@@ -1264,9 +1271,15 @@ class PythonGraphRuntime(GraphRuntime):
             # an outgoing edge, not just the ones this batch produced: a loop
             # edge carries tensors from earlier iterations, and those need
             # staging just as much. Deduped by uuid, so a re-emitted edge does
-            # not stage twice.
+            # not stage twice. Persisted tensors only for a remote reader:
+            # otherwise later walks read them from this worker's store.
+            req_info = self._request_info.get(rid)
+            persist = (
+                routing.persist
+                if req_info is None or req_info.has_remote_workers else []
+            )
             for edge in (
-                routing.persist + routing.emit_to_client
+                persist + routing.emit_to_client
                 + sum(routing.to_workers.values(), start=[])
                 + sum(routing.streaming_to_workers.values(), start=[])
             ):
