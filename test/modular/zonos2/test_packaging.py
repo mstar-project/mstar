@@ -88,3 +88,80 @@ def test_missing_torchcodec_names_the_extra(monkeypatch):
     model = Zonos2Model("unused", config=Zonos2Config(), skip_weight_loading=True)
     with pytest.raises(ImportError, match=r"torchcodec.*zonos2 extra"):
         model.load_audio("clip.wav", "cpu")
+
+
+# -- supply chain: pinned hub revisions, tensor-only checkpoint loads ----------
+class _Payload:
+    """A pickled object that is not a tensor; weights_only must refuse it."""
+
+
+def test_checkpoint_load_accepts_tensors_and_refuses_other_objects(tmp_path):
+    import torch
+
+    from mstar.model.zonos2.weight_loader import load_zonos2_state_dict
+
+    weights = {"a.weight": torch.ones(2)}
+    torch.save({"model": weights}, tmp_path / "model.pth")
+    assert torch.equal(load_zonos2_state_dict(str(tmp_path))["a.weight"], weights["a.weight"])
+
+    torch.save({"a.weight": torch.ones(2), "extra": _Payload()}, tmp_path / "model.pth")
+    with pytest.raises(Exception, match="Weights only load failed"):
+        load_zonos2_state_dict(str(tmp_path))
+
+
+def test_checkpoint_download_is_pinned(monkeypatch):
+    import huggingface_hub
+
+    from mstar.model.zonos2.config import Zonos2Config
+    from mstar.model.zonos2.weight_loader import resolve_zonos2_checkpoint
+
+    seen = {}
+    monkeypatch.setattr(
+        huggingface_hub, "snapshot_download",
+        lambda repo, **kw: seen.update(kw, repo=repo) or "/snap",
+    )
+    assert resolve_zonos2_checkpoint("Zyphra/ZONOS2", revision=Zonos2Config.checkpoint_revision) == "/snap"
+    assert seen["revision"] == Zonos2Config.checkpoint_revision
+    assert len(Zonos2Config.checkpoint_revision) == 40             # a full commit sha
+
+
+@pytest.mark.parametrize("override", [None, "main"])
+def test_config_load_downloads_the_pinned_or_overridden_checkpoint(monkeypatch, override):
+    from mstar.model.zonos2 import weight_loader
+    from mstar.model.zonos2.config import Zonos2Config
+    from mstar.model.zonos2.zonos2_model import Zonos2Model
+
+    seen = []
+    monkeypatch.setattr(
+        weight_loader, "resolve_zonos2_checkpoint",
+        lambda path, cache_dir=None, revision=None: seen.append(revision) or "/ckpt",
+    )
+    monkeypatch.setattr(
+        weight_loader, "load_zonos2_config_from_checkpoint",
+        lambda ckpt, **overrides: Zonos2Config(**overrides),
+    )
+    kwargs = {} if override is None else {"checkpoint_revision": override}
+    Zonos2Model("Zyphra/ZONOS2", **kwargs)
+    assert seen == [override or Zonos2Config.checkpoint_revision]
+
+
+def test_speaker_encoder_loads_the_pinned_revision(monkeypatch):
+    import transformers
+    from torch import nn
+
+    from mstar.model.zonos2.config import Zonos2Config
+    from mstar.model.zonos2.speaker_encoder import Qwen3SpeakerEncoder
+
+    seen = {}
+
+    def fake_from_pretrained(model_id, **kw):
+        seen.update(kw)
+        return nn.Identity()
+
+    monkeypatch.setattr(transformers.AutoModel, "from_pretrained", fake_from_pretrained)
+    Qwen3SpeakerEncoder(
+        "m/id", embedding_dim=4, revision=Zonos2Config.speaker_encoder_revision,
+    )
+    assert seen["revision"] == Zonos2Config.speaker_encoder_revision
+    assert seen["trust_remote_code"] is True
+    assert len(Zonos2Config.speaker_encoder_revision) == 40

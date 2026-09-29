@@ -52,6 +52,7 @@ class Qwen3SpeakerEncoder(nn.Module):
         embedding_dim: int,
         cache_dir: str | None = None,
         device: str | torch.device = "cpu",
+        revision: str | None = None,
     ):
         super().__init__()
         import torchaudio
@@ -70,7 +71,7 @@ class Qwen3SpeakerEncoder(nn.Module):
         self.encoder_device = torch.device(device)
 
         self.model = AutoModel.from_pretrained(
-            model_id, cache_dir=cache_dir, trust_remote_code=True,
+            model_id, revision=revision, cache_dir=cache_dir, trust_remote_code=True,
         )
         self.model.to(self.encoder_device).eval()
 

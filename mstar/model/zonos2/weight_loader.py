@@ -33,10 +33,13 @@ _STATE_DICT_NAMES = ("model.pth", "model.pt", "consolidated/consolidated.pth")
 
 
 @lru_cache()
-def resolve_zonos2_checkpoint(model_path: str, cache_dir: str | None = None) -> str:
+def resolve_zonos2_checkpoint(
+    model_path: str, cache_dir: str | None = None, revision: str | None = None,
+) -> str:
     """Return a local checkpoint directory.
 
-    The function downloads an HF repo id if necessary.
+    The function downloads an HF repo id at ``revision`` if necessary. A local
+    path is used as is.
     """
     if Path(model_path).expanduser().exists():
         return str(Path(model_path).expanduser())
@@ -46,6 +49,7 @@ def resolve_zonos2_checkpoint(model_path: str, cache_dir: str | None = None) -> 
         logger.info("Zonos2: downloading checkpoint from Hugging Face: %s", model_path)
         return snapshot_download(
             model_path,
+            revision=revision,
             cache_dir=cache_dir,
             allow_patterns=["*.json", "*.pth", "*.pt", "*.yaml"],
         )
@@ -79,7 +83,8 @@ def load_zonos2_state_dict(checkpoint_dir: str) -> dict[str, torch.Tensor]:
             f"No Zonos2 checkpoint ({' / '.join(_STATE_DICT_NAMES)}) under {checkpoint_dir!r}."
         )
     logger.info("Zonos2: loading weights from %s", sd_file)
-    state = torch.load(str(sd_file), map_location="cpu", weights_only=False)
+    # weights_only: the checkpoint is plain tensors, and a full unpickle could run code.
+    state = torch.load(str(sd_file), map_location="cpu", weights_only=True)
     if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
         state = state["model"]
     return state

@@ -92,9 +92,14 @@ class Zonos2Config:
     # loads an external HF model whose architecture lives in remote code. See
     # ``../ZONOS2/python/zonos2/models/speaker_cloning.py``. The repo id says
     # "1.7B", but that remote class is an ECAPA-TDNN of about 12M parameters.
-    # These two fields are deployment settings. ``params.json`` does not contain
+    # These fields are deployment settings. ``params.json`` does not contain
     # them, so the defaults apply on every run.
     speaker_encoder_model_id: str = "marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B"
+    # Hub commits to download, so an upstream push changes nothing until bumped.
+    # The encoder's is the reviewed remote code (trust_remote_code runs it).
+    # "main" restores always-latest.
+    speaker_encoder_revision: str = "7577f61c42737fc8064bba773e2a18602df92803"
+    checkpoint_revision: str = "65f1e80f94b599d474bb6af9094a803dc52f60bd"
     speaker_encoder_sample_rate: int = 24_000
     # The longest reference clip a clone request may send; longer ones get a
     # 400. The encoder embeds the whole clip on the LLM's GPU.

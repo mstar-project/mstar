@@ -273,5 +273,11 @@ Zonos2 environment requirements
   text, plus the generated audio (~86 frames/s). Generation stops when the context is full:
   ~70 s of speech after a short prompt, less after a long one. Text too long to leave room
   for audio gets a 400. Split long text into sentences or paragraphs.
+- **Pinned downloads.** The checkpoint (``Zyphra/ZONOS2``) and the speaker encoder, whose
+  hub code runs under ``trust_remote_code``, download at fixed commits:
+  ``checkpoint_revision`` and ``speaker_encoder_revision`` in ``Zonos2Config``. An upstream
+  push changes nothing until someone reviews it and bumps the sha, or sets one in the
+  serving YAML's ``model_kwargs`` (``"main"`` takes the latest). A local model path skips
+  the checkpoint download, and the checkpoint loads with ``torch.load(weights_only=True)``.
 - **Single GPU only.** Tensor parallelism is disabled until expert parallelism lands; a
   config with ``tp_size > 1`` is rejected at load.

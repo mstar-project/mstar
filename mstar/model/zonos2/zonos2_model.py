@@ -127,7 +127,11 @@ class Zonos2Model(Model):
             resolve_zonos2_checkpoint,
         )
 
-        ckpt = resolve_zonos2_checkpoint(self.model_path_hf, self.cache_dir)
+        # The config is not built yet, so take the pin from the YAML or the default.
+        revision = self._yaml_overrides.get(
+            "checkpoint_revision", Zonos2Config.checkpoint_revision,
+        )
+        ckpt = resolve_zonos2_checkpoint(self.model_path_hf, self.cache_dir, revision)
         cfg = load_zonos2_config_from_checkpoint(ckpt, **self._yaml_overrides)
         if cfg.text_vocab is None:
             cfg.text_vocab = BYTE_TEXT_VOCAB_SIZE
@@ -678,7 +682,9 @@ class Zonos2Model(Model):
         if self.skip_weight_loading:
             logger.warning("Zonos2: skip_weight_loading set; LLM weights are uninitialized.")
         else:
-            ckpt = resolve_zonos2_checkpoint(self.model_path_hf, self.cache_dir)
+            ckpt = resolve_zonos2_checkpoint(
+                self.model_path_hf, self.cache_dir, self.config.checkpoint_revision,
+            )
             load_zonos2_weights(model, ckpt, device=device)
         model.eval()
 
@@ -737,6 +743,7 @@ class Zonos2Model(Model):
             embedding_dim=self.config.speaker_embedding_dim,
             cache_dir=self.cache_dir,
             device=device,
+            revision=self.config.speaker_encoder_revision,
         )
         return Zonos2SpeakerEncoderSubmodule(
             encoder=encoder,
