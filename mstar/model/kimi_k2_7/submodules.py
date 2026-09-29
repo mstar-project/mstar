@@ -98,9 +98,13 @@ class KimiLLMSubmodule(ARNodeSubmodule):
         return [
             BatchedCudaGraphConfig(
                 capture_graph_walk="decode",
+                # Padding rows under a lease are built from these templates, so
+                # they must read as sampling or `declare_step` turns the whole
+                # batch eager and disagrees with the leased graph key.
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
                     input_seq_len=1,
+                    resource_step_info=True,
                 ),
             ),
             PackedCudaGraphConfig(
@@ -109,6 +113,7 @@ class KimiLLMSubmodule(ARNodeSubmodule):
                 make_node_input=lambda n: ARNodeInputs(
                     input_ids=torch.zeros((n,), dtype=torch.long, device=device),
                     input_seq_len=n,
+                    resource_step_info=True,
                 ),
                 capture_batch_sizes=prefill_batch_sizes,
             ),

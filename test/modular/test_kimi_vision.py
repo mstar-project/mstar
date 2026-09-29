@@ -501,3 +501,19 @@ def test_declare_step_stamps_cg_key_info_matching_cg_key_info_method():
     )
     assert step2.cg_key_info is False
     assert step2.cg_key_info == submodule.cg_key_info("prefill", {"r0": ready, "r1": not_ready})
+
+
+def test_declare_step_treats_lease_padding_rows_as_sampling():
+    """A leased decode/prefill batch is padded with rows built from the capture
+    templates; they must not flip the step to eager (cg_key_info False)."""
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    submodule = KimiLLMSubmodule(language_model=language_model, config=KimiK2Config.reduced())
+    decode_cfg, prefill_cfg = submodule.get_cuda_graph_configs(torch.device("cpu"))
+
+    real = ARNodeInputs(input_ids=torch.tensor([3]), input_seq_len=1, resource_step_info=True)
+    padded = [real, *decode_cfg.get_node_inputs(3, 0)]
+    assert submodule.declare_step("decode", ["r0", "p0", "p1", "p2"], padded).cg_key_info is None
+
+    padded = [real, *prefill_cfg.get_node_inputs(1, 0)]
+    assert submodule.declare_step("prefill", ["r0", "p0"], padded).cg_key_info is None
