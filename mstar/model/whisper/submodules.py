@@ -329,7 +329,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
             else:
                 tensor_inputs["ts_rules"] = torch.tensor(inactive_state(), dtype=torch.long, device=device)
         else:
-            state = self.request_state(fwd_info.request_id)
+            state = self.request_state(fwd_info.rid_handle)
             # The learned position table caps prompt + transcript at
             # max_target_positions, and check_stop reads this back.
             state.add("prompt_len", state.get("prompt_len", 0) + seq_len)
@@ -360,7 +360,7 @@ class WhisperDecoderSubmodule(ARNodeSubmodule):
         with ``<|notimestamps|>`` (word timing never uses timestamp tokens),
         the transcript's text tokens, end-of-text."""
         device = self.get_device()
-        state = self.request_state(fwd_info.request_id)
+        state = self.request_state(fwd_info.rid_handle)
         generated = [int(t) for part in inputs["transcript"] for t in part.reshape(-1).tolist()]
         language = state.get("language")
         if generated and self.config.language_of(generated[0]) is not None:
