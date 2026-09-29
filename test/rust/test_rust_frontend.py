@@ -39,6 +39,12 @@ class _Chunk:
         self.metadata = metadata or {}
 
 
+class _RejectedError(ValueError):
+    """Stands in for UnsupportedModalityError: a status-carrying intake error."""
+
+    status_code = 400
+
+
 class _StubAPIServer:
     """Scripted data plane: echoes the prompt back in two text chunks."""
 
@@ -51,6 +57,8 @@ class _StubAPIServer:
                        model_kwargs=None, streaming=True, request_id=None):
         if text and "boom" in text:
             raise ValueError("scripted ingest failure")
+        if text and "hologram" in text:
+            raise _RejectedError("model does not support: 'hologram' (input)")
         self.submitted.append({
             "rid": request_id, "text": text,
             "in": input_modalities, "out": output_modalities,
@@ -169,6 +177,14 @@ def test_ingest_failure_is_a_500_not_a_hang(stack):
     # and the server keeps serving afterwards
     assert _chat(port, "again")["choices"][0]["message"]["content"] == \
         "Hello world"
+
+
+def test_intake_rejection_keeps_its_status(stack):
+    port, _stub, _bridge, _proc = stack
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _chat(port, "hologram", timeout=15)
+    assert e.value.code == 400
+    assert "does not support" in json.loads(e.value.read())["error"]["message"]
 
 
 def test_health_goes_red_when_the_bridge_dies(stack):

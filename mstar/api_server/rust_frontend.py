@@ -126,7 +126,17 @@ class RustFrontendBridge:
             )
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the loop
             logger.warning("submit %s failed: %r", rid, e)
-            self._err(rid, repr(e))
+            status = getattr(e, "status_code", None)
+            if status is None:
+                self._err(rid, repr(e))
+            else:
+                # `err` is always a 500; the in-band error chunk carries the
+                # status, so an intake rejection stays a 400
+                self._send({
+                    "t": "chunk", "rid": rid, "modality": "error",
+                    "data": str(getattr(e, "detail", e)).encode(),
+                    "metadata": {"status": status},
+                })
             return
         asyncio.get_running_loop().create_task(self._relay(rid))
 

@@ -212,6 +212,30 @@ def test_videos_generations_wan22_rejects_video_conditioning(client_and_stub):
     assert "video" in r.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("model,path,kwargs", [
+    ("orpheus", "/v1/audio/speech", {"json": {"model": "orpheus", "input": "hi"}}),
+    ("bagel", "/v1/images/generations", {"json": {"model": "bagel", "prompt": "x"}}),
+    ("bagel", "/v1/images/edits", {
+        "files": {"image": ("in.png", b"\x89PNG", "image/png")}, "data": {"prompt": "x"},
+    }),
+])
+def test_intake_rejection_is_a_bad_request_on_every_route(
+    client_and_stub, monkeypatch, model, path, kwargs,
+):
+    # submit_request raises UnsupportedModalityError (a ValueError) at intake;
+    # every route must surface it as a 400 like chat and videos, not a 500
+    client, stub = client_and_stub
+    stub.model_name = model
+
+    def reject(**kw):
+        raise ValueError("model does not support: 'image' (output)")
+
+    monkeypatch.setattr(stub, "submit_request", reject)
+    r = client.post(path, **kwargs)
+    assert r.status_code == 400
+    assert "does not support" in r.json()["error"]["message"]
+
+
 def test_chat_stream(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
