@@ -97,7 +97,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
       - name: Cargo tests (transport + arena semantics)
         working-directory: rust
-        run: cargo test --release
+        # Off with extension-module (see rust/Cargo.toml): the test binary is an
+        # executable, so it links libpython rather than resolving CPython
+        # symbols at import time. setup-python's interpreter is --enable-shared,
+        # so point the loader at its libdir for the run.
+        env:
+          LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
+        run: cargo test --release --no-default-features
       - name: Build the Rust frontend (mstar-server)
         working-directory: rust/server
         run: cargo build --release
