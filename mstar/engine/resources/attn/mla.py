@@ -301,6 +301,12 @@ class MlaAbsorbManager(AttentionManager):
             dtype=self._dtype,
         )
         state.wrapper = wrapper
+        if lease is not None:
+            # `select_last_hidden` is captured in the graph, so it must read the
+            # wrapper's static buffer (refreshed by every plan), not this plan's
+            # fresh device tensor: a replay would otherwise gather with whatever
+            # now lives at the capture-time address and sample a garbage token.
+            state.qo_indptr = wrapper._qo_indptr_buf
         return state
 
     def _sdpa_plan(self, kv_out: KVPlanOutput) -> MlaSdpaPlan:
