@@ -35,6 +35,9 @@ class _RecordingTensorManager:
     def cleanup_request(self, request_id):
         pass
 
+    def force_cleanup_request(self, request_id):
+        pass
+
     def store_and_return_tensor_info(self, request_id, tensors):
         return {}
 
