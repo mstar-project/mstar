@@ -156,10 +156,13 @@ def test_allocation_failure_still_evicts():
 class _FakeMgmt:
     """``SubmoduleManagement``'s slot rotation, as `_exec_per_request` uses it."""
 
-    def __init__(self, submodule, num_slots: int, next_slot: int, seen: list):
+    def __init__(
+        self, submodule, num_slots: int, next_slot: int, seen: list, world_size: int = 1,
+    ):
         self.submodule = submodule
         self.num_slots = num_slots
         self.needs_slot_fence = False
+        self.joint_comm_group = SimpleNamespace(world_size=world_size)
         self._next_slot = next_slot
         self._seen = seen
 
@@ -185,7 +188,7 @@ class _FakeExecEngine:
     def __init__(
         self, fail_on: str | None = None, raise_on: str | None = None,
         num_slots: int = 1, next_slot: int = 0,
-        collect_raise_on: str | None = None,
+        collect_raise_on: str | None = None, world_size: int = 1,
     ):
         self._enable_nvtx = False
         self._fail_on = fail_on
@@ -198,7 +201,9 @@ class _FakeExecEngine:
         # the per-request path's slots; no fence, so no CUDA event is recorded
         self.piecewise_slots: list[int] = []
         self.run_slots: list[int] = []
-        self.mgmt = _FakeMgmt(self, num_slots, next_slot, self.piecewise_slots)
+        self.mgmt = _FakeMgmt(
+            self, num_slots, next_slot, self.piecewise_slots, world_size=world_size,
+        )
         self._submodules = {"node": self.mgmt}
 
     # --- submodule surface
@@ -353,3 +358,30 @@ def test_per_request_does_not_abort_a_step_that_committed():
     assert not any(kind == "abort" for kind, _ in engine.events)
     assert set(batch.failed_requests) == {"b"}
     assert out["a"] == {"token": 1} and out["b"] == {}
+
+
+def test_per_request_stops_after_a_failed_forward_on_a_sharded_node():
+    """Under TP/SP the peers may still be in b's collectives, so c must not run
+    and pair its own with them; it is failed and its admitted step aborted."""
+    engine = _FakeExecEngine(raise_on="b", world_size=2)
+    batch = _exec_batch(["a", "b", "c"])
+
+    out = engine._exec_per_request(batch)
+
+    assert [e for e in engine.events if e[0] in ("run", "abort")] == [
+        ("run", "a"), ("abort", "b"), ("abort", "c"),
+    ]
+    assert out == {"a": {"token": 1}, "b": {}, "c": {}}
+    assert set(batch.failed_requests) == {"b", "c"}
+    assert "failed before it" in batch.failed_requests["c"]
+
+
+def test_per_request_keeps_going_after_a_committed_step_on_a_sharded_node():
+    # the raise came after commit, so every rank finished b's collectives
+    engine = _FakeExecEngine(collect_raise_on="b", world_size=2)
+    batch = _exec_batch(["a", "b", "c"])
+
+    engine._exec_per_request(batch)
+
+    assert ("run", "c") in engine.events
+    assert set(batch.failed_requests) == {"b"}
