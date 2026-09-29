@@ -55,7 +55,15 @@ class Qwen3SpeakerEncoder(nn.Module):
     ):
         super().__init__()
         import torchaudio
-        from transformers import AutoModel
+
+        try:
+            from transformers import AutoModel
+        except ImportError as exc:
+            raise ImportError(
+                "The Zonos2 speaker encoder needs `transformers` (in the zonos2 extra: "
+                "pip install -e '.[zonos2]'). To serve text-only instead, drop the "
+                "speaker_encoder node group from the config YAML."
+            ) from exc
 
         self.model_id = model_id
         self.embedding_dim = int(embedding_dim)

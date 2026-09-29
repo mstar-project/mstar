@@ -426,7 +426,13 @@ class Zonos2Model(Model):
         That combination forces a lossy upsample with no content above 8 kHz.
         The embedding then degrades, but the code does not fail.
         """
-        from torchcodec.decoders import AudioDecoder
+        try:
+            from torchcodec.decoders import AudioDecoder
+        except ImportError as exc:
+            raise ImportError(
+                "Zonos2 voice cloning decodes the reference clip with `torchcodec` (in "
+                "the zonos2 extra: pip install -e '.[zonos2]'); it also needs FFmpeg 4-7."
+            ) from exc
 
         from mstar.model.base import TensorAndMetadata
 

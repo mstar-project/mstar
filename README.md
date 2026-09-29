@@ -84,7 +84,7 @@ Zonos2 (multi-codebook TTS) additionally needs the DAC vocoder — `pip install 
 (kept out of the extras; see [docs/installation.rst](docs/installation.rst)).
 
 Zonos2 voice cloning also downloads a Qwen speech encoder (not part of the checkpoint) at server
-start — `pip install transformers torchcodec` and set a writable `HF_MODULES_CACHE`.
+start — set a writable `HF_MODULES_CACHE` (`transformers` and `torchcodec` come with `.[zonos2]`).
 
 Other models: `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve orpheus` · `mstar serve zonos2` · `mstar serve pi05` · `mstar serve vjepa2`
 

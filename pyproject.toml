@@ -165,6 +165,10 @@ zonos2 = [
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
+    # The voice-clone speaker encoder, which the default config always builds:
+    # transformers loads it, torchcodec decodes the reference clip.
+    "torchcodec",
+    "transformers",
 ]
 
 # Text normalization for Zonos2 ("$5.32" -> "five dollars ..."); optional and

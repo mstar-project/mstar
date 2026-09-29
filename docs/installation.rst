@@ -90,10 +90,11 @@ Model families and some output formats need extra packages, exposed as pip *extr
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
    * - ``.[zonos2]``
      - Zonos2 TTS runtime: ``flashinfer-python``, ``safetensors``, ``huggingface-hub``,
-       ``mooncake-transfer-engine``. **Also needs** ``descript-audio-codec`` (the DAC
-       vocoder), which is installed separately — see `descript-audio-codec (Zonos2)`_.
-       **Voice cloning additionally needs** ``transformers`` and ``torchcodec``, which the
-       extra does not pull in — see `Qwen speech encoder (Zonos2 voice cloning)`_.
+       ``mooncake-transfer-engine``, and ``transformers`` / ``torchcodec`` for the voice-clone
+       speaker encoder, which the default config always builds. **Also needs**
+       ``descript-audio-codec`` (the DAC vocoder), which is installed separately — see
+       `descript-audio-codec (Zonos2)`_ — and a writable ``HF_MODULES_CACHE``; see
+       `Qwen speech encoder (Zonos2 voice cloning)`_.
    * - ``.[zonos2-norm]``
      - Optional Zonos2 text normalization ("$5.32" → "five dollars thirty two cents"):
        ``nemo_text_processing`` (pins ``pynini``; pulls ``pandas``). Not part of ``.[all]``.
@@ -279,14 +280,17 @@ Qwen speech encoder (Zonos2 voice cloning)
 
 Zonos2 has no named voices: it clones one from a reference clip, using a Qwen speech encoder
 (~48 MB) that is not part of the checkpoint. A speaker-conditioned checkpoint downloads it
-from the hub at server start, which needs two packages ``.[zonos2]`` doesn't install and a
+from the hub at server start. ``.[zonos2]`` installs what it needs (``transformers`` to load
+it, ``torchcodec`` to decode the clip, which also needs FFmpeg 4–7), but it also needs a
 **writable** ``HF_MODULES_CACHE`` (the encoder is remote code, so ``transformers`` writes its
 module files at load time; the shared ``HF_HOME`` default is often read-only):
 
 .. code-block:: bash
 
-   pip install transformers torchcodec
    export HF_MODULES_CACHE=/path/you/can/write/hf_modules
+
+``torchcodec`` does not declare the torch it was built for, so pin it to match: on torch 2.9
+use ``torchcodec==0.9.1``; 0.10 and later need torch 2.10 or newer.
 
 ``test/zonos2/launch_server_zonos2.sh`` sets ``HF_MODULES_CACHE`` for you. Text-only serving
 needs none of this — drop the ``speaker_encoder`` node group from the config YAML.

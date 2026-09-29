@@ -249,8 +249,8 @@ Zonos2 environment requirements
 - The **DAC vocoder** (``pip install descript-audio-codec``) is required and is kept out of
   every extra — see :doc:`installation`.
 - **Voice cloning** embeds the reference clip with a Qwen speech encoder that is not part of
-  the checkpoint, downloaded from the hub at server start. It needs ``transformers`` and
-  ``torchcodec`` (neither is in ``.[zonos2]``) and a writable ``HF_MODULES_CACHE`` — see
+  the checkpoint, downloaded from the hub at server start. ``.[zonos2]`` brings its
+  ``transformers`` and ``torchcodec``; it also needs a writable ``HF_MODULES_CACHE`` — see
   :doc:`installation`. Drop the ``speaker_encoder`` node group from the config YAML to serve
   text-only; clone requests then fail instead of ignoring the reference audio.
 - Clone requests send reference audio (``audio=...`` with ``"audio"`` in
