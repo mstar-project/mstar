@@ -184,7 +184,9 @@ def test_intake_rejection_keeps_its_status(stack):
     with pytest.raises(urllib.error.HTTPError) as e:
         _chat(port, "hologram", timeout=15)
     assert e.value.code == 400
-    assert "does not support" in json.loads(e.value.read())["error"]["message"]
+    err = json.loads(e.value.read())["error"]
+    assert "does not support" in err["message"]
+    assert err["type"] == "invalid_request_error"
 
 
 def test_health_goes_red_when_the_bridge_dies(stack):
