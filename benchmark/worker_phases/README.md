@@ -82,6 +82,9 @@ Take the LONGEST segment at the expected batch size as steady state.
 
 ## Caveats
 
+* This harness only measures time *inside the worker*. TTFT and ITL are not
+  here and cannot be derived from these numbers -- they come from the
+  runner's closed loop, measured client-side against a live server.
 * Only iterations that run a batch are counted; an idle worker waiting for
   work records nothing.
 * Per-worker. Under TP the leader and follower have genuinely different phase

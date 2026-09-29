@@ -164,11 +164,19 @@ def segment(
     ``skip_warmup`` drops that many leading records per worker -- the first
     flushes of a run include cold caches and the concurrency ramp.
 
-    A record opens a new segment when its ``bs`` differs from the running mean
+    A record opens a new segment when its ``bs`` differs from the FIRST record
     of the current one by more than ``bs_tolerance`` (a fraction, so 0.15 means
     15%). That is what separates steady state from the drain without anyone
     having to guess a time window per workload. Segments shorter than
     ``min_records`` are dropped, which discards the brief transitions.
+
+    Anchored on the first record rather than the segment's running mean: a
+    mean follows a slow ramp, so no single step trips the tolerance and the
+    whole ramp reports as one segment whose mean describes none of it. The
+    anchor does not move, so it bounds the segment's bs span. It is the more
+    brittle statistic of the two -- an outlier as the first record splits more
+    than it should -- but erring toward more segments keeps each one
+    homogeneous, which is the point.
 
     With no ``bs`` in the log (older workers) every record reads bs=0.0 and
     this degenerates to one segment per worker, which is the old behaviour.
@@ -181,18 +189,15 @@ def segment(
     for worker, recs in by_worker.items():
         recs = sorted(recs, key=lambda r: r.iter)[skip_warmup:]
         cur: Segment | None = None
-        run_sum = 0.0
         for r in recs:
             if cur is not None:
-                mean = run_sum / len(cur.records)
-                ref = max(mean, 1e-9)
-                if abs(r.bs - mean) / ref > bs_tolerance:
+                anchor = cur.records[0].bs
+                if abs(r.bs - anchor) / max(anchor, 1e-9) > bs_tolerance:
                     out.append(cur)
                     cur = None
             if cur is None:
-                cur, run_sum = Segment(worker=worker), 0.0
+                cur = Segment(worker=worker)
             cur.records.append(r)
-            run_sum += r.bs
         if cur is not None:
             out.append(cur)
     return [s for s in out if len(s.records) >= min_records]
