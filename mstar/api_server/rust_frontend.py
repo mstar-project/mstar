@@ -119,7 +119,7 @@ class RustFrontendBridge:
                 text=msg.get("text"),
                 file_paths=msg.get("file_paths") or None,
                 input_modalities=list(msg.get("input_modalities") or []),
-                output_modalities=list(msg.get("output_modalities") or ["text"]),
+                output_modalities=list(msg.get("output_modalities") or []),
                 model_kwargs=dict(msg.get("model_kwargs") or {}),
                 streaming=bool(msg.get("streaming", True)),
                 request_id=rid,

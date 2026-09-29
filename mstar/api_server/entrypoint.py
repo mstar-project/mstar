@@ -280,6 +280,12 @@ class APIServer:
         """
         if request_id is None:
             request_id = str(uuid.uuid4())
+        # A request that names no output gets the model's own (audio for TTS)
+        if not output_modalities:
+            output_modalities = (
+                list(self.model.default_output_modalities())
+                if self.model is not None else ["text"]
+            )
 
         # Reject at intake anything the loaded model has no encoder/decoder for.
         # Uploads count too: the data worker loads every file_paths key
@@ -735,7 +741,7 @@ async def generate(
     text: Optional[str] = Form(None),
     files: Optional[list[UploadFile]] = File(None),
     input_modalities: Optional[str] = Form(None),
-    output_modalities: str = Form("text"),
+    output_modalities: Optional[str] = Form(None),
     streaming: bool = Form(True),
     model_kwargs: Optional[str] = Form(None),
     request_id: Optional[str] = Form(None),
@@ -748,8 +754,8 @@ async def generate(
             each file is inferred from its extension.
         input_modalities: Comma-separated list of input modalities.  When
             omitted, modalities are auto-detected from the provided data.
-        output_modalities: Comma-separated list of desired output modalities
-            (default ``"text"``).
+        output_modalities: Comma-separated list of desired output modalities.
+            When omitted, the model's default (e.g. ``"audio"`` for a TTS model).
         streaming: If ``True``, return an NDJSON stream of result chunks.
         model_kwargs: Optional JSON string of model-specific parameters.
         request_id: Optional client-supplied request id. When omitted, the
@@ -760,7 +766,7 @@ async def generate(
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
 
-    out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
+    out_mods = [m.strip() for m in (output_modalities or "").split(",") if m.strip()]
 
     # --- save uploaded files, grouped by modality ----------------
     file_paths: dict[str, list[str]] = {}

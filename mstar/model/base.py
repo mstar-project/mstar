@@ -254,6 +254,16 @@ class Model(ABC):
     # universe, so a model that doesn't narrow it behaves as before
     SUPPORTED_INPUT_MODALITIES: frozenset[str] = MODALITIES
     SUPPORTED_OUTPUT_MODALITIES: frozenset[str] = MODALITIES
+    # What a request that names no output gets. None: the model's only output,
+    # else text; a model with several outputs and no text must set it
+    DEFAULT_OUTPUT_MODALITIES: tuple[str, ...] | None = None
+
+    def default_output_modalities(self) -> tuple[str, ...]:
+        if self.DEFAULT_OUTPUT_MODALITIES is not None:
+            return self.DEFAULT_OUTPUT_MODALITIES
+        if len(self.SUPPORTED_OUTPUT_MODALITIES) == 1:
+            return tuple(self.SUPPORTED_OUTPUT_MODALITIES)
+        return ("text",)
 
     def unsupported_modalities(
         self, input_modalities: list[str], output_modalities: list[str],

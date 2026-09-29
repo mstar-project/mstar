@@ -94,6 +94,7 @@ class Cosmos3Model(Model):
     # video (video_sound_gen adds audio) and actions for the world-model walks.
     SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image", "video"})
     SUPPORTED_OUTPUT_MODALITIES = frozenset({"image", "video", "audio", "action"})
+    DEFAULT_OUTPUT_MODALITIES = ("image",)
 
     PREFILL_WALK = constants.PREFILL_WALK
     PREFILL_COND_WALK = constants.PREFILL_COND_WALK

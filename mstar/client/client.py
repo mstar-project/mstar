@@ -62,7 +62,7 @@ class MStarClient:
         images=None,
         audio=None,
         video=None,
-        output_modalities=("text",),
+        output_modalities=None,
         input_modalities=None,
         stream: bool = False,
         request_id: str | None = None,
@@ -75,17 +75,17 @@ class MStarClient:
         tuple. Extra keyword args are forwarded verbatim as the model's
         ``model_kwargs`` (e.g. ``voice="tara"``, ``think_mode=True``,
         ``temperature=0.7``, ``max_output_tokens=256``); ``None`` values are
-        dropped so server-side defaults apply.
+        dropped so server-side defaults apply. Without ``output_modalities``
+        the server picks the model's default (text, or e.g. audio for TTS).
 
         Returns a :class:`GenerateResult` when ``stream=False``, or an iterator
         of :class:`StreamEvent` (``TextChunk`` / ``ImageChunk`` / ``AudioChunk``)
         when ``stream=True``.
         """
         files = self._build_files(images, audio, video)
-        data: dict[str, str] = {
-            "output_modalities": ",".join(output_modalities),
-            "streaming": "true" if stream else "false",
-        }
+        data: dict[str, str] = {"streaming": "true" if stream else "false"}
+        if output_modalities is not None:
+            data["output_modalities"] = ",".join(output_modalities)
         if text is not None:
             data["text"] = text
         if input_modalities is not None:

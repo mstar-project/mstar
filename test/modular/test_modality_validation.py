@@ -94,6 +94,27 @@ def test_falls_back_to_the_global_universe_without_a_model():
     assert rid in server.pending_requests
 
 
+class _SpeechOnly:
+    """A TTS model's declaration: text in, audio out."""
+
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"audio"})
+    DEFAULT_OUTPUT_MODALITIES = None
+    unsupported_modalities = Model.unsupported_modalities
+    default_output_modalities = Model.default_output_modalities
+
+
+def test_an_unnamed_output_is_the_model_default():
+    # a TTS model called without output_modalities speaks instead of a 400
+    server = _server(_SpeechOnly(), model_name="orpheus")
+    rid = server.submit_request(text="hi", input_modalities=["text"], output_modalities=[])
+    assert server.pending_requests[rid].output_modalities == ["audio"]
+    # and with no model to ask, text
+    server = _server(None, model_name="dummy")
+    rid = server.submit_request(text="hi", input_modalities=["text"], output_modalities=[])
+    assert server.pending_requests[rid].output_modalities == ["text"]
+
+
 # ── per-model declarations ──────────────────────────────────────────────────
 
 
@@ -227,3 +248,11 @@ def test_cosmos3_audio_out_means_the_sound_walk():
     ):
         with pytest.raises(ValueError, match="sound"):
             model._resolve_gen_params(mk, ["text"], out)
+
+
+@pytest.mark.parametrize("name", sorted(MODEL_REGISTRY))
+def test_every_default_output_is_one_the_model_supports(name):
+    """A model with several outputs and no text must name its default."""
+    cls = _model_cls(name)
+    model = cls.__new__(cls)
+    assert set(model.default_output_modalities()) <= cls.SUPPORTED_OUTPUT_MODALITIES

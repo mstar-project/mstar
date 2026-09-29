@@ -57,6 +57,18 @@ def test_coerce_and_build_files():
     assert c._build_files(None, b"\x00\x01", None) == [("files", ("audio_0.wav", b"\x00\x01"))]
 
 
+def test_generate_leaves_the_output_to_the_server():
+    """Unnamed, the server picks the model's default (audio for TTS)."""
+    c = MStarClient("http://x")
+    resp = mock.MagicMock()
+    resp.json.return_value = {"request_id": "r", "outputs": {}}
+    with mock.patch.object(c._session, "post", return_value=resp) as post:
+        c.generate(text="hi")
+        assert "output_modalities" not in post.call_args.kwargs["data"]
+        c.generate(text="hi", output_modalities=("audio",))
+        assert post.call_args.kwargs["data"]["output_modalities"] == "audio"
+
+
 def test_stream_without_content_type_charset():
     """Content-Type without a charset must still yield events (issue #163)."""
     requests = pytest.importorskip("requests")

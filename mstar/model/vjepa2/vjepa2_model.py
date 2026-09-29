@@ -1105,6 +1105,7 @@ class VJepa2ACModel(VJepa2Model):
 
     # the MPC walk adds the best-action index and the per-candidate costs
     SUPPORTED_OUTPUT_MODALITIES = frozenset({"video", "scalar", "tensor"})
+    DEFAULT_OUTPUT_MODALITIES = ("video",)
 
     def __init__(
         self,

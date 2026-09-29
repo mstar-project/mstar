@@ -812,7 +812,8 @@ fn videos_response(chunks: Vec<ResultChunk>) -> Value {
 async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Response {
     let mut text: Option<String> = None;
     let mut in_mods_raw: Option<String> = None;
-    let mut out_mods_raw = "text".to_string();
+    // none named: the backend picks the model's default output
+    let mut out_mods_raw = String::new();
     let mut streaming = true;
     let mut tokenize = false;
     let mut mk_raw: Option<String> = None;

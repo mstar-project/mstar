@@ -135,6 +135,20 @@ def test_chat_roundtrip(stack):
     assert sub["out"] == ["text"]
 
 
+def test_generate_leaves_an_unnamed_output_to_the_backend(stack):
+    # the backend fills in the model's default, not a hard-coded "text"
+    import urllib.parse
+
+    port, stub, _bridge, _proc = stack
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate",
+        data=urllib.parse.urlencode({"text": "hi", "streaming": "false"}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        assert r.status == 200
+    assert stub.submitted[-1]["out"] == []
+
+
 def _post_raw(port, path, raw_bytes, timeout=15):
     """POST a raw body (possibly malformed) as application/json; return
     (status, parsed_json_or_None)."""

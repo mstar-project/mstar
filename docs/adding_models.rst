@@ -172,7 +172,9 @@ the model tolerates, not only what it reads: if a front end sends a text prompt 
 the model ignores, ``text`` still belongs in the input set. Inputs that arrive in
 ``model_kwargs`` (actions, robot state) are not modalities. A model that does not
 declare inherits the full set, and
-``test/modular/test_modality_validation.py`` fails for it.
+``test/modular/test_modality_validation.py`` fails for it. A request that names no
+output gets ``DEFAULT_OUTPUT_MODALITIES``; left unset, that is the model's only
+output, or ``text``. A model with several outputs and no text output must set it.
 
 .. note::
 
