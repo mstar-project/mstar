@@ -83,6 +83,9 @@ class _Stub(Resource):
     def commit(self, step, ctx):
         self.calls.append("commit")
 
+    def abort_step(self, step, ctx):
+        self.calls.append("abort")
+
     def publish(self, request_id):
         self.calls.append(f"publish:{request_id}")
         return self._published
@@ -247,6 +250,20 @@ def test_commit_sweeps_declared_resources_in_plan_order():
     runner.commit(_step(["kv", "attn"]))
 
     assert kv.calls == ["commit"] and attn.calls == ["commit"]
+
+
+def test_abort_step_reaches_every_declared_resource_past_a_raise():
+    class _Raising(_Stub):
+        def abort_step(self, step, ctx):
+            raise RuntimeError("abort failed")
+
+    kv, attn = _Stub("kv"), _Raising("attn", deps=("kv",))
+    sampler = _Stub("sampler", deps=("attn",))
+    runner = StepRunner({"attn": attn, "kv": kv, "sampler": sampler})
+
+    runner.abort_step(_step(["kv", "attn", "sampler"]))
+
+    assert kv.calls == ["abort"] and sampler.calls == ["abort"]
 
 
 def test_publish_collects_per_request_per_key_and_omits_the_silent():

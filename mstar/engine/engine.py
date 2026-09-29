@@ -688,6 +688,10 @@ class Engine:
                 ctx=ctxs[rid], nvtx=nvtx
             )
             if not admit_outcome.ok:
+                # the rids admitted before this one will never run
+                for prev in batch.request_ids[:i]:
+                    if steps[prev] is not None:
+                        self._runner.abort_step(steps[prev])
                 return merged
 
         # Step 2: drive step, plan -> forward -> commit loop.
@@ -707,19 +711,18 @@ class Engine:
 
             if nvtx:
                 range_push(f"engine.per_request.{rid}")
+            committed = False
             try:
                 raw, _ = self._drive_step(
                     batch, submodule_mgmt, [rid], [inp], req_info, ctxs[rid],
                     lease=None, running_batched=False,
                     step=steps[rid], set_launch=not launched,
                 )
+                committed = True
                 if raw is None:
                     merged[rid] = {}
                     continue
                 launched = True
-                if fence:
-                    slot_events[slot] = torch.cuda.Event()
-                    slot_events[slot].record()
 
                 merged.update(self._collect_outputs(
                     submodule_mgmt, None, raw, [inp], req_info,
@@ -734,7 +737,15 @@ class Engine:
                 )
                 batch.register_failure(rid, error)
                 merged[rid] = {}
+                # commit never ran, so release what admit/plan still hold
+                if not committed and steps[rid] is not None:
+                    self._runner.abort_step(steps[rid])
             finally:
+                # on every exit: a raise after plan can leave this slot's
+                # staging copy queued
+                if fence:
+                    slot_events[slot] = torch.cuda.Event()
+                    slot_events[slot].record()
                 if nvtx:
                     range_pop()
 

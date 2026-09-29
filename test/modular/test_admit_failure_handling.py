@@ -185,10 +185,12 @@ class _FakeExecEngine:
     def __init__(
         self, fail_on: str | None = None, raise_on: str | None = None,
         num_slots: int = 1, next_slot: int = 0,
+        collect_raise_on: str | None = None,
     ):
         self._enable_nvtx = False
         self._fail_on = fail_on
         self._raise_on = raise_on
+        self._collect_raise_on = collect_raise_on
         # ordered log, so the test can assert admit-all-then-run
         self.events: list[tuple[str, str]] = []
         self._runner = self
@@ -218,6 +220,9 @@ class _FakeExecEngine:
             )
         return FullAdmitOutcome(AdmitOutcome(ok=True))
 
+    def abort_step(self, step):
+        self.events.append(("abort", step.ctx.request_ids[0]))
+
     # --- engine internals the path calls into
     def _drive_step(
         self, batch, submodule_mgmt, request_ids, inputs, req_info, ctx,
@@ -236,6 +241,8 @@ class _FakeExecEngine:
 
     def _collect_outputs(self, *a, **kw):
         del a
+        if kw["request_ids"][0] == self._collect_raise_on:
+            raise RuntimeError("collect failed")
         return dict(kw["request_ids"] and {kw["request_ids"][0]: {"token": 1}})
 
 
@@ -275,6 +282,8 @@ def test_per_request_runs_nothing_when_a_later_rid_fails_admit():
     assert not any(kind == "run" for kind, _ in engine.events)
     assert out == {"a": {}, "b": {}}
     assert isinstance(batch.admit_error, AllocationFailed)
+    # a was admitted and will never commit; b's admit was refused
+    assert [e for e in engine.events if e[0] == "abort"] == [("abort", "a")]
 
 
 def test_per_request_rotates_slots_within_the_batch():
@@ -321,11 +330,26 @@ def test_per_request_isolates_a_forward_error_to_the_failing_rid():
 
     out = engine._exec_per_request(batch)
 
-    # a and c ran despite b's forward raising
-    assert [e for e in engine.events if e[0] == "run"] == [("run", "a"), ("run", "c")]
+    # a and c ran despite b's forward raising, and only b's step was aborted
+    assert [e for e in engine.events if e[0] in ("run", "abort")] == [
+        ("run", "a"), ("abort", "b"), ("run", "c"),
+    ]
     assert out["a"] == {"token": 1}
     assert out["c"] == {"token": 1}
     assert out["b"] == {}
     # only b is failed
     assert set(batch.failed_requests) == {"b"}
     assert "RuntimeError" in batch.failed_requests["b"]
+
+
+def test_per_request_does_not_abort_a_step_that_committed():
+    """Collecting outputs runs after commit; a raise there fails the rid but
+    there is nothing left to abort."""
+    engine = _FakeExecEngine(collect_raise_on="b")
+    batch = _exec_batch(["a", "b"])
+
+    out = engine._exec_per_request(batch)
+
+    assert not any(kind == "abort" for kind, _ in engine.events)
+    assert set(batch.failed_requests) == {"b"}
+    assert out["a"] == {"token": 1} and out["b"] == {}

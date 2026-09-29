@@ -311,6 +311,15 @@ class StepRunner:
                 if self._nvtx:
                     range_pop()
 
+    def abort_step(self, step: SubmoduleStep) -> None:
+        """the failure-path counterpart of `commit`; one resource raising
+        doesn't stop the rest"""
+        for key in self._keys_for(step):
+            try:
+                self._resources[key].abort_step(step.get(key), step.ctx)
+            except Exception:
+                logger.exception("abort_step failed for resource %s", key)
+
     def publish(
         self, request_ids: list[str], node_name: str | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
