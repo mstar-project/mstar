@@ -861,8 +861,11 @@ class Cosmos3Model(Model):
         # Opt-in sound generation: video-only (image and action requests carry
         # no sound band), and only when the served checkpoint/config enable it.
         # Asking for audio out is the same opt-in
-        if mk.get("generate_sound") or mk.get("sound_gen") or "audio" in (output_modalities or []):
-            if num_frames <= 1 or action_mode is not None:
+        out = output_modalities or []
+        if mk.get("generate_sound") or mk.get("sound_gen") or "audio" in out:
+            # the sound walk is picked off a video output, so a multi-frame
+            # request without one would pack a sound band into an image walk
+            if num_frames <= 1 or action_mode is not None or "video" not in out:
                 raise ValueError(
                     "Cosmos3 sound generation is supported only for video requests "
                     "(num_frames > 1, no action mode)."

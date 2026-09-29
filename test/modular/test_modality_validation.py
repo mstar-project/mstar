@@ -218,5 +218,12 @@ def test_cosmos3_audio_out_means_the_sound_walk():
     model = cls(model_path_hf="unused", skip_weight_loading=True)
     params = model._resolve_gen_params({"num_frames": 17}, ["text"], ["video", "audio"])
     assert params["generate_sound"] is True
-    with pytest.raises(ValueError, match="sound"):
-        model._resolve_gen_params({}, ["text"], ["audio"])
+    for mk, out in (
+        ({}, ["audio"]),
+        # multi-frame but no video out: the walk would be image_gen
+        ({"num_frames": 17}, ["audio"]),
+        ({"num_frames": 17}, ["image", "audio"]),
+        ({"num_frames": 17, "generate_sound": True}, ["image"]),
+    ):
+        with pytest.raises(ValueError, match="sound"):
+            model._resolve_gen_params(mk, ["text"], out)
