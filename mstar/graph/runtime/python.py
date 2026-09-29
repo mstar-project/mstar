@@ -1465,9 +1465,16 @@ class PythonGraphRuntime(GraphRuntime):
         self._tensor_manager.refresh_shm_placement(
             info.pending_persist_signals
         )
+        # A loop can persist a name once per iteration before this goes out, so
+        # keep all of them; one output routed twice repeats its uuids.
         persist_signals: dict[str, list[TensorPointerInfo]] = {}
+        seen: set[tuple[str, int]] = set()
         for edge in info.pending_persist_signals:
-            persist_signals[edge.name] = edge.tensor_info
+            infos = persist_signals.setdefault(edge.name, [])
+            for i in edge.tensor_info:
+                if (edge.name, i.uuid) not in seen:
+                    seen.add((edge.name, i.uuid))
+                    infos.append(i)
         info.pending_persist_signals = []
         new_token_counts = info.pending_new_token_counts
         info.pending_new_token_counts = {}

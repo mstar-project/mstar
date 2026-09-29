@@ -122,6 +122,24 @@ impl PendingOutputs {
         )
     }
 
+    /// Every uuid of a signal, in order and deduped, matching Python: a loop
+    /// can persist a name once per iteration before the next frame goes out.
+    pub fn add_persist(&mut self, sig: Sym, uuids: Vec<u64>) {
+        let i = match self.persist.iter().position(|(s, _)| *s == sig) {
+            Some(i) => i,
+            None => {
+                self.persist.push((sig, Vec::with_capacity(uuids.len())));
+                self.persist.len() - 1
+            }
+        };
+        let v = &mut self.persist[i].1;
+        for u in uuids {
+            if !v.contains(&u) {
+                v.push(u);
+            }
+        }
+    }
+
     /// Accumulate, matching Python: a repeated signal's count adds up, and a
     /// repeated loop index overwrites.
     pub fn add_new_tokens(&mut self, counts: &[(String, i64)]) {
@@ -267,6 +285,15 @@ mod tests {
     fn set_walk_on_an_unknown_partition_is_a_no_op() {
         let mut info = RequestInfo::default();
         assert!(!info.set_walk(7, 100, || unreachable!("must not derive")));
+    }
+
+    #[test]
+    fn add_persist_keeps_every_uuid_of_a_signal_once_in_order() {
+        let mut p = PendingOutputs::default();
+        p.add_persist(1, vec![10, 10]);
+        p.add_persist(2, vec![20]);
+        p.add_persist(1, vec![11, 10]);
+        assert_eq!(p.persist, vec![(1, vec![10, 11]), (2, vec![20])]);
     }
 
     #[test]

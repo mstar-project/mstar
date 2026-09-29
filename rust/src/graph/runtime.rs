@@ -2927,7 +2927,7 @@ impl GraphRuntime {
             for (rid, signal, uuids) in plan.persist {
                 let sig = self.interner.intern(&signal);
                 if let Some(info) = self.requests[rid as usize].as_mut() {
-                    info.pending.persist.push((sig, uuids));
+                    info.pending.add_persist(sig, uuids);
                 }
             }
             for (rid, counts) in &new_token_counts {
