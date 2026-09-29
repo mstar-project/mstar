@@ -106,6 +106,8 @@ async def _stream(api, model_name, request_id, sample_rate, parser=None):
     async for c in api.iter_result_chunks(request_id):
         if c.modality == "text":
             text = c.data.decode("utf-8", "replace")
+            if not text:
+                continue  # held-back detokenizer step; nothing to stream yet
             if parser is None:
                 yield chunk({"content": text})
             else:

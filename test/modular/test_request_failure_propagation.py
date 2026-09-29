@@ -350,8 +350,11 @@ def test_text_output_holds_back_incomplete_utf8_then_emits_full_char():
     wt = _preprocess_thread(_TableTextModel(table))
     wt.tensor_uuid_to_metadata_per_request = {}
 
+    # The held-back step still yields a chunk (empty data): the API server counts
+    # one chunk per result tensor, so a skipped chunk would leave the request
+    # looking unfinished until the delivery TTL fails it.
     _feed_tensor(wt, "r1", "u1", [1])
-    assert wt.out_queue.qsize() == 0
+    assert wt.out_queue.get_nowait().data == b""
 
     _feed_tensor(wt, "r1", "u2", [2])
     assert wt.out_queue.get_nowait().data == b"e"
@@ -439,7 +442,21 @@ def test_text_output_splits_multibyte_char_across_window_boundary():
     chunks = []
     for i, byte in enumerate(original.encode("utf-8")):
         _feed_tensor(wt, "r1", f"u{i}", [byte])
-        chunks.append(wt.out_queue.get_nowait().data if not wt.out_queue.empty() else None)
+        chunks.append(wt.out_queue.get_nowait().data)
 
-    assert chunks == [b"A", b"B", b"C", b"D", b"E", b"F", None, None, None, b"\xf0\x9f\x9a\x80"]
-    assert b"".join(c for c in chunks if c is not None).decode("utf-8") == original
+    assert chunks == [b"A", b"B", b"C", b"D", b"E", b"F", b"", b"", b"", b"\xf0\x9f\x9a\x80"]
+    assert b"".join(chunks).decode("utf-8") == original
+
+
+def test_text_output_eos_only_tail_still_yields_a_chunk():
+    """A final tensor that decodes to nothing new (the model's postprocess drops
+    eos ids) must still produce a chunk, or the request never drains."""
+    table = {(): "", (7,): "ok", (7, 99): "ok"}
+    wt = _preprocess_thread(_TableTextModel(table))
+    wt.tensor_uuid_to_metadata_per_request = {}
+
+    _feed_tensor(wt, "r1", "u1", [7])
+    assert wt.out_queue.get_nowait().data == b"ok"
+
+    _feed_tensor(wt, "r1", "u2", [99])
+    assert wt.out_queue.get_nowait().data == b""

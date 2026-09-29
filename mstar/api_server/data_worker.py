@@ -599,14 +599,17 @@ class PreprocessWorkerThread:
                                 "num_channels": self.model.get_output_audio_channels("audio"),
                             }
 
-                        # Text can legitimately have nothing new yet (held back pending a full codepoint).
-                        if modality != "text" or emit:
-                            self.out_queue.put(ResultChunk(
-                                request_id=request_id,
-                                modality=modality,
-                                data=emit,
-                                metadata=chunk_metadata,
-                            ))
+                        # Text can legitimately have nothing new yet (held back pending a
+                        # full codepoint, or an eos-only tail). The chunk still goes out:
+                        # the API server's per_request_reading_tensors accounting is one
+                        # decrement per chunk, so a skipped chunk leaves the request
+                        # looking like it has a read outstanding until the TTL fails it.
+                        self.out_queue.put(ResultChunk(
+                            request_id=request_id,
+                            modality=modality,
+                            data=emit,
+                            metadata=chunk_metadata,
+                        ))
                     except Exception as exc:  # noqa: BLE001 — must reach the client
                         self._fail_request(
                             request_id, exc, f"{modality} output postprocessing",
