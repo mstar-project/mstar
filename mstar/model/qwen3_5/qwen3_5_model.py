@@ -737,6 +737,10 @@ class Qwen3_5DenseModel(Model):
         )
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
+        if (tp_group is not None and tp_group.world_size > 1
+                and model.model._fused_residual):
+            # collective over the TP group; every rank builds the LLM here
+            tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
         return LLMSubmodule(model, self.config, self.vision_config)
 

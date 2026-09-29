@@ -19,6 +19,8 @@ delta net's are its own (see ``GatedDeltaNet``).
 """
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -274,6 +276,19 @@ class Qwen3_5LanguageModel(nn.Module):
             attr: self._cursor_attr.index(attr) for attr in set(self._cursor_attr)
         }
 
+        # Carry the residual stream beside the hidden states instead of adding
+        # it at the end of each block, so every add lands in the norm that
+        # follows it: one fused add+norm per block (and, under TP, one fused
+        # all-reduce+add+norm kernel in place of NCCL + add + norm). The
+        # row-parallel outputs therefore hand back partial sums.
+        self._fused_residual = os.getenv("MSTAR_QWEN35_FUSED_ADD_NORM", "1") != "0"
+        if self._fused_residual:
+            for layer in self.layers:
+                mixer = layer.self_attn
+                out = mixer.o_proj if hasattr(mixer, "o_proj") else mixer.out_proj
+                out.reduce_results = False
+                layer.mlp.down_proj.reduce_results = False
+
     def build_cos_sin(
         self, position_ids_3d: torch.Tensor, dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -293,12 +308,39 @@ class Qwen3_5LanguageModel(nn.Module):
         # the label once per resource kind, advance the index per layer.
         for attr, idx in self._bind_through.items():
             getattr(self.layers[idx].self_attn, attr).bind_step(label)
+        if self._fused_residual:
+            return self._forward_fused_residual(query_sequence)
         for i, layer in enumerate(self.layers):
             getattr(layer.self_attn, self._cursor_attr[i]).set_layer_idx(
                 self._resource_idx[i]
             )
             query_sequence = layer(hidden_states=query_sequence)
         return self.norm(query_sequence)
+
+    def _forward_fused_residual(self, hidden: torch.Tensor) -> torch.Tensor:
+        """``DecoderLayer.forward`` with each residual add deferred into the
+        next norm. ``hidden`` coming out of a mixer or MLP is a partial sum
+        under TP; the norm's ``comm_group`` reduces it."""
+        cg = self.comm_group if self.comm_group.world_size > 1 else None
+        residual = None
+        for i, layer in enumerate(self.layers):
+            getattr(layer.self_attn, self._cursor_attr[i]).set_layer_idx(
+                self._resource_idx[i]
+            )
+            if residual is None:
+                residual = hidden
+                h = layer.input_layernorm(hidden)
+            else:
+                h, residual = layer.input_layernorm.forward_residual(
+                    hidden, residual, cg,
+                )
+            h = layer.self_attn(h)
+            h, residual = layer.post_attention_layernorm.forward_residual(
+                h, residual, cg,
+            )
+            hidden = layer.mlp(h)
+        normed, _ = self.norm.forward_residual(hidden, residual, cg)
+        return normed
 
 
 class Qwen3_5ForCausalLM(nn.Module):

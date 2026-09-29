@@ -58,6 +58,30 @@ class RMSNorm(nn.Module):
         out = run_rms_norm(flat, self.weight, eps=self.variance_epsilon)
         return out.reshape(orig_shape)
 
+    def forward_residual(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor,
+        comm_group=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``r = hidden_states + residual``; returns ``(norm(r), r)``.
+
+        The add and the norm stay in one graph, so inductor fuses them into
+        one reduction instead of folding the add into the producing GEMM as an
+        ``addmm`` (which costs a copy of ``residual`` into the GEMM's output).
+        Under tensor parallelism ``hidden_states`` is a row-parallel partial
+        sum and ``comm_group`` reduces it in the same fused kernel.
+        """
+        if comm_group is not None and comm_group.world_size > 1:
+            orig_shape = hidden_states.shape
+            normed, r = comm_group.allreduce_add_rmsnorm(
+                hidden_states.reshape(-1, orig_shape[-1]),
+                residual.reshape(-1, orig_shape[-1]),
+                self.weight, self.variance_epsilon,
+                weight_bias=1.0 if self.gemma_mode else 0.0,
+            )
+            return normed.reshape(orig_shape), r.reshape(orig_shape)
+        r = hidden_states + residual
+        return self(r), r
+
     def extra_repr(self) -> str:
         return f"{self.hidden_size}, eps={self.variance_epsilon}, gemma_mode={self.gemma_mode}"
 
