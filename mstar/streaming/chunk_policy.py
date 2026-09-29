@@ -184,17 +184,21 @@ class RampChunkPolicy(ChunkPolicy):
         self._growth = growth
         self._max_chunk = max_chunk
         self._continue_after_done = continue_after_done
-        self._chunks_read = 0
+        # Running size, clamped as it grows; a pow of the chunk count overflows on long streams.
+        self._size = float(chunk_size)
 
     def register_chunk(self, chunk_size: int):
+        # The first chunk only releases the chunk_size one; grow after each later chunk.
+        if self.first_chunk_read and (self._max_chunk is None or self._size < self._max_chunk):
+            self._size *= self._growth
+            if self._max_chunk is not None:
+                self._size = min(self._size, float(self._max_chunk))
         super().register_chunk(chunk_size)
-        self._chunks_read += 1
 
     def _current(self) -> int:
         if not self.first_chunk_read:
             return self._first_chunk
-        size = int(round(self._chunk_size * self._growth ** (self._chunks_read - 1)))
-        return min(size, self._max_chunk) if self._max_chunk is not None else size
+        return int(round(self._size))
 
     def is_ready(self, buffer_len: int) -> bool:
         return buffer_len >= self._current()

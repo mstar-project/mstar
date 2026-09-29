@@ -161,3 +161,12 @@ def test_ramp_policy_geometric_growth_is_capped():
         RampChunkPolicy(first_chunk=2, chunk_size=3, growth=0.5)
     with pytest.raises(ValueError):
         RampChunkPolicy(first_chunk=2, chunk_size=3, max_chunk=2)
+
+
+def test_ramp_policy_long_stream_stays_at_cap():
+    """Thousands of chunks at growth 2 stay at the cap; a pow of the chunk count overflowed."""
+    policy = RampChunkPolicy(first_chunk=2, chunk_size=3, growth=2.0, max_chunk=10)
+    for _ in range(5000):
+        policy.register_chunk(policy.next_chunk_size(0))
+    assert policy.next_chunk_size(10) == 10
+    assert policy.is_ready(10) and not policy.is_ready(9)
