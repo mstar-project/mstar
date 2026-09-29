@@ -68,6 +68,17 @@ class AttentionManager(AttentionResource):
             _warn_dense_fallback(reason)
             backend = AttnBackend.FLASHINFER
 
+        if backend == AttnBackend.FLASHINFER_MLA:
+            from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
+
+            return FlashInferMLAManager(
+                kv_cache=spec.config.kv_cache,
+                device=info.device,
+                dtype=info.kv_dtype,
+                kv_config=kv_config,
+                backend=spec.config.flashinfer_backend,
+                sm_scale=spec.config.sm_scale,
+            )
         if backend == AttnBackend.FLASHINFER:
             from mstar.engine.resources.attn.flashinfer import FlashInferManager
 

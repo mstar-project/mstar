@@ -93,6 +93,20 @@ class PagedIndptrs(NamedTuple):
         )
 
 
+def context_only_views(
+    views: list[SequenceView], query_spans: list[int], page_size: int,
+) -> list[SequenceView]:
+    """The views of a step's streams without the tokens the step appends: ``length`` shrinks by
+    ``to_compute`` (the pages beyond it dropped) and ``to_compute`` becomes the row's query count.
+    For attention over the stored context alone (``AttentionStep.context_only``)."""
+    out = []
+    for view, queries in zip(views, query_spans, strict=True):
+        length = view.length - view.to_compute
+        pages = -(-(view.start + length) // page_size) if length > 0 else 0
+        out.append(view._replace(page_idxs=view.page_idxs[:pages], length=length, to_compute=queries))
+    return out
+
+
 def build_paged_indptrs(
     segments: list[SequenceView],
     page_size: int,

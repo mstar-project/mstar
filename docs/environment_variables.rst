@@ -282,3 +282,11 @@ Worker scheduling
        ``remove_request``, check the KV page bookkeeping (free list, owner
        counts, seals) against the streams holding the pages. Walks every
        live stream; tests and debugging only.
+   * - ``MSTAR_MLA_DECODE_BACKEND``
+     - ``flashinfer``
+     - Which kernel the MLA attention resource runs for plain decode plans (one causal query per
+       row): ``flashinfer`` (FlashInfer's Hopper MLA kernel) or ``flashmla`` (DeepSeek's FlashMLA,
+       where it is built for the GPU: sm90, latent 512 + rope 64). On an H100 the two cost about the
+       same per call (15 us at one row, 26 against 31 us at 32 rows, 48 against 50 at 64), so
+       FlashMLA is an option, not the default. Prefill, verify blocks and context-only reads stay on
+       FlashInfer either way.
