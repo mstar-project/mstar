@@ -186,6 +186,12 @@ def _pin(ptr: int, nbytes: int) -> bool:
 class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     """Tensor transport via the Rust shared-memory arena (``mstar_rust``)."""
 
+    # Staging writes the segment and offset onto the descriptor the store
+    # holds, which routing may already have copied -- so every outgoing edge
+    # has to be refreshed from the store before it is sent. See
+    # ``TensorCommunicationManager.refresh_shm_placement``.
+    stamps_shm_placement = True
+
     def __init__(
         self,
         my_entity_id: str,

@@ -179,10 +179,11 @@ class ReadySignals:
         if self.is_ready:
             return
         self.is_ready = self.input_names.issubset(self.ready_names)
-        # ready once the only missing inputs are streaming ones (which arrive incrementally)
+        # Ready once the only missing inputs are streaming ones, which arrive
+        # incrementally
         self.is_ready_for_streaming = self.is_ready or \
             self.is_ready_for_streaming or (
-            self.input_names.issuperset(self.ready_names.union(self.streaming_inputs))
+            self.input_names.issubset(self.ready_names.union(self.streaming_inputs))
         )
 
     def clear(self):
@@ -217,7 +218,7 @@ class ReadySignals:
             return None
         self.ready_names.discard(edge_name)
         self.is_ready = self.input_names.issubset(self.ready_names)
-        self.is_ready_for_streaming = self.is_ready or self.input_names.issuperset(
+        self.is_ready_for_streaming = self.is_ready or self.input_names.issubset(
             self.ready_names | self.streaming_inputs
         )
         return edge
@@ -536,18 +537,27 @@ class Loop(GraphSection):
             # register_ingested_input before termination — cleaning those up is deferred
             # (they're harmless since reset_for_iter won't be called after the loop is done).
             self.inner_registry.clear()
-            self._managing_registry.mark_entity_complete(self.name)
             for edge in self.outputs:
                 edge.tensor_info = self._cached_outputs.get(edge.name, [])
             for edge in self.accumulated_outputs:
                 edge.tensor_info = self._accumulated_cache.get(edge.name, [])
+            # Cascade only once our tensor_info is populated -- the parent
+            # caches these edges on the way through -- and keep what it hands
+            # back. Both matter only for NESTED loops: cascading first makes a
+            # parent cache still-empty tensor_info, and discarding the result
+            # means a parent that finishes in this same event never routes its
+            # own outputs. Our declared outputs come back inside ``outer``
+            # (the parent reads them off ``managed_entities``) already filtered
+            # by its loop-back, so they are not added again here; the
+            # accumulated ones are disjoint by name and ride separately.
+            outer = self._managing_registry.mark_entity_complete(self.name)
 
             # Don't dereference, becaue the tensors will be used downstream
             self._cached_outputs.clear()
             self._accumulated_cache.clear()
             return NodeCompletionOutput(
-                output_edges=self.outputs + self.accumulated_outputs,
-                filtered_signals=self._loop_back_inputs
+                output_edges=list(outer.output_edges) + self.accumulated_outputs,
+                filtered_signals=self._loop_back_inputs | outer.filtered_signals,
             )
         else:
             self._advance_one_iter()
@@ -772,6 +782,15 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         entity = self.managed_entities.get(entity_name)
         if isinstance(entity, GraphNode):
             entity.ready_signals.clear()
+            # The registry's set has to follow the node-level clear down.
+            # Left alone, the name lingers after its inputs are gone and the
+            # node reads as streaming-ready with nothing ingested. A node
+            # whose inputs are ALL streaming is seeded into the set, so it
+            # goes back rather than being dropped.
+            if entity_name in self.only_streaming_inputs:
+                self.ready_for_streaming.add(entity_name)
+            else:
+                self.ready_for_streaming.discard(entity_name)
         return output
 
     def reset_for_iter(self):
@@ -792,4 +811,7 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         self.ready_names.clear()
         self.ready_for_streaming = set(self.only_streaming_inputs)
         self.ready_next_iter.clear()
-        self.ready_for_streaming = set(self.only_streaming_inputs)
+        # The NEXT-iter set, not `ready_for_streaming` a second time: the
+        # duplicate assignment left ready_streaming_next_iter holding names
+        # from before the clear.
+        self.ready_streaming_next_iter = set(self.only_streaming_inputs)
