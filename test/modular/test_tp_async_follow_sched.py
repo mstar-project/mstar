@@ -19,10 +19,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_OK  # noqa: E402
 from mstar.graph.base import GraphNode  # noqa: E402
-from mstar.graph.runtime.base import PopRidsOutput
+from mstar.graph.runtime.base import (
+    ColumnarEdgeSpecs,
+    PopRidsOutput,
+)
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ScheduleTPNode  # noqa: E402
 from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
+
+
+def _edge_block(rids) -> ColumnarEdgeSpecs:
+    """One ready input per rid, so the split / drop paths that re-slice the
+    columns have something to re-slice."""
+    block = ColumnarEdgeSpecs.empty()
+    for i, rid in enumerate(rids):
+        block.add(rid, "token", [i + 1], False)
+    return block
 
 NODE = "LLM"
 WALK = "decode"
@@ -95,7 +107,7 @@ class _FakeRuntime:
         ]
         return PopRidsOutput(
             wg_ids=ParallelList(rids, ["wg0"] * len(rids)),
-            input_edges=[], input_edges_per_rid=[0] * len(rids),
+            input_edges=_edge_block(rids),
         )
 
     def get_nodes(self, node_name, rids, wg_ids):
@@ -157,7 +169,7 @@ def test_pop_ready_rids_pops_exactly_the_named_set():
     wg, input_edges, _output_signals = popped
     assert list(wg) == ["r1", "r2"]  # wire order preserved
     assert wg == {"r1": "wg0", "r2": "wg0"}
-    assert set(input_edges) == {"r1", "r2"}
+    assert set(input_edges.rids) == {"r1", "r2"}
     # r0 untouched, r1/r2 consumed
     assert NODE in queue.per_request_queues["r0"].ready_node_names
     assert NODE not in queue.per_request_queues["r1"].ready_node_names
@@ -191,7 +203,12 @@ def test_pop_ready_rids_empty_set_is_a_valid_no_op():
     sched = _sched()
     manager = _FakeRequestStateManager(_FakeQueue(["r0"]))
     sched.runtime = manager.runtime
-    assert sched.pop_ready_rids(manager, NODE, WALK, []) == ({}, {}, ())
+    popped = sched.pop_ready_rids(manager, NODE, WALK, [])
+    # edge_specs is a columnar block now, so it is compared by emptiness
+    # rather than against a literal.
+    assert popped.wg_ids == {}
+    assert not popped.edge_specs
+    assert popped.output_signals == ()
     assert sched.batch_number == 0
 
 

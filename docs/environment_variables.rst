@@ -23,7 +23,20 @@ Communication
        ``1``: the Rust communicator, raising if the extension is missing.
        ``0``: always pyzmq. The two transports are wire-compatible, so
        this can be set per-process while the rest of the mesh stays on
-       pyzmq.
+       pyzmq. Under ``MSTAR_RUST_GRAPH=AUTO``, ``0`` also keeps that
+       worker's graph runtime on Python -- the Rust one cannot share a
+       pyzmq transport.
+   * - ``MSTAR_RUST_GRAPH``
+     - ``AUTO``
+     - Which graph runtime a worker builds (see
+       :func:`mstar.graph.runtime.utils.resolve_graph_runtime_type`).
+       ``AUTO``: Rust where the vendored ``rust/`` extension imports *and*
+       the Rust transport is in use, Python otherwise. ``1``: the Rust
+       runtime, failing at startup if the transport or the tensor bookkeeper
+       is a Python one -- it holds a share of both, so there is no degraded
+       mode to fall back to. ``0``: always the Python runtime. Resolved once
+       per process, because it also selects the tensor bookkeeper the
+       runtime and the tensor store must share.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a

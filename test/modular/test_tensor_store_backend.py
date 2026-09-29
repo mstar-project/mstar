@@ -1,8 +1,10 @@
 """Which TensorBookkeeping a TensorStore gets, and that the package imports
 without the Rust extension.
 
-An unguarded extension import is a silent failure: it makes the whole package
-unimportable wherever the extension is not built.
+Both are silent failures: the wrong backend makes MSTAR_RUST_GRAPH=1 refuse
+to start (the runtime holds a SHARE of this object, so the two must match),
+and an unguarded extension import makes the whole package unimportable
+wherever it is not built.
 """
 import importlib
 import sys
@@ -14,10 +16,44 @@ import pytest
 from mstar.communication.tensor_store import TensorStore
 
 
-def test_the_default_backend_is_python():
-    """The Rust bookkeeper copies each descriptor in and rebuilds it on the way
-    out, which only pays off for a Rust-side caller holding the same state;
-    until there is one, nothing selects it by default."""
+def test_the_default_backend_follows_the_resolved_runtime(monkeypatch):
+    """The two have to agree: the Rust runtime takes a SHARE of this object,
+    so an unset flag resolving to Rust in one place and Python in the other is
+    a worker that refuses to start."""
+    pytest.importorskip("mstar_rust", reason="extension not built")
+    monkeypatch.delenv("MSTAR_RUST_GRAPH", raising=False)
+    # AUTO declines Rust against a pinned pyzmq transport, so an ambient
+    # MSTAR_RUST_ZMQ would decide this one.
+    monkeypatch.delenv("MSTAR_RUST_ZMQ", raising=False)
+    assert type(TensorStore().bookkeeping).__name__ == "RustTensorBookkeeping"
+
+
+def test_the_rust_graph_flag_selects_the_rust_backend(monkeypatch):
+    pytest.importorskip("mstar_rust", reason="extension not built")
+    monkeypatch.setenv("MSTAR_RUST_GRAPH", "1")
+    bk = TensorStore().bookkeeping
+    assert type(bk).__name__ == "RustTensorBookkeeping"
+    # The worker's guard keys off this: the runtime takes a share of it.
+    assert hasattr(bk, "_rust")
+
+
+def test_auto_takes_the_backend_down_with_the_runtime(monkeypatch):
+    """AUTO declines Rust against a pinned pyzmq transport, and the bookkeeper
+    has to follow it down or the worker refuses to start on the mismatch."""
+    pytest.importorskip("mstar_rust", reason="extension not built")
+    monkeypatch.setenv("MSTAR_RUST_GRAPH", "AUTO")
+    monkeypatch.setenv("MSTAR_RUST_ZMQ", "0")
+    assert type(TensorStore().bookkeeping).__name__ == "PythonTensorBookkeeping"
+    monkeypatch.setenv("MSTAR_RUST_ZMQ", "1")
+    assert type(TensorStore().bookkeeping).__name__ == "RustTensorBookkeeping"
+
+
+def test_an_unrelated_flag_does_not_select_it(monkeypatch):
+    # It follows MSTAR_RUST_GRAPH and nothing else, so a 0 stays 0 no matter
+    # which other Rust-flavoured flag is set.
+    monkeypatch.setenv("MSTAR_RUST_GRAPH", "0")
+    monkeypatch.setenv("MSTAR_SHM_ARENA", "1")
+    monkeypatch.setenv("MSTAR_RUST_ZMQ", "1")
     assert type(TensorStore().bookkeeping).__name__ == "PythonTensorBookkeeping"
 
 
