@@ -138,6 +138,8 @@ class RustFrontendBridge:
                     "metadata": {"status": status},
                 })
             return
+        # past intake: a streaming response waits for this before its headers
+        self._send({"t": "ok", "rid": rid})
         asyncio.get_running_loop().create_task(self._relay(rid))
 
     async def _relay(self, rid: str) -> None:

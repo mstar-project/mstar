@@ -39,6 +39,9 @@ pub struct ResultChunk {
 /// request's serving task.
 #[derive(Debug)]
 pub enum StreamItem {
+    /// The backend took the request past intake; its output follows. Only a
+    /// streaming response waits on it (see `admitted_result_stream`).
+    Accepted,
     Chunk(ResultChunk),
     /// The backend failed this request (worker exception, bad input);
     /// terminal — the route is removed. `status` is the HTTP status the
@@ -150,6 +153,7 @@ impl Bridge {
                     })),
                     false,
                 ),
+                "ok" => (Some(StreamItem::Accepted), false),
                 // Legacy out-of-band error (the bridge relay caught an exception
                 // and sent `t="err"`); no status carried, default to 500.
                 "err" => (

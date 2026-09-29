@@ -189,6 +189,35 @@ def test_intake_rejection_keeps_its_status(stack):
     assert err["type"] == "invalid_request_error"
 
 
+def test_streaming_intake_rejection_keeps_its_status(stack):
+    """A streaming response is a 200 once its headers are out, so the frontend
+    waits for the backend's intake ack first; a rejection keeps its 400."""
+    import urllib.parse
+
+    port, _stub, _bridge, _proc = stack
+    chat = {"model": "qwen3_omni", "stream": True,
+            "messages": [{"role": "user", "content": "hologram"}]}
+    code, body = _post_raw(port, "/v1/chat/completions", json.dumps(chat).encode())
+    assert code == 400 and "does not support" in body["error"]["message"]
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate",
+        data=urllib.parse.urlencode({"text": "hologram", "streaming": "true"}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=15)
+    assert e.value.code == 400
+    assert "does not support" in json.loads(e.value.read())["detail"]
+
+    # an accepted request still streams
+    chat["messages"][0]["content"] = "hi"
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions",
+        data=json.dumps(chat).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        assert r.status == 200 and b"[DONE]" in r.read()
+
+
 def test_health_goes_red_when_the_bridge_dies(stack):
     port, _stub, bridge, _proc = stack
     bridge.stop()

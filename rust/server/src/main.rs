@@ -54,7 +54,7 @@ use protocol::{
     ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest,
     VideoGenerationRequest,
 };
-use serving::{collect, now, result_stream, rid, AppState, Out};
+use serving::{admitted_result_stream, collect, now, result_stream, rid, AppState, Out, OutStream};
 
 #[tokio::main]
 async fn main() {
@@ -400,7 +400,11 @@ async fn chat_completions(
     let request_id = rid("chatcmpl");
 
     if req.stream.unwrap_or(false) {
-        return chat_sse(st, args, request_id).into_response();
+        let base = match admitted_result_stream(&st, &args, &request_id).await {
+            Ok(base) => base,
+            Err((status, msg)) => return error(status, &msg, error_type(status)),
+        };
+        return chat_sse(st, base, request_id).into_response();
     }
     match collect(result_stream(&st, &args, &request_id, false)).await {
         Ok(chunks) => Json(build_chat_response(
@@ -414,12 +418,11 @@ async fn chat_completions(
 /// SSE `chat.completion.chunk`s: role delta, per-chunk deltas, finish, `[DONE]`.
 fn chat_sse(
     st: AppState,
-    args: SubmitArgs,
+    base: OutStream,
     request_id: String,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     let created = now();
     let model = st.model_name.clone();
-    let base = result_stream(&st, &args, &request_id, true);
 
     let head = {
         let s = chunk_json(&request_id, created, &model, json!({"role": "assistant"}), None);
@@ -580,7 +583,10 @@ async fn audio_speech(
         // A backend error ends the byte stream (the connection closes
         // mid-WAV, matching mstar's generator exception).
         let header = media::wav_stream_header(st.sample_rate, 1);
-        let base = result_stream(&st, &args, &request_id, true);
+        let base = match admitted_result_stream(&st, &args, &request_id).await {
+            Ok(base) => base,
+            Err((status, msg)) => return error(status, &msg, error_type(status)),
+        };
         let audio_only = base.filter_map(|item| async move {
             match item {
                 Out::Chunk(c) if c.modality == "audio" && !c.data.is_empty() => {
@@ -1010,7 +1016,10 @@ async fn generate_finish(
 
     schedule_upload_cleanup(&st.upload_dir, &args);
     if streaming {
-        let base = result_stream(&st, &args, &request_id, true);
+        let base = match admitted_result_stream(&st, &args, &request_id).await {
+            Ok(base) => base,
+            Err((status, msg)) => return detail_error(status, &msg),
+        };
         let body = base.map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),
