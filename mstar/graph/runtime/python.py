@@ -1259,10 +1259,12 @@ class PythonGraphRuntime(GraphRuntime):
             )
             routing_per_rid[rid] = routing
 
+            # Even when this batch produced none of them: an accumulated output
+            # carries earlier iterations' tensors.
+            for edge in routing.persist:
+                for info in edge.tensor_info:
+                    self._tensor_manager.set_persist(info.uuid, persist=True)
             if owned:
-                for edge in routing.persist:
-                    for info in edge.tensor_info:
-                        self._tensor_manager.set_persist(info.uuid, persist=True)
                 # persist is deliberately absent: those tensors are held alive
                 # by the persist marker, and counting them here would
                 # double-count a signal whose destination is EMPTY_DESTINATION
