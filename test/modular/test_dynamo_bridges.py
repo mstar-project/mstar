@@ -243,7 +243,7 @@ def test_realtime_full_turn(tmp_path):
     server = _FakeRealtimeServer([
         _chunk("text", b"hello"),
         _chunk("audio", b"\x01\x02\x03\x04"),
-        _chunk("text", b"<|im_end|>"),  # bare end token: stripped, no delta
+        _chunk("text", b""),  # the end token decodes to nothing: no delta
     ], tmp_path)
     out = _run_connection(server, [
         {"type": "session.update", "session": {
