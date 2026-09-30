@@ -851,8 +851,7 @@ class KVManager(AttentionResource):
 
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned and not ctx.is_preplan:
-            # a lease taken since the preplan converts only in a full admit
-            if self._preplan_key == self._plan_key(step, ctx) and not self._leased(step):
+            if self._preplan_key == self._plan_key(step, ctx):
                 # pages were already reserved by the preplan pass
                 return ADMIT_OK
             # a different step arrived first (see `plan`): drop the staged
@@ -1825,13 +1824,6 @@ class KVManager(AttentionResource):
         from mstar.engine.cuda_graph_runner import PIECEWISE_WALK
 
         return ctx.graph_walk == PIECEWISE_WALK
-
-    def _leased(self, step: KVStep) -> bool:
-        for segment in step.segments:
-            stream = self._streams.get(segment.request_id, {}).get(segment.label)
-            if stream is not None and stream.lease is not None:
-                return True
-        return False
 
     def _capacity(self) -> int:
         """Pages one request could have with nothing else admitted: all but the
