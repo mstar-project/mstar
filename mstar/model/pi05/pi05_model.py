@@ -516,6 +516,9 @@ class Pi05Model(Model):
                     ]
                 }
             return {}
+        # the LLM waits on the vision tower's img_emb, so no image would hang
+        if not (kwargs.get("tensors") or {}).get("image_inputs"):
+            raise ValueError("Pi0.5 requires at least one camera image")
 
         cleaned = (prompt or "").strip().replace("_", " ").replace("\n", " ")
 

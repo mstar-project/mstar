@@ -12,6 +12,7 @@ sys.path.insert(0, ".")
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
@@ -265,6 +266,9 @@ class _StubTokenizer:
         return torch.tensor([0], dtype=torch.long)
 
 
+_ONE_IMAGE = {"image_inputs": [torch.zeros(3, 224, 224)]}
+
+
 def test_pi05_process_prompt_formats_state_into_text():
     """Pi05Model.process_prompt should produce the openpi-style template
     ``"Task: <text>, State: <bin0> <bin1> ... <bin31>;\\nAction: "`` and
@@ -280,6 +284,7 @@ def test_pi05_process_prompt_formats_state_into_text():
         prompt="pick up the\nblock",
         input_modalities=["image", "text"],
         output_modalities=["action"],
+        tensors=_ONE_IMAGE,
         robot_state=state,
     )
 
@@ -302,11 +307,23 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
     model.tokenizer = stub
     result = model.process_prompt(
         prompt="hello world",
-        input_modalities=["text"],
+        input_modalities=["image", "text"],
         output_modalities=["action"],
+        tensors=_ONE_IMAGE,
     )
     assert "text_inputs" in result
     assert stub.last_prompt == "hello world"
+
+
+def test_pi05_process_prompt_without_an_image_fails():
+    # the LLM would wait on img_emb forever; a ValueError is a 400 instead
+    model = _make_model()
+    model.tokenizer = _StubTokenizer()
+    with pytest.raises(ValueError, match="camera image"):
+        model.process_prompt(
+            prompt="pick up the block", input_modalities=["text"],
+            output_modalities=["action"], tensors={},
+        )
 
 
 # ----------------------------------------------------------------------

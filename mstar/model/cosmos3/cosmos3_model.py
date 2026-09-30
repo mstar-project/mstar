@@ -537,7 +537,8 @@ class Cosmos3Model(Model):
         **kwargs,
     ) -> NameToTensorList:
         if prompt is None:
-            return {}
+            # every prefill walk waits on text_inputs, so this would hang
+            raise ValueError("Cosmos3 requires a text prompt")
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             return {
@@ -708,6 +709,9 @@ class Cosmos3Model(Model):
                     f"Unsupported Cosmos3 action_mode={mk.get('action_mode')!r}; "
                     f"expected one of {sorted(ACTION_MODES)}."
                 )
+            # an image output would run the image walk on an action prefill
+            if not {"action", "video"} & set(output_modalities or []):
+                raise ValueError("A Cosmos3 action_mode request needs an action or video output.")
 
         if action_mode is not None:
             # An action request predicts one action token per frame, so the

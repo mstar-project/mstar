@@ -270,6 +270,21 @@ def test_cosmos3_audio_out_means_the_sound_walk():
             model._resolve_gen_params(mk, ["text"], out)
 
 
+def test_cosmos3_fails_what_its_walks_cannot_serve():
+    cls = _model_cls("cosmos3")
+    model = cls(model_path_hf="unused", skip_weight_loading=True)
+    # every prefill walk waits on text_inputs
+    with pytest.raises(ValueError, match="text prompt"):
+        model.process_prompt(None, ["image"], ["video"], tensors={})
+    # an action prefill on the image walk
+    with pytest.raises(ValueError, match="action or video output"):
+        model._resolve_gen_params({"action_mode": "policy"}, ["text", "image"], ["image"])
+    mk = {"action_mode": "policy", "domain_name": "droid_lerobot",
+          "raw_action_dim": 10, "action_chunk_size": 16}  # the CLI hint's request
+    params = model._resolve_gen_params(mk, ["text", "image"], ["action"])
+    assert params["action_mode"] == "policy"
+
+
 @pytest.mark.parametrize("name", sorted(MODEL_REGISTRY))
 def test_every_default_output_is_one_the_model_supports(name):
     """A model with several outputs and no text must name its default."""
