@@ -571,9 +571,8 @@ class Worker:
         # tensor state now would race the GPU thread reading those tensors
         # / KV pages. Queue the remove and apply it once no in-flight step
         # references the rid (see _apply_pending_removes_safe_to_drop in
-        # the run loop). A queued committed TP-follow defers the same way:
-        # clear_rid drops the refcount but strands its ScheduleTPNode in the
-        # FIFO, blocking later follows; dropping it hangs the TP group.
+        # the run loop). So does a queued committed TP-follow: removing now
+        # strands its ScheduleTPNode in the FIFO and hangs the TP group.
         request_id = self._rid(body.request_id)
         if request_id is None:
             # Never admitted here, or already removed: no handle-keyed state to

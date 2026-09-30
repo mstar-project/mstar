@@ -88,9 +88,8 @@ pub fn result_stream(
     )
 }
 
-/// `result_stream` for a streaming response. Its headers commit it to a 200,
-/// so first wait until the backend accepts the request past intake, and hand
-/// back a rejection (an unsupported modality is a 400) as `(status, message)`.
+/// `result_stream`, but first waits for the backend's intake ack: the headers commit a 200.
+/// A rejection (an unsupported modality is a 400) comes back as `(status, message)`.
 pub async fn admitted_result_stream(
     state: &AppState,
     args: &SubmitArgs,

@@ -156,9 +156,8 @@ def _preprocess_video(
 class VJepa2Model(Model):
     """V-JEPA 2 model (encoder + optional predictor)."""
 
-    # Video in, predicted frames out. Actions/states arrive in model_kwargs,
-    # not as a modality. Text is tolerated, not read: the benchmark sends a
-    # prompt alongside the video.
+    # Video in, predicted frames out; actions/states come in model_kwargs.
+    # Text is tolerated, not read: the benchmark sends a prompt with the video.
     SUPPORTED_INPUT_MODALITIES = frozenset({"video", "text"})
     SUPPORTED_OUTPUT_MODALITIES = frozenset({"video"})
 
