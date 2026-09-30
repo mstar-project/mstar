@@ -5,6 +5,10 @@ run, but the graph still waits on its node: the conductor moves a request to
 its next walk only once every worker graph reports done. A rid left out of the
 step the way a vetoed one is would also be left out of routing, and the
 request would sit there until the client gave up.
+
+A text walk is keyed by its ids, whose positions are their count, so one
+placing positions of its own fails, probed or refused: its pages would be
+served later at positions they never had.
 """
 
 from __future__ import annotations
@@ -14,12 +18,18 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import pytest
 import torch
 
 from mstar.communication.tensors import StoredOutputs
-from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import StepContext
+from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.resources import StepContext, StepRunner
+from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, PrefixSpan
+from mstar.engine.resources.kv.keys import chain
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.graph.runtime.base import FreedTensors, RouteOutput
+from mstar.model.submodule_base import ARNodeInputs
 from mstar.worker.worker import PendingBatch, Worker
 
 RID = 7
@@ -125,3 +135,27 @@ def test_a_served_walk_is_routed_with_no_tensors():
         "completes and the request never reaches its next walk"
     )
     assert routed.num_tensors == [0], "a served walk routed tensors it never produced"
+
+
+@pytest.mark.parametrize("refused", [False, True], ids=["probed", "refused"])
+def test_a_keyed_text_walk_placing_its_own_positions_fails_probed_or_refused(monkeypatch, refused):
+    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda info, cache: None)
+    kv = KVManager(
+        cfg=KVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=16),
+        name="kv", joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.enable_prefix_cache(b"a root", {"main": (WALK, "decode")})
+    kv.ingest_request(RID, KVReqConfig(
+        prefix_keys={"main": chain([list(range(100))])}, prefix_layout={"main": [PrefixSpan(100, 100, WALK)]},
+    ))
+    engine = Engine.__new__(Engine)
+    engine._runner = StepRunner({"kv": kv}, node_resources={NODE: ["kv"]})
+    engine._keyed_walks = {NODE: {WALK}}
+    engine._prefix_model = "_Model"
+    inputs = ARNodeInputs(
+        input_ids=torch.arange(100), input_seq_len=100, custom_pos_ids=torch.arange(100), resource_step_info=refused,
+    )
+
+    with pytest.raises(AssertionError, match="the layout keys it by ids"):
+        engine._skip_cached_prefix(_batch(), RID, inputs)

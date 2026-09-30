@@ -213,6 +213,20 @@ def test_each_walk_the_cache_serves_moves_the_counter_by_its_advance_before_the_
     )
 
 
+def test_an_image_walk_placing_its_own_positions_is_answered():
+    node = _Node()
+    node.walk(TEXT_WALK, len(TEXT))
+
+    prefix = node.probe(IMAGE_WALK, IMAGE, custom_pos_ids={"main": torch.full((IMAGE,), len(TEXT))})
+
+    # a pin: before the cache read positions it answered this too, and the
+    # check that a text walk places none must not take that away
+    assert prefix.tokens == IMAGE, (
+        "an image walk, whose span places its block at one position, was refused "
+        "for placing positions of its own, so no Bagel image is ever served"
+    )
+
+
 def test_a_layout_reaches_the_kv_config_across_the_wire():
     config = KVReqConfig()
     config.apply_conductor_config(prefix_layout={"main": [[20, 20, TEXT_WALK, None], [30, 1, IMAGE_WALK, DIGEST]]})
