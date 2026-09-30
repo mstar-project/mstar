@@ -9,3 +9,4 @@ node_groups:
 resources:
   gdn_state:
     max_slots: 129
+    # state_dtype: bfloat16  # default: the checkpoint's mamba_ssm_dtype (float32)

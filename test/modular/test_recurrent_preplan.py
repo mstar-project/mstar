@@ -287,3 +287,21 @@ def test_state_dtype_override():
     for bad in ("float33", "nn", "Tensor"):
         with pytest.raises(ValueError, match="not a torch dtype"):
             pool_spec().apply_yaml_overrides(state_dtype=bad)
+
+
+@pytest.mark.parametrize("ckpt, k, v, want", [
+    ("float32", 128, 128, torch.float32),   # the released checkpoints
+    ("bfloat16", 128, 128, torch.bfloat16),
+    ("bfloat16", 64, 128, torch.float32),   # no bf16 decode kernel off K=V=128
+    ("float16", 128, 128, torch.float32),   # no fp16 decode kernel at all
+])
+def test_qwen3_5_state_dtype_follows_checkpoint(ckpt, k, v, want):
+    """The default is the checkpoint's ``mamba_ssm_dtype``, as in vLLM; bf16
+    is a yaml override (``gdn_state.state_dtype``), not the default."""
+    from types import SimpleNamespace
+
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = SimpleNamespace(config=SimpleNamespace(
+        mamba_ssm_dtype=ckpt, linear_key_head_dim=k, linear_value_head_dim=v))
+    assert Qwen3_5DenseModel._gdn_state_dtype(model) is want

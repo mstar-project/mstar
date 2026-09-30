@@ -171,18 +171,22 @@ class Qwen3_5DenseModel(Model):
     # -----------------------------------------------------------------------
 
     def _gdn_state_dtype(self) -> torch.dtype:
-        """bf16 where FlashInfer's fused decode kernel takes it, else fp32.
+        """The checkpoint's ``mamba_ssm_dtype`` (fp32 for the released ones),
+        as vLLM does; fp32 wherever the pool's decode kernels cannot take it.
 
-        That kernel is K=V=128 only, and falling off it costs both ways: the
-        state is read and written every step, so fp32 doubles the traffic, and
-        the fallback path L2-normalises q and k in eager ops rather than in the
-        kernel. Measured at bs=16 that was ~0.2ms a step in `norm`+`div` alone.
+        ``gdn_state.state_dtype: bfloat16`` in the yaml overrides this. bf16
+        halves the state traffic -- the state is read and written every step --
+        but only FlashInfer's fused bf16 decode kernel takes it, and that is
+        K=V=128 only.
         """
+        dtype = getattr(torch, self.config.mamba_ssm_dtype, None)
         head_dims_ok = (
             self.config.linear_key_head_dim == 128
             and self.config.linear_value_head_dim == 128
         )
-        return torch.bfloat16 if head_dims_ok else torch.float32
+        if dtype is torch.bfloat16 and head_dims_ok:
+            return torch.bfloat16
+        return torch.float32
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         num_kv_layers = len(self.config.full_layer_indices)
