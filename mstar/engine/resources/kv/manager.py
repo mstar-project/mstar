@@ -35,6 +35,7 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
     AdmitRuntimeError,
     AllocationFailed,
+    BucketKey,
     RequestOffloading,
     Segment,
     StepContext,
@@ -175,6 +176,9 @@ class CacheStream:
     lease: list[int] | None = None
     # set at conversion, cleared at `commit`, so a refused admit's re-probe answers the same
     converted: bool = False
+    # leading pages of `page_indices` the index lent this stream (a converted
+    # lease, a local match): held, but never taken from the free list
+    hits: int = 0
     offloaded: bool = False
     generation: int = 0
 
@@ -192,6 +196,7 @@ class CacheStream:
 
         if freed:
             self.page_indices.clear()
+            self.hits = 0
 
     def forget_chain(self):
         """Drop what the chain knows of this stream, for a run that starts over.
@@ -212,6 +217,14 @@ class ClaimedStream:
     stored_len: int
     position: int
     released: int
+
+
+@dataclass
+class Reservation:
+    """What an admitted request may take from the free list over its life."""
+    pages: int
+    # counted by the model; one guessed from the prompt's ids can overrun
+    exact: bool
 
 
 LabelToStream = dict[str, CacheStream]
@@ -294,6 +307,7 @@ class KVManager(AttentionResource):
         transfer_engine_info: TransferEngineInfo,
         device: torch.device,
         dtype=torch.bfloat16,
+        nodes: set[str] | None = None,
     ):
         self.config = cfg
         if joint_comm_group is not None:
@@ -360,6 +374,15 @@ class KVManager(AttentionResource):
         # one does not leave its streams unevictable
         self._preplan_marked: list[tuple[str, str]] = []
 
+        # the nodes sharing this pool, whose labels a request's reservation covers
+        self._nodes = nodes
+        self._reserved: dict[str, Reservation] = {}
+        # capture buckets whose padding rows take their capture span again on
+        # replay (a batched capture; a packed one pads with empty rows)
+        self._cg_padded_buckets: set[BucketKey] = set()
+        # (padding rid, label) -> pages that row may hold while serving
+        self._pad_caps: dict[tuple[str, str], int] = {}
+
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
         return cls(
@@ -369,12 +392,19 @@ class KVManager(AttentionResource):
             joint_comm_group=info.joint_comm_group,
             transfer_engine_info=info.transfer_engine_info,
             dtype=info.kv_dtype,
+            nodes=spec.nodes,
         )
 
     def build_cuda_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ):
-        del slots, max_bs
+        del max_bs
+        # not at module level: the config module imports back through the engine's resources
+        from mstar.engine.cuda_graph_config import CudaGraphConfigType
+
+        for spec in slots:
+            if spec.config.get_config_type() is CudaGraphConfigType.BASIC_BATCHED:
+                self._cg_padded_buckets.add(spec.bucket)
         # the per-(slot, label) buffers themselves are built on first plan for
         # that key (which labels a walk plans under is the step's to declare),
         # all at this one max length so they outlive any single bucket. Every
@@ -568,6 +598,7 @@ class KVManager(AttentionResource):
         # `stored_len` is 0, so any pages the stream holds are empty
         self._arena.release(stream.page_indices)
         stream.page_indices = list(matched)
+        stream.hits = len(matched)
         stream.stored_len = len(matched) * self.config.page_size
         stream.chain.cursor = len(matched)
 
@@ -792,6 +823,9 @@ class KVManager(AttentionResource):
         # one critical section so the read-of-stored_len then alloc is atomic
         # against a concurrent reset/remove/commit on another thread
         with self._lock:
+            # before the lease converts: a request is sized off the lease it holds
+            if not ctx.capture:
+                self._reserve_new(ctx)
             # before the fork loop and the segment loop, both of which size
             # off `stored_len`: a pre-fork target has to cover the whole prefix
             for segment in step.segments:
@@ -809,6 +843,7 @@ class KVManager(AttentionResource):
                     # drop the empty pages a refused batch admit left, before taking the lease
                     self._arena.release(stream.page_indices)
                     stream.page_indices = list(stream.lease)
+                    stream.hits = len(stream.lease)
                     stream.stored_len = (
                         len(stream.lease) * self.config.page_size
                     )
@@ -849,6 +884,12 @@ class KVManager(AttentionResource):
                 )
                 if not alloc_res.success:
                     return AdmitOutcome(ok=False, reason=alloc_res.error)
+
+            if (
+                ctx.capture and ctx.slot_lease is not None
+                and ctx.slot_lease.bucket in self._cg_padded_buckets
+            ):
+                self._note_padding_pages(ctx.padded_request_ids)
 
             # marked here rather than in plan so the mark also covers
             # admit -> plan, where an offload would otherwise release pages
@@ -1247,6 +1288,7 @@ class KVManager(AttentionResource):
                 freed += len(claim.pages)
                 self._arena.release(claim.pages)
                 stream.page_indices = []
+                stream.hits = 0
                 stream.reset()
             return freed, {claim.label for claim in moved}
 
@@ -1398,6 +1440,7 @@ class KVManager(AttentionResource):
                 self._cpu_pool.remove_request(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
+            self._reserved.pop(rid, None)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -1464,6 +1507,21 @@ class KVManager(AttentionResource):
                 f"pages still being written into, but not owned alone: {crowded}"
             )
 
+            # a guessed reservation may overrun and leave the rest short, which
+            # the worker's hold absorbs; only the model's own counts are checked
+            if all(res.exact for res in self._reserved.values()):
+                held = {rid: self._held_fresh(rid) for rid in self._reserved}
+                over = {
+                    rid: (held[rid], res.pages)
+                    for rid, res in self._reserved.items() if held[rid] > res.pages
+                }
+                assert not over, f"requests took more pages than they reserved: {over}"
+                outstanding, supply = self._outstanding(), self._supply()
+                assert outstanding <= supply, (
+                    f"admitted requests may still take {outstanding} pages, but "
+                    f"only {supply} are free or evictable"
+                )
+
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank
 
@@ -1473,7 +1531,14 @@ class KVManager(AttentionResource):
         ``all_gather`` itself is synchronizing, so no extra barrier is
         needed on the success path.
         """
-        if self._comm_group.world_size == 1:
+        with self._lock:
+            # a piecewise region never hands its rows back, and replays within them
+            self._note_padding_pages([rid for rid in self._streams if self._is_padding(rid)])
+            logger.info(
+                "KV %s: padding rows may take %d pages while serving",
+                self.name, self._padding_remaining(),
+            )
+        if self._comm_group is None or self._comm_group.world_size == 1:
             return
         local_free = self._arena.num_free
         local_t = torch.tensor(
@@ -1502,6 +1567,105 @@ class KVManager(AttentionResource):
                 self._streams[rid][label] = CacheStream()
                 self._seed_keys(rid, label, self._streams[rid][label])
             return self._streams[rid][label]
+
+    # Admission
+
+    @staticmethod
+    def _is_padding(rid) -> bool:
+        # CUDA-graph padding rows carry negative handles; tests key requests by str
+        return isinstance(rid, int) and rid < 0
+
+    def _labels_opened(self, overrides: KVReqConfig) -> set[str]:
+        """The labels ``overrides`` can open on this pool's nodes, on any walk."""
+        labels = set(overrides.needed_labels or ["main"])
+        for (node, _), named in overrides.needed_labels_per_node_walk.items():
+            if self._nodes is None or node in self._nodes:
+                labels.update(named)
+        for node, named in overrides.needed_labels_per_node.items():
+            if self._nodes is None or node in self._nodes:
+                labels.update(named)
+        return labels
+
+    def _reservation(self, rid: str) -> Reservation:
+        """The pages ``rid`` may take from the free list over its life here.
+
+        A label counts to its prompt plus what decode adds, at most
+        ``max_seq_len``: the prompt as the model counted it, else as its keys
+        describe it, else the cap itself for a label nothing describes. A page
+        the request leases, or was lent, is held rather than taken.
+        """
+        overrides = self._overrides[rid]
+        page_size, cap = self.config.page_size, self.config.max_seq_len
+        slots = overrides.prompt_slots or {}
+        labels = self._labels_opened(overrides)
+        pages = 0
+        for label in labels:
+            keys = (overrides.prefix_keys or {}).get(label)
+            if label in slots:
+                decodes = label in (overrides.decode_labels or ())
+                tokens = slots[label] + (overrides.max_tokens if decodes else 0)
+            elif keys:
+                tail = (overrides.prefix_tail or {}).get(label) or ()
+                prompt = (len(keys) - (1 if tail else 0)) * page_size + len(tail)
+                tokens = prompt + overrides.max_tokens
+            else:
+                tokens = cap
+            pages += -(-min(tokens, cap) // page_size)
+            stream = self._streams[rid].get(label)
+            if stream is not None:
+                pages -= len(stream.lease or ()) + stream.hits
+        return Reservation(pages=max(0, pages), exact=bool(slots) and labels <= slots.keys())
+
+    def _reserve_new(self, ctx: StepContext) -> None:
+        for rid in ctx.request_ids:
+            overrides = self._overrides.get(rid)
+            if overrides is None or overrides.max_tokens is None or rid in self._reserved:
+                continue
+            self._reserved[rid] = self._reservation(rid)
+
+    def _held_fresh(self, rid: str) -> int:
+        """Pages ``rid`` holds that it took from the free list."""
+        return sum(
+            len(stream.page_indices) - stream.hits
+            for stream in self._streams.get(rid, {}).values()
+        )
+
+    def _supply(self) -> int:
+        """Pages an allocation can still get: the free ones, and the cached ones
+        eviction reaches."""
+        evictable = len(self._index.evictable()) if self._index is not None else 0
+        return self._arena.num_free + evictable
+
+    def _outstanding(self) -> int:
+        """Pages admitted requests and padding rows may still take."""
+        return self._padding_remaining() + sum(
+            max(0, res.pages - self._held_fresh(rid))
+            for rid, res in self._reserved.items()
+        )
+
+    def _note_padding_pages(self, rids) -> None:
+        """Raise each padding row's cap to what it holds now.
+
+        Called at a batched capture and once capture is over: a batched replay
+        gives its padding rows their capture span again and they keep it, so
+        what a row held at capture is what it can take back while serving.
+        """
+        for rid in rids:
+            if not self._is_padding(rid):
+                continue
+            for label, stream in self._streams.get(rid, {}).items():
+                key = (rid, label)
+                self._pad_caps[key] = max(
+                    self._pad_caps.get(key, 0), len(stream.page_indices)
+                )
+
+    def _padding_remaining(self) -> int:
+        """Pages padding rows may still take back from the free list."""
+        total = 0
+        for (rid, label), cap in self._pad_caps.items():
+            stream = self._streams.get(rid, {}).get(label)
+            total += max(0, cap - (len(stream.page_indices) if stream is not None else 0))
+        return total
 
     def _check_ready(
         self, rid: str, label: str
@@ -1633,6 +1797,13 @@ class KVManager(AttentionResource):
                     new_pages = self._arena.acquire(num_new_pages)
                 if new_pages is None:
                     pages_short = num_new_pages - self._arena.num_free
+                    reserved = self._reserved.get(request_id)
+                    if _DEBUG_ASSERTS and reserved is not None and reserved.exact:
+                        raise AssertionError(
+                            f"KV {self.name}: {request_id}/{label} was admitted on "
+                            f"a reservation of {reserved.pages} pages and is "
+                            f"{pages_short} short"
+                        )
                     return AllocResult(
                         success=False,
                         error=AllocationFailed(
