@@ -25,10 +25,11 @@ from mstar.communication.tensors import StoredOutputs
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext, StepRunner
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, PrefixSpan
+from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, PrefixSpan
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.graph.runtime.base import FreedTensors, RouteOutput
+from mstar.model.base import PrefixStream
 from mstar.model.submodule_base import ARNodeInputs
 from mstar.worker.worker import PendingBatch, Worker
 
@@ -159,3 +160,34 @@ def test_a_keyed_text_walk_placing_its_own_positions_fails_probed_or_refused(mon
 
     with pytest.raises(AssertionError, match="the layout keys it by ids"):
         engine._skip_cached_prefix(_batch(), RID, inputs)
+
+
+class _StubModel:
+    """Declares a stream an image walk writes too, and names no checkpoint."""
+
+    def checkpoint_path(self):
+        return None
+
+    def preprocess_fingerprint(self):
+        return "stub"
+
+    def prefix_key_streams(self):
+        return {"kv": {"main": PrefixStream("text_inputs", "ids", WALK, "decode", ("prefill_image",))}}
+
+
+def test_the_layout_walks_reach_both_the_probe_and_the_cache(monkeypatch):
+    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda info, cache: None)
+    config = KVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, prefix_cache_salt="a salt")
+    kv = KVManager(
+        cfg=config, name="kv", joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    engine = Engine.__new__(Engine)
+    engine._resources = {"kv": kv}
+
+    engine._open_prefix_caches({"kv": KVSpec(resource_key="kv", nodes={NODE}, config=config)}, _StubModel())
+
+    walks = (engine._keyed_walks[NODE], kv._keyed_walks)
+    assert walks == ({WALK, "prefill_image"}, {"main": {WALK, "decode", "prefill_image"}}), (
+        "the engine never probes the image walk, or the cache ends the chain at its first commit"
+    )

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -27,7 +28,7 @@ from mstar.engine.resources import KVConfig, PositionConfig, PositionStep, StepR
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan
 from mstar.engine.resources.kv.keys import PageItem, chain
-from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.manager import KVManager, KVSequenceInfo, PublishedKVInfo
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.model.submodule_base import ARNodeInputs
@@ -245,3 +246,22 @@ def test_a_layout_reaches_the_kv_config_across_the_wire():
     assert decoded.prefix_layout == {"main": [
         PrefixSpan(20, 20, TEXT_WALK), PrefixSpan(30, 1, IMAGE_WALK, DIGEST),
     ]}, "the layout did not reach the worker as the spans the conductor was sent"
+
+
+def test_a_stream_read_in_from_the_rank_that_prefilled_indexes_its_prompt_at_decode(monkeypatch):
+    monkeypatch.setattr(manager_mod, "KVTransferManager", lambda info, cache: SimpleNamespace(
+        start_async_retrieve=lambda **kwargs: None, get_kv_transfer_info=lambda: None,
+    ))
+    prompt = list(range(1, 51))
+    node = _Node(None, [prompt])
+    published = PublishedKVInfo.build_for_rank(0, 1, {"main": KVSequenceInfo(
+        seq_len=len(prompt), latest_kv_transfer_info="peer", page_indices=list(range(4)),
+    )})
+    assert node.kv.admit_retrieve(RID, NODE, TEXT_WALK, published).ok
+
+    node.step(1, "decode")
+
+    assert len(node.kv._index.pages()) == len(prompt) // PAGE_SIZE, (
+        "the prompt a decode rank read in was never indexed, because its first "
+        "decode was taken for a write of the prompt's span by the wrong walk"
+    )

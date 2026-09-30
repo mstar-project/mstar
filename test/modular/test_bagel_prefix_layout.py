@@ -21,6 +21,7 @@ from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.bagel.submodules import ViTEncoderSubmodule
 from mstar.model.base import ProcessPromptOutput
 from mstar.model.multimodal import PromptPart
+from mstar.worker.engine_manager import _refuse_unservable_walks
 
 PATCH_SIZE = 14
 MAX_PATCHES_PER_SIDE = 70
@@ -135,3 +136,19 @@ def test_bagel_lays_out_only_the_understood_prompts_it_has_images_for():
         "a layout went to a prompt with no understood image or none of its "
         "tensors, or was missing from the one that has both"
     )
+
+
+def test_bagels_walks_pass_the_load_check_under_cfg_parallelism():
+    model = BagelModel.__new__(BagelModel)
+    model.config = SimpleNamespace(
+        num_hidden_layers=2, num_key_value_heads=2, hidden_size=64, num_attention_heads=4,
+        max_position_embeddings=128, num_timesteps=4, rope_theta=10000.0, vocab_size=256,
+        vit_config=SimpleNamespace(hidden_size=64, num_attention_heads=4, patch_size=PATCH_SIZE),
+    )
+    # the KV then spans LLM_cfg_text and LLM_cfg_img, which no prefill walk runs
+    model._has_cfg_parallel = True
+    assert model.prefix_key_streams()["kv"]["main"].layout_walks == ("prefill_vit",), (
+        "bagel names no layout walk, so the check below never looks at its walks"
+    )
+
+    _refuse_unservable_walks(model.get_node_resources(), model)
