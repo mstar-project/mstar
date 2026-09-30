@@ -29,6 +29,7 @@ from mstar.engine.cuda_graph_runner import (
     WarmedRegion,
     WarmedSpec,
 )
+from mstar.engine.engine import Engine
 from mstar.engine.resources import BucketKey, CGSlotSpec
 
 _GIB = 2**30
@@ -267,3 +268,18 @@ def test_a_region_shape_that_would_take_the_floor_runs_eagerly(gpu):
 
     assert region.tried == [(1, 1024)], "a shape that would take the floor must not even be tried"
     assert region.dropped_shapes == [(2, 4096)], "a refused shape must be listed as running eagerly"
+
+
+def test_a_runner_with_no_graphs_keeps_its_largest_bucket_as_its_batch_cap():
+    """A runner that captured nothing runs every bucket eager, and the floor
+    covers eager steps only up to its largest bucket."""
+    code2wav = SimpleNamespace(
+        submodule=SimpleNamespace(max_batch_size=lambda walk: None),
+        cuda_graph_runner=None,
+        capture_runner=SimpleNamespace(max_batch_size_for=lambda walk: 32),
+    )
+    engine = SimpleNamespace(_submodules={"Code2Wav": code2wav})
+
+    cap = Engine.get_max_batch_size(engine, "Code2Wav", "code2wav_chunk")
+
+    assert cap == 32, "a batch past the largest bucket is an eager step the floor never measured"
