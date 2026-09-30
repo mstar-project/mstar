@@ -288,6 +288,22 @@ Worker scheduling
      - Pre-plan the speculative batch's attention on a dedicated thread
        while the previous replay runs. ``0`` plans inline on the GPU
        thread.
+   * - ``MSTAR_STREAMS``
+     - ``aux``
+     - How the worker's stream roles (``mstar/utils/streams.py``) map onto
+       CUDA streams. ``aux``: compute on the default stream, KV offload /
+       reload on an ``offload`` stream created at the first offload, and
+       every other role (pre-plan, stop-check D2H, tensor send / receive,
+       transfer reads) on one ``aux`` stream. ``split``: one stream per
+       role. Or explicit ``role=stream`` pairs, e.g. ``plan=aux,send=aux``.
+       Side streams should carry only H2D / D2H copies while a graph
+       replays: a kernel or device-to-device copy there slows every
+       CUDA-graph node from then on (see ``mstar/utils/h2d.py``).
+   * - ``MSTAR_AUX_STREAM``
+     - ``1``
+     - ``Fork.run`` puts a layer's two independent branches on two streams
+       while a CUDA graph is captured, so their kernels overlap at replay.
+       ``0`` keeps every capture on one stream.
    * - ``MSTAR_MAX_CONSECUTIVE_SPEC_STEPS``
      - ``1024``
      - Cap on back-to-back speculative steps before the leader yields to
