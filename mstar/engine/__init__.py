@@ -15,7 +15,7 @@ def recompile_limit() -> int:
         return 84
     limit = min(max(requested, 8), 256)
     if limit != requested:
-        logger.warning("MSTAR_RECOMPILE_LIMIT=%d clamped to %d", requested, limit)
+        logger.warning("MSTAR_RECOMPILE_LIMIT=%d is outside [8, 256]; using %d", requested, limit)
     return limit
 
 
