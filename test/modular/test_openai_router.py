@@ -157,6 +157,21 @@ def test_audio_speech(client_and_stub):
     assert stub.last_submit["model_kwargs"]["voice"] == "tara"
 
 
+def test_audio_speech_clone_uploads_the_reference_clip(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "omnivoice"
+    stub.next_chunks = [_Chunk("audio", _pcm([100, -100]), {"sample_rate": 24000})]
+    ref = "data:audio/wav;base64," + base64.b64encode(b"RIFF....WAVE").decode()
+    r = client.post("/v1/audio/speech", json={
+        "model": "omnivoice", "input": "hi", "ref_audio": ref, "ref_text": "hello",
+    })
+    assert r.status_code == 200
+    sub = stub.last_submit
+    assert sub["input_modalities"] == ["text", "audio"]
+    (path,) = sub["file_paths"]["audio"]
+    assert Path(path).is_file() and Path(path).read_bytes() == b"RIFF....WAVE"
+
+
 def test_images(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"

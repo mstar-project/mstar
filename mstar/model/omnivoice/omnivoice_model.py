@@ -66,6 +66,10 @@ logger = logging.getLogger(__name__)
 class OmniVoiceModel(Model):
     """k2-fsa/OmniVoice."""
 
+    # Text in, plus an optional reference clip to clone; speech out
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "audio"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"audio"})
+
     ENCODE_REFERENCE_WALK = "encode_reference"
     SPEECH_GEN_WALK = "speech_gen"
     SPEECH_GEN_CLONE_WALK = "speech_gen_clone"

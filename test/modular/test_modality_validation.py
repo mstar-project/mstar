@@ -157,6 +157,9 @@ ACCEPTED = [
     ("qwen3_omni", ["image", "text"], ["audio"]),
     ("orpheus", ["text"], ["audio"]),
     ("qwen3_tts", ["text"], ["audio"]),
+    ("omnivoice", ["text"], ["audio"]),
+    # speech route with ref_audio: the clip to clone
+    ("omnivoice", ["text", "audio"], ["audio"]),
     ("cosmos3", ["text"], ["image"]),
     ("cosmos3", ["text"], ["video"]),
     ("cosmos3", ["image", "text"], ["video"]),
@@ -193,6 +196,8 @@ REJECTED = [
     ("higgs_audio", ["audio"], ["audio"]),
     ("orpheus", ["audio"], ["audio"]),
     ("qwen3_tts", ["text"], ["video"]),
+    ("omnivoice", ["image", "text"], ["audio"]),
+    ("omnivoice", ["text"], ["text"]),
     ("vjepa2", ["image"], ["video"]),
     # only the AC predictor's MPC walk emits these
     ("vjepa2", ["video"], ["scalar"]),

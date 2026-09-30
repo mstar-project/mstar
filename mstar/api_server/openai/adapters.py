@@ -366,8 +366,8 @@ class OmniVoiceAdapter(OpenAIAdapter):
         ref_audio = mk.pop("ref_audio", None)
         input_modalities = ["text"]
         if ref_audio:
-            # A data URL, a base64 blob, a local path or (when allowed) a URL.
-            path, _mime = media_io.resolve_media_ref(
+            # A data URL, a local path or (when allowed) a URL.
+            _, path = media_io.resolve_media_ref(
                 ref_audio, upload_dir, allow_remote=True
             )
             # Keyed by modality: the data worker iterates the dict and
