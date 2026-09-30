@@ -13,9 +13,8 @@
 //! `ZmqCommunicator`'s opaque byte payload:
 //!   frontend -> conductor: SubmitMsg {t:"submit", rid, text, file_paths,
 //!       input_modalities, output_modalities, model_kwargs, streaming}
-//!   conductor -> frontend: {t:"ok", rid} (past intake; before any chunk)
-//!                        | {t:"chunk", rid, modality, data(bin), metadata}
-//!                        | {t:"err", rid, msg} | {t:"done", rid} | {t:"pong", rid}
+//!   conductor -> frontend: {t:"ok", rid} (intake passed) | {t:"chunk", rid, modality,
+//!       data(bin), metadata} | {t:"err", rid, msg} | {t:"done", rid} | {t:"pong", rid}
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};

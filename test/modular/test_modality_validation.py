@@ -138,11 +138,8 @@ def test_an_unnamed_output_is_the_model_default():
 # ── per-model declarations ──────────────────────────────────────────────────
 
 
-# Every request shape the front ends actually emit, per registry name. These
-# are asserted rather than only the rejections: an over-narrow declaration
-# turns a working request into a 400, which is a worse failure than the
-# permissiveness it replaced. Sources: mstar/api_server/openai/adapters.py and
-# mstar/integrations/dynamo/bridges.py.
+# Every shape the front ends emit (openai/adapters.py, dynamo/bridges.py) must
+# pass: an over-narrow declaration turns a working request into a 400.
 ACCEPTED = [
     ("bagel", ["text"], ["text"]),
     ("bagel", ["image", "text"], ["text"]),
@@ -174,19 +171,16 @@ ACCEPTED = [
     # test/vjepa2/video_request_mpc.sh
     ("vjepa2_ac", ["video"], ["scalar", "tensor", "video"]),
     ("whisper_large", ["audio"], ["text"]),
-    # The chat adapter derives in_mods from the parts as written, so a text
-    # prompt can ride along with the attachment. Whisper ignores it
-    # (process_prompt builds the decoder prompt from language/task kwargs),
-    # so it must be tolerated at intake, not rejected.
+    # the chat adapter keeps a text part next to the audio; whisper ignores it
+    # (its prompt comes from kwargs), so intake must tolerate it
     ("whisper_large", ["audio", "text"], ["text"]),
     ("higgs_audio", ["audio"], ["text"]),
     ("higgs_audio", ["audio", "text"], ["text"]),
     ("pi05", ["image", "text"], ["action"]),
 ]
 
-# Combinations each model has no encoder/decoder for. Only rejections that
-# follow from the declared sets -- "audio is required" is not expressible here
-# (higgs_audio takes ["text"] at intake and fails in process_prompt).
+# Combinations a model has no encoder/decoder for; "audio is required" isn't
+# expressible here (higgs_audio takes ["text"] and fails in process_prompt).
 REJECTED = [
     ("bagel", ["audio"], ["text"]),
     ("bagel", ["video"], ["text"]),

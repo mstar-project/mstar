@@ -35,9 +35,8 @@ def _worker(
     w.failed = set()
     w.forced = []
     w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
-    # Identity interning by default: the rid string is its own handle, so the
-    # string/handle split is exercised without a real runtime. int_handles
-    # mints real ones, for state keyed by the wire string (the TP-follow count).
+    # the rid string is its own handle by default; int_handles mints real ones,
+    # for state keyed by the wire string (the TP-follow count)
     rids = RidTable()
     rids.intern("other")  # so no handle is 0
     handle = {r: rids.intern(r) if int_handles else r for r in known_rids}
