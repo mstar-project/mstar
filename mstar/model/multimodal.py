@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -57,28 +58,54 @@ class MediaSpan:
 
 
 def parts_from_modalities(
-    input_modalities: list[str], texts: Iterable[str] | str | None = None
+    input_modalities: list[str],
+    texts: Iterable[str] | str | None = None,
+    roles: Iterable[str | None] | None = None,
 ) -> list[PromptPart]:
     """Rebuild the parts for a layout, filling the text slots from ``texts``.
 
     ``input_modalities`` is one entry per part, in order, and is the layout
     every consumer plans from. Rebuilding from it beats carrying a second copy
     of the ordering that could drift. Unfilled text slots carry ``None``, which
-    is enough to plan with.
+    is enough to plan with. ``roles`` is one per part, in the same order.
     """
     if isinstance(texts, str):
         texts = [texts]
     remaining = iter(texts or ())
+    part_roles = iter(roles or ())
     parts: list[PromptPart] = []
     seen: dict[str, int] = {}
     for modality in input_modalities:
+        role = next(part_roles, None)
         if modality == TEXT:
-            parts.append(PromptPart(modality=TEXT, text=next(remaining, None)))
+            parts.append(PromptPart(modality=TEXT, text=next(remaining, None), role=role))
         else:
             index = seen.get(modality, 0)
-            parts.append(PromptPart(modality=modality, index=index))
+            parts.append(PromptPart(modality=modality, index=index, role=role))
             seen[modality] = index + 1
     return parts
+
+
+class Turn(NamedTuple):
+    """The parts of consecutive messages of one role."""
+
+    role: str
+    parts: list[PromptPart]
+
+
+def chat_turns(parts: list[PromptPart]) -> list[Turn]:
+    """Group ``parts`` into turns, starting a new one at every role change.
+
+    A part with no role is the user's, so a request from an entrypoint with no
+    messages renders as the one user turn it always did.
+    """
+    turns: list[Turn] = []
+    for part in parts:
+        role = part.role or "user"
+        if not turns or turns[-1].role != role:
+            turns.append(Turn(role, []))
+        turns[-1].parts.append(part)
+    return turns
 
 
 def prefill_plan(
