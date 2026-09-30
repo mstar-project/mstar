@@ -27,6 +27,8 @@ from mstar.engine.resources.kv.keys import chain
 from mstar.model.base import PrefixStream, ProcessPromptOutput
 from mstar.model.orpheus.config import OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel
+from mstar.model.whisper.config import WhisperModelConfig
+from mstar.model.whisper.whisper_model import WhisperModel
 
 PAGE_SIZE = 16
 PROMPT = list(range(100))
@@ -377,4 +379,28 @@ def test_orpheus_is_handed_a_config_for_the_stream_it_declares():
     assert set(orpheus.prefix_key_streams()) <= set(configs), (
         "orpheus returns a sampler config alone, so the resource it declared "
         "a stream for had nothing to carry its chain"
+    )
+
+
+# ── max_tokens on every kv cache ─────────────────────────────────────────
+
+
+def test_whisper_is_handed_max_tokens_on_both_of_its_caches():
+    whisper = WhisperModel.__new__(WhisperModel)
+    whisper.config = WhisperModelConfig()
+    caches = {
+        spec.resource_key for spec in whisper.get_node_resources()
+        if isinstance(spec, KVSpec)
+    }
+
+    configs = Conductor._get_resource_configs(
+        SimpleNamespace(model=whisper), {}, {},
+    )
+    for cfg in configs.values():
+        cfg.apply_conductor_config(seed=1, max_tokens=whisper.get_max_output_tokens())
+
+    handed = {key: getattr(configs.get(key), "max_tokens", None) for key in caches}
+    assert handed == dict.fromkeys(caches, 444), (
+        "whisper returns a sampler config alone, so its caches never learn how "
+        "far a request can grow"
     )
