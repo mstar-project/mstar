@@ -431,20 +431,19 @@ def test_per_request_does_not_abort_a_step_that_committed():
     assert out["a"] == {"token": 1} and out["b"] == {}
 
 
-def test_per_request_stops_after_a_failed_forward_on_a_sharded_node():
-    """Under TP/SP the peers may still be in b's collectives, so c must not run
-    and pair its own with them; it is failed and its admitted step aborted."""
+def test_per_request_runs_on_after_a_failed_forward_on_a_sharded_node():
+    """Every rank raised on b and every rank runs c: one rank stopping here
+    would leave c's collectives unpaired on the others."""
     engine = _FakeExecEngine(raise_on="b", world_size=2)
     batch = _exec_batch(["a", "b", "c"])
 
     out = engine._exec_per_request(batch)
 
     assert [e for e in engine.events if e[0] in ("run", "abort")] == [
-        ("run", "a"), ("abort", "b"), ("abort", "c"),
+        ("run", "a"), ("abort", "b"), ("run", "c"),
     ]
-    assert out == {"a": {"token": 1}, "b": {}, "c": {}}
-    assert set(batch.failed_requests) == {"b", "c"}
-    assert "failed before it" in batch.failed_requests["c"]
+    assert out["c"] == {"token": 1}
+    assert set(batch.failed_requests) == {"b"}
 
 
 def test_per_request_keeps_going_after_a_committed_step_on_a_sharded_node():

@@ -854,11 +854,8 @@ class Engine:
         # requests), and on the way out — see below.
         fence = submodule_mgmt.needs_slot_fence and self._device.type == "cuda"
         slot_events: dict[int, torch.cuda.Event] = {}
-        # Under TP/SP a raise on one rank can leave its peers inside this rid's
-        # collectives, so a failed step there fails the rest instead of running them
-        sharded = submodule_mgmt.joint_comm_group.world_size > 1
 
-        for n, (rid, inp) in enumerate(zip(batch.request_ids, batch.inputs, strict=True)):
+        for rid, inp in zip(batch.request_ids, batch.inputs, strict=True):
             req_info = {rid: batch.per_request_info[rid]}
             slot = ctxs[rid].slot
             submodule_mgmt.set_piecewise_slot(slot)
@@ -887,7 +884,8 @@ class Engine:
                 ))
             except Exception as error:
                 # A forward error here is attributable to this one request, not
-                # the batch: fail only one with failed_requests
+                # the batch: fail only one with failed_requests. Under TP/SP that
+                # keeps the ranks in step only if every rank raised here.
                 logger.exception(
                     "forward failed for request %s (node=%s, walk=%s)",
                     rid, batch.node_name, batch.step_context.graph_walk,
@@ -897,13 +895,6 @@ class Engine:
                 # commit never ran, so release what admit/plan still hold
                 if not committed and steps[rid] is not None:
                     self._runner.abort_step(steps[rid])
-                if sharded and not committed:
-                    skipped = RuntimeError(f"not run: request {rid} failed before it on a sharded node")
-                    for later in batch.request_ids[n + 1:]:
-                        batch.register_failure(later, skipped)
-                        if steps[later] is not None:
-                            self._runner.abort_step(steps[later])
-                    break
             finally:
                 # on every exit: a raise after plan can leave this slot's
                 # staging copy queued
