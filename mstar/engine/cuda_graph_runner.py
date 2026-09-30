@@ -119,6 +119,11 @@ def capture_into_graph(run, pool, device, autocast_dtype):
     """
     prev_stream = torch.cuda.current_stream(device)
     graph = torch.cuda.CUDAGraph()
+    # benchmark off, so cuDNN searches in the warm-up and not in here: a conv
+    # whose cached plan can't get its workspace would search again, timing
+    # candidates and emptying the allocator's cache, which fails the capture
+    benchmark = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = False
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
                 autocast_scope(autocast_dtype):
@@ -129,6 +134,8 @@ def capture_into_graph(run, pool, device, autocast_dtype):
         torch.cuda.synchronize(device)
         _stop_recording_to_pool(device, pool)
         raise
+    finally:
+        torch.backends.cudnn.benchmark = benchmark
     torch.cuda.synchronize(device)
     return graph, output
 
