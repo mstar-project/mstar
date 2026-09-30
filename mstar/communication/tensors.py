@@ -135,30 +135,30 @@ class AsyncMooncakeReader:
         self.max_batch_size = max_batch_size
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._pending: list[Future] = []
-        if device != "cpu":
-            self._copy_stream = torch.cuda.Stream(device=device)
-        else:
-            self._copy_stream = torch.cuda.Stream()
+        # none on the host: host buffers have no GPU work to wait for, and a stream or event would
+        # create a CUDA context on a GPU that other processes may have filled
+        self._copy_stream = torch.cuda.Stream(device=device) if torch.device(device).type == "cuda" else None
 
     def submit(self, read_info: list[TransferReadInfo]) -> Future:
         """Non-blocking: enqueue a batch of READs.
 
-        Records a CUDA event on the current stream to ensure GPU data
+        On a device, records a CUDA event on the current stream to ensure GPU data
         is ready before the background thread reads it.
         """
         if not read_info:
             return
-        event = torch.cuda.current_stream().record_event()
+        event = torch.cuda.current_stream().record_event() if self._copy_stream is not None else None
         future = self._executor.submit(self._do_read, read_info, event)
         self._pending.append(future)
         # Prune completed futures to avoid unbounded growth
         self._pending = [f for f in self._pending if not f.done()]
         return future
 
-    def _do_read(self, read_info: list["TransferReadInfo"], event: torch.cuda.Event):
+    def _do_read(self, read_info: list["TransferReadInfo"], event: torch.cuda.Event | None):
         """Worker thread: wait for GPU data via CUDA event, then PUT."""
-        self._copy_stream.wait_event(event)
-        self._copy_stream.synchronize()
+        if event is not None:
+            self._copy_stream.wait_event(event)
+            self._copy_stream.synchronize()
 
         start_time = time.perf_counter()
 
