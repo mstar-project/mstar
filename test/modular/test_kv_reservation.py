@@ -21,9 +21,9 @@ import pytest
 import torch
 
 from mstar.engine.cuda_graph_config import CudaGraphConfigType
-from mstar.engine.resources.base import CGSlotSpec
+from mstar.engine.resources.base import CGSlotSpec, EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep
+from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
@@ -167,6 +167,35 @@ def test_a_label_opened_only_on_another_node_is_not_reserved():
 
     assert kv._reserved["r"].pages == _pages(32 + 16), (
         "a label this pool never holds for the request was reserved on it"
+    )
+
+
+def test_a_worker_reserves_only_what_its_own_nodes_open():
+    # CFG parallel: every worker builds the cache from a spec naming all three
+    spec = KVSpec(
+        resource_key="kv", nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"},
+        config=KVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
+            max_num_pages=64, page_size=PAGE_SIZE,
+        ),
+    )
+    kv = KVManager.build(spec, EngineResourceInfo(
+        device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({"LLM"}),
+    ))
+    kv.ingest_request("r", KVReqConfig(
+        max_tokens=16,
+        needed_labels_per_node_walk={
+            ("LLM", WALK): ["main"],
+            ("LLM_cfg_text", "image_gen_cfg"): ["cfg_text"],
+            ("LLM_cfg_img", "image_gen_cfg"): ["cfg_img"],
+        },
+        prompt_slots={"main": 32}, decode_labels=["main"],
+    ))
+
+    _run(kv, "r", 32)
+
+    assert kv._reserved["r"].pages == _pages(32 + 16), (
+        "a worker reserved labels only the other workers' nodes open"
     )
 
 
