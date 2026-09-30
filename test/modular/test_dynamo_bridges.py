@@ -435,6 +435,25 @@ def test_chat_forces_text_only_output(tmp_path):
     assert out[-1]["choices"][0]["finish_reason"] == "stop"
 
 
+def test_chat_reaches_the_server_with_its_prompt_parts(tmp_path):
+    """Without them the model plans from the layout alone: one user turn."""
+    server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["qwen3_omni"], "q3o")
+
+    async def run():
+        return [out async for out in bridge.generate({"messages": [
+            {"role": "user", "content": "Name a color."},
+            {"role": "assistant", "content": "Blue."},
+            {"role": "user", "content": "Another."},
+        ]}, _Ctx())]
+
+    asyncio.run(run())
+    parts = server.submitted[0].get("prompt_parts") or []
+    assert [(p.role, p.text) for p in parts] == [
+        ("user", "Name a color."), ("assistant", "Blue."), ("user", "Another."),
+    ], "the bridge dropped the prompt parts, so the chat reaches the model as one user turn"
+
+
 def test_images_cancel_before_first_chunk(tmp_path):
     # Media requests emit nothing until nearly done; a client that goes
     # away mid-generation must still cancel promptly.
