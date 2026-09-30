@@ -13,6 +13,7 @@ on whether a capture succeeded.
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -271,6 +272,29 @@ def test_a_failed_capture_leaves_the_pool_and_stream_usable():
     graph.replay()
     torch.cuda.synchronize()
     assert out.tolist() == [2.0] * 8
+
+
+@requires_cuda
+@pytest.mark.parametrize("fails", [False, True], ids=["captured", "failed"])
+def test_benchmark_is_off_inside_the_capture_and_restored_after(monkeypatch, fails):
+    """Qwen3-Omni turns cuDNN's benchmark mode on for Code2Wav's warm-up.
+    Inside a capture its search fails the capture, which cost Code2Wav its
+    bs=32 graph and kept that graph's pool."""
+    device = torch.device("cuda")
+    x = torch.ones(8, device=device)
+    seen = []
+
+    def run():
+        seen.append(torch.backends.cudnn.benchmark)
+        # a pageable host-to-device copy is not permitted while capturing
+        return x + torch.tensor([1.0], device=device) if fails else x * 2
+
+    for benchmark in (True, False):
+        monkeypatch.setattr(torch.backends.cudnn, "benchmark", benchmark)
+        with pytest.raises(RuntimeError) if fails else nullcontext():
+            capture_into_graph(run, torch.cuda.graph_pool_handle(), device, None)
+        assert torch.backends.cudnn.benchmark is benchmark, "the caller's setting must come back"
+    assert seen == [False, False], "cuDNN must not search inside the capture"
 
 
 def test_required_graphs_turn_a_dropped_bucket_into_a_startup_failure(monkeypatch):
