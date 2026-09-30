@@ -254,15 +254,30 @@ def _decoded(bagel, spans):
     ("prompt", "in_mods", "out_mods"),
     [
         ("describe it", ["image", "text"], ["text"]),
+        ("describe it", ["text", "image"], ["text"]),
         ("hello", ["text"], ["text"]),
         ("a cat", ["text"], ["image"]),
         ("make it night", ["image", "text"], ["image"]),
         ("compare", ["image", "image", "text"], ["text"]),
     ],
 )
-def test_legacy_layouts_tokenize_exactly_as_before(bagel, prompt, in_mods, out_mods):
-    """Requests with no ordering to preserve keep their existing prompt."""
-    spans = _decoded(bagel, bagel.process_prompt(prompt, in_mods, out_mods)["text_inputs"])
+@pytest.mark.parametrize("as_chat", [False, True], ids=["legacy", "one-message-chat"])
+def test_legacy_layouts_tokenize_exactly_as_before(
+    bagel, tmp_path, prompt, in_mods, out_mods, as_chat,
+):
+    """Requests with no ordering to preserve keep their existing prompt, and so
+    does a chat of one user message in the same layout."""
+    parts = None
+    if as_chat:
+        content = [
+            {"type": "text", "text": prompt} if m == "text"
+            else {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}}
+            for m in in_mods
+        ]
+        _, _, _, parts = flatten_messages([{"role": "user", "content": content}], tmp_path)
+    spans = _decoded(bagel, bagel.process_prompt(
+        prompt, in_mods, out_mods, prompt_parts=parts,
+    )["text_inputs"])
     expected = {
         ("image", "text", "text"): [
             bagel.VLM_UNDERSTANDING_PREFIX.format(
@@ -270,10 +285,144 @@ def test_legacy_layouts_tokenize_exactly_as_before(bagel, prompt, in_mods, out_m
             ),
             bagel.VLM_UNDERSTANDING_SUFFIX.format(prompt=prompt),
         ],
+        ("text", "image", "text"): [
+            bagel.VLM_UNDERSTANDING_PREFIX.format(
+                system_prompt=bagel.BAGEL_DEFAULT_SYSTEM_PROMPT
+            ) + prompt,
+            bagel.VLM_UNDERSTANDING_SUFFIX.format(prompt=""),
+        ],
+        ("text", "text", "text"): [
+            bagel.VLM_UNDERSTANDING_TEMPLATE.format(
+                system_prompt=bagel.BAGEL_DEFAULT_SYSTEM_PROMPT, prompt=prompt,
+            ),
+        ],
     }.get((in_mods[0], in_mods[-1], out_mods[0]))
     if expected is not None:
         assert spans == expected
     assert spans  # every shape still produces at least one span
+
+
+def _chat_ids(bagel, messages, tmp_path):
+    text, _, in_mods, parts = flatten_messages(messages, tmp_path)
+    [ids] = bagel.process_prompt(text, in_mods, ["text"], prompt_parts=parts)["text_inputs"]
+    return ids.tolist()
+
+
+FIRST_TURN = [
+    {"role": "system", "content": "Be brief."},
+    {"role": "user", "content": "Name a color."},
+]
+SECOND_TURN = FIRST_TURN + [
+    {"role": "assistant", "content": "Blue."},
+    {"role": "user", "content": "Another."},
+]
+
+
+def test_a_legacy_prompt_with_no_text_slot_still_renders(bagel):
+    """A caller that sends a prompt but no text slot in its layout got it rendered before."""
+    [span] = _decoded(bagel, bagel.process_prompt("hello", [], ["text"])["text_inputs"])
+    assert span == bagel.VLM_UNDERSTANDING_TEMPLATE.format(
+        system_prompt=bagel.BAGEL_DEFAULT_SYSTEM_PROMPT, prompt="hello",
+    ), "a prompt with no text slot in its layout was dropped"
+
+
+def test_a_text_chat_renders_one_block_per_turn(bagel, tmp_path):
+    """The bare format: the system prompt's block, then one per turn."""
+    rendered = bagel.tokenizer.decode(_chat_ids(bagel, SECOND_TURN[1:], tmp_path))
+    assert rendered == (
+        f"<|im_start|>{bagel.BAGEL_DEFAULT_SYSTEM_PROMPT}<|im_end|><|im_start|>Name a color.<|im_end|>"
+        "<|im_start|>Blue.<|im_end|><|im_start|>Another.<|im_end|><|im_start|>"
+    ), "the chat was flattened into one turn"
+
+
+def test_a_leading_system_message_replaces_the_default(bagel, tmp_path):
+    rendered = bagel.tokenizer.decode(_chat_ids(bagel, FIRST_TURN, tmp_path))
+    assert rendered == "<|im_start|>Be brief.<|im_end|><|im_start|>Name a color.<|im_end|><|im_start|>", (
+        "the default system prompt still leads, with the client's inside the user turn"
+    )
+
+
+def test_a_lone_system_message_keeps_its_turn(bagel, tmp_path):
+    rendered = bagel.tokenizer.decode(_chat_ids(bagel, FIRST_TURN[:1], tmp_path))
+    assert rendered == (
+        f"<|im_start|>{bagel.BAGEL_DEFAULT_SYSTEM_PROMPT}<|im_end|><|im_start|>Be brief.<|im_end|><|im_start|>"
+    ), "a lone system message left an empty turn behind the default"
+
+
+def test_a_later_system_message_is_a_turn_of_its_own(bagel, tmp_path):
+    messages = [
+        {"role": "user", "content": "Name a color."},
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Another."},
+    ]
+    rendered = bagel.tokenizer.decode(_chat_ids(bagel, messages, tmp_path))
+    assert rendered == (
+        f"<|im_start|>{bagel.BAGEL_DEFAULT_SYSTEM_PROMPT}<|im_end|><|im_start|>Name a color.<|im_end|>"
+        "<|im_start|>Be brief.<|im_end|><|im_start|>Another.<|im_end|><|im_start|>"
+    ), "a later system message took the default's place"
+
+
+def test_the_next_turn_extends_the_last_prompt_and_its_reply(bagel, tmp_path):
+    """Turn 2 re-sends turn 1 and its reply, which the cache keyed as generated.
+
+    Flattened, the reply followed a newline where turn 1's prompt had closed
+    its turn, so no page keyed from the reply ever matched.
+    """
+    first = _chat_ids(bagel, FIRST_TURN, tmp_path)
+    second = _chat_ids(bagel, SECOND_TURN, tmp_path)
+    reply = bagel.tokenizer.encode("Blue.") + [_StubTokenizer.SPECIALS["<|im_end|>"]]
+    assert second[:len(first) + len(reply)] == first + reply, (
+        "turn 2 does not start with turn 1's prompt and reply, so the reply's pages never match"
+    )
+
+
+def test_an_image_chat_puts_each_turn_in_its_own_role_block(bagel, tmp_path):
+    """A message's attachment sits inside its own turn."""
+    messages = [
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            {"type": "text", "text": "What is it?"},
+        ]},
+        {"role": "assistant", "content": "A cat."},
+        {"role": "user", "content": "Its color?"},
+    ]
+    text, _, in_mods, parts = flatten_messages(messages, tmp_path)
+    spans = bagel.process_prompt(text, in_mods, ["text"], prompt_parts=parts)["text_inputs"]
+    rendered = bagel.IMAGE_PLACEHOLDER.join(_decoded(bagel, spans))
+    assert rendered == (
+        f"<|im_start|>system\n{bagel.BAGEL_DEFAULT_SYSTEM_PROMPT}<|im_end|>\n"
+        f"<|im_start|>user\n{bagel.IMAGE_PLACEHOLDER}\nWhat is it?<|im_end|>\n"
+        "<|im_start|>assistant\nA cat.<|im_end|>\n"
+        "<|im_start|>user\nIts color?<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    ), "the chat was flattened into one user turn"
+
+
+def test_an_image_chat_puts_a_leading_system_message_in_the_system_block(bagel, tmp_path):
+    messages = [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            {"type": "text", "text": "What is it?"},
+        ]},
+    ]
+    text, _, in_mods, parts = flatten_messages(messages, tmp_path)
+    spans = bagel.process_prompt(text, in_mods, ["text"], prompt_parts=parts)["text_inputs"]
+    assert bagel.IMAGE_PLACEHOLDER.join(_decoded(bagel, spans)) == (
+        "<|im_start|>system\nBe brief.<|im_end|>\n"
+        f"<|im_start|>user\n{bagel.IMAGE_PLACEHOLDER}\nWhat is it?<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    ), "the client's system prompt was written twice, or the default kept"
+
+
+def test_think_mode_still_instructs_a_client_system_prompt(bagel, tmp_path):
+    from mstar.model.bagel.bagel_model import VLM_THINK_SYSTEM_PROMPT
+
+    bagel.config.think_mode = True
+    rendered = bagel.tokenizer.decode(_chat_ids(bagel, FIRST_TURN, tmp_path))
+    assert rendered.startswith(f"<|im_start|>Be brief. {VLM_THINK_SYSTEM_PROMPT}<|im_end|>"), (
+        "a client's system prompt dropped the think-mode instruction"
+    )
 
 
 def test_text_before_an_attachment_stays_before_it(bagel):
