@@ -360,8 +360,11 @@ class PreprocessWorkerThread:
         # and returns any additional tensors to merge into the final dict.
         model_kwargs = dict(input.model_kwargs or {})
         # only this worker keys a prompt: a client that sent its own could name
-        # another request's pages and be served that request's KV
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode"):
+        # another request's pages and be served that request's KV. Nor does a
+        # client count its own pages: the cache admits it by the model's count
+        for name in (
+            "prefix_keys", "prefix_tail", "prefix_decode", "prompt_slots", "decode_labels",
+        ):
             model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
