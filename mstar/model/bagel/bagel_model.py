@@ -733,7 +733,11 @@ class BagelModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            detok = self.tokenizer.decode(output)
+            # the end token closes the turn, not the reply: a client sends the
+            # reply back as an assistant message, whose template writes it again
+            detok = self.tokenizer.decode(
+                [i for i in output.reshape(-1).tolist() if i != self.eos_token_id]
+            )
             logger.debug("OUTPUT TEXT %s", detok)
             return detok.encode("utf-8")
         if modality == "image":

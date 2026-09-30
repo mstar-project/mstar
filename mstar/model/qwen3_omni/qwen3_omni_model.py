@@ -1228,7 +1228,11 @@ class Qwen3OmniModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            detok = self.tokenizer.decode(output)
+            # the end token closes the turn, not the reply: a client sends the
+            # reply back as an assistant message, whose template writes it again
+            detok = self.tokenizer.decode(
+                [i for i in output.reshape(-1).tolist() if i != self.config.im_end_token_id]
+            )
             return detok.encode("utf-8")
         elif modality == "audio":
             if output.numel() == 0:
