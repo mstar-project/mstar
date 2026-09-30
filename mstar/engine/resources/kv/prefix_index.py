@@ -32,12 +32,7 @@ class PrefixIndex:
 
     def lookup(self, keys: Sequence[bytes]) -> list[int]:
         """Walk ``keys`` from the root and stop at the first one not indexed."""
-        pages: list[int] = []
-        for key in keys:
-            page = self._by_key.get(key)
-            if page is None:
-                break
-            pages.append(page)
+        pages = self.peek(keys)
         if pages:
             # one stamp for the whole run, so recency stays monotone along it
             self._clock += 1
@@ -71,9 +66,38 @@ class PrefixIndex:
         heapq.heappush(self._leaves, (self._clock, page))
         return True
 
+    def peek(self, keys: Sequence[bytes]) -> list[int]:
+        """`lookup` without the hit: asking what would match re-stamps nothing."""
+        pages: list[int] = []
+        for key in keys:
+            page = self._by_key.get(key)
+            if page is None:
+                break
+            pages.append(page)
+        return pages
+
     def page_for(self, key: bytes) -> int | None:
         # not `lookup`: this is not a hit, and must not re-stamp the page
         return self._by_key.get(key)
+
+    def evictable(self) -> set[int]:
+        """The pages `evict` could free, cascading from the leaves.
+
+        A page only the index holds is still out of reach while any page below
+        it is held by someone else: eviction takes leaves only, and that one is
+        never a leaf it can drop.
+        """
+        pinned: set[int] = set()
+        for page in self._by_key.values():
+            if self._arena.num_owners[page] > 1:
+                parent = self._parent[page]
+                while parent is not None and parent not in pinned:
+                    pinned.add(parent)
+                    parent = self._parent[parent]
+        return {
+            page for page in self._by_key.values()
+            if self._arena.num_owners[page] == 1 and page not in pinned
+        }
 
     def pages(self) -> list[int]:
         """Every page the index is holding a reference to."""
