@@ -24,6 +24,19 @@ Communication
        ``0``: always pyzmq. The two transports are wire-compatible, so
        this can be set per-process while the rest of the mesh stays on
        pyzmq.
+   * - ``MSTAR_TORCH_PROFILE``
+     - unset
+     - ``<start>:<count>[@<bs>][,...]`` makes a worker profile ``count`` engine
+       steps of ``MSTAR_TORCH_PROFILE_WALK`` (default ``decode``) from the ``start``-th such
+       step of each window with ``torch.profiler``, then log one per-kernel table per window
+       (CUDA time and launches per step, the batch sizes seen; the kernels of CUDA-graph
+       replays are listed individually) and write a Chrome trace to
+       ``MSTAR_TORCH_PROFILE_DIR`` (default ``/tmp``). With ``@<bs>`` a window counts and
+       covers only the steps of that batch size (one served run through several concurrency
+       levels gives one table per bucket). ``MSTAR_TORCH_PROFILE_RANKS`` (default
+       ``0``; comma-separated worker indices or ``all``) selects the workers;
+       ``MSTAR_TORCH_PROFILE_STACK=1`` records Python stacks and shapes, which attributes an
+       eager step's kernels to their ops. Unset, the hook is a counter increment per step.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a
