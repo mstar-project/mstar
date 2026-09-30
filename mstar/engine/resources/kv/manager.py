@@ -1655,10 +1655,12 @@ class KVManager(AttentionResource):
     def _reservation(self, rid: str) -> Reservation:
         """The pages ``rid`` may take from the free list over its life here.
 
-        A label counts to its prompt plus what decode adds, at most
-        ``max_seq_len``: the prompt as the model counted it, else as its keys
-        describe it. A page the request leases, or was lent, is held rather
-        than taken.
+        A label counts to its prompt plus what decode adds: the prompt as the
+        model counted it, else as its keys describe it. ``max_seq_len`` bounds
+        positions, so it caps decode, which takes one per token, and a keyed
+        prompt, whose tokens are positions, but not the model's count, whose
+        image tokens are not. A page the request leases, or was lent, is held
+        rather than taken.
         """
         overrides = self._overrides[rid]
         page_size, cap = self.config.page_size, self.config.max_seq_len
@@ -1668,13 +1670,13 @@ class KVManager(AttentionResource):
         for label in labels:
             if label in slots:
                 decodes = label in (overrides.decode_labels or ())
-                tokens = slots[label] + (overrides.max_tokens if decodes else 0)
+                tokens = slots[label] + (min(overrides.max_tokens, cap) if decodes else 0)
             else:
                 keys = overrides.prefix_keys[label]
                 tail = (overrides.prefix_tail or {}).get(label) or ()
                 prompt = (len(keys) - (1 if tail else 0)) * page_size + len(tail)
-                tokens = prompt + overrides.max_tokens
-            pages += -(-min(tokens, cap) // page_size)
+                tokens = min(prompt + overrides.max_tokens, cap)
+            pages += -(-tokens // page_size)
             stream = self._streams[rid].get(label)
             if stream is not None:
                 pages -= len(stream.lease or ()) + stream.hits
