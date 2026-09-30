@@ -172,6 +172,10 @@ class KokoroModel(Model):
             raise ValueError("Input contains no speakable text")
         if len(chunks) > self.config.max_chunks:
             raise ValueError(f"Input splits into {len(chunks)} chunks; the limit is {self.config.max_chunks}")
+        # past the PL-BERT window the embedding gather asserts on the device, killing the worker's CUDA context
+        longest = max(len(c.phonemes) for c in chunks)
+        if longest > self.config.max_phonemes:
+            raise RuntimeError(f"G2P produced a {longest}-phoneme chunk; the window is {self.config.max_phonemes}")
 
         ids = [torch.tensor(self.tokenize(c.phonemes), dtype=torch.long) for c in chunks]
         lengths = torch.tensor([len(x) for x in ids], dtype=torch.long)

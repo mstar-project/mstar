@@ -105,6 +105,23 @@ def _split_long(tokens: list, hard_max: int) -> list[list]:
     return [tokens[:cut]] + _split_long(tokens[cut:], hard_max)
 
 
+def split_phonemes(phonemes: str, hard_max: int) -> list[str]:
+    """Cut a phoneme string into pieces of at most ``hard_max``: at the last
+    space that fits, else hard. For a single word too long for the window
+    (a long number, an ID, a hyphenated compound)."""
+    pieces = []
+    phonemes = phonemes.strip()
+    while len(phonemes) > hard_max:
+        cut = phonemes.rfind(" ", 1, hard_max + 1)
+        if cut <= 0:
+            cut = hard_max
+        pieces.append(phonemes[:cut].strip())
+        phonemes = phonemes[cut:].strip()
+    if phonemes:
+        pieces.append(phonemes)
+    return pieces
+
+
 def pack_pieces(pieces: list[list], target: int, first_target: int | None = None) -> list[list]:
     """Greedily merge consecutive pieces while the phoneme count stays within
     ``target`` (``first_target`` for the first chunk); a single piece may
@@ -129,9 +146,9 @@ def chunk_tokens(tokens, target: int, hard_max: int, first_target: int | None = 
         pieces.extend(_split_long(sentence, hard_max))
     chunks = []
     for group in pack_pieces(pieces, target, first_target):
-        phonemes = _tokens_phonemes(group)
-        if phonemes:
-            chunks.append(Chunk(text=_tokens_text(group), phonemes=phonemes))
+        # only a lone token can still exceed the window: _split_long cuts between tokens
+        text = _tokens_text(group)
+        chunks.extend(Chunk(text=text, phonemes=ps) for ps in split_phonemes(_tokens_phonemes(group), hard_max))
     return chunks
 
 
@@ -143,19 +160,15 @@ def chunk_phoneme_strings(
     cur_text: list[str] = []
     cur_ps: list[str] = []
     limit = target if first_target is None else first_target
-    for text, ps in pairs:
-        ps = ps.strip()
-        if not ps:
-            continue
-        if len(ps) > hard_max:
-            logger.warning("Truncating a %d-phoneme sentence to %d", len(ps), hard_max)
-            ps = ps[:hard_max]
-        if cur_ps and len(" ".join(cur_ps + [ps])) > limit:
-            chunks.append(Chunk(" ".join(cur_text), " ".join(cur_ps)))
-            cur_text, cur_ps = [], []
-            limit = target
-        cur_text.append(text.strip())
-        cur_ps.append(ps)
+    for text, sentence_ps in pairs:
+        for piece, ps in enumerate(split_phonemes(sentence_ps, hard_max)):
+            if cur_ps and len(" ".join(cur_ps + [ps])) > limit:
+                chunks.append(Chunk(" ".join(cur_text), " ".join(cur_ps)))
+                cur_text, cur_ps = [], []
+                limit = target
+            if piece == 0 or not cur_text:
+                cur_text.append(text.strip())
+            cur_ps.append(ps)
     if cur_ps:
         chunks.append(Chunk(" ".join(cur_text), " ".join(cur_ps)))
     return chunks
