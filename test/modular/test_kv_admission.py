@@ -25,6 +25,7 @@ from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import AdmissionDeferred, KVManager
+from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
 
 requires_cuda = pytest.mark.skipif(
@@ -292,6 +293,43 @@ def test_a_guidance_cache_checks_no_room_of_its_own(monkeypatch):
 
     # admitted by the leader, so past what this cache alone would have let in
     assert _step(guidance, "b", 100).ok, "a guidance cache failed the leader's decision"
+
+
+# ── a batch that runs guidance for every row ────────────────────────────
+
+
+def _guided_prefill(kv: KVManager, rids: tuple[str, ...], span: int):
+    """Bagel's prefill_text once one row of the batch needs guidance: every
+    row writes main and cfg_img, and main forks onto cfg_text first."""
+    step = KVStep(
+        segments=tuple(
+            Segment(rid, label, span) for label in ("main", "cfg_img") for rid in rids
+        ),
+        pre_forks=(("main", "cfg_text"),),
+    )
+    ctx = StepContext(request_ids=rids, graph_walk=PREFILL, slot=0, capture=False)
+    assert kv.admit(step, ctx).ok
+    views = kv.plan(step, ctx)
+    kv.commit(step, ctx)
+    return views
+
+
+def test_a_row_the_batch_guides_takes_no_page_its_request_never_counted(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _manager(max_num_pages=32)
+    labels = ["main", "cfg_text", "cfg_img"]
+    guided = _request(list(range(500, 500 + 4 * PAGE_SIZE)), max_tokens=PAGE_SIZE)
+    guided.needed_labels = labels
+    guided.prompt_slots = dict.fromkeys(labels, 4 * PAGE_SIZE)
+    kv.ingest_request("text", _request(list(range(4 * PAGE_SIZE)), max_tokens=PAGE_SIZE))
+    kv.ingest_request("image", guided)
+    assert _ready(kv, "text").ready and _ready(kv, "image").ready
+
+    views = _guided_prefill(kv, ("text", "image"), 4 * PAGE_SIZE)
+
+    assert kv._held_fresh("text") == 4, "the unguided row took pages for the guidance branches"
+    view = next(v for v in views["cfg_img"].views if v.request_id == "text")
+    assert set(view.page_idxs) == {SINK_PAGE}, "the unguided row's cfg_img was planned off the sink"
 
 
 # ── a request moved to the host ─────────────────────────────────────────
