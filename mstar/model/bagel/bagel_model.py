@@ -816,7 +816,7 @@ class BagelModel(Model):
                     max_segments_per_request=1,
                 ),
             ),
-            KVSpec(resource_key="kv", nodes=nodes, config=kv_config),
+            KVSpec(resource_key="kv", nodes=nodes, config=kv_config, leader="LLM"),
             AttentionSpec(
                 resource_key="attn", nodes=nodes,
                 config=AttentionConfig(kv_cache="kv"),

@@ -323,7 +323,7 @@ class KVManager(AttentionResource):
         device: torch.device,
         dtype=torch.bfloat16,
         nodes: set[str] | None = None,
-        alone: bool = True,
+        leads: bool = True,
     ):
         self.config = cfg
         if joint_comm_group is not None:
@@ -392,9 +392,12 @@ class KVManager(AttentionResource):
 
         # the nodes sharing this pool, whose labels a request's reservation covers
         self._nodes = nodes
-        # whether this pool admits by reservation itself: rank 0 of a spec no
-        # other worker shares. The rest reserve what that one admitted
-        self._decides = self._rank == 0 and alone
+        # whether this pool's count stands for the request: the only pool of its
+        # spec, or the spec leader's. A guidance pool under CFG parallel only
+        # reserves what the leader admitted, so no room is checked on it
+        self._leads = leads
+        # and whether it admits by that count itself, as rank 0 of its group
+        self._decides = self._rank == 0 and leads
         self._reserved: dict[str, Reservation] = {}
         # requests that asked and have not reserved, in the order they first asked
         self._waiting: dict[str, None] = {}
@@ -413,7 +416,10 @@ class KVManager(AttentionResource):
             transfer_engine_info=info.transfer_engine_info,
             dtype=info.kv_dtype,
             nodes=spec.nodes if info.nodes is None else info.nodes,
-            alone=info.nodes is None or info.nodes >= spec.nodes,
+            leads=(
+                info.nodes is None or info.nodes >= spec.nodes
+                or spec.leader in info.nodes
+            ),
         )
 
     def build_cuda_graph_buffers(
@@ -1579,11 +1585,13 @@ class KVManager(AttentionResource):
                     for rid, res in self._reserved.items() if held[rid] > res.pages
                 }
                 assert not over, f"requests took more pages than they reserved: {over}"
-                outstanding, supply = self._outstanding(), self._supply()
-                assert outstanding <= supply, (
-                    f"admitted requests may still take {outstanding} pages, but "
-                    f"only {supply} are free or evictable"
-                )
+                # only a pool whose count stands for the request checks the room it promised
+                if self._leads:
+                    outstanding, supply = self._outstanding(), self._supply()
+                    assert outstanding <= supply, (
+                        f"admitted requests may still take {outstanding} pages, but "
+                        f"only {supply} are free or evictable"
+                    )
 
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every TP rank
@@ -1785,7 +1793,7 @@ class KVManager(AttentionResource):
             self._reserved[rid] = self._reservation(rid)
             self._waiting.pop(rid, None)
             self._rooted.pop(rid, None)
-            if _DEBUG_ASSERTS:
+            if _DEBUG_ASSERTS and self._leads:
                 assert self._outstanding() <= self._supply(), (
                     f"KV {self.name}: {rid} was admitted into room this rank does not have"
                 )
@@ -1986,7 +1994,7 @@ class KVManager(AttentionResource):
                 if new_pages is None:
                     pages_short = num_new_pages - self._arena.num_free
                     reserved = self._reserved.get(request_id)
-                    if _DEBUG_ASSERTS and reserved is not None and reserved.exact:
+                    if _DEBUG_ASSERTS and self._leads and reserved is not None and reserved.exact:
                         raise AssertionError(
                             f"KV {self.name}: {request_id}/{label} was admitted on "
                             f"a reservation of {reserved.pages} pages and is "

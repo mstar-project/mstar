@@ -119,6 +119,9 @@ class KVReqConfig(ResourceReqConfig):
 @dataclass
 class KVSpec(NodeResourceSpec):
     config: KVConfig
+    # of nodes on several workers (CFG parallel), the one whose cache admits a
+    # request for all of them; the others hold at most what it does per request
+    leader: str | None = None
 
     @property
     def resource_class(self) -> "type[Resource]":
