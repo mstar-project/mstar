@@ -18,7 +18,7 @@ from mstar.api_server.openai import (
     serving_speech,
     serving_videos,
 )
-from mstar.api_server.openai._util import now
+from mstar.api_server.openai._util import error_type, now
 from mstar.api_server.openai.adapters import get_adapter
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
@@ -58,8 +58,8 @@ def _error(status: int, message: str, type_: str = "invalid_request_error") -> J
 def _exception_error(e: Exception) -> JSONResponse:
     # ValueError/TypeError are bad requests (e.g. an unsupported modality at
     # intake); anything else is ours
-    default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-    return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
+    status = getattr(e, "status_code", 400 if isinstance(e, (ValueError, TypeError)) else 500)
+    return _error(status, str(getattr(e, "detail", e)), error_type(status))
 
 
 def _resolve(require: str):
