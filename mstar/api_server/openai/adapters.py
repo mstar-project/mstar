@@ -24,7 +24,7 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -60,37 +60,47 @@ def flatten_messages(
     ``parts`` is the ordered sequence as written; the other three derive from
     it — text newline-joined, attachments persisted under ``upload_dir`` and
     grouped by modality, ``input_modalities`` the per-part modality sequence.
-    So an attachment's position and a repeated modality both survive.
-    (Multi-turn role structure is flattened — a v1 simplification; the models
-    apply their own prompt formatting in ``process_prompt``.)
+    So an attachment's position and a repeated modality both survive. Each
+    part carries its message's role, so a reply stays its own turn.
     """
     parts: list[PromptPart] = []
     file_paths: dict[str, list[str]] = {}
 
-    def add_file(modality: str, path: str) -> None:
+    def add_file(modality: str, path: str, role: str) -> None:
+        # the layout has no text slot for the turn break the template writes
+        # between two attachments, so an attachment stays in a user turn
+        if role != "user":
+            raise ValueError(f"a {role} message cannot carry a {modality} attachment")
         paths = file_paths.setdefault(modality, [])
-        parts.append(PromptPart(modality=modality, index=len(paths)))
+        parts.append(PromptPart(modality=modality, index=len(paths), role=role))
         paths.append(path)
 
-    def add_text(text: str) -> None:
+    def add_text(text: str, role: str) -> None:
         # Adjacent text parts were newline-joined before ordering was kept;
-        # merge them here so only text an attachment separates gets its own
-        # part, and the rendered prompt keeps the separator it used to have.
-        if parts and parts[-1].modality == "text":
-            parts[-1] = PromptPart(
-                modality="text", text=f"{parts[-1].text}\n{text}"
-            )
+        # merge them here, across messages of one role too (the layout has no
+        # slot for the boundary between them), so only text an attachment or a
+        # role change separates gets its own part, and the rendered prompt
+        # keeps the separator it used to have.
+        if parts and parts[-1].modality == "text" and parts[-1].role == role:
+            parts[-1] = replace(parts[-1], text=f"{parts[-1].text}\n{text}")
             return
-        parts.append(PromptPart(modality="text", text=text))
+        parts.append(PromptPart(modality="text", text=text, role=role))
 
     for msg in messages or []:
         # Messages may be pydantic ChatMessage objects or plain dicts.
-        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        if isinstance(msg, dict):
+            role, content = msg.get("role"), msg.get("content")
+        else:
+            role, content = getattr(msg, "role", None), getattr(msg, "content", None)
+        # any other role reads as user, where every message went before, not as
+        # itself: Qwen3-Omni's template drops a developer message, text and all
+        if role not in ("system", "assistant"):
+            role = "user"
         if content is None:
             continue
         if isinstance(content, str):
             if content:
-                add_text(content)
+                add_text(content, role)
             continue
         for part in content:
             if not isinstance(part, dict):
@@ -98,28 +108,28 @@ def flatten_messages(
             ptype = part.get("type")
             if ptype == "text":
                 if part.get("text"):
-                    add_text(part["text"])
+                    add_text(part["text"], role)
             elif ptype == "image_url":
                 url = (part.get("image_url") or {}).get("url", "")
                 if url:
                     mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "image", path)
+                    add_file(mod or "image", path, role)
             elif ptype == "video_url":  # extension for video-capable models
                 url = (part.get("video_url") or {}).get("url", "")
                 if url:
                     mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "video", path)
+                    add_file(mod or "video", path, role)
             elif ptype == "audio_url":  # data:/http audio input (vllm-omni content style)
                 url = (part.get("audio_url") or {}).get("url", "")
                 if url:
                     mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
-                    add_file(mod or "audio", path)
+                    add_file(mod or "audio", path, role)
             elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
                 ia = part.get("input_audio") or {}
                 data, fmt = ia.get("data"), ia.get("format", "wav")
                 if data:
                     mod, path = media_io.save_base64(data, fmt, "audio", upload_dir)
-                    add_file(mod, path)
+                    add_file(mod, path, role)
 
     text_parts = [p.text for p in parts if p.modality == "text"]
     text = "\n".join(text_parts) if text_parts else None

@@ -31,12 +31,15 @@ class PromptPart:
     """One element of a prompt, in request order.
 
     ``index`` is the position within its own modality's list, so a media part
-    addresses ``tensors[f"{modality}_inputs"][index]``.
+    addresses ``tensors[f"{modality}_inputs"][index]``. ``role`` is the chat
+    role of the message the part came from, ``None`` from entrypoints with no
+    messages.
     """
 
     modality: str
     text: str | None = None
     index: int = 0
+    role: str | None = None
 
 
 @dataclass(frozen=True)
