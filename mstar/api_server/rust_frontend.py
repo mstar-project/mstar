@@ -9,9 +9,10 @@ protocol are untouched):
 
     frontend -> bridge:  {t:"submit", rid, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
-                          streaming} | {t:"abort", rid}
-    bridge -> frontend:  {t:"chunk", rid, modality, data(bin), metadata}
-                       | {t:"err", rid, msg} | {t:"done", rid}
+                          streaming} | {t:"abort", rid} | {t:"ping", rid}
+    bridge -> frontend:  {t:"ok", rid} (past intake; sent before any chunk)
+                       | {t:"chunk", rid, modality, data(bin), metadata}
+                       | {t:"err", rid, msg} | {t:"done", rid} | {t:"pong", rid}
 
 The submit shape is ``APIServer.submit_request``'s signature verbatim — the
 protocol was designed by flattening it. The bridge mesh lives in its own

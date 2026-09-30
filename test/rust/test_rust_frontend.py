@@ -4,6 +4,7 @@ stubbed — proves the HTTP surface, the msgpack bridge protocol, and the
 error path end to end without GPUs. Skipped unless the ``mstar_rust``
 extension is installed and the server binary is built
 (``cargo build --release`` in ``rust/server/``)."""
+import asyncio
 import contextlib
 import json
 import socket
@@ -530,6 +531,54 @@ def test_nonstreaming_backend_error_maps_to_real_status():
             json.dumps({"model": "qwen3_omni",
                         "messages": [{"role": "user", "content": "hi"}]}).encode())
         assert code == 400, (code, body)
+
+
+class _SlowFirstChunkStub(_StubAPIServer):
+    """The first output lands well after intake, like a long prefill."""
+
+    async def iter_result_chunks(self, request_id):
+        await asyncio.sleep(2.0)
+        async for c in super().iter_result_chunks(request_id):
+            yield c
+
+
+def _sse_events(port, body, timeout=15):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions",
+        data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    t0 = time.monotonic()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        headers_s = time.monotonic() - t0
+        lines = r.read().decode().splitlines()
+    return headers_s, [json.loads(ln[6:]) for ln in lines if ln.startswith("data: {")]
+
+
+def test_streaming_headers_go_out_at_intake_not_first_output():
+    # the intake ack commits the 200; without it the headers wait for output
+    body = {"model": "qwen3_omni", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}
+    with _model_stack("qwen3_omni", _SlowFirstChunkStub()) as (port, _up):
+        headers_s, events = _sse_events(port, body)
+    assert headers_s < 1.0, headers_s
+    assert "".join(e["choices"][0]["delta"].get("content") or "" for e in events) == "Hello world"
+
+
+def test_a_mid_stream_error_is_typed_by_its_status():
+    body = {"model": "qwen3_omni", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}
+    for status, type_ in ((400, "invalid_request_error"), (500, "server_error")):
+        with _model_stack("qwen3_omni", _ErrorChunkStub(status)) as (port, _up):
+            _, events = _sse_events(port, body)
+        (err,) = [e["error"] for e in events if "error" in e]
+        assert (err["type"], err["code"]) == (type_, status)
+
+
+def test_streaming_speech_intake_rejection_is_a_400():
+    # the WAV header is a 200 once sent, so the rejection has to land first
+    with _model_stack("orpheus", _StubAPIServer()) as (port, _up):
+        code, body = _post_raw(port, "/v1/audio/speech", json.dumps(
+            {"model": "orpheus", "input": "hologram", "stream": True}).encode())
+    assert code == 400 and "does not support" in body["error"]["message"]
 
 
 def test_images_generations_on_cosmos3():
