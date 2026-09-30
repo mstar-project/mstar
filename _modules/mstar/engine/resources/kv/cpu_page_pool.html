@@ -610,6 +610,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -891,7 +892,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">cpu_page_indices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
     <span class="n">stored_len</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">position</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="n">released</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span></div>
+    <span class="n">released</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">protected_prefix</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span></div>
 
 
 
@@ -956,6 +958,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">stored_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">position</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">released</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
+        <span class="n">protected_prefix</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Copy device pages to the host. False when the host pool is full,</span>
 <span class="sd">        in which case nothing moved and the caller keeps its device pages."""</span>
@@ -972,6 +975,10 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span> <span class="kc">False</span>
 
         <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_stream</span><span class="p">()</span>
+        <span class="c1"># The compute stream may still be running the step that last touched</span>
+        <span class="c1"># these pages (a commit hands pages on right after the launch). Queue</span>
+        <span class="c1"># the copies behind it, or they could read a page mid-write.</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">())</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">stream</span><span class="p">):</span>
             <span class="k">for</span> <span class="n">gpu_idx</span><span class="p">,</span> <span class="n">cpu_idx</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">gpu_page_indices</span><span class="p">,</span> <span class="n">cpu_pages</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
                 <span class="c1"># every layer of the page at once: cpu[:, cpu] = gpu[:, gpu]</span>
@@ -984,6 +991,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">stored_len</span><span class="o">=</span><span class="n">stored_len</span><span class="p">,</span>
             <span class="n">position</span><span class="o">=</span><span class="n">position</span><span class="p">,</span>
             <span class="n">released</span><span class="o">=</span><span class="n">released</span><span class="p">,</span>
+            <span class="n">protected_prefix</span><span class="o">=</span><span class="n">protected_prefix</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="k">return</span> <span class="kc">True</span></div>
 
@@ -1007,6 +1015,9 @@ window.runMermaid = runMermaid;</script>
             <span class="k">del</span> <span class="bp">self</span><span class="o">.</span><span class="n">offloaded</span><span class="p">[</span><span class="n">rid</span><span class="p">]</span>
 
         <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_stream</span><span class="p">()</span>
+        <span class="c1"># Same ordering as the offload: the device pages we write may have</span>
+        <span class="c1"># been released by a commit whose kernels are still reading them.</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">wait_stream</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">())</span>
         <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="n">stream</span><span class="p">):</span>
             <span class="k">for</span> <span class="n">cpu_idx</span><span class="p">,</span> <span class="n">gpu_idx</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
                 <span class="n">state</span><span class="o">.</span><span class="n">cpu_page_indices</span><span class="p">,</span> <span class="n">gpu_page_indices</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span>

@@ -610,6 +610,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -880,7 +881,13 @@ window.runMermaid = runMermaid;</script>
     <span class="n">PublishedInfo</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.cache</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVCache</span><span class="p">,</span> <span class="n">PageAllocator</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVConfig</span><span class="p">,</span> <span class="n">KVReqConfig</span><span class="p">,</span> <span class="n">KVSpec</span><span class="p">,</span> <span class="n">KVStep</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">KVConfig</span><span class="p">,</span>
+    <span class="n">KVReqConfig</span><span class="p">,</span>
+    <span class="n">KVSpec</span><span class="p">,</span>
+    <span class="n">KVStep</span><span class="p">,</span>
+    <span class="n">RetentionPolicy</span><span class="p">,</span>
+<span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.cpu_page_pool</span><span class="w"> </span><span class="kn">import</span> <span class="n">CPUPagePool</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">fingerprint</span><span class="p">,</span> <span class="n">page_key</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.plan</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
@@ -987,17 +994,6 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<div class="viewcode-block" id="RetentionPolicy">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.RetentionPolicy">[docs]</a>
-<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">RetentionPolicy</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""fifo retention of `context_budget`"""</span>
-    <span class="n">context_budget</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="c1"># front tokens the window never releases; only pages within them are indexed</span>
-    <span class="n">protected_prefix</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span></div>
-
-
-
 <div class="viewcode-block" id="PrefixChain">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.PrefixChain">[docs]</a>
 <span class="nd">@dataclass</span>
@@ -1064,7 +1060,15 @@ window.runMermaid = runMermaid;</script>
     <span class="n">page_indices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
     <span class="n">stored_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">position</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># tokens compacted out of the front by `release_oldest` so far; the</span>
+    <span class="c1"># stream's committed content is then `[0, protected_prefix) + the newest</span>
+    <span class="c1"># (stored_len - protected_prefix)` tokens of what was written</span>
     <span class="n">released</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># the first `protected_prefix` committed tokens (a text prefix, say) are</span>
+    <span class="c1"># never released; set once, after they commit (`protect_prefix`)</span>
+    <span class="n">protected_prefix</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># the policy the last committing step declared for this stream</span>
+    <span class="c1"># (`KVStep.retention`): the index caps at its prefix, `reset` clears it</span>
     <span class="n">retention</span><span class="p">:</span> <span class="n">RetentionPolicy</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">read_pending</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">read_future</span><span class="p">:</span> <span class="n">Future</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1092,6 +1096,8 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">position</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">released</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">retention</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">generation</span> <span class="o">+=</span> <span class="mi">1</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">step_in_flight</span> <span class="o">=</span> <span class="kc">False</span>
 
@@ -1123,7 +1129,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">generation</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">stored_len</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">position</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="n">released</span><span class="p">:</span> <span class="nb">int</span></div>
+    <span class="n">released</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">protected_prefix</span><span class="p">:</span> <span class="nb">int</span></div>
 
 
 
@@ -1833,7 +1840,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="p">)</span>
             <span class="k">if</span> <span class="n">_DEBUG_ASSERTS</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">assert_pages_conserved</span><span class="p">()</span>
-        <span class="c1"># TODO: apply retention policy</span>
+        <span class="c1"># retention is applied at commit (see `_apply_retention`)</span>
 
         <span class="k">return</span> <span class="n">ADMIT_OK</span></div>
 
@@ -2081,10 +2088,23 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">+=</span> <span class="n">segment</span><span class="o">.</span><span class="n">span</span>
                     <span class="c1"># committed, so there is no refused admit left for a re-probe to answer</span>
                     <span class="n">stream</span><span class="o">.</span><span class="n">converted</span> <span class="o">=</span> <span class="kc">False</span>
+                    <span class="n">policy</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">retention</span><span class="o">.</span><span class="n">get</span><span class="p">((</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="p">,</span> <span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="p">))</span>
+                    <span class="k">if</span> <span class="n">policy</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_adopt_retention</span><span class="p">(</span><span class="n">stream</span><span class="p">,</span> <span class="n">policy</span><span class="p">,</span> <span class="n">segment</span><span class="p">)</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_index_filled_pages</span><span class="p">(</span><span class="n">segment</span><span class="p">,</span> <span class="n">stream</span><span class="p">,</span> <span class="n">ctx</span><span class="p">)</span>
                     <span class="c1"># so a claim taken in a window the mark misses still fails</span>
                     <span class="c1"># `_commit_offload`'s generation guard</span>
                     <span class="n">stream</span><span class="o">.</span><span class="n">generation</span> <span class="o">+=</span> <span class="mi">1</span>
+                    <span class="c1"># The step's retention, if it declared one: drop what aged</span>
+                    <span class="c1"># past the context budget now that this step's tokens</span>
+                    <span class="c1"># count. Here, under the lock and before `commit_done`</span>
+                    <span class="c1"># lets the next step pre-plan, so no admitted plan</span>
+                    <span class="c1"># addresses the pages this frees (this step's own kernels</span>
+                    <span class="c1"># may still be reading them, but every later user of the</span>
+                    <span class="c1"># pages queues behind them on the node's stream, the host</span>
+                    <span class="c1"># pool's copies included)</span>
+                    <span class="k">if</span> <span class="n">policy</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="bp">self</span><span class="o">.</span><span class="n">_apply_retention</span><span class="p">(</span><span class="n">stream</span><span class="p">,</span> <span class="n">policy</span><span class="p">)</span>
             <span class="c1"># post-forks copy what this step just wrote, so they land after the</span>
             <span class="c1"># spans above are counted</span>
             <span class="k">for</span> <span class="p">(</span><span class="n">from_label</span><span class="p">,</span> <span class="n">to_label</span><span class="p">)</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">post_forks</span><span class="p">:</span>
@@ -2093,7 +2113,133 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="n">_DEBUG_ASSERTS</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">assert_pages_conserved</span><span class="p">()</span></div>
 
-        <span class="c1"># TODO: handle retention policy, free pages if not commit</span>
+
+    <span class="c1"># Partial release behind a protected prefix (windowed generation): a</span>
+    <span class="c1"># request that generates in windows commits each window's K/V and, once</span>
+    <span class="c1"># its context horizon fills, drops the oldest generated pages while the</span>
+    <span class="c1"># prompt prefix stays. Two routes to the same page-floored front release:</span>
+    <span class="c1"># a `RetentionPolicy` the committing step declares (`KVStep.retention`),</span>
+    <span class="c1"># applied inside that commit — the served route, safe under pre-planning —</span>
+    <span class="c1"># and the explicit `protect_prefix` / `release_oldest` pair for a driver</span>
+    <span class="c1"># that runs between steps. Ported from #198's PagedAllocationManager</span>
+    <span class="c1"># (merceod) onto the pool's streams.</span>
+
+<div class="viewcode-block" id="KVManager.protect_prefix">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.protect_prefix">[docs]</a>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">protect_prefix</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Mark the first ``num_tokens`` committed tokens of the stream as never</span>
+<span class="sd">        releasable. Set once, after the prefix commits and before any release;</span>
+<span class="sd">        idempotent at the same value."""</span>
+        <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_default_label</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="n">request_id</span><span class="p">][</span><span class="n">label</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">num_tokens</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">num_tokens</span> <span class="o">&gt;</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"protect_prefix(</span><span class="si">{</span><span class="n">num_tokens</span><span class="si">}</span><span class="s2">) outside the committed </span><span class="si">{</span><span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span><span class="si">}</span><span class="s2"> "</span>
+                    <span class="sa">f</span><span class="s2">"tokens of request </span><span class="si">{</span><span class="n">request_id</span><span class="si">!r}</span><span class="s2"> label </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2">"</span>
+                <span class="p">)</span>
+            <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">released</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"protect_prefix must precede any release_oldest for request "</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">request_id</span><span class="si">!r}</span><span class="s2"> label </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2">"</span>
+                <span class="p">)</span>
+            <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"protected prefix already </span><span class="si">{</span><span class="n">stream</span><span class="o">.</span><span class="n">protected_prefix</span><span class="si">}</span><span class="s2"> tokens for "</span>
+                    <span class="sa">f</span><span class="s2">"request </span><span class="si">{</span><span class="n">request_id</span><span class="si">!r}</span><span class="s2"> label </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2">, got </span><span class="si">{</span><span class="n">num_tokens</span><span class="si">}</span><span class="s2">"</span>
+                <span class="p">)</span>
+            <span class="n">stream</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="o">=</span> <span class="n">num_tokens</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_adopt_retention</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">CacheStream</span><span class="p">,</span> <span class="n">policy</span><span class="p">:</span> <span class="n">RetentionPolicy</span><span class="p">,</span> <span class="n">segment</span><span class="p">:</span> <span class="n">Segment</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Take the policy a committing step declares for its stream: the</span>
+<span class="sd">        protected prefix must be committed and agree with any earlier one</span>
+<span class="sd">        (`protect_prefix`, or the previous window's). The budget may change</span>
+<span class="sd">        between windows. Under the lock."""</span>
+        <span class="k">if</span> <span class="n">policy</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="o">&gt;</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"retention for request </span><span class="si">{</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="si">!r}</span><span class="s2"> label </span><span class="si">{</span><span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="si">!r}</span><span class="s2"> "</span>
+                <span class="sa">f</span><span class="s2">"protects </span><span class="si">{</span><span class="n">policy</span><span class="o">.</span><span class="n">protected_prefix</span><span class="si">}</span><span class="s2"> tokens but only "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span><span class="si">}</span><span class="s2"> are committed"</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">policy</span><span class="o">.</span><span class="n">protected_prefix</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"protected prefix already </span><span class="si">{</span><span class="n">stream</span><span class="o">.</span><span class="n">protected_prefix</span><span class="si">}</span><span class="s2"> tokens for "</span>
+                <span class="sa">f</span><span class="s2">"request </span><span class="si">{</span><span class="n">segment</span><span class="o">.</span><span class="n">request_id</span><span class="si">!r}</span><span class="s2"> label </span><span class="si">{</span><span class="n">segment</span><span class="o">.</span><span class="n">label</span><span class="si">!r}</span><span class="s2">, got "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">policy</span><span class="o">.</span><span class="n">protected_prefix</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="o">=</span> <span class="n">policy</span><span class="o">.</span><span class="n">protected_prefix</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">retention</span> <span class="o">=</span> <span class="n">policy</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_apply_retention</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">CacheStream</span><span class="p">,</span> <span class="n">policy</span><span class="p">:</span> <span class="n">RetentionPolicy</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Release what the step's policy no longer keeps. Under the lock."""</span>
+        <span class="n">excess</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">-</span> <span class="n">policy</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="o">-</span> <span class="n">policy</span><span class="o">.</span><span class="n">context_budget</span>
+        <span class="k">if</span> <span class="n">excess</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span> <span class="mi">0</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_release_oldest_locked</span><span class="p">(</span><span class="n">stream</span><span class="p">,</span> <span class="n">excess</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_release_oldest_locked</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stream</span><span class="p">:</span> <span class="n">CacheStream</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The page-floored front release shared by ``release_oldest`` and the</span>
+<span class="sd">        commit-time retention. Under the lock."""</span>
+        <span class="n">page_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">page_size</span>
+        <span class="n">first</span> <span class="o">=</span> <span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="o">+</span> <span class="n">page_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="n">page_size</span>
+        <span class="n">releasable</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">//</span> <span class="n">page_size</span> <span class="o">-</span> <span class="n">first</span>
+        <span class="n">k</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">num_tokens</span> <span class="o">//</span> <span class="n">page_size</span><span class="p">,</span> <span class="n">releasable</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">k</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span> <span class="mi">0</span>
+        <span class="n">freed</span> <span class="o">=</span> <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">[</span><span class="n">first</span><span class="p">:</span><span class="n">first</span> <span class="o">+</span> <span class="n">k</span><span class="p">]</span>
+        <span class="k">del</span> <span class="n">stream</span><span class="o">.</span><span class="n">page_indices</span><span class="p">[</span><span class="n">first</span><span class="p">:</span><span class="n">first</span> <span class="o">+</span> <span class="n">k</span><span class="p">]</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">-=</span> <span class="n">k</span> <span class="o">*</span> <span class="n">page_size</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">released</span> <span class="o">+=</span> <span class="n">k</span> <span class="o">*</span> <span class="n">page_size</span>
+        <span class="n">stream</span><span class="o">.</span><span class="n">generation</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_arena</span><span class="o">.</span><span class="n">release</span><span class="p">(</span><span class="n">freed</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">k</span> <span class="o">*</span> <span class="n">page_size</span>
+
+<div class="viewcode-block" id="KVManager.release_oldest">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.manager.html#mstar.engine.resources.kv.manager.KVManager.release_oldest">[docs]</a>
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">release_oldest</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Free the oldest unprotected committed tokens of a live stream, whole</span>
+<span class="sd">        pages only, compacting the page list so the remaining stream stays</span>
+<span class="sd">        contiguous in page-list order. Returns the tokens actually freed.</span>
+
+<span class="sd">        The freed span starts at the first page fully past the protected</span>
+<span class="sd">        prefix; a page straddling the protection boundary and a partially</span>
+<span class="sd">        filled tail page are never freed, so the realized release can fall</span>
+<span class="sd">        short of ``num_tokens`` by up to a page — callers re-offer the</span>
+<span class="sd">        shortfall next time (see ``WindowedKVSession``). ``stored_len`` drops</span>
+<span class="sd">        by exactly the freed count and ``generation`` moves, so a prefix a</span>
+<span class="sd">        backend gathered out of these pages is re-read (the dense backend keys</span>
+<span class="sd">        its gathered prefix on it). Positions are not touched: the tokens that</span>
+<span class="sd">        remain keep the absolute positions their K/V was written with.</span>
+
+<span class="sd">        Refused under an admitted step (its plan addresses these pages) and</span>
+<span class="sd">        while the stream is offloaded or being retrieved.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="n">label</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_default_label</span>
+        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+            <span class="n">stream</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streams</span><span class="p">[</span><span class="n">request_id</span><span class="p">][</span><span class="n">label</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">step_in_flight</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"release_oldest on request </span><span class="si">{</span><span class="n">request_id</span><span class="si">!r}</span><span class="s2"> label </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2"> under an "</span>
+                    <span class="s2">"admitted step; release between steps"</span>
+                <span class="p">)</span>
+            <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">offloaded</span> <span class="ow">or</span> <span class="n">stream</span><span class="o">.</span><span class="n">read_pending</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"release_oldest on request </span><span class="si">{</span><span class="n">request_id</span><span class="si">!r}</span><span class="s2"> label </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2"> while its "</span>
+                    <span class="s2">"pages are offloaded or in transfer"</span>
+                <span class="p">)</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_release_oldest_locked</span><span class="p">(</span><span class="n">stream</span><span class="p">,</span> <span class="n">num_tokens</span><span class="p">)</span></div>
+
 
     <span class="c1"># Eviction</span>
 
@@ -2155,6 +2301,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">gpu_page_indices</span><span class="o">=</span><span class="n">claim</span><span class="o">.</span><span class="n">pages</span><span class="p">,</span>
                     <span class="n">stored_len</span><span class="o">=</span><span class="n">claim</span><span class="o">.</span><span class="n">stored_len</span><span class="p">,</span> <span class="n">position</span><span class="o">=</span><span class="n">claim</span><span class="o">.</span><span class="n">position</span><span class="p">,</span>
                     <span class="n">released</span><span class="o">=</span><span class="n">claim</span><span class="o">.</span><span class="n">released</span><span class="p">,</span>
+                    <span class="n">protected_prefix</span><span class="o">=</span><span class="n">claim</span><span class="o">.</span><span class="n">protected_prefix</span><span class="p">,</span>
                 <span class="p">)</span>
             <span class="p">]</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="n">moved</span><span class="p">:</span>
@@ -2198,6 +2345,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">stored_len</span><span class="o">=</span><span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span><span class="p">,</span>
                     <span class="n">position</span><span class="o">=</span><span class="n">stream</span><span class="o">.</span><span class="n">position</span><span class="p">,</span>
                     <span class="n">released</span><span class="o">=</span><span class="n">stream</span><span class="o">.</span><span class="n">released</span><span class="p">,</span>
+                    <span class="n">protected_prefix</span><span class="o">=</span><span class="n">stream</span><span class="o">.</span><span class="n">protected_prefix</span><span class="p">,</span>
                 <span class="p">))</span>
                 <span class="k">if</span> <span class="n">stream</span><span class="o">.</span><span class="n">read_future</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="n">read_futures</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">stream</span><span class="o">.</span><span class="n">read_future</span><span class="p">)</span>
@@ -2292,6 +2440,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">stream</span><span class="o">.</span><span class="n">stored_len</span> <span class="o">=</span> <span class="n">state</span><span class="o">.</span><span class="n">stored_len</span>
                 <span class="n">stream</span><span class="o">.</span><span class="n">position</span> <span class="o">=</span> <span class="n">state</span><span class="o">.</span><span class="n">position</span>
                 <span class="n">stream</span><span class="o">.</span><span class="n">released</span> <span class="o">=</span> <span class="n">state</span><span class="o">.</span><span class="n">released</span>
+                <span class="n">stream</span><span class="o">.</span><span class="n">protected_prefix</span> <span class="o">=</span> <span class="n">state</span><span class="o">.</span><span class="n">protected_prefix</span>
                 <span class="n">stream</span><span class="o">.</span><span class="n">offloaded</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="c1"># sync outside the lock: orders the reload H2D copies before attention</span>
         <span class="c1"># reads them, but the pages are already assigned so it touches no</span>

@@ -257,6 +257,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.engine.windowing.html">mstar.engine.windowing</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -587,6 +588,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream"><code class="docutils literal notranslate"><span class="pre">OffloadedStream</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.cpu_page_indices"><code class="docutils literal notranslate"><span class="pre">OffloadedStream.cpu_page_indices</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.position"><code class="docutils literal notranslate"><span class="pre">OffloadedStream.position</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.protected_prefix"><code class="docutils literal notranslate"><span class="pre">OffloadedStream.protected_prefix</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.released"><code class="docutils literal notranslate"><span class="pre">OffloadedStream.released</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.stored_len"><code class="docutils literal notranslate"><span class="pre">OffloadedStream.stored_len</span></code></a></li>
 </ul>
@@ -704,7 +706,7 @@ these host pages go back to the pool.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.cpu_page_pool.CPUPagePool.offload_stream">
-<span class="sig-name descname"><span class="pre">offload_stream</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gpu_kv_cache</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gpu_page_indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stored_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">released</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/cpu_page_pool.html#CPUPagePool.offload_stream"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.cpu_page_pool.CPUPagePool.offload_stream" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">offload_stream</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gpu_kv_cache</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gpu_page_indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stored_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">released</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">protected_prefix</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/cpu_page_pool.html#CPUPagePool.offload_stream"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.cpu_page_pool.CPUPagePool.offload_stream" title="Link to this definition">#</a></dt>
 <dd><p>Copy device pages to the host. False when the host pool is full,
 in which case nothing moved and the caller keeps its device pages.</p>
 <dl class="field-list simple">
@@ -717,6 +719,7 @@ in which case nothing moved and the caller keeps its device pages.</p>
 <li><p><strong>stored_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>position</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>released</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>protected_prefix</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -777,7 +780,7 @@ a reload the attention kernels read them.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.cpu_page_pool.OffloadedStream">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.cpu_page_pool.</span></span><span class="sig-name descname"><span class="pre">OffloadedStream</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">cpu_page_indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stored_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">released</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/cpu_page_pool.html#OffloadedStream"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.cpu_page_pool.</span></span><span class="sig-name descname"><span class="pre">OffloadedStream</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">cpu_page_indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stored_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">released</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">protected_prefix</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/cpu_page_pool.html#OffloadedStream"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>One (request, label) stream living on the host.</p>
 <dl class="field-list simple">
@@ -787,6 +790,7 @@ a reload the attention kernels read them.</p>
 <li><p><strong>stored_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>position</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>released</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>protected_prefix</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -798,6 +802,11 @@ a reload the attention kernels read them.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.position">
 <span class="sig-name descname"><span class="pre">position</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.position" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.protected_prefix">
+<span class="sig-name descname"><span class="pre">protected_prefix</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.protected_prefix" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -876,6 +885,7 @@ a reload the attention kernels read them.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream"><code class="docutils literal notranslate"><span class="pre">OffloadedStream</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.cpu_page_indices"><code class="docutils literal notranslate"><span class="pre">OffloadedStream.cpu_page_indices</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.position"><code class="docutils literal notranslate"><span class="pre">OffloadedStream.position</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.protected_prefix"><code class="docutils literal notranslate"><span class="pre">OffloadedStream.protected_prefix</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.released"><code class="docutils literal notranslate"><span class="pre">OffloadedStream.released</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.cpu_page_pool.OffloadedStream.stored_len"><code class="docutils literal notranslate"><span class="pre">OffloadedStream.stored_len</span></code></a></li>
 </ul>

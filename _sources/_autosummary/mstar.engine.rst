@@ -38,4 +38,5 @@
    cuda_graph_runner
    engine
    resources
+   windowing
 

@@ -22,6 +22,7 @@ mstar.engine.resources.kv.config
       KVReqConfig
       KVSpec
       KVStep
+      RetentionPolicy
    
    
 
