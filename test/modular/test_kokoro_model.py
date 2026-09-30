@@ -267,6 +267,36 @@ def test_voice_registry_blends(voices_dir):
         registry.resolve("")
 
 
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "-af_heart",  # negated style: 40 s of near-full-scale noise on the real model
+        "af_heart-af_heart",  # cancels to a zero style
+        "af_heart(1)-af_sky(2)",
+        "af_heart(" + "9" * 400 + ")+af_sky",  # parses to inf, normalizes to NaN
+    ],
+)
+def test_voice_registry_rejects_degenerate_blends(voices_dir, spec):
+    registry = VoiceRegistry(voices_dir, pack_rows=510, style_dim=8)
+    with pytest.raises(ValueError):
+        registry.resolve(spec)
+
+
+def test_voice_registry_blend_cache_is_bounded(voices_dir, monkeypatch):
+    from mstar.model.kokoro import voices
+
+    monkeypatch.setattr(voices, "MAX_CACHED_BLENDS", 4)
+    registry = VoiceRegistry(voices_dir, pack_rows=510, style_dim=8)
+    for i in range(10):
+        registry.resolve(f"af_heart({i + 1})+af_sky")
+    assert list(registry._blends) == [f"af_heart({i + 1})+af_sky" for i in range(6, 10)]
+    registry.resolve("af_heart(7)+af_sky")  # a hit moves to the back of the eviction order
+    registry.resolve("am_adam+af_sky")
+    assert "af_heart(7)+af_sky" in registry._blends and "af_heart(8)+af_sky" not in registry._blends
+    # single voices come from the pack cache and never take a blend slot
+    assert registry.resolve("af_sky") is registry.pack("af_sky") and "af_sky" not in registry._blends
+
+
 # --------------------------------------------------------------------------
 # G2P chunking
 # --------------------------------------------------------------------------
@@ -299,9 +329,23 @@ def test_long_sentence_is_split_at_clauses_then_words():
     chunks = g2p.chunk_tokens(tokens, target=8, hard_max=16)
     assert all(len(c.phonemes) <= 16 for c in chunks)
     assert " ".join(c.phonemes for c in chunks) == "aaaa bbbb, cccc dddd; eeee ffff."
-    # a single word longer than the window still gets cut rather than dropped
+    # a single word longer than the window is cut to fit rather than dropped
     huge = [_tok("x" * 40, whitespace="")]
-    assert [len(c.phonemes) for c in g2p.chunk_tokens(huge, target=8, hard_max=16)] == [40]
+    assert [len(c.phonemes) for c in g2p.chunk_tokens(huge, target=8, hard_max=16)] == [16, 16, 8]
+
+
+def test_no_chunk_exceeds_the_window():
+    # a spelled-out long number is one token with spaces inside: cut at the last space that fits
+    number = _sentence(["naɪn " * 12])
+    chunks = g2p.chunk_tokens(_sentence(["ab"]) + number, target=8, hard_max=16)
+    assert all(len(c.phonemes) <= 16 for c in chunks)
+    assert " ".join(c.phonemes for c in chunks).split() == ["ab."] + ["naɪn"] * 12 + ["."]
+    assert g2p.split_phonemes("aaaa bbbb cccc", 9) == ["aaaa bbbb", "cccc"]
+    assert g2p.split_phonemes("  ", 9) == []
+    # the string-level G2P (espeak, ja, zh) splits too instead of truncating
+    chunks = g2p.chunk_phoneme_strings([("A.", "a" * 20), ("B.", "bb.")], target=8, hard_max=8)
+    assert [c.phonemes for c in chunks] == ["a" * 8, "a" * 8, "aaaa bb."]
+    assert [c.text for c in chunks] == ["A.", "A.", "A. B."]
 
 
 def test_chunk_phoneme_strings_packs_sentences():
@@ -454,6 +498,10 @@ def test_process_prompt_validation(voices_dir):
     model.g2p = _StubG2P([Chunk("", "a")] * 9)
     with pytest.raises(ValueError, match="chunks"):
         model.process_prompt("many", ["text"], ["audio"])
+    # a chunk past the PL-BERT window never reaches the worker, whatever the G2P did
+    model.g2p = _StubG2P([Chunk("", "a" * (model.config.max_phonemes + 1))])
+    with pytest.raises(RuntimeError, match="window"):
+        model.process_prompt("long", ["text"], ["audio"])
 
 
 def test_voices_and_requests_follow_the_installed_g2p(voices_dir):

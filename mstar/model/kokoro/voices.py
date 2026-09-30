@@ -5,15 +5,22 @@ count; a request's style is the row for its chunk's phoneme-string length. A
 blend is a weighted sum of packs, spelled ``af_bella+af_sky`` (equal weights),
 ``af_bella(2)+af_sky(1)`` or ``af_bella-am_adam(0.5)`` (Kokoro-FastAPI's syntax;
 weights are normalized by their absolute sum), or ``af_bella,af_sky`` (the
-``kokoro`` package's comma mean).
+``kokoro`` package's comma mean). Subtraction only steers a blend: the positive
+weights must outweigh the negative ones, since a negated or cancelled style
+decodes to loud noise.
 """
 
 from __future__ import annotations
 
+import math
 import re
+from collections import OrderedDict
 from pathlib import Path
 
 import torch
+
+# Blends cached by spec string; bounded, since a client can send endlessly many distinct specs.
+MAX_CACHED_BLENDS = 64
 
 _TERM = re.compile(r"^\s*([A-Za-z0-9_.\-]+?)\s*(?:\(\s*([0-9]*\.?[0-9]+)\s*\))?\s*$")
 
@@ -24,7 +31,7 @@ class VoiceRegistry:
         self._pack_rows = pack_rows
         self._style_dim = style_dim
         self._packs: dict[str, torch.Tensor] = {}
-        self._blends: dict[str, torch.Tensor] = {}
+        self._blends: OrderedDict[str, torch.Tensor] = OrderedDict()
         if not self._dir.is_dir():
             raise FileNotFoundError(f"Kokoro voices directory not found: {self._dir}")
         self._names = sorted(p.stem for p in self._dir.glob("*.pt"))
@@ -71,21 +78,32 @@ class VoiceRegistry:
                 if match is None:
                     raise ValueError(f"Cannot parse voice term {part!r} in {spec!r}")
                 name, weight = match.group(1), match.group(2)
-                terms.append((name, sign * (float(weight) if weight else 1.0)))
+                value = float(weight) if weight else 1.0
+                if not math.isfinite(value):
+                    raise ValueError(f"Voice {name!r} in {spec[:80]!r} has a weight that is not a finite number")
+                terms.append((name, sign * value))
         if not terms:
             raise ValueError(f"Cannot parse voice {spec!r}")
         return terms
 
     def resolve(self, spec: str) -> torch.Tensor:
-        """Style table for a voice or blend spec, cached by spec string."""
+        """Style table for a voice or blend spec; blends are cached by spec string."""
+        if spec in self._names:
+            return self.pack(spec)
         table = self._blends.get(spec)
-        if table is None:
-            terms = self.parse_blend(spec)
-            total = sum(abs(w) for _, w in terms)
-            if total == 0:
-                raise ValueError(f"Voice blend {spec!r} has zero total weight")
-            table = sum((w / total) * self.pack(name) for name, w in terms)
-            self._blends[spec] = table
+        if table is not None:
+            self._blends.move_to_end(spec)
+            return table
+        terms = self.parse_blend(spec)
+        total = sum(abs(w) for _, w in terms)
+        if total == 0:
+            raise ValueError(f"Voice blend {spec!r} has zero total weight")
+        if sum(w for _, w in terms) <= 0:
+            raise ValueError(f"Voice blend {spec!r} subtracts as much as it adds; its positive weights must be larger")
+        table = sum((w / total) * self.pack(name) for name, w in terms)
+        self._blends[spec] = table
+        if len(self._blends) > MAX_CACHED_BLENDS:
+            self._blends.popitem(last=False)
         return table
 
     def language_of(self, spec: str) -> str:
