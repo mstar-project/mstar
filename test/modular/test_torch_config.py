@@ -19,7 +19,8 @@ def test_executor_thread_gets_torch_config():
 
 
 @pytest.mark.parametrize(
-    "raw, expected", [(None, 84), ("", 84), ("123", 123), ("2", 8), ("5000", 256)]
+    "raw, expected",
+    [(None, 84), ("", 84), ("123", 123), ("2", 8), ("5000", 256), ("lots", 84)],
 )
 def test_recompile_limit_env(monkeypatch, raw, expected):
     if raw is None:

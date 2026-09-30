@@ -1,10 +1,22 @@
+import logging
 import os
 
 import torch
 
+logger = logging.getLogger(__name__)
+
 
 def recompile_limit() -> int:
-    return min(max(int(os.environ.get("MSTAR_RECOMPILE_LIMIT") or 84), 8), 256)
+    raw = os.environ.get("MSTAR_RECOMPILE_LIMIT") or "84"
+    try:
+        requested = int(raw)
+    except ValueError:
+        logger.warning("MSTAR_RECOMPILE_LIMIT=%r is not an integer; using 84", raw)
+        return 84
+    limit = min(max(requested, 8), 256)
+    if limit != requested:
+        logger.warning("MSTAR_RECOMPILE_LIMIT=%d clamped to %d", requested, limit)
+    return limit
 
 
 def apply_torch_config() -> None:
