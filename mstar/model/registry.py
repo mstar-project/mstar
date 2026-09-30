@@ -8,6 +8,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
+    "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
@@ -34,6 +35,10 @@ HF_MODELS: dict[str, dict] = {
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
+    # OmniVoice — masked-diffusion TTS, 600+ languages. A Qwen3-0.6B body read
+    # bidirectionally over an 8-codebook canvas, plus the Higgs-Audio-v2 codec
+    # shipped in the checkpoint's audio_tokenizer/ subfolder (~3.3 GB total).
+    "omnivoice": {"model_path_hf": "k2-fsa/OmniVoice"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar

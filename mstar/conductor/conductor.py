@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import signal
 import socket
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -25,12 +26,13 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
-from mstar.engine.resources import ResourceReqConfig
+from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -46,9 +48,23 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.utils.logging_config import quiet_noisy_loggers
+from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import range_pop, range_push
 
 logger = logging.getLogger(__name__)
+
+
+class DeadWorkerError(RuntimeError):
+    """A worker process exited. Raised out of ``Conductor.run`` so the
+    conductor tears the deployment down and exits non-zero."""
+
+    def __init__(self, worker_id: str, pid: int | None, exitcode: int | None):
+        super().__init__(
+            f"worker {worker_id} (pid {pid}) exited with {describe_exitcode(exitcode)}"
+        )
+        self.worker_id = worker_id
+        self.pid = pid
+        self.exitcode = exitcode
 
 
 def _req_id_to_seed(req_id: str):
@@ -80,14 +96,29 @@ def _pick_free_tcp_port() -> int:
         return s.getsockname()[1]
 
 
+def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> None:
+    """Worker-side watchdog that leaves once the conductor is gone.
+
+    So no worker outlives it holding GPU memory. That includes a worker still
+    in setup, which would otherwise wedge in a startup collective waiting for a
+    peer that already left. SIGTERM is the graceful path in
+    ``_worker_process_target``. The conductor watches the API server the same
+    way (``_conductor_process_target``).
+    """
+    exit_when_orphaned(
+        f"Worker {worker_id}", "conductor", signal.SIGTERM,
+        parent=parent, poll_s=poll_s,
+    )
+
+
 def _worker_process_target(
     worker_id: str,
     worker_ids: list[str],
     my_worker_graphs: list[WorkerGraph],
     model_config: dict,
-    all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-    all_worker_graph_ids_to_nodes: dict[str, set[str]],
-    all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
+    all_worker_graph_ids_to_graph_walks: dict[int, set[str]],
+    all_worker_graph_ids_to_nodes: dict[int, set[str]],
+    all_worker_graph_ids_to_dyn_loops: dict[int, set[str]],
     sharding_config: ShardingConfig,
     parallel_groups: WorkerParallelGroups,
     hostname: str,
@@ -119,6 +150,9 @@ def _worker_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    threading.Thread(
+        target=_exit_when_orphaned, args=(worker_id,), daemon=True, name="parent-watch",
+    ).start()
 
     from mstar.worker.worker import Worker
     logger.debug("Launching worker %s with graph nodes %s", worker_id, str(
@@ -145,6 +179,8 @@ def _worker_process_target(
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
         )
+    except SystemExit:
+        raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
     except BaseException as e:
         logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
         raise e
@@ -155,9 +191,9 @@ def _worker_process_target(
 class RequestData:
     # Request-level shared state
     persist_signals: dict[str, list[TensorPointerInfo]]  # signals passed back to conductor
-    persist_signal_ref_cnt: dict[str, int]  # uuid -> number of times it was passed to workers
-    worker_graph_to_workers: dict[str, list[str]]
-    all_worker_graph_ids: set[str]
+    persist_signal_ref_cnt: dict[int, int]  # uuid -> number of times it was passed to workers
+    worker_graph_to_workers: dict[int, list[str]]
+    all_worker_graph_ids: set[int]
     max_output_tokens: int
     random_seed: int
     # resource label -> the config this request's resources were opened with
@@ -187,7 +223,7 @@ class RequestData:
     rx_info: dict[tuple[str, str, str], RxInfo] = field(default_factory=dict)
     tx_info: dict[tuple[str, str], TxInfo] = field(default_factory=dict)
 
-    def remove_persist_signal_uuids(self, uuids: list[str]):
+    def remove_persist_signal_uuids(self, uuids: list[int]):
         uuids = set(uuids)
         for name in self.persist_signals:
             self.persist_signals[name] = [
@@ -264,6 +300,11 @@ class Conductor:
         self.tcp_transfer_device = tcp_transfer_device
 
         self._worker_processes: list[mp.Process] = []
+        # A worker that dies sends nothing, so its process handle is the only
+        # signal. The startup wait and the main loop poll it on this cadence
+        # (see _poll_worker_liveness).
+        self._liveness_interval_s = 0.5
+        self._next_liveness_check = 0.0
         self.waiting_queue: list[NewRequestConductor] = []
 
         with open(model_config_file, "r") as f:
@@ -278,9 +319,15 @@ class Conductor:
         assert "node_groups" in self.model_config
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
+        # The conductor is the only process that sees every worker graph, so it
+        # owns the numbering. Workers receive their graphs (and these ids) at
+        # spawn, so everyone agrees without the ids having to be negotiated.
+        worker_graphs = model.get_worker_graphs(model_config_file)
+        for index, worker_graph in enumerate(worker_graphs):
+            worker_graph.worker_graph_id = index
         self.worker_graphs = {
             worker_graph.worker_graph_id: worker_graph
-            for worker_graph in model.get_worker_graphs(model_config_file)
+            for worker_graph in worker_graphs
         }
 
         # (1) Set up worker graph TP ranks
@@ -303,7 +350,7 @@ class Conductor:
 
         # v1: one sharding group per worker graph. Track which group "owns"
         # each wg so we can assert single-group-per-wg.
-        wg_to_owning_group: dict[str, str] = {}
+        wg_to_owning_group: dict[int, str] = {}
 
         for group in self.default_sharding_config.groups:
             if group.graph_walks is not None and any([
@@ -372,10 +419,16 @@ class Conductor:
         Resolved once, here, and carried on the request: the worker hands each
         config to its resource at ingest. KV shape is not part of this — that
         is a deployment-wide property the model declares in its resource specs.
+
+        A declared stream gets a config even when the model returned none, or its
+        keys would have nowhere to go.
         """
-        return self.model.get_request_resource_configs(
+        configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
+        for key, streams in self.model.prefix_key_streams().items():
+            configs.setdefault(key, KVReqConfig(needed_labels=list(streams)))
+        return configs
 
     def _derive_worker_info(self):
         """Derive per-rank worker info from the worker graphs."""
@@ -401,14 +454,14 @@ class Conductor:
             self._per_worker_graphs[worker_id] = worker_graphs
 
         # Global maps needed by all workers
-        self._all_worker_graph_ids_to_graph_walks: dict[str, set[str]] = {
+        self._all_worker_graph_ids_to_graph_walks: dict[int, set[str]] = {
             worker_graph_id: worker_graph.graph_walks for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
-        self._all_worker_graph_ids_to_nodes: dict[str, set[str]] = {
+        self._all_worker_graph_ids_to_nodes: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_nodes())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
-        self._all_worker_graph_ids_to_dyn_loops: dict[str, set[str]] = {
+        self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
@@ -467,6 +520,8 @@ class Conductor:
 
     def shutdown(self):
         """Terminate and join all worker processes."""
+        if not self._worker_processes:
+            return  # already done (run()'s caller and the atexit hook both call this)
         logger.info("Shutting down conductor...")
         # SIGTERM is handled in _worker_process_target as a graceful exit so
         # the transports' cleanup runs (shm segments unlinked). A worker
@@ -486,7 +541,80 @@ class Conductor:
                 p.join(timeout=5)
         self._worker_processes.clear()
 
-    def _assign_worker_graphs_to_workers(self) -> dict[str, list[str]]:
+    def _dead_workers(self) -> list[tuple[str, mp.Process]]:
+        """(worker_id, handle) for every worker process that has exited.
+        Handles are appended in ``worker_ids`` order by ``_launch_workers``.
+        ``is_alive`` reaps the child, so ``exitcode`` is set afterwards."""
+        return [
+            (worker_id, p)
+            for worker_id, p in zip(self.worker_ids, self._worker_processes, strict=True)
+            if not p.is_alive()
+        ]
+
+    def _worker_nodes(self, worker_id: str) -> set[str]:
+        return {
+            node
+            for wg in self._per_worker_graphs.get(worker_id, [])
+            for node in wg.section.get_nodes()
+        }
+
+    def _poll_worker_liveness(self) -> None:
+        """Raise ``DeadWorkerError`` if a worker process has exited.
+
+        A worker that dies during setup (init exception, OOM kill) or while
+        serving (SIGKILL, segfault) sends nothing, so without this check the
+        startup wait and the main loop would wait for it forever and its
+        requests would sit until the API server's timeout. A dead worker is
+        fatal for the deployment. Every waiting client gets a 503 naming it,
+        then the exception propagates out of ``run`` so the conductor
+        terminates the remaining workers and exits non-zero.
+        """
+        now = time.perf_counter()
+        if now < self._next_liveness_check:
+            return
+        self._next_liveness_check = now + self._liveness_interval_s
+        dead = self._dead_workers()
+        if not dead:
+            return
+        for worker_id, p in dead:
+            logger.error(
+                "Worker %s (pid %s) exited with %s. It hosted nodes %s. "
+                "Shutting the deployment down.",
+                worker_id, p.pid, describe_exitcode(p.exitcode),
+                sorted(self._worker_nodes(worker_id)),
+            )
+        worker_id, p = dead[0]
+        self._fail_all_requests(
+            f"worker {worker_id} (pid {p.pid}) exited with "
+            f"{describe_exitcode(p.exitcode)}, so the server is shutting down"
+        )
+        raise DeadWorkerError(worker_id, p.pid, p.exitcode)
+
+    def _fail_all_requests(self, error_message: str, status: int = 503) -> None:
+        """Notify the client of every request still awaiting a result, bypassing
+        the drain barrier. Only for a deployment that is going down. The workers
+        are about to be terminated anyway, and waiting for a dead participant's
+        READS_DONE would just hold the client until the request timeout."""
+        pending = [body.request_id for body in self.waiting_queue]
+        for request_id in self.requests:
+            dr = self.draining.get(request_id)
+            if dr is not None and dr.failure_error is None:
+                continue  # completed or aborted, the client has already heard
+            pending.append(request_id)
+        for request_id in pending:
+            self.communicator.send(
+                "api_server",
+                APIServerMessage(
+                    message_type="request_failed",
+                    body=RequestFailed(
+                        request_id=request_id,
+                        error_message=error_message,
+                        status=status,
+                    ),
+                ),
+            )
+
+    def _assign_worker_graphs_to_workers(self) -> dict[int, list[str]]:
         """
         For a request, assign worker graphs to workers. DP picks are
         coordinated by ``_group_id`` so all wgs derived from the same
@@ -520,7 +648,7 @@ class Conductor:
         return result
 
     def _build_request_sharding_config(
-        self, worker_graph_to_workers: dict[str, list[str]],
+        self, worker_graph_to_workers: dict[int, list[str]],
     ) -> ShardingConfig:
         """Per-request ShardingConfig: clone default + setup with this
         request's worker assignments.
@@ -723,7 +851,7 @@ class Conductor:
             )
 
         # Collect all worker_graph_ids per worker for the NewRequest
-        worker_to_worker_graph_ids: dict[str, list[str]] = defaultdict(list)
+        worker_to_worker_graph_ids: dict[str, list[int]] = defaultdict(list)
         for wg_id, worker_ids in worker_graph_to_workers.items():
             for worker_id in worker_ids:
                 worker_to_worker_graph_ids[worker_id].append(wg_id)
@@ -770,8 +898,20 @@ class Conductor:
         request_data.resource_configs = self._get_resource_configs(
             model_kwargs, partition_fwd_args
         )
-        for cfg in request_data.resource_configs.values():
-            cfg.apply_conductor_config(seed=seed)
+        # keyed by resource, so each config is handed only its own chain
+        kwargs = model_kwargs or {}
+        prefix_keys = kwargs.get("prefix_keys") or {}
+        prefix_tail = kwargs.get("prefix_tail") or {}
+        prefix_decode = kwargs.get("prefix_decode") or {}
+        prefix_cache = kwargs.get("prefix_cache")
+        for key, cfg in request_data.resource_configs.items():
+            cfg.apply_conductor_config(
+                seed=seed,
+                prefix_keys=prefix_keys.get(key),
+                prefix_tail=prefix_tail.get(key),
+                prefix_decode=prefix_decode.get(key),
+                prefix_cache=prefix_cache,
+            )
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         for worker_id, worker_graph_ids in worker_to_worker_graph_ids.items():
@@ -816,9 +956,9 @@ class Conductor:
                 )
 
     def _resolve_worker_partition(
-        self, worker_graph_ids: list[str],
+        self, worker_graph_ids: list[int],
         partitions: list[PartitionDefinition],
-    ) -> dict[str, set[str]]:
+    ) -> dict[str, set[int]]:
         """Find which partition(s) a set of worker graphs belongs to."""
         partition_wg_ids = {}
         for wg_id in worker_graph_ids:
@@ -1145,9 +1285,7 @@ class Conductor:
 
             request_data.final_outputs.update(body.output_loop_indices)
 
-            pstate.curr_forward_outputs += body.output_signal_names if isinstance(
-                body.output_signal_names, list
-            ) else []
+            pstate.curr_forward_outputs += body.output_signal_names
 
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:
@@ -1315,7 +1453,8 @@ class Conductor:
         """Block until every worker reports ``SETUP_DONE`` (weight load + warmup
         + CUDA-graph capture), so the main loop opens only once all workers can
         serve. Any non-``SETUP_DONE`` message that races in is stashed and
-        replayed on the first main-loop iteration so it isn't lost.
+        replayed on the first main-loop iteration so it isn't lost. Raises
+        ``DeadWorkerError`` if a worker exits before reporting.
         """
         pending = set(self.worker_ids)
         logger.info(
@@ -1328,6 +1467,7 @@ class Conductor:
                 else:
                     self._startup_message_backlog.append(message)
             if pending:
+                self._poll_worker_liveness()
                 time.sleep(0.01)
         logger.info("Conductor: all %d worker(s) ready", len(self.worker_ids))
 
@@ -1405,4 +1545,7 @@ class Conductor:
                 if self.enable_nvtx:
                     range_pop()
 
+            # Outside the try above so DeadWorkerError leaves the loop instead of
+            # being logged as a main-loop error and retried.
+            self._poll_worker_liveness()
             time.sleep(0.001)

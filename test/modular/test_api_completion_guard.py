@@ -67,6 +67,7 @@ def test_preprocess_failure_emits_error_chunk():
     wt.device = "cpu"
     wt.tensor_uuid_to_metadata_per_request = {}
     wt.request_model_kwargs = {}
+    wt.in_flight_requests = set()
     wt._draining_rids = set()
     wt._reads_done_sent = set()
 

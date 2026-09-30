@@ -427,6 +427,11 @@ class ViTEncoderSubmodule(NodeSubmodule):
         return out
 
 
+# Added to the request seed for the VAE posterior draw, so it is a different
+# stream from the diffusion's initial noise (seeded with the request seed itself).
+_VAE_NOISE_SEED_OFFSET = 0x9E3779B9
+
+
 class VAEEncoderSubmodule(NodeSubmodule):
     """VAE encode + patchify + vae2llm + time_embedder + latent_pos_embed.
 
@@ -507,10 +512,20 @@ class VAEEncoderSubmodule(NodeSubmodule):
             max_num_patches_per_side=self.max_latent_size
         )
 
+        # The VAE samples its posterior. Drawing that noise here from the
+        # request's seed makes image-to-image repeatable per seed, like the
+        # diffusion's initial noise. The global RNG would differ per run.
+        generator = torch.Generator(device=device)
+        generator.manual_seed(fwd_info.random_seed + _VAE_NOISE_SEED_OFFSET)
+        vae_noise = self.vae_model.posterior_noise(
+            img_h, img_w, generator=generator, device=device,
+        )
+
         tensor_inputs = {
             "padded_images": image_tensor.unsqueeze(0),
             "packed_vae_position_ids": packed_vae_position_ids,
             "packed_timesteps": torch.tensor([0.0], device=device),
+            "vae_noise": vae_noise,
         }
         kwargs = {
             "h": h,
@@ -526,6 +541,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
         padded_images: torch.Tensor,
         packed_vae_position_ids: torch.Tensor,
         packed_timesteps: torch.Tensor,
+        vae_noise: torch.Tensor,
         h: int,
         w: int,
         **kwargs,
@@ -538,7 +554,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
             packed_timesteps.shape, h, w
         )
 
-        latent = self.vae_model.encode(padded_images)
+        latent = self.vae_model.encode(padded_images, noise=vae_noise)
 
         p = self.latent_patch_size
         # h, w are already ints from preprocess (CUDA graph compatible)
@@ -828,7 +844,7 @@ class LLMSubmodule(ARNodeSubmodule):
             labels = ["main", "cfg_text", "cfg_img"] # just return all labels since it is cheap
 
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
-                labels, fwd_info.request_id, device, seq_len
+                labels, fwd_info.rid_handle, device, seq_len
             )
 
         if graph_walk == "prefill_vae":
@@ -863,7 +879,7 @@ class LLMSubmodule(ARNodeSubmodule):
             seq_len = tensor_inputs["empty_combined_emb"].shape[0]
             node_inputs.input_seq_len = seq_len
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
-                labels, fwd_info.request_id, device, seq_len
+                labels, fwd_info.rid_handle, device, seq_len
             )
             node_inputs.tensor_inputs = {
                 **tensor_inputs,
@@ -1262,7 +1278,7 @@ class LLMSubmodule(ARNodeSubmodule):
             + pos_embed
 
         empty_combined_emb[1:-1] = latents_
-        logger.debug(f"packed_seq = {empty_combined_emb}")
+        logger.debug("packed_seq = %s", empty_combined_emb)  # tensor repr: keep lazy
 
         if requires_cfg:
             cfg_text_scale = kwargs.pop("cfg_text_scale", self.config.cfg_text_scale)
@@ -1622,7 +1638,7 @@ class VAEDecoderSubmodule(NodeSubmodule):
     ) -> NameToTensorList:
         logger.debug(
             "Running BAGEL VAE dec with latents shape %s, h %d, w %d",
-            str(latents.shape), image_h, image_w
+            latents.shape, image_h, image_w
         )
         H = image_h
         W = image_w

@@ -179,6 +179,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
+   * - ``max_concurrent_requests``
+     - *(optional)* How many requests run at once. Requests past the cap wait in the
+       conductor's queue.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
 
@@ -194,7 +197,8 @@ them by that name:
 
    resources:
      kv_cache:
-       max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages
+       max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
+                                # prefix_cache, prefix_cache_salt
      talker_attn:
        flashinfer_backend: fa2  # also: backend (flashinfer / dense)
      vit_attn:                  # a cacheless (ragged) attention resource
@@ -205,6 +209,18 @@ its encoder context, can therefore size each one separately. If a block names a 
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
 no longer read. It raises an error with a message describing the migration.
+
+``prefix_cache: false`` turns cross-request prefix reuse off for that cache, and
+``prefix_cache_salt`` keeps two otherwise identical deployments off each other's
+cached pages. A single request opts out by sending ``prefix_cache=False``, which
+travels with its other ``model_kwargs``.
+
+A cached prompt no longer reserves its pages, so the pool no longer limits how many
+requests are admitted. It has to hold the decode of every request allowed to run at once,
+and a decode step that finds no free page holds its requests until they time out. Two
+settings prevent that. ``max_concurrent_requests`` caps how many requests run at once, and
+the pool's pages divided by the pages one request needs, prompt and output together, is a
+safe value. ``cpu_offload_pages`` gives a full pool a request to move to the host.
 
 **Single GPU.** Everything on rank 0:
 
