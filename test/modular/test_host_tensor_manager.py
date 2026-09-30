@@ -5,9 +5,11 @@ registers them for send, and both calls synchronized the default stream whenever
 available. On SHM nothing else in the API server touches the GPU, so that sync created the
 process's context, about 600 MiB, at the first request, after the workers had filled the GPU:
 on Qwen3-Omni colocated every request failed ``preprocessing failed: CUDA error: out of memory``.
+Over TCP or RDMA the manager's Mooncake reader did the same, building a stream and recording an
+event per read.
 ``torch.cuda.is_initialized()`` cannot tell, since importing flashinfer initializes torch's CUDA
 state without a context, so the context tests run in a fresh interpreter and ask the driver; the
-rest check on CPU which managers sync at all.
+rest check on CPU which managers sync and which readers wait on the GPU.
 """
 
 import importlib.util
@@ -21,9 +23,11 @@ import torch
 
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
+    AsyncMooncakeReader,
     MooncakeCommunicationManager,
     SharedMemoryCommunicationManager,
     TensorCommunicationManager,
+    TransferReadInfo,
 )
 
 _REPO_ROOT = str(Path(__file__).resolve().parents[2])
@@ -105,6 +109,13 @@ class _StubTransferEngine:
         return 0
 
 
+class _StubMooncakeEngine:
+    """Completes every read without Mooncake."""
+
+    def batch_transfer_sync_read(self, session_id, local_ptrs, remote_ptrs, nbytes):
+        return 0
+
+
 class _StubStream:
     """Records syncs instead of touching CUDA."""
 
@@ -115,6 +126,19 @@ class _StubStream:
         self.syncs += 1
 
 
+class _StubCuda:
+    """Stands in for ``torch.cuda`` and every stream or event it hands out, recording each call instead of making it."""
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def __getattr__(self, name):
+        def call(*args, **kwargs):
+            self.calls.append(name)
+            return self
+        return call
+
+
 def _manager(cls, device: str):
     mgr = object.__new__(cls)
     TensorCommunicationManager.__init__(
@@ -122,6 +146,15 @@ def _manager(cls, device: str):
         communicator=_StubCommunicator(), transfer_engine=_StubTransferEngine(),
     )
     return mgr
+
+
+def _reader_calls(monkeypatch, device) -> list[str]:
+    cuda = _StubCuda()
+    monkeypatch.setattr(torch, "cuda", cuda)
+    reader = AsyncMooncakeReader(_StubMooncakeEngine(), device=device)
+    reader.submit([TransferReadInfo(source_session_id="worker_0", local_ptr=0, remote_ptr=0, nbytes=8)]).result()
+    reader.shutdown()
+    return cuda.calls
 
 
 @pytest.mark.parametrize("device", ["cuda", "cuda:1"])
@@ -145,3 +178,15 @@ def test_host_mooncake_manager_registers_without_a_sync(monkeypatch):
     monkeypatch.setattr(torch.cuda, "default_stream", lambda *args, **kwargs: stream)
     mgr.register_for_send("req1", infos["text_inputs"])
     assert stream.syncs == 0, "an RDMA API server would create a CUDA context at its first send"
+
+
+@pytest.mark.parametrize("device", ["cuda", "cuda:1"])
+def test_a_device_reader_waits_for_the_gpu(monkeypatch, device):
+    calls = _reader_calls(monkeypatch, device)
+    assert "wait_event" in calls, f"a {device} reader would let Mooncake write a buffer its GPU is still using"
+
+
+@pytest.mark.parametrize("device", ["cpu", torch.device("cpu")])
+def test_a_cpu_reader_never_touches_torch_cuda(monkeypatch, device):
+    calls = _reader_calls(monkeypatch, device)
+    assert calls == [], "an API server reading over TCP or RDMA would create a CUDA context on the workers' GPU"
