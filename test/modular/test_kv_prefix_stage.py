@@ -222,13 +222,6 @@ def test_a_node_with_no_keyed_stream_is_never_probed():
     assert resource.resolved == 0, "a node nobody declared was probed"
 
 
-def test_the_keyed_walk_placing_its_own_positions_names_the_model_and_walk():
-    engine = _engine({"kv": _Answering(96)}, {NODE: ["kv"]})
-
-    with pytest.raises(AssertionError, match=f"_Model keys the '{WALK}' walk of {NODE}"):
-        _stage(engine, _inputs(custom_pos_ids=torch.arange(PROMPT)))
-
-
 def test_the_keyed_walk_with_no_ids_to_cut_names_the_model_and_walk():
     engine = _engine({"kv": _Answering(96)}, {NODE: ["kv"]})
 

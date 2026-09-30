@@ -467,6 +467,7 @@ class KVManager(AttentionResource):
             if chain is None or chain.done == len(chain.spans):
                 return None
             span = chain.spans[chain.done]
+            self._check_positions(span, graph_walk, inputs)
             if span.walk != graph_walk or span.length != inputs.input_seq_len:
                 self._drop_layout(rid, label, stream, (
                     f"{graph_walk} writes {inputs.input_seq_len} slots where its "
@@ -494,6 +495,12 @@ class KVManager(AttentionResource):
                 self._arena.retain(matched)
                 stream.lease = matched
             return self._answer(label, chain, len(stream.lease) * self.config.page_size)
+
+    def _check_positions(self, span: PrefixSpan, graph_walk: str, inputs) -> None:
+        assert span.digest is not None or inputs.custom_pos_ids is None, (
+            f"KV {self.name}: {graph_walk} places positions of its own, but "
+            "the layout keys it by ids, whose positions are their count"
+        )
 
     @staticmethod
     def _answer(label: str, chain: PrefixChain, present: int) -> CachedPrefix:
@@ -549,11 +556,15 @@ class KVManager(AttentionResource):
         rest. With no answer, a walk the engine would not probe is about to
         write whole over what the lease holds, so the layout ends here.
         """
-        del inputs
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
             if label is None:
                 return
+            if prefix is None:
+                # a walk the engine would not probe never met the check in resolve
+                chain = self._ensure_label(rid, label).chain
+                if chain is not None and chain.done < len(chain.spans):
+                    self._check_positions(chain.spans[chain.done], graph_walk, inputs)
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.lease is None or stream.stored_len:
                 return

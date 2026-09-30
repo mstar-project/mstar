@@ -14,7 +14,6 @@ neither may leave anything behind for a later request to match.
 from __future__ import annotations
 
 import sys
-from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -26,6 +25,7 @@ from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep, Pref
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.model.submodule_base import ARNodeInputs
 
 PAGE_SIZE = 128
 ROOT = b"a root"
@@ -80,9 +80,9 @@ def _layout(n_tokens: int) -> dict[str, list[PrefixSpan]]:
     return {"main": [PrefixSpan(n_tokens, n_tokens, WALK)]}
 
 
-def _inputs(n_tokens: int) -> SimpleNamespace:
-    """A probe's view of a walk over ``n_tokens``: only its length is read."""
-    return SimpleNamespace(input_seq_len=n_tokens)
+def _inputs(n_tokens: int) -> ARNodeInputs:
+    """A probe's view of a walk over ``n_tokens`` ids."""
+    return ARNodeInputs(input_seq_len=n_tokens)
 
 
 def _step(

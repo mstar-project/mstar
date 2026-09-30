@@ -52,7 +52,7 @@ class PrefixStream(NamedTuple):
     """What keys one cache stream's pages: one input tensor's ids, or the layout its walks write."""
     tensor: str
     keyed_by: str
-    # the walk that writes the keyed span; a write from any other walk ends the chain
+    # the walk that writes the keyed span; a write from a walk not named here ends the chain
     walk: str
     # the walk whose input is the last sampled token, to key generated pages; None keys the prompt only
     decode_walk: str | None = None

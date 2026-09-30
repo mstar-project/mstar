@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import sys
-from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -29,6 +28,7 @@ from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.model.submodule_base import ARNodeInputs
 
 PAGE_SIZE = 16
 ROOT = b"a root"
@@ -134,7 +134,7 @@ def test_a_hit_reports_how_much_of_the_prompt_was_already_here(caplog):
     _run(kv, "a", len(tokens))
     kv.remove_request("a")
     _ingest(kv, "b", tokens)
-    kv.resolve_cached_prefix("b", NODE, WALK, SimpleNamespace(input_seq_len=len(tokens)))
+    kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(tokens)))
 
     with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
         _run(kv, "b", len(tokens))
@@ -156,7 +156,7 @@ def test_a_whole_prompt_that_came_back_says_so(caplog):
     # every whole page this request has is one the first request left behind
     longer = tokens + list(range(9000, 9004))
     _ingest(kv, "b", longer)
-    kv.resolve_cached_prefix("b", NODE, WALK, SimpleNamespace(input_seq_len=len(longer)))
+    kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(input_seq_len=len(longer)))
 
     with caplog.at_level(logging.INFO, logger=manager_mod.__name__):
         _run(kv, "b", len(longer))
@@ -221,7 +221,7 @@ def _serve(kv: KVManager, count: int, keyed: bool) -> None:
     for n in range(count):
         rid = f"r{n}"
         _ingest(kv, rid, list(range(64)), keyed=keyed)
-        kv.resolve_cached_prefix(rid, NODE, WALK, SimpleNamespace(input_seq_len=64))
+        kv.resolve_cached_prefix(rid, NODE, WALK, ARNodeInputs(input_seq_len=64))
         _run(kv, rid, 64)
         kv.remove_request(rid)
 

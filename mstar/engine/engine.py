@@ -537,13 +537,14 @@ class Engine:
         ]
         declared = model.prefix_key_streams() if model is not None else {}
         self._prefix_model = type(model).__name__
-        # node -> the walks a probe may run on: the keyed walk of every stream
-        # declared on a cache the node uses
+        # node -> the walks a probe may run on: the ones each stream declared
+        # on a cache the node uses names
         self._keyed_walks: dict[str, set[str]] = {}
         for key, by_label in declared.items():
             for node in specs_by_key[key].nodes:
                 self._keyed_walks.setdefault(node, set()).update(
-                    stream.walk for stream in by_label.values()
+                    walk for stream in by_label.values()
+                    for walk in (stream.walk, *stream.layout_walks)
                 )
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
@@ -566,7 +567,7 @@ class Engine:
                     if mark is not None:
                         parts.append(mark)
             opened = resource.enable_prefix_cache(fingerprint(*shared, *parts), {
-                label: (stream.walk, stream.decode_walk)
+                label: (stream.walk, stream.decode_walk, *stream.layout_walks)
                 for label, stream in declared.get(key, {}).items()
             })
             if not opened or not declared.get(key):
@@ -648,17 +649,20 @@ class Engine:
     ) -> NodeInputs | None:
         """Cut the leading tokens this node's resources already hold.
 
-        Only the keyed walk is probed, and only when `split_inputs` can cut its
-        inputs; a guided walk writes two labels from one input, so it is skipped.
+        Only the walks a keyed stream names are probed, and only when
+        `split_inputs` can cut their inputs; a guided walk writes two labels
+        from one input, so it is skipped. A skipped walk is still reported
+        with no answer: it writes whole, over anything a lease holds for it.
         """
         walk = batch.step_context.graph_walk
         if walk not in self._keyed_walks.get(batch.node_name, ()):
             return inputs
-        assert isinstance(inputs, ARNodeInputs) and inputs.custom_pos_ids is None, (
+        assert isinstance(inputs, ARNodeInputs), (
             f"{self._prefix_model} keys the {walk!r} walk of {batch.node_name} "
-            "for prefix reuse, but that walk places positions of its own"
+            "for prefix reuse, but that walk's inputs are not a sequence to cut"
         )
         if inputs.tensor_inputs or inputs.kwargs or inputs.resource_step_info:
+            self._runner.apply_cached_prefix(rid, batch.node_name, walk, inputs, None)
             return inputs
         prefix = self._runner.resolve_cached_prefix(rid, batch.node_name, walk, inputs)
         self._runner.apply_cached_prefix(
