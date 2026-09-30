@@ -241,6 +241,9 @@ class KimiSparseMoeBlock(nn.Module):
             comm_group=comm_group,
             activation=config.hidden_act,
             bias=False,
+            # Rank-local partial: forward() sums it with the routed partial
+            # and all-reduces once, instead of this MLP reducing on its own.
+            reduce_results=False,
         )
 
     def _attach_expert_weight_loaders(self) -> None:
@@ -294,7 +297,12 @@ class KimiSparseMoeBlock(nn.Module):
                     flat[start:end], topk_weights[start:end], topk_ids[start:end]
                 )
         shared = self.shared_expert(flat)
-        return (routed + shared).view(input_shape)
+        out = routed + shared
+        if self.tp_size > 1:
+            # routed and shared are both rank-local partials now; one
+            # all-reduce here replaces the three the block used to issue.
+            self.comm_group.all_reduce(out)
+        return out.view(input_shape)
 
     def _route(
         self,
@@ -345,7 +353,8 @@ class KimiSparseMoeBlock(nn.Module):
         )
         if reduce:
             return out
-        self.comm_group.all_reduce(out)
+        # Rank-local partial: sum over top-k here, leave the cross-rank
+        # reduce to forward()'s single all-reduce.
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(out, output, routed_scaling_factor=1.0)
         return output
@@ -429,7 +438,8 @@ class KimiSparseMoeBlock(nn.Module):
         )
         if reduce:
             return out
-        self.comm_group.all_reduce(out)
+        # Rank-local partial: sum over top-k here, leave the cross-rank
+        # reduce to forward()'s single all-reduce.
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(out, output, routed_scaling_factor=1.0)
         return output
@@ -450,7 +460,8 @@ class KimiSparseMoeBlock(nn.Module):
             topk_ids,
             reduce_results=False,
         )
-        self.comm_group.all_reduce(cache3)
+        # Rank-local partial: sum over top-k here, leave the cross-rank
+        # reduce to forward()'s single all-reduce.
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
         return output

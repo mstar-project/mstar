@@ -48,6 +48,10 @@ class ParallelGatedMLP(nn.Module):
         intermediate_size: SwiGLU intermediate dim (full).
         activation: HF activation name (``silu``, ``gelu``, ``gelu_tanh``).
         bias: whether the linears have a bias term.
+        reduce_results: whether ``down_proj`` all-reduces its partial sum.
+            False lets a caller sum this MLP's rank-local output with another
+            partial (e.g. a sibling MoE dispatch) before a single shared
+            all-reduce.
     """
 
     def __init__(
@@ -57,6 +61,7 @@ class ParallelGatedMLP(nn.Module):
         comm_group: CommGroup | None = None,
         activation: str | Callable = "silu",
         bias: bool = False,
+        reduce_results: bool = True,
     ):
         super().__init__()
         if comm_group is None:
@@ -78,7 +83,7 @@ class ParallelGatedMLP(nn.Module):
             output_size=hidden_size,
             bias=bias,
             input_is_parallel=True,
-            reduce_results=True,
+            reduce_results=reduce_results,
         )
 
         self.intermediate_size_per_partition = (
