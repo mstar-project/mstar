@@ -574,6 +574,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-generate">Native <code class="docutils literal notranslate"><span class="pre">/generate</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#websocket-generate-ws">WebSocket <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#python-sdk">Python SDK</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#openai-compatible-api">OpenAI-compatible API</a></li>
 </ul>
@@ -670,6 +671,44 @@ curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8000/gene
 <span class="w">  </span>-F<span class="w"> </span><span class="s1">'model_kwargs={"voice":"tara"}'</span><span class="w"> </span>-F<span class="w"> </span><span class="s1">'streaming=false'</span>
 </pre></div>
 </div>
+</section>
+<section id="websocket-generate-ws">
+<h2>WebSocket <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code><a class="headerlink" href="#websocket-generate-ws" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> is the same request over one persistent WebSocket, for control loops
+that cannot afford an HTTP round trip per step (robot policies, streaming world models).
+Each message is one request with the <code class="docutils literal notranslate"><span class="pre">/generate</span></code> fields — <code class="docutils literal notranslate"><span class="pre">text</span></code>, <code class="docutils literal notranslate"><span class="pre">files</span></code> as
+<code class="docutils literal notranslate"><span class="pre">[{&quot;name&quot;:</span> <span class="pre">...,</span> <span class="pre">&quot;data&quot;:</span> <span class="pre">...}]</span></code>, <code class="docutils literal notranslate"><span class="pre">input_modalities</span></code>, <code class="docutils literal notranslate"><span class="pre">output_modalities</span></code>,
+<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, <code class="docutils literal notranslate"><span class="pre">request_id</span></code> — sent either as a JSON text frame (<code class="docutils literal notranslate"><span class="pre">data</span></code> base64) or
+as a msgpack binary frame (<code class="docutils literal notranslate"><span class="pre">data</span></code> raw bytes). Replies use the same encoding as the
+message: one frame per result chunk, <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;modality&quot;,</span> <span class="pre">&quot;data&quot;,</span> <span class="pre">&quot;metadata&quot;}</span></code>,
+then <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;finish&quot;:</span> <span class="pre">true}</span></code>. A rejected message answers
+<code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;error&quot;:</span> <span class="pre">...}</span></code> and the socket stays open; a request that fails after it
+was accepted ends the same way, with the HTTP <code class="docutils literal notranslate"><span class="pre">status</span></code> it would have had, and no
+<code class="docutils literal notranslate"><span class="pre">finish</span></code> follows. Messages may be pipelined —
+send the next observation before the current action chunk has returned — and the
+<code class="docutils literal notranslate"><span class="pre">request_id</span></code> tells the replies apart. Closing the socket aborts whatever is still in
+flight.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">msgpack</span><span class="o">,</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span><span class="o">,</span><span class="w"> </span><span class="nn">websockets.sync.client</span>
+
+<span class="k">with</span> <span class="n">websockets</span><span class="o">.</span><span class="n">sync</span><span class="o">.</span><span class="n">client</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span><span class="s2">"ws://localhost:8000/generate/ws"</span><span class="p">,</span> <span class="n">max_size</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="k">as</span> <span class="n">ws</span><span class="p">:</span>
+    <span class="n">ws</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">msgpack</span><span class="o">.</span><span class="n">packb</span><span class="p">({</span>
+        <span class="s2">"text"</span><span class="p">:</span> <span class="s2">"pick up the mug"</span><span class="p">,</span>
+        <span class="s2">"files"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"obs.jpg"</span><span class="p">,</span> <span class="s2">"data"</span><span class="p">:</span> <span class="nb">open</span><span class="p">(</span><span class="s2">"obs.jpg"</span><span class="p">,</span> <span class="s2">"rb"</span><span class="p">)</span><span class="o">.</span><span class="n">read</span><span class="p">()}],</span>
+        <span class="s2">"output_modalities"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"action"</span><span class="p">],</span>
+        <span class="s2">"model_kwargs"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"action_mode"</span><span class="p">:</span> <span class="s2">"policy"</span><span class="p">,</span> <span class="s2">"domain_name"</span><span class="p">:</span> <span class="s2">"droid_lerobot"</span><span class="p">,</span>
+                         <span class="s2">"raw_action_dim"</span><span class="p">:</span> <span class="mi">10</span><span class="p">,</span> <span class="s2">"action_chunk_size"</span><span class="p">:</span> <span class="mi">32</span><span class="p">},</span>
+        <span class="s2">"request_id"</span><span class="p">:</span> <span class="s2">"step-0"</span><span class="p">,</span>
+    <span class="p">},</span> <span class="n">use_bin_type</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+    <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+        <span class="n">reply</span> <span class="o">=</span> <span class="n">msgpack</span><span class="o">.</span><span class="n">unpackb</span><span class="p">(</span><span class="n">ws</span><span class="o">.</span><span class="n">recv</span><span class="p">(),</span> <span class="n">raw</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">reply</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"modality"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"action"</span><span class="p">:</span>
+            <span class="n">actions</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span><span class="n">reply</span><span class="p">[</span><span class="s2">"data"</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">32</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">reply</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"finish"</span><span class="p">)</span> <span class="ow">or</span> <span class="n">reply</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"error"</span><span class="p">):</span>
+            <span class="k">break</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">examples/cosmos3_action_ws_client.py</span></code> is a complete openpi-style client that runs this
+loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.</p>
 </section>
 <section id="python-sdk">
 <h2>Python SDK<a class="headerlink" href="#python-sdk" title="Link to this heading">#</a></h2>
@@ -862,6 +901,7 @@ in the Orpheus config).</p></li>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-generate">Native <code class="docutils literal notranslate"><span class="pre">/generate</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#websocket-generate-ws">WebSocket <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#python-sdk">Python SDK</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#openai-compatible-api">OpenAI-compatible API</a></li>
 </ul>
