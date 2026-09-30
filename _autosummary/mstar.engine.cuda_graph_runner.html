@@ -657,6 +657,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.agree_across_ranks"><code class="docutils literal notranslate"><span class="pre">agree_across_ranks()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.autocast_scope"><code class="docutils literal notranslate"><span class="pre">autocast_scope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.capture_into_graph"><code class="docutils literal notranslate"><span class="pre">capture_into_graph()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.capture_with_static_outputs"><code class="docutils literal notranslate"><span class="pre">capture_with_static_outputs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.dummy_metadata"><code class="docutils literal notranslate"><span class="pre">dummy_metadata()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.dummy_rid_handle"><code class="docutils literal notranslate"><span class="pre">dummy_rid_handle()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.dummy_rid_name"><code class="docutils literal notranslate"><span class="pre">dummy_rid_name()</span></code></a></li>
@@ -686,16 +687,19 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.capture_into_graph" title="mstar.engine.cuda_graph_runner.capture_into_graph"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_into_graph</span></code></a>(run, pool, device, ...)</p></td>
 <td><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> into a new CUDA graph allocated from <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.dummy_metadata" title="mstar.engine.cuda_graph_runner.dummy_metadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_metadata</span></code></a>(rids, graph_walk)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.capture_with_static_outputs" title="mstar.engine.cuda_graph_runner.capture_with_static_outputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_with_static_outputs</span></code></a>(run, ...)</p></td>
+<td><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> so its outputs land in buffers allocated OUTSIDE <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.dummy_metadata" title="mstar.engine.cuda_graph_runner.dummy_metadata"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_metadata</span></code></a>(rids, graph_walk)</p></td>
 <td><p>Stand-in request info for padding rows, which have no real request.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.dummy_rid_handle" title="mstar.engine.cuda_graph_runner.dummy_rid_handle"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_handle</span></code></a>(name)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.dummy_rid_handle" title="mstar.engine.cuda_graph_runner.dummy_rid_handle"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_handle</span></code></a>(name)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.dummy_rid_name" title="mstar.engine.cuda_graph_runner.dummy_rid_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_name</span></code></a>(handle)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.dummy_rid_name" title="mstar.engine.cuda_graph_runner.dummy_rid_name"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dummy_rid_name</span></code></a>(handle)</p></td>
 <td><p>The name a padding-row handle was minted from.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.fail_if_graphs_required" title="mstar.engine.cuda_graph_runner.fail_if_graphs_required"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fail_if_graphs_required</span></code></a>(missing)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.cuda_graph_runner.fail_if_graphs_required" title="mstar.engine.cuda_graph_runner.fail_if_graphs_required"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fail_if_graphs_required</span></code></a>(missing)</p></td>
 <td><p>MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup failure, for deployments that would rather not come up than serve the eager path at 10-20x the latency.</p></td>
 </tr>
 </tbody>
@@ -1238,7 +1242,7 @@ replay pads with zero-length rows, so it is capture-time residue.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_runner.</span></span><span class="sig-name descname"><span class="pre">PiecewiseCudaGraphRunner</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resources</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step_runner</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_slots</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">joint_comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#PiecewiseCudaGraphRunner"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_runner.</span></span><span class="sig-name descname"><span class="pre">PiecewiseCudaGraphRunner</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resources</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step_runner</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_slots</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">joint_comm_group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">memory_pool</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#PiecewiseCudaGraphRunner"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseCudaGraphRunner" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Captures one inner callable of a submodule’s forward as a CUDA graph.</p>
 <p>Where <code class="docutils literal notranslate"><span class="pre">CudaGraphRunner</span></code> replays a whole <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> under engine
@@ -1497,8 +1501,10 @@ replay. <code class="docutils literal notranslate"><span class="pre">get_view</s
 <span class="sig-name descname"><span class="pre">get_view</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">default</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#PiecewiseOutput.get_view"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.PiecewiseOutput.get_view" title="Link to this definition">#</a></dt>
 <dd><p>The leading <code class="docutils literal notranslate"><span class="pre">real_len</span></code> slice WITHOUT copying.</p>
 <p>The result aliases the runner-owned static output buffer and is
-OVERWRITTEN by the next <code class="docutils literal notranslate"><span class="pre">run</span></code>. Read it within the same step; use
-<code class="docutils literal notranslate"><span class="pre">get</span></code> when you need something that outlives the step.</p>
+OVERWRITTEN by the next <code class="docutils literal notranslate"><span class="pre">run</span></code> of this runner. Nothing else writes
+there: the buffers live outside the graph memory pool, so replays of
+other regions sharing the node’s pool leave them alone. Read it within
+the same step; use <code class="docutils literal notranslate"><span class="pre">get</span></code> when you need something that outlives it.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
@@ -1566,6 +1572,26 @@ came in on.</p>
 failed up front with the guard that broke: dynamo saves the CUDA RNG state
 before it compiles, which CUDA refuses during capture, so such a capture
 cannot succeed and would otherwise die with an unrelated error.</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.cuda_graph_runner.capture_with_static_outputs">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.cuda_graph_runner.</span></span><span class="sig-name descname"><span class="pre">capture_with_static_outputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">run</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">warm_outputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">autocast_dtype</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/cuda_graph_runner.html#capture_with_static_outputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.cuda_graph_runner.capture_with_static_outputs" title="Link to this definition">#</a></dt>
+<dd><p>Capture <code class="docutils literal notranslate"><span class="pre">run</span></code> so its outputs land in buffers allocated OUTSIDE <code class="docutils literal notranslate"><span class="pre">pool</span></code>.</p>
+<p><code class="docutils literal notranslate"><span class="pre">warm_outputs</span></code> is what <code class="docutils literal notranslate"><span class="pre">run</span></code> returned on a warm-up call (<code class="docutils literal notranslate"><span class="pre">{name:</span>
+<span class="pre">Tensor}</span></code>); it fixes the shapes and dtypes. The captured graph ends with a
+device-to-device copy of each output into a buffer allocated here, before
+the capture, from the ordinary allocator.</p>
+<p>Why not hand out the graph’s own output tensors: blocks a graph frees
+while it is being captured go back to the pool and are handed to the
+graphs captured after it, so an output that lived in the pool could sit
+exactly where an earlier-captured graph keeps its scratch and be
+overwritten by that graph’s next replay. That is harmless while a pool
+belongs to one region whose graphs replay one at a time and whose
+outputs are consumed before the next replay, but not once a node’s
+regions share one pool and replay in data-dependent order. Buffers outside
+the pool stay valid until this graph’s own next replay, whatever else the
+node runs in between.</p>
 </dd></dl>
 
 <dl class="py function">
@@ -1761,6 +1787,7 @@ eager path at 10-20x the latency.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.agree_across_ranks"><code class="docutils literal notranslate"><span class="pre">agree_across_ranks()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.autocast_scope"><code class="docutils literal notranslate"><span class="pre">autocast_scope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.capture_into_graph"><code class="docutils literal notranslate"><span class="pre">capture_into_graph()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.capture_with_static_outputs"><code class="docutils literal notranslate"><span class="pre">capture_with_static_outputs()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.dummy_metadata"><code class="docutils literal notranslate"><span class="pre">dummy_metadata()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.dummy_rid_handle"><code class="docutils literal notranslate"><span class="pre">dummy_rid_handle()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.cuda_graph_runner.dummy_rid_name"><code class="docutils literal notranslate"><span class="pre">dummy_rid_name()</span></code></a></li>

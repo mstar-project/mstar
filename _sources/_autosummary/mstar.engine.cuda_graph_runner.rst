@@ -16,6 +16,7 @@ mstar.engine.cuda\_graph\_runner
       agree_across_ranks
       autocast_scope
       capture_into_graph
+      capture_with_static_outputs
       dummy_metadata
       dummy_rid_handle
       dummy_rid_name

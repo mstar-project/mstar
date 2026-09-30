@@ -1016,6 +1016,41 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="capture_with_static_outputs">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.capture_with_static_outputs">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">capture_with_static_outputs</span><span class="p">(</span><span class="n">run</span><span class="p">,</span> <span class="n">warm_outputs</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.</span>
+
+<span class="sd">    ``warm_outputs`` is what ``run`` returned on a warm-up call (``{name:</span>
+<span class="sd">    Tensor}``); it fixes the shapes and dtypes. The captured graph ends with a</span>
+<span class="sd">    device-to-device copy of each output into a buffer allocated here, before</span>
+<span class="sd">    the capture, from the ordinary allocator.</span>
+
+<span class="sd">    Why not hand out the graph's own output tensors: blocks a graph frees</span>
+<span class="sd">    while it is being captured go back to the pool and are handed to the</span>
+<span class="sd">    graphs captured after it, so an output that lived in the pool could sit</span>
+<span class="sd">    exactly where an earlier-captured graph keeps its scratch and be</span>
+<span class="sd">    overwritten by that graph's next replay. That is harmless while a pool</span>
+<span class="sd">    belongs to one region whose graphs replay one at a time and whose</span>
+<span class="sd">    outputs are consumed before the next replay, but not once a node's</span>
+<span class="sd">    regions share one pool and replay in data-dependent order. Buffers outside</span>
+<span class="sd">    the pool stay valid until this graph's own next replay, whatever else the</span>
+<span class="sd">    node runs in between.</span>
+<span class="sd">    """</span>
+    <span class="n">static_outputs</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="n">name</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">value</span><span class="p">)</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">warm_outputs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+    <span class="p">}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">captured</span><span class="p">():</span>
+        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">run</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">static_outputs</span><span class="p">[</span><span class="n">name</span><span class="p">]</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">static_outputs</span>
+
+    <span class="n">graph</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span><span class="n">captured</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">device</span><span class="p">,</span> <span class="n">autocast_dtype</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">graph</span><span class="p">,</span> <span class="n">static_outputs</span></div>
+
+
+
 <div class="viewcode-block" id="fail_if_graphs_required">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.fail_if_graphs_required">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">fail_if_graphs_required</span><span class="p">(</span><span class="n">missing</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1956,8 +1991,10 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""The leading ``real_len`` slice WITHOUT copying.</span>
 
 <span class="sd">        The result aliases the runner-owned static output buffer and is</span>
-<span class="sd">        OVERWRITTEN by the next ``run``. Read it within the same step; use</span>
-<span class="sd">        ``get`` when you need something that outlives the step.</span>
+<span class="sd">        OVERWRITTEN by the next ``run`` of this runner. Nothing else writes</span>
+<span class="sd">        there: the buffers live outside the graph memory pool, so replays of</span>
+<span class="sd">        other regions sharing the node's pool leave them alone. Read it within</span>
+<span class="sd">        the same step; use ``get`` when you need something that outlives it.</span>
 <span class="sd">        """</span>
         <span class="n">value</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -2005,6 +2042,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">num_slots</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
         <span class="n">joint_comm_group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">memory_pool</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_label</span> <span class="o">=</span> <span class="n">label</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_config</span> <span class="o">=</span> <span class="n">config</span>
@@ -2022,7 +2060,7 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_graphs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">PiecewiseGraphKey</span><span class="p">,</span> <span class="n">PiecewiseGraphData</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="n">memory_pool</span>
         <span class="c1"># (bs, total_tokens) shapes that failed to capture and run eagerly</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dropped_shapes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span> <span class="o">=</span> <span class="n">DummyRowPool</span><span class="p">(</span>
@@ -2115,7 +2153,8 @@ window.runMermaid = runMermaid;</script>
             <span class="k">return</span>
 
         <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graphs</span><span class="o">.</span><span class="n">graph_pool_handle</span><span class="p">()</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graphs</span><span class="o">.</span><span class="n">graph_pool_handle</span><span class="p">()</span>
 
         <span class="n">shapes</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">prepare_for_capture</span><span class="p">()</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">shapes</span><span class="p">:</span>
@@ -2202,24 +2241,25 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
 
         <span class="k">def</span><span class="w"> </span><span class="nf">run_fn</span><span class="p">():</span>
-            <span class="k">return</span> <span class="n">fn</span><span class="p">(</span><span class="n">call</span><span class="p">)</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_normalize_output</span><span class="p">(</span><span class="n">fn</span><span class="p">(</span><span class="n">call</span><span class="p">))</span>
 
         <span class="k">try</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+            <span class="n">warm_outputs</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">NUM_WARMUP</span><span class="p">):</span>
                 <span class="k">with</span> <span class="n">autocast_scope</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">):</span>
-                    <span class="n">run_fn</span><span class="p">()</span>
+                    <span class="n">warm_outputs</span> <span class="o">=</span> <span class="n">run_fn</span><span class="p">()</span>
                 <span class="c1"># back to a clean stream state so the re-plan below (and the</span>
                 <span class="c1"># capture after it) sees the shapes the first plan did</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_dummy_rows</span><span class="o">.</span><span class="n">reset</span><span class="p">(</span><span class="n">dummy_rids</span><span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_plan</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
-            <span class="n">graph</span><span class="p">,</span> <span class="n">raw_outputs</span> <span class="o">=</span> <span class="n">capture_into_graph</span><span class="p">(</span>
-                <span class="n">run_fn</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
+            <span class="n">graph</span><span class="p">,</span> <span class="n">static_outputs</span> <span class="o">=</span> <span class="n">capture_with_static_outputs</span><span class="p">(</span>
+                <span class="n">run_fn</span><span class="p">,</span> <span class="n">warm_outputs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_memory_pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_device</span><span class="p">,</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_autocast_dtype</span><span class="p">,</span>
             <span class="p">)</span>
-            <span class="n">static_outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_normalize_output</span><span class="p">(</span><span class="n">raw_outputs</span><span class="p">)</span>
         <span class="k">finally</span><span class="p">:</span>
             <span class="c1"># pages stay with the dummy streams: replay's padding rows address</span>
             <span class="c1"># the same ids, so their plan finds the storage already resident</span>
