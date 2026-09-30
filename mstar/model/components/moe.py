@@ -16,6 +16,11 @@ Parallel (TP-aware) variants:
 * :class:`ParallelSparseMoeBlock`
 * :class:`ParallelSparseMoeBlockWithSharedExpert`
 
+Expert-parallel variant:
+
+* :class:`ExpertParallelSparseMoeBlock` — each rank owns a contiguous
+  block of whole experts instead of a slice of every expert.
+
 When triton is installed and inputs are on CUDA, dispatch goes through
 the Triton fused-MoE kernel in :mod:`mstar.utils.fused_moe`; otherwise it
 falls back to the naive per-expert loop in :func:`dispatch_experts_fused`.
@@ -147,6 +152,7 @@ def dispatch_experts_fused(
     num_experts: int,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
+    skip_invalid: bool = False,
 ) -> torch.Tensor:
     """Naive per-expert dispatch using the fused HF checkpoint layout.
 
@@ -160,13 +166,17 @@ def dispatch_experts_fused(
         down_proj: ``(num_experts, hidden_size, moe_intermediate_size)``.
         selected_experts: ``(tokens, top_k)`` int64.
         routing_weights: ``(tokens, top_k)`` float.
+        skip_invalid: set when ``selected_experts`` may hold the EP
+            sentinel ``num_experts``; those slots contribute nothing.
     """
     final_hidden_states = torch.zeros_like(hidden_states)
 
     with torch.no_grad():
         # one-hot mask over expert dim: (num_experts, top_k, tokens)
-        expert_mask = F.one_hot(selected_experts, num_classes=num_experts)
-        expert_mask = expert_mask.permute(2, 1, 0)
+        num_classes = num_experts + 1 if skip_invalid else num_experts
+        expert_mask = F.one_hot(selected_experts, num_classes=num_classes)
+        # Drop the sentinel column so skipped slots never reach an expert.
+        expert_mask = expert_mask[..., :num_experts].permute(2, 1, 0)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
     for expert_idx_t in expert_hit:
@@ -192,16 +202,17 @@ def _dispatch(
     num_experts: int,
     selected_experts: torch.Tensor,
     routing_weights: torch.Tensor,
+    skip_invalid: bool = False,
 ) -> torch.Tensor:
     """Pick fused-Triton if available, otherwise the naive loop."""
     if _HAS_FUSED and hidden_states.is_cuda:
         return _fused_experts(
             hidden_states, gate_up_proj, down_proj,
-            routing_weights, selected_experts,
+            routing_weights, selected_experts, skip_invalid=skip_invalid,
         )
     return dispatch_experts_fused(
         hidden_states, gate_up_proj, down_proj,
-        num_experts, selected_experts, routing_weights,
+        num_experts, selected_experts, routing_weights, skip_invalid=skip_invalid,
     )
 
 
@@ -589,3 +600,165 @@ class ParallelSparseMoeBlockWithSharedExpert(nn.Module):
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
         self.comm_group.all_reduce(output)
         return output
+
+
+# ---------------------------------------------------------------------------
+# Expert-parallel MoE block
+# ---------------------------------------------------------------------------
+
+
+def _ep_gate_up_weight_loader(
+    expert_start: int, num_local_experts: int, full_inter: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: int | str | None = None,
+):
+    """Load one expert's gate_proj or up_proj whole, if this rank owns it.
+
+    ``loaded_shard_id`` is ``"gate:N"`` or ``"up:N"`` with ``N`` the global
+    expert index. Experts outside ``[expert_start, expert_start +
+    num_local_experts)`` belong to another rank and are skipped.
+    ``param`` has shape ``(E_local, 2*inter, hidden)``.
+    """
+    assert loaded_shard_id is not None
+    kind, expert_str = loaded_shard_id.split(":")
+    local_idx = int(expert_str) - expert_start
+    if not 0 <= local_idx < num_local_experts:
+        return
+    assert loaded_weight.shape == (full_inter, param.shape[2]), (
+        f"expert {loaded_shard_id} shape {tuple(loaded_weight.shape)} "
+        f"!= {(full_inter, param.shape[2])}"
+    )
+    if kind == "gate":
+        param.data[local_idx, :full_inter, :] = loaded_weight
+    else:
+        param.data[local_idx, full_inter:, :] = loaded_weight
+
+
+def _ep_down_proj_weight_loader(
+    expert_start: int, num_local_experts: int,
+    param: nn.Parameter, loaded_weight: torch.Tensor,
+    loaded_shard_id: int | str | None = None,
+):
+    """Load one expert's down_proj whole, if this rank owns it.
+
+    ``loaded_shard_id`` is ``"down:N"``. ``loaded_weight`` has shape
+    ``(hidden, inter)``, the same as one expert's slot in ``param``.
+    """
+    assert loaded_shard_id is not None
+    local_idx = int(loaded_shard_id.split(":")[1]) - expert_start
+    if not 0 <= local_idx < num_local_experts:
+        return
+    assert loaded_weight.shape == param.shape[1:], (
+        f"expert {loaded_shard_id} shape {tuple(loaded_weight.shape)} "
+        f"!= {tuple(param.shape[1:])}"
+    )
+    param.data[local_idx] = loaded_weight
+
+
+class ExpertParallelSparseMoeBlock(nn.Module):
+    """Expert-parallel Top-K sparse MoE.
+
+    Rank ``r`` of ``P`` owns global experts ``[r*E_local, (r+1)*E_local)``
+    at full intermediate width, with ``E_local = num_experts / P``. The
+    input and the router are replicated, so every rank computes the same
+    top-k. Each rank remaps slots routed to other ranks' experts to the
+    sentinel id ``E_local``, which the dispatch skips, and one all-reduce
+    sums the disjoint partial outputs.
+
+    The signature matches :class:`ParallelSparseMoeBlock`. When
+    ``world_size == 1`` the forward is identical to :class:`SparseMoeBlock`.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        num_experts_per_tok: int,
+        moe_intermediate_size: int,
+        norm_topk_prob: bool = True,
+        router: nn.Module | None = None,
+        comm_group: CommGroup | None = None,
+    ) -> None:
+        super().__init__()
+        if comm_group is None:
+            comm_group = CommGroup.trivial()
+        self.comm_group = comm_group
+
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.moe_intermediate_size = moe_intermediate_size
+        self.num_local_experts = divide(num_experts, comm_group.world_size)
+        self.expert_start = comm_group.rank * self.num_local_experts
+
+        self.gate = router if router is not None else TopKRouter(
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            norm_topk_prob=norm_topk_prob,
+        )
+
+        self.experts = nn.Module()
+        self.experts.gate_up_proj = nn.Parameter(
+            torch.empty(self.num_local_experts, 2 * moe_intermediate_size, hidden_size)
+        )
+        self.experts.down_proj = nn.Parameter(
+            torch.empty(self.num_local_experts, hidden_size, moe_intermediate_size)
+        )
+        self._attach_weight_loaders()
+
+    def _attach_weight_loaders(self):
+        from functools import partial
+
+        self.experts.gate_up_proj.weight_loader = partial(
+            _ep_gate_up_weight_loader,
+            self.expert_start, self.num_local_experts, self.moe_intermediate_size,
+        )
+        self.experts.down_proj.weight_loader = partial(
+            _ep_down_proj_weight_loader, self.expert_start, self.num_local_experts,
+        )
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        self._attach_weight_loaders()
+        return result
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_states: torch.Tensor | None = None,
+        *,
+        return_router_states: bool = False,
+    ):
+        input_shape = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
+        flat = hidden_states.view(-1, hidden_dim).contiguous()
+        routing_weights, selected_experts, router_states_next = self.gate(flat, router_states)
+
+        if self.comm_group.world_size == 1:
+            out = _dispatch(
+                flat, self.experts.gate_up_proj, self.experts.down_proj,
+                self.num_experts, selected_experts, routing_weights,
+            )
+        else:
+            out = self._dispatch_ep(flat, routing_weights, selected_experts)
+        out = out.view(input_shape)
+        return (out, router_states_next) if return_router_states else out
+
+    def _dispatch_ep(
+        self, flat: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        # Every shape is static, so this stays torch.compile and CUDA-graph safe.
+        local = selected_experts - self.expert_start
+        owned = (local >= 0) & (local < self.num_local_experts)
+        local = torch.where(owned, local, self.num_local_experts)
+        # Skipped slots never reach a GEMM; zeroing their weight is belt-and-braces.
+        routing_weights = torch.where(owned, routing_weights, 0)
+        out = _dispatch(
+            flat, self.experts.gate_up_proj, self.experts.down_proj,
+            self.num_local_experts, local, routing_weights, skip_invalid=True,
+        )
+        self.comm_group.all_reduce(out)
+        return out
