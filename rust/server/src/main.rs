@@ -996,6 +996,7 @@ async fn generate_finish(
         input_modalities,
         output_modalities,
         model_kwargs,
+        parts: Vec::new(),
     };
 
     schedule_upload_cleanup(&st.upload_dir, &args);

@@ -2,8 +2,9 @@
 //! Rust ZMQ transport (the `mstar_rust` library crate).
 //!
 //! Mirrors mstar's `APIServer.submit_request` / result-collection contract:
-//! the frontend flattens an OpenAI request into a submit (text + media file
-//! paths + in/out modalities + model_kwargs) and receives a stream of
+//! the frontend translates an OpenAI request into a submit (text + media file
+//! paths + in/out modalities + model_kwargs, and a chat's ordered parts) and
+//! receives a stream of
 //! multimodal `ResultChunk`s ({modality, data, metadata}) back — which the
 //! serving handlers translate into SSE / WAV / NDJSON. Media preprocessing and
 //! the model run in the Python data plane; no Python touches the request/HTTP
@@ -12,7 +13,8 @@
 //! Wire format is msgpack (the conductor speaks msgpack), sent as the
 //! `ZmqCommunicator`'s opaque byte payload:
 //!   frontend -> conductor: SubmitMsg {t:"submit", rid, text, file_paths,
-//!       input_modalities, output_modalities, model_kwargs, streaming}
+//!       input_modalities, output_modalities, model_kwargs, prompt_parts,
+//!       streaming}, `prompt_parts` present for a chat only
 //!   conductor -> frontend: {t:"chunk", rid, modality, data(bin), metadata}
 //!                        | {t:"done",  rid}
 
@@ -25,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::adapters::SubmitArgs;
+use crate::adapters::{Part, SubmitArgs};
 
 /// One chunk of generated output, matching mstar's `ResultChunk`.
 #[derive(Debug, Clone)]
@@ -63,7 +65,15 @@ struct SubmitMsg<'a> {
     input_modalities: &'a [String],
     output_modalities: &'a [String],
     model_kwargs: &'a serde_json::Map<String, Value>,
+    /// `submit_request`'s `prompt_parts`, one map per part; left out when
+    /// empty, so every other path's message is unchanged.
+    #[serde(skip_serializing_if = "no_parts")]
+    prompt_parts: &'a [Part],
     streaming: bool,
+}
+
+fn no_parts(parts: &&[Part]) -> bool {
+    parts.is_empty()
 }
 
 /// Inbound message; `t` selects chunk / err / done. `data` is msgpack binary.
@@ -198,6 +208,7 @@ impl Bridge {
             input_modalities: &args.input_modalities,
             output_modalities: &args.output_modalities,
             model_kwargs: &args.model_kwargs,
+            prompt_parts: &args.parts,
             streaming,
         };
         let payload = rmp_serde::to_vec_named(&msg).expect("encode submit");

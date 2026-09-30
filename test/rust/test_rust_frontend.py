@@ -48,13 +48,14 @@ class _StubAPIServer:
 
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
-                       model_kwargs=None, streaming=True, request_id=None):
+                       model_kwargs=None, prompt_parts=None, streaming=True,
+                       request_id=None):
         if text and "boom" in text:
             raise ValueError("scripted ingest failure")
         self.submitted.append({
             "rid": request_id, "text": text,
             "in": input_modalities, "out": output_modalities,
-            "mk": model_kwargs, "files": file_paths,
+            "mk": model_kwargs, "files": file_paths, "parts": prompt_parts,
             "streaming": streaming,
         })
         return request_id

@@ -21,12 +21,24 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::media;
 use crate::protocol::{
     ChatCompletionRequest, Content, ImageGenerationRequest, SpeechRequest, VideoGenerationRequest,
 };
+
+/// One element of a chat prompt, in request order: mstar's `PromptPart`,
+/// field for field, so the bridge builds one from each as it arrives.
+#[derive(Debug, Clone, Serialize)]
+pub struct Part {
+    pub modality: String,
+    pub text: Option<String>,
+    /// The position within its own modality's attachments.
+    pub index: usize,
+    pub role: String,
+}
 
 /// The arguments the bridge submits to the conductor (mirrors mstar's
 /// `SubmitArgs` / `PreprocessInput`).
@@ -42,6 +54,8 @@ pub struct SubmitArgs {
     pub input_modalities: Vec<String>,
     pub output_modalities: Vec<String>,
     pub model_kwargs: Map<String, Value>,
+    /// A chat's parts, in order; empty on every other path.
+    pub parts: Vec<Part>,
 }
 
 impl Default for SubmitArgs {
@@ -53,6 +67,7 @@ impl Default for SubmitArgs {
             input_modalities: Vec::new(),
             output_modalities: vec!["text".to_string()],
             model_kwargs: Map::new(),
+            parts: Vec::new(),
         }
     }
 }
@@ -299,6 +314,7 @@ impl Adapter {
                     input_modalities: in_mods,
                     output_modalities: vec!["text".to_string()],
                     model_kwargs: mk,
+                    parts: Vec::new(),
                 })
             }
             Adapter::Qwen3Omni => {
@@ -338,6 +354,7 @@ impl Adapter {
                     input_modalities: in_mods,
                     output_modalities: out_mods,
                     model_kwargs: mk,
+                    parts: Vec::new(),
                 })
             }
             Adapter::Orpheus | Adapter::Cosmos3 => {
@@ -372,6 +389,7 @@ impl Adapter {
                     input_modalities: vec!["text".to_string()],
                     output_modalities: vec!["text".to_string(), "audio".to_string()],
                     model_kwargs: mk,
+                    parts: Vec::new(),
                 })
             }
             Adapter::Orpheus => {
@@ -398,6 +416,7 @@ impl Adapter {
                     input_modalities: vec!["text".to_string()],
                     output_modalities: vec!["audio".to_string()],
                     model_kwargs: mk,
+                    parts: Vec::new(),
                 })
             }
             Adapter::Bagel | Adapter::Cosmos3 => {
@@ -420,6 +439,7 @@ impl Adapter {
                     input_modalities: vec!["text".to_string()],
                     output_modalities: vec!["image".to_string()],
                     model_kwargs: mk,
+                    parts: Vec::new(),
                 })
             }
             Adapter::Cosmos3 => {
@@ -437,6 +457,7 @@ impl Adapter {
                     input_modalities: vec!["text".to_string()],
                     output_modalities: vec!["image".to_string()],
                     model_kwargs: mk,
+                    parts: Vec::new(),
                 })
             }
             _ => Err("image generation is not supported by this model".to_string()),
@@ -486,6 +507,7 @@ impl Adapter {
                             input_modalities: vec!["image".to_string(), "text".to_string()],
                             output_modalities: vec!["video".to_string()],
                             model_kwargs: mk,
+                            parts: Vec::new(),
                         })
                     }
                     (None, Some(video)) => {
@@ -499,6 +521,7 @@ impl Adapter {
                             input_modalities: vec!["video".to_string(), "text".to_string()],
                             output_modalities: vec!["video".to_string()],
                             model_kwargs: mk,
+                            parts: Vec::new(),
                         })
                     }
                     (None, None) => Ok(SubmitArgs {
@@ -508,6 +531,7 @@ impl Adapter {
                         input_modalities: vec!["text".to_string()],
                         output_modalities: vec!["video".to_string()],
                         model_kwargs: mk,
+                        parts: Vec::new(),
                     }),
                 }
             }
@@ -532,6 +556,7 @@ impl Adapter {
                     input_modalities: vec!["image".to_string(), "text".to_string()],
                     output_modalities: vec!["image".to_string()],
                     model_kwargs: extra_kwargs,
+                    parts: Vec::new(),
                 })
             }
             _ => Err("image editing is not supported by this model".to_string()),
