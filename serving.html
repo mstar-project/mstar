@@ -834,6 +834,16 @@ conductor’s queue.</p></td>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code></p></td>
 <td><p><em>(optional)</em> Server-init model parameters (see below).</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">warmup_requests</span></code></p></td>
+<td><p><em>(optional)</em> Requests the server runs after the workers are ready and before it
+binds, so no client pays a shape’s first-request cost (torch.compile of a step,
+a cold cache). Each entry is a <code class="docutils literal notranslate"><span class="pre">/generate</span></code> request in yaml form: <code class="docutils literal notranslate"><span class="pre">text</span></code>,
+<code class="docutils literal notranslate"><span class="pre">output_modalities</span></code>, <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, and <code class="docutils literal notranslate"><span class="pre">files</span></code>, a list of media
+inputs in prompt order (text follows them). A file is a path or
+<code class="docutils literal notranslate"><span class="pre">hf://&lt;owner&gt;/&lt;repo&gt;/&lt;path&gt;</span></code> (a file in a model’s HF repo); its modality
+comes from the extension, or give <code class="docutils literal notranslate"><span class="pre">{path:</span> <span class="pre">...,</span> <span class="pre">modality:</span> <span class="pre">...}</span></code>. A
+malformed or failing warmup is logged and skipped.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
