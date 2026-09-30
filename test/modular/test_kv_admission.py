@@ -260,27 +260,38 @@ def test_a_follower_takes_what_rank_zero_would_hold_back():
     )
 
 
-def test_a_pool_other_workers_share_never_refuses():
-    # CFG parallel: this worker runs one of the three nodes the cache serves
+def _cfg_parallel_cache(node: str) -> KVManager:
+    """One worker's cache under CFG parallel, which runs ``node`` of the three."""
     spec = KVSpec(
         resource_key="kv", nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"},
         config=KVConfig(
             num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096,
             max_num_pages=16, page_size=PAGE_SIZE,
         ),
+        leader="LLM",
     )
-    alone, shared = (
-        _two_admitted(KVManager.build(spec, EngineResourceInfo(
-            device=torch.device("cpu"), kv_dtype=torch.float32, nodes=nodes,
-        )))
-        for nodes in (frozenset(spec.nodes), frozenset({"LLM"}))
-    )
+    return KVManager.build(spec, EngineResourceInfo(
+        device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({node}),
+    ))
+
+
+def test_under_cfg_parallel_the_leaders_cache_decides_for_the_guidance_caches():
+    leader = _two_admitted(_cfg_parallel_cache("LLM"))
+    guidance = _two_admitted(_cfg_parallel_cache("LLM_cfg_text"))
 
     # each worker's own queue would order two requests differently
-    assert not _ready(alone, "b").ready
-    assert _ready(shared, "b").ready and _step(shared, "b", 100).ok, (
-        "a worker refused a request on its own count"
+    assert not _ready(leader, "b").ready, "the leader's cache admitted past its room"
+    assert _ready(guidance, "b").ready and _step(guidance, "b", 100).ok, (
+        "a guidance cache refused a request on its own count"
     )
+
+
+def test_a_guidance_cache_checks_no_room_of_its_own(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    guidance = _two_admitted(_cfg_parallel_cache("LLM_cfg_text"))
+
+    # admitted by the leader, so past what this cache alone would have let in
+    assert _step(guidance, "b", 100).ok, "a guidance cache failed the leader's decision"
 
 
 # ── a request moved to the host ─────────────────────────────────────────
