@@ -12,6 +12,7 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.config import PositionSpec, PosScheme
+from mstar.graph.special_destinations import SPECIAL_DESTINATIONS
 from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,7 @@ def _refuse_unknown_walks(model: Model) -> None:
     for key, by_label in model.prefix_key_streams().items():
         for label, stream in by_label.items():
             unknown = sorted(
-                {stream.walk, stream.decode_walk} - walks - {None}
+                {stream.walk, stream.decode_walk, *stream.layout_walks} - walks - {None}
             )
             if unknown:
                 raise ValueError(
@@ -88,6 +89,43 @@ def _refuse_unknown_walks(model: Model) -> None:
                     f"{unknown}, which it never runs; its walks are "
                     f"{sorted(walks)}"
                 )
+
+
+def _refuse_unservable_walks(specs: list[NodeResourceSpec], model: Model) -> None:
+    """Refuse a walk of a laid-out stream that the cache could not serve whole:
+    one where its keyed node feeds another node, or where none of them runs.
+
+    A walk the cache serves whole completes with no outputs, so a node that
+    reads it would get nothing. Only a stream with layout walks has walks the
+    cache can serve whole: a single span always runs its last token.
+    """
+    graphs = model.get_graph_walk_graphs()
+    by_key = {spec.resource_key: spec for spec in specs}
+    for key, by_label in model.prefix_key_streams().items():
+        for label, stream in by_label.items():
+            if not stream.layout_walks:
+                continue
+            keyed_nodes = by_key[key].nodes
+            for walk in (stream.walk, *stream.layout_walks):
+                # per walk: a node the resource also serves elsewhere need not run here
+                nodes = graphs[walk].get_nodes()
+                ran = sorted(keyed_nodes & set(nodes))
+                if not ran:
+                    raise ValueError(
+                        f"{type(model).__name__} lays {key!r}/{label!r} out over "
+                        f"{walk!r}, where none of {sorted(keyed_nodes)} runs"
+                    )
+                for name in ran:
+                    fed = sorted(
+                        {edge.next_node for edge in nodes[name].outputs}
+                        - SPECIAL_DESTINATIONS
+                    )
+                    if fed:
+                        raise ValueError(
+                            f"{type(model).__name__} lays {key!r}/{label!r} out over "
+                            f"{walk!r}, where {name} feeds {fed}, which would get "
+                            "nothing from a walk the cache serves whole"
+                        )
 
 
 @dataclass
@@ -123,6 +161,7 @@ class EngineManager:
         _refuse_uncacheable_positions(specs, model)
         _refuse_unskippable_resources(specs, model)
         _refuse_unknown_walks(model)
+        _refuse_unservable_walks(specs, model)
 
         # Resolve autocast dtype: explicit YAML config wins; otherwise we
         # fall back to the Model's own preference (so models that need to
