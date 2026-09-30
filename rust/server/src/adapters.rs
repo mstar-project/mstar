@@ -160,7 +160,16 @@ fn refuse_outside_user(role: &str, modality: &str) -> Result<(), String> {
     if role == "user" {
         return Ok(());
     }
-    Err(format!("a {role} message cannot carry a {modality} attachment"))
+    Err(format!(
+        "{} message cannot carry {} attachment",
+        with_article(role),
+        with_article(modality)
+    ))
+}
+
+fn with_article(word: &str) -> String {
+    let article = if word.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+    format!("{article} {word}")
 }
 
 fn add_file(
@@ -711,7 +720,7 @@ mod tests {
         .unwrap_err();
         let saved = std::fs::read_dir(&dir).unwrap().count();
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(err, "a assistant message cannot carry a image attachment");
+        assert_eq!(err, "an assistant message cannot carry an image attachment");
         assert_eq!(saved, 0, "a refused attachment was saved, and nothing cleans it up");
     }
 }

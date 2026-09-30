@@ -52,6 +52,10 @@ class SubmitArgs:
     prompt_parts: list[PromptPart] | None = None
 
 
+def _with_article(word: str) -> str:
+    return f"{'an' if word[:1] in 'aeiou' else 'a'} {word}"
+
+
 def flatten_messages(
     messages: list, upload_dir: Path, allow_remote: bool = True
 ) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
@@ -70,7 +74,9 @@ def flatten_messages(
         # the layout has no text slot for the turn break the template writes
         # between two attachments, so an attachment stays in a user turn
         if role != "user":
-            raise ValueError(f"a {role} message cannot carry a {modality} attachment")
+            raise ValueError(
+                f"{_with_article(role)} message cannot carry {_with_article(modality)} attachment"
+            )
         paths = file_paths.setdefault(modality, [])
         parts.append(PromptPart(modality=modality, index=len(paths), role=role))
         paths.append(path)

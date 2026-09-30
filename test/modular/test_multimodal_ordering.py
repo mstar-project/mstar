@@ -123,13 +123,16 @@ def test_a_role_with_no_turn_stays_in_the_user_turn(tmp_path):
     )
 
 
-@pytest.mark.parametrize("role", ["system", "assistant"])
-def test_an_attachment_outside_a_user_message_is_refused(tmp_path, role):
+@pytest.mark.parametrize(("role", "message"), [
+    ("system", "a system message cannot carry an image attachment"),
+    ("assistant", "an assistant message cannot carry an image attachment"),
+])
+def test_an_attachment_outside_a_user_message_is_refused(tmp_path, role, message):
     """The template writes a turn break where the layout has no text slot for it."""
     messages = [{"role": role, "content": [
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
     ]}]
-    with pytest.raises(ValueError, match=f"a {role} message cannot carry"):
+    with pytest.raises(ValueError, match=f"^{message}$"):
         flatten_messages(messages, tmp_path)
 
 
