@@ -4,6 +4,10 @@ A prompt laid out text, image, text is three walks into one stream. The first
 walk's probe matches the whole layout and holds it; the walks it covers are
 served from that lease without running, and the one it covers in part runs
 from the lease's end.
+
+A served walk never admits, and an image walk reads the position counter while
+it prepares its inputs, so the counter moves at the probe, and by an image
+block's one position, not its slots.
 """
 
 from __future__ import annotations
@@ -131,6 +135,10 @@ class _Node:
     def stream(self):
         return self.kv._streams[RID]["main"]
 
+    @property
+    def counter(self) -> int:
+        return self.rope.position(RID, "main")
+
 
 
 def test_a_hit_across_three_walks_serves_the_two_it_covers_and_trims_the_third():
@@ -183,6 +191,26 @@ def test_a_mismatch_the_served_walks_cannot_survive_fails_the_request_and_says_w
         "the failure did not log which walk disagreed with the layout, and how"
     )
 
+
+
+
+def test_each_walk_the_cache_serves_moves_the_counter_by_its_advance_before_the_next_reads_it():
+    node = _Node()
+    node.walk(TEXT_WALK, len(TEXT))
+    past_text = node.counter
+    node.walk(IMAGE_WALK, IMAGE)
+    past_image = node.counter
+    trimmed = node.probe(TEXT_WALK, len(TAIL)).tokens
+
+    positions = node.step(len(TAIL) - trimmed, TEXT_WALK)
+
+    first = len(TEXT) + 1 + trimmed
+    assert (past_text, past_image, positions) == (
+        len(TEXT), len(TEXT) + 1, list(range(first, first + len(TAIL) - trimmed)),
+    ), (
+        "a walk after a served one read the counter at the start of what was "
+        "served, or an image moved it by its slots rather than its one position"
+    )
 
 
 def test_a_layout_reaches_the_kv_config_across_the_wire():

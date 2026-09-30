@@ -7,6 +7,9 @@ from an earlier request, once attending one it computed itself. Attention is
 planned over a different number of pages in the two runs, so what is asked of
 them is the repo's parity standard rather than equality.
 
+The same holds past an image: a hit serving text and an image whole leaves the
+last walk attending an image block it never computed, at the block's positions.
+
 The dtype decides which standard applies: FlashInfer's paged attention refuses
 fp32, so this runs in bf16, where the repo's tolerance is atol=rtol=5e-2 from
 `test_pi05_reference_equivalence.py`. The 1e-5 in
@@ -37,7 +40,7 @@ from mstar.engine.resources.attn.config import (
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PrefixSpan
-from mstar.engine.resources.kv.keys import chain
+from mstar.engine.resources.kv.keys import PageItem, chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.position.manager import RopeManager
@@ -52,6 +55,8 @@ PAGE_SIZE = 16
 ROOT = b"a root"
 NODE = "LLM"
 WALK = "prefill_text"
+IMAGE_WALK = "prefill_vit"
+DIGEST = bytes(range(32))
 # what this repo accepts between two bf16 paths; see the module docstring
 ATOL = RTOL = 5e-2
 DTYPE = torch.bfloat16
@@ -116,7 +121,10 @@ def _initialise(llm: torch.nn.Module) -> None:
 class _Node:
     """Bagel's language model over the real resources, at a small random init."""
 
-    def __init__(self, device: torch.device, cached: bool):
+    def __init__(
+        self, device: torch.device, cached: bool,
+        walks: dict[str, tuple[str | None, ...]] | None = None,
+    ):
         from mstar.model.bagel.components.language_model import BagelForCausalLM
 
         self.device = device
@@ -138,7 +146,7 @@ class _Node:
             transfer_engine_info=None, device=device, dtype=DTYPE,
         )
         if cached:
-            self.kv.enable_prefix_cache(ROOT)
+            self.kv.enable_prefix_cache(ROOT, walks)
         self.rope = RopeManager(
             config=PositionConfig(kv_cache="kv"), device=device, dtype=DTYPE,
         )
@@ -189,26 +197,89 @@ class _Node:
 
     def prefill(self, rid: str, tokens: list[int]) -> torch.Tensor:
         """Run one prefill over ``tokens`` and give back its hidden states."""
+        ids = torch.tensor(tokens, dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            return self._forward(rid, WALK, self.llm.model.embed_tokens(ids))
+
+    def _forward(self, rid: str, walk: str, embeds: torch.Tensor) -> torch.Tensor:
+        """One step; an image block runs as Bagel's image walk does, every slot at
+        the stream's current position, attending the whole block, one position on."""
+        image = walk == IMAGE_WALK
+        rope = PositionStep(
+            pos_ids={"main": torch.full(
+                (len(embeds),), self.rope.position(rid, "main"),
+                dtype=torch.int32, device=self.device,
+            )},
+            advance=(1,),
+        ) if image else PositionStep()
         step = SubmoduleStep(
             steps={
                 "kv": KVStep(),
-                "attn": AttentionStep(causal=True),
-                "rope": PositionStep(),
+                "attn": AttentionStep(causal=not image),
+                "rope": rope,
             },
-            segments=[Segment(rid, "main", len(tokens))],
+            segments=[Segment(rid, "main", len(embeds))],
         )
         ctx = StepContext(
-            request_ids=(rid,), graph_walk=WALK, slot=0, capture=False,
+            request_ids=(rid,), graph_walk=walk, slot=0, capture=False,
         )
         step.set_ctx(ctx)
         assert self.runner.admit(step).outcome.ok
         self.runner.plan(step)
-        ids = torch.tensor(tokens, dtype=torch.long, device=self.device)
-        with torch.no_grad():
-            hidden = self.llm.model.embed_tokens(ids)
-            hidden = self.llm(hidden, mode="und", label="main")
+        hidden = self.llm(embeds, mode="und", label="main")
         self.runner.commit(step)
         return hidden.float()
+
+    def ingest_layout(self, rid: str, parts: list) -> None:
+        """What the preprocess worker sends for ``parts``: ids, or an image's embeds."""
+        total = sum(len(part) for part in parts)
+        pages: list[list[int]] = [[] for _ in range(-(-total // PAGE_SIZE))]
+        items: dict[int, list[PageItem]] = {}
+        spans = []
+        at = 0
+        for part in parts:
+            if isinstance(part, list):
+                for slot, token in enumerate(part, start=at):
+                    pages[slot // PAGE_SIZE].append(token)
+                spans.append(PrefixSpan(len(part), len(part), WALK))
+            else:
+                for page in range(at // PAGE_SIZE, -(-(at + len(part)) // PAGE_SIZE)):
+                    first = max(at, page * PAGE_SIZE)
+                    items.setdefault(page, []).append(
+                        PageItem(first - page * PAGE_SIZE, first - at, len(part), DIGEST)
+                    )
+                spans.append(PrefixSpan(len(part), 1, IMAGE_WALK, DIGEST))
+            at += len(part)
+        self.runner.ingest_request(rid, {"kv": KVReqConfig(
+            prefix_keys={"main": chain(pages, items)},
+            prefix_tail={"main": pages[-1] if total % PAGE_SIZE else []},
+            prefix_layout={"main": spans},
+        )})
+
+    def run_layout(self, rid: str, parts: list) -> tuple[list[int], torch.Tensor]:
+        """Probe, serve or run each walk of ``parts``; what each was served, and the
+        last walk's hidden states over the tokens it ran."""
+        served, hidden = [], None
+        for part in parts:
+            image = not isinstance(part, list)
+            walk = IMAGE_WALK if image else WALK
+            inputs = ARNodeInputs(
+                input_ids=None if image else torch.tensor(part, device=self.device),
+                input_seq_len=len(part),
+            )
+            prefix = self.runner.resolve_cached_prefix(rid, NODE, walk, inputs)
+            self.runner.apply_cached_prefix(rid, NODE, walk, inputs, prefix)
+            held = prefix.tokens if prefix is not None else 0
+            served.append(held)
+            if held == len(part):
+                self.runner.complete_cached_walk(rid, NODE, walk)
+                continue
+            if image:
+                with torch.no_grad():
+                    hidden = self._forward(rid, walk, part[held:])
+            else:
+                hidden = self.prefill(rid, part[held:])
+        return served, hidden
 
 
 @requires_cuda
@@ -253,6 +324,51 @@ def test_a_consumed_prefix_lands_within_the_repos_parity_tolerance(capsys):
         from_cache, fresh, atol=ATOL, rtol=RTOL,
         msg=lambda default: (
             f"a prefix taken from the cache moved the forward by {deviation:.3e}, "
+            f"past the {ATOL:.0e} this repo accepts between a cached path and an "
+            f"uncached one\n{default}"
+        ),
+    )
+
+
+@requires_cuda
+def test_a_prompt_served_past_its_image_lands_within_the_repos_parity_tolerance(capsys):
+    device = torch.device("cuda:0")
+    walks = {"main": (WALK, "decode", IMAGE_WALK)}
+    generator = torch.Generator().manual_seed(20260930)
+    # at the scale `_initialise` gives the token embeddings
+    image = (torch.randn(50, _small_config().hidden_size, generator=generator) * 0.02).to(
+        device=device, dtype=DTYPE,
+    )
+    before, after, tail = list(range(1, 41)), list(range(200, 290)), list(range(400, 437))
+    # slots 0-39 text, 40-89 image, 90-179 text: 11 pages, so a repeat is served 40, 50 and 86
+    seeded, repeat = [before, image, after], [before, image, after + tail]
+
+    warm = _Node(device, cached=True, walks=walks)
+    warm.ingest_layout("seed", seeded)
+    warm.run_layout("seed", seeded)
+    warm.kv.remove_request("seed")
+
+    warm.ingest_layout("cached", repeat)
+    served, from_cache = warm.run_layout("cached", repeat)
+    cold = _Node(device, cached=False)
+    cold.ingest_layout("fresh", repeat)
+    fresh_served, whole = cold.run_layout("fresh", repeat)
+    fresh = whole[served[-1]:]
+
+    assert (served, fresh_served) == ([len(before), len(image), 86], [0, 0, 0]), (
+        f"served {served} and {fresh_served}, so this would not compare a walk "
+        "attending a cached image block with one that computed it"
+    )
+    assert all(hidden.isfinite().all() and hidden.abs().max() > 1e-2 for hidden in (from_cache, fresh)), (
+        "a run produced non-finite or near-zero hidden states, which any two runs agree on"
+    )
+    deviation = (from_cache - fresh).abs().max().item()
+    with capsys.disabled():
+        print(f"\n  served {served} slots of three walks; deviation {deviation:.3e}")
+    torch.testing.assert_close(
+        from_cache, fresh, atol=ATOL, rtol=RTOL,
+        msg=lambda default: (
+            f"a prompt served past its image moved the forward by {deviation:.3e}, "
             f"past the {ATOL:.0e} this repo accepts between a cached path and an "
             f"uncached one\n{default}"
         ),
