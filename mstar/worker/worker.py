@@ -847,10 +847,7 @@ class Worker:
         msg_types_needing_active_request = [
             WorkerMessageType.REMOVE_REQUEST,
             WorkerMessageType.INPUT_SIGNALS,
-            WorkerMessageType.STOP_LOOPS,
-            # A leader-forwarded DRAIN can beat the conductor's NEW; applying
-            # it early makes the NEW gate drop the NEW and strands the REMOVE.
-            WorkerMessageType.DRAIN_REQUEST,
+            WorkerMessageType.STOP_LOOPS
         ]
         # Snapshot: a REMOVE handled mid-iteration can re-buffer trailing
         # signals onto this same list, and mutating it while iterating it would
@@ -858,8 +855,14 @@ class Worker:
         for message in list(messages):
             # per_request_info is handle-keyed, so resolve the wire string
             # first; an unknown one has no handle and is parked the same way.
+            needs_active = message.message_type in msg_types_needing_active_request or (
+                # a leader-forwarded DRAIN can beat the conductor's NEW; applied
+                # early, the NEW gate drops the NEW and strands the REMOVE
+                message.message_type == WorkerMessageType.DRAIN_REQUEST
+                and message.body.source == MessageSource.TP_RANK_0
+            )
             if (
-                message.message_type in msg_types_needing_active_request and \
+                needs_active and \
                 self._rid(message.body.request_id)
                 not in self.request_state.per_request_info
             ):

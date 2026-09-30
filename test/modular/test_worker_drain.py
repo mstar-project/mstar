@@ -239,6 +239,18 @@ def test_drain_before_new_is_buffered_not_applied():
     assert _reads_done(w) == []
 
 
+def test_conductor_drain_for_a_never_admitted_rid_acks_at_once():
+    """Ingest can fail after the conductor registered the rid, so no NEW ever
+    comes; parking its DRAIN would hold the teardown barrier for the TTL."""
+    w = _worker(known_rids=())
+    w._unprocessed_messages = {}
+    Worker._process_message_list(w, [WorkerMessage(
+        message_type=WorkerMessageType.DRAIN_REQUEST, body=DrainRequest(request_id="X"),
+    )])
+    assert w._unprocessed_messages == {}
+    assert len(_reads_done(w)) == 1
+
+
 def test_draining_rid_still_takes_inputs_for_a_queued_tp_follow():
     """READS_DONE waits for a committed follow batch, so dropping the inputs
     that batch needs would stall the drain and hold the REMOVE forever."""
