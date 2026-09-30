@@ -18,6 +18,7 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.utils.streams import PLAN, get_stream
 
 logger = logging.getLogger(__name__)
 
@@ -936,7 +937,7 @@ class CudaGraphRunner:
         if not torch.cuda.is_available():
             return None
         if self._plan_stream is None:
-            self._plan_stream = torch.cuda.Stream(device=self._device)
+            self._plan_stream = get_stream(PLAN, self._device)
         return self._plan_stream
 
 

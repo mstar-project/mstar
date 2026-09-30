@@ -39,6 +39,7 @@ from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
+from mstar.utils.streams import RECV, SEND, TRANSFER_READ, get_stream
 
 logger = logging.getLogger(__name__)
 
@@ -134,10 +135,9 @@ class AsyncMooncakeReader:
         self.max_batch_size = max_batch_size
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._pending: list[Future] = []
-        if device != "cpu":
-            self._copy_stream = torch.cuda.Stream(device=device)
-        else:
-            self._copy_stream = torch.cuda.Stream()
+        self._copy_stream = get_stream(
+            TRANSFER_READ, device if device != "cpu" else None,
+        )
 
     def submit(self, read_info: list[TransferReadInfo]) -> Future:
         """Non-blocking: enqueue a batch of READs.
@@ -1361,8 +1361,8 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         self._d2h_stream: torch.cuda.Stream | None = None
         self._h2d_stream: torch.cuda.Stream | None = None
         if torch.cuda.is_available() and str(device) != "cpu":
-            self._d2h_stream = torch.cuda.Stream(device=device)
-            self._h2d_stream = torch.cuda.Stream(device=device)
+            self._d2h_stream = get_stream(SEND, device)
+            self._h2d_stream = get_stream(RECV, device)
 
     def _shm_path(self, entity_id: str, uuid: int) -> str:
         ns = f"{self._shm_namespace}_" if self._shm_namespace else ""

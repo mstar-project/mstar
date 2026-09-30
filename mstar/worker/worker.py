@@ -65,6 +65,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.numa import pin_to_device_numa_node
 from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
+from mstar.utils.streams import CHECK_STOP, get_stream
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -2622,7 +2623,7 @@ class Worker:
             return source
 
         if self._d2h_stream is None:
-            self._d2h_stream = torch.cuda.Stream(device=self.device)
+            self._d2h_stream = get_stream(CHECK_STOP, self.device)
         side = self._d2h_stream
         side.wait_event(completion_event)
 

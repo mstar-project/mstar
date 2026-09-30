@@ -16,14 +16,18 @@ Usage:
 """
 
 import logging
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
+
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -1130,6 +1134,57 @@ class Buffer:
 
 
 @dataclass
+class HostBuffer:
+    """Storage for one per-request scalar sampling parameter that only changes
+    on a config update (temperature, top-k, top-p, seed, penalty).
+
+    - ``buf``    ``[cg_slots, max_bs]`` per-step device tensor the graph reads
+      (its address must stay stable across replays).
+    - ``master`` ``[capacity]`` slot-indexed HOST array, one row per request.
+
+    The master lives on the host because the gather runs in the pre-plan,
+    beside the previous step's graph: from here the per-step row is one H2D
+    copy, where a device-side master would need an ``index_select`` (and its
+    row writes a ``fill_``) on the plan stream -- see ``mstar.utils.h2d``.
+    """
+    buf: torch.Tensor
+    master: np.ndarray
+    default: float
+    dtype: torch.dtype
+    stager: PinnedStager
+
+    @classmethod
+    def allocate(
+        cls, max_bs: int, capacity: int, device: torch.device,
+        dtype: torch.dtype, default: float, cg_slots: int = 1,
+    ) -> "HostBuffer":
+        np_dtype = torch.empty((), dtype=dtype).numpy().dtype
+        return cls(
+            buf=torch.full((cg_slots, max_bs), default, dtype=dtype, device=device),
+            master=np.full(capacity, default, dtype=np_dtype),
+            default=default,
+            dtype=dtype,
+            stager=PinnedStager(dtype, numel=max_bs),
+        )
+
+    def write_master_row(self, slot: int, value) -> None:
+        self.master[slot] = value
+
+    def grow_master(self, new_capacity: int) -> None:
+        new = np.full(new_capacity, self.default, dtype=self.master.dtype)
+        new[: self.master.shape[0]] = self.master
+        self.master = new
+
+    def slot_view(self, cg_slot: int, bs: int) -> torch.Tensor:
+        """This slot's per-step row."""
+        return self.buf[cg_slot if self.buf.shape[0] > 1 else 0, :bs]
+
+    def gather(self, rows: np.ndarray, padded_bs: int, cg_slot: int) -> None:
+        """Rows ``rows`` of the master into ``cg_slot``'s per-step buffer."""
+        self.stager.copy_(self.slot_view(cg_slot, padded_bs), self.master[rows])
+
+
+@dataclass
 class MaskBuffer:
     """Three-tier storage for the per-request seen-token mask ``[*, V]`` (bool).
 
@@ -1193,16 +1248,17 @@ class SamplerBuffers:
     cheap gather per buffer instead of the old per-element item-assignments.
     """
     max_batch_size: int
-    temperature: Buffer
-    top_k: Buffer
-    top_p: Buffer
-    seed: Buffer
-    rep_penalty: Buffer
+    temperature: HostBuffer
+    top_k: HostBuffer
+    top_p: HostBuffer
+    seed: HostBuffer
+    rep_penalty: HostBuffer
     # Per-request RNG offset: gathered by slot, advanced in graph, scattered
     # back after replay (all on GPU). Not a config value, so it's kept out of
     # ``_scalar_buffers`` (never written from a SamplingConfig) and reset to 0
     # on register instead.
     offset: Buffer
+
     # TP communicator for the submodule that owns these buffers. Passed
     # through ``slice_for_bs`` into every per-step ``CudaGraphableSampler``
     # so its ``_broadcast_tokens`` aligns the sampled token across ranks.
@@ -1241,9 +1297,15 @@ class SamplerBuffers:
     # Slot bookkeeping (CPU-only).
     _rid_to_slot: dict[str, int] = field(default_factory=dict, repr=False)
     _free_slots: list[int] = field(default_factory=list, repr=False)
-    # Slots awaiting GPU init, consumed by the next gather so every write is
-    # enqueued from the GPU thread rather than racing it from the main one.
+    # Slots awaiting init, consumed by the next gather so the rows are written
+    # on the gathering thread rather than racing it from the main one.
     _pending_init: set[int] = field(default_factory=set, repr=False)
+    # Slots whose RNG offset must be zeroed before it is next gathered. The
+    # zeroing is a device write, so it waits for ``gather_dynamic`` on the
+    # default stream rather than running on the plan stream from the pre-plan.
+    # Filled by the plan thread, drained by the GPU thread.
+    _pending_offset_reset: set[int] = field(default_factory=set, repr=False)
+    _offset_reset_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Last-known config per rid — change-detect for ``update_request_config``
     # so steady-state per-step calls do zero GPU work (for the scalar rows).
     _cached_config: dict[str, SamplingConfig] = field(default_factory=dict, repr=False)
@@ -1252,7 +1314,7 @@ class SamplerBuffers:
     def tracks_seen_tokens(self) -> bool:
         return self.seen_tokens is not None
 
-    def _scalar_buffers(self) -> list[Buffer]:
+    def _scalar_buffers(self) -> list[HostBuffer]:
         return [self.temperature, self.top_k, self.top_p, self.seed, self.rep_penalty]
 
     @classmethod
@@ -1275,9 +1337,9 @@ class SamplerBuffers:
         pinned = torch.cuda.is_available() and device.type == "cuda"
         cap = max_batch_size
 
-        def mk(dtype: torch.dtype, default: float, slots=cg_slots) -> Buffer:
-            return Buffer.allocate(
-                max_batch_size, cap, device, dtype, default, slots
+        def mk(dtype: torch.dtype, default: float) -> HostBuffer:
+            return HostBuffer.allocate(
+                max_batch_size, cap, device, dtype, default, cg_slots
             )
 
         # seen token mask is not double-buffered, as it depends on the GPU
@@ -1293,7 +1355,7 @@ class SamplerBuffers:
             top_p=mk(torch.float32, 1.0),
             seed=mk(torch.long, 0),
             rep_penalty=mk(torch.float32, 1.0),
-            offset=mk(torch.long, 0, slots=1),
+            offset=Buffer.allocate(max_batch_size, cap, device, torch.long, 0, 1),
             tp_group=tp_group,
             seen_tokens=seen_tokens,
             _master_capacity=cap,
@@ -1327,8 +1389,7 @@ class SamplerBuffers:
     def _write_master_row(self, slot: int, cfg: SamplingConfig) -> None:
         """Push one config row into each scalar master buffer.
 
-        Five scalar fills, queued in stream order ahead of the gather that
-        reads them; only runs on register or actual config change
+        Host writes only; only runs on register or actual config change
         (change-detection lives in ``update_request_config``). The seen-token
         mask is NOT written here (it changes every step — see
         ``update_request_config``).
@@ -1446,10 +1507,13 @@ class SamplerBuffers:
             torch._foreach_copy_(dsts, srcs)
 
     def _init_slot(self, slot: int, rid: str) -> None:
-        """GPU-side init for a newly registered slot. Must run on the thread
-        that gathers, so these writes are ordered ahead of the index_selects
-        that read them (``register_request`` runs on the main thread)."""
-        self.offset.master[slot:slot + 1].zero_()
+        """Init for a newly registered slot. Runs on the thread that gathers,
+        so the rows are written before the gather that reads them
+        (``register_request`` runs on the main thread). No device work: this
+        runs in the pre-plan, so the offset reset is queued for
+        ``gather_dynamic`` on the default stream."""
+        with self._offset_reset_lock:
+            self._pending_offset_reset.add(slot)
         self._write_master_row(slot, self._cached_config[rid])
         # mask row not cleared: always staged fresh before gather, and clearing
         # here would race the default-stream stage from the plan stream
@@ -1506,9 +1570,11 @@ class SamplerBuffers:
         into ``cg_slot``. Safe to pre-plan: these change only on a config
         update, never step to step."""
         self._stage_slot_idx(request_ids, padded_bs, cg_slot)
-        idx_view = self._upload_slot_idx(padded_bs, cg_slot)
+        # H2D copies only -- this runs in the pre-plan (see HostBuffer). The
+        # device-side index row is uploaded by gather_dynamic.
+        rows = self._slot_idx_np[cg_slot, :padded_bs]
         for buf in self._scalar_buffers():
-            buf.gather(idx_view, padded_bs, cg_slot)
+            buf.gather(rows, padded_bs, cg_slot)
         self._last_real_bs[cg_slot] = len(request_ids)
 
     def gather_dynamic(
@@ -1529,6 +1595,10 @@ class SamplerBuffers:
         caller's graph actually applies the penalty in-graph (the Talker)."""
         if self._staged_rids.get(cg_slot) != (tuple(request_ids), padded_bs):
             self._stage_slot_idx(request_ids, padded_bs, cg_slot)
+        with self._offset_reset_lock:
+            resets, self._pending_offset_reset = self._pending_offset_reset, set()
+        for slot in resets:
+            self.offset.master[slot:slot + 1].zero_()
         idx_view = self._upload_slot_idx(padded_bs, cg_slot)
         self.offset.gather(idx_view, padded_bs, cg_slot)
         if self.seen_tokens is not None and gather_seen_tokens:

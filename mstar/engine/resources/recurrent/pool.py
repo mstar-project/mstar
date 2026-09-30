@@ -30,6 +30,7 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,9 @@ class RecurrentStatePool(Resource):
 
         self._cg_max_bs = 0
         self._cg_addressing: dict[CGSlotKey, RecurrentAddressing] = {}
+        # copy-only H2D for the addressing, see `_build_addressing`
+        self._index_stager = PinnedStager(torch.int32)
+        self._state_stager = PinnedStager(torch.bool)
         self._eager_addressing: dict[str, RecurrentAddressing] = {}
         # label -> this step's addressing, for the backend to read
         self._current: dict[str, RecurrentAddressing] = {}
@@ -395,22 +399,15 @@ class RecurrentStatePool(Resource):
         num_rows = len(indices)
         target = self._addressing_buffers(label, ctx, num_rows)
         # Built on the host and copied in: the values come from Python
-        # bookkeeping, so building them on device would sync.
-        pin = torch.cuda.is_available()
-        target.slot_indices[:num_rows].copy_(
-            torch.tensor(indices, dtype=torch.int32, pin_memory=pin),
-            non_blocking=True,
-        )
-        target.has_state[:num_rows].copy_(
-            torch.tensor(has_state, dtype=torch.bool, pin_memory=pin),
-            non_blocking=True,
-        )
-        # Clear the tail rather than leaving last step's. Attention keeps a
-        # replay off its padding with the plan's indptrs; a recurrent kernel
-        # has no such thing and reads every row of the batch, so a stale index
-        # here is a write to a slot whose request is not in this step.
-        target.slot_indices[num_rows:].fill_(pad)
-        target.has_state[num_rows:].fill_(False)
+        # bookkeeping, so building them on device would sync. The tail is
+        # cleared too rather than left at last step's values -- attention keeps
+        # a replay off its padding with the plan's indptrs, but a recurrent
+        # kernel has no such thing and reads every row of the batch, so a stale
+        # index here is a write to a slot whose request is not in this step.
+        # The clear rides the same copy (padding written on the host): this
+        # runs in the pre-plan, beside a live graph, so no device-side fill.
+        self._index_stager.copy_(target.slot_indices, indices, pad_value=pad)
+        self._state_stager.copy_(target.has_state, has_state, pad_value=False)
         return RecurrentAddressing(
             slot_indices=target.slot_indices,
             has_state=target.has_state,

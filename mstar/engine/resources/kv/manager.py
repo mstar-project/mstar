@@ -39,6 +39,7 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.utils.h2d import PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +342,8 @@ class KVManager(AttentionResource):
 
         # (slot, label) -> KVPlanState, sized for the largest capture bucket
         self._static_plan_states: dict[tuple[int, str], KVPlanState] = {}
+        # copy-only H2D into those, see `_stage_decode_plan_state`
+        self._plan_stager = PinnedStager(torch.long)
         self._cg_max_seq_len = 0
         self._current_plan_states: dict[str, KVPlanState] = {}
         self.reset_default_cursors()
@@ -972,15 +975,7 @@ class KVManager(AttentionResource):
         stream, so build it in the same CPU pass the views came from and send
         it over as one H2D.
         """
-        page_size = self.kv_cache.page_size
-        pages: list[int] = []
-        offsets: list[int] = []
-        for view in views:
-            # off the stream's page count, not its logical length: that is what
-            # `build_paged_indptrs` hands attention, so a stream holding more
-            # pages than its length needs stays self-consistent
-            pages.append(view.page_idxs[-1])
-            offsets.append((view.last_page_len(page_size) or page_size) - 1)
+        pages, offsets = self._decode_locations(views)
         locations = torch.tensor(
             [pages, offsets], dtype=torch.long
         ).to(self._device, non_blocking=True)
@@ -990,11 +985,54 @@ class KVManager(AttentionResource):
             total_tokens=len(views),
         )
 
+    def _decode_locations(
+        self, views: list[SequenceView],
+    ) -> tuple[list[int], list[int]]:
+        """Each decode row's (page, offset-in-page) for the token it writes.
+
+        Off the stream's page count, not its logical length: that is what
+        `build_paged_indptrs` hands attention, so a stream holding more pages
+        than its length needs stays self-consistent."""
+        page_size = self.kv_cache.page_size
+        pages = [view.page_idxs[-1] for view in views]
+        offsets = [(view.last_page_len(page_size) or page_size) - 1 for view in views]
+        return pages, offsets
+
+    def _stage_decode_plan_state(
+        self, views: list[SequenceView], static_state: KVPlanState,
+        capture_len: int,
+    ) -> KVPlanState:
+        """``_decode_plan_state`` + ``KVPlanState.copy_`` without the device
+        staging tensor: rows past the real tokens get SINK_PAGE / 0, as there."""
+        pages, offsets = self._decode_locations(views)
+        self._plan_stager.copy_(
+            static_state.token_to_page[:capture_len], pages, pad_value=SINK_PAGE,
+        )
+        self._plan_stager.copy_(
+            static_state.token_to_cache[:capture_len], offsets, pad_value=0,
+        )
+        static_state.total_tokens = len(views)
+        return static_state
+
     def _setup_plan_states(
         self, plan_output: dict[str, KVPlanOutput],
         ctx: StepContext, lease,
     ):
         for label, indptrs in plan_output.items():
+            if indptrs.is_decode and lease is not None:
+                # Straight into the captured buffers, padding and all, in one
+                # H2D per buffer: this runs in the pre-plan beside a live graph,
+                # where a device-side staging copy + fill would share the GPU
+                # with it (see mstar.utils.h2d).
+                plan_state = self._stage_decode_plan_state(
+                    indptrs.views, self._static_plan_state(lease.slot, label),
+                    lease.bucket.num_tokens,
+                )
+                if ctx.is_preplan:
+                    self._preplan_states[label] = plan_state
+                else:
+                    self._current_plan_states[label] = plan_state
+                continue
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(indptrs.views)
             else:
