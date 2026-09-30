@@ -232,6 +232,22 @@ class CaptureBudget:
         )
         return cls(device=device, floor=floor)
 
+    def fits(self, need: int, what: str, verb: str = "not capturing") -> bool:
+        """Whether taking ``need`` more bytes for ``what`` still leaves the floor free."""
+        free = self._free()
+        if free - need >= self.floor:
+            return True
+        logger.warning(
+            "CaptureBudget[%s]: %s %s: %.0f MiB free, %.0f to take, %.0f for eager steps",
+            self.device, verb, what, free / 2**20, need / 2**20, self.floor / 2**20,
+        )
+        return False
+
+    def _free(self) -> int:
+        # blocks cached in the allocator count as used to the driver
+        torch.cuda.empty_cache()
+        return torch.cuda.mem_get_info(self.device)[0]
+
 
 class DummyRowPool:
     """The padding rows captured replays pad onto.
@@ -496,7 +512,7 @@ class CudaGraphRunner:
         self._dummy_rows.release_all()
         return self._eager_steps
 
-    def warmup_and_capture(self):
+    def warmup_and_capture(self, budget: CaptureBudget | None = None):
         """Capture graphs for all configs and batch sizes."""
         if self._device is None or not torch.cuda.is_available():
             logger.warning("CUDA not available, skipping graph capture for %s",
@@ -518,6 +534,8 @@ class CudaGraphRunner:
             # stopped early here would leave the others waiting
             self._comm_group.tp_group.barrier()
             self._comm_group.sp_group.barrier()
+            if budget is not None and not self._wanted(spec, captured, budget):
+                continue
 
             try:
                 slot = self._capture_one(spec)
@@ -529,6 +547,14 @@ class CudaGraphRunner:
                 continue
 
             captured.setdefault(spec.bucket, {})[spec.slot] = (spec, slot)
+            del slot
+            if budget is not None and not budget.fits(0, f"{self._submodule_name} {spec}", "giving back"):
+                # the executable graph's own memory shows only once it exists:
+                # dropping the bucket returns it, and for a runner's first
+                # bucket the pool too
+                del captured[spec.bucket]
+                torch.cuda.empty_cache()
+                continue
             if  len(captured[spec.bucket]) == self._num_slots:
                 logger.info(
                     "Captured CUDA graph for %s: %s (%d slots)",
@@ -560,6 +586,28 @@ class CudaGraphRunner:
 
         mem_after = torch.cuda.memory_allocated(self._device)
         self._log_memory(mem_before, mem_after)
+
+    def _wanted(
+        self, spec: CGSlotSpec, captured: Mapping[BucketKey, Mapping[int, Any]],
+        budget: CaptureBudget,
+    ) -> bool:
+        """Whether every rank captures ``spec`` under ``budget``, settled before any warms it up.
+
+        The warm-up forward may hold collectives, so either every rank runs it
+        or none does. A bucket registers all of its slots or none, so a slot is
+        wanted only while its bucket is whole, and only if the budget can spare
+        it and the slots after it.
+        """
+        step = self._eager_steps.get(spec.bucket)
+        # a bucket whose eager run failed left nothing to size its capture by
+        wanted = (
+            len(captured.get(spec.bucket, ())) == spec.slot
+            and step is not None and step.reserved is not None
+            and budget.fits(
+                step.reserved * (self._num_slots - spec.slot), f"{self._submodule_name} {spec}",
+            )
+        )
+        return agree_across_ranks(self._comm_group, [wanted], self._device)[0]
 
     def _report_dropped(self, wanted: list, kept) -> None:
         """Say loudly which buckets run eagerly. A dropped bucket is a silent
@@ -633,6 +681,9 @@ class CudaGraphRunner:
 
     def _capture_one(self, spec: CGSlotSpec) -> CudaGraphSlot:
         with self._warmed(spec) as warmed:
+            # the warm-up's blocks sit cached in the allocator, where the
+            # capture's own pool can't reach them
+            torch.cuda.empty_cache()
             graph, output = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
             )
@@ -1294,7 +1345,7 @@ class PiecewiseCudaGraphRunner:
         self._dummy_rows.release_all()
         return self._eager_steps
 
-    def warmup_and_capture(self) -> None:
+    def warmup_and_capture(self, budget: CaptureBudget | None = None) -> None:
         if self._device is None or not torch.cuda.is_available():
             logger.warning(
                 "CUDA not available, skipping piecewise capture for %s", self._label
@@ -1323,6 +1374,9 @@ class PiecewiseCudaGraphRunner:
                 if self._comm_group is not None:
                     self._comm_group.tp_group.barrier()
                     self._comm_group.sp_group.barrier()
+                if budget is not None and not self._wanted(shape, slot, shape_captured, budget):
+                    shape_captured = False
+                    continue
                 try:
                     self._capture_one(shape, slot)
                 except Exception:
@@ -1332,6 +1386,16 @@ class PiecewiseCudaGraphRunner:
                         "total_tokens=%d slot=%d", self._label, shape.bs,
                         shape.total_tokens, slot, exc_info=True,
                     )
+                if shape_captured and budget is not None and not budget.fits(
+                    0, f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens} slot={slot}", "giving back",
+                ):
+                    # as in `CudaGraphRunner.warmup_and_capture`
+                    for captured_slot in range(slot + 1):
+                        self._graphs.pop(PiecewiseGraphKey(
+                            bs=shape.bs, seq_len=shape.total_tokens, slot=captured_slot,
+                        ), None)
+                    torch.cuda.empty_cache()
+                    shape_captured = False
             captured.append(shape_captured)
             if shape_captured:
                 logger.info(
@@ -1370,8 +1434,24 @@ class PiecewiseCudaGraphRunner:
                 self.dropped_shapes,
             )
 
+    def _wanted(
+        self, shape: PiecewiseCaptureShape, slot: int, whole: bool, budget: CaptureBudget,
+    ) -> bool:
+        """Whether every rank captures ``shape`` into ``slot``; see ``CudaGraphRunner._wanted``."""
+        step = self._eager_steps.get(self._bucket(shape))
+        wanted = (
+            whole and step is not None and step.reserved is not None
+            and budget.fits(
+                step.reserved * (self._num_slots - slot),
+                f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens} slot={slot}",
+            )
+        )
+        return agree_across_ranks(self._comm_group, [wanted], self._device)[0]
+
     def _capture_one(self, shape: PiecewiseCaptureShape, slot: int) -> None:
         with self._warmed(shape, slot) as warmed:
+            # as in `CudaGraphRunner._capture_one`
+            torch.cuda.empty_cache()
             graph, raw_outputs = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
             )

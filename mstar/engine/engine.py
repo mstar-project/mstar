@@ -471,13 +471,13 @@ class Engine:
 
         for node_name, submodule_mgmt in self._submodules.items():
             runner = cg_runners[node_name]
-            runner.warmup_and_capture()
+            runner.warmup_and_capture(budget)
             if runner.any_graphs:
                 submodule_mgmt.cuda_graph_runner = runner
 
             captured: dict[str, PiecewiseCudaGraphRunner] = {}
             for label, pw_runner in piecewise[node_name].items():
-                pw_runner.warmup_and_capture()
+                pw_runner.warmup_and_capture(budget)
                 if pw_runner.any_graphs:
                     captured[label] = pw_runner
             submodule_mgmt.piecewise_runners = captured
