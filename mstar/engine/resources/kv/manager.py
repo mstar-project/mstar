@@ -35,7 +35,6 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
     AdmitRuntimeError,
     AllocationFailed,
-    BucketKey,
     RequestOffloading,
     Segment,
     StepContext,
@@ -403,11 +402,6 @@ class KVManager(AttentionResource):
         self._rooted: dict[str, list[bytes]] = {}
         # label -> the walk prepare probes it on
         self._prefill_walks: dict[str, str] = {}
-        # capture buckets whose padding rows take their capture span again on
-        # replay (a batched capture; a packed one pads with empty rows)
-        self._cg_padded_buckets: set[BucketKey] = set()
-        # (padding rid, label) -> pages that row may hold while serving
-        self._pad_caps: dict[tuple[str, str], int] = {}
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
@@ -425,13 +419,7 @@ class KVManager(AttentionResource):
     def build_cuda_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ):
-        del max_bs
-        # not at module level: the config module imports back through the engine's resources
-        from mstar.engine.cuda_graph_config import CudaGraphConfigType
-
-        for spec in slots:
-            if spec.config.get_config_type() is CudaGraphConfigType.BASIC_BATCHED:
-                self._cg_padded_buckets.add(spec.bucket)
+        del slots, max_bs
         # the per-(slot, label) buffers themselves are built on first plan for
         # that key (which labels a walk plans under is the step's to declare),
         # all at this one max length so they outlive any single bucket. Every
@@ -923,6 +911,8 @@ class KVManager(AttentionResource):
                 self._preplan_marked = []
             for (from_label, to_label), extra in forks:
                 for rid in ctx.padded_request_ids:
+                    if self._in_sink(rid, ctx):
+                        continue
                     # checked before the reservation, which is what creates it
                     if (
                         ctx.is_preplan
@@ -937,7 +927,7 @@ class KVManager(AttentionResource):
                         return AdmitOutcome(ok=False, reason=alloc_res.error)
 
             for segment in step.segments:
-                if segment.span == 0:
+                if segment.span == 0 or self._in_sink(segment.request_id, ctx):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
                 alloc_res = self._alloc(
@@ -947,12 +937,6 @@ class KVManager(AttentionResource):
                 )
                 if not alloc_res.success:
                     return AdmitOutcome(ok=False, reason=alloc_res.error)
-
-            if (
-                ctx.capture and ctx.slot_lease is not None
-                and ctx.slot_lease.bucket in self._cg_padded_buckets
-            ):
-                self._note_padding_pages(ctx.padded_request_ids)
 
             # marked here rather than in plan so the mark also covers
             # admit -> plan, where an offload would otherwise release pages
@@ -988,9 +972,13 @@ class KVManager(AttentionResource):
             # into the wrong page and reports the padding as resident context
             length = s.span + stream.stored_len
             num_pages = -(-length // page_size)
+            page_idxs = stream.page_indices[:num_pages]
+            if self._is_padding(s.request_id):
+                # a replay's padding row took no page of its own: its token lands in the sink
+                page_idxs += [SINK_PAGE] * (num_pages - len(page_idxs))
             views.append(SequenceView(
                 request_id=s.request_id,
-                label=s.label, page_idxs=stream.page_indices[:num_pages],
+                label=s.label, page_idxs=page_idxs,
                 length=length,
                 to_compute=s.span,
                 generation=stream.generation,
@@ -1127,7 +1115,8 @@ class KVManager(AttentionResource):
         undo = self._preplan_fork_undo if ctx.is_preplan else None
         for (from_label, to_label) in step.pre_forks:
             for rid in ctx.padded_request_ids:
-                self._apply_fork(rid, from_label, to_label, undo=undo)
+                if not self._in_sink(rid, ctx):
+                    self._apply_fork(rid, from_label, to_label, undo=undo)
         res = KVPlanOutputs(
             {
                 plan_label: self._plan_output(self._sequence_views(segments))
@@ -1220,7 +1209,8 @@ class KVManager(AttentionResource):
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
                 for rid in ctx.padded_request_ids:
-                    self._apply_fork(rid, from_label, to_label)
+                    if not self._in_sink(rid, ctx):
+                        self._apply_fork(rid, from_label, to_label)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
         # TODO: handle retention policy, free pages if not commit
@@ -1604,14 +1594,7 @@ class KVManager(AttentionResource):
         ``all_gather`` itself is synchronizing, so no extra barrier is
         needed on the success path.
         """
-        with self._lock:
-            # a piecewise region never hands its rows back, and replays within them
-            self._note_padding_pages([rid for rid in self._streams if self._is_padding(rid)])
-            logger.info(
-                "KV %s: padding rows may take %d pages while serving",
-                self.name, self._padding_remaining(),
-            )
-        if self._comm_group is None or self._comm_group.world_size == 1:
+        if self._comm_group.world_size == 1:
             return
         local_free = self._arena.num_free
         local_t = torch.tensor(
@@ -1647,6 +1630,16 @@ class KVManager(AttentionResource):
     def _is_padding(rid) -> bool:
         # CUDA-graph padding rows carry negative handles; tests key requests by str
         return isinstance(rid, int) and rid < 0
+
+    def _in_sink(self, rid, ctx: StepContext) -> bool:
+        """Whether ``rid`` is a replay's padding row, which writes into the sink.
+
+        A batched replay gives its padding rows their capture span, so each
+        would otherwise take a page per label on its first replay and keep it,
+        in every bucket, config and slot, which no request could be admitted
+        against. A capture still gives them pages, and hands them back after.
+        """
+        return not ctx.capture and self._is_padding(rid)
 
     def _labels_opened(self, overrides: KVReqConfig) -> set[str]:
         """The labels ``overrides`` can open on this pool's nodes, on any walk."""
@@ -1832,13 +1825,13 @@ class KVManager(AttentionResource):
 
     def _capacity(self) -> int:
         """Pages one request could have with nothing else admitted: all but the
-        sink and what the padding rows hold or may take back."""
+        sink and what a piecewise region's padding rows keep from capture."""
         padding = sum(
             len(stream.page_indices)
             for rid, streams in self._streams.items() if self._is_padding(rid)
             for stream in streams.values()
         )
-        return self.config.max_num_pages - 1 - padding - self._padding_remaining()
+        return self.config.max_num_pages - 1 - padding
 
     def _held_fresh(self, rid: str) -> int:
         """Pages ``rid`` holds that it took from the free list."""
@@ -1854,35 +1847,11 @@ class KVManager(AttentionResource):
         return self._arena.num_free + len(evictable.difference(leasing))
 
     def _outstanding(self) -> int:
-        """Pages admitted requests and padding rows may still take."""
-        return self._padding_remaining() + sum(
+        """Pages admitted requests may still take."""
+        return sum(
             max(0, res.pages - self._held_fresh(rid))
             for rid, res in self._reserved.items()
         )
-
-    def _note_padding_pages(self, rids) -> None:
-        """Raise each padding row's cap to what it holds now.
-
-        Called at a batched capture and once capture is over: a batched replay
-        gives its padding rows their capture span again and they keep it, so
-        what a row held at capture is what it can take back while serving.
-        """
-        for rid in rids:
-            if not self._is_padding(rid):
-                continue
-            for label, stream in self._streams.get(rid, {}).items():
-                key = (rid, label)
-                self._pad_caps[key] = max(
-                    self._pad_caps.get(key, 0), len(stream.page_indices)
-                )
-
-    def _padding_remaining(self) -> int:
-        """Pages padding rows may still take back from the free list."""
-        total = 0
-        for (rid, label), cap in self._pad_caps.items():
-            stream = self._streams.get(rid, {}).get(label)
-            total += max(0, cap - (len(stream.page_indices) if stream is not None else 0))
-        return total
 
     def _check_ready(
         self, rid: str, label: str

@@ -13,20 +13,18 @@ counted twice leaves no room for anyone.
 from __future__ import annotations
 
 import sys
-from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_config import CudaGraphConfigType
-from mstar.engine.resources.base import CGSlotSpec, EngineResourceInfo
+from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.engine.resources.step import Segment, StepContext
 
 PAGE_SIZE = 16
 ROOT = b"a root"
@@ -225,30 +223,3 @@ def test_an_admitted_request_that_finds_no_page_is_an_assertion(monkeypatch):
 
     with pytest.raises(AssertionError, match="was admitted on a reservation of"):
         kv.admit(KVStep(segments=(Segment("r", "main", PAGE_SIZE),)), _ctx("r"))
-
-
-# ── padding rows ────────────────────────────────────────────────────────
-
-
-def test_padding_rows_count_what_a_batched_capture_gave_them():
-    kv = _manager()
-    bucket = BucketKey(graph_walk="decode", bs=4, num_tokens=4)
-    batched = SimpleNamespace(get_config_type=lambda: CudaGraphConfigType.BASIC_BATCHED)
-    kv.build_cuda_graph_buffers(
-        [CGSlotSpec(bucket=bucket, slot=0, config=batched)], max_bs=4, max_seq_len=64,
-    )
-    rows = (-2, -3, -4, -5)
-    for rid in rows:
-        kv.ingest_request(rid)
-    ctx = _ctx(*rows, capture=True)
-    ctx.slot_lease = SlotLease(slot=0, bucket=bucket)
-    step = KVStep(segments=tuple(Segment(rid, "main", 1) for rid in rows))
-    assert kv.admit(step, ctx).ok
-
-    # capture ends by handing every page back; a replay takes them again
-    for rid in rows:
-        kv.reset_request(rid, free=True)
-
-    assert kv._padding_remaining() == len(rows), (
-        "pages the padding rows take back on their first replay were counted as free"
-    )
