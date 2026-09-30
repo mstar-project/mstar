@@ -1,5 +1,6 @@
 
 
+import hashlib
 import logging
 import os
 import queue
@@ -25,9 +26,9 @@ from mstar.api_server.request_types import (
 from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
 from mstar.engine.resources.kv.config import KVSpec
-from mstar.engine.resources.kv.keys import chain
+from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint
 from mstar.engine.resources.spec import apply_yaml_overrides
-from mstar.model.base import Model, ProcessPromptOutput
+from mstar.model.base import Model, PrefixStream, ProcessPromptOutput, Span
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils.ipc_format import (
     AbortRequest,
@@ -43,6 +44,11 @@ from mstar.utils.ipc_format import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _sha256(path: str) -> bytes:
+    with open(path, "rb") as file:
+        return hashlib.file_digest(file, "sha256").digest()
 
 
 def _preprocess_loop(**kwargs):
@@ -322,6 +328,7 @@ class PreprocessWorkerThread:
     ):
         tensors: NameToTensorList = {}
         input_metadata = {}
+        file_digests: dict[str, list[bytes]] = {}
         self.in_flight_requests.add(input.request_id)
 
         # First, load raw modality tensors from file_paths (images, audio, video)
@@ -334,6 +341,11 @@ class PreprocessWorkerThread:
                 input_metadata[key] = []
 
                 for filepath in input.file_paths[modality]:
+                    if self._prefix_streams:
+                        # before the load, and checked again when keyed: a file
+                        # that changed between would file its KV under bytes
+                        # nobody decoded
+                        file_digests.setdefault(modality, []).append(_sha256(filepath))
                     # ---- Image ----
                     if modality == "image":
                         out = self.model.load_image(filepath, self.device)
@@ -361,7 +373,7 @@ class PreprocessWorkerThread:
         model_kwargs = dict(input.model_kwargs or {})
         # only this worker keys a prompt: a client that sent its own could name
         # another request's pages and be served that request's KV
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode"):
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "prefix_layout"):
             model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
@@ -378,14 +390,14 @@ class PreprocessWorkerThread:
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
+            # popped, not carried: a Span pickles every kwarg it rides with, so
+            # only the plain form `_prefix_keys` builds goes on
+            layouts = model_kwargs.pop("prefix_layout", {})
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
-            prefix_keys, prefix_tail, prefix_decode = self._prefix_keys(tensors)
-            if prefix_keys:
-                model_kwargs["prefix_keys"] = prefix_keys
-                model_kwargs["prefix_tail"] = prefix_tail
-                if prefix_decode:
-                    model_kwargs["prefix_decode"] = prefix_decode
+            model_kwargs.update(self._prefix_keys(
+                tensors, layouts, input.file_paths, file_digests,
+            ))
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
             byte_data = input.text.encode("utf-8")
@@ -434,32 +446,156 @@ class PreprocessWorkerThread:
                 inputs=self._summarize_inputs(input),
             ))
 
-    def _prefix_keys(self, tensors: dict) -> tuple[dict, dict, dict]:
-        """Key each page of every declared stream, by resource and label.
+    def _prefix_keys(
+        self, tensors: dict, layouts: dict, file_paths: dict | None,
+        file_digests: dict[str, list[bytes]],
+    ) -> dict:
+        """Key each page of every declared stream, as the kwargs that carry it.
 
-        Returns the keys, the prompt tail past the last whole page, and the output
-        tensor each stream's sampled ids arrive in. The keys are unrooted.
+        By resource and label: one unrooted key a page, the ids on the prompt's
+        partial last page, the layout as ``[length, advance, walk, digest]``,
+        and the output tensor the stream's sampled ids arrive in.
         """
+        # before any check: a worker built without a config keys nothing, and
+        # a model's layout is then dropped with the rest
+        if not self._prefix_streams:
+            return {}
+        for resource_key, by_label in layouts.items():
+            for label in by_label:
+                assert label in self._prefix_streams.get(resource_key, {}), (
+                    f"{type(self.model).__name__} returned a prefix_layout for "
+                    f"{resource_key!r}/{label!r}, which it does not declare"
+                )
         keys: dict[str, dict[str, list[bytes]]] = {}
         tails: dict[str, dict[str, list[int]]] = {}
+        layout_rows: dict[str, dict[str, list[list]]] = {}
         decode: dict[str, dict[str, str]] = {}
         for resource_key, by_label in self._prefix_streams.items():
             page_size = self._prefix_page_sizes[resource_key]
             for label, stream in by_label.items():
-                ids = tensors.get(stream.tensor)
-                if stream.keyed_by != "ids" or not ids:
-                    continue
-                flat = ids[0].flatten().tolist()
-                pages = [
-                    flat[at:at + page_size]
-                    for at in range(0, len(flat), page_size)
+                layout = layouts.get(resource_key, {}).get(label)
+                if layout is None:
+                    ids = tensors.get(stream.tensor)
+                    if stream.keyed_by != "ids" or not ids:
+                        continue
+                    layout = [Span(
+                        "ids", stream.walk, ids[0].numel(), ids[0].numel(),
+                        stream.tensor,
+                    )]
+                else:
+                    assert stream.layout_walks, (
+                        f"{type(self.model).__name__} returned a prefix_layout "
+                        f"for {resource_key!r}/{label!r}, which declares no "
+                        "layout_walks"
+                    )
+                digests = [
+                    self._digest(span, file_paths, file_digests)
+                    if span.kind == "digest" else None
+                    for span in layout
                 ]
-                keys.setdefault(resource_key, {})[label] = chain(pages)
-                whole = len(flat) // page_size
-                tails.setdefault(resource_key, {})[label] = flat[whole * page_size:]
+                pages, items = self._page_layout(
+                    stream, layout, digests, tensors, page_size,
+                )
+                keys.setdefault(resource_key, {})[label] = chain(pages, items)
+                total = sum(span.length for span in layout)
+                tails.setdefault(resource_key, {})[label] = (
+                    pages[-1] if total % page_size else []
+                )
+                layout_rows.setdefault(resource_key, {})[label] = [
+                    [span.length, span.advance, span.walk, digest]
+                    for span, digest in zip(layout, digests, strict=True)
+                ]
                 if stream.decode_walk is not None:
                     decode.setdefault(resource_key, {})[label] = stream.tensor
-        return keys, tails, decode
+        if not keys:
+            return {}
+        kwargs = {
+            "prefix_keys": keys, "prefix_tail": tails, "prefix_layout": layout_rows,
+        }
+        if decode:
+            kwargs["prefix_decode"] = decode
+        return kwargs
+
+    def _page_layout(
+        self, stream: PrefixStream, layout: list[Span],
+        digests: list[bytes | None], tensors: dict, page_size: int,
+    ) -> tuple[list[list[int]], dict[int, list[PageItem]]]:
+        """Each page's ids and items, in slot order."""
+        walks = {stream.walk, *stream.layout_walks}
+        entries: dict[str, int] = {}
+        total = sum(span.length for span in layout)
+        pages: list[list[int]] = [[] for _ in range(-(-total // page_size))]
+        items: dict[int, list[PageItem]] = {}
+        at = 0
+        for span, digest in zip(layout, digests, strict=True):
+            assert span.kind in ("ids", "digest"), f"a span of kind {span.kind!r}"
+            assert span.walk in walks, (
+                f"a {span.kind} span names walk {span.walk!r}, which the "
+                f"stream does not declare; it declares {sorted(walks)}"
+            )
+            # exactly int: a numpy one would have page_key fail, or pickle the kwargs
+            assert type(span.length) is int and type(span.advance) is int, (
+                f"a {span.kind} span's length and advance are "
+                f"{type(span.length).__name__} and {type(span.advance).__name__}"
+            )
+            touched = range(at // page_size, -(-(at + span.length) // page_size))
+            if span.kind == "ids":
+                entry = entries.get(span.source, 0)
+                entries[span.source] = entry + 1
+                assert entry < len(tensors.get(span.source, ())), (
+                    f"ids span {entry} of {span.source!r} has no entry to key"
+                )
+                ids = tensors[span.source][entry].flatten().tolist()
+                assert len(ids) == span.length == span.advance, (
+                    f"an ids span of length {span.length} and advance "
+                    f"{span.advance} over {len(ids)} ids of {span.source!r}; "
+                    "an ids span fills one slot and one position per id"
+                )
+                for page in touched:
+                    first = max(at, page * page_size)
+                    last = min(at + span.length, (page + 1) * page_size)
+                    pages[page].extend(ids[first - at:last - at])
+            else:
+                assert span.length > 0, (
+                    "a zero-length digest span has no slot, so no page to fold into"
+                )
+                for page in touched:
+                    first = max(at, page * page_size)
+                    items.setdefault(page, []).append(PageItem(
+                        first - page * page_size, first - at, span.length, digest,
+                    ))
+            at += span.length
+        return pages, items
+
+    def _digest(
+        self, span: Span, file_paths: dict | None,
+        file_digests: dict[str, list[bytes]],
+    ) -> bytes:
+        """Hash the file a digest span names, whole, with all else that decides its KV.
+
+        Never cut short and never turned into an id: that is how two images
+        come to share a key and one request is served another's KV.
+        """
+        assert type(span.params) is tuple and all(
+            type(param) in (type(None), bool, int, float, str, bytes)
+            for param in span.params
+        ), f"digest params {span.params!r} are not a tuple of plain values, whose repr is exact"
+        modality, index = span.source
+        paths = (file_paths or {}).get(modality, ())
+        assert 0 <= index < len(paths), (
+            f"a digest span names {modality} {index}, but the request sent "
+            f"{len(paths)}"
+        )
+        raw = _sha256(paths[index])
+        assert raw == file_digests[modality][index], (
+            f"{paths[index]} changed while it was loaded, so no key can name "
+            "the bytes its tensors came from"
+        )
+        return fingerprint(
+            raw, modality, self.model.preprocess_fingerprint(), span.advance,
+            # repr, not str: True and "True" can preprocess differently
+            *(repr(param) for param in span.params),
+        )
 
     @staticmethod
     def _summarize_inputs(input: PreprocessInput) -> list[InputInfo]:

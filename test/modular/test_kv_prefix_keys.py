@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, ".")
 
-from mstar.engine.resources.kv.keys import chain, page_key
+from mstar.engine.resources.kv.keys import PageItem, chain, page_key
 
 PAGES = ([11, 12, 13], [14, 15, 16], [17, 18])
 
@@ -44,9 +44,9 @@ def test_a_changed_token_changes_its_page_and_every_page_above_it():
 
 
 def test_a_changed_digest_changes_its_page_and_every_page_above_it():
-    keys = chain(PAGES, {1: [b"image-a"]})
+    keys = chain(PAGES, {1: [PageItem(0, 0, 1, b"image-a")]})
 
-    changed = chain(PAGES, {1: [b"image-b"]})
+    changed = chain(PAGES, {1: [PageItem(0, 0, 1, b"image-b")]})
 
     assert changed[0] == keys[0], "a page below the digest was renamed"
     assert all(
@@ -68,13 +68,17 @@ def test_a_changed_root_changes_every_key():
 
 
 def test_a_digest_is_not_a_token_that_encodes_the_same_bytes():
-    assert page_key(b"", [1, 2]) != page_key(b"", [1], [(2).to_bytes(4, "little")]), (
+    item = PageItem(1, 0, 1, (2).to_bytes(4, "little"))
+    assert page_key(b"", [1, 2]) != page_key(b"", [1], [item]), (
         "a token and a digest of its bytes hash alike"
     )
 
 
 def test_two_digests_are_not_one_digest_of_their_bytes():
-    assert page_key(b"", [], [b"ab", b"c"]) != page_key(b"", [], [b"abc"]), (
+    two = [PageItem(0, 0, 1, b"ab"), PageItem(1, 0, 1, b"c")]
+    # the bytes the two encode to without the digests' length prefixes, as one digest
+    one = [PageItem(0, 0, 1, b"ab" + b"".join(n.to_bytes(4, "little") for n in (1, 0, 1)) + b"c")]
+    assert page_key(b"", [], two) != page_key(b"", [], one), (
         "the split between two digests is not in the key"
     )
 
@@ -83,14 +87,14 @@ def test_two_digests_are_not_one_digest_of_their_bytes():
 
 
 def test_the_encoding_is_the_same_in_another_process():
-    here = chain(PAGES, {1: [b"image-a"]}, root=b"root")
+    here = chain(PAGES, {1: [PageItem(0, 0, 1, b"image-a")]}, root=b"root")
 
     there = subprocess.run(
         [
             sys.executable, "-c",
-            "from mstar.engine.resources.kv.keys import chain;"
-            "print(chain(([11,12,13],[14,15,16],[17,18]), {1: [b'image-a']}, b'root')"
-            "[-1].hex())",
+            "from mstar.engine.resources.kv.keys import PageItem, chain;"
+            "print(chain(([11,12,13],[14,15,16],[17,18]),"
+            " {1: [PageItem(0, 0, 1, b'image-a')]}, b'root')[-1].hex())",
         ],
         capture_output=True, text=True, check=True, cwd=".",
     ).stdout.strip()
