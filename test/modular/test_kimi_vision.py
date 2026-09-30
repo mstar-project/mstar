@@ -1,6 +1,8 @@
 """Tests for Kimi-K2.7-Code's vision tower, preprocessing, and the
 image-aware prefill schedule / process_prompt wiring."""
 
+import json
+
 import pytest
 import torch
 
@@ -206,6 +208,32 @@ def test_graph_walks_include_prefill_vision_when_vision_configured():
     walks = _make_model().get_graph_walk_graphs()
     assert set(walks) == {"prefill", "decode", "prefill_vision"}
     assert isinstance(walks["prefill_vision"], Sequential)
+
+
+def test_vision_false_kwarg_drops_vision_tower_for_text_only_deployment(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 5}))
+
+    model = KimiK2Model(
+        model_path_hf=str(tmp_path), config_variant="k27_code", vision=False,
+    )
+
+    assert model.config.vision is None
+    walk_nodes = set()
+    for walk in model.get_graph_walk_graphs().values():
+        walk_nodes.update(walk.get_nodes().keys())
+    assert VISION_NODE not in walk_nodes
+
+
+def test_k27_code_default_vision_kwarg_keeps_vision_tower(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 5}))
+
+    model = KimiK2Model(model_path_hf=str(tmp_path), config_variant="k27_code")
+
+    assert model.config.vision is not None
+    walk_nodes = set()
+    for walk in model.get_graph_walk_graphs().values():
+        walk_nodes.update(walk.get_nodes().keys())
+    assert VISION_NODE in walk_nodes
 
 
 # --- process_prompt image path ------------------------------------------------

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 import torch
 
@@ -127,6 +128,11 @@ class KimiK2Model(Model):
             config_dir = _resolve_checkpoint_config_dir(model_path_hf, cache_dir=cache_dir)
             if config_dir is not None:
                 self.config = KimiK2Config.from_checkpoint(config_dir, base=self.config)
+        if not kwargs.get("vision", True):
+            # Text-only deployment: drops the vision tower and the
+            # ``prefill_vision`` walk; the chat path then treats image parts
+            # as unsupported.
+            self.config = replace(self.config, vision=None)
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
