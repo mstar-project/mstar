@@ -138,6 +138,20 @@ def test_removal_gives_the_reservation_back():
     assert kv._outstanding() == 0, "a removed request still held room it can never take"
 
 
+def test_a_models_count_past_max_seq_len_is_reserved_whole():
+    # Bagel's image tokens: counted by the model, but not positions
+    kv = _manager(max_seq_len=64)
+    kv.ingest_request("r", KVReqConfig(
+        max_tokens=16, prompt_slots={"main": 200}, decode_labels=["main"],
+    ))
+
+    _run(kv, "r", 20)
+
+    assert kv._reserved["r"].pages == _pages(200 + 16), (
+        "a model's own count was cut down to max_seq_len, leaving the request short"
+    )
+
+
 def test_a_request_nothing_counts_is_left_to_run_as_before():
     # no count from the model and no keys: max_seq_len is all that bounds it,
     # which for most models is far more than the pool can spare per request
