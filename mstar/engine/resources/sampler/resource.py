@@ -68,8 +68,8 @@ class SamplerResource(Resource):
         self._preplan_cg_sampler: CudaGraphableSampler | None = None
         self._preplan_key = None
         self._preplanned = False
-        # rid -> the prompt tokens a cache hit kept out of this step's inputs
-        self._cached_prefix: dict[str, torch.Tensor] = {}
+        # rid -> position past them -> prompt tokens a cache hit kept out of a walk's inputs
+        self._cached_prefix: dict[str, dict[int, torch.Tensor]] = {}
 
     @property
     def _penalty_live(self) -> bool:
@@ -141,12 +141,17 @@ class SamplerResource(Resource):
 
         A step declares its tracked tokens from inputs the prefix has already
         been cut out of, so without these the mask would hold the prompt's tail
-        alone and the penalty would let the model repeat the rest.
+        alone and the penalty would let the model repeat the rest. A walk the
+        cache serves whole runs no plan, so its tokens wait for the walk that
+        does, beside that walk's own.
         """
         del node_name, graph_walk
         # a walk that prefills from embeddings has no ids to keep
         if prefix is not None and prefix.tokens > 0 and inputs.input_ids is not None:
-            self._cached_prefix[rid] = inputs.input_ids[:prefix.tokens]
+            # by position, not appended: a probe repeated for a refused step replaces its own
+            self._cached_prefix.setdefault(rid, {})[prefix.position] = (
+                inputs.input_ids[:prefix.tokens]
+            )
 
     def remove_request(self, rid: str):
         self._sampler.remove_request(rid)
@@ -218,8 +223,7 @@ class SamplerResource(Resource):
             # dropped as they are used: `plan` runs on every step of a resident
             # request, and these belong to the one prefill that was cut
             for rid in ctx.request_ids:
-                skipped = self._cached_prefix.pop(rid, None)
-                if skipped is not None:
+                for skipped in self._cached_prefix.pop(rid, {}).values():
                     self._sampler.get_token_mask(rid).add_tokens(skipped)
 
         # A step planned ahead promotes here. Its static config was gathered in
