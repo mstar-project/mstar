@@ -510,6 +510,10 @@ class KVManager(AttentionResource):
         while chain.cursor < filled:
             key = fingerprint(self._prefix_root, chain.keys[chain.cursor])
             page = stream.page_indices[chain.cursor]
+            # unparented, not chained, under a page only the index holds: a live
+            # child would keep eviction from a page the pool counts as free
+            if parent is not None and self._arena.num_owners[parent] == 1:
+                parent = None
             if not self._index.insert(key, page, parent):
                 # another request filled this page first and its copy is the
                 # one the index names; ours stays private to this stream
