@@ -126,6 +126,10 @@ class Resource(ABC):
         """Take this step's sampled tokens, so what was generated can be keyed."""
         return
 
+    def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
+        """Count a walk the cache served whole as written; it never admits or commits."""
+        return
+
     def fingerprint(self) -> bytes | None:
         """What this resource contributes to the prefix cache's root.
 

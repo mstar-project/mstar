@@ -215,6 +215,9 @@ class ExecutingBatch:
     # rids the submodule declined this step — e.g. a speculatively scheduled
     # flow step for a request already past its own max iters
     skipped_rids: set[str] = field(default_factory=set)
+    # skipped because the cache holds the whole walk: no forward, but their
+    # node still completes, or the request never reaches its next walk
+    cached_rids: set[str] = field(default_factory=set)
     # rid -> error, for per-rid stages that raised. The rid leaves the batch;
     # the rest of it runs.
     failed_requests: dict[str, str] = field(default_factory=dict)
@@ -642,7 +645,7 @@ class Engine:
 
     def _skip_cached_prefix(
         self, batch: ExecutingBatch, rid: str, inputs: NodeInputs,
-    ) -> NodeInputs:
+    ) -> NodeInputs | None:
         """Cut the leading tokens this node's resources already hold.
 
         Only the keyed walk is probed, and only when `split_inputs` can cut its
@@ -663,6 +666,9 @@ class Engine:
         )
         if matched <= 0:
             return inputs
+        if matched >= inputs.input_seq_len:
+            batch.cached_rids.add(rid)
+            return None
         return self._submodules[batch.node_name].submodule.split_inputs(
             walk, batch.per_request_info[rid], inputs,
             matched, inputs.input_seq_len,
@@ -1165,6 +1171,9 @@ class Engine:
         # so the tail has nothing to consume; the worker re-drives the step.
         if batch.admit_error is None:
             self.postprocess_batch(batch, outputs)
+            # not on a refused step, whose push-back probes these again
+            for rid in batch.cached_rids:
+                self._runner.complete_cached_walk(rid, batch.node_name, batch.graph_walk)
         return outputs
 
     def check_stop_for_batch(

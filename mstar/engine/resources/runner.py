@@ -143,6 +143,11 @@ class StepRunner:
                 rid, node_name, graph_walk, outputs,
             )
 
+    def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
+        """Tell the node's own resources the cache served this walk whole."""
+        for key in self._sweep(self._node_order, self._order, node_name):
+            self._resources[key].complete_cached_walk(rid, node_name, graph_walk)
+
     def _check_preplan_deps(self) -> None:
         """A pre-planning resource's dependencies must pre-plan too.
 

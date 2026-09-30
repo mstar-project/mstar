@@ -2187,7 +2187,7 @@ class Worker:
             range_push("worker.postprocess.pending_loop_stops", synchronize=False)
         # If any nodes in the batch have "overstayed" their loop stop, then make
         # sure to not route their outputs
-        valid_rids = set(batch_N.node_batch.request_ids)
+        valid_rids = set(batch_N.node_batch.request_ids) | batch_N.node_batch.cached_rids
         if batch_N.speculative_new_iter:
             stopped_rids = self._graph_runtime.pending_loop_stop_rids(
                 batch_N.graph_walk, batch_N.loop_name,
@@ -2208,7 +2208,8 @@ class Worker:
         # An engine can drop rids that were skipped during execution (a
         # submodule's prepare_inputs returned None) from node_batch.request_ids,
         # but it cannot reach the worker-side ScheduledBatch. Reconcile it here so
-        # the routing/output loops below only touch rids that produced outputs.
+        # the routing/output loops below only touch rids that ran or that the
+        # cache served.
         for rid in list(batch_N.batch.request_to_worker_graph):
             if rid not in valid_rids:
                 batch_N.batch.request_to_worker_graph.pop(rid, None)
