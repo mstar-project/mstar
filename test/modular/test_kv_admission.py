@@ -27,6 +27,10 @@ from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import AdmissionDeferred, KVManager
 from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
 
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the host pool pins its memory"
+)
+
 PAGE_SIZE = 16
 ROOT = b"a root"
 NODE = "LLM"
@@ -56,7 +60,10 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _manager(max_num_pages: int = 16, rank: int = 0, world_size: int = 1) -> KVManager:
+def _manager(
+    max_num_pages: int = 16, rank: int = 0, world_size: int = 1,
+    cpu_offload_pages: int = 0,
+) -> KVManager:
     group = None
     if world_size > 1:
         group = SimpleNamespace(rank=rank, world_size=world_size)
@@ -64,9 +71,11 @@ def _manager(max_num_pages: int = 16, rank: int = 0, world_size: int = 1) -> KVM
         cfg=KVConfig(
             num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096,
             max_num_pages=max_num_pages, page_size=PAGE_SIZE,
+            cpu_offload_pages=cpu_offload_pages,
         ),
         name="kv", joint_comm_group=group, transfer_engine_info=None,
-        device=torch.device("cpu"), dtype=torch.float32,
+        device=torch.device("cuda" if cpu_offload_pages else "cpu"),
+        dtype=torch.float32,
     )
     kv.enable_prefix_cache(ROOT, {"main": (PREFILL, DECODE)})
     return kv
@@ -272,6 +281,53 @@ def test_a_pool_other_workers_share_never_refuses():
     assert _ready(shared, "b").ready and _step(shared, "b", 100).ok, (
         "a worker refused a request on its own count"
     )
+
+
+# ── a request moved to the host ─────────────────────────────────────────
+
+
+def _offloaded_with_a_hit(kv: KVManager) -> str:
+    """``b`` running on three pages lent by the index, then moved out."""
+    prompt = list(range(4 * PAGE_SIZE))
+    kv.ingest_request("a", _request(prompt, max_tokens=2 * PAGE_SIZE))
+    assert _ready(kv, "a").ready and _prefill(kv, "a", len(prompt)).ok
+    kv.ingest_request("b", _request(prompt, max_tokens=2 * PAGE_SIZE))
+    assert _ready(kv, "b").ready and _prefill(kv, "b", len(prompt)).ok
+    kv.remove_request("a")
+    assert kv.offload("b") > 0, "the request did not move to the host"
+    return "b"
+
+
+@requires_cuda
+def test_a_reload_takes_back_only_what_the_reservation_kept():
+    kv = _manager(max_num_pages=32, cpu_offload_pages=32)
+    prompt = list(range(4 * PAGE_SIZE))
+    kv.ingest_request("a", _request(prompt, max_tokens=2 * PAGE_SIZE))
+    assert _ready(kv, "a").ready and _prefill(kv, "a", len(prompt)).ok
+    kv.ingest_request("b", _request(prompt, max_tokens=2 * PAGE_SIZE))
+    assert _ready(kv, "b").ready and _prefill(kv, "b", len(prompt)).ok
+    owed = kv._reserved["b"].pages - kv._held_fresh("b")
+
+    assert kv.offload("b") > 0 and kv.reload("b")
+
+    # the three lent pages come back as private copies, taken off the free list
+    assert kv._reserved["b"].pages - kv._held_fresh("b") == owed, (
+        "the reload left the request owed other than the growth it had before"
+    )
+
+
+@requires_cuda
+def test_nothing_is_admitted_into_the_room_a_reload_will_take():
+    kv = _manager(max_num_pages=16, cpu_offload_pages=32)
+    _offloaded_with_a_hit(kv)
+    # b comes back on four pages of its own and still owes two of growth: of
+    # the fifteen, a request needing ten fits only if b's room goes to it
+    kv.ingest_request("c", KVReqConfig(
+        max_tokens=1, prompt_slots={"main": 10 * PAGE_SIZE - 1}, decode_labels=["main"],
+    ))
+
+    assert not _ready(kv, "c").ready, "a request was admitted into the room b left"
+    assert kv.reload("b"), "the room b left was not there when it came back"
 
 
 # ── the invariant ───────────────────────────────────────────────────────
