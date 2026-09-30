@@ -168,3 +168,32 @@ class Fork:
             self._join.record()
         self._join.wait()
         return r0, r1
+
+
+def reset_device_scheduling(device) -> None:
+    """Create and destroy a throwaway CUDA context on ``device``.
+
+    Kernels (or device-to-device copies) from a side stream running beside a
+    CUDA-graph replay can leave the GPU in a mode CUDA graph nodes have delayed
+    launch, until the device's scheduling setup is rebuilt, e.g., another
+    context arriving on the GPU.
+    """
+    import ctypes
+
+    if not torch.cuda.is_available():
+        return
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        return
+    index = dev.index if dev.index is not None else torch.cuda.current_device()
+    torch.cuda.synchronize(index)
+    cu = ctypes.CDLL("libcuda.so.1")
+    cu.cuCtxCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint, ctypes.c_int]
+    cu.cuCtxDestroy_v2.argtypes = [ctypes.c_void_p]
+    handle = ctypes.c_int()
+    ctx = ctypes.c_void_p()
+    if cu.cuDeviceGet(ctypes.byref(handle), index) == 0 and \
+            cu.cuCtxCreate_v2(ctypes.byref(ctx), 0, handle.value) == 0:
+        cu.cuCtxDestroy_v2(ctx)
+    # back onto torch's primary context for this thread
+    torch.cuda.set_device(index)
