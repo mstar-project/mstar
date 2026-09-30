@@ -392,7 +392,7 @@ class KVManager(AttentionResource):
             joint_comm_group=info.joint_comm_group,
             transfer_engine_info=info.transfer_engine_info,
             dtype=info.kv_dtype,
-            nodes=spec.nodes,
+            nodes=spec.nodes if info.nodes is None else info.nodes,
         )
 
     def build_cuda_graph_buffers(
