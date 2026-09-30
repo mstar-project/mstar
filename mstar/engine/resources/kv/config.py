@@ -60,6 +60,18 @@ class KVConfig:
         self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
 
 
+@dataclass(frozen=True)
+class PrefixSpan:
+    """One write to a keyed stream, as the preprocess worker laid it out."""
+    # the slots it fills
+    length: int
+    # how far it moves the position counter
+    advance: int
+    walk: str
+    # an item's digest; None for ids
+    digest: bytes | None = None
+
+
 @dataclass
 class KVReqConfig(ResourceReqConfig):
     # NOTE: this may need to be refined
@@ -72,6 +84,8 @@ class KVReqConfig(ResourceReqConfig):
     prefix_tail: dict[str, list[int]] | None = None
     # label -> the output tensor its sampled ids arrive in, if the stream keys generation
     prefix_decode: dict[str, str] | None = None
+    # label -> the layout its keys were chained over, one span per write
+    prefix_layout: dict[str, list[PrefixSpan]] | None = None
     prefix_cache: bool = True
 
     def apply_conductor_config(
@@ -79,6 +93,7 @@ class KVReqConfig(ResourceReqConfig):
         prefix_keys: dict[str, list[bytes]] | None=None,
         prefix_tail: dict[str, list[int]] | None=None,
         prefix_decode: dict[str, str] | None=None,
+        prefix_layout: dict[str, list[list]] | None=None,
         prefix_cache: bool | None=None,
         **kwargs,
     ):
@@ -88,6 +103,12 @@ class KVReqConfig(ResourceReqConfig):
             self.prefix_tail = prefix_tail
         if prefix_decode is not None:
             self.prefix_decode = prefix_decode
+        if prefix_layout is not None:
+            # rows, not PrefixSpans, in the kwargs: a dataclass there pickles them all
+            self.prefix_layout = {
+                label: [PrefixSpan(*row) for row in rows]
+                for label, rows in prefix_layout.items()
+            }
         if prefix_cache is not None:
             self.prefix_cache = prefix_cache
 

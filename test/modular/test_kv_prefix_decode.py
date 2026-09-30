@@ -23,10 +23,11 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep
+from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep, PrefixSpan
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.model.submodule_base import ARNodeInputs
 
 PAGE_SIZE = 128
 ROOT = b"a root"
@@ -82,6 +83,7 @@ def _ingest(kv: KVManager, rid: str, prompt: list[int], chains: bool = True):
         prefix_keys={"main": chain(_pages(prompt))},
         prefix_tail={"main": prompt[whole * PAGE_SIZE:]},
         prefix_decode={"main": TENSOR} if chains else None,
+        prefix_layout={"main": [PrefixSpan(len(prompt), len(prompt), WALK)]},
     ))
 
 
@@ -159,9 +161,13 @@ def test_a_generated_page_is_matched_by_the_request_that_asks_for_it_next():
     _decode(kv, "r0", 9999)
 
     # the next turn: the whole of the first turn is now the prompt
-    _ingest(kv, "r1", prompt + generated + list(range(200, 260)))
+    next_prompt = prompt + generated + list(range(200, 260))
+    _ingest(kv, "r1", next_prompt)
 
-    assert kv.resolve_cached_prefix("r1", NODE, WALK) == PAGE_SIZE, (
+    matched = kv.resolve_cached_prefix("r1", NODE, WALK, ARNodeInputs(
+        input_ids=torch.tensor(next_prompt), input_seq_len=len(next_prompt),
+    ))
+    assert matched is not None and matched.tokens == PAGE_SIZE, (
         "the page the first turn generated was not there for the second"
     )
     kv.assert_pages_conserved()
@@ -221,6 +227,7 @@ def test_a_request_that_opted_out_chains_nothing():
         prefix_keys={"main": chain(_pages(prompt))},
         prefix_tail={"main": []},
         prefix_decode={"main": TENSOR},
+        prefix_layout={"main": [PrefixSpan(len(prompt), len(prompt), WALK)]},
         prefix_cache=False,
     ))
 

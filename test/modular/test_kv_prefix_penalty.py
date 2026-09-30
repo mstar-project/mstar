@@ -17,6 +17,7 @@ sys.path.insert(0, ".")
 
 import torch
 
+from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import StepContext
@@ -25,8 +26,11 @@ from mstar.model.submodule_base import ARNodeInputs
 RID = "r0"
 NODE = "LLM"
 WALK = "prefill"
+LABEL = "main"
 PROMPT = torch.arange(100)
 MATCHED = 96
+# a text-only walk: its position is its token count
+HIT = CachedPrefix(LABEL, MATCHED, MATCHED)
 
 
 def _sampler(penalty: float = 1.2) -> SamplerResource:
@@ -61,7 +65,7 @@ def test_a_cut_prefill_still_ends_with_the_whole_prompt_in_the_mask():
     resource = _sampler()
     inputs = ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT))
 
-    resource.apply_cached_prefix(RID, NODE, WALK, inputs, MATCHED)
+    resource.apply_cached_prefix(RID, NODE, WALK, inputs, HIT)
     _prefill(resource, PROMPT[MATCHED:])
 
     assert _seen(resource) == PROMPT.tolist(), (
@@ -73,7 +77,7 @@ def test_the_skipped_tokens_are_folded_in_once():
     resource = _sampler()
     resource.apply_cached_prefix(
         RID, NODE, WALK,
-        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), MATCHED,
+        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), HIT,
     )
     _prefill(resource, PROMPT[MATCHED:])
 
@@ -92,7 +96,7 @@ def test_a_miss_keeps_nothing():
 
     resource.apply_cached_prefix(
         RID, NODE, WALK,
-        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), 0,
+        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), None,
     )
 
     assert RID not in resource._cached_prefix, (
@@ -106,7 +110,7 @@ def test_a_walk_without_token_ids_keeps_nothing():
     resource.apply_cached_prefix(
         RID, NODE, WALK,
         ARNodeInputs(input_embeds=torch.zeros(100, 8), input_seq_len=100),
-        MATCHED,
+        HIT,
     )
 
     assert RID not in resource._cached_prefix, (
@@ -118,7 +122,7 @@ def test_an_inert_penalty_leaves_the_mask_alone():
     resource = _sampler(penalty=1.0)
     resource.apply_cached_prefix(
         RID, NODE, WALK,
-        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), MATCHED,
+        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), HIT,
     )
 
     _prefill(resource, PROMPT[MATCHED:])
@@ -132,7 +136,7 @@ def test_a_preplan_folds_nothing_in():
     resource = _sampler()
     resource.apply_cached_prefix(
         RID, NODE, WALK,
-        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), MATCHED,
+        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), HIT,
     )
 
     resource.plan(
@@ -152,7 +156,7 @@ def test_removing_the_request_drops_what_was_kept_for_it():
     resource = _sampler()
     resource.apply_cached_prefix(
         RID, NODE, WALK,
-        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), MATCHED,
+        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), HIT,
     )
 
     resource.remove_request(RID)

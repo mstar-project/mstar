@@ -5,7 +5,7 @@ from dataclasses import asdict
 import torch
 
 from mstar.distributed.communication import JointGroups
-from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.sampler.config import (
     SamplerSpec,
     SamplerStep,
@@ -135,7 +135,7 @@ class SamplerResource(Resource):
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
-        inputs, matched_len: int,
+        inputs, prefix: CachedPrefix | None,
     ) -> None:
         """Keep the tokens the cache is about to skip, for `plan` to fold in.
 
@@ -145,8 +145,8 @@ class SamplerResource(Resource):
         """
         del node_name, graph_walk
         # a walk that prefills from embeddings has no ids to keep
-        if matched_len > 0 and inputs.input_ids is not None:
-            self._cached_prefix[rid] = inputs.input_ids[:matched_len]
+        if prefix is not None and prefix.tokens > 0 and inputs.input_ids is not None:
+            self._cached_prefix[rid] = inputs.input_ids[:prefix.tokens]
 
     def remove_request(self, rid: str):
         self._sampler.remove_request(rid)

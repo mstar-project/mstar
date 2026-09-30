@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -75,6 +75,15 @@ class EngineResourceInfo:
         return spec
 
 
+class CachedPrefix(NamedTuple):
+    """How much of a walk a resource holds, and where that leaves its stream."""
+    label: str
+    # the walk's leading inputs held, never more than it has
+    tokens: int
+    # the stream's position counter past them
+    position: int
+
+
 class Resource(ABC):
     @classmethod
     @abstractmethod
@@ -90,30 +99,29 @@ class Resource(ABC):
     prefix_skip_safe: bool = False
 
     def enable_prefix_cache(
-        self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
+        self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
     ) -> bool:
         """Open whatever this resource keeps across requests, under ``root``;
         True if anything opened.
 
-        ``walks`` names, per label, the walk that writes the keyed span and the
-        one that decodes after it.
+        ``walks`` names, per label, the walks that write the keyed stream.
         """
         return False
 
     def resolve_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str,
-    ) -> int | None:
-        """How many of this request's leading tokens this resource already holds.
+        self, rid: str, node_name: str, graph_walk: str, inputs: Any,
+    ) -> CachedPrefix | None:
+        """How much of this walk's leading inputs this resource already holds.
 
-        None leaves the length to other resources; 0 means nothing can be skipped.
+        None leaves the answer to other resources; 0 tokens means nothing can be skipped.
         """
         return None
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
-        inputs: Any, matched_len: int,
+        inputs: Any, prefix: CachedPrefix | None,
     ) -> None:
-        """Take on the length every resource agreed to skip.
+        """Take on the prefix every resource agreed to skip, None if none was.
 
         The inputs are untrimmed, so a resource that needs the tokens being
         skipped can still read them.

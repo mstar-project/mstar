@@ -11,7 +11,7 @@ import logging
 from collections.abc import Collection, Mapping
 from typing import Any
 
-from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
+from mstar.engine.resources.base import CachedPrefix, CGSlotSpec, PublishedInfo, Resource
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
@@ -107,31 +107,31 @@ class StepRunner:
         self._staged: tuple | None = None
 
     def resolve_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str,
-    ) -> int:
-        """The longest prefix every resource on ``node_name`` can serve.
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+    ) -> CachedPrefix | None:
+        """The longest prefix of this walk every resource on ``node_name`` can serve.
 
         The smallest answer wins, because a step is one span: a resource that
         holds less than another has to be caught up by the tokens that run.
         A resource with no opinion is not an answer of zero.
         """
-        matched = None
+        agreed = None
         for key in self._sweep(self._node_order, self._order, node_name):
             answer = self._resources[key].resolve_cached_prefix(
-                rid, node_name, graph_walk,
+                rid, node_name, graph_walk, inputs,
             )
-            if answer is not None and (matched is None or answer < matched):
-                matched = answer
-        return matched or 0
+            if answer is not None and (agreed is None or answer.tokens < agreed.tokens):
+                agreed = answer
+        return agreed
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
-        inputs, matched_len: int,
+        inputs, prefix: CachedPrefix | None,
     ) -> None:
-        """Give every resource the agreed length, with the untrimmed inputs."""
+        """Give every resource the agreed prefix, with the untrimmed inputs."""
         for key in self._sweep(self._node_order, self._order, node_name):
             self._resources[key].apply_cached_prefix(
-                rid, node_name, graph_walk, inputs, matched_len,
+                rid, node_name, graph_walk, inputs, prefix,
             )
 
     def extend_prefix_chains(

@@ -29,7 +29,7 @@ import torch
 from mstar.engine.engine import Engine
 from mstar.engine.resources import Resource
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec
+from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, PrefixSpan
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.position.manager import RopeManager
@@ -304,7 +304,10 @@ def test_an_uncached_node_says_nothing_at_load(caplog, overrides, model):
 def test_ingest_puts_the_requests_keys_on_the_stream():
     kv = _kv()
 
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0", b"k1"]}))
+    kv.ingest_request("r0", KVReqConfig(
+        prefix_keys={"main": [b"k0", b"k1"]},
+        prefix_layout={"main": [PrefixSpan(32, 32, "prefill_text")]},
+    ))
 
     assert kv._streams["r0"]["main"].chain.keys == [b"k0", b"k1"], (
         "the chain the request brought never reached its stream"
@@ -313,7 +316,10 @@ def test_ingest_puts_the_requests_keys_on_the_stream():
 
 def test_a_label_the_request_did_not_key_carries_none():
     kv = _kv()
-    kv.ingest_request("r0", KVReqConfig(prefix_keys={"main": [b"k0"]}))
+    kv.ingest_request("r0", KVReqConfig(
+        prefix_keys={"main": [b"k0"]},
+        prefix_layout={"main": [PrefixSpan(16, 16, "prefill_text")]},
+    ))
 
     stream = kv._ensure_label("r0", "cfg_text")
 
@@ -324,7 +330,8 @@ def test_a_request_can_opt_out_of_the_cache():
     kv = _kv()
 
     kv.ingest_request("r0", KVReqConfig(
-        prefix_keys={"main": [b"k0"]}, prefix_cache=False,
+        prefix_keys={"main": [b"k0"]},
+        prefix_layout={"main": [PrefixSpan(16, 16, "prefill_text")]}, prefix_cache=False,
     ))
 
     assert kv._streams["r0"]["main"].chain is None, (

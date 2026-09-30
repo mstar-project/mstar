@@ -6,7 +6,13 @@ from dataclasses import dataclass, field, fields
 
 import torch
 
-from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, PublishedInfo, Resource
+from mstar.engine.resources.base import (
+    CachedPrefix,
+    CGSlotKey,
+    EngineResourceInfo,
+    PublishedInfo,
+    Resource,
+)
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs, SequenceView
 from mstar.engine.resources.position.config import (
@@ -152,12 +158,13 @@ class RopeManager(PositionManager):
         self._matched.pop(rid, None)
 
     def apply_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+        prefix: CachedPrefix | None,
     ) -> None:
         """Hold what the cache matched, until an admit seeds a counter with it."""
         del node_name, graph_walk, inputs
-        if matched_len:
-            self._matched[rid] = matched_len
+        if prefix is not None and prefix.tokens:
+            self._matched[rid] = prefix.tokens
 
     def admit(self, step: "PositionStep", ctx: StepContext) -> AdmitOutcome:
         """Start a matched prefix's counter past it, as a retrieved one does.

@@ -660,10 +660,11 @@ class Engine:
         )
         if inputs.tensor_inputs or inputs.kwargs or inputs.resource_step_info:
             return inputs
-        matched = self._runner.resolve_cached_prefix(rid, batch.node_name, walk)
+        prefix = self._runner.resolve_cached_prefix(rid, batch.node_name, walk, inputs)
         self._runner.apply_cached_prefix(
-            rid, batch.node_name, walk, inputs, matched,
+            rid, batch.node_name, walk, inputs, prefix,
         )
+        matched = prefix.tokens if prefix is not None else 0
         if matched <= 0:
             return inputs
         if matched >= inputs.input_seq_len:

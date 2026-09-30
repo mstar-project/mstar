@@ -36,12 +36,13 @@ from mstar.engine.resources.attn.config import (
 )
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PrefixSpan
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.step import Segment, SubmoduleStep
+from mstar.model.submodule_base import ARNodeInputs
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the attention backend needs a device"
@@ -174,12 +175,17 @@ class _Node:
                 for at in range(0, len(tokens), PAGE_SIZE)
             ])},
             prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
+            prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
         )})
 
-    def resolve(self, rid: str) -> int:
-        matched = self.runner.resolve_cached_prefix(rid, NODE, WALK)
-        self.runner.apply_cached_prefix(rid, NODE, WALK, None, matched)
-        return matched
+    def resolve(self, rid: str, tokens: list[int]) -> int:
+        inputs = ARNodeInputs(
+            input_ids=torch.tensor(tokens, dtype=torch.long, device=self.device),
+            input_seq_len=len(tokens),
+        )
+        prefix = self.runner.resolve_cached_prefix(rid, NODE, WALK, inputs)
+        self.runner.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
+        return prefix.tokens if prefix is not None else 0
 
     def prefill(self, rid: str, tokens: list[int]) -> torch.Tensor:
         """Run one prefill over ``tokens`` and give back its hidden states."""
@@ -213,18 +219,18 @@ def test_a_consumed_prefix_lands_within_the_repos_parity_tolerance(capsys):
 
     warm = _Node(device, cached=True)
     warm.ingest("seed", prompt)
-    warm.resolve("seed")
+    warm.resolve("seed", prompt)
     warm.prefill("seed", prompt)
     warm.kv.remove_request("seed")
 
     warm.ingest("cached", prompt + tail)
-    matched = warm.resolve("cached")
+    matched = warm.resolve("cached", prompt + tail)
     assert matched, "nothing matched, so this would compare two fresh runs"
     from_cache = warm.prefill("cached", (prompt + tail)[matched:])
 
     cold = _Node(device, cached=False)
     cold.ingest("fresh", prompt + tail)
-    assert cold.resolve("fresh") == 0, (
+    assert cold.resolve("fresh", prompt + tail) == 0, (
         "the fresh node matched something, so it is not the uncached side"
     )
     whole = cold.prefill("fresh", prompt + tail)

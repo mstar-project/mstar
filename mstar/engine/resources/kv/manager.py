@@ -10,14 +10,15 @@ import torch
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.base import (
     AttentionResource,
+    CachedPrefix,
     CGSlotSpec,
     EngineResourceInfo,
     PublishedInfo,
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
+from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep, PrefixSpan
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
-from mstar.engine.resources.kv.keys import fingerprint, page_key
+from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     KVPlanOutput,
@@ -109,17 +110,40 @@ class RetentionPolicy:
     protected_prefix: int = 0
 
 
+def _items_on(spans: list[PrefixSpan], page: int, page_size: int) -> list[PageItem]:
+    """The items with a slot on ``page``, as the preprocess worker keyed them."""
+    first_slot, end = page * page_size, (page + 1) * page_size
+    items = []
+    at = 0
+    for span in spans:
+        if span.digest is not None and at < end and at + span.length > first_slot:
+            first = max(at, first_slot)
+            items.append(PageItem(first - first_slot, first - at, span.length, span.digest))
+        at += span.length
+    return items
+
+
 @dataclass
 class PrefixChain:
     """The keys that name a stream's pages, and how far the index holds them."""
     # one key per page of this stream's prompt, from the preprocess worker
     keys: list[bytes]
-    # tokens not yet keyed: the prompt tail, then sampled ids, until a page fills
+    # ids not yet keyed: those on the prompt's partial page, then sampled ids, until a page fills
     unkeyed: list[int] | None
     # keys naming a whole page; the prompt's last key names a partial one until generation fills it
     keyed_pages: int
-    # tokens the chain accounts for: its prompt, and every token sampled since
+    # slots the chain accounts for: its prompt, and every token sampled since
     covered_len: int
+    # the prompt's layout, one span per write
+    spans: list[PrefixSpan]
+    # the items on the page `unkeyed` fills, keyed with its ids
+    unkeyed_items: list[PageItem]
+    # how much of the layout the stream holds: spans written, read in or
+    # served whole by the cache, and their slots
+    done: int = 0
+    consumed: int = 0
+    # the span the latest probe answered for
+    probed: int | None = None
     # how many of this stream's pages the index already holds
     cursor: int = 0
     # set once this stream has been reported, so a request that is admitted
@@ -127,21 +151,26 @@ class PrefixChain:
     reported: bool = False
 
     @classmethod
-    def seed(cls, keys: list[bytes], tail: list[int], page_size: int) -> "PrefixChain":
-        keyed_pages = len(keys) - (1 if tail else 0)
+    def seed(
+        cls, keys: list[bytes], tail: list[int], spans: list[PrefixSpan], page_size: int,
+    ) -> "PrefixChain":
+        total = sum(span.length for span in spans)
+        whole = total // page_size
         return cls(
-            keys=list(keys), unkeyed=tail, keyed_pages=keyed_pages,
-            covered_len=keyed_pages * page_size + len(tail),
+            keys=list(keys), unkeyed=tail, keyed_pages=whole, covered_len=total,
+            spans=list(spans), unkeyed_items=_items_on(spans, whole, page_size),
         )
 
     def extend(self, tokens: list[int], page_size: int) -> None:
         self.unkeyed.extend(tokens)
         self.covered_len += len(tokens)
-        while len(self.unkeyed) >= page_size:
+        # the prompt's items all end on its partial page, each holding its last length - offset slots
+        room = page_size - sum(item.length - item.offset for item in self.unkeyed_items)
+        while len(self.unkeyed) >= room:
             whole = self.keyed_pages
             key = page_key(
                 self.keys[whole - 1] if whole else b"",
-                self.unkeyed[:page_size],
+                self.unkeyed[:room], self.unkeyed_items,
             )
             # overwrites the partial key the prompt left here, if any
             if whole < len(self.keys):
@@ -149,7 +178,9 @@ class PrefixChain:
             else:
                 self.keys.append(key)
             self.keyed_pages = whole + 1
-            del self.unkeyed[:page_size]
+            del self.unkeyed[:room]
+            self.unkeyed_items = []
+            room = page_size
 
     def pages_filled(self, stored_len: int, page_size: int) -> int:
         return min(stored_len // page_size, self.keyed_pages)
@@ -396,7 +427,7 @@ class KVManager(AttentionResource):
         return state
 
     def enable_prefix_cache(
-        self, root: bytes, walks: dict[str, tuple[str, str | None]] | None = None,
+        self, root: bytes, walks: dict[str, tuple[str | None, ...]] | None = None,
     ) -> bool:
         """Open the index under ``root``, the identity every key hangs from."""
         self._keyed_walks = {
@@ -417,13 +448,14 @@ class KVManager(AttentionResource):
         return True
 
     def resolve_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str,
-    ) -> int | None:
-        """Match this request's prefix against the index and hold what matched.
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+    ) -> CachedPrefix | None:
+        """Answer this walk from one lease on the whole layout, held for every walk.
 
-        Answers the same length every time it is asked, and takes one reference
-        however often that is: a probe is repeated whenever a step is prepared
-        again.
+        A stream holding a lease, whoever took it, answers from it past the spans
+        already consumed. A probe is repeated whenever a step is prepared again,
+        so nothing it answers from moves until the walk commits or the cache
+        serves it, and one reference is taken however often it is asked.
         """
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
@@ -431,30 +463,92 @@ class KVManager(AttentionResource):
                 self._warn_unkeyed(rid, node_name, graph_walk)
                 return None
             stream = self._ensure_label(rid, label)
+            chain = stream.chain
+            if chain is None or chain.done == len(chain.spans):
+                return None
+            span = chain.spans[chain.done]
+            if span.walk != graph_walk or span.length != inputs.input_seq_len:
+                self._drop_layout(rid, label, stream, (
+                    f"{graph_walk} writes {inputs.input_seq_len} slots where its "
+                    f"layout's span {chain.done} has {span.walk} write {span.length}"
+                ))
+                return None
             if stream.converted:
-                return stream.stored_len
+                return self._answer(label, chain, stream.stored_len)
             if stream.lease is not None:
-                return len(stream.lease) * self.config.page_size
+                return self._answer(label, chain, len(stream.lease) * self.config.page_size)
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
-            keys = list(stream.chain.keys)
+            keys = list(chain.keys)
         # outside the lock: one SHA-256 per page, and admit, commit and remove would wait on it
         rooted = [fingerprint(self._prefix_root, key) for key in keys]
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return None
-            # one key short, so a fully cached prompt still leaves a token to run
-            matched = self._index.lookup(rooted)[:len(rooted) - 1]
-            if not matched:
-                return None
-            self._arena.retain(matched)
-            stream.lease = matched
-            return len(matched) * self.config.page_size
+            # a lease another thread took while this one hashed is the one to answer from
+            if stream.lease is None:
+                # one key short, so a fully cached prompt still leaves a token to run
+                matched = self._index.lookup(rooted)[:len(rooted) - 1]
+                if not matched:
+                    return None
+                self._arena.retain(matched)
+                stream.lease = matched
+            return self._answer(label, chain, len(stream.lease) * self.config.page_size)
+
+    @staticmethod
+    def _answer(label: str, chain: PrefixChain, present: int) -> CachedPrefix:
+        """Of ``present`` slots held, this walk's share and the position past it,
+        recording that the probe answered span ``chain.done``."""
+        span = chain.spans[chain.done]
+        tokens = min(max(present - chain.consumed, 0), span.length)
+        position = sum(earlier.advance for earlier in chain.spans[:chain.done])
+        if span.digest is None:
+            position += tokens
+        elif tokens == span.length:
+            # an item's advance is the block's, applied once it is whole
+            position += span.advance
+        chain.probed = chain.done
+        return CachedPrefix(label, tokens, position)
+
+    def _drop_layout(
+        self, rid: str, label: str, stream: CacheStream, disagreement: str,
+    ) -> None:
+        """End the chain of a stream its layout does not describe.
+
+        A walk the cache served never admits, so until a walk that runs converts
+        the lease, the served walks' KV lives only in it: releasing it would have
+        the next walk write from slot 0 with them missing. The served part is
+        kept when it ends on a page boundary; otherwise nothing can keep it, and
+        the request fails.
+        """
+        logger.warning(
+            "KV %s: %s/%s %s; its chain ends here", self.name, rid, label, disagreement,
+        )
+        chain = stream.chain
+        if chain.done and stream.lease is not None:
+            keep, partial = divmod(chain.consumed, self.config.page_size)
+            if partial:
+                raise RuntimeError(
+                    f"KV {self.name}: {rid}/{label}: the walks the cache served end "
+                    f"inside a page ({chain.consumed} slots), so their KV cannot be kept"
+                )
+            self._adopt(stream, stream.lease[:keep])
+            self._arena.release(stream.lease[keep:])
+            stream.lease = None
+        else:
+            self._release_lease(stream)
+        stream.chain = None
 
     def apply_cached_prefix(
-        self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
+        self, rid: str, node_name: str, graph_walk: str, inputs,
+        prefix: CachedPrefix | None,
     ) -> None:
-        """Cut this stream's lease down to ``matched_len``, the agreed length."""
+        """Cut the lease to the agreed prefix, unless the cache serves this walk whole.
+
+        A served walk leaves the lease whole, since the walks after it read the
+        rest. With no answer, a walk the engine would not probe is about to
+        write whole over what the lease holds, so the layout ends here.
+        """
         del inputs
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
@@ -463,10 +557,28 @@ class KVManager(AttentionResource):
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.lease is None or stream.stored_len:
                 return
-            keep = matched_len // self.config.page_size
+            if prefix is None:
+                self._drop_layout(rid, label, stream, f"{graph_walk} writes unprobed")
+                return
+            chain = stream.chain
+            if prefix.tokens == chain.spans[chain.done].length:
+                return
+            keep = (chain.consumed + prefix.tokens) // self.config.page_size
             if keep < len(stream.lease):
                 self._arena.release(stream.lease[keep:])
                 stream.lease = stream.lease[:keep] or None
+
+    def complete_cached_walk(self, rid: str, node_name: str, graph_walk: str) -> None:
+        with self._lock:
+            label = self._keyed_label(rid, node_name, graph_walk)
+            if label is None:
+                return
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None or stream.chain is None:
+                return
+            chain = stream.chain
+            chain.consumed += chain.spans[chain.done].length
+            chain.done += 1
 
     def _index_filled_pages(
         self, segment: Segment, stream: CacheStream, ctx: StepContext,
@@ -495,6 +607,20 @@ class KVManager(AttentionResource):
         if stream.released or stream.stored_len - segment.span > chain.covered_len:
             stream.chain = None
             return
+        # a span that ends before this write starts was read in, matched or
+        # served; only one this write reaches has to be the walk's own
+        start = stream.stored_len - segment.span
+        while chain.done < len(chain.spans):
+            end = chain.consumed + chain.spans[chain.done].length
+            if chain.consumed < stream.stored_len and end > start and (
+                chain.spans[chain.done].walk != ctx.graph_walk
+            ):
+                stream.chain = None
+                return
+            if stream.stored_len < end:
+                break
+            chain.consumed = end
+            chain.done += 1
         filled = chain.pages_filled(stream.stored_len, self.config.page_size)
         if stream.retention is not None:
             filled = min(
@@ -552,6 +678,8 @@ class KVManager(AttentionResource):
             or stream.stored_len
             or stream.offloaded
             or stream.chain is None
+            # a live lease is the probe's, for walks not yet admitted; its own admit converts it
+            or stream.lease is not None
         ):
             return
         # never past what the other side published, and only whole pages
@@ -561,10 +689,7 @@ class KVManager(AttentionResource):
         if not matched:
             return
         self._arena.retain(matched)
-        # `stored_len` is 0, so any pages the stream holds are empty
-        self._arena.release(stream.page_indices)
-        stream.page_indices = list(matched)
-        stream.stored_len = len(matched) * self.config.page_size
+        self._adopt(stream, matched)
         stream.chain.cursor = len(matched)
 
     def _warn_unkeyed(self, rid: str, node_name: str, graph_walk: str) -> None:
@@ -617,10 +742,11 @@ class KVManager(AttentionResource):
         if overrides is None or not overrides.prefix_cache:
             return
         keys = (overrides.prefix_keys or {}).get(label)
-        if not keys:
+        spans = (overrides.prefix_layout or {}).get(label)
+        if not keys or not spans:
             return
         tail = list((overrides.prefix_tail or {}).get(label) or ())
-        stream.chain = PrefixChain.seed(keys, tail, self.config.page_size)
+        stream.chain = PrefixChain.seed(keys, tail, spans, self.config.page_size)
 
     def extend_prefix_chain(
         self, rid: str, node_name: str, graph_walk: str, outputs,
@@ -647,6 +773,15 @@ class KVManager(AttentionResource):
                 stream.chain = None
                 return
             stream.chain.extend(sampled[0].flatten().tolist(), self.config.page_size)
+
+    def _adopt(self, stream: CacheStream, pages: list[int]) -> None:
+        """Make ``pages`` the whole of a stream that has written nothing yet.
+
+        Any pages it already holds are empty ones a refused admit left, and go back.
+        """
+        self._arena.release(stream.page_indices)
+        stream.page_indices = list(pages)
+        stream.stored_len = len(pages) * self.config.page_size
 
     def _release_lease(self, stream: CacheStream) -> None:
         """Give back a lease `admit` never converted; a converted one is released
@@ -802,12 +937,12 @@ class KVManager(AttentionResource):
                     and not stream.offloaded
                     and not stream.read_pending
                 ):
-                    # drop the empty pages a refused batch admit left, before taking the lease
-                    self._arena.release(stream.page_indices)
-                    stream.page_indices = list(stream.lease)
-                    stream.stored_len = (
-                        len(stream.lease) * self.config.page_size
+                    assert stream.chain.probed == stream.chain.done, (
+                        f"KV {self.name}: {segment.request_id}/{segment.label} admits a "
+                        "walk its lease was never probed for, which would write over "
+                        "the pages the lease holds for it"
                     )
+                    self._adopt(stream, stream.lease)
                     # they came out of the index, so they are already in it
                     stream.chain.cursor = len(stream.lease)
                     stream.lease = None

@@ -22,7 +22,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep
+from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep, PrefixSpan
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import (
     KVManager,
@@ -92,6 +92,7 @@ def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
     kv.ingest_request(rid, KVReqConfig(
         prefix_keys={"main": _keys(tokens)},
         prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
+        prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
     ))
 
 

@@ -23,6 +23,7 @@ import torch
 
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import Resource, StepContext, StepRunner
+from mstar.engine.resources.base import CachedPrefix
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -33,6 +34,7 @@ RID = "r0"
 NODE = "LLM"
 OTHER = "Talker"
 WALK = "prefill"
+LABEL = "main"
 PROMPT = 100
 
 
@@ -42,18 +44,23 @@ class _Answering(Resource):
     def __init__(self, matched: int | None):
         self._matched = matched
         self.resolved = 0
-        self.applied: list[tuple[int, int]] = []
+        self.applied: list[tuple[int, int | None]] = []
 
     @classmethod
     def build(cls, spec, info):
         raise NotImplementedError
 
-    def resolve_cached_prefix(self, rid, node_name, graph_walk):
+    def resolve_cached_prefix(self, rid, node_name, graph_walk, inputs):
         self.resolved += 1
-        return self._matched
+        if self._matched is None:
+            return None
+        # a text-only walk: its position is its token count
+        return CachedPrefix(LABEL, self._matched, self._matched)
 
-    def apply_cached_prefix(self, rid, node_name, graph_walk, inputs, matched_len):
-        self.applied.append((inputs.input_seq_len, matched_len))
+    def apply_cached_prefix(self, rid, node_name, graph_walk, inputs, prefix):
+        self.applied.append(
+            (inputs.input_seq_len, prefix.tokens if prefix is not None else None),
+        )
 
 
 class _Submodule:
@@ -299,10 +306,10 @@ class _RaisingFor(_Answering):
         super().__init__(matched)
         self._rid = rid
 
-    def apply_cached_prefix(self, rid, node_name, graph_walk, inputs, matched_len):
+    def apply_cached_prefix(self, rid, node_name, graph_walk, inputs, prefix):
         if rid == self._rid:
             raise RuntimeError("apply failed")
-        super().apply_cached_prefix(rid, node_name, graph_walk, inputs, matched_len)
+        super().apply_cached_prefix(rid, node_name, graph_walk, inputs, prefix)
 
 
 class _Preparing(_Submodule):

@@ -22,10 +22,11 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep
+from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep, PrefixSpan
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.model.submodule_base import ARNodeInputs
 
 PAGE_SIZE = 16
 ROOT = b"a root"
@@ -79,6 +80,7 @@ def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
     ]
     kv.ingest_request(rid, KVReqConfig(
         prefix_keys={"main": chain(pages)}, prefix_tail={"main": []},
+        prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
     ))
 
 
@@ -144,9 +146,13 @@ def test_a_leased_page_is_never_evicted():
     tokens = _tokens(0)
     _finished(kv, "a", tokens)
     _ingest(kv, "b", tokens)
-    matched = kv.resolve_cached_prefix("b", NODE, WALK)
+    matched = kv.resolve_cached_prefix("b", NODE, WALK, ARNodeInputs(
+        input_ids=torch.tensor(tokens), input_seq_len=len(tokens),
+    ))
     leased = list(kv._streams["b"]["main"].lease)
-    assert matched, "the second request did not match, so nothing was leased"
+    assert matched is not None and matched.tokens, (
+        "the second request did not match, so nothing was leased"
+    )
 
     # somebody else asks for everything the pool can give
     kv._index.evict(kv.config.max_num_pages)

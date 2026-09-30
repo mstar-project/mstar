@@ -24,12 +24,13 @@ import torch
 
 from mstar.engine.resources import KVConfig, PositionConfig, StepContext, StepRunner
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.step import Segment, SubmoduleStep
+from mstar.model.submodule_base import ARNodeInputs
 
 PAGE_SIZE = 16
 ROOT = b"a root"
@@ -83,6 +84,8 @@ class _Node:
         self.runner = StepRunner(
             {KV: self.kv, ROPE: self.rope}, node_resources={NODE: [KV, ROPE]},
         )
+        # each request's untrimmed walk inputs, which a probe checks against its layout
+        self._inputs: dict[str, ARNodeInputs] = {}
 
     def ingest(self, rid: str, tokens: list[int]) -> None:
         whole = len(tokens) // PAGE_SIZE
@@ -92,14 +95,19 @@ class _Node:
                 for at in range(0, len(tokens), PAGE_SIZE)
             ])},
             prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
+            prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
         )})
+        self._inputs[rid] = ARNodeInputs(
+            input_ids=torch.tensor(tokens), input_seq_len=len(tokens),
+        )
 
     def resolve(self, rid: str) -> int:
         """Both halves, in the order the engine runs them: every resource has
         to be told the length before any of them is asked to act on it."""
-        matched = self.runner.resolve_cached_prefix(rid, NODE, WALK)
-        self.runner.apply_cached_prefix(rid, NODE, WALK, None, matched)
-        return matched
+        inputs = self._inputs[rid]
+        prefix = self.runner.resolve_cached_prefix(rid, NODE, WALK, inputs)
+        self.runner.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
+        return prefix.tokens if prefix is not None else 0
 
     def step(self, rid: str, span: int) -> list[int]:
         """Admit, plan, write the slots this step owns, commit."""
