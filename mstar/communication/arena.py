@@ -43,22 +43,55 @@ import threading
 import time
 import weakref
 from concurrent.futures import Future
+from typing import NamedTuple
 
 import torch
 
 from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import (
     FutureAndPointers,
+    Rid,
     SharedMemoryCommunicationManager,
     _deserialize_tensor,
     _nullcontext,
     _serialize_tensor,
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
+from mstar.utils.containers import ParallelList
 
 logger = logging.getLogger(__name__)
 
 _CUDA_HOST_ALREADY_REGISTERED = 712
+
+
+class _Placements(NamedTuple):
+    """Where a batch's staged tensors landed, as columns.
+
+    Index-parallel, one entry per staged tensor, in the layout
+    ``set_shm_placement`` takes -- so staging fills three lists rather than
+    minting an object per tensor that ``_write_back`` then takes apart again.
+
+    The segment is its INDEX, not its name: the store learned the names once,
+    as the arena grew into them.
+
+    Empty is ``not p.uuids``, not ``not p`` -- this is a 3-tuple, so it is
+    always truthy. ``ParallelList`` does NOT share that edge: it defines
+    ``__len__``, which ``bool`` falls back on, so an empty one is falsey.
+    """
+
+    uuids: list[int]
+    segment_idxs: list[int]
+    offsets: list[int]
+
+    @classmethod
+    def empty(cls) -> "_Placements":
+        return cls([], [], [])
+
+    def add(self, uuid: int, segment_idx: int, offset: int) -> None:
+        """All three at once: they mean nothing out of lockstep."""
+        self.uuids.append(uuid)
+        self.segment_idxs.append(segment_idx)
+        self.offsets.append(offset)
 
 
 class _CudaEventFuture:
@@ -152,6 +185,12 @@ def _pin(ptr: int, nbytes: int) -> bool:
 
 class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     """Tensor transport via the Rust shared-memory arena (``mstar_rust``)."""
+
+    # Staging writes the segment and offset onto the descriptor the store
+    # holds, which routing may already have copied -- so every outgoing edge
+    # has to be refreshed from the store before it is sent. See
+    # ``TensorCommunicationManager.refresh_shm_placement``.
+    stamps_shm_placement = True
 
     def __init__(
         self,
@@ -288,12 +327,20 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # Producer-side segment views (memoryviews are stable: segments
         # never move or resize) + how many segments are already pinned.
         self._seg_views: list[memoryview] = []
+        # Index -> name, so staging never calls back into the arena for a
+        # name it would only hand straight to the store.
+        self._seg_names: list[str] = []
+        # The store we last named our segments to. The table lives in the
+        # bookkeeper, so a store swapped in after construction starts empty
+        # and has to be re-told -- otherwise placement cites an index it
+        # cannot resolve.
+        self._segments_named_to = None
         self._pinned_segments = 0
         self._sync_segments()
         # uuid -> (segment_idx, offset) for sender-side reclaim.
         # (register_for_send receives the TensorPointerInfos directly and
         # stamps them in place — no side-table needed.)
-        self._arena_locs: dict[str, tuple[int, int]] = {}
+        self._arena_locs: dict[int, tuple[int, int]] = {}
         # uuid -> stage time, for the TTL backstop: a request aborted after
         # staging but before every consumer ACKs defers reclaim forever
         # (cleanup_request waits for ACKs that will never come). A slot
@@ -302,7 +349,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         # above it cannot race a real consumer. Default OFF pending review
         # discussion; enable with MSTAR_SHM_ARENA_SLOT_TTL_S (recommend
         # >= 2x the request timeout).
-        self._arena_ts: dict[str, float] = {}
+        self._arena_ts: dict[int, float] = {}
         self._slot_ttl_s = float(
             os.getenv("MSTAR_SHM_ARENA_SLOT_TTL_S", "0"))
         self._ttl_reclaimed_total = 0
@@ -373,15 +420,20 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
 
     def _sync_segments(self) -> None:
         grew = False
+        old_len = len(self._seg_views)
         while len(self._seg_views) < self._arena.num_segments:
             i = len(self._seg_views)
             seg = self._arena.segment(i)
-            self._own_segment_paths.append(
-                f"/dev/shm/{self._arena.segment_name(i)}")
+            name = self._arena.segment_name(i)
+            self._own_segment_paths.append(f"/dev/shm/{name}")
+            self._seg_names.append(name)
             self._seg_views.append(memoryview(seg))
             self._maybe_pin(*seg.ptr_len())
             grew = True
         if grew:
+            # Once per segment ever created, so placement can cross as the
+            # index the reserve already returned.
+            self._name_segments_to_store(start_idx=old_len)
             total, free, largest = self._arena.stats()
             if (self._shm_total is not None
                     and total > self._shm_total * 0.8):
@@ -552,94 +604,176 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             self._sync_segments()
             return seg, off
 
-    def register_for_send(
-        self, request_id: str, tensor_infos: list[TensorPointerInfo],
-        skip_cuda_sync: bool = False,
-    ):
-        if not skip_cuda_sync and self._on_cuda:
-            torch.cuda.default_stream().synchronize()
-        ctx = (
+    def _d2h_ctx(self):
+        return (
             torch.cuda.stream(self._d2h_stream)
             if self._d2h_stream is not None
             else _nullcontext()
         )
+
+    def _name_segments_to_store(self, start_idx: int = 0) -> None:
+        """Tell the store what each segment index is called. Idempotent, and
+        once per segment rather than once per tensor -- the whole point of
+        placement crossing as an index.
+
+        ``start_idx`` skips the segments already named, so a grow names only
+        what it added; re-naming the whole list each grow is quadratic in
+        segment count. It must slice as well as renumber -- enumerating the
+        full list from ``start_idx`` would file every existing name under the
+        wrong index."""
+        store = self.tensor_store
+        for i, name in enumerate(self._seg_names[start_idx:], start=start_idx):
+            store.register_shm_segment(i, name)
+        self._segments_named_to = store
+
+    def _stage_one(
+        self, request_id: Rid, uuid: int,
+        info_arg: TensorPointerInfo | None,
+        placements: _Placements,
+    ) -> bool:
+        """Stage one tensor into the arena. Returns whether a D2H was queued.
+
+        The caller owns the CUDA sync, the ``_d2h_ctx`` context and the
+        trailing stream sync, so a batch pays for each of those once -- and
+        the writeback of ``placements``, which is why they are collected here
+        rather than stored one at a time.
+        """
+        if self.tensor_store.is_registered(uuid):
+            return False
+        tensor = self.tensor_store.get_tensor(uuid)
+        t0 = time.perf_counter()
+        t = tensor.detach().contiguous()
+        nbytes = t.numel() * t.element_size()
+        loc = self._reserve(nbytes)
+        if loc is not None and self.tensor_store.is_registered(uuid):
+            # Lost a concurrent-duplicate race: another thread registered this
+            # uuid while our reserve released the GIL. Return our slot instead
+            # of orphaning it.
+            self._arena.free(*loc)
+            return False
+        if loc is None:
+            # Arena saturated: spill THIS tensor to the per-uuid file protocol
+            # (infos keep shm_segment=None — the consumer falls back to the
+            # file read for exactly those).
+            data = _serialize_tensor(t)
+            path = self._shm_path(self.my_entity_id, uuid)
+            self._write_shm_file(path, data)
+            self._shm_files[uuid] = path
+            self._arena_ts[uuid] = time.monotonic()
+            self.tensor_store.set_metadata(uuid, mem_registered=True)
+            if self.enable_prof:
+                self._record_tx(request_id, uuid, len(data), time.perf_counter() - t0)
+            logger.debug("ARENA: spilled %s to %s (%d bytes)",
+                         uuid, path, len(data))
+            return False
+        seg, off = loc
         queued = False
+        try:
+            if nbytes:
+                host = torch.frombuffer(
+                    self._seg_views[seg][off:off + nbytes],
+                    dtype=torch.uint8,
+                ).view(t.dtype).reshape(t.shape)
+                # Async D2H into the pinned segment when a copy stream exists
+                # (the caller's single sync covers the batch); blocking
+                # otherwise, so the descriptor can never ship ahead of the bytes.
+                host.copy_(t, non_blocking=self._d2h_stream is not None)
+                queued = True
+            self._arena_locs[uuid] = (seg, off)
+            self._arena_ts[uuid] = time.monotonic()
+        except BaseException:
+            # Anything that unwinds between reserve and the _arena_locs record
+            # would orphan the slot forever (cleanup can only free what is
+            # recorded).
+            self._arena.free(seg, off)
+            raise
+        # A list index, not a call back into the arena: this used to mint a
+        # Python str per tensor that the store then interned straight back
+        # down to an id it already had.
+        seg_name = self._seg_names[seg]
+        # Still stamped in place when the caller handed one in: that contract
+        # is relied on (test_descriptor_survives_register_for_send). The
+        # uuid-driven path has no caller object and needs none.
+        if info_arg is not None:
+            info_arg.shm_segment = seg_name
+            info_arg.shm_offset = off
+        # The store must learn the segment, not just the caller's object. With
+        # the Python bookkeeper those are the same object and this is a
+        # re-assign; with the Rust one the descriptor was COPIED in, so without
+        # this the stamp dies on a throwaway and the tensor ships with
+        # shm_segment=None -- which the consumer reads as "spilled to a file"
+        # and goes looking for a file that was never written.
+        #
+        # Only the two fields travel, not the descriptor: rebuilding one for
+        # Python and marshalling it back costs ~3.5us per tensor to write two
+        # integers the store already holds. The segment goes as its INDEX --
+        # the store learned the name once, at the grow.
+        placements.add(uuid, seg, off)
+        self.tensor_store.set_metadata(uuid, mem_registered=True)
+        if self.enable_prof:
+            self._record_tx(request_id, uuid, nbytes, time.perf_counter() - t0)
+        logger.debug("ARENA: staged %s at %s+%d (%d bytes)",
+                     uuid, seg_name, off, nbytes)
+        return queued
+
+    def _write_back(self, placements: _Placements):
+        """One crossing for the batch, not one per tensor."""
+        if not placements.uuids:
+            return
+        if self.tensor_store is not self._segments_named_to:
+            # Swapped store: it has never heard of our segments, and an index
+            # it cannot resolve is an error it would raise here.
+            self._name_segments_to_store()
+        # The columns go straight across, already in the callee's layout.
+        self.tensor_store.set_shm_placement(
+            placements.uuids, placements.segment_idxs, placements.offsets,
+        )
+
+    def register_for_send(
+        self, request_id: Rid, tensor_infos: list[TensorPointerInfo],
+        skip_cuda_sync: bool = False,
+    ):
+        if not skip_cuda_sync and self._on_cuda:
+            torch.cuda.default_stream().synchronize()
+        queued = False
+        placements = _Placements.empty()
         self._maybe_log_stats()
-        with ctx:
+        with self._d2h_ctx():
             for info_arg in tensor_infos:
-                uuid = info_arg.uuid
-                if self.tensor_store.is_registered(request_id, uuid):
-                    continue
-                tensor = self.tensor_store.get_tensor(request_id, uuid)
-                t0 = time.perf_counter()
-                t = tensor.detach().contiguous()
-                nbytes = t.numel() * t.element_size()
-                loc = self._reserve(nbytes)
-                if loc is not None and self.tensor_store.is_registered(
-                        request_id, uuid):
-                    # Lost a concurrent-duplicate race: another thread
-                    # registered this uuid while our reserve released the
-                    # GIL. Return our slot instead of orphaning it.
-                    self._arena.free(*loc)
-                    continue
-                if loc is None:
-                    # Arena saturated: spill THIS tensor to the per-uuid file
-                    # protocol (infos keep shm_segment=None — the consumer
-                    # falls back to the file read for exactly those).
-                    data = _serialize_tensor(t)
-                    path = self._shm_path(self.my_entity_id, uuid)
-                    self._write_shm_file(path, data)
-                    self._shm_files[uuid] = path
-                    self._arena_ts[uuid] = time.monotonic()
-                    self.tensor_store.set_metadata(
-                        request_id, uuid, mem_registered=True)
-                    if self.enable_prof:
-                        self._record_tx(request_id, uuid, len(data),
-                                        time.perf_counter() - t0)
-                    logger.debug("ARENA: spilled %s to %s (%d bytes)",
-                                 uuid, path, len(data))
-                    continue
-                seg, off = loc
-                try:
-                    if nbytes:
-                        host = torch.frombuffer(
-                            self._seg_views[seg][off:off + nbytes],
-                            dtype=torch.uint8,
-                        ).view(t.dtype).reshape(t.shape)
-                        # Async D2H into the pinned segment when a copy
-                        # stream exists (one sync below covers the batch);
-                        # blocking otherwise, so the descriptor can never
-                        # ship ahead of the bytes.
-                        host.copy_(
-                            t, non_blocking=self._d2h_stream is not None)
-                        queued = True
-                    self._arena_locs[uuid] = (seg, off)
-                    self._arena_ts[uuid] = time.monotonic()
-                except BaseException:
-                    # Anything that unwinds between reserve and the
-                    # _arena_locs record would orphan the slot forever
-                    # (cleanup can only free what is recorded).
-                    self._arena.free(seg, off)
-                    raise
-                seg_name = self._arena.segment_name(seg)
-                info_arg.shm_segment = seg_name
-                info_arg.shm_offset = off
-                self.tensor_store.set_metadata(
-                    request_id, uuid, mem_registered=True)
-                if self.enable_prof:
-                    self._record_tx(
-                        request_id, uuid, nbytes, time.perf_counter() - t0)
-                logger.debug("ARENA: staged %s at %s+%d (%d bytes)",
-                             uuid, seg_name, off, nbytes)
+                queued |= self._stage_one(
+                    request_id, info_arg.uuid, info_arg, placements)
+        self._write_back(placements)
         if queued and self._d2h_stream is not None:
             # The control message referencing these bytes is sent after we
             # return; the consumer must never observe a partial copy.
             self._d2h_stream.synchronize()
 
+    def register_for_send_uuids(
+        self,
+        per_request: ParallelList[Rid, list[int]],
+        skip_cuda_sync: bool = False,
+    ):
+        """Uuid-driven staging: no descriptor is rebuilt to be read for its
+        uuid, and placement goes back as two columns rather than a whole
+        descriptor. The whole batch stages inside one stream context and syncs
+        once at the end, rather than one host-blocking sync per request."""
+        if not skip_cuda_sync and self._on_cuda:
+            torch.cuda.default_stream().synchronize()
+        queued = False
+        placements = _Placements.empty()
+        self._maybe_log_stats()
+        with self._d2h_ctx():
+            for request_id, uuids in per_request:
+                for uuid in uuids:
+                    queued |= self._stage_one(request_id, uuid, None, placements)
+        self._write_back(placements)
+        if queued and self._d2h_stream is not None:
+            self._d2h_stream.synchronize()
+
     # -- consumer ---------------------------------------------------------
 
     def start_read_tensors(
-        self, request_id: str, graph_edges: list[GraphEdge],
+        self, request_id: Rid, graph_edges: list[GraphEdge],
         graph_walk: str | None = None,
     ):
         # Increment races are benign here: a torn count can only make
@@ -672,13 +806,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                             next_node=graph_edge.next_node,
                             graph_walk=graph_walk, info=info,
                         )
-                        self.tensor_store.increment_ref(
-                            request_id, info.uuid, 1)
+                        self.tensor_store.increment_ref(info.uuid, 1)
                         continue
-                    if self.tensor_store.check_uuid_presence(
-                            request_id, info.uuid):
-                        self.tensor_store.increment_ref(
-                            request_id, info.uuid, 1)
+                    if self.tensor_store.check_uuid_presence(info.uuid):
+                        self.tensor_store.increment_ref(info.uuid, 1)
                         continue
                     if info.shm_segment is None:
                         # Spilled at the producer (arena saturated): read the
@@ -693,12 +824,11 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                         tensor = self._read_from_arena(info)
                     h2d_did_work = h2d_did_work or tensor.numel() > 0
                     self.tensor_store.put_tensor(
-                        request_id, info.uuid, tensor)
-                    self.tensor_store.set_metadata(
-                        request_id, info.uuid, mem_registered=False)
+                        request_id, info.uuid, tensor, info)
+                    self.tensor_store.set_metadata(info.uuid, mem_registered=False)
                     # +1 transit (released by get_ready_tensors), +1 usage
                     # (released by _cleanup_consumed_inputs).
-                    self.tensor_store.increment_ref(request_id, info.uuid, 2)
+                    self.tensor_store.increment_ref(info.uuid, 2)
                 read_edges.append(
                     (graph_edge, time.perf_counter() - rx_t0))
         future = None
@@ -790,10 +920,11 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 self._wake_q.put(None)
                 self._wake_q = None
 
-    def _cleanup_by_uuid(self, request_id: str, uuid: str):
+    def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
         # Grandparent cleanup (refcounts): skip the file manager's unlink.
         super(SharedMemoryCommunicationManager, self)._cleanup_by_uuid(
-            request_id, uuid)
+            uuid, registered,
+        )
         self._arena_ts.pop(uuid, None)
         if (loc := self._arena_locs.pop(uuid, None)) is not None:
             self._arena.free(*loc)
@@ -803,6 +934,6 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 os.unlink(path)   # spilled tensor: reclaim the file
             except FileNotFoundError:
                 pass
-        if not self.tensor_store.check_uuid_presence(request_id, uuid):
+        if not self.tensor_store.check_uuid_presence(uuid):
             return
-        self.tensor_store.remove_tensor(request_id, uuid)
+        self.tensor_store.remove_tensor(uuid)

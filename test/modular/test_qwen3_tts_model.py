@@ -637,7 +637,7 @@ def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
     )
     prepared = submodule.prepare_inputs(
         "talker_decode",
-        SimpleNamespace(request_id="real"),
+        SimpleNamespace(request_id="real", rid_handle="real"),
         {"talker_input_embeds": [torch.zeros(1, config.talker.hidden_size)]},
     )
     packed = submodule.preprocess(
@@ -857,7 +857,7 @@ def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
 
     prepared = submodule.prepare_inputs(
         "codec_chunk",
-        SimpleNamespace(request_id="request"),
+        SimpleNamespace(request_id="request", rid_handle="request"),
         {"codec_tokens": [codes]},
     )
 
