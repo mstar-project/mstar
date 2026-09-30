@@ -14,8 +14,10 @@ Each half is captured as a piecewise CUDA graph per padded length bucket:
 * ``frames_F<n>``: frame-aligned features -> waveform.
 
 Rows of a batch are grouped by frame bucket before the decoder so a short
-sentence is not padded to a long one. Anything without a captured bucket
-(a very long chunk, a batch size above the cap) runs the same code eagerly.
+sentence is not padded to a long one. A batch larger than the biggest
+captured one is cut into captured-size slices; a chunk longer than every
+frame bucket runs the same code eagerly, at most ``max_batch_frames`` frames
+per call, so no call needs more memory than a capture did.
 """
 
 from __future__ import annotations
@@ -243,7 +245,8 @@ class KokoroSynthSubmodule(NodeSubmodule):
         sizes = frame_lengths.tolist()  # the one host read
         pcm: list[torch.Tensor | None] = [None] * len(sizes)
         groups = group_by_bucket(sizes, self.config.frame_buckets, self.config.frame_grouping)
-        for bucket, rows in groups:
+        calls = [(bucket, part) for bucket, rows in groups for part in self._frame_batches(bucket, rows, sizes)]
+        for bucket, rows in calls:
             index = torch.tensor(rows, device=input_ids.device)
             runner = runners.get(frame_region(bucket)) if bucket is not None else None
             if runner is not None and runner.can_run(len(rows)):
@@ -268,12 +271,55 @@ class KokoroSynthSubmodule(NodeSubmodule):
                 len(sizes),
                 input_ids.shape[1],
                 sizes,
-                [(b, len(r)) for b, r in groups],
+                [(b, len(r)) for b, r in calls],
                 (time.perf_counter() - t0) * 1000,
             )
         return pcm
 
+    def frame_capture_sizes(self, bucket: int) -> list[int]:
+        """Batch sizes captured for a frame bucket: ``bs * bucket <= max_batch_frames``."""
+        cfg = self.config
+        return [bs for bs in cfg.capture_batch_sizes if bs * bucket <= cfg.max_batch_frames] or [1]
+
+    def _frame_batches(self, bucket: int | None, rows: list[int], sizes: list[int]) -> list[list[int]]:
+        """Split one frame group so no decoder call exceeds what start-up captured.
+
+        A bucketed group is cut at the bucket's largest captured batch; rows
+        past every bucket go eager, at most ``max_batch_frames`` frames per call.
+        """
+        if bucket is not None:
+            step = max(self.frame_capture_sizes(bucket))
+            return [rows[i : i + step] for i in range(0, len(rows), step)]
+        batches: list[list[int]] = []
+        for row in sorted(rows, key=lambda r: -sizes[r]):
+            # longest first, so a batch's first row sets its padded frame count
+            if batches and (len(batches[-1]) + 1) * sizes[batches[-1][0]] <= self.config.max_batch_frames:
+                batches[-1].append(row)
+            else:
+                batches.append([row])
+        return batches
+
     def _encode_text(
+        self,
+        input_ids: torch.Tensor,
+        lengths: torch.Tensor,
+        style: torch.Tensor,
+        speed: torch.Tensor,
+        runners: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The text half, in slices of the largest captured batch so none runs unbounded."""
+        step = max(self.config.capture_batch_sizes)
+        if input_ids.shape[0] <= step:
+            return self._encode_text_rows(input_ids, lengths, style, speed, runners)
+        parts = [
+            self._encode_text_rows(
+                input_ids[i : i + step], lengths[i : i + step], style[i : i + step], speed[i : i + step], runners
+            )
+            for i in range(0, input_ids.shape[0], step)
+        ]
+        return tuple(torch.cat(outputs, dim=0) for outputs in zip(*parts, strict=True))
+
+    def _encode_text_rows(
         self,
         input_ids: torch.Tensor,
         lengths: torch.Tensor,
@@ -345,11 +391,10 @@ class KokoroSynthSubmodule(NodeSubmodule):
                 capture_batch_sizes=list(cfg.capture_batch_sizes),
             )
         for bucket in cfg.frame_buckets:
-            sizes = [bs for bs in cfg.capture_batch_sizes if bs * bucket <= cfg.max_batch_frames] or [1]
             regions[frame_region(bucket)] = PiecewiseBatchedConfig(
                 capture_fn=self._frames_capture,
                 make_static_inputs=partial(self._frame_static_inputs, bucket=bucket, device=device),
                 seq_len=bucket,
-                capture_batch_sizes=sizes,
+                capture_batch_sizes=self.frame_capture_sizes(bucket),
             )
         return regions

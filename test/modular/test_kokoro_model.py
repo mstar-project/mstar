@@ -784,3 +784,72 @@ def test_synthesize_uses_runners_when_they_fit():
     assert sum(bs for _, bs in frame_calls) == 3  # every row went through exactly one frame bucket
     for a, b in zip(eager, captured, strict=True):
         assert a.shape == b.shape and rel_l2(a.float(), b.float()) < 5e-3
+
+
+def test_frame_batches_stay_within_the_captured_budget():
+    config = tiny_config()
+    config.capture_batch_sizes = [1, 2, 4]
+    config.frame_buckets = [16, 32]
+    config.max_batch_frames = 64
+    submodule = KokoroSynthSubmodule(tiny_model(), config)
+    assert submodule.frame_capture_sizes(16) == [1, 2, 4] and submodule.frame_capture_sizes(32) == [1, 2]
+    assert submodule.frame_capture_sizes(128) == [1]
+    # a bucketed group is cut at the bucket's largest captured batch, so every slice can replay
+    assert submodule._frame_batches(16, list(range(7)), [10] * 7) == [[0, 1, 2, 3], [4, 5, 6]]
+    assert submodule._frame_batches(32, [0, 1, 2], [20] * 3) == [[0, 1], [2]]
+    # rows past every bucket go eager, longest first, at most max_batch_frames padded frames per call
+    sizes = [40, 70, 20, 30, 10]
+    batches = submodule._frame_batches(None, list(range(5)), sizes)
+    assert batches == [[1], [0], [3, 2], [4]]
+    assert all(len(b) * max(sizes[r] for r in b) <= 64 or len(b) == 1 for b in batches)
+
+
+def _recording_submodule():
+    """Captured batch sizes [1, 2] and a 64-frame budget; records the batch of every half's call."""
+    config = tiny_config()
+    config.capture_batch_sizes = [1, 2]
+    config.frame_buckets = [16, 64]
+    config.max_batch_frames = 64
+    submodule = KokoroSynthSubmodule(tiny_model(), config)
+    model, text_calls, frame_calls = submodule.model, [], []
+    encode, synth = model.encode_text, model.synthesize_frames
+    model.encode_text = lambda ids, *a: text_calls.append(ids.shape[0]) or encode(ids, *a)
+    model.synthesize_frames = lambda d, *a: frame_calls.append((d.shape[0], a[-1])) or synth(d, *a)
+    return submodule, text_calls, frame_calls
+
+
+def _random_batch(seed: int, lengths: tuple[int, ...]):
+    torch.manual_seed(seed)
+    ids = [torch.randint(1, len(VOCAB), (n,)) for n in lengths]
+    padded = torch.nn.utils.rnn.pad_sequence(ids, batch_first=True, padding_value=BOUNDARY_TOKEN_ID)
+    return padded, torch.tensor(lengths), torch.randn(len(lengths), 16)
+
+
+def test_oversized_batch_is_sliced_and_matches_one_pass():
+    """A batch past the captured sizes runs in slices, and each row's audio is
+    what one unsliced pass gives."""
+    submodule, text_calls, _ = _recording_submodule()
+    padded, lengths, style = _random_batch(3, (7, 4, 9, 5, 8))
+    speed = torch.tensor([1.0, 0.5, 0.8, 1.2, 0.6])
+    with torch.no_grad():
+        sliced = submodule._synthesize(padded, lengths, style, speed, {})
+        text_calls.clear()
+        audio, frame_lengths, _ = submodule.model(padded, lengths, style, speed)
+    assert text_calls == [5]  # the reference really is one pass
+    for row, pcm in enumerate(sliced):
+        n = int(frame_lengths[row]) * submodule.config.samples_per_frame
+        ref = (audio[row, :n].clamp(-1, 1) * 32767).to(torch.int16)
+        assert pcm.shape == ref.shape and rel_l2(pcm.float(), ref.float()) < 5e-3
+
+
+def test_oversized_batch_calls_stay_bounded():
+    submodule, text_calls, frame_calls = _recording_submodule()
+    padded, lengths, style = _random_batch(4, (7, 4, 9, 5, 8, 6, 9))
+    with torch.no_grad():
+        # speed 0.3 pushes four rows past the 64-frame bucket, onto the eager path
+        pcm = submodule._synthesize(padded, lengths, style, torch.full((7,), 0.3), {})
+    assert len(pcm) == 7 and all(p.numel() > 0 for p in pcm)
+    assert text_calls == [2, 2, 2, 1]
+    assert sum(bs for bs, _ in frame_calls) == 7
+    assert any(frames > 64 for _, frames in frame_calls)
+    assert all(bs * frames <= submodule.config.max_batch_frames or bs == 1 for bs, frames in frame_calls)
