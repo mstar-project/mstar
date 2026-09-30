@@ -1154,6 +1154,10 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 return
             logger.debug("Registering %s for send", uuid)
             tensor = self.tensor_store.get_tensor(uuid)
+            if tensor.nbytes == 0:
+                # mooncake refuses to register zero bytes, and nothing reads
+                # them; left unmarked, cleanup has nothing to unregister either
+                return
             t0 = time.perf_counter()
             ret_value = self.transfer_engine.register_memory(
                 tensor.data_ptr(), tensor.nbytes
@@ -1223,11 +1227,15 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
                 self.tensor_store.put_tensor(
                     request_id=request_id, uuid=info.uuid, tensor=buffer, info=info,
                 )
-                self.tensor_store.set_metadata(info.uuid, mem_registered=True
-                )
                 # +1 for transit (released by get_ready_tensors)
                 # +1 for graph-node usage (released by _cleanup_consumed_inputs)
                 self.tensor_store.increment_ref(info.uuid, 2
+                )
+                if info.nbytes == 0:
+                    # the empty buffer is the whole tensor, and mooncake
+                    # refuses to register zero bytes
+                    continue
+                self.tensor_store.set_metadata(info.uuid, mem_registered=True
                 )
 
                 if self.protocol in (CommProtocol.RDMA, CommProtocol.TCP):
