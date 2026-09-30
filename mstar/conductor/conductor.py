@@ -410,6 +410,32 @@ class Conductor:
             ipc_socket_path_prefix=socket_path_prefix,
         )
 
+    @staticmethod
+    def _stamp_resource_configs(
+        configs: dict[str, ResourceReqConfig], model_kwargs: dict | None,
+        seed: int, max_tokens: int | None,
+    ) -> None:
+        """Hand each config what the request settled for its resource."""
+        # keyed by resource, so each config is handed only its own chain and counts
+        kwargs = model_kwargs or {}
+        prefix_keys = kwargs.get("prefix_keys") or {}
+        prefix_tail = kwargs.get("prefix_tail") or {}
+        prefix_decode = kwargs.get("prefix_decode") or {}
+        prefix_cache = kwargs.get("prefix_cache")
+        prompt_slots = kwargs.get("prompt_slots") or {}
+        decode_labels = kwargs.get("decode_labels") or {}
+        for key, cfg in configs.items():
+            cfg.apply_conductor_config(
+                seed=seed,
+                prefix_keys=prefix_keys.get(key),
+                prefix_tail=prefix_tail.get(key),
+                prefix_decode=prefix_decode.get(key),
+                prefix_cache=prefix_cache,
+                max_tokens=max_tokens,
+                prompt_slots=prompt_slots.get(key),
+                decode_labels=decode_labels.get(key),
+            )
+
     def _get_resource_configs(
         self, model_kwargs: dict,
         partition_fwd_args: dict[str, ForwardPassArgs]
@@ -902,25 +928,10 @@ class Conductor:
         request_data.resource_configs = self._get_resource_configs(
             model_kwargs, partition_fwd_args
         )
-        # keyed by resource, so each config is handed only its own chain
-        kwargs = model_kwargs or {}
-        prefix_keys = kwargs.get("prefix_keys") or {}
-        prefix_tail = kwargs.get("prefix_tail") or {}
-        prefix_decode = kwargs.get("prefix_decode") or {}
-        prefix_cache = kwargs.get("prefix_cache")
-        prompt_slots = kwargs.get("prompt_slots") or {}
-        decode_labels = kwargs.get("decode_labels") or {}
-        for key, cfg in request_data.resource_configs.items():
-            cfg.apply_conductor_config(
-                seed=seed,
-                prefix_keys=prefix_keys.get(key),
-                prefix_tail=prefix_tail.get(key),
-                prefix_decode=prefix_decode.get(key),
-                prefix_cache=prefix_cache,
-                max_tokens=request_data.max_output_tokens,
-                prompt_slots=prompt_slots.get(key),
-                decode_labels=decode_labels.get(key),
-            )
+        self._stamp_resource_configs(
+            request_data.resource_configs, model_kwargs,
+            seed=seed, max_tokens=request_data.max_output_tokens,
+        )
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         for worker_id, worker_graph_ids in worker_to_worker_graph_ids.items():
