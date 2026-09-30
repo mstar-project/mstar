@@ -57,6 +57,97 @@ def _down_packed_loader(
     param.data[expert_idx, :, :] = loaded_weight[:, start:start + span]
 
 
+# Optional fused Triton kernel for the n_group == 1 router fast path (the
+# Kimi-K2.7 config). KimiMoEGate.forward falls back to the general torch
+# path below when triton isn't available or the scores aren't on CUDA.
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _kimi_gate_fused_kernel(
+        scores_ptr, bias_ptr, weight_ptr, id_ptr,
+        E,
+        K: tl.constexpr,
+        BLOCK_E: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        NORM_TOPK: tl.constexpr,
+        SCALE: tl.constexpr,
+    ):
+        """One program per token row: bias-add, top-K by selection score with
+        a lowest-index tie-break, gather the original scores as weights.
+
+        K iterations of max + lowest-index argmin over the BLOCK_E-wide row
+        replace the topk-of-2-per-group/scatter/expand/masked_fill/expert-topk
+        chain that n_group == 1 reduces to an identity mask over.
+        """
+        row = tl.program_id(0)
+        offs_e = tl.arange(0, BLOCK_E)
+        mask = offs_e < E
+        scores = tl.load(scores_ptr + row * E + offs_e, mask=mask, other=float("-inf")).to(tl.float32)
+        if HAS_BIAS:
+            bias = tl.load(bias_ptr + offs_e, mask=mask, other=0.0).to(tl.float32)
+            remaining = scores + bias  # padding stays -inf: -inf + 0.0 == -inf
+        else:
+            remaining = scores
+
+        # K is a power of two (checked by the launcher): offs_k indexes the
+        # output slots as a vector so the loop only ever writes through
+        # tl.where, never a Python list/index -- required for real compilation.
+        offs_k = tl.arange(0, K)
+        w_vec = tl.zeros([K], dtype=tl.float32)
+        id_vec = tl.zeros([K], dtype=tl.int32)
+        for k in tl.static_range(K):
+            best_val = tl.max(remaining, axis=0)
+            is_best = (remaining == best_val) & mask
+            best_idx = tl.min(tl.where(is_best, offs_e, BLOCK_E), axis=0)
+            is_winner = offs_e == best_idx
+            orig = tl.sum(tl.where(is_winner, scores, 0.0), axis=0)
+            w_vec = tl.where(offs_k == k, orig, w_vec)
+            id_vec = tl.where(offs_k == k, best_idx, id_vec)
+            remaining = tl.where(is_winner, float("-inf"), remaining)
+
+        if NORM_TOPK:
+            w_vec = w_vec / tl.sum(w_vec, axis=0)
+        if SCALE != 1.0:
+            w_vec = w_vec * SCALE
+        tl.store(weight_ptr + row * K + offs_k, w_vec)
+        tl.store(id_ptr + row * K + offs_k, id_vec.to(tl.int64))
+
+    _HAS_FUSED_GATE = True
+except Exception as e:  # pragma: no cover -- exercised only when triton missing
+    _kimi_gate_fused_kernel = None
+    _HAS_FUSED_GATE = False
+    logger.warning(f"Could not load Triton for the fused Kimi router: {e}")
+
+
+def _fused_group1_topk(
+    scores: torch.Tensor,
+    bias: torch.Tensor | None,
+    top_k: int,
+    norm_topk_prob: bool,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """n_group == 1 fast path: the group stage is a no-op (every expert is
+    eligible), so go straight from scores to the fused top-k kernel."""
+    assert top_k & (top_k - 1) == 0, f"_fused_group1_topk requires a power-of-two top_k, got {top_k}"
+    num_tokens, num_experts = scores.shape
+    scores = scores.contiguous()
+    topk_weights = torch.empty(num_tokens, top_k, dtype=torch.float32, device=scores.device)
+    topk_ids = torch.empty(num_tokens, top_k, dtype=torch.int64, device=scores.device)
+    bias_arg = bias if bias is not None else scores  # unread stand-in when HAS_BIAS=False
+    _kimi_gate_fused_kernel[(num_tokens,)](
+        scores, bias_arg, topk_weights, topk_ids,
+        num_experts,
+        K=top_k,
+        BLOCK_E=triton.next_power_of_2(num_experts),
+        HAS_BIAS=bias is not None,
+        NORM_TOPK=norm_topk_prob,
+        SCALE=routed_scaling_factor,
+    )
+    return topk_weights, topk_ids
+
+
 class KimiMoEGate(nn.Module):
     """DeepSeek-V3 group-limited sigmoid router with selection-only bias."""
 
@@ -105,6 +196,17 @@ class KimiMoEGate(nn.Module):
             scores = gating.softmax(dim=-1)
         else:
             raise ValueError(f"Unsupported scoring_func: {self.scoring_func!r}")
+
+        if (
+            self.n_group == 1
+            and _HAS_FUSED_GATE
+            and scores.is_cuda
+            and self.top_k & (self.top_k - 1) == 0
+        ):
+            return _fused_group1_topk(
+                scores, self.e_score_correction_bias, self.top_k,
+                self.norm_topk_prob, self.routed_scaling_factor,
+            )
 
         num_token = scores.shape[0]
         if self.e_score_correction_bias is not None:
