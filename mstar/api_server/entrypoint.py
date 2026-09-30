@@ -776,6 +776,138 @@ class APIServer:
         if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
             self._msg_thread.join(timeout=2)
 
+
+def _resolve_warmup_path(path: str) -> str:
+    """A warmup file is a local path, or ``hf://<owner>/<repo>/<path>`` for a
+    file shipped with a model (its example inputs), taken from the HF cache."""
+    if not path.startswith("hf://"):
+        return path
+    parts = path[len("hf://"):].split("/", 2)
+    if len(parts) != 3:
+        raise ValueError(f"hf:// path needs <owner>/<repo>/<path>, got {path!r}")
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=f"{parts[0]}/{parts[1]}", filename=parts[2])
+
+
+@dataclass
+class WarmupMedia:
+    """One media input of a warmup request: a local or ``hf://`` path and its
+    modality (from the extension unless the yaml names it)."""
+
+    path: str
+    modality: str
+
+    @classmethod
+    def from_config(cls, entry: Any) -> "WarmupMedia":
+        if isinstance(entry, str):
+            entry = {"path": entry}
+        if not isinstance(entry, dict) or not entry.get("path"):
+            raise ValueError(f"a warmup file is a path or a mapping with 'path', got {entry!r}")
+        path = str(entry["path"])
+        modality = entry.get("modality") or _detect_modality(path)
+        if modality not in SUPPORTED_MODALITIES:
+            raise ValueError(
+                f"cannot determine modality for warmup file {path!r}; set 'modality'"
+            )
+        return cls(path=path, modality=modality)
+
+
+@dataclass
+class WarmupRequest:
+    """One entry of the deployment's ``warmup_requests``: a ``/generate``
+    request in yaml form. ``files`` are the media inputs in prompt order
+    (any modality, any number), followed by ``text`` as on ``/generate``."""
+
+    text: str | None = None
+    files: list[WarmupMedia] = field(default_factory=list)
+    output_modalities: list[str] = field(default_factory=lambda: ["text"])
+    model_kwargs: dict | None = None
+
+    @classmethod
+    def from_config(cls, spec: Any) -> "WarmupRequest":
+        if not isinstance(spec, dict):
+            raise ValueError("not a mapping")
+        unknown = set(spec) - {"text", "files", "output_modalities", "model_kwargs"}
+        if unknown:
+            raise ValueError(f"unknown key(s) {sorted(unknown)}")
+        out_mods = spec.get("output_modalities") or ["text"]
+        if isinstance(out_mods, str):
+            out_mods = [m.strip() for m in out_mods.split(",") if m.strip()]
+        files = spec.get("files") or []
+        if not isinstance(files, list):
+            files = [files]
+        model_kwargs = spec.get("model_kwargs") or None
+        if model_kwargs is not None and not isinstance(model_kwargs, dict):
+            raise ValueError("model_kwargs must be a mapping")
+        return cls(
+            text=spec.get("text") or None,
+            files=[WarmupMedia.from_config(f) for f in files],
+            output_modalities=list(out_mods),
+            model_kwargs=model_kwargs,
+        )
+
+    def submit(self, server: APIServer, request_id: str) -> str:
+        """Submit to ``server`` the way ``/generate`` would, ``hf://`` files
+        resolved from the cache."""
+        file_paths: dict[str, list[str]] = {}
+        parts: list[PromptPart] = []
+        for media in self.files:
+            paths = file_paths.setdefault(media.modality, [])
+            parts.append(PromptPart(modality=media.modality, index=len(paths)))
+            paths.append(_resolve_warmup_path(media.path))
+        if self.text:
+            parts.append(PromptPart(modality="text", text=self.text))
+        return server.submit_request(
+            text=self.text,
+            file_paths=file_paths or None,
+            input_modalities=[p.modality for p in parts],
+            output_modalities=self.output_modalities,
+            model_kwargs=self.model_kwargs,
+            prompt_parts=parts or None,
+            streaming=False,
+            request_id=request_id,
+        )
+
+
+def _run_warmup_requests(server: APIServer, specs: list) -> None:
+    """Run the deployment's ``warmup_requests`` once the workers are ready and
+    before the server binds, so the first client does not pay what a first
+    request of a shape costs (torch.compile of a denoise step, a cold
+    inductor cache). Each spec is parsed into a :class:`WarmupRequest`. A
+    warmup that is malformed or fails is logged and skipped; it must not keep
+    the server from coming up.
+    """
+    if not isinstance(specs, list):
+        logger.warning("warmup_requests must be a list; ignoring %r", type(specs).__name__)
+        return
+
+    async def _one(request: WarmupRequest, request_id: str) -> None:
+        await server.collect_results(request.submit(server, request_id))
+
+    for index, spec in enumerate(specs):
+        try:
+            request = WarmupRequest.from_config(spec)
+        except ValueError as exc:
+            logger.warning("warmup_requests[%d] skipped: %s", index, exc)
+            continue
+        t0 = time.perf_counter()
+        try:
+            asyncio.run(_one(request, f"warmup-{index}"))
+        except Exception as exc:  # noqa: BLE001 — a cold server is better than none
+            logger.warning(
+                "warmup request %d/%d failed after %.1f s: %s",
+                index + 1, len(specs), time.perf_counter() - t0,
+                getattr(exc, "detail", exc),
+            )
+            continue
+        logger.info(
+            "warmup request %d/%d (%s) done in %.1f s",
+            index + 1, len(specs), ",".join(request.output_modalities),
+            time.perf_counter() - t0,
+        )
+
+
 # ------------------------------------------------------------------
 # FastAPI application
 # ------------------------------------------------------------------
@@ -1303,6 +1435,12 @@ def main(argv: list[str] | None = None):
         # Block until all workers have finished setup, so the server only binds
         # (and logs "Starting…") once it can actually serve requests.
         api_server.finalize_setup()
+        # The deployment's warmup requests run here, before the bind: a
+        # client never sees the first request of a shape.
+        warmups = config.get("warmup_requests") or []
+        if warmups:
+            logger.info("Running %d warmup request(s) before binding", len(warmups))
+            _run_warmup_requests(api_server, warmups)
         if args.rust_frontend:
             import tempfile
 
