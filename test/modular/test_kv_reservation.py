@@ -140,16 +140,15 @@ def test_removal_gives_the_reservation_back():
     assert kv._outstanding() == 0, "a removed request still held room it can never take"
 
 
-def test_a_label_nothing_describes_reserves_its_pools_max_seq_len():
-    # Whisper's cross-attention context: written once at prefill, never keyed
+def test_a_request_nothing_counts_is_left_to_run_as_before():
+    # no count from the model and no keys: max_seq_len is all that bounds it,
+    # which for most models is far more than the pool can spare per request
     kv = _manager(max_seq_len=64)
     kv.ingest_request("r", KVReqConfig(max_tokens=444))
 
     _run(kv, "r", 20)
 
-    assert kv._reserved["r"].pages == _pages(64), (
-        "a label with no count and no keys was sized off a guess below its cap"
-    )
+    assert "r" not in kv._reserved, "a request with nothing to size it by was held to a guess"
 
 
 def test_a_label_opened_only_on_another_node_is_not_reserved():
@@ -215,12 +214,13 @@ def test_the_check_catches_a_request_taking_more_than_it_reserved(monkeypatch):
 
 def test_an_admitted_request_that_finds_no_page_is_an_assertion(monkeypatch):
     kv = _manager(max_num_pages=8)
-    # a row with no max_tokens is never admitted by reservation, so it can fill the pool
-    kv.ingest_request("filler", KVReqConfig())
-    _run(kv, "filler", 7 * PAGE_SIZE)
     kv.ingest_request("r", KVReqConfig(
         max_tokens=16, prompt_slots={"main": PAGE_SIZE}, decode_labels=["main"],
     ))
+    assert kv.admit_retrieve("r", "LLM", WALK, None).ready
+    # a row with no max_tokens is never admitted by reservation, so it can take the room
+    kv.ingest_request("filler", KVReqConfig())
+    _run(kv, "filler", 7 * PAGE_SIZE)
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
 
     with pytest.raises(AssertionError, match="was admitted on a reservation of"):

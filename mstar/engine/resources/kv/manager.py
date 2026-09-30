@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 # request after each admit, commit, reset and remove.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
+# admitted, but its reservation does not fit yet: the scheduler asks again
+_WAIT = AdmitOutcome(ok=True, ready=False)
+
 
 @dataclass
 class PageArena:
@@ -179,6 +182,9 @@ class CacheStream:
     # leading pages of `page_indices` the index lent this stream (a converted
     # lease, a local match): held, but never taken from the free list
     hits: int = 0
+    # a lease admission took before prepare saw the request, until prepare cuts
+    # the inputs to it (`apply_cached_prefix`); `admit` never converts one still set
+    gate_lease: bool = False
     offloaded: bool = False
     generation: int = 0
 
@@ -225,6 +231,16 @@ class Reservation:
     pages: int
     # counted by the model; one guessed from the prompt's ids can overrun
     exact: bool
+
+
+@dataclass
+class AdmissionDeferred(AdmitFailedReason):
+    """A step carries a request that has not reserved, and its turn hasn't come.
+
+    Not an `AllocationFailed`: nothing needs evicting. The step goes back, and
+    readiness admits the request when its reservation fits.
+    """
+    request_id: str
 
 
 LabelToStream = dict[str, CacheStream]
@@ -308,6 +324,7 @@ class KVManager(AttentionResource):
         device: torch.device,
         dtype=torch.bfloat16,
         nodes: set[str] | None = None,
+        alone: bool = True,
     ):
         self.config = cfg
         if joint_comm_group is not None:
@@ -376,7 +393,16 @@ class KVManager(AttentionResource):
 
         # the nodes sharing this pool, whose labels a request's reservation covers
         self._nodes = nodes
+        # whether this pool admits by reservation itself: rank 0 of a spec no
+        # other worker shares. The rest reserve what that one admitted
+        self._decides = self._rank == 0 and alone
         self._reserved: dict[str, Reservation] = {}
+        # requests that asked and have not reserved, in the order they first asked
+        self._waiting: dict[str, None] = {}
+        # the head's rooted prompt keys, hashed once however often it asks
+        self._rooted: dict[str, list[bytes]] = {}
+        # label -> the walk prepare probes it on
+        self._prefill_walks: dict[str, str] = {}
         # capture buckets whose padding rows take their capture span again on
         # replay (a batched capture; a packed one pads with empty rows)
         self._cg_padded_buckets: set[BucketKey] = set()
@@ -393,6 +419,7 @@ class KVManager(AttentionResource):
             transfer_engine_info=info.transfer_engine_info,
             dtype=info.kv_dtype,
             nodes=spec.nodes if info.nodes is None else info.nodes,
+            alone=info.nodes is None or info.nodes >= spec.nodes,
         )
 
     def build_cuda_graph_buffers(
@@ -433,6 +460,7 @@ class KVManager(AttentionResource):
             label: frozenset(walk for walk in named if walk is not None)
             for label, named in (walks or {}).items()
         }
+        self._prefill_walks = {label: named[0] for label, named in (walks or {}).items()}
         if not self.config.prefix_cache:
             return False
         if self._world_size > 1:
@@ -473,13 +501,28 @@ class KVManager(AttentionResource):
         with self._lock:
             if self._streams.get(rid, {}).get(label) is not stream:
                 return None
-            # one key short, so a fully cached prompt still leaves a token to run
-            matched = self._index.lookup(rooted)[:len(rooted) - 1]
-            if not matched:
+            # admission may have leased it on its own thread while this one hashed
+            if stream.lease is None:
+                self._lease(rid, stream, rooted)
+            if stream.lease is None:
                 return None
-            self._arena.retain(matched)
-            stream.lease = matched
-            return len(matched) * self.config.page_size
+            return len(stream.lease) * self.config.page_size
+
+    def _lease(self, rid: str, stream: CacheStream, rooted: list[bytes]) -> None:
+        # one key short, so a fully cached prompt still leaves a token to run
+        matched = self._index.lookup(rooted)[:len(rooted) - 1]
+        if not matched:
+            return
+        self._arena.retain(matched)
+        stream.lease = matched
+        self._lent(rid, len(matched))
+
+    def _lent(self, rid: str, pages: int) -> None:
+        # held rather than taken, so the reservation gives up what the index lends
+        # (and takes back what it returns)
+        reserved = self._reserved.get(rid)
+        if reserved is not None:
+            reserved.pages -= pages
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs, matched_len: int,
@@ -493,8 +536,10 @@ class KVManager(AttentionResource):
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.lease is None or stream.stored_len:
                 return
+            stream.gate_lease = False
             keep = matched_len // self.config.page_size
             if keep < len(stream.lease):
+                self._lent(rid, keep - len(stream.lease))
                 self._arena.release(stream.lease[keep:])
                 stream.lease = stream.lease[:keep] or None
 
@@ -689,6 +734,7 @@ class KVManager(AttentionResource):
         if stream.lease is not None:
             self._arena.release(stream.lease)
         stream.lease = None
+        stream.gate_lease = False
 
     def fingerprint(self) -> bytes:
         return fingerprint(
@@ -720,6 +766,11 @@ class KVManager(AttentionResource):
         graph_walk: str,
         published: PublishedKVInfo | None
     ) -> AdmitOutcome:
+        # one pool decides for each request, and the rest follow it
+        if self._decides:
+            gated = self._gate(rid, node_name, graph_walk)
+            if gated is not None:
+                return gated
         if published is None:
             return ADMIT_OK
 
@@ -763,7 +814,9 @@ class KVManager(AttentionResource):
                     # another rank sampled the token after this record, so the pending tail is one behind
                     stream.chain.unkeyed = None
                 new_len = seq_info.seq_len
+                hits = stream.hits
                 self._take_local_match(stream, new_len, rooted.get(label))
+                self._lent(rid, stream.hits - hits)
                 old_len = stream.stored_len
                 if new_len <= old_len:
                     continue
@@ -804,7 +857,8 @@ class KVManager(AttentionResource):
 
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned and not ctx.is_preplan:
-            if self._preplan_key == self._plan_key(step, ctx):
+            # a lease taken since the preplan converts only in a full admit
+            if self._preplan_key == self._plan_key(step, ctx) and not self._leased(step):
                 # pages were already reserved by the preplan pass
                 return ADMIT_OK
             # a different step arrived first (see `plan`): drop the staged
@@ -823,9 +877,12 @@ class KVManager(AttentionResource):
         # one critical section so the read-of-stored_len then alloc is atomic
         # against a concurrent reset/remove/commit on another thread
         with self._lock:
-            # before the lease converts: a request is sized off the lease it holds
+            # before anything moves, so a refusal leaves nothing to unwind, and
+            # before the lease converts, as a request is sized off the lease it holds
             if not ctx.capture:
-                self._reserve_new(ctx)
+                deferred = self._reserve_new(ctx)
+                if deferred is not None:
+                    return AdmitOutcome(ok=False, reason=deferred)
             # before the fork loop and the segment loop, both of which size
             # off `stored_len`: a pre-fork target has to cover the whole prefix
             for segment in step.segments:
@@ -834,8 +891,14 @@ class KVManager(AttentionResource):
                 ).get(segment.label)
                 if stream is None:
                     continue
+                if stream.gate_lease and not ctx.is_preplan and segment.span:
+                    # prepare never cut this step's inputs to the lease the gate
+                    # took, so the step writes the stream from 0
+                    self._lent(segment.request_id, -len(stream.lease))
+                    self._release_lease(stream)
                 if (
                     stream.lease is not None
+                    and not stream.gate_lease
                     and not stream.stored_len
                     and not stream.offloaded
                     and not stream.read_pending
@@ -1441,6 +1504,8 @@ class KVManager(AttentionResource):
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
             self._reserved.pop(rid, None)
+            self._waiting.pop(rid, None)
+            self._rooted.pop(rid, None)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -1507,9 +1572,15 @@ class KVManager(AttentionResource):
                 f"pages still being written into, but not owned alone: {crowded}"
             )
 
-            # a guessed reservation may overrun and leave the rest short, which
-            # the worker's hold absorbs; only the model's own counts are checked
-            if all(res.exact for res in self._reserved.values()):
+            # a guessed reservation, or a request nothing counts, may take room the
+            # others were promised, which the worker's hold absorbs: only pools
+            # holding nothing but the model's own counts are checked
+            ungated = any(
+                rid not in self._reserved and self._held_fresh(rid)
+                for rid, overrides in self._overrides.items()
+                if overrides.max_tokens is not None
+            )
+            if not ungated and all(res.exact for res in self._reserved.values()):
                 held = {rid: self._held_fresh(rid) for rid in self._reserved}
                 over = {
                     rid: (held[rid], res.pages)
@@ -1591,8 +1662,8 @@ class KVManager(AttentionResource):
 
         A label counts to its prompt plus what decode adds, at most
         ``max_seq_len``: the prompt as the model counted it, else as its keys
-        describe it, else the cap itself for a label nothing describes. A page
-        the request leases, or was lent, is held rather than taken.
+        describe it. A page the request leases, or was lent, is held rather
+        than taken.
         """
         overrides = self._overrides[rid]
         page_size, cap = self.config.page_size, self.config.max_seq_len
@@ -1600,28 +1671,172 @@ class KVManager(AttentionResource):
         labels = self._labels_opened(overrides)
         pages = 0
         for label in labels:
-            keys = (overrides.prefix_keys or {}).get(label)
             if label in slots:
                 decodes = label in (overrides.decode_labels or ())
                 tokens = slots[label] + (overrides.max_tokens if decodes else 0)
-            elif keys:
+            else:
+                keys = overrides.prefix_keys[label]
                 tail = (overrides.prefix_tail or {}).get(label) or ()
                 prompt = (len(keys) - (1 if tail else 0)) * page_size + len(tail)
                 tokens = prompt + overrides.max_tokens
-            else:
-                tokens = cap
             pages += -(-min(tokens, cap) // page_size)
             stream = self._streams[rid].get(label)
             if stream is not None:
                 pages -= len(stream.lease or ()) + stream.hits
         return Reservation(pages=max(0, pages), exact=bool(slots) and labels <= slots.keys())
 
-    def _reserve_new(self, ctx: StepContext) -> None:
+    def _gated(self, rid: str, overrides: KVReqConfig | None) -> bool:
+        """Whether ``rid`` still has to reserve before it runs.
+
+        Only a request whose every label is counted, by the model or by its
+        keys: a bound as loose as ``max_seq_len`` would hold back or refuse
+        requests that fit, so the rest run as they always have.
+        """
+        if overrides is None or overrides.max_tokens is None or rid in self._reserved:
+            return False
+        slots = overrides.prompt_slots or {}
+        keys = overrides.prefix_keys or {}
+        return all(label in slots or keys.get(label) for label in self._labels_opened(overrides))
+
+    def _gate(self, rid: str, node_name: str, graph_walk: str) -> AdmitOutcome | None:
+        """Hold ``rid`` back until what it may take fits, in the order requests
+        first asked. None once it has reserved.
+
+        Nothing passes the head, so short requests never starve a long one. The
+        head's hit is leased as it is admitted, not credited off a lookup that
+        an eviction could undo before its prefill runs.
+        """
+        overrides = self._overrides.get(rid)
+        if not self._gated(rid, overrides):
+            return None
+        with self._lock:
+            if rid not in self._overrides or rid in self._reserved:
+                return None
+            self._waiting.setdefault(rid, None)
+            if next(iter(self._waiting)) != rid:
+                return _WAIT
+            label = self._probe_label(rid, node_name, graph_walk)
+            keys = None
+            if label is not None and rid not in self._rooted:
+                keys = overrides.prefix_keys[label]
+        # outside the lock, as `resolve_cached_prefix` hashes
+        rooted = None if keys is None else [fingerprint(self._prefix_root, key) for key in keys]
+        with self._lock:
+            if rid not in self._overrides or rid in self._reserved:
+                return None
+            if rooted is not None:
+                self._rooted[rid] = rooted
+            stream = None if label is None else self._ensure_label(rid, label)
+            return self._try_reserve(rid, stream, self._rooted.get(rid))
+
+    def _try_reserve(
+        self, rid: str, stream: CacheStream | None = None,
+        rooted: list[bytes] | None = None,
+    ) -> AdmitOutcome | None:
+        """Reserve for ``rid`` if it heads the queue and fits, leasing its hit
+        on ``stream`` as it does. None once it has reserved."""
+        self._waiting.setdefault(rid, None)
+        if next(iter(self._waiting)) != rid:
+            return _WAIT
+        hit = []
+        if stream is not None and rooted and self._leasable(stream):
+            hit = self._index.peek(rooted)[:len(rooted) - 1]
+        reservation = self._reservation(rid)
+        held = len(hit) + sum(len(s.lease or ()) + s.hits for s in self._streams[rid].values())
+        need = reservation.pages - len(hit)
+        capacity = self._capacity()
+        if need + held > capacity:
+            if reservation.exact:
+                del self._waiting[rid]
+                self._rooted.pop(rid, None)
+                return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
+                    f"KV {self.name}: request {rid} needs {need + held} pages, "
+                    f"and the pool has {capacity} for requests"
+                ))
+            # a guess proves nothing unservable: at worst it waits for an empty pool
+            need = capacity - held
+        if self._outstanding() + need > self._supply(leasing=hit):
+            return _WAIT
+        if hit:
+            self._lease(rid, stream, rooted)
+            stream.gate_lease = True
+        reservation.pages = need
+        self._reserved[rid] = reservation
+        del self._waiting[rid]
+        self._rooted.pop(rid, None)
+        return None
+
+    def _reserve_new(self, ctx: StepContext) -> AdmissionDeferred | None:
+        """Reserve for a request that reached admit without passing readiness,
+        as one continuing a speculative step onto another node does.
+
+        Where this pool decides, at world size 1, it waits its turn as at
+        readiness. Under TP, rank 0 has already sent the step to the other
+        ranks, so refusing it would leave them in a forward rank 0 never runs;
+        and a pool that does not decide reserves what the deciding one admitted.
+        """
         for rid in ctx.request_ids:
-            overrides = self._overrides.get(rid)
-            if overrides is None or overrides.max_tokens is None or rid in self._reserved:
+            if not self._gated(rid, self._overrides.get(rid)):
+                continue
+            if self._decides and self._world_size == 1 and not self._in_region(ctx):
+                if self._try_reserve(rid) is not None:
+                    return AdmissionDeferred(
+                        message=f"KV {self.name}: request {rid} has not reserved its pages",
+                        request_id=rid,
+                    )
                 continue
             self._reserved[rid] = self._reservation(rid)
+            self._waiting.pop(rid, None)
+            self._rooted.pop(rid, None)
+            if _DEBUG_ASSERTS:
+                assert self._outstanding() <= self._supply(), (
+                    f"KV {self.name}: {rid} was admitted into room this rank does not have"
+                )
+        return None
+
+    def _probe_label(self, rid: str, node_name: str, graph_walk: str) -> str | None:
+        """The label prepare probes for ``rid`` on this walk, if any.
+
+        Only its keyed label's own walk, and only alone: a guided walk writes a
+        second label from the same input, and prepare leaves it whole.
+        """
+        label = self._keyed_label(rid, node_name, graph_walk)
+        if label is None or self._prefill_walks.get(label) != graph_walk:
+            return None
+        if self._overrides[rid].get_labels(node_name, graph_walk) != [label]:
+            return None
+        return label
+
+    @staticmethod
+    def _leasable(stream: CacheStream) -> bool:
+        return stream.lease is None and not (
+            stream.converted or stream.stored_len or stream.offloaded or stream.read_pending
+        )
+
+    @staticmethod
+    def _in_region(ctx: StepContext) -> bool:
+        # a piecewise region admits inside the forward, where a refusal fails the
+        # batch; imported here, as the runner imports this package
+        from mstar.engine.cuda_graph_runner import PIECEWISE_WALK
+
+        return ctx.graph_walk == PIECEWISE_WALK
+
+    def _leased(self, step: KVStep) -> bool:
+        for segment in step.segments:
+            stream = self._streams.get(segment.request_id, {}).get(segment.label)
+            if stream is not None and stream.lease is not None:
+                return True
+        return False
+
+    def _capacity(self) -> int:
+        """Pages one request could have with nothing else admitted: all but the
+        sink and what the padding rows hold or may take back."""
+        padding = sum(
+            len(stream.page_indices)
+            for rid, streams in self._streams.items() if self._is_padding(rid)
+            for stream in streams.values()
+        )
+        return self.config.max_num_pages - 1 - padding - self._padding_remaining()
 
     def _held_fresh(self, rid: str) -> int:
         """Pages ``rid`` holds that it took from the free list."""
@@ -1630,11 +1845,11 @@ class KVManager(AttentionResource):
             for stream in self._streams.get(rid, {}).values()
         )
 
-    def _supply(self) -> int:
+    def _supply(self, leasing: list[int] = ()) -> int:
         """Pages an allocation can still get: the free ones, and the cached ones
-        eviction reaches."""
-        evictable = len(self._index.evictable()) if self._index is not None else 0
-        return self._arena.num_free + evictable
+        eviction reaches, less any about to be leased."""
+        evictable = self._index.evictable() if self._index is not None else set()
+        return self._arena.num_free + len(evictable.difference(leasing))
 
     def _outstanding(self) -> int:
         """Pages admitted requests and padding rows may still take."""
