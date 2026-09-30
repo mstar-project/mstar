@@ -25,6 +25,7 @@ from mstar.engine.cuda_graph_runner import DummyRowPool
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVConfig, KVStep
 from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -185,3 +186,52 @@ def test_freed_pages_are_reusable_by_a_real_request(page_size):
     # rest only fits because the capture handed its pages back
     kv.ingest_request("real")
     _admit(kv, ["real"], [page_size * 7])
+
+
+# ── a replay's padding rows ─────────────────────────────────────────────
+
+
+def _replay(kv: KVManager, step: KVStep, rows) -> StepContext:
+    """``real`` and its padding ``rows`` through a batched replay's admit."""
+    ctx = StepContext(request_ids=("real",), graph_walk="decode", slot=0, capture=False)
+    ctx.set_padded_rids(("real", *rows))
+    assert kv.admit(step, ctx).ok
+    return ctx
+
+
+def test_a_replays_padding_row_writes_into_the_sink():
+    """A batched config gives its padding rows their capture span at replay,
+    but nothing reads what they write: a page of their own would only be one
+    no request could use."""
+    kv = _kv_manager()
+    kv.ingest_request("real")
+    kv.ingest_request(-2)
+    free = kv._arena.num_free
+    step = KVStep(segments=(Segment("real", "main", 1), Segment(-2, "main", 1)))
+
+    ctx = _replay(kv, step, [-2])
+    views = kv.plan(step, ctx)["main"].views
+
+    assert kv._arena.num_free == free - 1, "the padding row took a page of its own"
+    assert next(v for v in views if v.request_id == -2).page_idxs == [SINK_PAGE], (
+        "the padding row's token was planned somewhere other than the sink"
+    )
+
+
+def test_a_replays_padding_row_reserves_no_fork_target():
+    kv = _kv_manager()
+    kv.ingest_request("real")
+    kv.ingest_request(-2)
+    free = kv._arena.num_free
+    step = KVStep(
+        segments=(Segment("real", "main", 1), Segment(-2, "main", 1)),
+        post_forks=(("main", "cfg"),),
+    )
+
+    ctx = _replay(kv, step, [-2])
+    kv.plan(step, ctx)
+    kv.commit(step, ctx)
+
+    assert kv._arena.num_free == free - 2, (
+        "the padding row's guidance copy took pages the real row's did not"
+    )
