@@ -57,6 +57,80 @@ def test_single_attachment_layout_is_unchanged(tmp_path):
     assert _mods(plan) == [("text", 0), ("image", 0), ("text", 1)]
 
 
+def _roles(parts):
+    return [(p.modality, p.role, p.text) for p in parts]
+
+
+def test_each_message_keeps_its_role(tmp_path):
+    """A reply stays its own part, so a model can render it as its own turn."""
+    messages = [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            {"type": "text", "text": "what is it"},
+        ]},
+        {"role": "assistant", "content": "a cat"},
+        {"role": "user", "content": "and its color?"},
+    ]
+    text, _, _, parts = flatten_messages(messages, tmp_path)
+    assert text == "Be brief.\nwhat is it\na cat\nand its color?"
+    assert _roles(parts) == [
+        ("text", "system", "Be brief."),
+        ("image", "user", None),
+        ("text", "user", "what is it"),
+        ("text", "assistant", "a cat"),
+        ("text", "user", "and its color?"),
+    ], "text merged across a role change, so the reply lands inside a user turn"
+
+
+def test_text_within_one_message_still_merges(tmp_path):
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "first"},
+        {"type": "text", "text": "second"},
+    ]}]
+    text, _, in_mods, parts = flatten_messages(messages, tmp_path)
+    assert text == "first\nsecond"
+    assert in_mods == ["text"]
+    assert _roles(parts) == [("text", "user", "first\nsecond")], (
+        "one message split into two parts would render as two turns"
+    )
+
+
+def test_messages_of_one_role_stay_one_turn(tmp_path):
+    """The layout has no slot for a boundary between them, so they merge."""
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "second"},
+    ]
+    text, _, _, parts = flatten_messages(messages, tmp_path)
+    assert text == "first\nsecond"
+    assert _roles(parts) == [("text", "user", "first\nsecond")], (
+        "two user messages no longer render as the one turn they did before"
+    )
+
+
+def test_a_role_with_no_turn_stays_in_the_user_turn(tmp_path):
+    """Qwen3-Omni's template drops a role it does not know, text and all."""
+    messages = [
+        {"role": "developer", "content": "Be brief."},
+        {"role": "user", "content": "hi"},
+    ]
+    _, _, _, parts = flatten_messages(messages, tmp_path)
+    assert _roles(parts) == [("text", "user", "Be brief.\nhi")], (
+        "a developer message would reach a template that drops it"
+    )
+
+
+@pytest.mark.parametrize("role", ["system", "assistant"])
+def test_an_attachment_outside_a_user_message_is_refused(tmp_path, role):
+    """The template writes a turn break where the layout has no text slot for it."""
+    messages = [{"role": role, "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+    ]}]
+    with pytest.raises(ValueError, match=f"a {role} message cannot carry"):
+        flatten_messages(messages, tmp_path)
+
+
 def test_plan_orders_attachments_as_written():
     parts = parts_from_modalities(["audio", "image", "audio"])
     plan = prefill_plan(parts)
