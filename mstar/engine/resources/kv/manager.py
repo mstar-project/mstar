@@ -1349,6 +1349,8 @@ class KVManager(AttentionResource):
             for claim in moved:
                 stream = streams[claim.label]
                 freed += len(claim.pages)
+                # what the index lent comes back on reload as the request's own copies
+                self._lent(rid, -stream.hits)
                 self._arena.release(claim.pages)
                 stream.page_indices = []
                 stream.hits = 0
