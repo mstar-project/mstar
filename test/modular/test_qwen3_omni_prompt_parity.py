@@ -20,6 +20,7 @@ present (``MSTAR_QWEN3_OMNI_PATH``). Everything else runs weight-free in CI.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -319,6 +320,14 @@ def test_a_later_system_message_still_replaces_the_default_persona(model, tmp_pa
         {"role": "user", "content": [{"type": "text", "text": "Again."}]},
     ])
     assert span.tolist() == expected, "the default persona leads a chat whose client sent a system message"
+
+
+def test_a_reply_comes_back_without_its_end_token(model):
+    """Sent back as an assistant message, the reply gets its end token from the template."""
+    model.config = SimpleNamespace(im_end_token_id=SPECIAL_IDS["<|im_end|>"])
+    ids = model.tokenizer("Blue.<|im_end|>")["input_ids"][0].tolist()
+    reply = b"".join(model.postprocess(torch.tensor([i]), "text") for i in ids)
+    assert reply == b"Blue.", "the reply ends with a literal end token, which the next turn writes twice"
 
 
 def test_schedule_matches_the_spans(model):

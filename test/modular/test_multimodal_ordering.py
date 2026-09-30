@@ -5,6 +5,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from mstar.api_server.openai.adapters import flatten_messages
 from mstar.model.multimodal import (
@@ -265,7 +266,7 @@ class _StubTokenizer:
     def decode(self, ids):
         inverse = {v: k for k, v in self.SPECIALS.items()}
         return "".join(
-            inverse[i] if i in inverse else chr(i - 1000) for i in ids
+            inverse[int(i)] if int(i) in inverse else chr(int(i) - 1000) for i in ids
         )
 
 
@@ -412,6 +413,14 @@ def test_the_next_turn_extends_the_last_prompt_and_its_reply(bagel, tmp_path):
     assert second[:len(first) + len(reply)] == first + reply, (
         "turn 2 does not start with turn 1's prompt and reply, so the reply's pages never match"
     )
+
+
+def test_a_reply_comes_back_without_its_end_token(bagel):
+    """Sent back as an assistant message, the reply gets its end token from the template."""
+    bagel.eos_token_id = _StubTokenizer.SPECIALS["<|im_end|>"]
+    ids = bagel.tokenizer.encode("Blue.<|im_end|>")
+    reply = b"".join(bagel.postprocess(torch.tensor([i]), "text") for i in ids)
+    assert reply == b"Blue.", "the reply ends with a literal end token, which the next turn writes twice"
 
 
 def test_an_image_chat_puts_each_turn_in_its_own_role_block(bagel, tmp_path):
