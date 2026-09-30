@@ -581,6 +581,29 @@ def test_streaming_speech_intake_rejection_is_a_400():
     assert code == 400 and "does not support" in body["error"]["message"]
 
 
+def test_mock_generate_without_a_named_output_answers_in_text():
+    # no bridge, so no model to pick a default: the mock falls back to text
+    import base64
+    import subprocess
+    import urllib.parse
+
+    port = _free_port()
+    proc = subprocess.Popen([BINARY, "qwen3_omni", str(port)])
+    try:
+        assert _wait_healthy(port)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/generate",
+            data=urllib.parse.urlencode({"text": "hi", "streaming": "false"}).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = json.loads(r.read())
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+    (chunk,) = body["outputs"]["text"]
+    assert base64.b64decode(chunk["data"]) == b"[mock] hi"
+
+
 def test_images_generations_on_cosmos3():
     """Cosmos3 also serves `/v1/images/generations` (text-to-image)."""
     import base64

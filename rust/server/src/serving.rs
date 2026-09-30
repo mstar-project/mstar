@@ -264,7 +264,14 @@ pub async fn collect(stream: OutStream) -> Result<Vec<ResultChunk>, (u16, String
 fn mock_chunks(args: &SubmitArgs, sample_rate: u32) -> Vec<ResultChunk> {
     let mut out = Vec::new();
     let prompt = args.text.clone().unwrap_or_default();
-    for modality in &args.output_modalities {
+    // none named: a real backend picks the model's default; the mock has no model
+    let text = ["text".to_string()];
+    let mods = if args.output_modalities.is_empty() {
+        &text[..]
+    } else {
+        &args.output_modalities[..]
+    };
+    for modality in mods {
         match modality.as_str() {
             "text" => out.push(ResultChunk {
                 modality: "text".to_string(),
