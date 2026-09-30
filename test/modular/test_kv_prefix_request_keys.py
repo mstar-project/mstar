@@ -121,6 +121,8 @@ def _apply_chain(cfg, key: str, model_kwargs: dict | None) -> None:
         prefix_tail=(kwargs.get("prefix_tail") or {}).get(key),
         prefix_decode=(kwargs.get("prefix_decode") or {}).get(key),
         prefix_cache=kwargs.get("prefix_cache"),
+        prompt_slots=(kwargs.get("prompt_slots") or {}).get(key),
+        decode_labels=(kwargs.get("decode_labels") or {}).get(key),
     )
 
 
@@ -404,3 +406,35 @@ def test_whisper_is_handed_max_tokens_on_both_of_its_caches():
         "whisper returns a sampler config alone, so its caches never learn how "
         "far a request can grow"
     )
+
+
+class _StubFeatureExtractor:
+    """A silent 30 s window's features, the length the real extractor pads to."""
+
+    sampling_rate = 16000
+
+    def __call__(self, audio, sampling_rate, return_tensors):
+        del audio, sampling_rate, return_tensors
+        return {"input_features": [torch.zeros(128, 3000)]}
+
+
+def test_whisper_hands_each_cache_what_it_will_hold():
+    whisper = WhisperModel.__new__(WhisperModel)
+    whisper.config = WhisperModelConfig(
+        lang_to_id={"<|en|>": 50259}, task_to_id={"transcribe": 50360},
+    )
+    whisper.feature_extractor = _StubFeatureExtractor()
+    out = whisper.process_prompt(
+        None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(16000)]},
+    )
+
+    configs = _conductor_configs(whisper, out.metadata)
+
+    handed = {
+        key: (configs[key].prompt_slots, configs[key].decode_labels)
+        for key in ("kv_cache", "cross_kv_cache")
+    }
+    assert handed == {
+        "kv_cache": ({"main": 4}, ["main"]),
+        "cross_kv_cache": ({"main": 1500}, []),
+    }, "whisper's caches were not handed the forced prompt and the audio window"
