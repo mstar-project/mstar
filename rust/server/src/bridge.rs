@@ -255,3 +255,52 @@ impl Bridge {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn encoded(parts: &[Part]) -> Value {
+        let file_paths = BTreeMap::new();
+        let model_kwargs = serde_json::Map::new();
+        let msg = SubmitMsg {
+            t: "submit",
+            rid: "r",
+            text: Some("hi"),
+            tokens: None,
+            frontend_detok: false,
+            file_paths: &file_paths,
+            input_modalities: &[],
+            output_modalities: &[],
+            model_kwargs: &model_kwargs,
+            prompt_parts: parts,
+            streaming: true,
+        };
+        rmp_serde::from_slice(&rmp_serde::to_vec_named(&msg).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_submit_with_no_parts_leaves_the_key_out() {
+        assert!(
+            encoded(&[]).get("prompt_parts").is_none(),
+            "every non-chat submit gained a key the bridge did not have before"
+        );
+    }
+
+    #[test]
+    fn a_chat_submit_carries_each_part_by_name() {
+        let parts = [
+            Part { modality: "image".into(), text: None, index: 0, role: "user".into() },
+            Part { modality: "text".into(), text: Some("what is it".into()), index: 0, role: "user".into() },
+        ];
+        assert_eq!(
+            encoded(&parts)["prompt_parts"],
+            json!([
+                {"modality": "image", "text": null, "index": 0, "role": "user"},
+                {"modality": "text", "text": "what is it", "index": 0, "role": "user"},
+            ]),
+            "a part did not travel as a map of PromptPart's fields"
+        );
+    }
+}
