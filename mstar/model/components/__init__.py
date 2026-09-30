@@ -14,6 +14,7 @@ from mstar.model.components.decoder_layer import DecoderLayer, GatedDecoderLayer
 from mstar.model.components.linear import FusedColumnLinear
 from mstar.model.components.mlp import MLP, FusedGatedMLP, GatedMLP
 from mstar.model.components.moe import (
+    ExpertParallelSparseMoeBlock,
     ParallelSparseMoeBlock,
     ParallelSparseMoeBlockWithSharedExpert,
     SparseMoeBlock,
@@ -32,6 +33,7 @@ __all__ = [
     "FusedGatedMLP",
     "MLP",
     "GatedMLP",
+    "ExpertParallelSparseMoeBlock",
     "ParallelSparseMoeBlock",
     "ParallelSparseMoeBlockWithSharedExpert",
     "SparseMoeBlock",
