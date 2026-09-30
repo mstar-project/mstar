@@ -79,8 +79,9 @@ from mstar.model.bagel.submodules import (
     VAEDecoderSubmodule,
     VAEEncoderSubmodule,
     ViTEncoderSubmodule,
+    vit_image_slots,
 )
-from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream
+from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream, ProcessPromptOutput, Span
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
@@ -576,7 +577,7 @@ class BagelModel(Model):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         """Tokenize the prompt into one text span per prefill step.
 
         Returns model-specific keys matching get_forward_pass_inputs:
@@ -588,10 +589,11 @@ class BagelModel(Model):
         attachments gets its own span and no seam is re-tokenized. The schedule
         builder walks the same :func:`prefill_plan`.
 
-        Bagel doesn't need the raw multimodal tensors here; images are loaded
-        as ``image_inputs`` by the data worker.
+        An understanding prompt with images, given their tensors, also returns
+        the main stream's ``prefix_layout``, so it is keyed past its images.
         """
         result: NameToTensorList = {}
+        layout = None
 
         if prompt is not None:
             target_output = output_modalities[0] if output_modalities else "text"
@@ -640,6 +642,15 @@ class BagelModel(Model):
                     spans,
                     len(segments),
                 )
+                # not for an edit: its image is resized below, before the ViT
+                # sees it, and the file's digest cannot know that
+                if is_understanding and "image" not in output_modalities and tensors is not None:
+                    layout = self._prefix_layout(
+                        parts, segments, tensors["image_inputs"],
+                        # folded, not passed through: the ViT resizes any name but
+                        # "vllm" as "default", so both key alike
+                        "vllm" if kwargs.get("image_preprocess") == "vllm" else "default",
+                    )
                 if think_mode and not is_understanding:
                     # Not part of the request layout: tokenized on its own and
                     # prefilled ahead of the plan.
@@ -667,7 +678,30 @@ class BagelModel(Model):
                 for img in tensors["image_inputs"]
             ]
 
-        return result
+        if layout is None:
+            return result
+        return ProcessPromptOutput(result, {"prefix_layout": {"kv": {"main": layout}}})
+
+    def _prefix_layout(
+        self, parts: list[PromptPart], segments: list[torch.Tensor],
+        images: list[torch.Tensor], image_preprocess: str,
+    ) -> list[Span]:
+        """The main stream's writes in walk order: text by its ids, an image by its file."""
+        spans = []
+        for step in prefill_plan(parts, leading_text=True):
+            if step.modality == TEXT:
+                length = segments[step.index].numel()
+                spans.append(Span("ids", "prefill_text", length, length, "text_inputs"))
+                continue
+            _, height, width = images[step.index].shape
+            slots = vit_image_slots(
+                height, width, image_preprocess,
+                self.config.vit_config.patch_size, self.config.vit_max_num_patch_per_side,
+            )
+            spans.append(Span(
+                "digest", "prefill_vit", slots, 1, ("image", step.index), (image_preprocess,),
+            ))
+        return spans
 
     @staticmethod
     def _resize_to_fit(
@@ -736,13 +770,13 @@ class BagelModel(Model):
         )
 
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
-        """The text walk's prompt is its token ids, and so is every step it takes.
+        """The text walks key by their ids, and an understood image by its file.
 
-        The image walks write into this stream too, and an edit's picture lands
-        at the positions its keyed text would have; only the text walk is named.
+        An edit's VAE walk writes this stream too, over positions no layout
+        describes, so it is not named.
         """
         return {"kv": {"main": PrefixStream(
-            "text_inputs", "ids", "prefill_text", "decode",
+            "text_inputs", "ids", "prefill_text", "decode", ("prefill_vit",),
         )}}
 
     def checkpoint_path(self) -> str:

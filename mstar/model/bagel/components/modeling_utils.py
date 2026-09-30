@@ -225,7 +225,11 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
             height, width = img.shape[-2:]
         else:
             width, height = img.size
+        new_height, new_width = self.target_size(height, width, img_num)
+        return F.resize(img, (new_height, new_width), self.interpolation, antialias=self.antialias)
 
+    def target_size(self, height: int, width: int, img_num: int = 1) -> tuple[int, int]:
+        """The ``(height, width)`` an image of this size is resized to."""
         scale = min(self.max_size / max(width, height), 1.0)
         scale = max(scale, self.min_size / min(width, height))
         new_width, new_height = self._apply_scale(width, height, scale)
@@ -240,7 +244,7 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
             scale = self.max_size / max(new_width, new_height)
             new_width, new_height = self._apply_scale(new_width, new_height, scale)
 
-        return F.resize(img, (new_height, new_width), self.interpolation, antialias=self.antialias)
+        return new_height, new_width
 
 
 class ImageTransform:

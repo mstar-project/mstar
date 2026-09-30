@@ -97,6 +97,30 @@ def active_labels(graph_walk: str, cfg: bool, node_name: str) -> list[str]:
     return ["main"]
 
 
+# module level, not per ViT: `vit_image_slots` counts with the resizes prepare_inputs runs
+_VAE_TRANSFORM = ImageTransform(1024, 512, 16)
+_VIT_TRANSFORM = ImageTransform(980, 224, 14)
+
+
+def vit_image_slots(
+    height: int, width: int, image_preprocess: str,
+    patch_size: int, max_num_patches_per_side: int,
+) -> int:
+    """The KV slots the ViT walk writes for one image: a patch each, and its two sentinels.
+
+    Counted from the image's size by the resizes `ViTEncoderSubmodule.prepare_inputs`
+    runs, so a layout agrees with the walk; the probe's length check catches one that
+    does not, and the walks after it lose their reuse.
+    """
+    if image_preprocess == "vllm":
+        patches = max_num_patches_per_side ** 2
+    else:
+        height, width = _VAE_TRANSFORM.resize_transform.target_size(height, width)
+        height, width = _VIT_TRANSFORM.resize_transform.target_size(height, width)
+        patches = (height // patch_size) * (width // patch_size)
+    return patches + 2
+
+
 class ViTEncoderSubmodule(NodeSubmodule):
     """SigLIP2 ViT + connector + vit_pos_embed: pixel patches -> ViT features.
 
@@ -121,8 +145,8 @@ class ViTEncoderSubmodule(NodeSubmodule):
 
         self.vit_patch_size = vit_patch_size
         self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
-        self.transform = ImageTransform(980, 224, 14)
-        self.vae_transform = ImageTransform(1024, 512, 16)
+        self.transform = _VIT_TRANSFORM
+        self.vae_transform = _VAE_TRANSFORM
 
         self._vit_batching = os.environ.get("MSTAR_VIT_BATCHING", "0") == "1"
         # CUDA-graph capture of the ViT block loop, over the engine's ragged

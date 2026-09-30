@@ -56,7 +56,7 @@ class PrefixStream(NamedTuple):
     walk: str
     # the walk whose input is the last sampled token, to key generated pages; None keys the prompt only
     decode_walk: str | None = None
-    # the other walks that write this stream
+    # the other walks a layout may name
     layout_walks: tuple[str, ...] = ()
 
 
