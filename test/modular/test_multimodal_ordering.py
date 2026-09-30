@@ -10,6 +10,7 @@ from mstar.api_server.openai.adapters import flatten_messages
 from mstar.model.multimodal import (
     PromptPart,
     check_attachments,
+    messages_from_parts,
     parts_from_modalities,
     prefill_plan,
 )
@@ -200,6 +201,43 @@ def test_a_layout_that_does_not_match_its_attachments_is_refused(
 ])
 def test_a_matching_layout_passes(layout, counts):
     check_attachments(parts_from_modalities(layout), counts)
+
+
+def test_messages_from_parts_gives_one_message_per_turn():
+    """An attachment stays in its own turn, as the item the template writes a placeholder for."""
+    parts = [
+        PromptPart(modality="text", text="Be brief.", role="system"),
+        PromptPart(modality="image", index=0, role="user"),
+        PromptPart(modality="text", text="What is it?", role="user"),
+        PromptPart(modality="text", text="A cat.", role="assistant"),
+    ]
+    assert messages_from_parts(parts) == [
+        {"role": "system", "content": [{"type": "text", "text": "Be brief."}]},
+        {"role": "user", "content": [
+            {"type": "image", "image": ""}, {"type": "text", "text": "What is it?"},
+        ]},
+        {"role": "assistant", "content": [{"type": "text", "text": "A cat."}]},
+    ], "the chat reaches the template as other than one message per turn"
+
+
+@pytest.mark.parametrize(("roles", "leads"), [
+    (["user"], True),
+    (["user", "system", "user"], False),
+])
+def test_the_default_system_message_leads_only_when_the_client_sent_none(roles, leads):
+    parts = [PromptPart(modality="text", text=f"m{i}", role=r) for i, r in enumerate(roles)]
+    messages = messages_from_parts(parts, default_system="Default.")
+    assert (messages[0] == {"role": "system", "content": "Default."}) == leads, (
+        "a template would write the default and the client's system message both"
+        if not leads else "a chat with no system message lost the default one"
+    )
+
+
+def test_a_part_with_no_role_is_the_users():
+    """An entrypoint with no messages sends role-less parts."""
+    assert messages_from_parts([PromptPart(modality="text", text="hi")]) == [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+    ], "a role-less part did not render as the user turn it always did"
 
 
 class _StubTokenizer:
