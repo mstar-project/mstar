@@ -128,6 +128,20 @@ def test_a_lookup_stops_at_the_first_key_the_index_does_not_hold():
     _assert_pages_partition(arena)
 
 
+def test_a_peek_matches_as_a_lookup_does_but_leaves_every_stamp():
+    arena = _arena()
+    index = PrefixIndex(arena)
+    pages = _chain(index, arena)
+    stamps = list(index._stamp)
+
+    peeked = index.peek([b"A", b"B", b"missing", b"C"])
+
+    assert peeked == [pages["A"], pages["B"]], "a peek matched differently from a lookup"
+    assert index._stamp == stamps, (
+        "asking what would match refreshed the pages as though they were hit"
+    )
+
+
 # ── eviction ────────────────────────────────────────────────────────────
 
 
@@ -232,3 +246,21 @@ def test_a_page_already_indexed_cannot_take_a_second_key():
 
     with pytest.raises(AssertionError, match=f"page {page} indexed under .* while it is still indexed under"):
         index.insert(b"second key", page)
+
+
+# ── what eviction can reach ─────────────────────────────────────────────
+
+
+def test_a_held_page_keeps_every_page_above_it_out_of_the_evictable_set():
+    arena = _arena()
+    index = PrefixIndex(arena)
+    pages = _chain(index, arena)
+    assert index.evictable() == set(pages.values())
+
+    # a request holds C, so B and A stay behind it however cold they are
+    arena.retain([pages["C"]])
+
+    assert index.evictable() == {pages["D"]}, (
+        "the count took in pages only the index holds that eviction cannot reach"
+    )
+    assert index.evict(len(pages)) == 1, "eviction freed other than what was counted"
