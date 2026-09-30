@@ -91,6 +91,9 @@ class SubmoduleManagement:
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
     cuda_graph_runner: CudaGraphRunner | None = None
+    # the runner capture ran with, graphs or none: a bucket it didn't capture
+    # runs eager, and the floor covers eager steps only up to its largest
+    capture_runner: CudaGraphRunner | None = None
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -472,6 +475,8 @@ class Engine:
         for node_name, submodule_mgmt in self._submodules.items():
             runner = cg_runners[node_name]
             runner.warmup_and_capture(budget)
+            if budget is not None:
+                submodule_mgmt.capture_runner = runner
             if runner.any_graphs:
                 submodule_mgmt.cuda_graph_runner = runner
 
@@ -1313,16 +1318,17 @@ class Engine:
         """Most requests this node will take in one step, or None for no cap.
 
         Two sources: what the submodule says it can batch, and the largest
-        batch this walk captured a graph for — going past that would drop the
-        step to eager, so the scheduler splits instead. Splitting is the
-        scheduler's job, not the engine's: the pieces then pipeline like any
-        other batch instead of running back to back.
+        bucket this walk has a capture config for, captured or not — past it a
+        step runs eager at a size the capture budget never measured, so the
+        scheduler splits instead. Splitting is the scheduler's job, not the
+        engine's: the pieces then pipeline like any other batch instead of
+        running back to back.
         """
         submodule_mgmt = self._submodules[node_name]
         caps = [submodule_mgmt.submodule.max_batch_size(graph_walk)]
-        if submodule_mgmt.cuda_graph_runner is not None:
+        if submodule_mgmt.capture_runner is not None:
             caps.append(
-                submodule_mgmt.cuda_graph_runner.max_batch_size_for(graph_walk)
+                submodule_mgmt.capture_runner.max_batch_size_for(graph_walk)
             )
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
