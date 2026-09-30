@@ -1,0 +1,123 @@
+name: Claude Review
+
+# Advisory LLM review of every PR. Not a merge gate. Rules live in AGENTS.md;
+# the reviewer's operating instructions are in .github/review/review-prompt.md.
+#
+# Why pull_request_target: a plain `pull_request` trigger withholds secrets from
+# fork PRs, so the reviewer would silently never run for outside contributors --
+# exactly the people it is for. pull_request_target runs with secrets, and always
+# uses the workflow file and the base tree from `main`, never the PR's version.
+#
+# The safety rules that come with that, and that must hold for any edit here:
+#
+#   1. Never check out the PR at the repository root, and never build, install
+#      or execute anything from it. The PR's tree goes in pr-head/ and is read
+#      only. There is no setup-python, no pip, no cargo, no make.
+#   2. persist-credentials: false on both checkouts, so no token is written into
+#      a working tree the PR controls.
+#   3. Rules are read from the base checkout at the root. The prompt tells the
+#      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
+#      cannot rewrite the rules it is judged by.
+#   4. Write permission is pull-requests only, and mutation tools are disabled,
+#      so the worst case for a prompt injection is a bad comment.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Review
+    # No repository pin: a fork with no ANTHROPIC_API_KEY exits green at the
+    # preflight below, which is the same protection and visible in the log
+    # rather than a silently skipped job. It also means a fork that *does* set
+    # the key gets reviews, which is how you test changes to this workflow.
+    if: >-
+      !github.event.pull_request.draft &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-ai-review')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # Secrets can't be tested in a job-level `if`, so short-circuit here
+      # instead. Lets this land before ANTHROPIC_API_KEY exists without
+      # failing a check on every PR.
+      - name: Preflight
+        id: pre
+        env:
+          KEY_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          if [ "$KEY_SET" != "true" ]; then
+            echo "::warning::ANTHROPIC_API_KEY is not set; skipping the review."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Trusted: the base branch. AGENTS.md and the review prompt come from here.
+      - name: Check out the base branch
+        if: steps.pre.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      # Untrusted: the PR's tree, for reading changed files in full context.
+      # Never executed.
+      - name: Check out the PR into pr-head/
+        if: steps.pre.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          persist-credentials: false
+
+      - name: Collect the diff
+        if: steps.pre.outputs.run == 'true'
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr diff "$PR" --repo "$REPO" > pr.diff
+          lines=$(wc -l < pr.diff)
+          echo "lines=$lines" >> "$GITHUB_OUTPUT"
+          # Very large diffs are usually vendoring, generated code or a rename
+          # sweep. Reviewing all of it costs a lot and finds little, so tell the
+          # model to triage instead of pretending to cover it.
+          if [ "$lines" -gt 4000 ]; then
+            echo "note=This diff is $lines lines. Do not attempt full coverage: pick the files most likely to contain a defect by the routing table, review those, and say in your comment which files you did not review." >> "$GITHUB_OUTPUT"
+          else
+            echo "note=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Review
+        if: steps.pre.outputs.run == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          use_sticky_comment: true
+          prompt: |
+            Read .github/review/review-prompt.md from the repository root and follow it
+            exactly. It defines your trust boundary, your method, your reporting bar and
+            your output format.
+
+            PR #${{ github.event.pull_request.number }}: ${{ github.event.pull_request.title }}
+            ${{ steps.diff.outputs.note }}
+          # Read-only. Blocking the mutation and network tools caps a prompt
+          # injection at a bad comment; the action's own comment plumbing is
+          # left alone deliberately, so this is a denylist and not an allowlist.
+          claude_args: |
+            --model claude-sonnet-5-5
+            --max-turns 40
+            --disallowedTools Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch

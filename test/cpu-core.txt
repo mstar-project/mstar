@@ -8,3 +8,4 @@ test/modular/test_rid_handles.py
 test/modular/test_tensor_uuid.py
 test/modular/test_shm_tensor_comm.py
 test/modular/test_deployment_lock.py
+test/modular/test_model_registration.py
