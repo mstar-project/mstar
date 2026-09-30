@@ -9,6 +9,11 @@ while the entries it left behind still name the originals.
 In both cases the stream's next page has to chain onto what the index named. Off
 its own page list it would name a page the index has never heard of, and the
 insert refuses that, because a parent has to outlive its children.
+
+Unless nobody but the index holds that page any more: the winner has left, or
+the reloaded request's originals went back when it was moved out. Chained under
+it, the stream's live page would keep eviction from reaching a page the pool
+counts as free, so the next page goes in with no parent instead.
 """
 
 from __future__ import annotations
@@ -142,11 +147,35 @@ def test_the_loser_keeps_its_own_page_and_the_index_keeps_one_entry():
     kv.assert_pages_conserved()
 
 
+def test_the_loser_does_not_chain_onto_a_winner_that_has_left():
+    kv = _manager()
+    tokens = list(range(64))
+    for rid in ("r0", "r1"):
+        _ingest(kv, rid, tokens)
+    _batch(kv, ("r0", "r1"), PAGE_SIZE)
+    winner_page = _indexed_page(kv, "r0", 0)
+    loser = next(
+        rid for rid in ("r0", "r1")
+        if kv._streams[rid]["main"].page_indices[0] != winner_page
+    )
+    winner = "r1" if loser == "r0" else "r0"
+
+    # the index alone holds the winner's page once the winner is gone
+    kv.remove_request(winner)
+    _batch(kv, (loser,), PAGE_SIZE)
+
+    assert winner_page in kv._index.evictable(), (
+        "the loser chained its next page under the winner's, which pins a page "
+        "nobody but the index holds"
+    )
+    kv.assert_pages_conserved()
+
+
 # ── a request that came back onto different pages ───────────────────────
 
 
 @requires_cuda
-def test_a_reloaded_request_chains_its_next_page_onto_the_original():
+def test_a_reloaded_request_leaves_the_originals_to_eviction():
     kv = _manager(cpu_offload_pages=64)
     tokens = list(range(160))
     _ingest(kv, "a", tokens)
@@ -165,8 +194,8 @@ def test_a_reloaded_request_chains_its_next_page_onto_the_original():
         "reload handed back the very pages the index named, so this proves "
         "nothing about chaining onto a copy"
     )
-    assert kv._index._parent[_indexed_page(kv, "a", 5)] == original, (
-        "the reloaded stream chained onto its own copy rather than onto the "
-        "page the index named"
+    assert original in kv._index.evictable(), (
+        "the reloaded stream chained under the original, which only the index "
+        "holds once the request moved out"
     )
     kv.assert_pages_conserved()
