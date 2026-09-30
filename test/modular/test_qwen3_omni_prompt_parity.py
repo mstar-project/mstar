@@ -24,6 +24,7 @@ import os
 import pytest
 import torch
 
+from mstar.api_server.openai.adapters import flatten_messages
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
 
 SYSTEM_PROMPT = (
@@ -176,11 +177,30 @@ LEGACY_LAYOUTS = [
 ]
 
 
+# What the chat adapter is sent for each modality, as one message part.
+CHAT_PARTS = {
+    "image": {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+    "audio": {"type": "input_audio", "input_audio": {"data": "aGk=", "format": "wav"}},
+    "video": {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,aGk="}},
+}
+
+
 @pytest.mark.parametrize(("prompt", "input_modalities"), LEGACY_LAYOUTS)
-def test_legacy_layout_tokenizes_exactly_as_before(model, prompt, input_modalities):
-    """The bytes a shipped benchmark sends must produce the bytes it did."""
+@pytest.mark.parametrize("as_chat", [False, True], ids=["legacy", "one-message-chat"])
+def test_legacy_layout_tokenizes_exactly_as_before(
+    model, tmp_path, prompt, input_modalities, as_chat,
+):
+    """The bytes a shipped benchmark sends must produce the bytes it did, and a
+    chat of one user message in the same layout must too."""
     old = _old_process_prompt(model, prompt, input_modalities)
-    new = _new_text_inputs(model, prompt, input_modalities)
+    parts = None
+    if as_chat:
+        content = [
+            {"type": "text", "text": prompt} if m == "text" else CHAT_PARTS[m]
+            for m in input_modalities
+        ]
+        _, _, _, parts = flatten_messages([{"role": "user", "content": content}], tmp_path)
+    new = _new_text_inputs(model, prompt, input_modalities, prompt_parts=parts)
     assert _ids(new) == _ids(old)
 
 
@@ -241,6 +261,66 @@ def test_new_layouts_differ_from_the_old_path(model, prompt, input_modalities):
         assert model.tokenizer.decode(new[0]).endswith(prompt)
 
 
+def _template_ids(model, messages):
+    return model.tokenizer(
+        model._processor.apply_chat_template(messages), return_tensors="pt",
+    )["input_ids"][0].tolist()
+
+
+def test_a_chat_matches_its_own_template(model, tmp_path):
+    """Each turn keeps its role and its attachment, as the template would put them."""
+    messages = [
+        {"role": "user", "content": [CHAT_PARTS["image"], {"type": "text", "text": "What is it?"}]},
+        {"role": "assistant", "content": "A cat."},
+        {"role": "user", "content": "Its color?"},
+    ]
+    text, _, in_mods, parts = flatten_messages(messages, tmp_path)
+    spans = _new_text_inputs(model, text, in_mods, prompt_parts=parts)
+    rejoined = (
+        spans[0].tolist()
+        + [SPECIAL_IDS["<|vision_start|>"], SPECIAL_IDS["<|image_pad|>"],
+           SPECIAL_IDS["<|vision_end|>"]]
+        + spans[1].tolist()
+    )
+    expected = _template_ids(model, [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": [{"type": "image", "image": ""}, {"type": "text", "text": "What is it?"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "A cat."}]},
+        {"role": "user", "content": [{"type": "text", "text": "Its color?"}]},
+    ])
+    assert rejoined == expected, "the chat reached the template as one user turn"
+
+
+def test_a_client_system_message_replaces_the_default_persona(model, tmp_path):
+    messages = [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Hi."},
+    ]
+    text, _, in_mods, parts = flatten_messages(messages, tmp_path)
+    [span] = _new_text_inputs(model, text, in_mods, prompt_parts=parts)
+    expected = _template_ids(model, [
+        {"role": "system", "content": [{"type": "text", "text": "Be brief."}]},
+        {"role": "user", "content": [{"type": "text", "text": "Hi."}]},
+    ])
+    assert span.tolist() == expected, "the client's system message did not reach the template as its system turn"
+
+
+def test_a_later_system_message_still_replaces_the_default_persona(model, tmp_path):
+    messages = [
+        {"role": "user", "content": "Hi."},
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Again."},
+    ]
+    text, _, in_mods, parts = flatten_messages(messages, tmp_path)
+    [span] = _new_text_inputs(model, text, in_mods, prompt_parts=parts)
+    expected = _template_ids(model, [
+        {"role": "user", "content": [{"type": "text", "text": "Hi."}]},
+        {"role": "system", "content": [{"type": "text", "text": "Be brief."}]},
+        {"role": "user", "content": [{"type": "text", "text": "Again."}]},
+    ])
+    assert span.tolist() == expected, "the default persona leads a chat whose client sent a system message"
+
+
 def test_schedule_matches_the_spans(model):
     """As many text walks as spans, one media walk per attachment, in order."""
     mods = ["image", "text", "image"]
@@ -262,20 +342,32 @@ def test_schedule_matches_the_spans(model):
     not os.environ.get("MSTAR_QWEN3_OMNI_PATH"),
     reason="set MSTAR_QWEN3_OMNI_PATH to check the stub against real weights",
 )
-def test_stub_matches_released_checkpoint():
+@pytest.mark.parametrize("messages", [
+    [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": [
+            {"type": "image", "image": ""},
+            {"type": "text", "text": "Describe the image."},
+        ]},
+    ],
+    # the shape process_prompt sends a chat in: list content, every turn
+    [
+        {"role": "system", "content": [{"type": "text", "text": "Be brief."}]},
+        {"role": "user", "content": [
+            {"type": "image", "image": ""},
+            {"type": "text", "text": "What is it?"},
+        ]},
+        {"role": "assistant", "content": [{"type": "text", "text": "A cat."}]},
+        {"role": "user", "content": [{"type": "text", "text": "Its color?"}]},
+    ],
+], ids=["one-turn", "chat"])
+def test_stub_matches_released_checkpoint(messages):
     """Pin the stub template to the checkpoint's, so the parity above is real."""
     from transformers import AutoProcessor
 
     real = AutoProcessor.from_pretrained(
         os.environ["MSTAR_QWEN3_OMNI_PATH"], trust_remote_code=True,
     )
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": [
-            {"type": "image", "image": ""},
-            {"type": "text", "text": "Describe the image."},
-        ]},
-    ]
     assert real.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
     ) == _StubProcessor().apply_chat_template(messages)
