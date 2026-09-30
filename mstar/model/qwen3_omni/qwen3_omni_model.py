@@ -58,10 +58,10 @@ from mstar.model.base import MAX_OUTPUT_TOKENS, ForwardPassArgs, Model, TensorAn
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
-    chat_turns,
     check_attachments,
     check_plan,
     find_media_spans,
+    messages_from_parts,
     parts_from_modalities,
     prefill_plan,
     split_around_spans,
@@ -1139,25 +1139,12 @@ class Qwen3OmniModel(Model):
         # (``ThinkerSubmodule._wrap_audio_input``) and the encoder embeddings
         # replace the pad tokens, so the Thinker's spans are what lies between
         # the placeholders.
-        messages = [
-            {"role": turn.role, "content": [
-                {"type": TEXT, "text": part.text or ""} if part.modality == TEXT
-                else {"type": part.modality, part.modality: ""}
-                for part in turn.parts
-            ]}
-            for turn in chat_turns(parts)
-        ]
-        if not any(m["role"] == "system" for m in messages):
-            # a client's system message replaces the default persona, wherever it sits
-            messages.insert(0, {
-                "role": "system",
-                "content": (
-                    "You are Qwen, a virtual human developed by the "
-                    "Qwen team, Alibaba Group, capable of perceiving "
-                    "auditory and visual inputs, as well as generating "
-                    "text and speech."
-                ),
-            })
+        messages = messages_from_parts(parts, default_system=(
+            "You are Qwen, a virtual human developed by the "
+            "Qwen team, Alibaba Group, capable of perceiving "
+            "auditory and visual inputs, as well as generating "
+            "text and speech."
+        ))
 
         text = self._processor.apply_chat_template(
             messages,

@@ -108,6 +108,30 @@ def chat_turns(parts: list[PromptPart]) -> list[Turn]:
     return turns
 
 
+def messages_from_parts(
+    parts: list[PromptPart], default_system: str | None = None,
+) -> list[dict]:
+    """One OpenAI-style message per turn of ``parts``, for a chat template to take as is.
+
+    An attachment is an empty ``{"type": modality, modality: ""}`` item: the
+    template writes its placeholder there, in the turn it belongs to, and the
+    tokenized prompt is scanned for it. ``default_system`` leads only when no
+    part is a system message's, wherever that message sits: a template writes
+    every system message it is given, so both would reach the model.
+    """
+    messages = [
+        {"role": turn.role, "content": [
+            {"type": TEXT, "text": part.text or ""} if part.modality == TEXT
+            else {"type": part.modality, part.modality: ""}
+            for part in turn.parts
+        ]}
+        for turn in chat_turns(parts)
+    ]
+    if default_system is not None and not any(m["role"] == "system" for m in messages):
+        messages.insert(0, {"role": "system", "content": default_system})
+    return messages
+
+
 def prefill_plan(
     parts: list[PromptPart], *, leading_text: bool = True
 ) -> list[PromptPart]:
