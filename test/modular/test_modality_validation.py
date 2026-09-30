@@ -18,9 +18,29 @@ from mstar.api_server.entrypoint import (
     APIServer,
     UnsupportedModalityError,
 )
-from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.base import Model
 from mstar.model.registry import MODEL_REGISTRY
+
+
+def _model_cls(name):
+    module, cls = MODEL_REGISTRY[name]
+    try:
+        mod = import_module(module)
+    except ModuleNotFoundError as e:
+        # CI's CPU job installs only .[dev], so a model whose third-party deps
+        # are missing is skipped there; a broken mstar import still fails
+        if (e.name or "").split(".")[0] == "mstar":
+            raise
+        pytest.skip(f"{name} needs {e.name}")
+    return getattr(mod, cls)
+
+
+class _TextImage:
+    """BAGEL's declaration, for the intake tests: no model import needed."""
+
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text", "image"})
+    unsupported_modalities = Model.unsupported_modalities
 
 
 def _server(model, model_name="bagel"):
@@ -29,20 +49,20 @@ def _server(model, model_name="bagel"):
     s.model_name = model_name
     s.request_lock = threading.Lock()
     s.pending_requests = {}
+    s.fatal_error = None
     s.preprocess_worker = SimpleNamespace(new_request=lambda *a, **k: None)
     return s
 
 
 def test_bagel_declares_text_and_image_only():
     # Acceptance: BAGEL rejects audio/video input (it has no such encoder).
-    assert BagelModel.SUPPORTED_INPUT_MODALITIES == frozenset({"text", "image"})
-    assert BagelModel.SUPPORTED_OUTPUT_MODALITIES == frozenset({"text", "image"})
-    assert "audio" not in BagelModel.SUPPORTED_INPUT_MODALITIES
-    assert "video" not in BagelModel.SUPPORTED_INPUT_MODALITIES
+    bagel = _model_cls("bagel")
+    assert bagel.SUPPORTED_INPUT_MODALITIES == _TextImage.SUPPORTED_INPUT_MODALITIES
+    assert bagel.SUPPORTED_OUTPUT_MODALITIES == _TextImage.SUPPORTED_OUTPUT_MODALITIES
 
 
 def test_unsupported_modalities_flags_input_and_output():
-    model = BagelModel.__new__(BagelModel)  # class attrs only, no HF download
+    model = _TextImage()
     assert model.unsupported_modalities(["text", "audio"], ["image", "audio"]) == [
         ("audio", "input"), ("audio", "output"),
     ]
@@ -50,7 +70,7 @@ def test_unsupported_modalities_flags_input_and_output():
 
 
 def test_submit_request_rejects_unsupported_modality_for_the_model():
-    server = _server(BagelModel.__new__(BagelModel))
+    server = _server(_TextImage())
     with pytest.raises(UnsupportedModalityError, match="audio"):
         server.submit_request(input_modalities=["audio"], output_modalities=["text"])
     assert server.pending_requests == {}  # nothing dispatched downstream
@@ -59,7 +79,7 @@ def test_submit_request_rejects_unsupported_modality_for_the_model():
 def test_submit_request_checks_the_uploaded_files_too():
     # the data worker loads every file_paths key, so a declared text-only
     # request carrying a .wav would still feed BAGEL audio
-    server = _server(BagelModel.__new__(BagelModel))
+    server = _server(_TextImage())
     with pytest.raises(UnsupportedModalityError, match="'audio' \\(input\\)"):
         server.submit_request(
             text="hi", file_paths={"audio": ["/tmp/x.wav"]},
@@ -69,7 +89,7 @@ def test_submit_request_checks_the_uploaded_files_too():
 
 
 def test_rejection_is_a_400_that_names_what_is_supported():
-    server = _server(BagelModel.__new__(BagelModel))
+    server = _server(_TextImage())
     with pytest.raises(UnsupportedModalityError) as e:
         server.submit_request(input_modalities=["audio"], output_modalities=["text"])
     assert e.value.status_code == 400
@@ -77,7 +97,7 @@ def test_rejection_is_a_400_that_names_what_is_supported():
 
 
 def test_submit_request_accepts_a_supported_combination():
-    server = _server(BagelModel.__new__(BagelModel))
+    server = _server(_TextImage())
     rid = server.submit_request(
         text="hi", input_modalities=["text", "image"], output_modalities=["image"],
     )
@@ -116,11 +136,6 @@ def test_an_unnamed_output_is_the_model_default():
 
 
 # ── per-model declarations ──────────────────────────────────────────────────
-
-
-def _model_cls(name):
-    module, cls = MODEL_REGISTRY[name]
-    return getattr(import_module(module), cls)
 
 
 # Every request shape the front ends actually emit, per registry name. These
