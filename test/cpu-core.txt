@@ -44,3 +44,4 @@ test/modular/test_mamba2_resource.py
 test/modular/test_streams.py
 test/modular/test_batched_model_output.py
 test/modular/test_qwen3_5_check_stop_batched.py
+test/modular/test_model_registration.py

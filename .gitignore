@@ -26,6 +26,7 @@ asr_benchmark_results/
 # internal design docs (not for public release)
 mstar/worker/ASYNC_REDESIGN.md
 
-# local AI-assistant context (kept local, not published — cf. vllm-omni)
+# local AI-assistant context. AGENTS.md is published (it is the shared contract the
+# PR reviewer cites — see .github/review/); CLAUDE.md stays local, so it can hold
+# personal notes. `ln -s AGENTS.md CLAUDE.md` if your tooling wants that name.
 CLAUDE.md
-AGENTS.md

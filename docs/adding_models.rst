@@ -72,25 +72,33 @@ A typical model lives in its own package under ``mstar/model/<your_model>/``:
    ├── submodules.py        # NodeSubmodule subclasses (the compute wrappers)
    └── components/          # the actual nn.Modules (attention, decoder, etc.)
 
-Plus two things outside that package:
+Plus a handful of things outside that package:
 
-- an entry in ``mstar/model/registry.py`` so the model is discoverable, and
-- a config YAML in ``configs/`` mapping nodes to ranks.
+- an entry in ``mstar/model/registry.py`` so the model is discoverable,
+- a config YAML in ``configs/`` mapping nodes to ranks,
+- an entry in ``DEFAULT_CONFIGS`` (``mstar/cli/main.py``) so ``mstar serve`` knows the name,
+- a row in ``docs/models.rst``, and
+- an OpenAI adapter, only if the model needs OpenAI-compatible routes.
+
+Step 1 covers all of them.
 
 Step 1 — Register the model
 ---------------------------
 
-Open ``mstar/model/registry.py`` and add your class to ``MODEL_REGISTRY`` (and, if it
+Open ``mstar/model/registry.py`` and add your model to ``MODEL_REGISTRY`` (and, if it
 loads weights from Hugging Face, to ``HF_MODELS``). The dict key is the string you put
 under ``model:`` in a config YAML.
 
+The value is a ``(module_path, class_name)`` tuple, not an imported class: the module is
+imported lazily through ``import_module`` when the model is actually used, which keeps
+``mstar.model.registry`` cheap to import. A direct class import here would pull every
+model's dependencies into every process.
+
 .. code-block:: python
 
-   from mstar.model.your_model.your_model_model import YourModel
-
-   MODEL_REGISTRY: dict[str, type[Model]] = {
+   MODEL_REGISTRY: dict[str, tuple[str, str]] = {
        # ...
-       "your_model": YourModel,
+       "your_model": ("mstar.model.your_model.your_model_model", "YourModel"),
    }
 
    HF_MODELS: dict[str, dict] = {
@@ -98,8 +106,22 @@ under ``model:`` in a config YAML.
        "your_model": {"model_path_hf": "org/your-model-id"},
    }
 
-This is the only wiring step. There is no plugin scan. The registry import is the single
-source of truth.
+There is no plugin scan, so the registry is the only place the class is discovered — but it
+is **not** the only wiring step. A model also needs:
+
+- ``DEFAULT_CONFIGS`` in ``mstar/cli/main.py``, mapping the name to its default config file.
+  Without it, ``mstar serve <your_model>`` exits with ``error: unknown model`` before
+  anything loads.
+- a row in ``docs/models.rst``, which is the model list users read.
+- an ``OpenAIAdapter`` subclass in ``ADAPTER_REGISTRY``
+  (``mstar/api_server/openai/adapters.py``), *only* if the model maps onto OpenAI semantics
+  such as ``chat.completions``, ``audio.speech`` or ``images.generate``. A model reached
+  only through ``POST /generate`` needs none.
+- the client-example tuples further down ``mstar/cli/main.py``, so ``mstar serve`` prints a
+  usage snippet. Cosmetic, but user-visible.
+
+``test/modular/test_model_registration.py`` enforces the registry, CLI and docs entries, so
+CI fails rather than shipping a model nobody can reach.
 
 Step 2 — Implement the ``Model`` class
 --------------------------------------
@@ -1771,8 +1793,14 @@ Checklist
          [ ] get_submodule
          [ ] (optional) get_request_resource_configs
          [ ] (optional) prefix_key_streams + checkpoint_path   — cross-request prefix reuse
-   [ ] mstar/model/registry.py                    — add to MODEL_REGISTRY (+ HF_MODELS)
+   [ ] mstar/model/registry.py                    — (module_path, class_name) in MODEL_REGISTRY
+         [ ] HF_MODELS too, if weights come from Hugging Face
    [ ] configs/<your_model>.yaml                  — node_groups → ranks (+ resources: overrides)
+   [ ] mstar/cli/main.py DEFAULT_CONFIGS          — else `mstar serve <name>` says "unknown model"
+         [ ] the client-example tuples lower down (cosmetic, user-visible)
+   [ ] docs/models.rst                            — one row in the registry-key table
+   [ ] (optional) mstar/api_server/openai/adapters.py — only for OpenAI-compatible routes
+   [ ] (optional) pyproject.toml extra            — if it needs deps the base install lacks
    [ ] (optional) async partitions if pipelined
 
 Testing
