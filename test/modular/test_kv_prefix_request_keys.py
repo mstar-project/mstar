@@ -271,6 +271,19 @@ def test_a_clients_prefix_keys_never_reach_process_prompt():
     )
 
 
+def test_a_clients_page_counts_never_reach_the_conductor():
+    # a model that stamps nothing leaves the client's own counts standing
+    worker = _worker(_Model(metadata=None), _deployment())
+
+    kwargs = _run(worker, {
+        "prompt_slots": {"kv": {"main": 1}}, "decode_labels": {"kv": []},
+    })
+
+    assert not {"prompt_slots", "decode_labels"} & set(kwargs), (
+        "a client's own count of its pages would reach the cache that admits by it"
+    )
+
+
 # ── the metadata fold ───────────────────────────────────────────────────
 
 
