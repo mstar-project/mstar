@@ -316,14 +316,16 @@ def test_pi05_process_prompt_without_state_uses_plain_text():
 
 
 def test_pi05_process_prompt_without_an_image_fails():
-    # the LLM would wait on img_emb forever; a ValueError is a 400 instead
-    model = _make_model()
-    model.tokenizer = _StubTokenizer()
-    with pytest.raises(ValueError, match="camera image"):
-        model.process_prompt(
-            prompt="pick up the block", input_modalities=["text"],
-            output_modalities=["action"], tensors={},
-        )
+    # the LLM would wait on img_emb forever; a ValueError is a 400 instead,
+    # with or without a tokenizer (one can fail to load and the server still starts)
+    for tokenizer in (_StubTokenizer(), None):
+        model = _make_model()
+        model.tokenizer = tokenizer
+        with pytest.raises(ValueError, match="camera image"):
+            model.process_prompt(
+                prompt="pick up the block", input_modalities=["text"],
+                output_modalities=["action"], tensors={},
+            )
 
 
 # ----------------------------------------------------------------------

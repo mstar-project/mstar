@@ -507,6 +507,10 @@ class Pi05Model(Model):
         here so the resulting ``text_inputs`` stream matches the production
         format.
         """
+        # the LLM waits on the vision tower's img_emb, so no image would hang;
+        # before the fallback, which a server whose tokenizer failed to load runs
+        if not (kwargs.get("tensors") or {}).get("image_inputs"):
+            raise ValueError("Pi0.5 requires at least one camera image")
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             if prompt is not None:
@@ -516,9 +520,6 @@ class Pi05Model(Model):
                     ]
                 }
             return {}
-        # the LLM waits on the vision tower's img_emb, so no image would hang
-        if not (kwargs.get("tensors") or {}).get("image_inputs"):
-            raise ValueError("Pi0.5 requires at least one camera image")
 
         cleaned = (prompt or "").strip().replace("_", " ").replace("\n", " ")
 
