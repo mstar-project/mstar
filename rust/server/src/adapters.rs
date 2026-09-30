@@ -597,3 +597,121 @@ fn chat_voice(req: &ChatCompletionRequest) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ChatMessage;
+
+    type Flattened = (Option<String>, BTreeMap<String, Vec<String>>, Vec<String>, Vec<Part>);
+
+    fn flatten(messages: &str, upload_dir: &Path) -> Result<Flattened, String> {
+        let messages: Vec<ChatMessage> = serde_json::from_str(messages).unwrap();
+        flatten_messages(&messages, upload_dir, false)
+    }
+
+    fn described(parts: &[Part]) -> Vec<(&str, &str, Option<&str>, usize)> {
+        parts
+            .iter()
+            .map(|p| (p.modality.as_str(), p.role.as_str(), p.text.as_deref(), p.index))
+            .collect()
+    }
+
+    #[test]
+    fn a_reply_stays_its_own_part() {
+        let (text, _, in_mods, parts) = flatten(
+            r#"[{"role":"system","content":"Be brief."},
+                {"role":"user","content":"Name a color."},
+                {"role":"assistant","content":"Blue."},
+                {"role":"user","content":"Another."}]"#,
+            Path::new("/unused"),
+        )
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("Be brief.\nName a color.\nBlue.\nAnother."));
+        assert_eq!(in_mods, ["text", "text", "text", "text"]);
+        assert_eq!(
+            described(&parts),
+            [
+                ("text", "system", Some("Be brief."), 0),
+                ("text", "user", Some("Name a color."), 0),
+                ("text", "assistant", Some("Blue."), 0),
+                ("text", "user", Some("Another."), 0),
+            ],
+            "text merged across a role change, so the reply lands inside a user turn"
+        );
+    }
+
+    #[test]
+    fn messages_of_one_role_stay_one_part() {
+        let (_, _, in_mods, parts) = flatten(
+            r#"[{"role":"user","content":"First."},{"role":"user","content":"Second."}]"#,
+            Path::new("/unused"),
+        )
+        .unwrap();
+        assert_eq!(in_mods, ["text"]);
+        assert_eq!(
+            described(&parts),
+            [("text", "user", Some("First.\nSecond."), 0)],
+            "two user messages no longer render as the one turn they do on the default server"
+        );
+    }
+
+    #[test]
+    fn an_attachment_keeps_its_place_between_text() {
+        let (text, file_paths, in_mods, parts) = flatten(
+            r#"[{"role":"user","content":[
+                {"type":"text","text":"A"},
+                {"type":"image_url","image_url":{"url":"/in/a.png"}},
+                {"type":"text","text":"B"}]}]"#,
+            Path::new("/unused"),
+        )
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("A\nB"));
+        assert_eq!(file_paths["image"], ["/in/a.png"]);
+        assert_eq!(in_mods, ["text", "image", "text"], "the layout lost the image's place");
+        assert_eq!(
+            described(&parts),
+            [
+                ("text", "user", Some("A"), 0),
+                ("image", "user", None, 0),
+                ("text", "user", Some("B"), 0),
+            ],
+            "text written after the image moved ahead of it"
+        );
+    }
+
+    #[test]
+    fn two_images_are_indexed_in_order() {
+        let (_, file_paths, in_mods, parts) = flatten(
+            r#"[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"/in/a.png"}},
+                {"type":"image_url","image_url":{"url":"/in/b.png"}},
+                {"type":"text","text":"Compare."}]}]"#,
+            Path::new("/unused"),
+        )
+        .unwrap();
+        assert_eq!(file_paths["image"], ["/in/a.png", "/in/b.png"]);
+        assert_eq!(in_mods, ["image", "image", "text"]);
+        assert_eq!(
+            parts.iter().map(|p| p.index).collect::<Vec<_>>(),
+            [0, 1, 0],
+            "the second image does not address the second upload"
+        );
+    }
+
+    #[test]
+    fn an_attachment_outside_a_user_message_is_refused_before_it_is_saved() {
+        let dir = std::env::temp_dir().join(format!("mstar_adapters_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = flatten(
+            r#"[{"role":"assistant","content":[
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}}]}]"#,
+            &dir,
+        )
+        .unwrap_err();
+        let saved = std::fs::read_dir(&dir).unwrap().count();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(err, "a assistant message cannot carry a image attachment");
+        assert_eq!(saved, 0, "a refused attachment was saved, and nothing cleans it up");
+    }
+}

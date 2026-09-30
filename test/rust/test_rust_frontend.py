@@ -128,6 +128,37 @@ def test_chat_roundtrip(stack):
     assert sub["out"] == ["text"]
 
 
+def test_a_chats_roles_reach_the_bridge(stack):
+    """The chat renders as its own turns, as it does on the default server."""
+    port, stub, _bridge, _proc = stack
+    _post_json(port, "/v1/chat/completions", {"model": "qwen3_omni", "messages": [
+        {"role": "user", "content": "Name a color."},
+        {"role": "assistant", "content": "Blue."},
+        {"role": "user", "content": "Another."},
+    ]})
+    (sub,) = stub.submitted
+    assert [(p.role, p.text) for p in sub["parts"] or []] == [
+        ("user", "Name a color."), ("assistant", "Blue."), ("user", "Another."),
+    ], "the Rust frontend joined the chat into one user turn"
+
+
+def test_a_single_user_message_arrives_as_one_user_part(stack):
+    port, stub, _bridge, _proc = stack
+    _chat(port, "Say hello.")
+    (sub,) = stub.submitted
+    assert [(p.modality, p.role, p.text) for p in sub["parts"] or []] == [
+        ("text", "user", "Say hello."),
+    ], "a one-message chat did not arrive as the one user turn it renders as"
+
+
+def test_generate_arrives_without_parts(stack):
+    """``/generate`` has no messages, so the model takes its legacy layout."""
+    port, stub, _bridge, _proc = stack
+    _generate(port, urlencoded=True)
+    (sub,) = stub.submitted
+    assert sub["parts"] is None, "a /generate submit carried chat parts"
+
+
 def _post_raw(port, path, raw_bytes, timeout=15):
     """POST a raw body (possibly malformed) as application/json; return
     (status, parsed_json_or_None)."""
