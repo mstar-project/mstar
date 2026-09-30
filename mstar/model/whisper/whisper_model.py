@@ -48,7 +48,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.whisper.config import (
     ATTN,
@@ -322,7 +322,7 @@ class WhisperModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Extract the log-mel spectrogram and build the forced decoder prompt.
 
         The text ``prompt`` is unused — Whisper is conditioned via the
@@ -350,10 +350,21 @@ class WhisperModel(Model):
             task=kwargs.get("task", "transcribe"),
         )
 
-        return {
-            "audio_features": [audio_features],
-            "text_inputs": [torch.tensor(prompt_ids, dtype=torch.long)],
-        }
+        return ProcessPromptOutput(
+            {
+                "audio_features": [audio_features],
+                "text_inputs": [torch.tensor(prompt_ids, dtype=torch.long)],
+            },
+            {
+                # the decoder's stream grows by what it decodes; the audio
+                # context is the whole 30 s window, written once
+                "prompt_slots": {
+                    KV_CACHE: {"main": len(prompt_ids)},
+                    CROSS_KV_CACHE: {CONTEXT_LABEL: self.config.max_source_positions},
+                },
+                "decode_labels": {KV_CACHE: ["main"], CROSS_KV_CACHE: []},
+            },
+        )
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
