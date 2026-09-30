@@ -407,6 +407,7 @@ def _submit(server: APIServer, args: SubmitArgs, prefix: str) -> str:
         input_modalities=args.input_modalities,
         output_modalities=args.output_modalities,
         model_kwargs=args.model_kwargs,
+        prompt_parts=args.prompt_parts,
         streaming=True,
         request_id=rid,
     )
