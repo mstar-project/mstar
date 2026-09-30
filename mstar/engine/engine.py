@@ -14,6 +14,7 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
 from mstar.engine.cuda_graph_runner import (
+    CaptureBudget,
     CudaGraphRunner,
     PiecewiseCudaGraphRunner,
     autocast_scope,
@@ -461,6 +462,12 @@ class Engine:
             cg_runners[node_name].prepare_for_capture()
             for runner in piecewise[node_name].values():
                 runner.prepare_for_capture()
+
+        # before the first capture, while every eager step still fits
+        budget = CaptureBudget.measure(self._device, [
+            runner for node_name in self._submodules
+            for runner in (cg_runners[node_name], *piecewise[node_name].values())
+        ])
 
         for node_name, submodule_mgmt in self._submodules.items():
             runner = cg_runners[node_name]

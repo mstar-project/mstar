@@ -1,8 +1,9 @@
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping, NamedTuple
+from typing import Any, Callable, Iterator, Mapping, NamedTuple
 
 import torch
 
@@ -158,6 +159,80 @@ def _stop_recording_to_pool(device, pool) -> None:
         pass
 
 
+class EagerStep(NamedTuple):
+    """What one eager forward of a bucket took on the device."""
+    # bytes allocated at the peak, above what was live
+    peak: int
+    # bytes a pool of its own reserved for it: what its capture takes; None
+    # when nothing can size its capture
+    reserved: int | None
+
+
+def _eager_step(device: torch.device, run: Callable[[], Any]) -> EagerStep:
+    """Run ``run`` in a pool of its own, for what its capture takes, then as
+    serving runs it, for its peak.
+
+    A capture pays for every segment its allocations round up to, about twice
+    the peak for a conv (Code2Wav bs=32: 3.3 GiB peak, 6.9 GiB reserved). Short
+    of room in the pool, cuDNN swaps a conv's cached plan for a smaller
+    workspace and keeps it, so the peak comes after; a forward that overflows
+    the pool leaves ``reserved`` None.
+    """
+    # blocks cached in the shared pool are no use to a pool of its own
+    torch.cuda.empty_cache()
+    pool = torch.cuda.MemPool()
+    try:
+        with torch.cuda.use_mem_pool(pool):
+            run()
+        torch.cuda.synchronize(device)
+        reserved = sum(segment["total_size"] for segment in pool.snapshot())
+    except torch.OutOfMemoryError:
+        reserved = None
+    del pool
+    torch.cuda.empty_cache()
+    live = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    run()
+    torch.cuda.synchronize(device)
+    return EagerStep(peak=torch.cuda.max_memory_allocated(device) - live, reserved=reserved)
+
+
+@dataclass(frozen=True)
+class CaptureBudget:
+    """What CUDA graph capture leaves free on one device.
+
+    A bucket that isn't captured runs eager, so once capture is done the device
+    still has to fit the largest eager step of any runner on it. That step is
+    the floor, and every runner on the device captures against the same one: in
+    whatever order they run, the first can't take what another's eager steps
+    need.
+    """
+    device: torch.device
+    floor: int
+
+    @classmethod
+    def measure(
+        cls, device: torch.device | None,
+        runners: "list[CudaGraphRunner | PiecewiseCudaGraphRunner]",
+    ) -> "CaptureBudget | None":
+        """The budget for ``device``, from the largest eager step of any of ``runners``.
+
+        None off CUDA: capture is skipped there, and asking the driver for
+        memory would fail an XPU or CPU worker at start.
+        """
+        if device is None or device.type != "cuda":
+            return None
+        floor = max((
+            step.peak for runner in runners
+            for step in runner.measure_eager_steps().values()
+        ), default=0)
+        logger.info(
+            "CaptureBudget[%s]: the largest eager step takes %.0f MiB",
+            device, floor / 2**20,
+        )
+        return cls(device=device, floor=floor)
+
+
 class DummyRowPool:
     """The padding rows captured replays pad onto.
 
@@ -234,6 +309,15 @@ class CudaGraphBucket:
     slots: list[CudaGraphSlot] = field(default_factory=list)
 
 
+class WarmedSpec(NamedTuple):
+    """A spec prepared and run eagerly: what its capture reads."""
+    run: Callable[[], Any]
+    static_inputs: dict[str, Any]
+    static_input_keys: tuple[str, ...]
+    dummy_rids: list[int]
+    dummy_metadata: dict[int, CurrentForwardPassInfo]
+
+
 class CudaGraphRunner:
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
     NUM_WARMUP = 2
@@ -275,6 +359,8 @@ class CudaGraphRunner:
         self.dropped_buckets: list[BucketKey] = []
         # set by prepare_for_capture; capture reuses it rather than re-deriving
         self._prepared_slot_specs: list[CGSlotSpec] | None = None
+        # bucket -> its eager step, from measure_eager_steps
+        self._eager_steps: dict[BucketKey, EagerStep] = {}
 
         # (config_idx, tensor_key) → max-bucket static buffer. Lazily populated
         # by _intern_static_buffer on the first capture. Smaller-bucket captures
@@ -372,6 +458,43 @@ class CudaGraphRunner:
             )
             self._prepared_slot_specs = slot_specs
         return self._prepared_slot_specs
+
+    def measure_eager_steps(self) -> dict[BucketKey, EagerStep]:
+        """Warm every spec up before any runner captures, and measure each bucket once.
+
+        Every bucket rather than the first in capture order: that order leads
+        with batch size, so it can open on a decode bucket while a one-row
+        prefill of thousands of tokens peaks far higher. And every slot: a
+        slot's padding rows keep state of their own from their first forward.
+        Warming them all here spends that, and what compiling every shape
+        takes, before the first capture is weighed against the floor.
+        """
+        for spec in self.prepare_for_capture():
+            # the forward may hold collectives; every rank runs these specs, in
+            # config order, as it does the captures
+            self._comm_group.tp_group.barrier()
+            self._comm_group.sp_group.barrier()
+            try:
+                with self._warmed(spec) as warmed:
+                    # at slot 0 alone, so every rank runs the same forwards
+                    if spec.slot == 0 and spec.bucket not in self._eager_steps:
+                        # more forwards where the capture would go, measured
+                        # there and nowhere else: whatever outlives a measured
+                        # call pins its pool
+                        with autocast_scope(self._autocast_dtype):
+                            self._eager_steps[spec.bucket] = _eager_step(self._device, warmed.run)
+            except Exception:
+                # this slot's state would land after the floor: keep the peak, never capture
+                if (step := self._eager_steps.get(spec.bucket)) is not None:
+                    self._eager_steps[spec.bucket] = step._replace(reserved=None)
+                logger.warning(
+                    "CudaGraphRunner[%s]: could not run %s eagerly to size its "
+                    "capture", self._submodule_name, spec, exc_info=True,
+                )
+        # hand the pages back: held through the captures, they would shift every
+        # admit after them on a node that shares the resource
+        self._dummy_rows.release_all()
+        return self._eager_steps
 
     def warmup_and_capture(self):
         """Capture graphs for all configs and batch sizes."""
@@ -509,6 +632,23 @@ class CudaGraphRunner:
         )
 
     def _capture_one(self, spec: CGSlotSpec) -> CudaGraphSlot:
+        with self._warmed(spec) as warmed:
+            graph, output = capture_into_graph(
+                warmed.run, self._memory_pool, self._device, self._autocast_dtype,
+            )
+            return self._build_slot_from_capture(
+                output=output,
+                graph=graph,
+                static_inputs=warmed.static_inputs,
+                static_input_keys=warmed.static_input_keys,
+                dummy_rids=warmed.dummy_rids,
+                dummy_metadata=warmed.dummy_metadata,
+                config_idx=spec.config_idx,
+            )
+
+    @contextmanager
+    def _warmed(self, spec: CGSlotSpec) -> Iterator[WarmedSpec]:
+        """Prepare ``spec`` and run its forward eagerly, as its capture needs first."""
         walk = spec.bucket.graph_walk
         config = spec.config
         dummy_rids = self._dummy_rows.ensure(
@@ -581,18 +721,12 @@ class CudaGraphRunner:
                 prepare()
             torch.cuda.synchronize()
 
-            graph, output = capture_into_graph(
-                run_forward, self._memory_pool, self._device, self._autocast_dtype,
-            )
-
-            return self._build_slot_from_capture(
-                output=output,
-                graph=graph,
+            yield WarmedSpec(
+                run=run_forward,
                 static_inputs=static_inputs,
                 static_input_keys=static_input_keys,
                 dummy_rids=dummy_rids,
                 dummy_metadata=engine_inputs.per_request_info,
-                config_idx=spec.config_idx,
             )
         finally:
             # pages stay with the dummy streams: replay's padding rows address
@@ -999,6 +1133,13 @@ class PiecewiseGraphKey(NamedTuple):
     slot: int
 
 
+class WarmedRegion(NamedTuple):
+    """A region's shape planned and run eagerly: what its capture reads."""
+    run: Callable[[], Any]
+    static_inputs: dict[str, torch.Tensor]
+    dummy_rids: list[int]
+
+
 class PiecewiseCudaGraphRunner:
     """Captures one inner callable of a submodule's forward as a CUDA graph.
 
@@ -1046,6 +1187,8 @@ class PiecewiseCudaGraphRunner:
         self._memory_pool = None
         # (bs, total_tokens) shapes that failed to capture and run eagerly
         self.dropped_shapes: list[tuple[int, int]] = []
+        # bucket -> its eager step, from measure_eager_steps
+        self._eager_steps: dict[BucketKey, EagerStep] = {}
         self._dummy_rows = DummyRowPool(
             prefix=f"pw_{label}", step_runner=step_runner, resources=resources,
         )
@@ -1119,6 +1262,37 @@ class PiecewiseCudaGraphRunner:
                 )
             self._prepared_shapes = shapes
         return self._prepared_shapes
+
+    def measure_eager_steps(self) -> dict[BucketKey, EagerStep]:
+        """Warm every shape and slot up, measuring each shape once; see
+        ``CudaGraphRunner.measure_eager_steps``."""
+        torch.cuda.set_device(self._device)
+        shapes = sorted(
+            self.prepare_for_capture(), key=lambda s: (s.bs, s.total_tokens), reverse=True,
+        )
+        for shape in shapes:
+            for slot in range(self._num_slots):
+                if self._comm_group is not None:
+                    self._comm_group.tp_group.barrier()
+                    self._comm_group.sp_group.barrier()
+                try:
+                    with self._warmed(shape, slot) as warmed:
+                        if slot == 0:
+                            with autocast_scope(self._autocast_dtype):
+                                self._eager_steps[self._bucket(shape)] = _eager_step(
+                                    self._device, warmed.run,
+                                )
+                except Exception:
+                    # as in `CudaGraphRunner.measure_eager_steps`
+                    if (step := self._eager_steps.get(self._bucket(shape))) is not None:
+                        self._eager_steps[self._bucket(shape)] = step._replace(reserved=None)
+                    logger.warning(
+                        "PiecewiseCudaGraphRunner[%s]: could not run bs=%d total_tokens=%d "
+                        "slot=%d eagerly to size its capture", self._label, shape.bs,
+                        shape.total_tokens, slot, exc_info=True,
+                    )
+        self._dummy_rows.release_all()
+        return self._eager_steps
 
     def warmup_and_capture(self) -> None:
         if self._device is None or not torch.cuda.is_available():
@@ -1197,6 +1371,27 @@ class PiecewiseCudaGraphRunner:
             )
 
     def _capture_one(self, shape: PiecewiseCaptureShape, slot: int) -> None:
+        with self._warmed(shape, slot) as warmed:
+            graph, raw_outputs = capture_into_graph(
+                warmed.run, self._memory_pool, self._device, self._autocast_dtype,
+            )
+            static_outputs = self._normalize_output(raw_outputs)
+
+        self._graphs[PiecewiseGraphKey(
+            bs=shape.bs, seq_len=shape.total_tokens, slot=slot
+        )] = PiecewiseGraphData(
+            graph=graph,
+            static_inputs=warmed.static_inputs,
+            static_outputs=static_outputs,
+            dummy_rids=list(warmed.dummy_rids),
+            shape=shape,
+            bucket=self._bucket(shape),
+        )
+
+    @contextmanager
+    def _warmed(self, shape: PiecewiseCaptureShape, slot: int) -> Iterator[WarmedRegion]:
+        """Plan ``shape`` and run the region eagerly, as its capture needs first;
+        see ``CudaGraphRunner._warmed``."""
         dummy_rids = self._dummy_rows.ensure(
             self._dummy_key(shape, slot), shape.bs
         )
@@ -1228,25 +1423,14 @@ class PiecewiseCudaGraphRunner:
                 self._plan(step, shape)
             torch.cuda.synchronize()
 
-            graph, raw_outputs = capture_into_graph(
-                run_fn, self._memory_pool, self._device, self._autocast_dtype,
+            yield WarmedRegion(
+                run=run_fn, static_inputs=static_inputs,
+                dummy_rids=dummy_rids,
             )
-            static_outputs = self._normalize_output(raw_outputs)
         finally:
             # pages stay with the dummy streams: replay's padding rows address
             # the same ids, so their plan finds the storage already resident
             self._dummy_rows.reset(dummy_rids)
-
-        self._graphs[PiecewiseGraphKey(
-            bs=shape.bs, seq_len=shape.total_tokens, slot=slot
-        )] = PiecewiseGraphData(
-            graph=graph,
-            static_inputs=static_inputs,
-            static_outputs=static_outputs,
-            dummy_rids=list(dummy_rids),
-            shape=shape,
-            bucket=self._bucket(shape),
-        )
 
     def _call_inputs(
         self,
