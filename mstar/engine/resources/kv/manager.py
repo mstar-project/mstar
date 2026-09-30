@@ -916,7 +916,7 @@ class KVManager(AttentionResource):
                 self._preplan_marked = []
             for (from_label, to_label), extra in forks:
                 for rid in ctx.padded_request_ids:
-                    if self._in_sink(rid, ctx):
+                    if self._in_sink(rid, ctx, to_label):
                         continue
                     # checked before the reservation, which is what creates it
                     if (
@@ -932,9 +932,11 @@ class KVManager(AttentionResource):
                         return AdmitOutcome(ok=False, reason=alloc_res.error)
 
             for segment in step.segments:
-                if segment.span == 0 or self._in_sink(segment.request_id, ctx):
+                if segment.span == 0:
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
+                if self._in_sink(segment.request_id, ctx, segment.label):
+                    continue
                 alloc_res = self._alloc(
                     segment.request_id,
                     segment.label,
@@ -978,8 +980,9 @@ class KVManager(AttentionResource):
             length = s.span + stream.stored_len
             num_pages = -(-length // page_size)
             page_idxs = stream.page_indices[:num_pages]
-            if self._is_padding(s.request_id):
-                # a replay's padding row took no page of its own: its token lands in the sink
+            if self._is_padding(s.request_id) or self._unheld(s.request_id, s.label):
+                # a replay's padding row, or a label its request holds nothing
+                # in, took no page of its own: its tokens land in the sink
                 page_idxs += [SINK_PAGE] * (num_pages - len(page_idxs))
             views.append(SequenceView(
                 request_id=s.request_id,
@@ -1120,7 +1123,7 @@ class KVManager(AttentionResource):
         undo = self._preplan_fork_undo if ctx.is_preplan else None
         for (from_label, to_label) in step.pre_forks:
             for rid in ctx.padded_request_ids:
-                if not self._in_sink(rid, ctx):
+                if not self._in_sink(rid, ctx, to_label):
                     self._apply_fork(rid, from_label, to_label, undo=undo)
         res = KVPlanOutputs(
             {
@@ -1191,7 +1194,12 @@ class KVManager(AttentionResource):
                 # tokens (image_gen, action_gen) still read these pages, and
                 # leaving the mark set would make the request unevictable
                 stream.step_in_flight = False
-                if step.commit and segment.span > 0:
+                # what a label the request holds nothing in wrote went to the
+                # sink, so it keeps no length a reload would size pages for
+                if (
+                    step.commit and segment.span > 0
+                    and not self._unheld(segment.request_id, segment.label)
+                ):
                     # an offload beat the mark (claimed before this step's
                     # admit). the host copy predates the span, so writing the
                     # length here would be lost on reload
@@ -1214,7 +1222,7 @@ class KVManager(AttentionResource):
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
                 for rid in ctx.padded_request_ids:
-                    if not self._in_sink(rid, ctx):
+                    if not self._in_sink(rid, ctx, to_label):
                         self._apply_fork(rid, from_label, to_label)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
@@ -1638,15 +1646,27 @@ class KVManager(AttentionResource):
         # CUDA-graph padding rows carry negative handles; tests key requests by str
         return isinstance(rid, int) and rid < 0
 
-    def _in_sink(self, rid, ctx: StepContext) -> bool:
-        """Whether ``rid`` is a replay's padding row, which writes into the sink.
+    def _in_sink(self, rid, ctx: StepContext, label: str) -> bool:
+        """Whether what ``rid`` writes to ``label`` goes into the sink.
 
         A batched replay gives its padding rows their capture span, so each
         would otherwise take a page per label on its first replay and keep it,
         in every bucket, config and slot, which no request could be admitted
         against. A capture still gives them pages, and hands them back after.
         """
-        return not ctx.capture and self._is_padding(rid)
+        return (not ctx.capture and self._is_padding(rid)) or self._unheld(rid, label)
+
+    def _unheld(self, rid, label: str) -> bool:
+        """Whether the model counted ``rid`` out of ``label``.
+
+        A model can run a label for a whole batch (Bagel's guidance branches run
+        for every row once one row needs them), and a row whose request holds
+        nothing there never reads back what it wrote. Pages for it would be
+        pages the request never reserved.
+        """
+        overrides = self._overrides.get(rid)
+        slots = overrides.prompt_slots if overrides is not None else None
+        return bool(slots) and label not in slots
 
     def _labels_opened(self, overrides: KVReqConfig) -> set[str]:
         """The labels ``overrides`` can open on this pool's nodes, on any walk."""

@@ -75,7 +75,8 @@ class KVReqConfig(ResourceReqConfig):
     prefix_cache: bool = True
     # the most tokens the request may generate; None on a row no request owns
     max_tokens: int | None = None
-    # label -> tokens it holds over the request's life, decode aside, as the model counts them
+    # label -> tokens it holds over the request's life, decode aside, as the model counts them;
+    # a label left out holds none, so what a batch writes there for the request lands in the sink
     prompt_slots: dict[str, int] | None = None
     # labels decode grows, by up to max_tokens; read only beside prompt_slots
     decode_labels: list[str] | None = None
