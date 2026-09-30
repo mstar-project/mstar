@@ -864,11 +864,13 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.api_server.openai.serving_speech</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""/v1/audio/speech handler (text-to-speech).</span>
+<span></span><span class="sd">"""/v1/audio/speech and /v1/audio/voices handlers (text-to-speech).</span>
 
-<span class="sd">Non-streaming returns the full audio as a container blob (WAV by default).</span>
-<span class="sd">Streaming returns a single open-ended WAV response (header + PCM16 frames) as</span>
-<span class="sd">the audio is produced.</span>
+<span class="sd">Non-streaming speech returns the full audio as a container blob (WAV by</span>
+<span class="sd">default). Streaming returns one open-ended response as the audio is produced:</span>
+<span class="sd">a WAV header followed by PCM16 frames, or, with ``response_format="pcm"``,</span>
+<span class="sd">the bare PCM16 frames that the OpenAI TTS clients (LiveKit, Pipecat) expect.</span>
+<span class="sd">``/v1/audio/voices`` lists the ``voice`` values the served model accepts.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
@@ -877,6 +879,22 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">rid</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai.protocol</span><span class="w"> </span><span class="kn">import</span> <span class="n">VoiceCard</span><span class="p">,</span> <span class="n">VoiceList</span>
+
+
+<div class="viewcode-block" id="list_voices">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html#mstar.api_server.openai.serving_speech.list_voices">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">list_voices</span><span class="p">(</span><span class="n">api</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">VoiceList</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The served model's voices, or ``None`` when it has no fixed list."""</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span>
+    <span class="n">voices</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">get_voices</span><span class="p">()</span> <span class="k">if</span> <span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+    <span class="k">if</span> <span class="n">voices</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span>
+    <span class="k">return</span> <span class="n">VoiceList</span><span class="p">(</span>
+        <span class="n">voices</span><span class="o">=</span><span class="p">[</span><span class="n">VoiceCard</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="n">v</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">voices</span><span class="p">],</span>
+        <span class="n">default_voice</span><span class="o">=</span><span class="n">model</span><span class="o">.</span><span class="n">get_default_voice</span><span class="p">(),</span>
+    <span class="p">)</span></div>
+
 
 
 <div class="viewcode-block" id="create_speech">
@@ -898,9 +916,10 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span>
 
     <span class="k">if</span> <span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">:</span>
+        <span class="n">raw_pcm</span> <span class="o">=</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"pcm"</span>
         <span class="k">return</span> <span class="n">StreamingResponse</span><span class="p">(</span>
-            <span class="n">_stream_wav</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">),</span>
-            <span class="n">media_type</span><span class="o">=</span><span class="s2">"audio/wav"</span><span class="p">,</span>
+            <span class="n">_stream_pcm</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">with_wav_header</span><span class="o">=</span><span class="ow">not</span> <span class="n">raw_pcm</span><span class="p">),</span>
+            <span class="n">media_type</span><span class="o">=</span><span class="s2">"audio/pcm"</span> <span class="k">if</span> <span class="n">raw_pcm</span> <span class="k">else</span> <span class="s2">"audio/wav"</span><span class="p">,</span>
             <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">},</span>
         <span class="p">)</span>
 
@@ -911,8 +930,9 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_stream_wav</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">):</span>
-    <span class="k">yield</span> <span class="n">media_io</span><span class="o">.</span><span class="n">wav_stream_header</span><span class="p">(</span><span class="n">sample_rate</span><span class="p">)</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_stream_pcm</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">with_wav_header</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">with_wav_header</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">media_io</span><span class="o">.</span><span class="n">wav_stream_header</span><span class="p">(</span><span class="n">sample_rate</span><span class="p">)</span>
     <span class="k">async</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">request_id</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span> <span class="ow">and</span> <span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">:</span>
             <span class="k">yield</span> <span class="n">c</span><span class="o">.</span><span class="n">data</span>

@@ -923,7 +923,14 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Available voices</span>
     <span class="n">available_voices</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
         <span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="s2">"tara"</span><span class="p">,</span> <span class="s2">"zoe"</span><span class="p">,</span> <span class="s2">"zac"</span><span class="p">,</span> <span class="s2">"jess"</span><span class="p">,</span> <span class="s2">"leo"</span><span class="p">,</span> <span class="s2">"mia"</span><span class="p">,</span> <span class="s2">"julia"</span><span class="p">,</span> <span class="s2">"leah"</span><span class="p">]</span>
-    <span class="p">)</span></div>
+    <span class="p">)</span>
+    <span class="n">default_voice</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"tara"</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">default_voice</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">available_voices</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"default_voice </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">default_voice</span><span class="si">!r}</span><span class="s2"> is not in available_voices"</span>
+            <span class="p">)</span></div>
 
 </pre></div>
 

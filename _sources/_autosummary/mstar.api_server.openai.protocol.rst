@@ -24,6 +24,8 @@ mstar.api\_server.openai.protocol
       ModelList
       SpeechRequest
       VideoGenerationRequest
+      VoiceCard
+      VoiceList
    
    
 

@@ -574,6 +574,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_speech.create_speech"><code class="docutils literal notranslate"><span class="pre">create_speech()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_speech.list_voices"><code class="docutils literal notranslate"><span class="pre">list_voices()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -587,15 +588,20 @@
                   
   <section id="module-mstar.api_server.openai.serving_speech">
 <span id="mstar-api-server-openai-serving-speech"></span><h1>mstar.api_server.openai.serving_speech<a class="headerlink" href="#module-mstar.api_server.openai.serving_speech" title="Link to this heading">#</a></h1>
-<p>/v1/audio/speech handler (text-to-speech).</p>
-<p>Non-streaming returns the full audio as a container blob (WAV by default).
-Streaming returns a single open-ended WAV response (header + PCM16 frames) as
-the audio is produced.</p>
+<p>/v1/audio/speech and /v1/audio/voices handlers (text-to-speech).</p>
+<p>Non-streaming speech returns the full audio as a container blob (WAV by
+default). Streaming returns one open-ended response as the audio is produced:
+a WAV header followed by PCM16 frames, or, with <code class="docutils literal notranslate"><span class="pre">response_format=&quot;pcm&quot;</span></code>,
+the bare PCM16 frames that the OpenAI TTS clients (LiveKit, Pipecat) expect.
+<code class="docutils literal notranslate"><span class="pre">/v1/audio/voices</span></code> lists the <code class="docutils literal notranslate"><span class="pre">voice</span></code> values the served model accepts.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_speech.create_speech" title="mstar.api_server.openai.serving_speech.create_speech"><code class="xref py py-obj docutils literal notranslate"><span class="pre">create_speech</span></code></a>(api, model_name, adapter, req)</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.serving_speech.list_voices" title="mstar.api_server.openai.serving_speech.list_voices"><code class="xref py py-obj docutils literal notranslate"><span class="pre">list_voices</span></code></a>(api)</p></td>
+<td><p>The served model's voices, or <code class="docutils literal notranslate"><span class="pre">None</span></code> when it has no fixed list.</p></td>
 </tr>
 </tbody>
 </table>
@@ -604,6 +610,17 @@ the audio is produced.</p>
 <dt class="sig sig-object py" id="mstar.api_server.openai.serving_speech.create_speech">
 <span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_speech.</span></span><span class="sig-name descname"><span class="pre">create_speech</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">api</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">adapter</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">raw_request</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_speech.html#create_speech"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_speech.create_speech" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.serving_speech.list_voices">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.serving_speech.</span></span><span class="sig-name descname"><span class="pre">list_voices</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">api</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/serving_speech.html#list_voices"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.serving_speech.list_voices" title="Link to this definition">#</a></dt>
+<dd><p>The served model’s voices, or <code class="docutils literal notranslate"><span class="pre">None</span></code> when it has no fixed list.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.VoiceList" title="mstar.api_server.openai.protocol.VoiceList"><em>VoiceList</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
 
 </section>
 
@@ -655,6 +672,7 @@ the audio is produced.</p>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_speech.create_speech"><code class="docutils literal notranslate"><span class="pre">create_speech()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.serving_speech.list_voices"><code class="docutils literal notranslate"><span class="pre">list_voices()</span></code></a></li>
 </ul>
   </nav></div>
 

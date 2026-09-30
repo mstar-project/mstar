@@ -646,6 +646,19 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VideoGenerationRequest.video"><code class="docutils literal notranslate"><span class="pre">VideoGenerationRequest.video</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceCard"><code class="docutils literal notranslate"><span class="pre">VoiceCard</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceCard.id"><code class="docutils literal notranslate"><span class="pre">VoiceCard.id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceCard.model_config"><code class="docutils literal notranslate"><span class="pre">VoiceCard.model_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceCard.name"><code class="docutils literal notranslate"><span class="pre">VoiceCard.name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceList"><code class="docutils literal notranslate"><span class="pre">VoiceList</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceList.default_voice"><code class="docutils literal notranslate"><span class="pre">VoiceList.default_voice</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceList.model_config"><code class="docutils literal notranslate"><span class="pre">VoiceList.model_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceList.object"><code class="docutils literal notranslate"><span class="pre">VoiceList.object</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceList.voices"><code class="docutils literal notranslate"><span class="pre">VoiceList.voices</span></code></a></li>
+</ul>
+</li>
 </ul>
             </nav>
         </div>
@@ -687,6 +700,12 @@ built as plain dicts in the serving handlers to keep the multimodal shapes
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.protocol.VideoGenerationRequest" title="mstar.api_server.openai.protocol.VideoGenerationRequest"><code class="xref py py-obj docutils literal notranslate"><span class="pre">VideoGenerationRequest</span></code></a>(*, prompt[, model, ...])</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/v1/videos/generations</span></code> (text/image/video-to-video).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.protocol.VoiceCard" title="mstar.api_server.openai.protocol.VoiceCard"><code class="xref py py-obj docutils literal notranslate"><span class="pre">VoiceCard</span></code></a>(*, id, name)</p></td>
+<td><p>One entry of <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/audio/voices</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.protocol.VoiceList" title="mstar.api_server.openai.protocol.VoiceList"><code class="xref py py-obj docutils literal notranslate"><span class="pre">VoiceList</span></code></a>(*[, object, voices, default_voice])</p></td>
+<td><p></p></td>
 </tr>
 </tbody>
 </table>
@@ -1100,6 +1119,74 @@ video-to-video. Extra knobs (<code class="docutils literal notranslate"><span cl
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.openai.protocol.VoiceCard">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.protocol.</span></span><span class="sig-name descname"><span class="pre">VoiceCard</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/protocol.html#VoiceCard"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.protocol.VoiceCard" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">BaseModel</span></code></p>
+<p>One entry of <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/audio/voices</span></code>. <code class="docutils literal notranslate"><span class="pre">id</span></code> is what <code class="docutils literal notranslate"><span class="pre">voice</span></code> accepts;
+<code class="docutils literal notranslate"><span class="pre">name</span></code> duplicates it for clients that render a voice picker.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.protocol.VoiceCard.id">
+<span class="sig-name descname"><span class="pre">id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.api_server.openai.protocol.VoiceCard.id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.protocol.VoiceCard.model_config">
+<span class="sig-name descname"><span class="pre">model_config</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{}</span></span><a class="headerlink" href="#mstar.api_server.openai.protocol.VoiceCard.model_config" title="Link to this definition">#</a></dt>
+<dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.protocol.VoiceCard.name">
+<span class="sig-name descname"><span class="pre">name</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.api_server.openai.protocol.VoiceCard.name" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.openai.protocol.VoiceList">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.protocol.</span></span><span class="sig-name descname"><span class="pre">VoiceList</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">object</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'list'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">voices</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">default_voice</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/protocol.html#VoiceList"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.protocol.VoiceList" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">BaseModel</span></code></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>object</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>voices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.api_server.openai.protocol.VoiceCard" title="mstar.api_server.openai.protocol.VoiceCard"><em>VoiceCard</em></a><em>]</em>)</p></li>
+<li><p><strong>default_voice</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.protocol.VoiceList.default_voice">
+<span class="sig-name descname"><span class="pre">default_voice</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.api_server.openai.protocol.VoiceList.default_voice" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.protocol.VoiceList.model_config">
+<span class="sig-name descname"><span class="pre">model_config</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{}</span></span><a class="headerlink" href="#mstar.api_server.openai.protocol.VoiceList.model_config" title="Link to this definition">#</a></dt>
+<dd><p>Configuration for the model, should be a dictionary conforming to [<cite>ConfigDict</cite>][pydantic.config.ConfigDict].</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.protocol.VoiceList.object">
+<span class="sig-name descname"><span class="pre">object</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.api_server.openai.protocol.VoiceList.object" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.protocol.VoiceList.voices">
+<span class="sig-name descname"><span class="pre">voices</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.api_server.openai.protocol.VoiceCard" title="mstar.api_server.openai.protocol.VoiceCard"><span class="pre">VoiceCard</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.api_server.openai.protocol.VoiceList.voices" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
 </section>
 
 
@@ -1220,6 +1307,19 @@ video-to-video. Extra knobs (<code class="docutils literal notranslate"><span cl
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VideoGenerationRequest.seed"><code class="docutils literal notranslate"><span class="pre">VideoGenerationRequest.seed</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VideoGenerationRequest.size"><code class="docutils literal notranslate"><span class="pre">VideoGenerationRequest.size</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VideoGenerationRequest.video"><code class="docutils literal notranslate"><span class="pre">VideoGenerationRequest.video</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceCard"><code class="docutils literal notranslate"><span class="pre">VoiceCard</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceCard.id"><code class="docutils literal notranslate"><span class="pre">VoiceCard.id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceCard.model_config"><code class="docutils literal notranslate"><span class="pre">VoiceCard.model_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceCard.name"><code class="docutils literal notranslate"><span class="pre">VoiceCard.name</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceList"><code class="docutils literal notranslate"><span class="pre">VoiceList</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceList.default_voice"><code class="docutils literal notranslate"><span class="pre">VoiceList.default_voice</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceList.model_config"><code class="docutils literal notranslate"><span class="pre">VoiceList.model_config</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceList.object"><code class="docutils literal notranslate"><span class="pre">VoiceList.object</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.protocol.VoiceList.voices"><code class="docutils literal notranslate"><span class="pre">VoiceList.voices</span></code></a></li>
 </ul>
 </li>
 </ul>

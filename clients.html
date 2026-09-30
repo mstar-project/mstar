@@ -749,10 +749,13 @@ when <code class="docutils literal notranslate"><span class="pre">stream=False</
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tts(text,</span> <span class="pre">*,</span> <span class="pre">voice=None,</span> <span class="pre">**kw)</span></code></p></td>
 <td><p>An <code class="docutils literal notranslate"><span class="pre">AudioBuffer</span></code> (<code class="docutils literal notranslate"><span class="pre">.to_wav(path)</span></code>, <code class="docutils literal notranslate"><span class="pre">.to_numpy()</span></code>, <code class="docutils literal notranslate"><span class="pre">len(...)</span></code> samples).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">stream(**kw)</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">voices()</span></code></p></td>
+<td><p>The <code class="docutils literal notranslate"><span class="pre">voice</span></code> ids the served speech model accepts (<code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/audio/voices</span></code>).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">stream(**kw)</span></code></p></td>
 <td><p>Sugar for <code class="docutils literal notranslate"><span class="pre">generate(stream=True,</span> <span class="pre">...)</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">health()</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">health()</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">True</span></code> if the server is healthy.</p></td>
 </tr>
 </tbody>
@@ -814,11 +817,15 @@ semantics. Point any OpenAI client at <code class="docutils literal notranslate"
 <td><p><code class="docutils literal notranslate"><span class="pre">orpheus</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
 <td><p>Text-to-speech.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/generations</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/audio/voices</span></code></p></td>
+<td><p>speech models that publish a voice list through their speech adapter (<code class="docutils literal notranslate"><span class="pre">orpheus</span></code>; 404 otherwise)</p></td>
+<td><p>The <code class="docutils literal notranslate"><span class="pre">voice</span></code> ids the served model accepts, plus its default.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/generations</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code></p></td>
 <td><p>Text-to-image.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/edits</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/edits</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code></p></td>
 <td><p>Image editing (image + prompt → image).</p></td>
 </tr>
@@ -832,6 +839,8 @@ semantics. Point any OpenAI client at <code class="docutils literal notranslate"
 
 <span class="c1"># text-to-speech</span>
 <span class="n">client</span><span class="o">.</span><span class="n">audio</span><span class="o">.</span><span class="n">speech</span><span class="o">.</span><span class="n">create</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"orpheus"</span><span class="p">,</span> <span class="nb">input</span><span class="o">=</span><span class="s2">"hello there"</span><span class="p">,</span> <span class="n">voice</span><span class="o">=</span><span class="s2">"tara"</span><span class="p">)</span>
+<span class="c1"># (mstar extension) the voices the served model accepts</span>
+<span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"http://localhost:8000/v1/audio/voices"</span><span class="p">)</span><span class="o">.</span><span class="n">json</span><span class="p">()[</span><span class="s2">"voices"</span><span class="p">]</span>
 
 <span class="c1"># image generation</span>
 <span class="n">client</span><span class="o">.</span><span class="n">images</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"bagel"</span><span class="p">,</span> <span class="n">prompt</span><span class="o">=</span><span class="s2">"a cat in a hat"</span><span class="p">)</span>

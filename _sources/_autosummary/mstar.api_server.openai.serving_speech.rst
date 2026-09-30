@@ -14,6 +14,7 @@ mstar.api\_server.openai.serving\_speech
    .. autosummary::
    
       create_speech
+      list_voices
    
    
 

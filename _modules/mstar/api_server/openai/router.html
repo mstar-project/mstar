@@ -983,6 +983,20 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="audio_voices">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.audio_voices">[docs]</a>
+<span class="nd">@router</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"/v1/audio/voices"</span><span class="p">)</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">audio_voices</span><span class="p">():</span>
+    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_speech"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">err</span>
+    <span class="n">voices</span> <span class="o">=</span> <span class="n">serving_speech</span><span class="o">.</span><span class="n">list_voices</span><span class="p">(</span><span class="n">api</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">voices</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">404</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"Model </span><span class="si">{</span><span class="n">model_name</span><span class="si">!r}</span><span class="s2"> does not publish a voice list"</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">voices</span><span class="o">.</span><span class="n">model_dump</span><span class="p">())</span></div>
+
+
+
 <div class="viewcode-block" id="images_generations">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.images_generations">[docs]</a>
 <span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/images/generations"</span><span class="p">)</span>
