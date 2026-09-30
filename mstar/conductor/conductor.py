@@ -908,6 +908,8 @@ class Conductor:
         prefix_tail = kwargs.get("prefix_tail") or {}
         prefix_decode = kwargs.get("prefix_decode") or {}
         prefix_cache = kwargs.get("prefix_cache")
+        prompt_slots = kwargs.get("prompt_slots") or {}
+        decode_labels = kwargs.get("decode_labels") or {}
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
                 seed=seed,
@@ -916,6 +918,8 @@ class Conductor:
                 prefix_decode=prefix_decode.get(key),
                 prefix_cache=prefix_cache,
                 max_tokens=request_data.max_output_tokens,
+                prompt_slots=prompt_slots.get(key),
+                decode_labels=decode_labels.get(key),
             )
 
         # Send NewRequest to each worker with the appropriate partition's inputs

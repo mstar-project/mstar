@@ -164,7 +164,10 @@ def bagel():
 
     class _Bagel(BagelModel):
         def __init__(self):
-            self.config = SimpleNamespace(think_mode=False)
+            self.config = SimpleNamespace(
+                think_mode=False, vit_max_num_patch_per_side=70,
+                max_latent_size=64, latent_downsample=16,
+            )
             self.tokenizer = _StubTokenizer()
             self.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]
             self.eoi_token_id = _StubTokenizer.SPECIALS["<|vision_end|>"]
@@ -188,7 +191,7 @@ def _decoded(bagel, spans):
 )
 def test_legacy_layouts_tokenize_exactly_as_before(bagel, prompt, in_mods, out_mods):
     """Requests with no ordering to preserve keep their existing prompt."""
-    spans = _decoded(bagel, bagel.process_prompt(prompt, in_mods, out_mods)["text_inputs"])
+    spans = _decoded(bagel, bagel.process_prompt(prompt, in_mods, out_mods).new_input_tensors["text_inputs"])
     expected = {
         ("image", "text", "text"): [
             bagel.VLM_UNDERSTANDING_PREFIX.format(
@@ -210,7 +213,7 @@ def test_text_before_an_attachment_stays_before_it(bagel):
     ]
     spans = _decoded(bagel, bagel.process_prompt(
         "look at this", ["text", "image"], ["text"], prompt_parts=parts
-    )["text_inputs"])
+    ).new_input_tensors["text_inputs"])
     assert spans[0].endswith("look at this")
     assert "look at this" not in spans[-1]
 
@@ -227,7 +230,7 @@ def test_interleaved_layout_prefills_end_to_end(bagel):
     in_mods = [p.modality for p in parts]
     tensors = bagel.process_prompt(
         "A\nB\nC", in_mods, ["text"], prompt_parts=parts
-    )["text_inputs"]
+    ).new_input_tensors["text_inputs"]
     spans = _decoded(bagel, tensors)
     assert len(spans) == 3
     assert spans[0].endswith("A")
@@ -290,7 +293,7 @@ def test_bagel_spans_come_from_one_tokenization(bagel):
     assert bagel.IMAGE_PLACEHOLDER in rendered
     spans = bagel.process_prompt(
         "A\nB", [p.modality for p in parts], ["text"], prompt_parts=parts
-    )["text_inputs"]
+    ).new_input_tensors["text_inputs"]
     # Concatenating the spans back, with the placeholder's interior restored,
     # reproduces the single tokenization they were sliced out of.
     whole = bagel.tokenizer.encode(rendered)

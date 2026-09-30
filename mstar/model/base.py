@@ -43,6 +43,8 @@ class ProcessPromptOutput(NamedTuple):
     The data worker folds ``metadata`` into the request's ``model_kwargs``, so
     what a model settles while tokenizing reaches
     `get_request_resource_configs` without a field of its own on the request.
+    ``prompt_slots`` and ``decode_labels``, keyed by resource like the prefix
+    keys, are what a KV cache reserves a request's pages by.
     """
     new_input_tensors: NameToTensorList
     metadata: dict

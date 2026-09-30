@@ -80,7 +80,7 @@ from mstar.model.bagel.submodules import (
     VAEEncoderSubmodule,
     ViTEncoderSubmodule,
 )
-from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream
+from mstar.model.base import DECODE, ForwardPassArgs, Model, PrefixStream, ProcessPromptOutput
 from mstar.model.loader import iter_safetensors_file, load_hf_weights
 from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
@@ -576,7 +576,7 @@ class BagelModel(Model):
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         """Tokenize the prompt into one text span per prefill step.
 
         Returns model-specific keys matching get_forward_pass_inputs:
@@ -667,7 +667,9 @@ class BagelModel(Model):
                 for img in tensors["image_inputs"]
             ]
 
-        return result
+        return ProcessPromptOutput(
+            result, self._kv_slots(result, tensors, output_modalities, kwargs),
+        )
 
     @staticmethod
     def _resize_to_fit(
@@ -703,6 +705,43 @@ class BagelModel(Model):
             align_corners=False,
         )
         return resized.squeeze(0)
+
+    def _kv_slots(
+        self, result: NameToTensorList, tensors: NameToTensorList | None,
+        output_modalities: list[str], kwargs: dict,
+    ) -> dict:
+        """What each ``kv`` label holds over the request's life, decode aside,
+        and the labels decode grows, for the cache to admit the request by.
+
+        An attachment counts at its encoder's largest grid, not the size it is
+        resized to, so the count never falls short of what its ViT and VAE walks
+        write. The guidance labels take main's count: each holds at most main's.
+        """
+        segments = result.get("text_inputs")
+        if not segments:
+            return {}
+        cfg = self.config
+        generating = "image" in output_modalities
+        images = (tensors or {}).get("image_inputs") or []
+        per_image = cfg.vit_max_num_patch_per_side ** 2 + 2
+        if generating:
+            per_image += cfg.max_latent_size ** 2 + 2
+        main = sum(len(span) for span in segments) + len(images) * per_image
+        if not generating:
+            return {"prompt_slots": {"kv": {"main": main}}, "decode_labels": {"kv": ["main"]}}
+        # an edit generates at its input's size (see get_initial_forward_pass_args)
+        edited = result.get("image_inputs")
+        if edited:
+            height, width = edited[0].shape[-2:]
+        else:
+            height, width = kwargs.get("height", 1024), kwargs.get("width", 1024)
+        main += (height // cfg.latent_downsample) * (width // cfg.latent_downsample) + 2
+        labels = ("main", "cfg_text", "cfg_img")
+        think = kwargs.get("think_mode", cfg.think_mode)
+        return {
+            "prompt_slots": {"kv": dict.fromkeys(labels, main)},
+            "decode_labels": {"kv": list(labels) if think else []},
+        }
 
     def postprocess(
         self, output: torch.Tensor,
