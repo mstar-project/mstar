@@ -112,18 +112,11 @@ def _deployment(page_size: int = PAGE_SIZE) -> dict:
     return {"model": "stub", "resources": {"kv": {"page_size": page_size}}}
 
 
-def _apply_chain(cfg, key: str, model_kwargs: dict | None) -> None:
-    """One config's share of the conductor's loop over a request's chains."""
-    kwargs = model_kwargs or {}
-    cfg.apply_conductor_config(
-        seed=1,
-        prefix_keys=(kwargs.get("prefix_keys") or {}).get(key),
-        prefix_tail=(kwargs.get("prefix_tail") or {}).get(key),
-        prefix_decode=(kwargs.get("prefix_decode") or {}).get(key),
-        prefix_cache=kwargs.get("prefix_cache"),
-        prompt_slots=(kwargs.get("prompt_slots") or {}).get(key),
-        decode_labels=(kwargs.get("decode_labels") or {}).get(key),
-    )
+def _apply_chain(
+    cfg, key: str, model_kwargs: dict | None, max_tokens: int | None = None,
+) -> None:
+    """One config's share of the conductor's stamp over a request's configs."""
+    Conductor._stamp_resource_configs({key: cfg}, model_kwargs, seed=1, max_tokens=max_tokens)
 
 
 def _handed_over(model_kwargs: dict, key: str = "kv") -> KVReqConfig:
@@ -361,15 +354,16 @@ class _SamplerOnlyModel(_Model):
         return {"sampler": SamplingReqConfig()}
 
 
-def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
+def _conductor_configs(
+    model, model_kwargs: dict | None = None, max_tokens: int | None = None,
+) -> dict:
     """The configs a request is opened with, as the conductor resolves them:
-    the model's own, a default for anything it declared a stream for, and then
-    each handed its own chain."""
+    the model's own, a default for anything it declared a stream for or any
+    cache, and then each stamped with its own chain and counts."""
     configs = Conductor._get_resource_configs(
         SimpleNamespace(model=model), model_kwargs, {},
     )
-    for key, cfg in configs.items():
-        _apply_chain(cfg, key, model_kwargs)
+    Conductor._stamp_resource_configs(configs, model_kwargs, seed=1, max_tokens=max_tokens)
     return configs
 
 
@@ -441,13 +435,16 @@ def test_whisper_hands_each_cache_what_it_will_hold():
         None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(16000)]},
     )
 
-    configs = _conductor_configs(whisper, out.metadata)
+    configs = _conductor_configs(whisper, out.metadata, max_tokens=444)
 
     handed = {
-        key: (configs[key].prompt_slots, configs[key].decode_labels)
+        key: (configs[key].max_tokens, configs[key].prompt_slots, configs[key].decode_labels)
         for key in ("kv_cache", "cross_kv_cache")
     }
     assert handed == {
-        "kv_cache": ({"main": 4}, ["main"]),
-        "cross_kv_cache": ({"main": 1500}, []),
-    }, "whisper's caches were not handed the forced prompt and the audio window"
+        "kv_cache": (444, {"main": 4}, ["main"]),
+        "cross_kv_cache": (444, {"main": 1500}, []),
+    }, (
+        "the conductor's stamp left whisper's caches without the count and the "
+        "growth they are admitted by"
+    )
