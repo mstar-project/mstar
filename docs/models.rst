@@ -73,9 +73,11 @@ Notes
 OmniVoice notes
 ~~~~~~~~~~~~~~~
 
-- Zero-shot only: there are no built-in speakers. Pass ``ref_audio`` with its
-  transcript in ``ref_text`` to clone a voice, or describe one in ``voice``.
-  ``ref_text`` is required alongside ``ref_audio``.
+- Zero-shot only: there are no built-in speakers. To clone a voice, send the
+  clip with its transcript in ``ref_text``: ``ref_audio`` on
+  ``/v1/audio/speech``, an ``audio`` upload with the SDK or ``/generate``. To
+  design one, describe it in ``voice`` (``instruct`` with the SDK or
+  ``/generate``). ``ref_text`` is required alongside the clip.
 - ``language`` takes either the name (``Vietnamese``) or the id (``vi``): a
   name is resolved to the id the model was trained on before the prompt is
   built, and an unrecognised value warns and falls back to language-agnostic
