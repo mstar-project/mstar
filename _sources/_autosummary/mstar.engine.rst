@@ -9,6 +9,13 @@
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      apply_torch_config
+      recompile_limit
+   
    
 
    
