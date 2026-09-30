@@ -743,7 +743,10 @@ class Worker:
     def _process_new_inputs(self, body: InputSignals) -> None:
         # Draining for teardown: don't start new reads for this rid. The
         # producer's segment may be unlinked once every reader ACKs READS_DONE.
-        if body.request_id in self._draining_rids:
+        # A queued committed TP-follow still needs its inputs, and READS_DONE
+        # waits for it, so those still land.
+        if body.request_id in self._draining_rids and \
+                self.scheduler.pending_tp_follow_count.get(body.request_id, 0) == 0:
             return
         logger.debug(
             "Received new signals %s at worker %s for request %s",

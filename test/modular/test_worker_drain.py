@@ -2,7 +2,8 @@
 
 DRAIN_REQUEST stops scheduling/reading a request and ACKs READS_DONE once its
 in-flight reads finish; the hard cleanup (force_cleanup_request) waits for the
-conductor's REMOVE_REQUEST. No read may start for a draining request.
+conductor's REMOVE_REQUEST. No read may start for a draining request, except
+the inputs a committed TP-follow batch still queued for it needs.
 """
 
 from types import SimpleNamespace
@@ -236,6 +237,22 @@ def test_drain_before_new_is_buffered_not_applied():
     ]
     assert "X" not in w._draining_rids
     assert _reads_done(w) == []
+
+
+def test_draining_rid_still_takes_inputs_for_a_queued_tp_follow():
+    """READS_DONE waits for a committed follow batch, so dropping the inputs
+    that batch needs would stall the drain and hold the REMOVE forever."""
+    w = _worker(draining=("X",), tp_follow=("X",), int_handles=True)
+    w.enable_nvtx = False
+    reads = []
+    w.tensor_manager.start_read_tensors = (
+        lambda rid, edges, graph_walk=None: reads.append(rid) or []
+    )
+    w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    Worker._process_new_inputs(w, InputSignals(
+        request_id="X", inputs=[], request_info=SimpleNamespace(graph_walk="g"),
+    ))
+    assert reads == [w._graph_runtime.get_rid_handle("X")]
 
 
 def test_process_new_inputs_skips_reads_for_draining_rid():
