@@ -752,6 +752,12 @@ class LoopStateRegistry(GraphStateRegistry):
         self.loop = loop
 
     def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:
+        if self._loop_or_ancestor_done():
+            # A finished loop takes no completion: counting it would finish
+            # the loop again and send its outputs with an emptied cache.
+            return NodeCompletionOutput(
+                output_edges=self.managed_entities[entity_name].outputs
+            )
         output = super().mark_entity_complete(entity_name)
         self.loop.maybe_cache_output(self.managed_entities[entity_name].outputs)
         if self.is_done:
@@ -766,6 +772,14 @@ class LoopStateRegistry(GraphStateRegistry):
             ]
             output.output_edges.extend(loop_out.output_edges)
         return output
+
+    def _loop_or_ancestor_done(self) -> bool:
+        registry = self
+        while isinstance(registry, LoopStateRegistry):
+            if registry.loop.is_done:
+                return True
+            registry = registry.loop._managing_registry
+        return False
 
     def register_ingested_input(
         self, graph_edge: GraphEdge, for_next_iter: bool=False
