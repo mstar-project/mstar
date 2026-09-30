@@ -26,7 +26,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
-from mstar.engine.resources import KVReqConfig, ResourceReqConfig
+from mstar.engine.resources import KVReqConfig, KVSpec, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
@@ -421,13 +421,17 @@ class Conductor:
         is a deployment-wide property the model declares in its resource specs.
 
         A declared stream gets a config even when the model returned none, or its
-        keys would have nowhere to go.
+        keys would have nowhere to go. So does every KV cache, which admits a
+        request by how far its ``max_tokens`` lets it grow.
         """
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
         for key, streams in self.model.prefix_key_streams().items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(streams)))
+        for spec in self.model.get_node_resources():
+            if isinstance(spec, KVSpec):
+                configs.setdefault(spec.resource_key, KVReqConfig())
         return configs
 
     def _derive_worker_info(self):
@@ -911,6 +915,7 @@ class Conductor:
                 prefix_tail=prefix_tail.get(key),
                 prefix_decode=prefix_decode.get(key),
                 prefix_cache=prefix_cache,
+                max_tokens=request_data.max_output_tokens,
             )
 
         # Send NewRequest to each worker with the appropriate partition's inputs

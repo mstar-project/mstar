@@ -73,6 +73,8 @@ class KVReqConfig(ResourceReqConfig):
     # label -> the output tensor its sampled ids arrive in, if the stream keys generation
     prefix_decode: dict[str, str] | None = None
     prefix_cache: bool = True
+    # the most tokens the request may generate; None on a row no request owns
+    max_tokens: int | None = None
 
     def apply_conductor_config(
         self,
@@ -80,6 +82,7 @@ class KVReqConfig(ResourceReqConfig):
         prefix_tail: dict[str, list[int]] | None=None,
         prefix_decode: dict[str, str] | None=None,
         prefix_cache: bool | None=None,
+        max_tokens: int | None=None,
         **kwargs,
     ):
         if prefix_keys is not None:
@@ -90,6 +93,8 @@ class KVReqConfig(ResourceReqConfig):
             self.prefix_decode = prefix_decode
         if prefix_cache is not None:
             self.prefix_cache = prefix_cache
+        if max_tokens is not None:
+            self.max_tokens = max_tokens
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
