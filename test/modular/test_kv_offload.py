@@ -508,3 +508,38 @@ def test_oom_still_reports_allocation_failed():
     assert isinstance(outcome.reason, AllocationFailed)
     assert outcome.reason.pages_short > 0
     _assert_pages_conserved(mgr)
+
+
+@requires_cuda
+def test_offload_reload_keeps_the_protected_prefix():
+    mgr = _make_manager()
+    mgr.ingest_request("r0")
+    _grow(mgr, "r0", "main", 4 * PAGE_SIZE)
+    mgr.protect_prefix("r0", 2 * PAGE_SIZE)
+    assert mgr.offload("r0") == 4
+    assert mgr.reload("r0") is True
+    assert _stream(mgr, "r0").protected_prefix == 2 * PAGE_SIZE
+    assert mgr.release_oldest("r0", 4 * PAGE_SIZE) == 2 * PAGE_SIZE
+
+
+@requires_cuda
+def test_pool_copies_queue_behind_the_compute_stream():
+    """Both directions wait for the current stream before copying: the pages
+    they touch may still be in use by the step that last ran (a commit hands
+    pages on right after the launch)."""
+    mgr = _make_manager()
+    waited = []
+
+    class _Spy(torch.cuda.Stream):
+        def wait_stream(self, stream):
+            waited.append(stream.cuda_stream)
+            super().wait_stream(stream)
+
+    mgr._cpu_pool._stream = _Spy()
+    mgr.ingest_request("r0")
+    _grow(mgr, "r0", "main", 2 * PAGE_SIZE)
+    compute = torch.cuda.current_stream().cuda_stream
+    assert mgr.offload("r0") == 2
+    assert waited == [compute]
+    assert mgr.reload("r0") is True
+    assert waited == [compute, compute]
