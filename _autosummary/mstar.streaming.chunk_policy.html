@@ -603,6 +603,14 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.LeftContextChunkPolicy.window_size"><code class="docutils literal notranslate"><span class="pre">LeftContextChunkPolicy.window_size()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy.continue_after_producer_done"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy.continue_after_producer_done()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy.is_ready()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy.next_chunk_size()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy.register_chunk"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy.register_chunk()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy.window_size"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy.window_size()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy"><code class="docutils literal notranslate"><span class="pre">SlidingWindowChunkPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">SlidingWindowChunkPolicy.is_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">SlidingWindowChunkPolicy.next_chunk_size()</span></code></a></li>
@@ -634,7 +642,10 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.chunk_policy.LeftContextChunkPolicy" title="mstar.streaming.chunk_policy.LeftContextChunkPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LeftContextChunkPolicy</span></code></a>(chunk, left_context)</p></td>
 <td><p>Chunk policy for streaming vocoders with left-context overlap.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy" title="mstar.streaming.chunk_policy.SlidingWindowChunkPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SlidingWindowChunkPolicy</span></code></a>(window, stride)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.streaming.chunk_policy.RampChunkPolicy" title="mstar.streaming.chunk_policy.RampChunkPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RampChunkPolicy</span></code></a>(first_chunk, chunk_size[, ...])</p></td>
+<td><p>A smaller first chunk, then chunks that grow geometrically up to a cap.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy" title="mstar.streaming.chunk_policy.SlidingWindowChunkPolicy"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SlidingWindowChunkPolicy</span></code></a>(window, stride)</p></td>
 <td><p>Fixed-size sliding window that advances by a stride.</p></td>
 </tr>
 </tbody>
@@ -876,6 +887,108 @@ the buffer retains older items so the chunk contains the full window.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.streaming.chunk_policy.RampChunkPolicy">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.chunk_policy.</span></span><span class="sig-name descname"><span class="pre">RampChunkPolicy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">first_chunk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunk_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">continue_after_done</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">growth</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_chunk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#RampChunkPolicy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.RampChunkPolicy" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.streaming.chunk_policy.ChunkPolicy" title="mstar.streaming.chunk_policy.ChunkPolicy"><code class="xref py py-class docutils literal notranslate"><span class="pre">ChunkPolicy</span></code></a></p>
+<p>A smaller first chunk, then chunks that grow geometrically up to a cap.</p>
+<p>A streaming consumer that re-runs over the whole accumulated stream on
+every chunk (a flow-matching mel decoder conditioned on all tokens so far)
+wants its first chunk as early as the model allows, for time-to-first-audio,
+and later chunks sized for throughput. <code class="docutils literal notranslate"><span class="pre">first_chunk</span></code> items release the
+first chunk; the next is <code class="docutils literal notranslate"><span class="pre">chunk_size</span></code> items and every chunk after that is
+<code class="docutils literal notranslate"><span class="pre">growth</span></code> times the previous one, capped at <code class="docutils literal notranslate"><span class="pre">max_chunk</span></code> (<code class="docutils literal notranslate"><span class="pre">growth=1</span></code>
+keeps them fixed). Growing chunks track the listener’s playback buffer:
+each chunk buys the time to produce a bigger one, so fewer, larger solves
+carry the same stream. No overlap: the consumer keeps its own history.</p>
+<p><code class="docutils literal notranslate"><span class="pre">continue_after_done</span></code> behaves as in <a class="reference internal" href="#mstar.streaming.chunk_policy.FixedChunkPolicy" title="mstar.streaming.chunk_policy.FixedChunkPolicy"><code class="xref py py-class docutils literal notranslate"><span class="pre">FixedChunkPolicy</span></code></a>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>first_chunk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>chunk_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>continue_after_done</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>growth</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>max_chunk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.streaming.chunk_policy.RampChunkPolicy.continue_after_producer_done">
+<span class="sig-name descname"><span class="pre">continue_after_producer_done</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#RampChunkPolicy.continue_after_producer_done"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.RampChunkPolicy.continue_after_producer_done" title="Link to this definition">#</a></dt>
+<dd><p>Whether the buffer should keep producing (empty) chunks after the
+producer signals done and all buffered items have been consumed.</p>
+<p>Default <code class="docutils literal notranslate"><span class="pre">False</span></code>: partition-done is propagated to the conductor after
+the last item is flushed.</p>
+<p>Set to <code class="docutils literal notranslate"><span class="pre">True</span></code> for connections where the consumer must keep running
+after the producer finishes (e.g., Thinker→Talker: the Talker
+continues generating codec tokens after the Thinker hits text EOS).
+In this case the buffer produces empty chunks (<code class="docutils literal notranslate"><span class="pre">_collate([])</span></code> →
+<code class="docutils literal notranslate"><span class="pre">{&quot;data&quot;:</span> <span class="pre">None}</span></code>), and the consumer’s partition-done is determined
+by its own model logic, not by the StreamBuffer.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.streaming.chunk_policy.RampChunkPolicy.is_ready">
+<span class="sig-name descname"><span class="pre">is_ready</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">buffer_len</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#RampChunkPolicy.is_ready"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.RampChunkPolicy.is_ready" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the buffer has enough items for a chunk.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>buffer_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.streaming.chunk_policy.RampChunkPolicy.next_chunk_size">
+<span class="sig-name descname"><span class="pre">next_chunk_size</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">buffer_len</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#RampChunkPolicy.next_chunk_size"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.RampChunkPolicy.next_chunk_size" title="Link to this definition">#</a></dt>
+<dd><p>Return the number of items to consume for the next chunk.</p>
+<p>Only called when is_ready() returns True.
+For sliding-window policies this is the stride, not the window.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>buffer_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.streaming.chunk_policy.RampChunkPolicy.register_chunk">
+<span class="sig-name descname"><span class="pre">register_chunk</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">chunk_size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#RampChunkPolicy.register_chunk"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.RampChunkPolicy.register_chunk" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>chunk_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.streaming.chunk_policy.RampChunkPolicy.window_size">
+<span class="sig-name descname"><span class="pre">window_size</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#RampChunkPolicy.window_size"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.RampChunkPolicy.window_size" title="Link to this definition">#</a></dt>
+<dd><p>Return the full window of items to include in the chunk.</p>
+<p>For non-overlapping policies, equals next_chunk_size.
+For sliding-window policies, this is larger than the stride —
+the buffer retains older items so the chunk contains the full window.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.streaming.chunk_policy.SlidingWindowChunkPolicy">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.streaming.chunk_policy.</span></span><span class="sig-name descname"><span class="pre">SlidingWindowChunkPolicy</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">window</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stride</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#SlidingWindowChunkPolicy"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.streaming.chunk_policy.ChunkPolicy" title="mstar.streaming.chunk_policy.ChunkPolicy"><code class="xref py py-class docutils literal notranslate"><span class="pre">ChunkPolicy</span></code></a></p>
@@ -1005,6 +1118,14 @@ the buffer retains older items so the chunk contains the full window.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.LeftContextChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">LeftContextChunkPolicy.is_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.LeftContextChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">LeftContextChunkPolicy.next_chunk_size()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.LeftContextChunkPolicy.window_size"><code class="docutils literal notranslate"><span class="pre">LeftContextChunkPolicy.window_size()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy.continue_after_producer_done"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy.continue_after_producer_done()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy.is_ready()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy.next_chunk_size()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy.register_chunk"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy.register_chunk()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.RampChunkPolicy.window_size"><code class="docutils literal notranslate"><span class="pre">RampChunkPolicy.window_size()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy"><code class="docutils literal notranslate"><span class="pre">SlidingWindowChunkPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

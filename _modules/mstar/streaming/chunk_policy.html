@@ -1082,6 +1082,85 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span></div>
 </div>
 
+
+
+<div class="viewcode-block" id="RampChunkPolicy">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.RampChunkPolicy">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RampChunkPolicy</span><span class="p">(</span><span class="n">ChunkPolicy</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A smaller first chunk, then chunks that grow geometrically up to a cap.</span>
+
+<span class="sd">    A streaming consumer that re-runs over the whole accumulated stream on</span>
+<span class="sd">    every chunk (a flow-matching mel decoder conditioned on all tokens so far)</span>
+<span class="sd">    wants its first chunk as early as the model allows, for time-to-first-audio,</span>
+<span class="sd">    and later chunks sized for throughput. ``first_chunk`` items release the</span>
+<span class="sd">    first chunk; the next is ``chunk_size`` items and every chunk after that is</span>
+<span class="sd">    ``growth`` times the previous one, capped at ``max_chunk`` (``growth=1``</span>
+<span class="sd">    keeps them fixed). Growing chunks track the listener's playback buffer:</span>
+<span class="sd">    each chunk buys the time to produce a bigger one, so fewer, larger solves</span>
+<span class="sd">    carry the same stream. No overlap: the consumer keeps its own history.</span>
+
+<span class="sd">    ``continue_after_done`` behaves as in :class:`FixedChunkPolicy`.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">first_chunk</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">continue_after_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
+        <span class="n">growth</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span><span class="p">,</span> <span class="n">max_chunk</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">first_chunk</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="n">chunk_size</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"first_chunk and chunk_size must be positive"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">growth</span> <span class="o">&lt;</span> <span class="mf">1.0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"growth must be &gt;= 1"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">max_chunk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">max_chunk</span> <span class="o">&lt;</span> <span class="n">chunk_size</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"max_chunk must be &gt;= chunk_size"</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_first_chunk</span> <span class="o">=</span> <span class="n">first_chunk</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chunk_size</span> <span class="o">=</span> <span class="n">chunk_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_growth</span> <span class="o">=</span> <span class="n">growth</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_max_chunk</span> <span class="o">=</span> <span class="n">max_chunk</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span> <span class="o">=</span> <span class="n">continue_after_done</span>
+        <span class="c1"># Running size, clamped as it grows; a pow of the chunk count overflows on long streams.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_size</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">chunk_size</span><span class="p">)</span>
+
+<div class="viewcode-block" id="RampChunkPolicy.register_chunk">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.RampChunkPolicy.register_chunk">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">register_chunk</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="c1"># The first chunk only releases the chunk_size one; grow after each later chunk.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">first_chunk_read</span> <span class="ow">and</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_max_chunk</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_size</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_chunk</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_size</span> <span class="o">*=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_growth</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_chunk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_size</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_size</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_max_chunk</span><span class="p">))</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">register_chunk</span><span class="p">(</span><span class="n">chunk_size</span><span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_current</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">first_chunk_read</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_first_chunk</span>
+        <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="nb">round</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_size</span><span class="p">))</span>
+
+<div class="viewcode-block" id="RampChunkPolicy.is_ready">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.RampChunkPolicy.is_ready">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_ready</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">buffer_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">buffer_len</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="RampChunkPolicy.next_chunk_size">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.RampChunkPolicy.next_chunk_size">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">next_chunk_size</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">buffer_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="RampChunkPolicy.window_size">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.RampChunkPolicy.window_size">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">window_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="RampChunkPolicy.continue_after_producer_done">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.RampChunkPolicy.continue_after_producer_done">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">continue_after_producer_done</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span></div>
+</div>
+
 </pre></div>
 
                 </article>
