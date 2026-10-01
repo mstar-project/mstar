@@ -176,7 +176,11 @@ class SubmoduleManagement:
 class ExecutingBatch:
     node_name: str
 
-    per_request_info: Mapping[str, CurrentForwardPassInfo]
+    # Keyed by the worker's integer rid handle. CUDA-graph capture pads with
+    # its own rows, which carry negative handles from the same space (see
+    # cuda_graph_runner.dummy_rid_handle), so a padded batch is still int-keyed
+    # throughout.
+    per_request_info: Mapping[int, CurrentForwardPassInfo]
     step_context: StepContext
 
     running_batched: bool = False
@@ -192,7 +196,7 @@ class ExecutingBatch:
     # The rids the staged plan was built over. The plan is theirs exactly —
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
-    preplanned_rids: tuple[str, ...] | None = None
+    preplanned_rids: tuple[int, ...] | None = None
 
     # Declared once for the batch (pre-plan declares it first when it runs)
     # and driven from here on
@@ -716,6 +720,14 @@ class Engine:
                     batch.outputs = self._exec_single(batch)
             batch.outputs_ready.set()
             return batch.outputs
+        except Exception:
+            # A raise before the plan was promoted (declare, admit) would leave
+            # the stage for the next step's admit to find. Drop it here. The
+            # lease is released by _exec_single's own finally.
+            if batch.preplanned_rids is not None and self._runner.staged:
+                self._runner.clear_preplan()
+                batch.preplanned_rids = None
+            raise
         finally:
             batch.preplan_event = None
             batch.release_waiters()
@@ -1504,8 +1516,8 @@ class Engine:
             cg_runner = self._submodules[batch.node_name].cuda_graph_runner
             if lease is not None and cg_runner is not None:
                 cg_runner.release(lease, len(batch.request_ids))
-        for resource in self._resources.values():
-            resource.clear_preplan()
+        # through the runner, so its record of the staged step goes too
+        self._runner.clear_preplan()
 
     # ── Eviction ────────────────────────────────────────────────────────
     #

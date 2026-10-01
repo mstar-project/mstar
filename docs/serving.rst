@@ -184,6 +184,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        conductor's queue.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``warmup_requests``
+     - *(optional)* Requests the server runs after the workers are ready and before it
+       binds, so no client pays a shape's first-request cost (torch.compile of a step,
+       a cold cache). Each entry is a ``/generate`` request in yaml form: ``text``,
+       ``output_modalities``, ``model_kwargs``, and ``files``, a list of media
+       inputs in prompt order (text follows them). A file is a path or
+       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
+       comes from the extension, or give ``{path: ..., modality: ...}``. A
+       malformed or failing warmup is logged and skipped.
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /
