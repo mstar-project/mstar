@@ -5,6 +5,7 @@ from NVIDIA's own ``LMModel``/``LMGen`` with random weights (fixtures/personaple
 They establish algorithmic equivalence on synthetic weights, not checkpoint or GPU parity.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn.functional as F
+from personaplex_fixture_utils import load_binary_fixture, verify_reference_fixture
 
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.components.delayed_cache import DelayedTokenCache
@@ -59,6 +61,20 @@ def _tiny_lm(seed: int = 0) -> PersonaPlexLM:
 
 def _greedy(logits, _step=None):
     return logits.float().argmax(dim=-1)
+
+
+def test_reference_fixture_loader_rejects_changed_tensor_and_source_pin():
+    data = {"source": "NVIDIA/personaplex", "source_sha": cfg.REFERENCE_SHA,
+            "payload": torch.tensor([1], dtype=torch.int32)}
+    digest = {"payload": ["torch.int32", [1], hashlib.sha256(bytes([1, 0, 0, 0])).hexdigest()],
+              "source": data["source"], "source_sha": data["source_sha"]}
+    data["content_sha256"] = hashlib.sha256(
+        json.dumps(digest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert verify_reference_fixture(data) is data
+    with pytest.raises(ValueError, match="content SHA256"):
+        verify_reference_fixture({**data, "payload": torch.tensor([2], dtype=torch.int32)})
+    with pytest.raises(ValueError, match="source SHA"):
+        verify_reference_fixture({**data, "source_sha": "0" * 40})
 
 
 # --------------------------------------------------------------------------- T5 (fixture-free part)
@@ -246,8 +262,8 @@ def test_t6_depformer_uses_step_weights_and_feeds_forced_tokens():
 
 @pytest.fixture(scope="module")
 def reference_manifest_fixture():
-    data = json.loads(_fixture("PERSONAPLEX_REFERENCE_MANIFEST", "reference_lm_manifest.json").read_text())
-    assert data["source"] == "NVIDIA/personaplex" and data["source_sha"] == cfg.REFERENCE_SHA
+    data = verify_reference_fixture(json.loads(
+        _fixture("PERSONAPLEX_REFERENCE_MANIFEST", "reference_lm_manifest.json").read_text()))
     assert data["lm_kwargs"]["dep_q"] == 16 and data["buffers"] == {}
     return data
 
@@ -265,8 +281,7 @@ def test_t5_native_keys_and_shapes_equal_nvidia_lmmodel_manifest(reference_manif
 @pytest.fixture(scope="module")
 def reference_lm():
     pytest.importorskip("safetensors", reason="mstar.model.loader imports safetensors")
-    data = torch.load(_fixture("PERSONAPLEX_REFERENCE_LM", "reference_lm.pt"), weights_only=True)
-    assert data["source"] == "NVIDIA/personaplex" and data["source_sha"] == cfg.REFERENCE_SHA
+    data = load_binary_fixture(_fixture("PERSONAPLEX_REFERENCE_LM", "reference_lm.pt"))
     assert data["use_sampling"] is False and data["dtype"] == "float32"
     assert {(c["batch_size"], c["mode"]) for c in data["cases"]} == {
         (b, m) for b in (1, 2) for m in ("token_priming", "embedding_replay")

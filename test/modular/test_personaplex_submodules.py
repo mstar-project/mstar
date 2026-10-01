@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from personaplex_fixture_utils import load_binary_fixture
 
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.components.delayed_cache import DelayedTokenCache
@@ -52,7 +53,7 @@ def _fixture(env, name):
     path = Path(configured) if configured else FIXTURES / name
     if not path.is_file() and not configured:
         pytest.skip(f"needs {name} from the NVIDIA oracle; see fixtures/personaplex/README.rst or set {env}")
-    return torch.load(path, weights_only=True)
+    return load_binary_fixture(path)
 
 
 class _Run:
@@ -344,7 +345,7 @@ def test_lm_submodule_conditioning_and_generate_match_nvidia_lmgen():
             assert logits is None, what  # conditioning skips the text head
     for out, record in zip(gen, records[len(cond):], strict=True):
         assert torch.equal(out["agent_frame"][0], record["output"][:, 1:9]), record["phase"]
-        assert torch.equal(out["text_frame"][0], record["output"][:, 0, 0]), record["phase"]
+        assert torch.equal(out["text_output"][0], record["output"][:, 0, 0]), record["phase"]
 
 
 @contextmanager
@@ -408,8 +409,8 @@ def _code_margins(codec, pcm):
 
 
 @torch.no_grad()
-def test_offline_replay_end_to_end_matches_nvidia_offline_py():
-    """NVIDIA's offline.py pipeline vs M*'s three submodules wired as the graph wires them.
+def test_offline_components_match_nvidia_with_reference_user_codes():
+    """Compare M* stages with NVIDIA's offline.py, substituting NVIDIA's encoder codes.
 
     Tiny random LM and Mimi, greedy: warmup + reset, .pt voice replay, persona,
     131 user frames from stereo audio (channel 0 used, last frame zero-padded,
@@ -449,11 +450,12 @@ def test_offline_replay_end_to_end_matches_nvidia_offline_py():
         assert margins[first, frame] < 1e-6, (frame, first, float(margins[first, frame]))
     assert mismatch.any(0).float().mean() < 0.02
 
-    # Later stages run on NVIDIA's codes so a tie upstream cannot cascade into them.
+    # This is component parity, not uninterrupted M* encoder-to-LM parity: the
+    # near-tie above changes a code, so downstream stages use NVIDIA's codes.
     run = _Run(LMSubmodule(lm), meta, preset, persona, reference_codes)
     _, state = run.walk(cfg.CONDITIONING_WALK, None)
     generated, _ = run.walk(cfg.GENERATE_WALK, state)
-    assert [int(out["text_frame"][0]) for out in generated] == data["text_tokens"]
+    assert [int(out["text_output"][0]) for out in generated] == data["text_tokens"]
 
     decoder = MimiDecoderSubmodule(codec)
     node = decoder.prepare_inputs(cfg.GENERATE_WALK, info, {"agent_frame": [o["agent_frame"][0] for o in generated]})

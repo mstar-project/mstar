@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from personaplex_fixture_utils import load_binary_fixture
 
 from mstar.model.personaplex.components import mimi as mimi_mod
 from mstar.model.personaplex.components.mimi import (
@@ -182,8 +183,8 @@ def reference():
     if not path.is_file() and not configured:
         pytest.skip("needs reference_mimi.pt from the NVIDIA oracle; see fixtures/personaplex/README.rst "
                     "or set PERSONAPLEX_REFERENCE_MIMI")
-    data = torch.load(path, weights_only=True)
-    assert data["source"] == "NVIDIA/personaplex" and data["num_codebooks"] == 8
+    data = load_binary_fixture(path)
+    assert data["num_codebooks"] == 8
     return data
 
 

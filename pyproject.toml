@@ -132,7 +132,7 @@ bagel = [
     "torchvision",
     "torchaudio",
     "torchcodec",
-    "transformers",
+    "transformers==4.57.3",  # personaplex Mimi is verified only at this version
 ]
 
 bagel_xpu = [
@@ -272,7 +272,7 @@ pi05 = [
 
 personaplex = [
     # Only what mstar/model/personaplex imports: no moshi, pyloudnorm or einops.
-    # transformers backs Mimi (MimiModel submodules, tested at 4.57.3);
+    # transformers backs Mimi (MimiModel submodules); only 4.57.3 has been verified.
     # sentencepiece tokenizes the persona prompt.
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
@@ -280,7 +280,7 @@ personaplex = [
     "safetensors",
     "sentencepiece",
     "torchcodec",
-    "transformers>=4.57.3",
+    "transformers==4.57.3",
 ]
 
 vjepa2 = [

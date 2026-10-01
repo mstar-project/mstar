@@ -113,15 +113,15 @@ The M* side converts the state dict with the vendored HF v4.45.0 table and
 compares ``MimiCodec`` (HF submodules + the ring mask) against those outputs. The
 recorder itself imports no transformers code.
 
-End-to-end offline replay (tiny random weights)
------------------------------------------------
+Offline component replay with reference user codes (tiny random weights)
+------------------------------------------------------------------------
 
 .. code-block:: bash
 
    /tmp/personaplex-oracle/bin/python test/scratch/personaplex_reference_oracle.py \
      --source /tmp/personaplex-3428dfd9 --mode offline --out /tmp/personaplex-fixtures
    PERSONAPLEX_REFERENCE_OFFLINE=/tmp/personaplex-fixtures/reference_offline.pt \
-     python -m pytest test/modular/test_personaplex_submodules.py -v -k offline_replay
+     python -m pytest test/modular/test_personaplex_submodules.py -v -k offline_components
 
 ``offline`` runs NVIDIA's ``offline.py`` steps with its own helpers (``warmup``,
 ``load_voice_prompt_embeddings``, ``step_system_prompts``, ``_iterate_audio``,
@@ -132,3 +132,6 @@ both state dicts, the preset, the user codes, the per-frame text tokens and the
 trimmed PCM. About 48 MB. The M* test runs MimiEncoder → LM (conditioning,
 generate) → MimiDecoder; encoder codes may differ only at fp32 argmin ties,
 which it checks, and later stages use NVIDIA's codes so a tie cannot cascade.
+This compares each stage against the recorded reference; it does not establish
+an uninterrupted M* encoder-to-LM-to-decoder result. A separate deterministic
+case with well-separated codebook choices is still needed for that claim.

@@ -186,7 +186,7 @@ class LMSubmodule(ARNodeSubmodule):
         if not conditioning:
             # Delay-0 channels from the previous step, delay-1 from this one (R4).
             outputs["agent_frame"] = [output[:, 1 : 1 + cfg.AUDIO_CODEBOOKS_PER_STREAM].contiguous()]
-            outputs["text_frame"] = [output[:, 0, 0].contiguous()]
+            outputs["text_output"] = [output[:, 0, 0].contiguous()]
         return outputs
 
     # ------------------------------------------------------------------ engine contract
