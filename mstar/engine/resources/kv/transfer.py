@@ -19,7 +19,6 @@ import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from mstar.engine.resources.kv.cache import KVCache, KVLayout
-from mstar.utils.cuda_streams import compute_stream
 
 if TYPE_CHECKING:
     from mstar.communication.tensors import (
@@ -181,7 +180,7 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
     ):
         if not read_info:
             return
-        event = compute_stream().record_event()
+        event = torch.cuda.current_stream().record_event()
         future = self._executor.submit(self._do_read, remote_kv_info, read_info, event)
         self._pending.append(future)
         # Prune completed futures to avoid unbounded growth

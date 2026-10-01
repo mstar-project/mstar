@@ -8,7 +8,7 @@ import time as _time
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from time import sleep
@@ -43,7 +43,6 @@ from mstar.model.base import Model, WorkerGraph
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.containers import ParallelList, RecentSet
-from mstar.utils.cuda_streams import set_compute_stream
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -236,18 +235,6 @@ class Worker:
         if self.device.type != "cpu" and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
 
-        # The forward does not run on the default stream (otherwise one rank
-        # waiting for TP collectives can block Mooncake reads)
-        self._compute_stream: torch.cuda.Stream | None = None
-        if self.device.type == "cuda" and \
-                os.environ.get("MSTAR_FORWARD_SIDE_STREAM", "1") == "1":
-            self._compute_stream = torch.cuda.Stream(device=self.device)
-            set_compute_stream(self._compute_stream)
-            logger.info(
-                "Worker %s: model forward runs on a dedicated CUDA stream",
-                worker_id,
-            )
-
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mstar`` runs on
         # the same host don't collide. The ``tcp://{hostname}:29500``
@@ -436,8 +423,8 @@ class Worker:
         self.scheduler.pending_removes = self._pending_removes
 
         # Side stream for D→H copies in postprocess (check_stop pre-materialize).
-       # The forward's stream has GPU(N+1) queued behind GPU(N)'s outputs after
-        # speculation, so syncing on it would also drain GPU(N+1) and
+        # The default stream has GPU(N+1) queued behind GPU(N)'s outputs after
+        # speculation, so syncing on default would also drain GPU(N+1) and
         # erase the overlap. The side stream waits on
         # ``output.completion_event`` (recorded after GPU(N)) and then runs
         # an isolated D→H, so the main thread only blocks on the copy.
@@ -1473,17 +1460,6 @@ class Worker:
         if self._phase_period > 0:
             self._phase_buf[name].append(dt)
 
-    def _on_compute_stream(self):
-        """Submit this thread's GPU work to the forward's stream.
-
-        Nothing inside needs to name the stream: ``current_stream`` resolves to
-        it, so the engine's own event records and syncs follow along.
-        """
-        return (
-            nullcontext() if self._compute_stream is None
-            else torch.cuda.stream(self._compute_stream)
-        )
-
     def _execute_on_gpu_thread(
         self,
         batch: ScheduledBatch,
@@ -1497,11 +1473,8 @@ class Worker:
         drain the GPU on every iter and hide the overlap between
         post-processing and the next step's kernel execution.
 
-        Everything from prepare_inputs through finalize_batch is submitted to
-        the forward's stream, not the default one — see
-        ``mstar.utils.cuda_streams``. ``execution_stream`` below therefore
-        resolves to that stream, and the completion event it records is what
-        anything reading the output VALUES waits on.
+        Once the step's work is submitted we record a CUDA event on the
+        default stream; anything that reads the output VALUES waits on it.
         """
         from mstar.utils.profiler import range_pop, range_push
 
@@ -1523,30 +1496,29 @@ class Worker:
                 synchronize=False,
             )
         try:
-            with self._on_compute_stream():
-                try:
-                    with self._span("worker.gpu_thread.prepare_inputs"):
-                        engine.prepare_inputs(node_batch)
-                except Exception:
-                    if plan_future is not None and node_batch.preplanned_rids is not None:
-                        # The stage was for this batch, which now never runs.
-                        engine.reset_pre_plan_for_batch(node_batch)
-                    raise
-                # call is_stale after prepare_inputs because prepare_inputs may drop rids
-                if plan_future is not None and engine.preplan_is_stale(node_batch):
+            try:
+                with self._span("worker.gpu_thread.prepare_inputs"):
+                    engine.prepare_inputs(node_batch)
+            except Exception:
+                if plan_future is not None and node_batch.preplanned_rids is not None:
+                    # The stage was for this batch, which now never runs.
                     engine.reset_pre_plan_for_batch(node_batch)
-                with self._span("worker.gpu_thread.exec"):
-                    outputs = engine.exec_and_postprocess(node_batch)
-                execution_stream = (
-                    torch.accelerator.current_stream(self.device)
-                    if self.device.type != "cpu"
-                    else None
-                )
-                if execution_stream is not None:
-                    event = torch.Event()
-                    event.record(execution_stream)
-                    node_batch.completion_event = event
-                return outputs
+                raise
+            # call is_stale after prepare_inputs because prepare_inputs may drop rids
+            if plan_future is not None and engine.preplan_is_stale(node_batch):
+                engine.reset_pre_plan_for_batch(node_batch)
+            with self._span("worker.gpu_thread.exec"):
+                outputs = engine.exec_and_postprocess(node_batch)
+            execution_stream = (
+                torch.accelerator.current_stream(self.device)
+                if self.device.type != "cpu"
+                else None
+            )
+            if execution_stream is not None:
+                event = torch.Event()
+                event.record(execution_stream)
+                node_batch.completion_event = event
+            return outputs
         finally:
             # Safety net: a step that raised before the forward would otherwise
             # leave the submitter blocked on this for the full wait timeout.
@@ -1561,8 +1533,7 @@ class Worker:
             # the next iter's prep and the conductor see it. Runs regardless
             # of success, allocation failure, or an uncaught raise —
             # finalize_batch reads whatever state the engine actually reached.
-            with self._on_compute_stream():
-                engine.finalize_batch(node_batch)
+            engine.finalize_batch(node_batch)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 

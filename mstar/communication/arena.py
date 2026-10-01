@@ -58,7 +58,6 @@ from mstar.communication.tensors import (
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.utils.containers import ParallelList
-from mstar.utils.cuda_streams import compute_stream
 
 logger = logging.getLogger(__name__)
 
@@ -736,7 +735,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         skip_cuda_sync: bool = False,
     ):
         if not skip_cuda_sync and torch.cuda.is_available():
-            compute_stream().synchronize()
+            torch.cuda.default_stream().synchronize()
         queued = False
         placements = _Placements.empty()
         self._maybe_log_stats()
@@ -760,7 +759,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         descriptor. The whole batch stages inside one stream context and syncs
         once at the end, rather than one host-blocking sync per request."""
         if not skip_cuda_sync and torch.cuda.is_available():
-            compute_stream().synchronize()
+            torch.cuda.default_stream().synchronize()
         queued = False
         placements = _Placements.empty()
         self._maybe_log_stats()
@@ -836,7 +835,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         future = None
         if h2d_did_work and self._h2d_stream is not None:
             # Downstream kernels see the data (device-side ordering only).
-            compute_stream(self.device).wait_stream(
+            torch.cuda.default_stream(self.device).wait_stream(
                 self._h2d_stream)
             # The producer reclaims the slot when an edge is ACKed, and the
             # source is its live mapping — so the edge must not report ready

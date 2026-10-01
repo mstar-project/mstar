@@ -283,17 +283,6 @@ Worker scheduling
        refuse to start on a mismatch. Leave ``MSTAR_ENGINE_STEP_SYNC`` at
        ``0`` with it: that throttle holds the GPU thread until step N drains,
        which serialises the very overlap this flag buys.
-   * - ``MSTAR_FORWARD_SIDE_STREAM``
-     - ``1``
-     - Run the model forward — prepare_inputs, plan, preprocess, the
-       collectives, postprocess — on a dedicated CUDA stream instead of the
-       default one. A rank parked on a collective on the *default* stream
-       blocks its peers from reading out of its tensor store, so under TP a
-       rank that reaches its forward first can fail a peer's read; on a side
-       stream those reads stay served. Everything that has to be ordered
-       against the forward (input H2D, KV reload, the events fencing a peer's
-       read) names this stream — see ``mstar.utils.cuda_streams``. ``0``
-       restores the default stream, and the stall with it.
    * - ``MSTAR_PRE_PLAN_SPEC``
      - ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread

@@ -14,7 +14,6 @@ from dataclasses import dataclass
 import torch
 
 from mstar.engine.resources.kv.cache import KVCache, KVConfig, PageAllocator
-from mstar.utils.cuda_streams import compute_stream
 
 logger = logging.getLogger(__name__)
 
@@ -156,17 +155,14 @@ class CPUPagePool:
         return 0 if state is None else len(state.cpu_page_indices)
 
     def sync(self) -> None:
-        """Order the forward's stream behind the pending copies.
+        """Order the current stream behind the pending copies.
 
         Both directions need this before the pages they touched are reused:
         after an offload the device pages go back to the allocator, and after
-        a reload the attention kernels read them. Named explicitly rather than
-        taken from ``current_stream``: offload and reload are driven from the
-        scheduler thread, whose current stream is not the one that runs
-        attention (see ``mstar.utils.cuda_streams``).
+        a reload the attention kernels read them.
         """
         if self._stream is not None:
-            compute_stream().wait_stream(self._stream)
+            torch.cuda.current_stream().wait_stream(self._stream)
 
     def remove_request(self, rid: str) -> None:
         for state in self.offloaded.pop(rid, {}).values():

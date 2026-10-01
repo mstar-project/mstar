@@ -20,7 +20,6 @@ from mstar.communication.tensor_store import (  # NameToTensorList, Rid re-expor
 from mstar.distributed.base import ShardingConfig
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.utils.containers import ParallelList
-from mstar.utils.cuda_streams import compute_stream
 
 try:
     from mooncake.engine import TransferEngine
@@ -117,10 +116,10 @@ class TransferReadInfo:
 class AsyncMooncakeReader:
     """Background thread for non-blocking mooncake READ operations.
 
-    Follows SGLang's pattern: caller records CUDA event on compute stream,
+    Follows SGLang's pattern: caller records CUDA event on default stream,
     submits write task to thread pool. Worker thread waits on event via
     dedicated CUDA stream, then does blocking mooncake PUTs.
-    The compute stream is never blocked by store writes.
+    The default stream is never blocked by store writes.
     """
 
     def __init__(
@@ -142,14 +141,12 @@ class AsyncMooncakeReader:
     def submit(self, read_info: list[TransferReadInfo]) -> Future:
         """Non-blocking: enqueue a batch of READs.
 
-        Records a CUDA event on the forward's stream to ensure GPU data
-        is ready before the background thread reads it. Not the current one:
-        this runs from the scheduler thread, and the pages it fences were
-        written by the forward (see ``mstar.utils.cuda_streams``).
+        Records a CUDA event on the current stream to ensure GPU data
+        is ready before the background thread reads it.
         """
         if not read_info:
             return
-        event = compute_stream().record_event()
+        event = torch.cuda.current_stream().record_event()
         future = self._executor.submit(self._do_read, read_info, event)
         self._pending.append(future)
         # Prune completed futures to avoid unbounded growth
@@ -464,10 +461,11 @@ class TensorCommunicationManager(ABC):
         # SHM serialize). With same-thread async scheduling the caller
         # has typically already synced on ``output.completion_event``
         # (which waits for *only* the producing step, not the queued next
-        # step), so the unconditional sync here would uselessly drain
-        # GPU(N+1). Pass ``skip_cuda_sync=True`` from those call sites.
+        # step), so the unconditional default-stream sync here would
+        # uselessly drain GPU(N+1). Pass ``skip_cuda_sync=True`` from
+        # those call sites.
         if not skip_cuda_sync and torch.cuda.is_available():
-            compute_stream().synchronize()
+            torch.cuda.default_stream().synchronize()
         request_ids: list[Rid] = []
         uuids: list[int] = []
         canonicals: list[torch.Tensor] = []
@@ -505,7 +503,7 @@ class TensorCommunicationManager(ABC):
         freed when its request is torn down.
         """
         if not skip_cuda_sync and torch.cuda.is_available():
-            compute_stream().synchronize()
+            torch.cuda.default_stream().synchronize()
 
         flat_uuids: list[int] = []
         flat_rids: list[int] = []
@@ -728,7 +726,7 @@ class TensorCommunicationManager(ABC):
     ):
         """Mark these tensors ready for remote consumers to RDMA-read.
 
-        ``skip_cuda_sync=True`` skips the compute-stream sync this call normally
+        ``skip_cuda_sync=True`` skips the default-stream sync this call normally
         issues to ensure the source tensors' writes are visible before their
         addresses are shared with peers. Callers must have already synced on
         their own (e.g. before a batched loop) — meant to cut N serialized
@@ -1130,7 +1128,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
 
     def register_for_send(self, request_id, tensor_infos, skip_cuda_sync=False):
         if not skip_cuda_sync:
-            compute_stream().synchronize()
+            torch.cuda.default_stream().synchronize()
         for info in tensor_infos:
             self._register_one(request_id, info.uuid)
 
@@ -1143,7 +1141,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         but the uuid -- the tensor itself comes from the store -- so taking
         uuids avoids rebuilding one per tensor."""
         if not skip_cuda_sync:
-            compute_stream().synchronize()
+            torch.cuda.default_stream().synchronize()
         for request_id, uuids in per_request:
             for uuid in uuids:
                 self._register_one(request_id, uuid)
@@ -1354,7 +1352,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         self._shm_namespace = _deployment_namespace(communicator)
 
         # Dedicated copy streams: D2H/H2D run here so they don't serialize
-        # behind the next GPU step queued on the compute stream.
+        # behind the next GPU step queued on the default stream.
         self._d2h_stream: torch.cuda.Stream | None = None
         self._h2d_stream: torch.cuda.Stream | None = None
         if torch.cuda.is_available() and str(device) != "cpu":
@@ -1411,11 +1409,11 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         skip_cuda_sync: bool = False,
     ):
         if not skip_cuda_sync and torch.cuda.is_available():
-            compute_stream().synchronize()
+            torch.cuda.default_stream().synchronize()
         # Producer's completion event is already waited on upstream, so the
         # source tensors are device-visible on entry. Running the D2H on a
         # dedicated stream keeps .cpu()'s host-wait bounded by the copy
-        # itself instead of stalling behind GPU(N+1) on the compute stream.
+        # itself instead of stalling behind GPU(N+1) on the default stream.
         ctx = (
             torch.cuda.stream(self._d2h_stream)
             if self._d2h_stream is not None
@@ -1433,7 +1431,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         """Uuid-driven form. This path reads nothing off a descriptor but the
         uuid, so taking uuids avoids rebuilding one per tensor."""
         if not skip_cuda_sync and torch.cuda.is_available():
-            compute_stream().synchronize()
+            torch.cuda.default_stream().synchronize()
         ctx = (
             torch.cuda.stream(self._d2h_stream)
             if self._d2h_stream is not None
@@ -1467,8 +1465,8 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         graph_walk: str | None = None
     ):
         # Run H2D copies on a dedicated stream so they overlap with the
-        # consumer's in-flight forward. That forward's stream waits for the
-        # H2D stream at the end, so its kernels see the data.
+        # consumer's in-flight default-stream work. We make default wait
+        # for the H2D stream at the end so downstream kernels see the data.
         h2d_did_work = False
         ctx = (
             torch.cuda.stream(self._h2d_stream)
@@ -1522,7 +1520,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     )
                 )
         if h2d_did_work and self._h2d_stream is not None:
-            compute_stream(self.device).wait_stream(self._h2d_stream)
+            torch.cuda.default_stream(self.device).wait_stream(self._h2d_stream)
         return []
 
     def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
