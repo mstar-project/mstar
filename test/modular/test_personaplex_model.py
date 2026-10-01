@@ -88,7 +88,7 @@ def test_t9_walks_instantiate_with_one_lm_per_walk_and_async_off():
 def test_t9_lm_loop_backs_are_consumed_and_outputs_routed():
     walks = _model().get_graph_walk_graphs()
     for walk, loop_backs in ((cfg.CONDITIONING_WALK, {"lm_state"}),
-                             (cfg.GENERATE_WALK, {"lm_state", "agent_frame", "text_output"})):
+                             (cfg.GENERATE_WALK, {"lm_state", "agent_frame", "text_frame"})):
         lm = walks[walk].get_nodes()["LM"]
         assert {e.name for e in lm.outputs if e.next_node == "LM"} == loop_backs
         assert loop_backs <= set(lm.input_names)  # consumed, never rejected (§3 M3)
@@ -97,7 +97,7 @@ def test_t9_lm_loop_backs_are_consumed_and_outputs_routed():
     assert [(e.name, e.next_node, e.persist) for e in cond.outputs] == [("lm_state", EMPTY_DESTINATION, True)]
     encode = walks[cfg.ENCODE_USER_AUDIO_WALK]
     assert [(e.name, e.persist) for e in encode.outputs] == [("user_audio_codes", True)]
-    for walk, accumulated in ((cfg.GENERATE_WALK, [("agent_frame", "MimiDecoder"), ("text_output", EMIT_TO_CLIENT)]),
+    for walk, accumulated in ((cfg.GENERATE_WALK, [("agent_frame", "MimiDecoder"), ("text_frame", EMIT_TO_CLIENT)]),
                               (GENERATE_AUDIO_WALK, [("agent_frame", "MimiDecoder")])):
         seq = walks[walk]
         assert isinstance(seq, Sequential)
@@ -138,9 +138,9 @@ def test_t9_schedule_encode_condition_generate_done_with_persisted_state():
     gen = _step(model, cond.full_metadata, persist)
     assert gen.full_metadata.graph_walk == cfg.GENERATE_WALK
     by_name = {e.name: e for e in gen.inputs}
-    assert set(by_name) == {"lm_state", "user_audio_codes", "agent_frame", "text_output"}
+    assert set(by_name) == {"lm_state", "user_audio_codes", "agent_frame", "text_frame"}
     assert by_name["lm_state"].tensor_info == persist["lm_state"]
-    assert by_name["agent_frame"].tensor_info == [] and by_name["text_output"].tensor_info == []
+    assert by_name["agent_frame"].tensor_info == [] and by_name["text_frame"].tensor_info == []
     assert {i.uuid for i in gen.unpersist_tensors} == {"uuid-lm_state", "uuid-codes"}
 
     done = _step(model, gen.full_metadata, {})
@@ -152,21 +152,27 @@ def test_t9_audio_only_requests_use_the_walk_without_text_emission():
     assert args.full_metadata.kwargs["walk_schedule"][-1] == GENERATE_AUDIO_WALK
 
 
-@pytest.mark.parametrize("with_text,legacy_name", [(False, False), (True, False), (True, True)],
-                         ids=["audio-only", "audio-plus-text", "legacy-text-frame"])
-def test_t9_data_worker_emits_requested_modalities(with_text, legacy_name):
-    """Exercise transfer setup and the real edge-name to ResultChunk boundary."""
+@pytest.mark.parametrize("with_text", [False, True], ids=["audio-only", "audio-plus-text"])
+def test_t9_data_worker_emits_requested_modalities(with_text):
+    """Exercise transfer setup and the real edge-name to ResultChunk boundary.
+
+    The worker sends ``ResultTensors.modality = edge.output_modality``
+    (worker.py:1055-1059) and ``_read_result_tensor`` renames the edge to
+    ``f"{modality}_output"`` (data_worker.py:419), so the producer name
+    ``text_frame`` never reaches postprocessing.
+    """
     model = _model()
     walk = model.get_graph_walk_graphs()[cfg.GENERATE_WALK if with_text else GENERATE_AUDIO_WALK]
     edges = ([walk.sections[0].accumulated_outputs[1]] if with_text else []) + [walk.sections[1].outputs[0]]
     edges = [edge.clone() for edge in edges]
+    assert [(e.name, e.output_modality) for e in edges] == (
+        [("text_frame", "text"), ("audio_output", "audio")] if with_text else [("audio_output", "audio")]
+    )
     tensors = {}
     for edge in edges:
         info = _info(edge.name, [1])
         edge.tensor_info = [info]
         tensors[info.uuid] = torch.tensor([4]) if edge.output_modality == "text" else torch.tensor([0.5])
-    if legacy_name:
-        edges[0].name = "text_frame"
 
     class ReadyTensors:
         def __init__(self):
@@ -229,7 +235,7 @@ def test_t9_worker_graphs_from_yaml_keep_accumulated_edges():
     assert {walk for wg in graphs for walk in wg.graph_walks} == {cfg.ENCODE_USER_AUDIO_WALK, *LM_WALKS}
     loops = [loop for wg in graphs if cfg.GENERATE_WALK in wg.graph_walks
              for loop in wg.section.get_loops().values()]
-    assert [[e.name for e in loop.accumulated_outputs] for loop in loops] == [["agent_frame", "text_output"]]
+    assert [[e.name for e in loop.accumulated_outputs] for loop in loops] == [["agent_frame", "text_frame"]]
     assert all(wg.ranks == [0] for wg in graphs)
 
 
@@ -330,7 +336,7 @@ def _drive(walk, initial, *, finish_after=None, rid="r0"):
 def _generate_inputs():
     return [GraphEdge(next_node="LM", name="user_audio_codes", tensor_info=["external"]),
             GraphEdge(next_node="LM", name="lm_state", tensor_info=["external"]),
-            GraphEdge(next_node="LM", name="agent_frame"), GraphEdge(next_node="LM", name="text_output")]
+            GraphEdge(next_node="LM", name="agent_frame"), GraphEdge(next_node="LM", name="text_frame")]
 
 
 @pytest.mark.parametrize("finish_after", [1, 7, 25])
@@ -339,7 +345,7 @@ def test_t8_generate_accumulates_frames_in_order_and_completes(finish_after):
     out, runs, refs = _drive(walk, _generate_inputs(), finish_after=finish_after)
     assert runs == {"LM": finish_after, "MimiDecoder": 1}
     assert out["decoder_frames"] == [("agent_frame", i) for i in range(finish_after)]
-    assert out["client"] == [("text_output", [("text_output", i) for i in range(finish_after)]),
+    assert out["client"] == [("text_frame", [("text_frame", i) for i in range(finish_after)]),
                              ("audio_output", [("audio_output", 0)])]
     assert out["rejected"] == []
     assert all(r >= 0 for r in refs.values())
@@ -365,7 +371,7 @@ def test_t8_generate_runs_to_max_iters_without_a_finish_signal():
 def test_t8_final_iteration_accumulated_tensors_are_released():
     walk = _model().get_graph_walk_graphs()[cfg.GENERATE_WALK]
     _, _, refs = _drive(walk, _generate_inputs(), finish_after=7)
-    assert refs[("agent_frame", 6)] == 0 and refs[("text_output", 6)] == 0
+    assert refs[("agent_frame", 6)] == 0 and refs[("text_frame", 6)] == 0
 
 
 def test_t8_conditioning_persists_only_the_final_lm_state():

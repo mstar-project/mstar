@@ -345,7 +345,7 @@ def test_lm_submodule_conditioning_and_generate_match_nvidia_lmgen():
             assert logits is None, what  # conditioning skips the text head
     for out, record in zip(gen, records[len(cond):], strict=True):
         assert torch.equal(out["agent_frame"][0], record["output"][:, 1:9]), record["phase"]
-        assert torch.equal(out["text_output"][0], record["output"][:, 0, 0]), record["phase"]
+        assert torch.equal(out["text_frame"][0], record["output"][:, 0, 0]), record["phase"]
 
 
 @contextmanager
@@ -455,7 +455,7 @@ def test_offline_components_match_nvidia_with_reference_user_codes():
     run = _Run(LMSubmodule(lm), meta, preset, persona, reference_codes)
     _, state = run.walk(cfg.CONDITIONING_WALK, None)
     generated, _ = run.walk(cfg.GENERATE_WALK, state)
-    assert [int(out["text_output"][0]) for out in generated] == data["text_tokens"]
+    assert [int(out["text_frame"][0]) for out in generated] == data["text_tokens"]
 
     decoder = MimiDecoderSubmodule(codec)
     node = decoder.prepare_inputs(cfg.GENERATE_WALK, info, {"agent_frame": [o["agent_frame"][0] for o in generated]})

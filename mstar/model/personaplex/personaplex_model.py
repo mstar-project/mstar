@@ -13,7 +13,7 @@ Walks, stepped through ``kwargs["walk_schedule"]`` (Wan2.2 pattern):
                         final ``lm_state`` (token cache, mask, offset, step)
     generate[_audio]  - Loop over LM, one iteration per user frame, then
                         MimiDecoder; ``agent_frame`` (and, for ``generate``,
-                        ``text_output``) accumulate across iterations
+                        ``text_frame``) accumulate across iterations
 
 The LM is one node name in two walks (a walk may hold it once; worklog §3 M4).
 Its loop-backs are consumed and seeded empty at iteration 0, and async
@@ -52,7 +52,7 @@ MIMI_CHECKPOINT_NAME = "tokenizer-e351c8d8-checkpoint125.safetensors"  # [PP] mo
 GENERATE_AUDIO_WALK = cfg.GENERATE_AUDIO_WALK
 LM_LOOP_BACKS = {
     cfg.CONDITIONING_WALK: ("lm_state",),
-    cfg.GENERATE_WALK: ("lm_state", "agent_frame", "text_output"),
+    cfg.GENERATE_WALK: ("lm_state", "agent_frame", "text_frame"),
 }
 SAMPLING_KWARGS = ("temp_text", "temp_audio", "topk_text", "topk_audio", "greedy")
 
@@ -111,7 +111,7 @@ class PersonaPlexModel(Model):
     def _lm_node(self, walk: str) -> GraphNode:
         inputs = {
             cfg.CONDITIONING_WALK: ["lm_state", "voice_embeddings", "voice_cache", "persona_tokens"],
-            cfg.GENERATE_WALK: ["lm_state", "agent_frame", "text_output", "user_audio_codes"],
+            cfg.GENERATE_WALK: ["lm_state", "agent_frame", "text_frame", "user_audio_codes"],
         }[walk]
         return GraphNode(
             name=cfg.LM_NODE, input_names=inputs,
@@ -122,7 +122,7 @@ class PersonaPlexModel(Model):
     def _generate_walk(self, with_text: bool) -> GraphSection:
         accumulated = [GraphEdge(next_node=cfg.MIMI_DECODER_NODE, name="agent_frame")]
         if with_text:
-            accumulated.append(GraphEdge(next_node=EMIT_TO_CLIENT, name="text_output", output_modality="text"))
+            accumulated.append(GraphEdge(next_node=EMIT_TO_CLIENT, name="text_frame", output_modality="text"))
         decode_loop = Loop(
             name=cfg.DECODE_LOOP, section=self._lm_node(cfg.GENERATE_WALK),
             max_iters=cfg.MAX_TEMPORAL_FORWARDS, outputs=[], accumulated_outputs=accumulated,
@@ -375,7 +375,7 @@ class PersonaPlexModel(Model):
                 inputs.append(GraphEdge(next_node=cfg.LM_NODE, name="lm_state"))
             else:
                 inputs = self._signals(persist_signals, cfg.LM_NODE, ["lm_state", "user_audio_codes"])
-                inputs += [GraphEdge(next_node=cfg.LM_NODE, name=n) for n in ("agent_frame", "text_output")]
+                inputs += [GraphEdge(next_node=cfg.LM_NODE, name=n) for n in ("agent_frame", "text_frame")]
         # Each persisted tensor is used for the last time in the walk it feeds.
         return ForwardPassArgs(
             full_metadata=metadata, inputs=inputs,
