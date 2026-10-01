@@ -12,9 +12,10 @@ from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferPrefillWrapper,
+    check_flashinfer_head_dim,
 )
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.kv.config import KVConfig
+from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.step import SlotLease, StepContext
 
@@ -25,7 +26,7 @@ class FlashInferManager(AttentionManager):
         kv_cache: str,
         device: torch.device,
         dtype: torch.dtype,
-        kv_config: KVConfig,
+        kv_config: PagedKVConfig,
         backend: str="auto",
     ):
         self._kv_cache_name = kv_cache
@@ -44,6 +45,7 @@ class FlashInferManager(AttentionManager):
         self._preplanned = False
 
         self._kv_config = kv_config
+        check_flashinfer_head_dim(kv_config.head_dim, device)     # at load, not at the first plan
         self._wrapper_kv_kwargs = dict(
             num_qo_heads=kv_config.num_qo_heads,
             num_kv_heads=kv_config.num_kv_heads,
@@ -83,12 +85,18 @@ class FlashInferManager(AttentionManager):
 
         bucket = lease.bucket
         buffer = self._workspaces.get(label, lease.slot)
+        # per row, not per pool: rows that matched one cached prefix all name
+        # its pages, so a step can name more page ids than the pool holds
+        kv_kwargs = {
+            **self._wrapper_kv_kwargs,
+            "max_num_pages": num_rows * self._kv_config.max_num_pages,
+        }
         if bucket.bs == bucket.num_tokens:
             wrapper = FlashInferDecodeWrapper(
                 workspace_buffer=buffer,
                 batch_size=num_rows,
                 use_cuda_graph=True,
-                **self._wrapper_kv_kwargs,
+                **kv_kwargs,
             )
         else:
             wrapper = FlashInferPrefillWrapper(
@@ -96,7 +104,7 @@ class FlashInferManager(AttentionManager):
                 batch_size=num_rows,
                 max_total_tokens=bucket.num_tokens,
                 use_cuda_graph=True,
-                **self._wrapper_kv_kwargs,
+                **kv_kwargs,
             )
         self._cg_plan_states[key] = wrapper
         return wrapper

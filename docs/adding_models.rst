@@ -197,7 +197,10 @@ request, and the engine passes each config to its resource when the request is i
 There are two ``ResourceReqConfig`` subclasses:
 
 - ``SamplingReqConfig`` holds ``temperature``, ``top_k``, ``top_p``,
-  ``repetition_penalty`` and ``ignore_eos``. The conductor fills in the per-request seed.
+  ``repetition_penalty``, ``min_p`` and ``ignore_eos``. The conductor fills in the
+  per-request seed. ``min_p`` follows the HF processor order (after the penalty and
+  temperature, before top-k/top-p) and needs ``enable_min_p=True`` on the node's
+  ``SamplerSpec``, which adds the filter to that node's captured sampler only.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
@@ -233,6 +236,77 @@ sampling parameters. The engine no longer reads it directly. Pass its result int
    through ``SamplingReqConfig`` are stored in buffers whose addresses do not change
    across replays, so they stay per-request and remain safe under CUDA graphs.
 
+Cross-request prefix reuse
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Two requests that begin with the same tokens fill the same KV pages, and the second can
+attend the pages the first filled instead of recomputing them. A model opts in with two
+methods. Both have defaults, and a model that overrides neither is never cached. The
+deployment switch and the per-request opt-out are described under **Resource overrides**
+in :doc:`serving`.
+
+``prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]``
+   Return ``{resource_key: {label: PrefixStream}}``, one entry for each KV cache stream
+   whose pages are keyed. A :class:`mstar.model.base.PrefixStream` has four fields:
+
+   - ``tensor`` names the request tensor that holds the stream's token ids, as
+     ``process_prompt`` returns it.
+   - ``keyed_by`` is ``"ids"``: each page is keyed by its token ids, chained from the key
+     of the page before it.
+   - ``walk`` names the graph walk that writes the keyed span. Only this walk is probed
+     for a match. If any walk other than ``walk`` and ``decode_walk`` writes into the
+     stream, the stream stops being keyed.
+   - ``decode_walk`` names the walk whose input is the token just sampled, so that the
+     generated tokens are chained onto the prompt's keys and a later request that
+     re-sends the reply matches it too. ``None`` keys the prompt only.
+
+   BAGEL keys the text walk of its LLM and the decode that follows it:
+
+   .. code-block:: python
+
+      return {"kv": {"main": PrefixStream(
+          "text_inputs", "ids", "prefill_text", "decode",
+      )}}
+
+   Orpheus keys its prompt walk and its decode walk:
+
+   .. code-block:: python
+
+      return {
+          KV_CACHE: {"main": PrefixStream("text_inputs", "ids", "prefill", "decode")},
+      }
+
+``checkpoint_path(self) -> str | None``
+   Return the local directory that holds the weights and ``config.json``. The cache
+   hashes the checkpoint's safetensors index and config into the root of every key, so
+   naming the checkpoint is what keeps two builds off each other's pages. The default
+   returns ``None``, which leaves the weights out of the root. A model without a
+   checkpoint therefore needs ``prefix_cache_salt`` set to use the cache at all. Without
+   one, the engine keeps the cache shut and logs why.
+
+A model that declares a stream is checked at load time. Loading fails in three cases:
+
+- A position resource over a keyed cache uses a scheme other than sequential. A page is
+  reusable only where its tokens land at the positions they were written at. The message
+  is ``resource '<key>' places positions by <scheme>, but it sits over ['<kv key>'],
+  which the model keyed for prefix reuse; either drop the stream or give the resource a
+  sequential scheme``.
+- A resource on a keyed node does not set ``prefix_skip_safe``. A hit takes the front of
+  the request away from every resource on the node, including resources that never saw
+  those tokens. The message is ``resource '<key>' cannot serve a request whose prefix
+  came from the cache, but it sits on ['<node>'], which the model keyed for prefix
+  reuse; either drop the stream or give the resource the prefix hooks``.
+- A stream names a walk that the model does not run. The message is ``<Model> keys
+  '<resource key>'/'<label>' on ['<walk>'], which it never runs; its walks are [...]``.
+
+Some requests stay uncached even when the model declares a stream. The engine checks each
+request's inputs on the keyed walk and cuts a prefix only from inputs that the default
+``split_inputs`` can slice. A request whose inputs carry ``tensor_inputs``, ``kwargs`` or
+``resource_step_info`` is never probed; BAGEL's guided requests carry ``requires_cfg``
+there. The keys stop at a prompt's first input that is not a token, so a BAGEL prompt is
+keyed over its leading text only. A stream under a sliding window files pages only up to
+its protected prefix, which the window never releases.
+
 .. _Step 2a — Declare your resources:
 
 Step 2a — Declare your resources
@@ -265,19 +339,27 @@ The spec types are:
 
    * - Spec
      - What it builds
-   * - ``KVSpec(config=KVConfig(...))``
-     - A paged KV cache. ``KVConfig`` holds ``num_layers``, ``num_kv_heads``,
-       ``head_dim``, ``max_seq_len`` and ``num_qo_heads``. It also holds three fields that
-       a deployment can tune: ``max_num_pages``, ``page_size`` and ``cpu_offload_pages``
-       (the number of pinned host pages used for offload; 0 disables offload).
+   * - ``KVSpec(config=PagedKVConfig(...))``
+     - A paged KV cache. ``KVConfig`` is the abstract base for common model geometry;
+       ``PagedKVConfig`` adds ``max_seq_len`` and five fields that
+       a deployment can tune: ``max_num_pages``, ``page_size``, ``cpu_offload_pages``
+       (the number of pinned host pages used for offload; 0 disables offload),
+       ``prefix_cache`` and ``prefix_cache_salt``.
+   * - ``KVSpec(config=RingKVConfig(...))``
+     - A fixed-capacity frame ring. It adds ``tokens_per_frame``, one
+       ``RingKVLayerConfig`` per layer, and the deployment-tunable ``num_sessions``.
+       Ring storage is currently paired with FlexAttention.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
-       ``AttnBackend.FLASHINFER`` (the default) or ``AttnBackend.DENSE``.
+       ``AttnBackend.FLASHINFER`` (the default), ``AttnBackend.DENSE`` or
+       ``AttnBackend.FLEX``. FlashInfer and dense attention require a
+       ``PagedKVConfig``; FlexAttention requires a ``RingKVConfig``.
        ``flashinfer_backend`` selects a kernel generation: ``"auto"``, ``"fa2"`` or
-       ``"fa3"``.
+       ``"fa3"`` when the FlashInfer backend is selected.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
-     - Attention over a context that is written once and never extended. See
-       `Cross-attention (encoder-decoder models)`_.
+     - Attention over a paged context that is written once and never extended. Only
+       the FlashInfer backend is implemented. See `Cross-attention (encoder-decoder
+       models)`_.
    * - ``RaggedAttentionSpec(config=RaggedAttentionConfig(...))``
      - Cacheless (ragged) varlen self-attention over the segments packed into one
        forward. Nothing is paged, and nothing carries to the next step.
@@ -310,7 +392,7 @@ appears in no spec, so it receives no resources:
 
    # mstar/model/orpheus/orpheus_model.py
    def get_node_resources(self) -> list[NodeResourceSpec]:
-       kv_config = KVConfig(
+       kv_config = PagedKVConfig(
            num_layers=self.config.num_hidden_layers,
            num_kv_heads=self.config.num_key_value_heads,
            head_dim=self.config.head_dim,
@@ -925,6 +1007,9 @@ Both types share the base ``CudaGraphConfig`` fields:
   engine's eager batch size for the walk. The default is ``True``, so the engine never
   batches beyond a captured size.
 - ``compile`` runs ``torch.compile`` before capture. The default is ``True``.
+- ``required`` makes every bucket in the config mandatory. If capture fails locally or
+  on another participating rank, warmup raises after rank-wide agreement instead of
+  dropping the bucket and falling back to eager execution. The default is ``False``.
 
 ``BatchedCudaGraphConfig`` also accepts ``total_tokens_multiplier``. Use it when one
 request's step commits KV across several labels that are combined into a single plan, as
@@ -1036,6 +1121,9 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   default.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
+- ``required`` makes every declared shape mandatory. If any participating rank cannot
+  capture one, warmup raises instead of leaving that shape on the eager path. The default
+  is ``False``.
 
 **Splitting the declaration.** When a region leases its own slot, exactly one of the two
 declarations must own each resource. The common pattern is for the outer ``declare_step``
@@ -1209,10 +1297,16 @@ that a misspelled setting is never silently ignored:
 
    * - Spec
      - Accepts
-   * - ``KVSpec``
-     - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``
-   * - ``AttentionSpec`` / ``CrossAttentionSpec``
-     - ``backend`` (``flashinfer`` / ``dense``), ``flashinfer_backend``
+   * - ``KVSpec`` with ``PagedKVConfig``
+     - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``,
+       ``prefix_cache``, ``prefix_cache_salt``
+   * - ``KVSpec`` with ``RingKVConfig``
+     - ``num_sessions``
+   * - ``AttentionSpec``
+     - ``backend`` (``flashinfer`` / ``dense`` / ``flex``),
+       ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``)
+   * - ``CrossAttentionSpec``
+     - ``backend`` (only ``flashinfer`` is implemented), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``)
    * - ``RaggedAttentionSpec``
      - ``flashinfer_backend`` (``auto`` / ``fa2`` / ``fa3``),
@@ -1221,8 +1315,9 @@ that a misspelled setting is never silently ignored:
        not the model.
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
-example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``, while
-``configs/cosmos3_nano.yaml`` sets the page count under its KV key.
+example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
+``configs/cosmos3_nano.yaml`` sets the page count under its paged KV key, and
+``configs/waypoint.yaml`` sets the resident world count under its ring KV key.
 
 .. note::
 
@@ -1589,6 +1684,7 @@ Checklist
          [ ] postprocess
          [ ] get_submodule
          [ ] (optional) get_request_resource_configs
+         [ ] (optional) prefix_key_streams + checkpoint_path   — cross-request prefix reuse
    [ ] mstar/model/registry.py                    — add to MODEL_REGISTRY (+ HF_MODELS)
    [ ] configs/<your_model>.yaml                  — node_groups → ranks (+ resources: overrides)
    [ ] (optional) async partitions if pipelined

@@ -58,13 +58,13 @@ class WorkerProfileInfo:
     steps for a request (e.g. decode) sum into one entry with ``exec_count``.
     """
     # request_id -> {(node, graph_walk) -> accumulated GraphTiming}
-    per_rid_graph_timings: dict[str, GraphTimings] = field(default_factory=dict)
+    per_rid_graph_timings: dict[int, GraphTimings] = field(default_factory=dict)
 
     def register_end(
         self,
         node: str,
         walk: str,
-        rids: list[str],
+        rids: list[int],
         timings: ExecTimings,
         end_time: float | None = None,
     ):
@@ -101,6 +101,6 @@ class WorkerProfileInfo:
             else:
                 rid_timings[(node, walk)] = timing
 
-    def pop_request(self, rid: str) -> GraphTimings:
+    def pop_request(self, rid: int) -> GraphTimings:
         """Drop and return a request's accumulated timings (called on removal)."""
         return self.per_rid_graph_timings.pop(rid, {})

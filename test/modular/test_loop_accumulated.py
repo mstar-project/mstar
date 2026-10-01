@@ -10,6 +10,7 @@ balance without booting shared memory.
 from __future__ import annotations
 
 import pytest
+import torch
 
 pytest.skip(
     "Drives the deleted cache_outputs + complete_loops API and tests "
@@ -58,7 +59,7 @@ class MockTensorManager:
 def _make_info(uuid_str: str) -> TensorPointerInfo:
     return TensorPointerInfo(
         dims=[1],
-        dtype="float32",
+        dtype=torch.float32,
         nbytes=4,
         address=0,
         stride=[1],

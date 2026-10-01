@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Assemble the BENCHMARK_PROTOCOL.md TTS table from ``tts_speech_bench`` / ``tts_wer`` / parity JSONs.
+"""Assemble the BENCHMARK_PROTOCOL.md TTS table from ``tts_speech_bench`` / ``tts_speech_wer`` / parity JSONs.
 
     python -m benchmark.tts_report --results results/2026-09-18 --out results/2026-09-18/REPORT.md
 
 Every ``*_c<N>.json`` written by ``benchmark/tts_speech_bench.py`` becomes one row
 (label, concurrency, TTFA p50/p95, RTF, audio-seconds per second, errors); a
-sibling ``*_c<N>_wer.json`` from ``benchmark/tts_wer.py`` fills the WER column
+sibling ``*_c<N>_wer.json`` from ``benchmark/tts_speech_wer.py`` fills the WER column
 and ``parity_*.json`` files from ``test/qwen3-tts/parity_qwen3_tts.py`` become
 the parity table. The markdown is printed and optionally written to ``--out``.
 """

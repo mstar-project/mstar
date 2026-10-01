@@ -80,6 +80,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
 )
+from mstar.streaming.stream_buffer import StreamChunkInfo
 
 # the CodePredictor depth loop, as a piecewise capture region
 DEPTH_LOOP_REGION = "code_predictor_loop"
@@ -430,7 +431,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         del kwargs
         if graph_walk in ("talker_prefill", "talker_prefill_clone"):
             input_embeds = self._build_prefill(
-                fwd_info.request_id,
+                fwd_info.rid_handle,
                 inputs["text_inputs"][0],
                 inputs["prompt_layout"][0],
                 int(inputs["speaker_id"][0].item()),
@@ -438,9 +439,9 @@ class TalkerSubmodule(ARNodeSubmodule):
                 speaker_embed=inputs["speaker_embed"][0] if "speaker_embed" in inputs else None,
                 ref_codes=inputs["ref_codes"][0] if "ref_codes" in inputs else None,
             )
-            state = self.request_state(fwd_info.request_id)
+            state = self.request_state(fwd_info.rid_handle)
         elif graph_walk == "talker_decode":
-            state = self.request_state(fwd_info.request_id)
+            state = self.request_state(fwd_info.rid_handle)
             step = int(state["generation_step"])
             trailing = state["trailing_text_hidden"]
             text_condition = (
@@ -1003,10 +1004,9 @@ class CodecSubmodule(ARNodeSubmodule):
         )
 
     @staticmethod
-    def _stream_chunk_meta(fwd_info: CurrentForwardPassInfo) -> dict[str, Any]:
-        """Geometry of this window from the stream buffer (offset, context, final)."""
-        step_metadata = getattr(fwd_info, "step_metadata", None) or {}
-        return step_metadata.get("stream_chunks", {}).get("codec_tokens", {})
+    def _codec_chunk(stream_chunks: Mapping[str, StreamChunkInfo] | None) -> StreamChunkInfo | None:
+        """This window's geometry from the stream buffer (offset, context, items, final)."""
+        return (stream_chunks or {}).get("codec_tokens")
 
     def prepare_inputs(
         self,
@@ -1022,8 +1022,9 @@ class CodecSubmodule(ARNodeSubmodule):
         captured window that fits so the ramp's windows and the terminal tail
         all replay CUDA graphs.
         """
-        del graph_walk, kwargs
-        state = self.request_state(fwd_info.request_id)
+        del graph_walk
+        chunk = self._codec_chunk(kwargs.get("stream_chunks"))
+        state = self.request_state(fwd_info.rid_handle)
         if "ref_frames" in inputs and "skip_samples" not in state:
             # Voice clone: the stream leads with the last ``left_context_frames``
             # of the reference clip (all of it when shorter), whose audio the
@@ -1051,18 +1052,17 @@ class CodecSubmodule(ARNodeSubmodule):
             :self.config.codec.num_quantizers,
         ]
         frames = codes.shape[0]
-        meta = self._stream_chunk_meta(fwd_info)
-        context = int(meta.get("context_items", 0))
+        context = chunk.context_items if chunk is not None else 0
         # The bucket is chosen from the window's item count (EOS included) so
-        # that ``cg_key_info``, which only sees the stream metadata, agrees.
-        bucket = self._bucket(max(int(meta.get("num_items", num_items)), 1))
+        # that ``cg_key_info``, which only sees the stream chunk info, agrees.
+        bucket = self._bucket(max(chunk.num_items if chunk is not None else num_items, 1))
         if frames < bucket:
             codes = torch.nn.functional.pad(codes, (0, 0, 0, bucket - frames))
         logger.debug(
             "codec %s: window items=%d context=%d frames=%d bucket=%d final=%s",
-            fwd_info.request_id, num_items, context, frames, bucket, meta.get("is_final"),
+            fwd_info.request_id, num_items, context, frames, bucket, chunk is not None and chunk.is_final,
         )
-        state.add("codec_bucket", bucket)   # graph-key fallback when a caller has no stream metadata
+        state.add("codec_bucket", bucket)   # graph-key fallback when a caller has no stream chunk info
         # The window's geometry rides with this pass: under speculative
         # scheduling the next window of the same request is prepared before
         # this one is postprocessed, so request state would be overwritten.
@@ -1176,20 +1176,23 @@ class CodecSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         per_request_info: Mapping[str, CurrentForwardPassInfo],
+        per_request_stream_chunks: Mapping[str, Mapping[str, StreamChunkInfo]] | None = None,
+        **kwargs: Any,
     ) -> Any:
         """The widest window bucket in this batch, which ``preprocess`` pads to.
 
-        Derived from the stream metadata the worker attaches to each request
-        (available before ``prepare_inputs`` runs, so a pre-planned lease can
-        find its capture); the state written by ``prepare_inputs`` is the
-        fallback for callers without that metadata.
+        Derived from the batch's stream chunk info (available before
+        ``prepare_inputs`` runs, so a pre-planned lease can find its capture);
+        the state written by ``prepare_inputs`` is the fallback for callers
+        without it.
         """
-        del graph_walk
+        del graph_walk, kwargs
+        per_request_stream_chunks = per_request_stream_chunks or {}
         buckets = set()
-        for request_id, fwd_info in per_request_info.items():
-            num_items = self._stream_chunk_meta(fwd_info).get("num_items")
-            if num_items is not None:
-                buckets.add(self._bucket(max(int(num_items), 1)))
+        for request_id in per_request_info:
+            chunk = self._codec_chunk(per_request_stream_chunks.get(request_id))
+            if chunk is not None:
+                buckets.add(self._bucket(max(chunk.num_items, 1)))
             else:
                 buckets.add(self.request_state(request_id).get("codec_bucket"))
         buckets.discard(None)

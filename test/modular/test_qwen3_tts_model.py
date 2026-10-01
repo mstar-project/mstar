@@ -37,7 +37,7 @@ from mstar.model.qwen3_tts.submodules import CodecSubmodule, TalkerSubmodule
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
-from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "qwen3tts.yaml"
 
@@ -767,7 +767,7 @@ def test_qwen3_tts_talker_builds_official_non_streaming_prefill():
     assert state["trailing_text_hidden"].shape == (0, 16)
     prepared = submodule.prepare_inputs(
         "talker_decode",
-        SimpleNamespace(request_id="request"),
+        SimpleNamespace(request_id="request", rid_handle="request"),
         {"talker_input_embeds": [torch.zeros(1, 16)]},
     )
     assert torch.equal(prepared.input_embeds[0], state["tts_pad_embed"])
@@ -1016,7 +1016,7 @@ def test_qwen3_tts_eos_suppression_ignores_graph_dummy_request_ids():
     )
     prepared = submodule.prepare_inputs(
         "talker_decode",
-        SimpleNamespace(request_id="real"),
+        SimpleNamespace(request_id="real", rid_handle="real"),
         {"talker_input_embeds": [torch.zeros(1, config.talker.hidden_size)]},
     )
     packed = submodule.preprocess(
@@ -1315,12 +1315,16 @@ def test_qwen3_tts_codec_postprocess_uses_its_own_pass_geometry():
     request's latest state."""
     config = _tiny_model_config()   # upsample 4, windows [1, 4]
     submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
-    meta = lambda context: SimpleNamespace(  # noqa: E731
-        request_id="request",
-        step_metadata={"stream_chunks": {"codec_tokens": {"context_items": context, "is_final": False}}},
-    )
-    first = submodule.prepare_inputs("codec_chunk", meta(0), {"codec_tokens": [torch.ones(1, 4, dtype=torch.long)]})
-    second = submodule.prepare_inputs("codec_chunk", meta(1), {"codec_tokens": [torch.ones(4, 4, dtype=torch.long)]})
+    fwd_info = SimpleNamespace(request_id="request", rid_handle="request")
+
+    def prepare(codes, context):
+        chunk = StreamChunkInfo(start_offset=0, context_items=context, num_items=codes.shape[0], is_final=False)
+        return submodule.prepare_inputs(
+            "codec_chunk", fwd_info, {"codec_tokens": [codes]}, stream_chunks={"codec_tokens": chunk},
+        )
+
+    first = prepare(torch.ones(1, 4, dtype=torch.long), 0)
+    second = prepare(torch.ones(4, 4, dtype=torch.long), 1)
     assert (first.kwargs, second.kwargs) == ({"frames": 1, "context": 0}, {"frames": 4, "context": 1})
 
     out_first = {"audio_chunk": [torch.arange(4)]}
@@ -1336,7 +1340,7 @@ def test_qwen3_tts_codec_trims_reference_audio_from_clone_streams():
     submodule = CodecSubmodule(_FakeCodecDecoder(4), config)
     codes = torch.ones(3, 4, dtype=torch.long)
     submodule.prepare_inputs(
-        "codec_chunk_clone", SimpleNamespace(request_id="clone"),
+        "codec_chunk_clone", SimpleNamespace(request_id="clone", rid_handle="clone"),
         {"codec_tokens": [codes], "ref_frames": [torch.tensor([4])]},
     )
     state = submodule.request_state("clone")
@@ -1364,13 +1368,14 @@ def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
         [5, 6, 7, 8],
     ])
 
-    fwd_info = SimpleNamespace(
-        request_id="request",
-        step_metadata={"stream_chunks": {"codec_tokens": {
-            "start_offset": 1, "context_items": 1, "num_items": 3, "is_final": False,
-        }}},
+    prepared = submodule.prepare_inputs(
+        "codec_chunk",
+        SimpleNamespace(request_id="request", rid_handle="request"),
+        {"codec_tokens": [codes]},
+        stream_chunks={"codec_tokens": StreamChunkInfo(
+            start_offset=1, context_items=1, num_items=3, is_final=False,
+        )},
     )
-    prepared = submodule.prepare_inputs("codec_chunk", fwd_info, {"codec_tokens": [codes]})
 
     # Three items (one of them EOS) pad up to the smallest captured window (4).
     packed = prepared.tensor_inputs["codec_tokens"]
@@ -1382,12 +1387,12 @@ def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
 
     # A single frame lands in the first ramp bucket; too many frames is an error.
     one = submodule.prepare_inputs(
-        "codec_chunk", SimpleNamespace(request_id="one"), {"codec_tokens": [codes[:1]]},
+        "codec_chunk", SimpleNamespace(request_id="one", rid_handle="one"), {"codec_tokens": [codes[:1]]},
     )
     assert one.tensor_inputs["codec_tokens"].shape == (4, 1)
     with pytest.raises(ValueError, match="maximum is 4"):
         submodule.prepare_inputs(
-            "codec_chunk", SimpleNamespace(request_id="big"),
+            "codec_chunk", SimpleNamespace(request_id="big", rid_handle="big"),
             {"codec_tokens": [torch.ones(5, 4, dtype=torch.long)]},
         )
 
@@ -1424,14 +1429,11 @@ def test_qwen3_tts_streaming_policy_ramps_and_flushes_only_new_tail_audio():
 
     # The codec trims exactly the context frames the buffer reported (tail: 1 new frame).
     codec = CodecSubmodule(_FakeCodecDecoder(4), config)
-    fwd_info = SimpleNamespace(
-        request_id="request",
-        step_metadata={"stream_chunks": {"codec_tokens": {
-            "start_offset": tail.start_offset, "context_items": tail.context_items, "is_final": True,
-        }}},
-    )
     tail_codes = tail.data["data"].view(3, 1).expand(3, 4)
-    prepared = codec.prepare_inputs("codec_chunk", fwd_info, {"codec_tokens": [tail_codes]})
+    prepared = codec.prepare_inputs(
+        "codec_chunk", SimpleNamespace(request_id="request", rid_handle="request"),
+        {"codec_tokens": [tail_codes]}, stream_chunks={"codec_tokens": tail.info},
+    )
     assert prepared.tensor_inputs["codec_tokens"].shape == (4, 4)   # 3 frames padded to the 4-frame bucket
     outputs = {"audio_chunk": [torch.arange(16)]}
     codec.postprocess("request", None, outputs, inputs=prepared)
@@ -1482,16 +1484,17 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
     }
     assert submodule.max_batch_size("codec_chunk") == 32
     # The batch's capture key is the bucket its requests pad to: read off the
-    # stream metadata when present (before prepare_inputs), else off the state.
-    def meta(num_items):
-        return SimpleNamespace(step_metadata={"stream_chunks": {"codec_tokens": {
-            "num_items": num_items, "context_items": 0, "start_offset": 0, "is_final": False,
-        }}})
+    # stream chunk info when present (before prepare_inputs), else off the state.
+    def chunks(num_items):
+        return {"codec_tokens": StreamChunkInfo(
+            start_offset=0, context_items=0, num_items=num_items, is_final=False,
+        )}
 
-    assert submodule.cg_key_info("codec_chunk", {"a": meta(3), "b": meta(4)}) == 4
+    infos = {"a": None, "b": None}
+    assert submodule.cg_key_info("codec_chunk", infos, {"a": chunks(3), "b": chunks(4)}) == 4
     # Requests at different points of the ramp share a batch: the key (and the
     # padding in preprocess) is the widest window among them.
-    assert submodule.cg_key_info("codec_chunk", {"a": meta(1), "b": meta(4)}) == 4
+    assert submodule.cg_key_info("codec_chunk", infos, {"a": chunks(1), "b": chunks(4)}) == 4
     for rid in ("a", "b"):
         submodule.request_state(rid).add("codec_bucket", 4)
     assert submodule.cg_key_info("codec_chunk", {"a": None, "b": None}) == 4
@@ -1573,7 +1576,7 @@ def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
     )
     clip = torch.randn(2, 4000) * 0.1   # stereo, averaged to mono
     prepared = submodule.prepare_inputs(
-        "talker_prefill_clone", SimpleNamespace(request_id="clone"),
+        "talker_prefill_clone", SimpleNamespace(request_id="clone", rid_handle="clone"),
         {"audio_inputs": [clip], "prompt_layout": [torch.tensor([0, 2, 1, 5, 7])]},
     )
     assert prepared.tensor_inputs["waveform"].shape == (4000,)
@@ -1588,7 +1591,7 @@ def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
 
     # x-vector only: the codec encoder is skipped and a placeholder frame rides the edge.
     prepared = submodule.prepare_inputs(
-        "talker_prefill_clone", SimpleNamespace(request_id="xvec"),
+        "talker_prefill_clone", SimpleNamespace(request_id="xvec", rid_handle="xvec"),
         {"audio_inputs": [clip[0]], "prompt_layout": [torch.tensor([0, 2, 1, 0, 0])]},
     )
     out = submodule.forward("talker_prefill_clone", engine_inputs, **submodule.preprocess(
@@ -1618,7 +1621,7 @@ def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
 
     def encode(rid: str, clip: torch.Tensor, ref_frames: int):
         prepared = submodule.prepare_inputs(
-            "talker_prefill_clone", SimpleNamespace(request_id=rid),
+            "talker_prefill_clone", SimpleNamespace(request_id=rid, rid_handle=rid),
             {"audio_inputs": [clip], "prompt_layout": [torch.tensor([0, 2, 1, ref_frames, ref_frames])]},
         )
         return submodule.forward("talker_prefill_clone", engine_inputs, **submodule.preprocess(

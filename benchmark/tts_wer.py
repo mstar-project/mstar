@@ -1,133 +1,176 @@
-#!/usr/bin/env python3
-"""Word error rate of synthesized speech, transcribed with whisper-large-v3-turbo.
+"""WER quality guard for TTS engines (BENCHMARK_PROTOCOL.md, TTS row).
 
-Quality guard for the TTS benchmark (BENCHMARK_PROTOCOL.md): every engine's WAVs
-from ``benchmark/tts_speech_bench.py --save-audio-dir`` are transcribed with the
-same ASR model and scored against the same input sentences, after Whisper's
-English text normalizer. Engines must land within one WER point of each other.
+Synthesizes every line of a sentence file through an OpenAI-compatible
+``/v1/audio/speech`` (M*, Kokoro-FastAPI, ...) or through the raw ``kokoro``
+package, transcribes the audio with ``openai/whisper-large-v3-turbo`` and
+reports the word error rate against the input text, with Whisper's English
+normalizer applied to both sides. Per-sentence synthesis wall time and audio
+duration are recorded too; for the package path that is the single-request
+real-time factor of the reference implementation.
 
-    python -m benchmark.tts_wer --audio-dir results/mstar_c8_wav \\
-        --sentences $BENCH/tts/sentences_200.txt --out results/mstar_c8_wer.json
+    python benchmark/tts_wer.py --url http://127.0.0.1:8000 --sentences sentences_200.txt --out out/mstar
+    python benchmark/tts_wer.py --engine kokoro-package --sentences sentences_200.txt --out out/package
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
-import sys
+import statistics
+import time
 from pathlib import Path
 
+import numpy as np
 
-def word_errors(reference: list[str], hypothesis: list[str]) -> int:
-    """Levenshtein distance over words (substitutions + insertions + deletions)."""
-    previous = list(range(len(hypothesis) + 1))
-    for i, ref_word in enumerate(reference, start=1):
-        current = [i]
-        for j, hyp_word in enumerate(hypothesis, start=1):
-            current.append(min(
-                previous[j] + 1,
-                current[j - 1] + 1,
-                previous[j - 1] + (ref_word != hyp_word),
-            ))
-        previous = current
-    return previous[-1]
+SAMPLE_RATE = 24000
 
 
-def load_sentences(path: str) -> dict[int, str]:
-    lines = Path(path).read_text(encoding="utf-8").splitlines()
-    return {i + 1: ln.strip() for i, ln in enumerate(lines) if ln.strip()}
+def read_wav(data: bytes) -> np.ndarray:
+    import soundfile as sf
+
+    audio, rate = sf.read(io.BytesIO(data), dtype="float32")
+    if rate != SAMPLE_RATE:
+        raise ValueError(f"expected {SAMPLE_RATE} Hz audio, got {rate}")
+    return audio if audio.ndim == 1 else audio.mean(axis=1)
+
+
+def synth_openai(url: str, model: str, voice: str, speed: float, text: str) -> np.ndarray:
+    import requests
+
+    body = {"model": model, "input": text, "voice": voice, "speed": speed, "response_format": "wav"}
+    r = requests.post(f"{url.rstrip('/')}/v1/audio/speech", json=body, timeout=600)
+    r.raise_for_status()
+    return read_wav(r.content)
+
+
+class PackageSynth:
+    """The ``kokoro`` package, one request at a time (the reference implementation)."""
+
+    def __init__(self, voice: str, device: str):
+        import torch
+        from kokoro import KModel, KPipeline
+
+        self.voice = voice
+        self.model = KModel(repo_id="hexgrad/Kokoro-82M").to(device).eval()
+        self.pipeline = KPipeline(lang_code=voice[0], repo_id="hexgrad/Kokoro-82M", model=self.model)
+        self.torch = torch
+
+    def __call__(self, text: str, speed: float) -> np.ndarray:
+        chunks = [r.audio.numpy() for r in self.pipeline(text, voice=self.voice, speed=speed) if r.audio is not None]
+        if self.model.device.type == "cuda":
+            self.torch.cuda.synchronize()
+        return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
 
 ASR_SAMPLE_RATE = 16000
+WHISPER_WINDOW_SECONDS = 30
 
 
-def load_for_asr(path: Path) -> dict:
-    """A WAV file as the pipeline's raw-audio input (mono float32 at 16 kHz).
-
-    Decoded with soundfile so the benchmark hosts need no ffmpeg binary.
-    """
-    import numpy as np
+def transcribe(wavs: list[Path], asr_model: str, device: str, batch_size: int) -> list[str]:
+    """Whisper transcripts of the files (each at most one 30 s window)."""
     import soundfile as sf
     import torch
-    import torchaudio.functional as taf
-
-    audio, sample_rate = sf.read(str(path), dtype="float32", always_2d=True)
-    mono = torch.from_numpy(np.ascontiguousarray(audio.mean(axis=1)))
-    if sample_rate != ASR_SAMPLE_RATE:
-        mono = taf.resample(mono, sample_rate, ASR_SAMPLE_RATE)
-    return {"raw": mono.numpy(), "sampling_rate": ASR_SAMPLE_RATE}
-
-
-def transcribe(audio_paths: list[Path], model_id: str, device: str, batch_size: int) -> list[str]:
-    """Whisper transcripts, one per file, in the order given.
-
-    Drives the model directly rather than through ``pipeline(...)``: the
-    pipeline decodes files with ffmpeg/torchcodec, which benchmark hosts may
-    not have, while the processor only needs 16 kHz arrays.
-    """
-    import torch
+    from scipy.signal import resample_poly
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
     dtype = torch.float16 if device.startswith("cuda") else torch.float32
-    processor = WhisperProcessor.from_pretrained(model_id)
-    model = WhisperForConditionalGeneration.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
+    processor = WhisperProcessor.from_pretrained(asr_model)
+    model = WhisperForConditionalGeneration.from_pretrained(asr_model, dtype=dtype).to(device).eval()
+    clips = []
+    for path in wavs:
+        audio, rate = sf.read(path, dtype="float32")
+        audio = audio if audio.ndim == 1 else audio.mean(axis=1)
+        g = np.gcd(rate, ASR_SAMPLE_RATE)
+        clip = resample_poly(audio, ASR_SAMPLE_RATE // g, rate // g).astype(np.float32)
+        clips.append(clip[: WHISPER_WINDOW_SECONDS * ASR_SAMPLE_RATE])
     texts: list[str] = []
-    for start in range(0, len(audio_paths), batch_size):
-        clips = [load_for_asr(p)["raw"] for p in audio_paths[start:start + batch_size]]
-        features = processor(
-            clips, sampling_rate=ASR_SAMPLE_RATE, return_tensors="pt",
-        ).input_features.to(device=device, dtype=dtype)
-        with torch.inference_mode():
-            generated = model.generate(features, language="en", task="transcribe", max_new_tokens=440)
-        texts.extend(processor.batch_decode(generated, skip_special_tokens=True))
-    return [t.strip() for t in texts]
+    with torch.no_grad():
+        for start in range(0, len(clips), batch_size):
+            batch = clips[start : start + batch_size]
+            features = processor(batch, sampling_rate=ASR_SAMPLE_RATE, return_tensors="pt").input_features
+            ids = model.generate(features.to(device=device, dtype=dtype), language="en", task="transcribe")
+            texts.extend(processor.batch_decode(ids, skip_special_tokens=True))
+    return texts
 
 
-def main(argv: list[str] | None = None) -> None:
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--audio-dir", required=True, help="directory of <id>.wav files")
-    parser.add_argument("--sentences", required=True, help="text file, one sentence per line (id = line number)")
+    parser.add_argument("--engine", choices=["openai", "kokoro-package", "wavs"], default="openai")
+    parser.add_argument("--wavs-dir", help="for --engine wavs: directory of rendered NNN.wav files in sentence order")
+    parser.add_argument("--url", default="http://127.0.0.1:8000", help="server for --engine openai")
+    parser.add_argument("--model", default="kokoro")
+    parser.add_argument("--voice", default="af_heart")
+    parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--sentences", required=True, help="text file, one sentence per line")
+    parser.add_argument("--out", required=True, help="output directory (wavs, transcripts.tsv, summary.json)")
     parser.add_argument("--asr-model", default="openai/whisper-large-v3-turbo")
-    parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--out", default=None)
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--device", default=None, help="for the package path and the ASR model (default: cuda if available)"
+    )
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--asr-batch-size", type=int, default=16)
+    args = parser.parse_args()
 
-    from transformers.models.whisper.english_normalizer import EnglishTextNormalizer
+    import jiwer
+    import soundfile as sf
+    import torch
+    from transformers import WhisperTokenizer
 
-    sentences = load_sentences(args.sentences)
-    audio_paths = sorted(Path(args.audio_dir).glob("*.wav"))
-    if not audio_paths:
-        sys.exit(f"no WAV files in {args.audio_dir}")
-    hypotheses = transcribe(audio_paths, args.asr_model, args.device, args.batch_size)
-    normalize = EnglishTextNormalizer({})
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    sentences = [s.strip() for s in Path(args.sentences).read_text(encoding="utf-8").splitlines() if s.strip()]
+    if args.limit:
+        sentences = sentences[: args.limit]
+    out = Path(args.out)
+    (out / "wav").mkdir(parents=True, exist_ok=True)
 
-    rows = []
-    total_errors = total_words = 0
-    for path, hypothesis in zip(audio_paths, hypotheses, strict=True):
-        sid = int(path.stem)
-        reference = sentences[sid]
-        ref_words = normalize(reference).split()
-        hyp_words = normalize(hypothesis).split()
-        errors = word_errors(ref_words, hyp_words)
-        total_errors += errors
-        total_words += len(ref_words)
-        rows.append({"id": sid, "reference": reference, "hypothesis": hypothesis.strip(),
-                     "errors": errors, "words": len(ref_words)})
-    wer = 100.0 * total_errors / max(total_words, 1)
-    report = {
-        "audio_dir": str(Path(args.audio_dir).resolve()),
+    synth = PackageSynth(args.voice, device) if args.engine == "kokoro-package" else None
+    wavs, seconds, audio_seconds = [], [], []
+    if args.engine == "wavs":
+        # Scoring only: another harness rendered these (benchmark/kokoro_onnx_baselines.py writes them).
+        wavs = sorted(Path(args.wavs_dir).glob("*.wav"))[: len(sentences)]
+        sentences = sentences[: len(wavs)]
+        seconds = [float("nan")] * len(wavs)
+        audio_seconds = [sf.info(path).duration for path in wavs]
+    for i, text in enumerate(sentences if args.engine != "wavs" else []):
+        t0 = time.perf_counter()
+        audio = synth(text, args.speed) if synth else synth_openai(args.url, args.model, args.voice, args.speed, text)
+        seconds.append(time.perf_counter() - t0)
+        audio_seconds.append(len(audio) / SAMPLE_RATE)
+        path = out / "wav" / f"{i + 1:03d}.wav"
+        sf.write(path, audio, SAMPLE_RATE)
+        wavs.append(path)
+
+    hyps = transcribe(wavs, args.asr_model, device, args.asr_batch_size)
+    normalize = WhisperTokenizer.from_pretrained(args.asr_model).normalize
+    refs_n = [normalize(s) for s in sentences]
+    hyps_n = [normalize(h) for h in hyps]
+    wer = jiwer.wer(refs_n, hyps_n)
+    per_sentence = [jiwer.wer(r, h) if r else float("nan") for r, h in zip(refs_n, hyps_n, strict=True)]
+
+    with (out / "transcripts.tsv").open("w", encoding="utf-8") as f:
+        f.write("id\twer\tsynth_s\taudio_s\treference\thypothesis\n")
+        rows = zip(sentences, hyps, per_sentence, seconds, audio_seconds, strict=True)
+        for i, (text, hyp, w, s, a) in enumerate(rows):
+            f.write(f"{i + 1}\t{w:.3f}\t{s:.3f}\t{a:.2f}\t{text}\t{hyp.strip()}\n")
+    summary = {
+        "engine": args.engine,
+        "url": args.url if args.engine == "openai" else None,
+        "wavs_dir": args.wavs_dir,
+        "model": args.model,
+        "voice": args.voice,
+        "speed": args.speed,
         "asr_model": args.asr_model,
-        "files": len(rows),
-        "wer_percent": wer,
-        "total_words": total_words,
-        "total_errors": total_errors,
-        "rows": rows,
+        "num_sentences": len(sentences),
+        "wer": wer,
+        "audio_seconds_total": sum(audio_seconds),
+        "synth_seconds_total": sum(seconds),
+        "rtf_sequential": sum(seconds) / max(sum(audio_seconds), 1e-9),
+        "synth_seconds_p50": statistics.median(seconds),
+        "synth_seconds_p95": sorted(seconds)[int(0.95 * (len(seconds) - 1))],
     }
-    if args.out:
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(f"WER {wer:.2f}% over {len(rows)} files ({total_errors}/{total_words} words)")
+    (out / "summary.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

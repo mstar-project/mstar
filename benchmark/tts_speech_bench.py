@@ -8,7 +8,7 @@ One client, one metric definition, every engine (BENCHMARK_PROTOCOL.md, TTS row)
 * end-to-end latency and RTF = wall time / seconds of audio produced;
 * audio-seconds generated per wall-clock second at the given concurrency;
 * the PCM of every request can be written out for a WER check
-  (``benchmark/tts_wer.py``).
+  (``benchmark/tts_speech_wer.py``).
 
 Requests are closed-loop: ``--concurrency`` requests in flight at all times until
 every sentence of the input file has been synthesized once per repeat. Warmup

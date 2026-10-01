@@ -6,6 +6,7 @@ so ordering, ids, seeds and playback concatenation can be checked without an
 engine.
 """
 
+import asyncio
 import sys
 import tempfile
 import types
@@ -121,6 +122,8 @@ class _RecordingAPI:
         self.upload_dir = Path(tempfile.mkdtemp())
         self.submits: list[dict] = []
         self._chunks: dict[str, list] = {}
+        self.released: list[str] = []
+        self.read_to_end: set[str] = set()
 
     def submit_request(self, **kw):
         index = len(self.submits)
@@ -134,6 +137,22 @@ class _RecordingAPI:
     async def iter_result_chunks(self, request_id):
         for c in self._chunks[request_id]:
             yield c
+        self.read_to_end.add(request_id)
+
+    def release_request(self, request_id):
+        self.released.append(request_id)
+
+    def fail(self, index, status=400):
+        """Make the ``index``-th submitted piece end with an error chunk."""
+        submit = self.submit_request
+
+        def failing_submit(**kw):
+            request_id = submit(**kw)
+            if len(self.submits) - 1 == index:
+                self._chunks[request_id] = [_Chunk("error", b"piece failed", {"status": status})]
+            return request_id
+
+        self.submit_request = failing_submit
 
 
 @pytest.fixture
@@ -234,3 +253,129 @@ def test_streaming_request_that_fails_up_front_returns_the_error_status(client_a
     stub.collect_results = collect
     r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": "hi there", "voice": "nobody"})
     assert r.status_code == 400
+
+
+def _ids(stub):
+    return [s["request_id"] for s in stub.submits]
+
+
+def test_chunk_count_is_capped(client_and_stub, monkeypatch):
+    client, stub = client_and_stub
+    monkeypatch.setattr(adapters.OrpheusAdapter, "speech_chunk_max_pieces", 2)
+    r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": LONG_TEXT, "sentence_chunking": True})
+    assert r.status_code == 400 and "at most 2" in r.json()["error"]["message"]
+    assert stub.submits == []
+
+
+def test_streaming_error_up_front_releases_only_the_pieces_ahead(client_and_stub):
+    client, stub = client_and_stub
+    stub.fail(0)
+    r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": LONG_TEXT, "stream": True})
+    assert r.status_code == 400
+    # the failed piece was read to its end (so it isn't aborted); the lookahead is released
+    ids = _ids(stub)
+    assert ids[0] in stub.read_to_end and stub.released == ids[1:]
+
+
+def test_non_streaming_error_releases_only_the_pieces_ahead(client_and_stub):
+    client, stub = client_and_stub
+    from fastapi import HTTPException
+
+    async def collect(request_id, raw_request=None):
+        if request_id == _ids(stub)[1]:
+            raise HTTPException(status_code=400, detail="piece failed")
+        return stub._chunks[request_id]
+
+    stub.collect_results = collect
+    r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": LONG_TEXT})
+    assert r.status_code == 400
+    assert stub.released == _ids(stub)[2:] and len(stub.submits) == 3
+
+
+def _stream(stub, num_chunks):
+    ids = [f"speech-x-{i}" for i in range(num_chunks)]
+
+    def submit(index):
+        return stub.submit_request(request_id=ids[index], text="")
+
+    async def start():
+        from mstar.api_server.openai import serving_speech
+
+        pending = [submit(0), submit(1)]
+        first_iter = stub.iter_result_chunks(pending[0])
+        first = await anext(first_iter)
+        return serving_speech._stream_pcm(stub, submit, num_chunks, pending, first_iter, first, 24000)
+
+    return ids, start
+
+
+def test_closing_a_chunked_stream_releases_every_unread_piece():
+    stub = _RecordingAPI()
+    ids, start = _stream(stub, 4)
+
+    async def run():
+        gen = await start()
+        assert (await anext(gen))[:4] == b"RIFF"
+        assert await anext(gen) == _pcm(0, 0)  # piece 0 playing, piece 2 submitted ahead
+        await gen.aclose()  # the client went away
+
+    asyncio.run(run())
+    assert stub.released == ids[:3] and len(stub.submits) == 3
+
+
+def test_mid_stream_error_closes_the_stream_and_releases_the_pieces_ahead():
+    from fastapi import HTTPException
+
+    stub = _RecordingAPI()
+    stub.fail(1)
+    ids, start = _stream(stub, 4)
+
+    async def run():
+        gen = await start()
+        with pytest.raises(HTTPException):
+            async for _ in gen:
+                pass
+
+    asyncio.run(run())
+    assert ids[1] in stub.read_to_end and stub.released == ids[2:]
+
+
+def test_non_streaming_disconnect_stops_submitting_and_releases_the_pieces_ahead(client_and_stub):
+    _, stub = client_and_stub
+    from mstar.api_server.openai.protocol import SpeechRequest
+    from mstar.api_server.openai.serving_speech import create_speech
+
+    collected = []
+
+    async def collect(request_id, raw_request=None):
+        collected.append(request_id)
+        return []  # what collect_results returns once it sees the disconnect
+
+    class _Gone:
+        async def is_disconnected(self):
+            return True
+
+    stub.collect_results = collect
+    req = SpeechRequest(model="orpheus", input=LONG_TEXT)
+    asyncio.run(create_speech(stub, "orpheus", adapters.OrpheusAdapter(), req, _Gone()))
+    ids = _ids(stub)
+    assert collected == ids[:1] and len(ids) == 3 and stub.released == ids[1:]
+
+
+def test_release_request_aborts_only_requests_still_running():
+    import threading
+
+    from mstar.api_server.entrypoint import APIServer
+
+    aborted = []
+    done, running = threading.Event(), threading.Event()
+    done.set()
+    server = types.SimpleNamespace(
+        request_lock=threading.Lock(),
+        pending_requests={"done": types.SimpleNamespace(event=done),
+                          "running": types.SimpleNamespace(event=running)},
+        abort_request=aborted.append,
+    )
+    APIServer.release_request(server, "done")
+    APIServer.release_request(server, "running")
+    assert aborted == ["running"] and "done" not in server.pending_requests
