@@ -171,12 +171,13 @@ def test_cache_validation_and_step_lifecycle():
 
 
 def test_t4_context_budget_boundary():
-    assert cfg.validate_context_budget(voice_embeddings=5, text_tokens=7, user_frames=2976) == 3000
+    assert (cfg.CONTEXT_FRAMES, cfg.MAX_TEMPORAL_FORWARDS) == (3000, 2999)
+    assert cfg.validate_context_budget(voice_embeddings=5, text_tokens=7, user_frames=2975) == 2999
     with pytest.raises(ValueError) as exc:
-        cfg.validate_context_budget(voice_embeddings=5, text_tokens=7, user_frames=2977)
+        cfg.validate_context_budget(voice_embeddings=5, text_tokens=7, user_frames=2976)
     assert str(exc.value) == (
         "PersonaPlex context budget exceeded: voice_embeddings=5 + silence_frames=12 + "
-        "text_tokens=7 + user_frames=2977 = 3001 > 3000"
+        "text_tokens=7 + user_frames=2976 = 3000 > 2999"
     )
 
 

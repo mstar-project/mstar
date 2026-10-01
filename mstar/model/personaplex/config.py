@@ -56,6 +56,10 @@ FRAME_RATE = 12.5  # [PP] models/loaders.py:40
 FRAME_SIZE = int(SAMPLE_RATE / FRAME_RATE)  # [PP] offline.py:211
 SILENCE_FRAMES = int(0.5 * FRAME_RATE)  # [PP] offline.py:214
 CONTEXT_FRAMES = 3000  # [PP] models/loaders.py:104
+# Once its ring is full, RingKVCache.complete labels the slot at end_offset %
+# capacity as position end_offset, which masks it ([PP] modules/transformer.py:
+# 263-299). Dense causal attention therefore matches only up to C - 1 forwards.
+MAX_TEMPORAL_FORWARDS = CONTEXT_FRAMES - 1
 
 TEMPORAL_DIM = 4096  # [PP] models/loaders.py:93
 TEMPORAL_LAYERS = 32  # [PP] models/loaders.py:100
@@ -88,17 +92,17 @@ def validate_context_budget(*, voice_embeddings: int, text_tokens: int, user_fra
 
     Voice replay runs once per embedding ([PP] models/lm.py:1031-1038),
     followed by two silence blocks, text and user frames (offline.py:241-276).
-    PR1 caps forwards at the reference's sliding-window size until M* has
-    sliding-window attention.
+    PR1 caps forwards at MAX_TEMPORAL_FORWARDS, the longest span over which the
+    reference's ring KV equals M*'s dense causal attention.
     """
     counts = (voice_embeddings, text_tokens, user_frames)
     if any(type(count) is not int or count < 0 for count in counts):
         raise ValueError("voice_embeddings, text_tokens and user_frames must be nonnegative integers")
     total = voice_embeddings + 2 * SILENCE_FRAMES + text_tokens + user_frames
-    if total > CONTEXT_FRAMES:
+    if total > MAX_TEMPORAL_FORWARDS:
         raise ValueError(
             f"PersonaPlex context budget exceeded: voice_embeddings={voice_embeddings} + "
             f"silence_frames={2 * SILENCE_FRAMES} + text_tokens={text_tokens} + "
-            f"user_frames={user_frames} = {total} > {CONTEXT_FRAMES}"
+            f"user_frames={user_frames} = {total} > {MAX_TEMPORAL_FORWARDS}"
         )
     return total
