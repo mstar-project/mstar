@@ -16,7 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
-from mstar.streaming.stream_buffer import StreamBuffer  # noqa: E402
+from mstar.streaming.stream_buffer import (  # noqa: E402
+    StreamBuffer,
+    StreamChunkInfo,
+    StreamingEdge,
+)
 from mstar.worker.worker import Worker  # noqa: E402
 
 PARTITION = "Decoder"
@@ -62,9 +66,12 @@ def _step(worker, node, final_edges):
 
 
 def _final_edge(name):
-    return GraphEdge(
-        next_node=TOPOLOGY[name][0], name=name, is_streaming=True,
-        _final_stream_chunk=True,
+    return StreamingEdge(
+        GraphEdge(
+            next_node=TOPOLOGY[name][0], name=name, is_streaming=True,
+            _final_stream_chunk=True,
+        ),
+        StreamChunkInfo(start_offset=0, context_items=0, num_items=1, is_final=True),
     )
 
 

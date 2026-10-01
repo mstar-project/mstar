@@ -51,6 +51,7 @@ from mstar.utils.profiler import mark, range_pop, range_push
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
+    from mstar.streaming.stream_buffer import StreamChunkInfo
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,11 @@ class ExecutingBatch:
     # rids for which this step ends every finite stream into the node; the
     # consumer flushes what it held back
     final_stream_rids: set[str] = field(default_factory=set)
+    # rid -> {input_name: chunk info} for rids consuming a streamed input
+    per_request_stream_chunks: Mapping[str, Mapping[str, "StreamChunkInfo"]] = field(
+        default_factory=dict
+    )
+
     # rids for which this step ends every finite stream into the partition;
     # this step reports the partition done
     stream_partition_done_rids: set[str] = field(default_factory=set)
@@ -1055,6 +1061,7 @@ class Engine:
             per_request_states=LazyRequestStates(submodule, rids),
             captured=lease is not None,
             step=step,
+            per_request_stream_chunks=batch.per_request_stream_chunks,
         )
         if nvtx:
             range_push("engine.preprocess")
