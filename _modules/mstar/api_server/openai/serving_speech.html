@@ -570,6 +570,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
@@ -888,15 +889,61 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">a WAV header followed by PCM16 frames, or, with ``response_format="pcm"``,</span>
 <span class="sd">the bare PCM16 frames that the OpenAI TTS clients (LiveKit, Pipecat) expect.</span>
 <span class="sd">``/v1/audio/voices`` lists the ``voice`` values the served model accepts.</span>
+
+<span class="sd">Long inputs can be synthesized as ordered sentence chunks (one engine request</span>
+<span class="sd">per chunk, ``speech_chunking.split_sentences``): the adapter's</span>
+<span class="sd">``speech_chunk_min_chars`` turns this on for long texts, and a client can force</span>
+<span class="sd">or suppress it per request with ``sentence_chunking: true|false``. The next</span>
+<span class="sd">chunks are submitted while the current one streams, so the engine batches them</span>
+<span class="sd">and playback never waits for a prefill. An input needing more than the</span>
+<span class="sd">adapter's ``speech_chunk_max_pieces`` chunks is rejected.</span>
+
+<span class="sd">A streaming request only commits to HTTP 200 once its first result chunk has</span>
+<span class="sd">arrived and is not an error; an error chunk before that becomes the HTTP error</span>
+<span class="sd">it carries (the non-streaming path gets the same from ``collect_results``).</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPException</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">fastapi.responses</span><span class="w"> </span><span class="kn">import</span> <span class="n">Response</span><span class="p">,</span> <span class="n">StreamingResponse</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">rid</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai.protocol</span><span class="w"> </span><span class="kn">import</span> <span class="n">VoiceCard</span><span class="p">,</span> <span class="n">VoiceList</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai.speech_chunking</span><span class="w"> </span><span class="kn">import</span> <span class="n">split_sentences</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_plan_chunks</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The texts to synthesize, in playback order (``[text]`` when unchunked)."""</span>
+    <span class="c1"># Extra request fields live in pydantic's ``model_extra``; plain objects</span>
+    <span class="c1"># (tests, other frontends) may carry the attribute directly.</span>
+    <span class="n">requested</span> <span class="o">=</span> <span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"model_extra"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"sentence_chunking"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">requested</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">requested</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"sentence_chunking"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="n">min_chars</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="s2">"speech_chunk_min_chars"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">requested</span> <span class="ow">is</span> <span class="kc">False</span> <span class="ow">or</span> <span class="p">(</span><span class="n">requested</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="n">min_chars</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="n">text</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">min_chars</span><span class="p">)):</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">text</span><span class="p">]</span>
+    <span class="n">chunks</span> <span class="o">=</span> <span class="n">split_sentences</span><span class="p">(</span><span class="n">text</span><span class="p">,</span> <span class="n">max_chars</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="s2">"speech_chunk_max_chars"</span><span class="p">,</span> <span class="mi">400</span><span class="p">))</span>
+    <span class="n">max_pieces</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="s2">"speech_chunk_max_pieces"</span><span class="p">,</span> <span class="mi">32</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">max_pieces</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">HTTPException</span><span class="p">(</span>
+            <span class="n">status_code</span><span class="o">=</span><span class="mi">400</span><span class="p">,</span>
+            <span class="n">detail</span><span class="o">=</span><span class="sa">f</span><span class="s2">"input splits into </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">)</span><span class="si">}</span><span class="s2"> sentence chunks; at most </span><span class="si">{</span><span class="n">max_pieces</span><span class="si">}</span><span class="s2"> are allowed"</span><span class="p">,</span>
+        <span class="p">)</span>
+    <span class="k">return</span> <span class="n">chunks</span> <span class="ow">or</span> <span class="p">[</span><span class="n">text</span><span class="p">]</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_chunk_kwargs</span><span class="p">(</span><span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">index</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Per-chunk model kwargs: identical, except a client seed advances per chunk."""</span>
+    <span class="n">kwargs</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">model_kwargs</span><span class="p">)</span>
+    <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"sentence_chunking"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="n">seed</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">seed</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">seed</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
+        <span class="n">kwargs</span><span class="p">[</span><span class="s2">"seed"</span><span class="p">]</span> <span class="o">=</span> <span class="n">seed</span> <span class="o">+</span> <span class="n">index</span>
+    <span class="k">return</span> <span class="n">kwargs</span>
 
 
 <div class="viewcode-block" id="list_voices">
@@ -921,38 +968,121 @@ window.runMermaid = runMermaid;</script>
     <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"speech"</span><span class="p">)</span>
     <span class="n">sample_rate</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">get_output_sample_rate</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">)</span> <span class="k">if</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">24000</span>
     <span class="n">fmt</span> <span class="o">=</span> <span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">response_format</span> <span class="ow">or</span> <span class="s2">"wav"</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
+    <span class="n">chunks</span> <span class="o">=</span> <span class="n">_plan_chunks</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">text</span> <span class="ow">or</span> <span class="s2">""</span><span class="p">)</span>
 
-    <span class="n">api</span><span class="o">.</span><span class="n">submit_request</span><span class="p">(</span>
-        <span class="n">text</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
-        <span class="n">file_paths</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">,</span>
-        <span class="n">input_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">input_modalities</span><span class="p">,</span>
-        <span class="n">output_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">output_modalities</span><span class="p">,</span>
-        <span class="n">model_kwargs</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="p">,</span>
-        <span class="n">streaming</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">),</span>
-        <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
-    <span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="n">index</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="n">chunk_id</span> <span class="o">=</span> <span class="n">request_id</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">request_id</span><span class="si">}</span><span class="s2">-</span><span class="si">{</span><span class="n">index</span><span class="si">}</span><span class="s2">"</span>
+        <span class="k">return</span> <span class="n">api</span><span class="o">.</span><span class="n">submit_request</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">chunks</span><span class="p">[</span><span class="n">index</span><span class="p">],</span>
+            <span class="n">file_paths</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">,</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">input_modalities</span><span class="p">,</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">output_modalities</span><span class="p">,</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">_chunk_kwargs</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="p">,</span> <span class="n">index</span><span class="p">),</span>
+            <span class="n">streaming</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">),</span>
+            <span class="n">request_id</span><span class="o">=</span><span class="n">chunk_id</span><span class="p">,</span>
+        <span class="p">)</span>
 
+    <span class="n">lookahead</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="s2">"speech_chunk_lookahead"</span><span class="p">,</span> <span class="mi">2</span><span class="p">)))</span>
+    <span class="n">pending</span> <span class="o">=</span> <span class="p">[</span><span class="n">submit</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">min</span><span class="p">(</span><span class="n">lookahead</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">)))]</span>
     <span class="k">if</span> <span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">:</span>
         <span class="n">raw_pcm</span> <span class="o">=</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"pcm"</span>
+        <span class="c1"># Look at the first result before committing to a 200: a request the</span>
+        <span class="c1"># engine rejects (bad voice, dead worker, ...) must surface as an HTTP</span>
+        <span class="c1"># error, not as an empty WAV.</span>
+        <span class="n">first_iter</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">pending</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">first</span> <span class="o">=</span> <span class="k">await</span> <span class="n">anext</span><span class="p">(</span><span class="n">first_iter</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">_is_error</span><span class="p">(</span><span class="n">first</span><span class="p">):</span>
+                <span class="c1"># Read it to the end so the finished request isn't aborted.</span>
+                <span class="k">await</span> <span class="n">_drain</span><span class="p">(</span><span class="n">first_iter</span><span class="p">)</span>
+                <span class="k">raise</span> <span class="n">_http_error</span><span class="p">(</span><span class="n">first</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">BaseException</span><span class="p">:</span>
+            <span class="c1"># The first piece released itself; release the ones submitted ahead.</span>
+            <span class="n">_release_unread</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">pending</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="k">raise</span>
         <span class="k">return</span> <span class="n">StreamingResponse</span><span class="p">(</span>
-            <span class="n">_stream_pcm</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">with_wav_header</span><span class="o">=</span><span class="ow">not</span> <span class="n">raw_pcm</span><span class="p">),</span>
+            <span class="n">_stream_pcm</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">submit</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">),</span> <span class="n">pending</span><span class="p">,</span> <span class="n">first_iter</span><span class="p">,</span> <span class="n">first</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span>
+                        <span class="n">with_wav_header</span><span class="o">=</span><span class="ow">not</span> <span class="n">raw_pcm</span><span class="p">),</span>
             <span class="n">media_type</span><span class="o">=</span><span class="s2">"audio/pcm"</span> <span class="k">if</span> <span class="n">raw_pcm</span> <span class="k">else</span> <span class="s2">"audio/wav"</span><span class="p">,</span>
             <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">},</span>
         <span class="p">)</span>
 
-    <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
-    <span class="n">pcm</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">chunks</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span><span class="p">)</span>
-    <span class="n">audio_bytes</span><span class="p">,</span> <span class="n">mime</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">pcm16_to_container</span><span class="p">(</span><span class="n">pcm</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">fmt</span><span class="p">)</span>
+    <span class="n">pcm_parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">read</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># pieces collect_results has released; the rest are released on early exit</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">index</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">)):</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">pending</span><span class="p">)</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">):</span>
+                <span class="n">pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">submit</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">pending</span><span class="p">)))</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">results</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">pending</span><span class="p">[</span><span class="n">index</span><span class="p">],</span> <span class="n">raw_request</span><span class="p">)</span>
+            <span class="k">except</span> <span class="n">HTTPException</span><span class="p">:</span>
+                <span class="n">read</span> <span class="o">=</span> <span class="n">index</span> <span class="o">+</span> <span class="mi">1</span>
+                <span class="k">raise</span>
+            <span class="n">read</span> <span class="o">=</span> <span class="n">index</span> <span class="o">+</span> <span class="mi">1</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">results</span> <span class="ow">and</span> <span class="n">raw_request</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="k">await</span> <span class="n">raw_request</span><span class="o">.</span><span class="n">is_disconnected</span><span class="p">():</span>
+                <span class="k">break</span>
+            <span class="n">pcm_parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">data</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">results</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span><span class="p">))</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="n">_release_unread</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">pending</span><span class="p">,</span> <span class="n">read</span><span class="p">)</span>
+    <span class="n">audio_bytes</span><span class="p">,</span> <span class="n">mime</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">pcm16_to_container</span><span class="p">(</span><span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">pcm_parts</span><span class="p">),</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">fmt</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">Response</span><span class="p">(</span><span class="n">content</span><span class="o">=</span><span class="n">audio_bytes</span><span class="p">,</span> <span class="n">media_type</span><span class="o">=</span><span class="n">mime</span><span class="p">)</span></div>
 
 
 
-<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_stream_pcm</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">with_wav_header</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
-    <span class="k">if</span> <span class="n">with_wav_header</span><span class="p">:</span>
-        <span class="k">yield</span> <span class="n">media_io</span><span class="o">.</span><span class="n">wav_stream_header</span><span class="p">(</span><span class="n">sample_rate</span><span class="p">)</span>
-    <span class="k">async</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">request_id</span><span class="p">):</span>
-        <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span> <span class="ow">and</span> <span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">:</span>
-            <span class="k">yield</span> <span class="n">c</span><span class="o">.</span><span class="n">data</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_is_error</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">chunk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">chunk</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"error"</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_http_error</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">HTTPException</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A data-worker failure arrives as an ``error`` chunk; the HTTP error it carries."""</span>
+    <span class="k">return</span> <span class="n">HTTPException</span><span class="p">(</span>
+        <span class="n">status_code</span><span class="o">=</span><span class="nb">int</span><span class="p">((</span><span class="n">chunk</span><span class="o">.</span><span class="n">metadata</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"status"</span><span class="p">,</span> <span class="mi">500</span><span class="p">)),</span>
+        <span class="n">detail</span><span class="o">=</span><span class="n">chunk</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">,</span> <span class="s2">"replace"</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">data</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">)</span> <span class="k">else</span> <span class="nb">str</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">data</span><span class="p">),</span>
+    <span class="p">)</span>
+
+
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_drain</span><span class="p">(</span><span class="n">iterator</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">async</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="n">iterator</span><span class="p">:</span>
+        <span class="k">pass</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_release_unread</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">pending</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">read</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Release every submitted piece from ``pending[read]`` on (not yet fully read)."""</span>
+    <span class="k">for</span> <span class="n">chunk_id</span> <span class="ow">in</span> <span class="n">pending</span><span class="p">[</span><span class="n">read</span><span class="p">:]:</span>
+        <span class="n">api</span><span class="o">.</span><span class="n">release_request</span><span class="p">(</span><span class="n">chunk_id</span><span class="p">)</span>
+
+
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_stream_pcm</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">submit</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="nb">str</span><span class="p">],</span> <span class="n">num_chunks</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">pending</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
+                      <span class="n">first_iter</span><span class="p">,</span> <span class="n">first</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">with_wav_header</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">):</span>
+    <span class="n">read</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># pieces read to the end; the rest are released if the stream stops early</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">with_wav_header</span><span class="p">:</span>
+            <span class="k">yield</span> <span class="n">media_io</span><span class="o">.</span><span class="n">wav_stream_header</span><span class="p">(</span><span class="n">sample_rate</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">index</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_chunks</span><span class="p">):</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">pending</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">num_chunks</span><span class="p">:</span>
+                <span class="c1"># Keep the next chunk generating while this one plays.</span>
+                <span class="n">pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">submit</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">pending</span><span class="p">)))</span>
+            <span class="k">if</span> <span class="n">index</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="n">iterator</span><span class="p">,</span> <span class="n">head</span> <span class="o">=</span> <span class="n">first_iter</span><span class="p">,</span> <span class="n">first</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">iterator</span><span class="p">,</span> <span class="n">head</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">pending</span><span class="p">[</span><span class="n">index</span><span class="p">]),</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">head</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">head</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span> <span class="ow">and</span> <span class="n">head</span><span class="o">.</span><span class="n">data</span><span class="p">:</span>
+                <span class="k">yield</span> <span class="n">head</span><span class="o">.</span><span class="n">data</span>
+            <span class="n">error</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="k">async</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">iterator</span><span class="p">:</span>
+                <span class="c1"># Read past an error to the end: leaving early would abort a</span>
+                <span class="c1"># request that has already finished.</span>
+                <span class="k">if</span> <span class="n">error</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">_is_error</span><span class="p">(</span><span class="n">c</span><span class="p">):</span>
+                    <span class="n">error</span> <span class="o">=</span> <span class="n">c</span>
+                <span class="k">elif</span> <span class="n">error</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">c</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"audio"</span> <span class="ow">and</span> <span class="n">c</span><span class="o">.</span><span class="n">data</span><span class="p">:</span>
+                    <span class="k">yield</span> <span class="n">c</span><span class="o">.</span><span class="n">data</span>
+            <span class="n">read</span> <span class="o">=</span> <span class="n">index</span> <span class="o">+</span> <span class="mi">1</span>
+            <span class="k">if</span> <span class="n">error</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="c1"># Mid-stream the status is already sent; closing the stream is</span>
+                <span class="c1"># the only honest signal left, so raise rather than end quietly.</span>
+                <span class="k">raise</span> <span class="n">_http_error</span><span class="p">(</span><span class="n">error</span><span class="p">)</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="n">_release_unread</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">pending</span><span class="p">,</span> <span class="n">read</span><span class="p">)</span>
 </pre></div>
 
                 </article>

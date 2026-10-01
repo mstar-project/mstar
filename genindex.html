@@ -570,6 +570,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
@@ -5145,6 +5146,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.api_server.openai.serving_videos.html#module-mstar.api_server.openai.serving_videos">mstar.api_server.openai.serving_videos</a>
 </li>
+        <li><a href="_autosummary/mstar.api_server.openai.speech_chunking.html#module-mstar.api_server.openai.speech_chunking">mstar.api_server.openai.speech_chunking</a>
+</li>
         <li><a href="_autosummary/mstar.api_server.request_types.html#module-mstar.api_server.request_types">mstar.api_server.request_types</a>
 </li>
         <li><a href="_autosummary/mstar.api_server.rust_frontend.html#module-mstar.api_server.rust_frontend">mstar.api_server.rust_frontend</a>
@@ -5600,6 +5603,13 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.api_server.openai.serving_videos.html#module-mstar.api_server.openai.serving_videos">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.api_server.openai.speech_chunking
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.speech_chunking.html#module-mstar.api_server.openai.speech_chunking">module</a>
 </li>
       </ul></li>
       <li>
@@ -9553,14 +9563,14 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_window_tokens">snac_window_tokens (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.kokoro.components.decoder.html#mstar.model.kokoro.components.decoder.snake">snake() (in module mstar.model.kokoro.components.decoder)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.Snake1d">Snake1d (class in mstar.model.cosmos3.components.sound_tokenizer)</a>
 </li>
       <li><a href="_autosummary/mstar.model.kokoro.components.decoder.html#mstar.model.kokoro.components.decoder.SnakeResBlock">SnakeResBlock (class in mstar.model.kokoro.components.decoder)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.config.Cosmos3SchedulerConfig.solver_order">solver_order (mstar.model.cosmos3.config.Cosmos3SchedulerConfig attribute)</a>
 
       <ul>
@@ -9673,6 +9683,14 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.SpeculativeNodeInfo">SpeculativeNodeInfo (class in mstar.graph.base)</a>
 </li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_lookahead">speech_chunk_lookahead (mstar.api_server.openai.adapters.OpenAIAdapter attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_chars">speech_chunk_max_chars (mstar.api_server.openai.adapters.OpenAIAdapter attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_pieces">speech_chunk_max_pieces (mstar.api_server.openai.adapters.OpenAIAdapter attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_min_chars">speech_chunk_min_chars (mstar.api_server.openai.adapters.OpenAIAdapter attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.KokoroAdapter.speech_to_request">speech_to_request() (mstar.api_server.openai.adapters.KokoroAdapter method)</a>
 
       <ul>
@@ -9699,8 +9717,12 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.model.kokoro.g2p.html#mstar.model.kokoro.g2p.split_phonemes">split_phonemes() (in module mstar.model.kokoro.g2p)</a>
 </li>
-      <li><a href="_autosummary/mstar.model.kokoro.g2p.html#mstar.model.kokoro.g2p.split_sentences">split_sentences() (in module mstar.model.kokoro.g2p)</a>
+      <li><a href="_autosummary/mstar.api_server.openai.speech_chunking.html#mstar.api_server.openai.speech_chunking.split_sentences">split_sentences() (in module mstar.api_server.openai.speech_chunking)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.kokoro.g2p.html#mstar.model.kokoro.g2p.split_sentences">(in module mstar.model.kokoro.g2p)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.StackingMethod.STACK">STACK (mstar.model.submodule_base.StackingMethod attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.StackingMethod">StackingMethod (class in mstar.model.submodule_base)</a>

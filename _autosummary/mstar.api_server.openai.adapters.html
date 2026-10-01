@@ -217,6 +217,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
@@ -624,6 +625,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.chat_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.chat_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.image_edit_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.image_edit_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.image_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.image_to_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_lookahead"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_chunk_lookahead</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_chars"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_chunk_max_chars</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_pieces"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_chunk_max_pieces</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_min_chars"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_chunk_min_chars</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_chat"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_chat</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_images"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_images</span></code></a></li>
@@ -1031,6 +1036,26 @@ docstring) and are reached only via <code class="docutils literal notranslate"><
 </dl>
 </dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_lookahead">
+<span class="sig-name descname"><span class="pre">speech_chunk_lookahead</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">2</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_lookahead" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_chars">
+<span class="sig-name descname"><span class="pre">speech_chunk_max_chars</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">400</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_chars" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_pieces">
+<span class="sig-name descname"><span class="pre">speech_chunk_max_pieces</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">32</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_pieces" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_min_chars">
+<span class="sig-name descname"><span class="pre">speech_chunk_min_chars</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_min_chars" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.api_server.openai.adapters.OpenAIAdapter.speech_to_request">
 <span class="sig-name descname"><span class="pre">speech_to_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#OpenAIAdapter.speech_to_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_to_request" title="Link to this definition">#</a></dt>
@@ -1380,6 +1405,10 @@ apply their own prompt formatting in <code class="docutils literal notranslate">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.chat_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.chat_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.image_edit_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.image_edit_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.image_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.image_to_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_lookahead"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_chunk_lookahead</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_chars"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_chunk_max_chars</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_pieces"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_chunk_max_pieces</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_min_chars"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_chunk_min_chars</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.speech_to_request"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.speech_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_chat"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_chat</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.OpenAIAdapter.supports_images"><code class="docutils literal notranslate"><span class="pre">OpenAIAdapter.supports_images</span></code></a></li>

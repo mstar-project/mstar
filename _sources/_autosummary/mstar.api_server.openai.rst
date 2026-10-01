@@ -34,4 +34,5 @@ mstar.api\_server.openai
    serving_images
    serving_speech
    serving_videos
+   speech_chunking
 

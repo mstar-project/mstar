@@ -570,6 +570,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
@@ -1075,6 +1076,18 @@ window.runMermaid = runMermaid;</script>
     <span class="n">supports_images</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># POST /v1/images/generations and /v1/images/edits</span>
     <span class="n">supports_videos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># POST /v1/videos/generations</span>
     <span class="n">supports_realtime</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>  <span class="c1"># /v1/realtime (bidirectional speech WebSocket)</span>
+
+    <span class="c1"># ``/v1/audio/speech`` sentence chunking (``serving_speech``): inputs of at</span>
+    <span class="c1"># least ``speech_chunk_min_chars`` characters are split into sentence</span>
+    <span class="c1"># groups of about ``speech_chunk_max_chars`` and synthesized as ordered</span>
+    <span class="c1"># sub-requests. ``None`` keeps the whole text in one request unless the</span>
+    <span class="c1"># client sends ``sentence_chunking: true``.</span>
+    <span class="n">speech_chunk_min_chars</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">speech_chunk_max_chars</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">400</span>
+    <span class="c1"># sub-requests kept in flight ahead of the one being streamed</span>
+    <span class="n">speech_chunk_lookahead</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2</span>
+    <span class="c1"># most sub-requests one input may split into; longer inputs get a 400</span>
+    <span class="n">speech_chunk_max_pieces</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">32</span>
 
 <div class="viewcode-block" id="OpenAIAdapter.chat_to_request">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.chat_to_request">[docs]</a>

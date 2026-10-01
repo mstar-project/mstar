@@ -217,6 +217,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
 <li class="toctree-l4 current active"><a class="current reference internal" href="#">mstar.api_server.openai.serving_speech</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
@@ -611,6 +612,16 @@ default). Streaming returns one open-ended response as the audio is produced:
 a WAV header followed by PCM16 frames, or, with <code class="docutils literal notranslate"><span class="pre">response_format=&quot;pcm&quot;</span></code>,
 the bare PCM16 frames that the OpenAI TTS clients (LiveKit, Pipecat) expect.
 <code class="docutils literal notranslate"><span class="pre">/v1/audio/voices</span></code> lists the <code class="docutils literal notranslate"><span class="pre">voice</span></code> values the served model accepts.</p>
+<p>Long inputs can be synthesized as ordered sentence chunks (one engine request
+per chunk, <code class="docutils literal notranslate"><span class="pre">speech_chunking.split_sentences</span></code>): the adapter’s
+<code class="docutils literal notranslate"><span class="pre">speech_chunk_min_chars</span></code> turns this on for long texts, and a client can force
+or suppress it per request with <code class="docutils literal notranslate"><span class="pre">sentence_chunking:</span> <span class="pre">true|false</span></code>. The next
+chunks are submitted while the current one streams, so the engine batches them
+and playback never waits for a prefill. An input needing more than the
+adapter’s <code class="docutils literal notranslate"><span class="pre">speech_chunk_max_pieces</span></code> chunks is rejected.</p>
+<p>A streaming request only commits to HTTP 200 once its first result chunk has
+arrived and is not an error; an error chunk before that becomes the HTTP error
+it carries (the non-streaming path gets the same from <code class="docutils literal notranslate"><span class="pre">collect_results</span></code>).</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
