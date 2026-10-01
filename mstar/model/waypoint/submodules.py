@@ -205,8 +205,8 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         """
         device = self.get_device()
         dtype = self.dit.dtype
-        # The clock is per request and lives on the host.
-        state = self.request_state(fwd_info.request_id)
+        # The clock is per request and lives on the host
+        state = self.request_state(fwd_info.rid_handle)
 
         if graph_walk == ROLLOUT_WALK:
             requested = int(fwd_info.step_metadata.get("num_steps", 0) or 0)
@@ -253,7 +253,7 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
 
         tensor_inputs.update({
             f"{DECODER_HISTORY_PREFIX}{idx}": value
-            for idx, value in enumerate(self._history_state(fwd_info.request_id))
+            for idx, value in enumerate(self._history_state(fwd_info.rid_handle))
         })
 
         return NodeInputs(

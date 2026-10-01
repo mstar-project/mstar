@@ -141,6 +141,9 @@ def _fwd_info(
 ) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id=request_id,
+        # prepare_inputs keys host state on the handle; postprocess and
+        # cleanup_request get the same value, so one token serves as both.
+        rid_handle=request_id,
         graph_walk=graph_walk,
         fwd_index=0,
         random_seed=random_seed,
@@ -1198,6 +1201,7 @@ def _seed_hw_info(
 ) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id=request_id,
+        rid_handle=request_id,
         graph_walk=graph_walk,
         fwd_index=0,
         random_seed=0,

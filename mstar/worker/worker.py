@@ -1492,9 +1492,13 @@ class Worker:
         from mstar.utils.profiler import range_pop, range_push
 
         engine = self.engine_manager.get_engine(batch.node_name)
-        logger.debug(
-            "Executing: %s graph_walk=%s", node_batch.node_name, batch.graph_walk
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            # test/waypoint/serve_rollout.py parses this line (wire ids, logged
+            # before prepare_inputs runs) to recover the DiT schedule.
+            logger.debug(
+                "Executing: %s graph_walk=%s %s", node_batch.node_name,
+                batch.graph_walk, [self._rid_str(r) for r in node_batch.request_ids],
+            )
         if self.enable_nvtx:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)
