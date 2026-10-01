@@ -1,5 +1,8 @@
-PersonaPlex Commit 1 reference trace
-====================================
+PersonaPlex reference fixtures
+==============================
+
+Commit 1: LMGen integer trace (T3)
+----------------------------------
 
 T3 uses NVIDIA's actual ``LMGen`` at
 ``3428dfd95309a7f3c84fd93259ded0f810d1ff91``, with tiny random CPU transformers,
@@ -51,3 +54,35 @@ an explicitly configured missing or invalid fixture fails. T1, T2 and T4 do not
 need a fixture. If macOS cannot install the reference dependencies, run the same
 recorder on Linux CPU and transfer the JSON. Never synthesize a replacement
 trace from M* or the symbolic plan, or claim T3 parity without executing it.
+
+Commit 2: LM manifest (T5) and tiny-model numerics (T13-LM)
+-----------------------------------------------------------
+
+The same recorder has two more modes, run with the same reference venv:
+
+.. code-block:: bash
+
+   /tmp/personaplex-oracle/bin/python test/scratch/personaplex_reference_oracle.py \
+     --source /tmp/personaplex-3428dfd9 --mode manifest --out /tmp/personaplex-fixtures
+   /tmp/personaplex-oracle/bin/python test/scratch/personaplex_reference_oracle.py \
+     --source /tmp/personaplex-3428dfd9 --mode lm --out /tmp/personaplex-fixtures
+   PERSONAPLEX_REFERENCE_MANIFEST=/tmp/personaplex-fixtures/reference_lm_manifest.json \
+   PERSONAPLEX_REFERENCE_LM=/tmp/personaplex-fixtures/reference_lm.pt \
+     python -m pytest test/modular/test_personaplex_components.py -v
+
+- ``manifest`` builds NVIDIA's full-size ``LMModel`` on the meta device with
+  ``get_moshi_lm``'s ``dep_q=16`` override and records every parameter's key and
+  shape plus the total (8,371,408,896). About 30 KB of JSON; no weights.
+- ``lm`` builds a tiny fp32 ``LMModel`` (dim 64, 2+2 layers) that keeps the 17
+  codebooks, vocabularies, delays and 16 per-step depth slots, randomises its
+  RMSNorm scales, and runs NVIDIA's ``LMGen`` greedily with ``return_logits=True``
+  over the same phases as the trace (B=1/2; token priming and ``.pt``-style
+  embedding replay). For every forward it records the model input, the normed
+  hidden state, text logits, depth inputs, all 16 depth logits and tokens, and
+  the gathered output, plus the tiny state dict. About 99 MB (``torch.save``,
+  loadable with ``weights_only=True``); ``content_sha256`` digests every tensor.
+
+T13-LM loads that state dict through the strict M* key map and replays the
+whole greedy loop with M*'s cache, temporal transformer and depformer, so token
+errors cascade instead of being masked. This shows algorithmic equivalence with
+random weights only; it is not checkpoint, bf16 or GPU parity.

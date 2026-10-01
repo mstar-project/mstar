@@ -28,7 +28,9 @@
 state their formula; the public HF config is only a stub (§2 R21).
 """
 
-REFERENCE_SHA = "3428dfd95309a7f3c84fd93259ded0f810d1ff91"  # [PP] NVIDIA/personaplex commit pin
+from dataclasses import dataclass
+
+REFERENCE_SHA ="3428dfd95309a7f3c84fd93259ded0f810d1ff91"  # [PP] NVIDIA/personaplex commit pin
 
 AUDIO_CODEBOOKS_PER_STREAM = 8  # [PP] models/lm.py:54
 NUM_AUDIO_CODEBOOKS = 16  # [PP] models/loaders.py:96
@@ -80,6 +82,75 @@ DEPFORMER_FFN_HIDDEN = 2 * DEPFORMER_FFN_DIM // 3  # [PP] modules/gating.py:64
 DEPFORMER_CONTEXT = None  # [PP] models/lm.py:321 (overrides loaders.py:116)
 DEPFORMER_POS_EMB = "none"  # [PP] models/loaders.py:119
 DEPFORMER_WEIGHTS_PER_STEP = DEP_Q  # [PP] models/lm.py:322-323
+
+
+
+def gating_hidden(dim: int, dim_feedforward: int) -> int:
+    """Hidden width of ActivationGating ([PP] modules/gating.py:56-66)."""
+    return (21 * dim) // 8 if dim_feedforward == 4 * dim else (2 * dim_feedforward) // 3
+
+
+@dataclass(frozen=True)
+class LMArchConfig:
+    """Shapes of the temporal transformer and depformer.
+
+    Defaults are the PersonaPlex values above; tests shrink the transformer
+    widths and depths but keep the codebook layout, vocabularies and 16
+    per-step depth slots.
+    """
+
+    dim: int = TEMPORAL_DIM
+    num_heads: int = TEMPORAL_HEADS
+    num_layers: int = TEMPORAL_LAYERS
+    ffn_hidden: int = TEMPORAL_FFN_HIDDEN
+    depformer_dim: int = DEPFORMER_DIM
+    depformer_heads: int = DEPFORMER_HEADS
+    depformer_layers: int = DEPFORMER_LAYERS
+    depformer_ffn_hidden: int = DEPFORMER_FFN_HIDDEN
+    card: int = AUDIO_CARD
+    text_card: int = TEXT_CARD
+    norm_eps: float = NORM_EPS
+    rope_theta: float = ROPE_THETA
+
+    def __post_init__(self):
+        if self.dim % self.num_heads or self.depformer_dim % self.depformer_heads:
+            raise ValueError("model widths must be divisible by their head counts")
+        if (self.dim // self.num_heads) % 2:
+            raise ValueError("RoPE needs an even temporal head dimension")
+
+    @property
+    def head_dim(self) -> int:
+        return self.dim // self.num_heads
+
+    @property
+    def depformer_head_dim(self) -> int:
+        return self.depformer_dim // self.depformer_heads
+
+    @classmethod
+    def from_reference_kwargs(cls, kwargs: dict) -> "LMArchConfig":
+        """Build from an [PP] ``LMModel`` kwargs dict (models/loaders.py:92-122)."""
+        if (kwargs["n_q"], kwargs["dep_q"]) != (NUM_AUDIO_CODEBOOKS, DEP_Q):
+            raise ValueError("PersonaPlex needs n_q=16 and dep_q=16")
+        if tuple(kwargs["delays"]) != DELAYS or kwargs.get("existing_text_padding_id") != TEXT_PAD_TOKEN_ID:
+            raise ValueError("delays and text padding must match PersonaPlex")
+        if (kwargs["gating"], kwargs["depformer_gating"], kwargs["norm"]) != (GATING, GATING, NORM):
+            raise ValueError("only SiLU gating with rms_norm_f32 is supported")
+        if not (kwargs["depformer_multi_linear"] and kwargs["depformer_weights_per_step"]):
+            raise ValueError("the depformer needs per-codebook input projections and per-step weights")
+        if kwargs.get("depformer_pos_emb") != DEPFORMER_POS_EMB or kwargs.get("positional_embedding") != "rope":
+            raise ValueError("expected RoPE on the temporal transformer and no depformer positions")
+        if kwargs.get("layer_scale") is not None or kwargs.get("depformer_layer_scale") is not None:
+            raise ValueError("layer scale is not used by PersonaPlex")
+        dim, ddim = kwargs["dim"], kwargs["depformer_dim"]
+        dep_ffn = kwargs.get("depformer_dim_feedforward") or int(kwargs["hidden_scale"] * ddim)
+        return cls(
+            dim=dim, num_heads=kwargs["num_heads"], num_layers=kwargs["num_layers"],
+            ffn_hidden=gating_hidden(dim, int(kwargs["hidden_scale"] * dim)),
+            depformer_dim=ddim, depformer_heads=kwargs["depformer_num_heads"],
+            depformer_layers=kwargs["depformer_num_layers"], depformer_ffn_hidden=gating_hidden(ddim, dep_ffn),
+            card=kwargs["card"], text_card=kwargs["text_card"], rope_theta=kwargs["max_period"],
+        )
+
 
 TEXT_TEMPERATURE = 0.7  # [PP] models/lm.py:653; offline.py:363-374
 AUDIO_TEMPERATURE = 0.8  # [PP] models/lm.py:652; offline.py:363-374
