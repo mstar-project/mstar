@@ -63,6 +63,22 @@ Communication
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
+   * - ``MSTAR_ALLREDUCE_BACKEND``
+     - ``nccl``
+     - ``flashinfer`` routes ``CommGroup.all_reduce`` through FlashInfer's
+       ``allreduce_fusion`` (pattern ``kAllReduce``, "trtllm" backend)
+       instead of NCCL ring all-reduce (see
+       :mod:`mstar.distributed.flashinfer_allreduce`); ~3x faster per call
+       on H100 at decode-sized shapes. Falls back to NCCL per call when
+       FlashInfer isn't installed, the dtype isn't bf16/fp16, the
+       per-comm-group workspace hasn't been created yet (only legal outside
+       CUDA-graph capture and torch.compile tracing), or the token count
+       exceeds ``MSTAR_FLASHINFER_ALLREDUCE_MAX_TOKENS``.
+   * - ``MSTAR_FLASHINFER_ALLREDUCE_MAX_TOKENS``
+     - ``1024``
+     - Token-count cap of the FlashInfer all-reduce workspace, read when
+       ``MSTAR_ALLREDUCE_BACKEND=flashinfer``. A call wider than this (long
+       prefills) falls back to NCCL instead of resizing the workspace.
    * - ``MSTAR_SHM_ARENA``
      - ``0``
      - SHM tensor-transport implementation. ``0``: per-uuid files.

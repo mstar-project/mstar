@@ -6,6 +6,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from mstar.distributed import flashinfer_allreduce as _flashinfer_allreduce
+
 DIST_TIMEOUT_ENV = "MSTAR_DIST_TIMEOUT_S"
 
 
@@ -48,6 +50,7 @@ class CommGroup:
         self.world_size = len(group_members)
         self.device_group = None
         self.initialized = False
+        self.allreduce_handle = ""
 
     @classmethod
     def trivial(cls) -> "CommGroup":
@@ -88,8 +91,7 @@ class CommGroup:
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
             return input_
-        dist.all_reduce(input_, group=self.device_group)
-        return input_
+        return _flashinfer_allreduce.all_reduce(self, input_)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
@@ -333,6 +335,7 @@ class WorkerParallelGroups:
                 comm_group.initialized = True
                 continue
             comm_group.device_group = rank_tuple_to_pg[tuple(comm_group.group_members)]
+            comm_group.allreduce_handle = _flashinfer_allreduce.register(comm_group)
             comm_group.initialized = True
 
     def get_tp_config_for_node(self, node: str) -> CommGroup:

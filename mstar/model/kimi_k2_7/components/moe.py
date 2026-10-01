@@ -403,7 +403,7 @@ class KimiSparseMoeBlock(nn.Module):
         if self.tp_size > 1:
             # routed and shared are both rank-local partials now; one
             # all-reduce here replaces the three the block used to issue.
-            self.comm_group.all_reduce(out)
+            out = self.comm_group.all_reduce(out)
         return out.view(input_shape)
 
     def _route(
