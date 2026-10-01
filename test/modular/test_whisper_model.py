@@ -352,17 +352,17 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     from mstar.model.whisper.components.timestamps import FIRST_TOKEN, TimestampRules, inactive_state
 
     sub.timestamp_rules = TimestampRules(cfg)
-    fwd = type("F", (), {"request_id": "ts", "rid_handle": "ts"})()
+    fwd = type("F", (), {"request_id": "wire-ts", "rid_handle": 1})()
     ctx = {"encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)]}
     # a prompt without <|notimestamps|> turns the rules on, so the first token must be a timestamp
     row = sub.prepare_inputs(PREFILL_WALK, fwd, {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE])], **ctx})
-    assert sub.request_state("ts")["timestamps"] is True
+    assert sub.request_state(1)["timestamps"] is True
     assert row.tensor_inputs["ts_rules"].tolist() == [1, FIRST_TOKEN, cfg.timestamp_begin - 1, cfg.timestamp_begin + 51]
     # a plain prompt: inactive row
-    plain = type("F", (), {"request_id": "plain", "rid_handle": "plain"})()
+    plain = type("F", (), {"request_id": "wire-plain", "rid_handle": 2})()
     row2 = sub.prepare_inputs(PREFILL_WALK, plain, {"text_inputs": [torch.tensor([SOT, EN, TRANSCRIBE, NOTS])], **ctx})
     assert row2.tensor_inputs["ts_rules"].tolist() == inactive_state()
-    batch = sub.preprocess(PREFILL_WALK, _engine_inputs(["ts", "plain"]), [row, row2])
+    batch = sub.preprocess(PREFILL_WALK, _engine_inputs([1, 2]), [row, row2])
     assert batch["ts_rules"].shape == (2, 4)
 
     # a decode step takes the state routed with its token, never a host history
@@ -375,13 +375,13 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
     assert bare.tensor_inputs["ts_rules"].tolist() == inactive_state()
     # postprocess keeps the state under its own name for the loop-back edge
     outputs = {"new_token": [torch.tensor([5])], "ts_rules": [routed]}
-    sub.postprocess("ts", None, outputs)
+    sub.postprocess(1, None, outputs)
     assert outputs["text_inputs"] is outputs["new_token"] and outputs["ts_rules"] == [routed]
     # the capture template carries the same row so the graph's input set is fixed
     (decode_cfg,) = sub.get_cuda_graph_configs(torch.device("cpu"))
     assert decode_cfg.single_request_inputs.tensor_inputs["ts_rules"].tolist() == inactive_state()
     # language detection never applies the rules
-    detect = sub.prepare_inputs(DETECT_LANGUAGE_WALK, type("F", (), {"request_id": "d", "rid_handle": "d"})(),
+    detect = sub.prepare_inputs(DETECT_LANGUAGE_WALK, type("F", (), {"request_id": "wire-d", "rid_handle": 6})(),
                                 {"text_inputs": [torch.tensor([SOT])], **ctx})
     assert detect.tensor_inputs["ts_rules"].tolist() == inactive_state()
 
@@ -389,7 +389,7 @@ def test_decoder_timestamp_rules_ride_along_as_a_staged_row():
 def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
     cfg = _tiny_config()
     sub = _decoder_submodule(cfg)
-    fwd = type("F", (), {"request_id": "r0", "rid_handle": "r0"})()
+    fwd = type("F", (), {"request_id": "wire-r0", "rid_handle": 3})()
     # prepare_inputs reads the module device, so give it a parameter
     sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
     row = sub.prepare_inputs(
@@ -397,15 +397,15 @@ def test_decoder_prefill_prompt_appends_the_tail_to_the_detected_language():
         {"text_inputs": [torch.tensor([DE])], "prompt_tail": [torch.tensor([TRANSCRIBE, NOTS])]},
     )
     assert row.input_seq_len == 3
-    batch = sub.preprocess(PREFILL_PROMPT_WALK, _engine_inputs(["r0"]), [row])
+    batch = sub.preprocess(PREFILL_PROMPT_WALK, _engine_inputs([3]), [row])
     assert batch["input_ids"].tolist() == [DE, TRANSCRIBE, NOTS] and "encoder_states" not in batch
-    assert sub.request_state("r0")["prompt_lens"] == {PREFILL_PROMPT_WALK: 3}
+    assert sub.request_state(3)["prompt_lens"] == {PREFILL_PROMPT_WALK: 3}
     # a retried admit prepares the same walk again and must not count it twice
     sub.prepare_inputs(
         PREFILL_PROMPT_WALK, fwd,
         {"text_inputs": [torch.tensor([DE])], "prompt_tail": [torch.tensor([TRANSCRIBE, NOTS])]},
     )
-    assert sub.request_state("r0")["prompt_lens"] == {PREFILL_PROMPT_WALK: 3}
+    assert sub.request_state(3)["prompt_lens"] == {PREFILL_PROMPT_WALK: 3}
 
     detect_row = sub.prepare_inputs(
         DETECT_LANGUAGE_WALK, fwd,
@@ -657,21 +657,21 @@ def test_decoder_align_walk_emits_word_timings_in_the_timestamp_vocabulary():
     for param in decoder.parameters():  # fused projections start from torch.empty
         torch.nn.init.normal_(param, std=0.05)
     sub = WhisperDecoderSubmodule(decoder, cfg, tokenizer=model.tokenizer).eval()
-    fwd = type("F", (), {"request_id": "r", "rid_handle": "r"})()
+    fwd = type("F", (), {"request_id": "wire-r", "rid_handle": 4})()
     enc = torch.randn(cfg.max_source_positions, cfg.d_model)
     # forced English prompt recorded at prefill, then two text tokens and end-of-text generated
-    sub.request_state("r").add("language", EN)
-    sub.request_state("r").add("task", TRANSCRIBE)
+    sub.request_state(4).add("language", EN)
+    sub.request_state(4).add("task", TRANSCRIBE)
     row = sub.prepare_inputs(ALIGN_WALK, fwd, {
         "transcript": [torch.tensor([7]), torch.tensor([33]), torch.tensor([EOT])],
         "encoder_states": [enc], "audio_frames": [torch.tensor([cfg.num_frames])],
     })
     assert row.input_ids.tolist() == [SOT, EN, TRANSCRIBE, NOTS, 7, 33, EOT]
-    assert sub.declare_step(ALIGN_WALK, ["r"], [row]) is None and sub.max_batch_size(ALIGN_WALK) == 1
-    batch = sub.preprocess(ALIGN_WALK, _engine_inputs(["r"]), [row])
+    assert sub.declare_step(ALIGN_WALK, [4], [row]) is None and sub.max_batch_size(ALIGN_WALK) == 1
+    batch = sub.preprocess(ALIGN_WALK, _engine_inputs([4]), [row])
     with torch.no_grad():
-        out = sub.forward_batched(ALIGN_WALK, _engine_inputs(["r"]), **batch)
-    ids = out["r"]["word_tokens"][0].tolist()
+        out = sub.forward_batched(ALIGN_WALK, _engine_inputs([4]), **batch)
+    ids = out[4]["word_tokens"][0].tolist()
     assert ids[0] == STARTOFLM
     stamps = [i for i in ids[1:] if cfg.is_timestamp(i)]
     assert len(stamps) % 2 == 0 and stamps == sorted(stamps)  # <start> word <end> per word, monotonic
@@ -687,10 +687,10 @@ def test_decoder_prefill_selects_each_request_last_row_itself():
     assert sub._last_rows(hidden, torch.tensor([4, 1, 2])).flatten().tolist() == [3.0, 4.0, 6.0]
     # a language-detection prompt is a single token: still its own last row
     assert sub._last_rows(hidden[:1], torch.tensor([1])).flatten().tolist() == [0.0]
-    fwd = type("F", (), {"request_id": "a", "rid_handle": "a"})()
+    fwd = type("F", (), {"request_id": "wire-a", "rid_handle": 5})()
     detect = sub.prepare_inputs(DETECT_LANGUAGE_WALK, fwd, {
         "text_inputs": [torch.tensor([SOT])], "encoder_states": [torch.zeros(cfg.max_source_positions, cfg.d_model)],
     })
-    batch = sub.preprocess(DETECT_LANGUAGE_WALK, _engine_inputs(["a"]), [detect])
+    batch = sub.preprocess(DETECT_LANGUAGE_WALK, _engine_inputs([5]), [detect])
     assert batch["row_lens"].tolist() == [1] and batch["input_ids"].tolist() == [SOT]
 
