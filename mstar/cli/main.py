@@ -116,7 +116,7 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
     if model == "omnivoice":
         lines.append("    client.tts(\"Xin chào\", language=\"Vietnamese\").to_wav(\"out.wav\")")
-        lines.append("    # clone a voice: ref_audio=\"ref.wav\", ref_text=\"<its transcript>\"")
+        lines.append("    # clone a voice: reference_audio=\"ref.wav\", ref_text=\"<its transcript>\"")
     if model in ("kokoro", "orpheus", "qwen3_omni", "qwen3_tts"):
         voice = {
             "kokoro": "af_heart",
