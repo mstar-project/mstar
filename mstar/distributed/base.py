@@ -281,8 +281,16 @@ class ShardingConfig:
         source_group = self.group_mapping.get(source)
         if source_group is None:
             source_tp_size = 1
+            # A special source (api server) holds the whole tensor.
+            src_rank = 0
         else:
             source_tp_size = source_group.tp_size
+            # Resolved the same way compute_fanout resolves it -- which has
+            # already run above, so a missing _tp_rank raised there.
+            src_rank = (
+                source_tp_rank if source_tp_rank is not None
+                else source_group._tp_rank
+            )
 
         result = {}
         for item in fanout:
@@ -310,7 +318,16 @@ class ShardingConfig:
                     # compute offset and new nbytes
                     element_size = info.nbytes // math.prod(info.dims)
                     row_nbytes = element_size * math.prod(info.dims[1:])
-                    offset = start_idx * row_nbytes
+                    # start_idx is a row of the LOGICAL tensor, but offset is
+                    # a read into this rank's own shard (the reader does
+                    # `canonical_tensor[offset // row : ...]`, and the
+                    # transports do `address + offset` / `seek(offset)`), so
+                    # rebase onto the slab this rank holds. Without it a rank
+                    # above 0 indexes past the end of its own tensor and the
+                    # slice comes back EMPTY -- silently, since an
+                    # out-of-range slice is not an error.
+                    local_start = start_idx - src_rank * info.dims[0]
+                    offset = local_start * row_nbytes
                     new_nbytes = (end_idx - start_idx) * row_nbytes
 
                     new_info = info.clone()

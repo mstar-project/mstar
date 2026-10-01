@@ -1,0 +1,127 @@
+"""``warmup_requests`` in the deployment yaml: run through the API server
+after the workers are ready and before the server binds, as plain /generate
+requests; a failing one is logged and skipped."""
+
+from __future__ import annotations
+
+import logging
+import sys
+
+sys.path.insert(0, ".")
+
+from mstar.api_server import entrypoint
+
+
+class _FakeServer:
+    def __init__(self, fail_on: str | None = None):
+        self.submitted = []
+        self.collected = []
+        self.fail_on = fail_on
+
+    def submit_request(self, **kwargs):
+        self.submitted.append(kwargs)
+        return kwargs["request_id"]
+
+    async def collect_results(self, request_id, raw_request=None):
+        self.collected.append(request_id)
+        if self.fail_on == request_id:
+            raise RuntimeError("compile blew up")
+        return []
+
+
+def test_warmup_requests_run_as_generate_requests(caplog) -> None:
+    fake = _FakeServer()
+    specs = [
+        {"text": "a drone over a coast", "output_modalities": ["video"], "model_kwargs": {"num_frames": 121}},
+        {"text": "hi", "output_modalities": "text,audio"},
+        {"files": ["/tmp/obs.jpg"], "text": "pick up the mug", "output_modalities": ["action"]},
+    ]
+    with caplog.at_level(logging.INFO, logger="mstar.api_server.entrypoint"):
+        entrypoint._run_warmup_requests(fake, specs)
+    assert [s["request_id"] for s in fake.submitted] == ["warmup-0", "warmup-1", "warmup-2"]
+    assert fake.collected == ["warmup-0", "warmup-1", "warmup-2"]
+    first, second, third = fake.submitted
+    assert first["output_modalities"] == ["video"] and first["model_kwargs"] == {"num_frames": 121}
+    assert first["streaming"] is False and first["input_modalities"] == ["text"]
+    assert second["output_modalities"] == ["text", "audio"] and second["model_kwargs"] is None
+    assert third["file_paths"] == {"image": ["/tmp/obs.jpg"]}
+    assert third["input_modalities"] == ["image", "text"]
+    assert [p.modality for p in third["prompt_parts"]] == ["image", "text"]
+    assert caplog.text.count("done in") == 3
+
+
+def test_warmup_files_of_any_modality_keep_prompt_order() -> None:
+    fake = _FakeServer()
+    spec = {
+        "files": [
+            "/tmp/a.jpg",
+            "/tmp/speech.wav",
+            "/tmp/b.png",
+            {"path": "/tmp/clip.bin", "modality": "video"},
+        ],
+        "text": "describe",
+    }
+    entrypoint._run_warmup_requests(fake, [spec])
+    (req,) = fake.submitted
+    assert req["file_paths"] == {
+        "image": ["/tmp/a.jpg", "/tmp/b.png"],
+        "audio": ["/tmp/speech.wav"],
+        "video": ["/tmp/clip.bin"],
+    }
+    assert req["input_modalities"] == ["image", "audio", "image", "video", "text"]
+    assert [(p.modality, p.index) for p in req["prompt_parts"]] == [
+        ("image", 0), ("audio", 0), ("image", 1), ("video", 0), ("text", 0),
+    ]
+    assert req["output_modalities"] == ["text"]
+
+
+def test_malformed_warmups_are_skipped(caplog) -> None:
+    fake = _FakeServer()
+    with caplog.at_level(logging.WARNING, logger="mstar.api_server.entrypoint"):
+        entrypoint._run_warmup_requests(fake, [
+            {"files": ["/tmp/blob.xyz"]},           # modality unknown
+            {"image": "/tmp/a.jpg"},                # unknown key
+            {"text": "x", "model_kwargs": [1]},     # model_kwargs not a mapping
+            {"text": "ok"},
+        ])
+    assert fake.collected == ["warmup-3"]
+    assert "set 'modality'" in caplog.text
+    assert "unknown key(s) ['image']" in caplog.text
+    assert "model_kwargs must be a mapping" in caplog.text
+
+
+def test_a_failing_warmup_is_logged_and_skipped(caplog) -> None:
+    fake = _FakeServer(fail_on="warmup-0")
+    with caplog.at_level(logging.WARNING, logger="mstar.api_server.entrypoint"):
+        entrypoint._run_warmup_requests(fake, [{"text": "x"}, "not a mapping", {"text": "y"}])
+    assert fake.collected == ["warmup-0", "warmup-2"]
+    assert "warmup request 1/3 failed" in caplog.text and "compile blew up" in caplog.text
+    assert "not a mapping" in caplog.text
+    # not a list at all: nothing runs, one warning
+    entrypoint._run_warmup_requests(fake, {"text": "x"})
+    assert fake.collected == ["warmup-0", "warmup-2"]
+
+
+def test_hf_file_references_resolve_from_the_cache(monkeypatch) -> None:
+    calls = []
+
+    def fake_download(repo_id, filename):
+        calls.append((repo_id, filename))
+        return f"/cache/{repo_id}/{filename}"
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    assert entrypoint._resolve_warmup_path("/tmp/obs.jpg") == "/tmp/obs.jpg"
+    assert (
+        entrypoint._resolve_warmup_path("hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg")
+        == "/cache/nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg"
+    )
+    assert calls == [("nvidia/Cosmos3-Edge", "assets/example_i2v_input.jpg")]
+    fake = _FakeServer()
+    spec = {"files": ["hf://nvidia/Cosmos3-Edge/assets/x.jpg"], "output_modalities": ["video"]}
+    entrypoint._run_warmup_requests(fake, [spec])
+    assert fake.submitted[0]["file_paths"] == {"image": ["/cache/nvidia/Cosmos3-Edge/assets/x.jpg"]}
+    # a malformed reference is a failed warmup, not a crash
+    entrypoint._run_warmup_requests(fake, [{"files": ["hf://nvidia.jpg"], "output_modalities": ["video"]}])
+    assert len(fake.submitted) == 1

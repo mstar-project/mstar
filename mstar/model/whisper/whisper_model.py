@@ -37,9 +37,9 @@ from mstar.engine.resources import (
     AttentionSpec,
     CrossAttentionConfig,
     CrossAttentionSpec,
-    KVConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     ResourceReqConfig,
@@ -123,7 +123,7 @@ class WhisperModel(Model):
         # Sequences cap at max_target_positions (448) = 4 pages per
         # request; 128 pages ≈ 32 concurrent requests at ~2.7 GB
         # (vs 43 GB with the 2048-page default).
-        kv_config = KVConfig(
+        kv_config = PagedKVConfig(
             num_layers=self.config.decoder_layers,
             num_kv_heads=self.config.decoder_attention_heads,
             head_dim=self.config.head_dim,
@@ -133,7 +133,7 @@ class WhisperModel(Model):
         )
         # The fixed 30 s window is max_source_positions (1500) tokens = 12
         # pages per request; 192 pages ≈ 16 concurrent at ~4 GB.
-        context_kv_config = KVConfig(
+        context_kv_config = PagedKVConfig(
             num_layers=self.config.decoder_layers,
             num_kv_heads=self.config.decoder_attention_heads,
             head_dim=self.config.head_dim,

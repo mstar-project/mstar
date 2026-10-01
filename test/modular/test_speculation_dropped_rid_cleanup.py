@@ -16,25 +16,31 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.graph.base import GraphEdge  # noqa: E402
+from mstar.streaming.stream_buffer import StreamChunkInfo, StreamingEdge  # noqa: E402
 from mstar.worker.worker import Speculation, Worker  # noqa: E402
 
 NODE = "decoder"
 
 
-def _edge(name: str) -> GraphEdge:
-    return GraphEdge(next_node=NODE, name=name, is_streaming=True)
+_CHUNK = StreamChunkInfo(start_offset=0, context_items=0, num_items=1, is_final=False)
+
+
+def _edge(name: str) -> StreamingEdge:
+    return StreamingEdge(GraphEdge(next_node=NODE, name=name, is_streaming=True), _CHUNK)
 
 
 def _speculation(rids: list[str]) -> Speculation:
     return Speculation(
         scheduled_batch=SimpleNamespace(
             request_to_worker_graph={r: "wg" for r in rids},
-            node_objects={r: object() for r in rids},
         ),
         node_batch=SimpleNamespace(
             request_ids=list(rids),
             per_request_input_tensors={r: {} for r in rids},
             per_request_info={r: object() for r in rids},
+            per_request_stream_chunks={r: {f"audio_{r}": None} for r in rids},
+            final_stream_rids=set(rids),
+            stream_partition_done_rids=set(rids),
         ),
         consumed_edges={("tok", NODE)},
         continuing_rids=set(rids),
@@ -48,7 +54,7 @@ def _speculation(rids: list[str]) -> Speculation:
 def test_dropped_rid_gets_its_own_edges_back():
     returned: list[tuple[str, str]] = []
     worker = SimpleNamespace(
-        _return_speculative_streaming_edge=lambda rid, edge: returned.append((rid, edge.name)),
+        _return_streaming_edge=lambda rid, se: returned.append((rid, se.edge.name)),
     )
     # The dropped rid goes first: the threading loop leaves its variable bound
     # to the LAST rid it visited, so a cleanup that read that leftover would
@@ -64,8 +70,8 @@ def test_dropped_rid_gets_its_own_edges_back():
     for table in (
         spec.node_batch.per_request_input_tensors,
         spec.node_batch.per_request_info,
+        spec.node_batch.per_request_stream_chunks,
         spec.scheduled_batch.request_to_worker_graph,
-        spec.scheduled_batch.node_objects,
     ):
         assert set(table) == {"keep"}
 

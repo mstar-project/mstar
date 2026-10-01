@@ -56,3 +56,10 @@ class OrpheusModelConfig:
     available_voices: list[str] = field(
         default_factory=lambda: ["tara", "zoe", "zac", "jess", "leo", "mia", "julia", "leah"]
     )
+    default_voice: str = "tara"
+
+    def __post_init__(self):
+        if self.default_voice not in self.available_voices:
+            raise ValueError(
+                f"default_voice {self.default_voice!r} is not in available_voices"
+            )
