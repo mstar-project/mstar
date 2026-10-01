@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 30, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 01, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -290,6 +290,14 @@
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.kokoro.html">mstar.model.kokoro</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.components.html">mstar.model.kokoro.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.submodules.html">mstar.model.kokoro.submodules</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.kokoro.voices.html">mstar.model.kokoro.voices</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
@@ -814,11 +822,11 @@ semantics. Point any OpenAI client at <code class="docutils literal notranslate"
 <td><p>Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/audio/speech</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">orpheus</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
-<td><p>Text-to-speech.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">kokoro</span></code>, <code class="docutils literal notranslate"><span class="pre">orpheus</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
+<td><p>Text-to-speech (<code class="docutils literal notranslate"><span class="pre">kokoro</span></code> streams sentence by sentence with <code class="docutils literal notranslate"><span class="pre">stream=True</span></code>).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/audio/voices</span></code></p></td>
-<td><p>speech models that publish a voice list through their speech adapter (<code class="docutils literal notranslate"><span class="pre">orpheus</span></code>; 404 otherwise)</p></td>
+<td><p>speech models that publish a voice list through their speech adapter (<code class="docutils literal notranslate"><span class="pre">kokoro</span></code>, <code class="docutils literal notranslate"><span class="pre">orpheus</span></code>; 404 otherwise)</p></td>
 <td><p>The <code class="docutils literal notranslate"><span class="pre">voice</span></code> ids the served model accepts, plus its default.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/generations</span></code></p></td>
@@ -855,6 +863,10 @@ residual codec groups use <code class="docutils literal notranslate"><span class
 <code class="docutils literal notranslate"><span class="pre">Ethan</span></code>) and request audio output by including <code class="docutils literal notranslate"><span class="pre">&quot;audio&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">modalities</span></code>.
 Non-OpenAI knobs (e.g. <code class="docutils literal notranslate"><span class="pre">talker_top_k</span></code>, <code class="docutils literal notranslate"><span class="pre">code_predictor_top_p</span></code>) go through
 <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.</p></li>
+<li><p><strong>Kokoro</strong> — <code class="docutils literal notranslate"><span class="pre">voice</span></code> is one of the 54 bundled voices (default <code class="docutils literal notranslate"><span class="pre">af_heart</span></code>) or a
+blend such as <code class="docutils literal notranslate"><span class="pre">af_bella+af_sky</span></code> or <code class="docutils literal notranslate"><span class="pre">af_bella(2)+af_sky(1)</span></code>; <code class="docutils literal notranslate"><span class="pre">speed</span></code> scales the
+speaking rate (0.25-4.0). <code class="docutils literal notranslate"><span class="pre">lang_code</span></code> and <code class="docutils literal notranslate"><span class="pre">phonemes</span></code> go through <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.
+<code class="docutils literal notranslate"><span class="pre">temperature</span></code> / <code class="docutils literal notranslate"><span class="pre">top_p</span></code> are ignored: Kokoro does not sample.</p></li>
 <li><p><strong>Orpheus</strong> — set the speaker with <code class="docutils literal notranslate"><span class="pre">voice</span></code> — one of <code class="docutils literal notranslate"><span class="pre">tara</span></code> (default), <code class="docutils literal notranslate"><span class="pre">zoe</span></code>,
 <code class="docutils literal notranslate"><span class="pre">zac</span></code>, <code class="docutils literal notranslate"><span class="pre">jess</span></code>, <code class="docutils literal notranslate"><span class="pre">leo</span></code>, <code class="docutils literal notranslate"><span class="pre">mia</span></code>, <code class="docutils literal notranslate"><span class="pre">julia</span></code>, <code class="docutils literal notranslate"><span class="pre">leah</span></code> (the <code class="docutils literal notranslate"><span class="pre">available_voices</span></code> list
 in the Orpheus config).</p></li>
@@ -946,7 +958,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 30, 2026.
+  Last updated on Oct 01, 2026.
   <br/>
 </p>
   </div>

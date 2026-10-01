@@ -26,6 +26,7 @@ mstar.api\_server.openai.adapters
    
       BagelAdapter
       Cosmos3Adapter
+      KokoroAdapter
       OmniVoiceAdapter
       OpenAIAdapter
       OrpheusAdapter

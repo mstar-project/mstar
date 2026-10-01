@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Sep 30, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 01, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -643,6 +643,14 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.model.kokoro.html">mstar.model.kokoro</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.kokoro.components.html">mstar.model.kokoro.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.kokoro.submodules.html">mstar.model.kokoro.submodules</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.kokoro.voices.html">mstar.model.kokoro.voices</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
@@ -1305,6 +1313,41 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="KokoroAdapter">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.KokoroAdapter">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">KokoroAdapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Kokoro-82M: text-to-speech, audio out only.</span>
+
+<span class="sd">    ``voice`` is a bundled voice or a blend (``af_bella+af_sky``,</span>
+<span class="sd">    ``af_bella(2)+af_sky(1)``) and ``speed`` scales the predicted durations;</span>
+<span class="sd">    both are real model knobs and are forwarded. Kokoro does not sample, so</span>
+<span class="sd">    ``temperature`` / ``top_p`` are ignored. ``lang_code`` (a G2P language</span>
+<span class="sd">    override; the default follows the voice's prefix) and ``phonemes`` (skip</span>
+<span class="sd">    G2P) arrive through ``extra_body``.</span>
+<span class="sd">    """</span>
+
+    <span class="n">supports_speech</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="KokoroAdapter.speech_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.KokoroAdapter.speech_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">speech_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">SpeechRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
+        <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"voice"</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"voice"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">voice</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"speed"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"speed"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">speed</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"seed"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">input</span><span class="p">,</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"audio"</span><span class="p">],</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="Cosmos3Adapter">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Cosmos3Adapter">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3Adapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
@@ -1451,6 +1494,7 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"qwen3_omni"</span><span class="p">:</span> <span class="n">Qwen3OmniAdapter</span><span class="p">(),</span>
     <span class="s2">"omnivoice"</span><span class="p">:</span> <span class="n">OmniVoiceAdapter</span><span class="p">(),</span>
     <span class="s2">"orpheus"</span><span class="p">:</span> <span class="n">OrpheusAdapter</span><span class="p">(),</span>
+    <span class="s2">"kokoro"</span><span class="p">:</span> <span class="n">KokoroAdapter</span><span class="p">(),</span>
     <span class="s2">"cosmos3"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
     <span class="s2">"cosmos3_droid"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
     <span class="s2">"cosmos3_super"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
@@ -1510,7 +1554,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 30, 2026.
+  Last updated on Oct 01, 2026.
   <br/>
 </p>
   </div>

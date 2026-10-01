@@ -31,6 +31,7 @@
    components
    cosmos3
    higgs_audio
+   kokoro
    loader
    multimodal
    omnivoice
