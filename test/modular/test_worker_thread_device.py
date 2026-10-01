@@ -11,7 +11,7 @@ unordered with the real compute stream (silent corruption or illegal
 accesses on the eager fallback path, which launches Triton at request
 time).
 
-These tests exercise ``Worker._init_cuda_executor_thread`` exactly as
+These tests exercise ``Worker._init_engine_thread`` exactly as
 ``Worker.run`` wires it into its executors.
 """
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +33,7 @@ def _worker_with_device(device: torch.device) -> Worker:
 def test_executor_thread_pinned_to_worker_device():
     w = _worker_with_device(torch.device("cuda", 1))
     ex = ThreadPoolExecutor(
-        max_workers=1, initializer=w._init_cuda_executor_thread
+        max_workers=1, initializer=w._init_engine_thread
     )
     try:
         assert ex.submit(torch.cuda.current_device).result() == 1
@@ -58,7 +58,7 @@ def test_triton_launch_from_pinned_thread_is_ordered():
         a.fill_(1.0)                    # produced late
 
     ex = ThreadPoolExecutor(
-        max_workers=1, initializer=w._init_cuda_executor_thread
+        max_workers=1, initializer=w._init_engine_thread
     )
     try:
         ex.submit(act_and_mul_triton, a, out, "silu").result()

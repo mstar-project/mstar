@@ -5,7 +5,7 @@ import threading
 
 import torch
 
-from mstar.engine.resources.kv.config import KVConfig, KVLayout
+from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
 
 
 class PageAllocator:
@@ -70,7 +70,7 @@ class KVCache:
 
     def __init__(
         self,
-        cfg: KVConfig,
+        cfg: PagedKVConfig,
         device: torch.device,
         dtype=torch.bfloat16
     ):
