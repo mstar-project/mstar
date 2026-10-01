@@ -150,3 +150,64 @@ class FixedChunkPolicy(ChunkPolicy):
 
     def continue_after_producer_done(self) -> bool:
         return self._continue_after_done
+
+
+class RampChunkPolicy(ChunkPolicy):
+    """A smaller first chunk, then chunks that grow geometrically up to a cap.
+
+    A streaming consumer that re-runs over the whole accumulated stream on
+    every chunk (a flow-matching mel decoder conditioned on all tokens so far)
+    wants its first chunk as early as the model allows, for time-to-first-audio,
+    and later chunks sized for throughput. ``first_chunk`` items release the
+    first chunk; the next is ``chunk_size`` items and every chunk after that is
+    ``growth`` times the previous one, capped at ``max_chunk`` (``growth=1``
+    keeps them fixed). Growing chunks track the listener's playback buffer:
+    each chunk buys the time to produce a bigger one, so fewer, larger solves
+    carry the same stream. No overlap: the consumer keeps its own history.
+
+    ``continue_after_done`` behaves as in :class:`FixedChunkPolicy`.
+    """
+
+    def __init__(
+        self, first_chunk: int, chunk_size: int, continue_after_done: bool = False,
+        growth: float = 1.0, max_chunk: int | None = None,
+    ):
+        super().__init__()
+        if first_chunk <= 0 or chunk_size <= 0:
+            raise ValueError("first_chunk and chunk_size must be positive")
+        if growth < 1.0:
+            raise ValueError("growth must be >= 1")
+        if max_chunk is not None and max_chunk < chunk_size:
+            raise ValueError("max_chunk must be >= chunk_size")
+        self._first_chunk = first_chunk
+        self._chunk_size = chunk_size
+        self._growth = growth
+        self._max_chunk = max_chunk
+        self._continue_after_done = continue_after_done
+        # Running size, clamped as it grows; a pow of the chunk count overflows on long streams.
+        self._size = float(chunk_size)
+
+    def register_chunk(self, chunk_size: int):
+        # The first chunk only releases the chunk_size one; grow after each later chunk.
+        if self.first_chunk_read and (self._max_chunk is None or self._size < self._max_chunk):
+            self._size *= self._growth
+            if self._max_chunk is not None:
+                self._size = min(self._size, float(self._max_chunk))
+        super().register_chunk(chunk_size)
+
+    def _current(self) -> int:
+        if not self.first_chunk_read:
+            return self._first_chunk
+        return int(round(self._size))
+
+    def is_ready(self, buffer_len: int) -> bool:
+        return buffer_len >= self._current()
+
+    def next_chunk_size(self, buffer_len: int) -> int:
+        return self._current()
+
+    def window_size(self) -> int:
+        return self._current()
+
+    def continue_after_producer_done(self) -> bool:
+        return self._continue_after_done

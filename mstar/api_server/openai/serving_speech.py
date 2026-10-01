@@ -1,8 +1,10 @@
-"""/v1/audio/speech handler (text-to-speech).
+"""/v1/audio/speech and /v1/audio/voices handlers (text-to-speech).
 
-Non-streaming returns the full audio as a container blob (WAV by default).
-Streaming returns a single open-ended WAV response (header + PCM16 frames) as
-the audio is produced.
+Non-streaming speech returns the full audio as a container blob (WAV by
+default). Streaming returns one open-ended response as the audio is produced:
+a WAV header followed by PCM16 frames, or, with ``response_format="pcm"``,
+the bare PCM16 frames that the OpenAI TTS clients (LiveKit, Pipecat) expect.
+``/v1/audio/voices`` lists the ``voice`` values the served model accepts.
 
 Long inputs can be synthesized as ordered sentence chunks (one engine request
 per chunk, ``speech_chunking.split_sentences``): the adapter's
@@ -25,6 +27,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import rid
+from mstar.api_server.openai.protocol import VoiceCard, VoiceList
 from mstar.api_server.openai.speech_chunking import split_sentences
 
 
@@ -52,6 +55,18 @@ def _chunk_kwargs(model_kwargs: dict, index: int) -> dict:
     return kwargs
 
 
+def list_voices(api) -> VoiceList | None:
+    """The served model's voices, or ``None`` when it has no fixed list."""
+    model = api.model
+    voices = model.get_voices() if model is not None else None
+    if voices is None:
+        return None
+    return VoiceList(
+        voices=[VoiceCard(id=v, name=v) for v in voices],
+        default_voice=model.get_default_voice(),
+    )
+
+
 async def create_speech(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
     args = adapter.speech_to_request(req, api.upload_dir)
     request_id = rid("speech")
@@ -73,6 +88,7 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
 
     lookahead = max(1, int(getattr(adapter, "speech_chunk_lookahead", 2)))
     if req.stream:
+        raw_pcm = fmt == "pcm"
         pending = [submit(i) for i in range(min(lookahead, len(chunks)))]
         # Look at the first result before committing to a 200: a request the
         # engine rejects (bad voice, dead worker, ...) must surface as an HTTP
@@ -81,8 +97,9 @@ async def create_speech(api, model_name, adapter, req, raw_request=None):  # noq
         first = await anext(first_iter, None)
         _raise_if_error(first)
         return StreamingResponse(
-            _stream_wav(api, submit, len(chunks), pending, first_iter, first, sample_rate),
-            media_type="audio/wav",
+            _stream_pcm(api, submit, len(chunks), pending, first_iter, first, sample_rate,
+                        with_wav_header=not raw_pcm),
+            media_type="audio/pcm" if raw_pcm else "audio/wav",
             headers={"Cache-Control": "no-cache"},
         )
 
@@ -106,9 +123,10 @@ def _raise_if_error(chunk) -> None:
         )
 
 
-async def _stream_wav(api, submit: Callable[[int], str], num_chunks: int, pending: list[str],
-                      first_iter, first, sample_rate: int):
-    yield media_io.wav_stream_header(sample_rate)
+async def _stream_pcm(api, submit: Callable[[int], str], num_chunks: int, pending: list[str],
+                      first_iter, first, sample_rate: int, with_wav_header: bool = True):
+    if with_wav_header:
+        yield media_io.wav_stream_header(sample_rate)
     for index in range(num_chunks):
         if len(pending) < num_chunks:
             # Keep the next chunk generating while this one plays.

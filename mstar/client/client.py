@@ -139,12 +139,44 @@ class MStarClient:
             raise RuntimeError("Server returned no image output")
         return res.images[0]
 
-    def tts(self, text: str, *, voice: str | None = None, **model_kwargs) -> AudioBuffer:
-        """Text-to-speech. Returns an :class:`AudioBuffer` (``.to_wav(path)``)."""
-        res = self.generate(text=text, output_modalities=("audio",), voice=voice, **model_kwargs)
+    def tts(
+        self,
+        text: str,
+        *,
+        voice: str | None = None,
+        reference_audio=None,
+        **model_kwargs,
+    ) -> AudioBuffer:
+        """Text-to-speech. Returns an :class:`AudioBuffer` (``.to_wav(path)``).
+
+        ``voice`` names a built-in speaker. ``reference_audio`` (a path, raw
+        ``bytes`` or a ``(filename, bytes)`` tuple) clones a voice from a clip
+        on models that support it; the clip travels as the request's audio
+        input, and model-specific knobs (``ref_text``, ``instruct``,
+        ``language``, ...) are forwarded verbatim as ``model_kwargs``.
+        """
+        audio = None
+        input_modalities = None
+        if reference_audio is not None:
+            audio = [reference_audio]
+            input_modalities = ("audio", "text")
+        res = self.generate(
+            text=text,
+            audio=audio,
+            input_modalities=input_modalities,
+            output_modalities=("audio",),
+            voice=voice,
+            **model_kwargs,
+        )
         if res.audio is None:
             raise RuntimeError("Server returned no audio output")
         return res.audio
+
+    def voices(self) -> list[str]:
+        """The ``voice`` ids the served speech model accepts (``GET /v1/audio/voices``)."""
+        r = self._session.get(f"{self.base_url}/v1/audio/voices", timeout=self.timeout)
+        r.raise_for_status()
+        return [v["id"] for v in r.json().get("voices", [])]
 
     def health(self) -> bool:
         try:

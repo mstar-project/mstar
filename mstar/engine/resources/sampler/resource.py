@@ -16,6 +16,8 @@ from mstar.engine.resources.step import SlotLease, StepContext
 
 
 class SamplerResource(Resource):
+    prefix_skip_safe = True
+
     # TODO: this is  a light wrapper around mstar/engine/resources/sampler/utils.py. In the future,
     # we should rip out the parts we need from sampling.py and discard the rest.
     def __init__(
@@ -23,9 +25,11 @@ class SamplerResource(Resource):
         vocab_size: int | None,
         enable_repetion_penalty: bool,
         device: torch.device,
-        comm_group: JointGroups | None=None
+        comm_group: JointGroups | None=None,
+        enable_min_p: bool = False,
     ):
         self._track_seen_tokens = enable_repetion_penalty
+        self._enable_min_p = enable_min_p
         self._vocab_size = vocab_size if self._track_seen_tokens else None
         self._sampler = Sampler(
             device=device,
@@ -64,7 +68,10 @@ class SamplerResource(Resource):
         self._cg_sampler: CudaGraphableSampler | None = None
         # pre-planned a step ahead, promoted by the next non-preplan plan
         self._preplan_cg_sampler: CudaGraphableSampler | None = None
+        self._preplan_key = None
         self._preplanned = False
+        # rid -> the prompt tokens a cache hit kept out of this step's inputs
+        self._cached_prefix: dict[str, torch.Tensor] = {}
 
     @property
     def _penalty_live(self) -> bool:
@@ -87,6 +94,7 @@ class SamplerResource(Resource):
             enable_repetion_penalty=spec.enable_repetion_penalty,
             device=info.device,
             comm_group=info.joint_comm_group,
+            enable_min_p=spec.enable_min_p,
         )
 
     def build_cuda_graph_buffers(
@@ -109,6 +117,7 @@ class SamplerResource(Resource):
             tp_group=self._comm_group,
             vocab_size=self._vocab_size,
             cg_slots=self._cg_slots,
+            enable_min_p=self._enable_min_p,
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
@@ -121,16 +130,48 @@ class SamplerResource(Resource):
         )
         # Read off the resolved config rather than `overrides`, so a request
         # that leaves the penalty unset takes the same default the sampler will.
-        if self._sampler._sampling_config[rid].repetition_penalty != 1.0:
+        resolved = self._sampler._sampling_config[rid]
+        # written so NaN fails too; NaN would also slip past the `> 0` check below
+        if not 0.0 <= resolved.min_p <= 1.0:
+            self._sampler.remove_request(rid)
+            raise ValueError(
+                f"request {rid!r} asks for min_p={resolved.min_p}; it must be in [0, 1]"
+            )
+        if resolved.min_p > 0 and not self._enable_min_p:
+            # the graph-captured sampler has no min-p buffer, so honouring it
+            # eagerly but not in graph would make sampling depend on the path
+            self._sampler.remove_request(rid)
+            raise ValueError(
+                f"request {rid!r} asks for min_p={resolved.min_p} but the node's "
+                "SamplerSpec has enable_min_p=False"
+            )
+        # after the refusals, so a refused request leaves no stale entry
+        if resolved.repetition_penalty != 1.0:
             self._penalty_rids.add(rid)
         if self._cg_buffers is not None:
             self._cg_buffers.register_request(
                 rid, sampling_config=self._sampler._sampling_config[rid]
             )
 
+    def apply_cached_prefix(
+        self, rid: str, node_name: str, graph_walk: str,
+        inputs, matched_len: int,
+    ) -> None:
+        """Keep the tokens the cache is about to skip, for `plan` to fold in.
+
+        A step declares its tracked tokens from inputs the prefix has already
+        been cut out of, so without these the mask would hold the prompt's tail
+        alone and the penalty would let the model repeat the rest.
+        """
+        del node_name, graph_walk
+        # a walk that prefills from embeddings has no ids to keep
+        if matched_len > 0 and inputs.input_ids is not None:
+            self._cached_prefix[rid] = inputs.input_ids[:matched_len]
+
     def remove_request(self, rid: str):
         self._sampler.remove_request(rid)
         self._penalty_rids.discard(rid)
+        self._cached_prefix.pop(rid, None)
         if self._cg_buffers is not None:
             self._cg_buffers.unregister_request(rid)
 
@@ -180,23 +221,45 @@ class SamplerResource(Resource):
     def clear_preplan(self):
         self._preplanned = False
         self._preplan_cg_sampler = None
+        self._preplan_key = None
+
+    @staticmethod
+    def _plan_key(ctx: StepContext):
+        """What identifies the step a pre-plan was staged for: its padded
+        request rows and the slot they were leased on."""
+        lease = ctx.slot_lease
+        return (tuple(ctx.padded_request_ids), lease.slot if lease is not None else None)
 
     def plan(self, step: SamplerStep, ctx: StepContext):
         self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan and self._penalty_live:
             for rid, tokens in step.prefill_tracked_tokens.items():
                 self._sampler.get_token_mask(rid).add_tokens(tokens)
+            # dropped as they are used: `plan` runs on every step of a resident
+            # request, and these belong to the one prefill that was cut
+            for rid in ctx.request_ids:
+                skipped = self._cached_prefix.pop(rid, None)
+                if skipped is not None:
+                    self._sampler.get_token_mask(rid).add_tokens(skipped)
 
         # A step planned ahead promotes here. Its static config was gathered in
         # the preplan; the per-step state (RNG offset + seen-token mask) is NOT
         # double-buffered — it must reflect the previous step's commit, so
         # gather it inline now, on the default stream, after that commit.
+        # Only the leased step the plan was staged for may promote it: a
+        # different batch reaching the GPU thread first (a new request's
+        # eager prefill while a decode step sits pre-planned) plans inline
+        # and the staged plan is dropped, exactly as `reset_pre_plan_for_batch`
+        # would have done.
         if self._preplanned and not ctx.is_preplan:
-            self._gather_dynamic(ctx, ctx.slot_lease)
-            self._cg_sampler = self._preplan_cg_sampler
-            self._preplan_cg_sampler = None
-            self._preplanned = False
-            return
+            if ctx.slot_lease is None or self._preplan_key != self._plan_key(ctx):
+                self.clear_preplan()
+            else:
+                self._gather_dynamic(ctx, ctx.slot_lease)
+                self._cg_sampler = self._preplan_cg_sampler
+                self._preplan_cg_sampler = None
+                self._preplanned = False
+                return
 
         # invalidated on the inline path here (not in commit, which now runs
         # before output collection); a preplan must leave the in-flight one be
@@ -217,6 +280,7 @@ class SamplerResource(Resource):
         sampler = self._cg_buffers.sampler_for(padded_bs, cg_slot)
         if ctx.is_preplan:
             self._preplan_cg_sampler = sampler
+            self._preplan_key = self._plan_key(ctx)
             self._preplanned = True
         else:
             # fresh inline (capture / no preplan): gather the per-step state too
