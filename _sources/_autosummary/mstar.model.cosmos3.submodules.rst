@@ -9,6 +9,12 @@ mstar.model.cosmos3.submodules
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      native_flow_sigmas
+   
    
 
    
@@ -19,8 +25,11 @@ mstar.model.cosmos3.submodules
    
       Cosmos3AudioDecoderSubmodule
       Cosmos3DiTSubmodule
+      Cosmos3ReasonerSubmodule
+      Cosmos3VAEDecoderARSubmodule
       Cosmos3VAEDecoderSubmodule
       Cosmos3VAEEncoderSubmodule
+      Cosmos3VisionEncoderSubmodule
       GenStepInfo
    
    

@@ -283,6 +283,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4 current active"><a class="reference internal" href="mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
@@ -593,6 +594,9 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_video_psnr"><code class="docutils literal notranslate"><span class="pre">test_dense_fa3_video_psnr()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_image_psnr"><code class="docutils literal notranslate"><span class="pre">test_engine_cache_path_image_psnr()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_video_psnr"><code class="docutils literal notranslate"><span class="pre">test_engine_cache_path_video_psnr()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_dense_matches_paged()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_engine_release_and_psnr()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_matches_reference()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -661,6 +665,15 @@ matches the fused pipeline within PSNR &gt;= 30 (FlashInfer-vs-sdpa precision).<
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_video_psnr" title="mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_video_psnr"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_engine_cache_path_video_psnr</span></code></a>()</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged" title="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_windowed_kv_dense_matches_paged</span></code></a>()</p></td>
+<td><p>kv-mode denoise on the dense FA3 fast path — whose committed prefix mutates every window and is re-gathered on the stream's generation — against the pure paged FlashInfer backend.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr" title="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_windowed_kv_engine_release_and_psnr</span></code></a>()</p></td>
+<td><p>The served kv path on the real paged pool (production batched-CFG denoise + commit): pages of aged-out context are freed on the live request by the commit-time retention with exact token accounting, and window 0 matches the reference within the usual FlashInfer-vs-sdpa precision bar.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference" title="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_windowed_kv_matches_reference</span></code></a>()</p></td>
+<td><p>The served kv path — block-causal denoise over committed context, commit passes, page-floor release — must reproduce the hand-rolled reference bit-tightly on the sdpa resources (sequential guidance, the bit-exact regime), window by window.</p></td>
 </tr>
 </tbody>
 </table>
@@ -804,6 +817,56 @@ the fused pipeline, the same bar the eager engine path meets.</p>
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_windowed_kv_dense_matches_paged</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_windowed_kv_dense_matches_paged"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged" title="Link to this definition">#</a></dt>
+<dd><p>kv-mode denoise on the dense FA3 fast path — whose committed prefix
+mutates every window and is re-gathered on the stream’s generation —
+against the pure paged FlashInfer backend. Same machinery, different
+attention kernel: window 0 must agree at the usual kernel-precision bar;
+later windows compound the kernels’ rounding through the committed
+context (same autoregressive-feedback regime as the reference
+comparison) and get the corruption floor.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_windowed_kv_engine_release_and_psnr</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_windowed_kv_engine_release_and_psnr"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr" title="Link to this definition">#</a></dt>
+<dd><p>The served kv path on the real paged pool (production batched-CFG
+denoise + commit): pages of aged-out context are freed on the live
+request by the commit-time retention with exact token accounting, and
+window 0 matches the reference within the usual FlashInfer-vs-sdpa
+precision bar. Later windows denoise against committed K/V that already
+carries the kernels’ rounding, so their trajectories legitimately diverge
+(autoregressive feedback, not an implementation error — implementation
+fidelity is the bit-exact sdpa check above); they get a corruption
+floor, not the precision bar.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.tests.test_engine_cache.</span></span><span class="sig-name descname"><span class="pre">test_windowed_kv_matches_reference</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/tests/test_engine_cache.html#test_windowed_kv_matches_reference"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference" title="Link to this definition">#</a></dt>
+<dd><p>The served kv path — block-causal denoise over committed context,
+commit passes, page-floor release — must reproduce the hand-rolled
+reference bit-tightly on the sdpa resources (sequential guidance, the
+bit-exact regime), window by window.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -865,6 +928,9 @@ the fused pipeline, the same bar the eager engine path meets.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_dense_fa3_video_psnr"><code class="docutils literal notranslate"><span class="pre">test_dense_fa3_video_psnr()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_image_psnr"><code class="docutils literal notranslate"><span class="pre">test_engine_cache_path_image_psnr()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_engine_cache_path_video_psnr"><code class="docutils literal notranslate"><span class="pre">test_engine_cache_path_video_psnr()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_dense_matches_paged"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_dense_matches_paged()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_engine_release_and_psnr"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_engine_release_and_psnr()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.tests.test_engine_cache.test_windowed_kv_matches_reference"><code class="docutils literal notranslate"><span class="pre">test_windowed_kv_matches_reference()</span></code></a></li>
 </ul>
   </nav></div>
 

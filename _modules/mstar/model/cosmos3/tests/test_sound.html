@@ -636,6 +636,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
@@ -1141,7 +1142,7 @@ window.runMermaid = runMermaid;</script>
           <span class="s2">"guidance_scale"</span><span class="p">:</span> <span class="n">GS</span><span class="p">,</span> <span class="s2">"num_inference_steps"</span><span class="p">:</span> <span class="n">STEPS</span><span class="p">,</span> <span class="s2">"generate_sound"</span><span class="p">:</span> <span class="kc">True</span><span class="p">}</span>
     <span class="n">fwd</span> <span class="o">=</span> <span class="n">CurrentForwardPassInfo</span><span class="p">(</span>
         <span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span> <span class="n">graph_walk</span><span class="o">=</span><span class="s2">"prefill"</span><span class="p">,</span>
-        <span class="n">fwd_index</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">random_seed</span><span class="o">=</span><span class="n">SEED</span><span class="p">,</span> <span class="n">max_tokens</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">sampling_config</span><span class="o">=</span><span class="p">{},</span> <span class="n">step_metadata</span><span class="o">=</span><span class="n">md</span><span class="p">,</span>
+        <span class="n">fwd_index</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">random_seed</span><span class="o">=</span><span class="n">SEED</span><span class="p">,</span> <span class="n">max_tokens</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">step_metadata</span><span class="o">=</span><span class="n">md</span><span class="p">,</span>
     <span class="p">)</span>
     <span class="n">text_inputs</span> <span class="o">=</span> <span class="p">[</span>
         <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="n">cond_ids</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">long</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>

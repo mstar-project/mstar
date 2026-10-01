@@ -25,6 +25,9 @@ mstar.model.cosmos3.tests.test\_engine\_cache
       test_dense_fa3_video_psnr
       test_engine_cache_path_image_psnr
       test_engine_cache_path_video_psnr
+      test_windowed_kv_dense_matches_paged
+      test_windowed_kv_engine_release_and_psnr
+      test_windowed_kv_matches_reference
    
    
 

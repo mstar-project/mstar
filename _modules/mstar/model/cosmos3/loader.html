@@ -636,6 +636,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
@@ -872,14 +873,22 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.cosmos3.loader</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""Weight loading for the Cosmos3 generator backbone.</span>
+<span></span><span class="sd">"""Weight loading for the Cosmos3 generator backbone and the Edge reasoner's</span>
+<span class="sd">vision tower.</span>
 
 <span class="sd">The published checkpoint is the diffusers ``transformer/`` layout: flat</span>
 <span class="sd">``layers.N.*`` keys with unfused attention projections (``to_q/to_k/to_v`` for</span>
 <span class="sd">the understanding pathway, ``add_q_proj/add_k_proj/add_v_proj`` for the</span>
 <span class="sd">generation pathway) and ``_moe_gen``-suffixed GEN MLP/norms. Our backbone</span>
 <span class="sd">module mirrors that layout one-to-one, so loading needs no key remapping and</span>
-<span class="sd">no stacked-parameter fusion — only the unused text ``lm_head`` is dropped.</span>
+<span class="sd">no stacked-parameter fusion. The text ``lm_head`` is dropped for generators</span>
+<span class="sd">that never decode text and loaded for checkpoints served as a reasoner.</span>
+
+<span class="sd">Edge checkpoints add ``vision_encoder/model.safetensors`` (the SigLIP2-style</span>
+<span class="sd">tower under ``model.visual.*`` and the patch-merger projector under</span>
+<span class="sd">``model.projector.*``); ``load_vision_encoder_weights`` streams it into the</span>
+<span class="sd">reasoner's vision module, whose submodules are named ``visual`` and</span>
+<span class="sd">``projector`` so only the ``model.`` prefix is stripped.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
@@ -889,25 +898,41 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
-<span class="c1"># Checkpoint keys deliberately not loaded into the generator backbone. The</span>
-<span class="c1"># text ``lm_head`` exists in the checkpoint (the understanding tower descends</span>
-<span class="c1"># from a text LM) but is never used: generation emits flow velocity via</span>
-<span class="c1"># ``proj_out``, so we do not build or load it.</span>
+<span class="c1"># Checkpoint keys deliberately not loaded into a generator-only backbone. The</span>
+<span class="c1"># text ``lm_head`` exists in every checkpoint (the understanding tower</span>
+<span class="c1"># descends from a text LM) but generation emits flow velocity via</span>
+<span class="c1"># ``proj_out``; only a backbone that also serves the reasoner builds and loads</span>
+<span class="c1"># it (see ``cosmos3_name_remapper``).</span>
 <span class="n">DROP_KEYS</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="s2">"lm_head.weight"</span><span class="p">})</span>
+
+<span class="c1"># The Edge ``vision_encoder/`` shard's key prefix; the reasoner's vision</span>
+<span class="c1"># module keeps the ``visual`` / ``projector`` names below it.</span>
+<span class="n">VISION_ENCODER_PREFIX</span> <span class="o">=</span> <span class="s2">"model."</span>
 
 
 <div class="viewcode-block" id="cosmos3_name_remapper">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.loader.html#mstar.model.cosmos3.loader.cosmos3_name_remapper">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">cosmos3_name_remapper</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">cosmos3_name_remapper</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">with_lm_head</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Map a checkpoint key to a backbone parameter path, or ``None`` to drop.</span>
 
 <span class="sd">    Identity for every key the backbone owns; ``None`` for the intentional</span>
-<span class="sd">    drop-list. Kept explicit so an unexpected checkpoint key surfaces as a</span>
-<span class="sd">    coverage failure rather than being silently ignored.</span>
+<span class="sd">    drop-list (``lm_head.weight`` unless the backbone serves the reasoner).</span>
+<span class="sd">    Kept explicit so an unexpected checkpoint key surfaces as a coverage</span>
+<span class="sd">    failure rather than being silently ignored.</span>
 <span class="sd">    """</span>
-    <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">DROP_KEYS</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">DROP_KEYS</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">with_lm_head</span><span class="p">:</span>
         <span class="k">return</span> <span class="kc">None</span>
     <span class="k">return</span> <span class="n">name</span></div>
+
+
+
+<div class="viewcode-block" id="vision_encoder_name_remapper">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.loader.html#mstar.model.cosmos3.loader.vision_encoder_name_remapper">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">vision_encoder_name_remapper</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``model.visual.*`` / ``model.projector.*`` -&gt; ``visual.*`` / ``projector.*``."""</span>
+    <span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="n">VISION_ENCODER_PREFIX</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">name</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">VISION_ENCODER_PREFIX</span><span class="p">):]</span>
+    <span class="k">return</span> <span class="kc">None</span></div>
 
 
 
@@ -997,7 +1022,11 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">shard</span> <span class="ow">in</span> <span class="n">shard_names</span><span class="p">:</span>
             <span class="k">yield from</span> <span class="n">iter_safetensors_file</span><span class="p">(</span><span class="n">tdir</span> <span class="o">/</span> <span class="n">shard</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
 
-    <span class="n">loaded</span> <span class="o">=</span> <span class="n">load_hf_weights</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">_weights</span><span class="p">(),</span> <span class="n">name_remapper</span><span class="o">=</span><span class="n">cosmos3_name_remapper</span><span class="p">)</span>
+    <span class="n">with_lm_head</span> <span class="o">=</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="s2">"lm_head"</span><span class="p">)</span>
+    <span class="n">loaded</span> <span class="o">=</span> <span class="n">load_hf_weights</span><span class="p">(</span>
+        <span class="n">model</span><span class="p">,</span> <span class="n">_weights</span><span class="p">(),</span>
+        <span class="n">name_remapper</span><span class="o">=</span><span class="k">lambda</span> <span class="n">name</span><span class="p">:</span> <span class="n">cosmos3_name_remapper</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">with_lm_head</span><span class="o">=</span><span class="n">with_lm_head</span><span class="p">),</span>
+    <span class="p">)</span>
 
     <span class="n">expected</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="nb">dict</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">())</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
     <span class="n">missing</span> <span class="o">=</span> <span class="n">expected</span> <span class="o">-</span> <span class="n">loaded</span>
@@ -1007,6 +1036,57 @@ window.runMermaid = runMermaid;</script>
         <span class="k">raise</span> <span class="ne">KeyError</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">"Cosmos3 transformer load left </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">missing</span><span class="p">)</span><span class="si">}</span><span class="s2"> parameter(s) unfilled "</span>
             <span class="sa">f</span><span class="s2">"from </span><span class="si">{</span><span class="n">tdir</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">sample</span><span class="si">}{</span><span class="n">more</span><span class="si">}</span><span class="s2">"</span>
+        <span class="p">)</span>
+    <span class="k">return</span> <span class="n">loaded</span></div>
+
+
+
+<div class="viewcode-block" id="read_vision_encoder_weight_shapes">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.loader.html#mstar.model.cosmos3.loader.read_vision_encoder_weight_shapes">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">read_vision_encoder_weight_shapes</span><span class="p">(</span><span class="n">checkpoint_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""``{remapped key: shape}`` of ``vision_encoder/model.safetensors``, from</span>
+<span class="sd">    the safetensors header only (CPU-side shape verification of the meta-built</span>
+<span class="sd">    vision module)."""</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">safetensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">safe_open</span>
+
+    <span class="n">path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">checkpoint_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s2">"vision_encoder"</span> <span class="o">/</span> <span class="s2">"model.safetensors"</span>
+    <span class="n">shapes</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">with</span> <span class="n">safe_open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">framework</span><span class="o">=</span><span class="s2">"pt"</span><span class="p">)</span> <span class="k">as</span> <span class="n">handle</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">handle</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+            <span class="n">mapped</span> <span class="o">=</span> <span class="n">vision_encoder_name_remapper</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">mapped</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">shapes</span><span class="p">[</span><span class="n">mapped</span><span class="p">]</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">handle</span><span class="o">.</span><span class="n">get_slice</span><span class="p">(</span><span class="n">key</span><span class="p">)</span><span class="o">.</span><span class="n">get_shape</span><span class="p">())</span>
+    <span class="k">return</span> <span class="n">shapes</span></div>
+
+
+
+<div class="viewcode-block" id="load_vision_encoder_weights">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.loader.html#mstar.model.cosmos3.loader.load_vision_encoder_weights">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">load_vision_encoder_weights</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span>
+    <span class="n">checkpoint_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">,</span>
+    <span class="n">device</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"cpu"</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Stream ``vision_encoder/model.safetensors`` into the reasoner's vision</span>
+<span class="sd">    module (tower + projector) and return the loaded keys, raising if any</span>
+<span class="sd">    parameter is left unfilled."""</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.loader</span><span class="w"> </span><span class="kn">import</span> <span class="n">iter_safetensors_file</span><span class="p">,</span> <span class="n">load_hf_weights</span>
+
+    <span class="n">path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">checkpoint_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s2">"vision_encoder"</span> <span class="o">/</span> <span class="s2">"model.safetensors"</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+        <span class="k">raise</span> <span class="ne">FileNotFoundError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"no vision encoder weights under </span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+    <span class="n">loaded</span> <span class="o">=</span> <span class="n">load_hf_weights</span><span class="p">(</span>
+        <span class="n">model</span><span class="p">,</span> <span class="n">iter_safetensors_file</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="n">name_remapper</span><span class="o">=</span><span class="n">vision_encoder_name_remapper</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="n">expected</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="nb">dict</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">())</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+    <span class="n">missing</span> <span class="o">=</span> <span class="n">expected</span> <span class="o">-</span> <span class="n">loaded</span>
+    <span class="k">if</span> <span class="n">missing</span><span class="p">:</span>
+        <span class="n">sample</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">missing</span><span class="p">)[:</span><span class="mi">10</span><span class="p">]</span>
+        <span class="n">more</span> <span class="o">=</span> <span class="s2">"…"</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">missing</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">10</span> <span class="k">else</span> <span class="s2">""</span>
+        <span class="k">raise</span> <span class="ne">KeyError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"Cosmos3 vision encoder load left </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">missing</span><span class="p">)</span><span class="si">}</span><span class="s2"> parameter(s) unfilled "</span>
+            <span class="sa">f</span><span class="s2">"from </span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">sample</span><span class="si">}{</span><span class="n">more</span><span class="si">}</span><span class="s2">"</span>
         <span class="p">)</span>
     <span class="k">return</span> <span class="n">loaded</span></div>
 

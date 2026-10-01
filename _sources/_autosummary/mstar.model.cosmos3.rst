@@ -32,6 +32,7 @@ mstar.model.cosmos3
    constants
    cosmos3_model
    loader
+   sessions
    submodules
    tests
 

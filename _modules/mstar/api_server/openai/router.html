@@ -636,6 +636,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
@@ -1032,6 +1033,12 @@ window.runMermaid = runMermaid;</script>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
         <span class="n">default_status</span> <span class="o">=</span> <span class="mi">400</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span> <span class="k">else</span> <span class="mi">500</span>
         <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="n">default_status</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">request</span><span class="o">.</span><span class="n">model_extra</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"stream_video"</span><span class="p">):</span>
+        <span class="c1"># A windowed request delivering each window as it lands: NDJSON lines</span>
+        <span class="c1"># (see serving_videos._stream_ndjson) instead of one JSON body.</span>
+        <span class="k">return</span> <span class="n">StreamingResponse</span><span class="p">(</span>
+            <span class="n">result</span><span class="p">,</span> <span class="n">media_type</span><span class="o">=</span><span class="s2">"application/x-ndjson"</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">}</span>
+        <span class="p">)</span>
     <span class="k">return</span> <span class="n">JSONResponse</span><span class="p">(</span><span class="n">result</span><span class="p">)</span></div>
 
 

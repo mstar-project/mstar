@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.model.cosmos3.submodules" href="mstar.model.cosmos3.submodules.html" />
+    <link rel="next" title="mstar.model.cosmos3.sessions" href="mstar.model.cosmos3.sessions.html" />
     <link rel="prev" title="mstar.model.cosmos3.constants" href="mstar.model.cosmos3.constants.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -283,6 +283,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4 current active"><a class="current reference internal" href="#">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
@@ -583,8 +584,11 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.cosmos3_name_remapper"><code class="docutils literal notranslate"><span class="pre">cosmos3_name_remapper()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.load_transformer_weights"><code class="docutils literal notranslate"><span class="pre">load_transformer_weights()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.load_vision_encoder_weights"><code class="docutils literal notranslate"><span class="pre">load_vision_encoder_weights()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.read_transformer_weight_keys"><code class="docutils literal notranslate"><span class="pre">read_transformer_weight_keys()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.read_transformer_weight_shapes"><code class="docutils literal notranslate"><span class="pre">read_transformer_weight_shapes()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.read_vision_encoder_weight_shapes"><code class="docutils literal notranslate"><span class="pre">read_vision_encoder_weight_shapes()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.vision_encoder_name_remapper"><code class="docutils literal notranslate"><span class="pre">vision_encoder_name_remapper()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -598,41 +602,61 @@
                   
   <section id="module-mstar.model.cosmos3.loader">
 <span id="mstar-model-cosmos3-loader"></span><h1>mstar.model.cosmos3.loader<a class="headerlink" href="#module-mstar.model.cosmos3.loader" title="Link to this heading">#</a></h1>
-<p>Weight loading for the Cosmos3 generator backbone.</p>
+<p>Weight loading for the Cosmos3 generator backbone and the Edge reasoner’s
+vision tower.</p>
 <p>The published checkpoint is the diffusers <code class="docutils literal notranslate"><span class="pre">transformer/</span></code> layout: flat
 <code class="docutils literal notranslate"><span class="pre">layers.N.*</span></code> keys with unfused attention projections (<code class="docutils literal notranslate"><span class="pre">to_q/to_k/to_v</span></code> for
 the understanding pathway, <code class="docutils literal notranslate"><span class="pre">add_q_proj/add_k_proj/add_v_proj</span></code> for the
 generation pathway) and <code class="docutils literal notranslate"><span class="pre">_moe_gen</span></code>-suffixed GEN MLP/norms. Our backbone
 module mirrors that layout one-to-one, so loading needs no key remapping and
-no stacked-parameter fusion — only the unused text <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> is dropped.</p>
+no stacked-parameter fusion. The text <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> is dropped for generators
+that never decode text and loaded for checkpoints served as a reasoner.</p>
+<p>Edge checkpoints add <code class="docutils literal notranslate"><span class="pre">vision_encoder/model.safetensors</span></code> (the SigLIP2-style
+tower under <code class="docutils literal notranslate"><span class="pre">model.visual.*</span></code> and the patch-merger projector under
+<code class="docutils literal notranslate"><span class="pre">model.projector.*</span></code>); <code class="docutils literal notranslate"><span class="pre">load_vision_encoder_weights</span></code> streams it into the
+reasoner’s vision module, whose submodules are named <code class="docutils literal notranslate"><span class="pre">visual</span></code> and
+<code class="docutils literal notranslate"><span class="pre">projector</span></code> so only the <code class="docutils literal notranslate"><span class="pre">model.</span></code> prefix is stripped.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.loader.cosmos3_name_remapper" title="mstar.model.cosmos3.loader.cosmos3_name_remapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">cosmos3_name_remapper</span></code></a>(name)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.loader.cosmos3_name_remapper" title="mstar.model.cosmos3.loader.cosmos3_name_remapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">cosmos3_name_remapper</span></code></a>(name[, with_lm_head])</p></td>
 <td><p>Map a checkpoint key to a backbone parameter path, or <code class="docutils literal notranslate"><span class="pre">None</span></code> to drop.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.loader.load_transformer_weights" title="mstar.model.cosmos3.loader.load_transformer_weights"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_transformer_weights</span></code></a>(model, checkpoint_dir)</p></td>
 <td><p>Stream the <code class="docutils literal notranslate"><span class="pre">transformer/</span></code> shards into <code class="docutils literal notranslate"><span class="pre">model</span></code> and return loaded keys.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.loader.read_transformer_weight_keys" title="mstar.model.cosmos3.loader.read_transformer_weight_keys"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_transformer_weight_keys</span></code></a>(checkpoint_dir)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.loader.load_vision_encoder_weights" title="mstar.model.cosmos3.loader.load_vision_encoder_weights"><code class="xref py py-obj docutils literal notranslate"><span class="pre">load_vision_encoder_weights</span></code></a>(model, ...[, device])</p></td>
+<td><p>Stream <code class="docutils literal notranslate"><span class="pre">vision_encoder/model.safetensors</span></code> into the reasoner's vision module (tower + projector) and return the loaded keys, raising if any parameter is left unfilled.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.loader.read_transformer_weight_keys" title="mstar.model.cosmos3.loader.read_transformer_weight_keys"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_transformer_weight_keys</span></code></a>(checkpoint_dir)</p></td>
 <td><p>Return every tensor key declared by the <code class="docutils literal notranslate"><span class="pre">transformer/</span></code> shard index.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.loader.read_transformer_weight_shapes" title="mstar.model.cosmos3.loader.read_transformer_weight_shapes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_transformer_weight_shapes</span></code></a>(checkpoint_dir)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.loader.read_transformer_weight_shapes" title="mstar.model.cosmos3.loader.read_transformer_weight_shapes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_transformer_weight_shapes</span></code></a>(checkpoint_dir)</p></td>
 <td><p>Return <code class="docutils literal notranslate"><span class="pre">{key:</span> <span class="pre">shape}</span></code> for every <code class="docutils literal notranslate"><span class="pre">transformer/</span></code> tensor by reading only the safetensors headers — no tensor data is materialized.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.loader.read_vision_encoder_weight_shapes" title="mstar.model.cosmos3.loader.read_vision_encoder_weight_shapes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_vision_encoder_weight_shapes</span></code></a>(checkpoint_dir)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">{remapped</span> <span class="pre">key:</span> <span class="pre">shape}</span></code> of <code class="docutils literal notranslate"><span class="pre">vision_encoder/model.safetensors</span></code>, from the safetensors header only (CPU-side shape verification of the meta-built vision module).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.loader.vision_encoder_name_remapper" title="mstar.model.cosmos3.loader.vision_encoder_name_remapper"><code class="xref py py-obj docutils literal notranslate"><span class="pre">vision_encoder_name_remapper</span></code></a>(name)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">model.visual.*</span></code> / <code class="docutils literal notranslate"><span class="pre">model.projector.*</span></code> -&gt; <code class="docutils literal notranslate"><span class="pre">visual.*</span></code> / <code class="docutils literal notranslate"><span class="pre">projector.*</span></code>.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.loader.cosmos3_name_remapper">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.loader.</span></span><span class="sig-name descname"><span class="pre">cosmos3_name_remapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/loader.html#cosmos3_name_remapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.loader.cosmos3_name_remapper" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.loader.</span></span><span class="sig-name descname"><span class="pre">cosmos3_name_remapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">with_lm_head</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/loader.html#cosmos3_name_remapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.loader.cosmos3_name_remapper" title="Link to this definition">#</a></dt>
 <dd><p>Map a checkpoint key to a backbone parameter path, or <code class="docutils literal notranslate"><span class="pre">None</span></code> to drop.</p>
 <p>Identity for every key the backbone owns; <code class="docutils literal notranslate"><span class="pre">None</span></code> for the intentional
-drop-list. Kept explicit so an unexpected checkpoint key surfaces as a
-coverage failure rather than being silently ignored.</p>
+drop-list (<code class="docutils literal notranslate"><span class="pre">lm_head.weight</span></code> unless the backbone serves the reasoner).
+Kept explicit so an unexpected checkpoint key surfaces as a coverage
+failure rather than being silently ignored.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>with_lm_head</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
@@ -650,6 +674,26 @@ index (the generic iterator only knows the <code class="docutils literal notrans
 stacked-parameter rules: the checkpoint’s projections are unfused and match
 the backbone parameter names directly. Raises if any backbone parameter is
 left unfilled — the completeness guarantee bagel’s loader also enforces.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>model</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module" title="(in PyTorch v2.14)"><em>Module</em></a>)</p></li>
+<li><p><strong>checkpoint_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/pathlib.html#pathlib.Path" title="(in Python v3.12)"><em>Path</em></a>)</p></li>
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.loader.load_vision_encoder_weights">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.loader.</span></span><span class="sig-name descname"><span class="pre">load_vision_encoder_weights</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">checkpoint_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'cpu'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/loader.html#load_vision_encoder_weights"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.loader.load_vision_encoder_weights" title="Link to this definition">#</a></dt>
+<dd><p>Stream <code class="docutils literal notranslate"><span class="pre">vision_encoder/model.safetensors</span></code> into the reasoner’s vision
+module (tower + projector) and return the loaded keys, raising if any
+parameter is left unfilled.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -694,6 +738,36 @@ shape verification of the meta-built backbone against the checkpoint.</p>
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.loader.read_vision_encoder_weight_shapes">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.loader.</span></span><span class="sig-name descname"><span class="pre">read_vision_encoder_weight_shapes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">checkpoint_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/loader.html#read_vision_encoder_weight_shapes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.loader.read_vision_encoder_weight_shapes" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">{remapped</span> <span class="pre">key:</span> <span class="pre">shape}</span></code> of <code class="docutils literal notranslate"><span class="pre">vision_encoder/model.safetensors</span></code>, from
+the safetensors header only (CPU-side shape verification of the meta-built
+vision module).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>checkpoint_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/pathlib.html#pathlib.Path" title="(in Python v3.12)"><em>Path</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, …]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.cosmos3.loader.vision_encoder_name_remapper">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.loader.</span></span><span class="sig-name descname"><span class="pre">vision_encoder_name_remapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/loader.html#vision_encoder_name_remapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.loader.vision_encoder_name_remapper" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">model.visual.*</span></code> / <code class="docutils literal notranslate"><span class="pre">model.projector.*</span></code> -&gt; <code class="docutils literal notranslate"><span class="pre">visual.*</span></code> / <code class="docutils literal notranslate"><span class="pre">projector.*</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -717,11 +791,11 @@ shape verification of the meta-built backbone against the checkpoint.</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.model.cosmos3.submodules.html"
+       href="mstar.model.cosmos3.sessions.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.model.cosmos3.submodules</p>
+        <p class="prev-next-title">mstar.model.cosmos3.sessions</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -745,8 +819,11 @@ shape verification of the meta-built backbone against the checkpoint.</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.cosmos3_name_remapper"><code class="docutils literal notranslate"><span class="pre">cosmos3_name_remapper()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.load_transformer_weights"><code class="docutils literal notranslate"><span class="pre">load_transformer_weights()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.load_vision_encoder_weights"><code class="docutils literal notranslate"><span class="pre">load_vision_encoder_weights()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.read_transformer_weight_keys"><code class="docutils literal notranslate"><span class="pre">read_transformer_weight_keys()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.read_transformer_weight_shapes"><code class="docutils literal notranslate"><span class="pre">read_transformer_weight_shapes()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.read_vision_encoder_weight_shapes"><code class="docutils literal notranslate"><span class="pre">read_vision_encoder_weight_shapes()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.cosmos3.loader.vision_encoder_name_remapper"><code class="docutils literal notranslate"><span class="pre">vision_encoder_name_remapper()</span></code></a></li>
 </ul>
   </nav></div>
 

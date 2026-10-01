@@ -636,6 +636,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
@@ -1261,6 +1262,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">vae_scale_factor_temporal</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
     <span class="n">device</span><span class="p">,</span>
     <span class="n">noisy_frames</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">start_frame_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""``latent_shape`` is the vision latent tensor shape ``[B, C, T, H, W]``.</span>
 
@@ -1268,7 +1270,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    are clean conditioning context. When ``None`` it defaults to frame 0 clean</span>
 <span class="sd">    if ``has_image_condition`` else all frames noisy — i.e. the t2i/t2v/i2v</span>
 <span class="sd">    layouts. Action modes pass an explicit list (e.g. ``[]`` for</span>
-<span class="sd">    inverse-dynamics, where the whole video is conditioning)."""</span>
+<span class="sd">    inverse-dynamics, where the whole video is conditioning).</span>
+<span class="sd">    ``start_frame_offset`` shifts the temporal mRoPE axis so the segment's</span>
+<span class="sd">    frames sit at absolute latent frames ``start_frame_offset ..`` — a window</span>
+<span class="sd">    of a longer video positions itself exactly where the full clip would."""</span>
     <span class="n">p</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">latent_patch_size</span>
     <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">latent_t</span><span class="p">,</span> <span class="n">latent_h</span><span class="p">,</span> <span class="n">latent_w</span> <span class="o">=</span> <span class="n">latent_shape</span>
     <span class="n">patch_h</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">latent_h</span> <span class="o">/</span> <span class="n">p</span><span class="p">)</span>
@@ -1298,6 +1303,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">fps</span><span class="o">=</span><span class="n">effective_fps</span><span class="p">,</span>
         <span class="n">base_fps</span><span class="o">=</span><span class="nb">float</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">base_fps</span><span class="p">),</span>
         <span class="n">temporal_compression_factor</span><span class="o">=</span><span class="n">vae_scale_factor_temporal</span><span class="p">,</span>
+        <span class="n">start_frame_offset</span><span class="o">=</span><span class="n">start_frame_offset</span><span class="p">,</span>
     <span class="p">)</span>
 
     <span class="k">return</span> <span class="p">{</span>
@@ -1361,6 +1367,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">has_image_condition</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="n">sound_latent_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="n">noisy_frames</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="n">start_frame_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""Assemble the per-prompt static transformer inputs for image/video</span>
 <span class="sd">    generation. ``latent_shape`` is ``[B, C, T, H, W]`` (``T == 1`` for images;</span>
@@ -1384,6 +1391,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">vae_scale_factor_temporal</span><span class="o">=</span><span class="n">vae_scale_factor_temporal</span><span class="p">,</span>
         <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
         <span class="n">noisy_frames</span><span class="o">=</span><span class="n">noisy_frames</span><span class="p">,</span>
+        <span class="n">start_frame_offset</span><span class="o">=</span><span class="n">start_frame_offset</span><span class="p">,</span>
     <span class="p">)</span>
     <span class="n">parts</span> <span class="o">=</span> <span class="p">[</span><span class="n">text</span><span class="p">[</span><span class="s2">"text_mrope_ids"</span><span class="p">],</span> <span class="n">vision</span><span class="p">[</span><span class="s2">"vision_mrope_ids"</span><span class="p">]]</span>
     <span class="n">static</span> <span class="o">=</span> <span class="p">{</span><span class="o">**</span><span class="n">text</span><span class="p">,</span> <span class="o">**</span><span class="n">vision</span><span class="p">}</span>

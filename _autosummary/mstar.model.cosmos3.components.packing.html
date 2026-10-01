@@ -50,8 +50,8 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.model.cosmos3.components.sound_tokenizer" href="mstar.model.cosmos3.components.sound_tokenizer.html" />
-    <link rel="prev" title="mstar.model.cosmos3.components" href="mstar.model.cosmos3.components.html" />
+    <link rel="next" title="mstar.model.cosmos3.components.reasoner" href="mstar.model.cosmos3.components.reasoner.html" />
+    <link rel="prev" title="mstar.model.cosmos3.components.conditioning" href="mstar.model.cosmos3.components.conditioning.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -283,6 +283,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
@@ -755,7 +756,7 @@ temporal offset with the vision band. Every sound frame is noisy/predicted
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.components.packing.build_static_inputs">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.components.packing.</span></span><span class="sig-name descname"><span class="pre">build_static_inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">latent_shape</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vae_scale_factor_temporal</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">has_image_condition</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sound_latent_frames</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">noisy_frames</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/components/packing.html#build_static_inputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.components.packing.build_static_inputs" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.components.packing.</span></span><span class="sig-name descname"><span class="pre">build_static_inputs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">latent_shape</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vae_scale_factor_temporal</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">has_image_condition</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sound_latent_frames</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">noisy_frames</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start_frame_offset</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/components/packing.html#build_static_inputs"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.components.packing.build_static_inputs" title="Link to this definition">#</a></dt>
 <dd><p>Assemble the per-prompt static transformer inputs for image/video
 generation. <code class="docutils literal notranslate"><span class="pre">latent_shape</span></code> is <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">C,</span> <span class="pre">T,</span> <span class="pre">H,</span> <span class="pre">W]</span></code> (<code class="docutils literal notranslate"><span class="pre">T</span> <span class="pre">==</span> <span class="pre">1</span></code> for images;
 <code class="docutils literal notranslate"><span class="pre">T</span> <span class="pre">==</span> <span class="pre">1</span> <span class="pre">+</span> <span class="pre">(num_frames</span> <span class="pre">-</span> <span class="pre">1)</span> <span class="pre">//</span> <span class="pre">temporal_factor</span></code> for video). When
@@ -777,6 +778,7 @@ band after the vision tokens (the generation block becomes
 <li><p><strong>has_image_condition</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 <li><p><strong>sound_latent_frames</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>noisy_frames</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>start_frame_offset</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -819,13 +821,16 @@ band after the vision tokens (the generation block becomes
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.components.packing.build_vision_segment">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.components.packing.</span></span><span class="sig-name descname"><span class="pre">build_vision_segment</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">latent_shape</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">has_image_condition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mrope_offset</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vision_fps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">curr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vae_scale_factor_temporal</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">noisy_frames</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/components/packing.html#build_vision_segment"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.components.packing.build_vision_segment" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.components.packing.</span></span><span class="sig-name descname"><span class="pre">build_vision_segment</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">latent_shape</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">has_image_condition</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mrope_offset</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vision_fps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">curr</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vae_scale_factor_temporal</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">noisy_frames</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start_frame_offset</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/components/packing.html#build_vision_segment"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.components.packing.build_vision_segment" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">latent_shape</span></code> is the vision latent tensor shape <code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">C,</span> <span class="pre">T,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">noisy_frames</span></code> lists the latent frames that are noisy (predicted); the rest
 are clean conditioning context. When <code class="docutils literal notranslate"><span class="pre">None</span></code> it defaults to frame 0 clean
 if <code class="docutils literal notranslate"><span class="pre">has_image_condition</span></code> else all frames noisy — i.e. the t2i/t2v/i2v
 layouts. Action modes pass an explicit list (e.g. <code class="docutils literal notranslate"><span class="pre">[]</span></code> for
-inverse-dynamics, where the whole video is conditioning).</p>
+inverse-dynamics, where the whole video is conditioning).
+<code class="docutils literal notranslate"><span class="pre">start_frame_offset</span></code> shifts the temporal mRoPE axis so the segment’s
+frames sit at absolute latent frames <code class="docutils literal notranslate"><span class="pre">start_frame_offset</span> <span class="pre">..</span></code> — a window
+of a longer video positions itself exactly where the full clip would.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -836,6 +841,7 @@ inverse-dynamics, where the whole video is conditioning).</p>
 <li><p><strong>curr</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>vae_scale_factor_temporal</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>noisy_frames</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>start_frame_offset</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1006,20 +1012,20 @@ truncation contract); <code class="docutils literal notranslate"><span class="pr
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.model.cosmos3.components.html"
+       href="mstar.model.cosmos3.components.conditioning.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.model.cosmos3.components</p>
+        <p class="prev-next-title">mstar.model.cosmos3.components.conditioning</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.model.cosmos3.components.sound_tokenizer.html"
+       href="mstar.model.cosmos3.components.reasoner.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.model.cosmos3.components.sound_tokenizer</p>
+        <p class="prev-next-title">mstar.model.cosmos3.components.reasoner</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>

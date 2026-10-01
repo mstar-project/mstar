@@ -636,6 +636,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
@@ -1428,6 +1429,44 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="Cosmos3EdgeAdapter">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Cosmos3EdgeAdapter">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3EdgeAdapter</span><span class="p">(</span><span class="n">Cosmos3Adapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Cosmos3-Edge: the generator surfaces of :class:`Cosmos3Adapter` plus</span>
+<span class="sd">    chat (the reasoner: the understanding tower served as a VLM).</span>
+
+<span class="sd">    Chat requests take the OpenAI ``messages`` layout with image / video</span>
+<span class="sd">    attachments in order; ``temperature`` / ``top_p`` / ``max_tokens`` map to</span>
+<span class="sd">    the reasoner's sampler, and ``extra_body`` knobs (``enable_thinking``,</span>
+<span class="sd">    ``top_k``, ``repetition_penalty``, ``video_fps`` / ``video_num_frames``)</span>
+<span class="sd">    pass through.</span>
+<span class="sd">    """</span>
+
+    <span class="n">supports_chat</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="Cosmos3EdgeAdapter.chat_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Cosmos3EdgeAdapter.chat_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">chat_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">ChatCompletionRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
+        <span class="n">text</span><span class="p">,</span> <span class="n">file_paths</span><span class="p">,</span> <span class="n">in_mods</span><span class="p">,</span> <span class="n">parts</span> <span class="o">=</span> <span class="n">flatten_messages</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">messages</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
+        <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+        <span class="n">_apply_sampling</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">mk</span><span class="p">)</span>
+        <span class="c1"># ``chat_template_kwargs`` is how the vLLM recipe toggles thinking;</span>
+        <span class="c1"># accept it alongside a flat ``enable_thinking``.</span>
+        <span class="n">template_kwargs</span> <span class="o">=</span> <span class="n">mk</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"chat_template_kwargs"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="s2">"enable_thinking"</span> <span class="ow">in</span> <span class="n">template_kwargs</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"enable_thinking"</span><span class="p">,</span> <span class="nb">bool</span><span class="p">(</span><span class="n">template_kwargs</span><span class="p">[</span><span class="s2">"enable_thinking"</span><span class="p">]))</span>
+        <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">text</span><span class="p">,</span>
+            <span class="n">file_paths</span><span class="o">=</span><span class="n">file_paths</span> <span class="ow">or</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="n">in_mods</span><span class="p">,</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+            <span class="n">prompt_parts</span><span class="o">=</span><span class="n">parts</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="Wan22Adapter">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Wan22Adapter">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Wan22Adapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
@@ -1497,7 +1536,11 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"kokoro"</span><span class="p">:</span> <span class="n">KokoroAdapter</span><span class="p">(),</span>
     <span class="s2">"cosmos3"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
     <span class="s2">"cosmos3_droid"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
+    <span class="s2">"cosmos3_edge"</span><span class="p">:</span> <span class="n">Cosmos3EdgeAdapter</span><span class="p">(),</span>
+    <span class="s2">"cosmos3_edge_droid"</span><span class="p">:</span> <span class="n">Cosmos3EdgeAdapter</span><span class="p">(),</span>
     <span class="s2">"cosmos3_super"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
+    <span class="s2">"cosmos3_super_i2v_4step"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
+    <span class="s2">"cosmos3_super_t2i_4step"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
     <span class="s2">"wan22"</span><span class="p">:</span> <span class="n">Wan22Adapter</span><span class="p">(),</span>
 <span class="p">}</span>
 

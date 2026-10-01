@@ -279,6 +279,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4 current active"><a class="current reference internal" href="#">mstar.model.cosmos3.tests</a></li>
 </ul>
@@ -585,13 +586,16 @@
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.cosmos3.tests.pipeline.html#module-mstar.model.cosmos3.tests.pipeline" title="mstar.model.cosmos3.tests.pipeline"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pipeline</span></code></a></p></td>
-<td><p>Fused generation pipeline for Cosmos3-Nano (text/image-to-image/video).</p></td>
+<td><p>Fused generation pipeline for Cosmos3 (text/image-to-image/video).</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.model.cosmos3.tests.test_engine_cache.html#module-mstar.model.cosmos3.tests.test_engine_cache" title="mstar.model.cosmos3.tests.test_engine_cache"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_engine_cache</span></code></a></p></td>
 <td><p>GPU parity for the cache-once engine path of the Cosmos3 generator.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.cosmos3.tests.test_sound.html#module-mstar.model.cosmos3.tests.test_sound" title="mstar.model.cosmos3.tests.test_sound"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_sound</span></code></a></p></td>
 <td><p>Tests for the Cosmos3 opt-in sound generation path.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.cosmos3.tests.test_video_capture.html#module-mstar.model.cosmos3.tests.test_video_capture" title="mstar.model.cosmos3.tests.test_video_capture"><code class="xref py py-obj docutils literal notranslate"><span class="pre">test_video_capture</span></code></a></p></td>
+<td><p>CPU checks for the video / windowed denoise CUDA-graph capture: one graph per latent shape built with every frame declared noisy, the request's clean/noisy layout carried as a per-token mask input.</p></td>
 </tr>
 </tbody>
 </table>

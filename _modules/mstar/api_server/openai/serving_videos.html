@@ -636,6 +636,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
@@ -877,6 +878,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
@@ -891,15 +893,18 @@ window.runMermaid = runMermaid;</script>
     <span class="n">args</span> <span class="o">=</span> <span class="n">adapter</span><span class="o">.</span><span class="n">video_to_request</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span>
     <span class="n">request_id</span> <span class="o">=</span> <span class="n">rid</span><span class="p">(</span><span class="s2">"vid"</span><span class="p">)</span>
 
+    <span class="n">stream</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"stream_video"</span><span class="p">))</span>
     <span class="n">api</span><span class="o">.</span><span class="n">submit_request</span><span class="p">(</span>
         <span class="n">text</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
         <span class="n">file_paths</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">,</span>
         <span class="n">input_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">input_modalities</span><span class="p">,</span>
         <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"video"</span><span class="p">],</span>
         <span class="n">model_kwargs</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="p">,</span>
-        <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">streaming</span><span class="o">=</span><span class="n">stream</span><span class="p">,</span>
         <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span>
     <span class="p">)</span>
+    <span class="k">if</span> <span class="n">stream</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">_stream_ndjson</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">)</span>
 
     <span class="n">chunks</span> <span class="o">=</span> <span class="k">await</span> <span class="n">api</span><span class="o">.</span><span class="n">collect_results</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
     <span class="c1"># Each video chunk is an mp4 (H.264); return it base64-encoded, mirroring the</span>
@@ -929,6 +934,36 @@ window.runMermaid = runMermaid;</script>
         <span class="n">data</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"b64_json"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">video</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">),</span> <span class="s2">"url"</span><span class="p">:</span> <span class="kc">None</span><span class="p">})</span>
     <span class="k">return</span> <span class="p">{</span><span class="s2">"created"</span><span class="p">:</span> <span class="n">now</span><span class="p">(),</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">data</span><span class="p">}</span></div>
 
+
+
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_stream_ndjson</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">request_id</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Yield one NDJSON line per result chunk for a ``stream_video`` request.</span>
+
+<span class="sd">    A windowed request emits each window's mp4 as its own ``video`` chunk;</span>
+<span class="sd">    the lines use the ``/generate`` wire shape (modality / base64 data /</span>
+<span class="sd">    metadata) with a running ``index``, and the stream is closed by a ``done``</span>
+<span class="sd">    line carrying the chunk count. Failures after the stream is open travel</span>
+<span class="sd">    in-band as a terminal ``error`` line (the HTTP status is committed), in</span>
+<span class="sd">    which case no ``done`` line follows.</span>
+<span class="sd">    """</span>
+    <span class="n">index</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">failed</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="k">async</span> <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">api</span><span class="o">.</span><span class="n">iter_result_chunks</span><span class="p">(</span><span class="n">request_id</span><span class="p">):</span>
+        <span class="n">metadata</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">metadata</span> <span class="ow">or</span> <span class="p">{})</span>
+        <span class="k">if</span> <span class="n">chunk</span><span class="o">.</span><span class="n">modality</span> <span class="o">==</span> <span class="s2">"error"</span><span class="p">:</span>
+            <span class="n">failed</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">metadata</span><span class="p">[</span><span class="s2">"index"</span><span class="p">]</span> <span class="o">=</span> <span class="n">index</span>
+            <span class="n">index</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="k">yield</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">({</span>
+            <span class="s2">"modality"</span><span class="p">:</span> <span class="n">chunk</span><span class="o">.</span><span class="n">modality</span><span class="p">,</span>
+            <span class="s2">"data"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">),</span>
+            <span class="s2">"metadata"</span><span class="p">:</span> <span class="n">metadata</span><span class="p">,</span>
+        <span class="p">})</span> <span class="o">+</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">failed</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span>
+            <span class="p">{</span><span class="s2">"modality"</span><span class="p">:</span> <span class="s2">"done"</span><span class="p">,</span> <span class="s2">"data"</span><span class="p">:</span> <span class="s2">""</span><span class="p">,</span> <span class="s2">"metadata"</span><span class="p">:</span> <span class="p">{</span><span class="s2">"chunks"</span><span class="p">:</span> <span class="n">index</span><span class="p">}}</span>
+        <span class="p">)</span> <span class="o">+</span> <span class="s2">"</span><span class="se">\n</span><span class="s2">"</span>
 </pre></div>
 
                 </article>

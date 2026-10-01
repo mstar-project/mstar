@@ -636,6 +636,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html">mstar.model.cosmos3.submodules</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
 </ul>
@@ -875,17 +876,30 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="sd">"""Configuration for the Cosmos3 omni generator.</span>
 
 <span class="sd">A single ``Cosmos3Config`` describes every Cosmos3 checkpoint (Nano, Super,</span>
-<span class="sd">Policy-DROID, and the Super task variants). The checkpoints share one</span>
-<span class="sd">architecture; they differ only in the transformer dimensions</span>
-<span class="sd">(``num_hidden_layers`` / ``hidden_size`` / ``num_attention_heads`` /</span>
-<span class="sd">``intermediate_size``) and two capability flags (``sound_gen``,</span>
-<span class="sd">``action_gen``).</span>
+<span class="sd">Edge, the Policy-DROID fine-tunes and the Super task variants). The</span>
+<span class="sd">checkpoints share one dual-pathway MoT architecture; they differ in the</span>
+<span class="sd">transformer dimensions (``num_hidden_layers`` / ``hidden_size`` /</span>
+<span class="sd">``num_attention_heads`` / ``intermediate_size``), the two capability flags</span>
+<span class="sd">(``sound_gen``, ``action_gen``) and, for Edge, the backbone family: a dense</span>
+<span class="sd">Nemotron text tower (``hidden_act="relu2"``, Nemotron RMSNorm ordering, no</span>
+<span class="sd">text QK-norm, a ``k_norm_und_for_gen`` on the understanding K the generation</span>
+<span class="sd">tower reads) instead of Nano's Qwen3-VL one.</span>
+
+<span class="sd">Edge checkpoints also carry the reasoner (the understanding tower served as a</span>
+<span class="sd">VLM): a top-level ``config.json`` with the SigLIP2-style vision tower and</span>
+<span class="sd">patch-merger projector, plus ``vision_encoder/model.safetensors``. That is</span>
+<span class="sd">parsed into ``Cosmos3Config.reasoner`` (``None`` for checkpoints without it).</span>
 
 <span class="sd">Values load from a local HF checkpoint directory laid out the diffusers way::</span>
 
 <span class="sd">    &lt;ckpt&gt;/transformer/config.json   -&gt; the DiT (dual-pathway MoT) dimensions</span>
 <span class="sd">    &lt;ckpt&gt;/vae/config.json           -&gt; AutoencoderKLWan factors + latent stats</span>
-<span class="sd">    &lt;ckpt&gt;/scheduler/scheduler_config.json -&gt; UniPC flow scheduler settings</span>
+<span class="sd">    &lt;ckpt&gt;/scheduler/scheduler_config.json -&gt; UniPC flow scheduler settings (or the</span>
+<span class="sd">                                        distilled checkpoints' FlowMatchEuler SDE sampler)</span>
+<span class="sd">    &lt;ckpt&gt;/model_index.json          -&gt; pipeline flags (native flow schedule)</span>
+<span class="sd">    &lt;ckpt&gt;/modular_model_index.json  -&gt; distilled sampler (is_distilled, distilled_sigmas)</span>
+<span class="sd">    &lt;ckpt&gt;/config.json               -&gt; reasoner (vision tower + projector), Edge only</span>
+<span class="sd">    &lt;ckpt&gt;/preprocessor_config.json, video_preprocessor_config.json -&gt; reasoner media processors</span>
 
 <span class="sd">Dataclass defaults mirror Cosmos3-Nano so a bare ``Cosmos3Config()`` is a</span>
 <span class="sd">valid Nano config without any file present.</span>
@@ -937,12 +951,16 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3SchedulerConfig">[docs]</a>
 <span class="nd">@dataclass</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3SchedulerConfig</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""UniPC multistep flow scheduler settings (``scheduler/scheduler_config``).</span>
+<span class="w">    </span><span class="sd">"""Flow scheduler settings (``scheduler/scheduler_config``).</span>
 
-<span class="sd">    The denoise loop drives a diffusers ``UniPCMultistepScheduler`` configured</span>
-<span class="sd">    from these fields; we do not re-implement the bh2 corrector.</span>
+<span class="sd">    The denoise loop drives a diffusers scheduler configured from these fields</span>
+<span class="sd">    — ``UniPCMultistepScheduler`` for the base checkpoints (we do not</span>
+<span class="sd">    re-implement the bh2 corrector), ``FlowMatchEulerDiscreteScheduler`` with</span>
+<span class="sd">    stochastic (SDE) steps over the fixed ``distilled_sigmas`` for the 4-step</span>
+<span class="sd">    distilled ones; ``scheduler_class`` records which.</span>
 <span class="sd">    """</span>
 
+    <span class="n">scheduler_class</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"UniPCMultistepScheduler"</span>
     <span class="n">scheduler_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"unipc"</span>
     <span class="n">prediction_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"flow_prediction"</span>
     <span class="n">predict_x0</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
@@ -955,15 +973,182 @@ window.runMermaid = runMermaid;</script>
     <span class="n">flow_shift</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
     <span class="n">sigma_min</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.147</span>
     <span class="n">sigma_max</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">200.0</span>
+    <span class="c1"># FlowMatchEuler (distilled): re-noise every position each step.</span>
+    <span class="n">stochastic_sampling</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
 <div class="viewcode-block" id="Cosmos3SchedulerConfig.from_dict">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3SchedulerConfig.from_dict">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">"Cosmos3SchedulerConfig"</span><span class="p">:</span>
         <span class="c1"># diffusers stores the flow shift under "flow_shift"; keep the rest by name.</span>
+        <span class="n">cfg</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">_filtered</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">d</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"_class_name"</span><span class="p">):</span>
+            <span class="n">cfg</span><span class="o">.</span><span class="n">scheduler_class</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">d</span><span class="p">[</span><span class="s2">"_class_name"</span><span class="p">])</span>
+        <span class="k">return</span> <span class="n">cfg</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="Cosmos3VisionEncoderConfig">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3VisionEncoderConfig">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3VisionEncoderConfig</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The reasoner's packed SigLIP2-style vision tower (``vision_config`` of the</span>
+<span class="sd">    Edge ``config.json``): patch-embedding linear over ``patch_size**2 * 3``</span>
+<span class="sd">    pixel patches, a learned square position grid of ``num_patches`` entries</span>
+<span class="sd">    that is bilinearly resized to each image's patch grid, ``num_hidden_layers``</span>
+<span class="sd">    pre-LayerNorm encoder blocks attending within one frame, and a post</span>
+<span class="sd">    LayerNorm. ``spatial_merge_size`` is the projector's 2x2 patch merge."""</span>
+
+    <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1152</span>
+    <span class="n">intermediate_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4304</span>
+    <span class="n">num_hidden_layers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">27</span>
+    <span class="n">num_attention_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span>
+    <span class="n">num_channels</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">3</span>
+    <span class="n">patch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span>
+    <span class="n">num_patches</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">256</span>
+    <span class="n">spatial_merge_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2</span>
+    <span class="n">hidden_act</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"gelu_pytorch_tanh"</span>
+    <span class="n">layer_norm_eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span>
+
+<div class="viewcode-block" id="Cosmos3VisionEncoderConfig.from_dict">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3VisionEncoderConfig.from_dict">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">"Cosmos3VisionEncoderConfig"</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">_filtered</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">))</span></div>
 </div>
 
+
+
+<div class="viewcode-block" id="Cosmos3MediaProcessorConfig">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3MediaProcessorConfig">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3MediaProcessorConfig</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Resize/normalize/patchify settings of the reasoner's image and video</span>
+<span class="sd">    processors (``preprocessor_config.json`` / ``video_preprocessor_config.json``).</span>
+
+<span class="sd">    An input is resized (bicubic, antialiased) so both sides are multiples of</span>
+<span class="sd">    ``patch_size * merge_size`` and the pixel count lands in</span>
+<span class="sd">    ``[min_pixels, max_pixels]``, normalized with ``image_mean`` /</span>
+<span class="sd">    ``image_std``, and cut into ``patch_size`` patches in block-major 2x2</span>
+<span class="sd">    order. Video inputs are first sampled at ``fps`` frames per second, clamped</span>
+<span class="sd">    to ``[min_frames, max_frames]``."""</span>
+
+    <span class="n">patch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span>
+    <span class="n">merge_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2</span>
+    <span class="n">temporal_patch_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+    <span class="n">min_pixels</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">65536</span>
+    <span class="n">max_pixels</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16777216</span>
+    <span class="n">image_mean</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="nb">float</span><span class="p">,</span> <span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="mf">0.5</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">)</span>
+    <span class="n">image_std</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="nb">float</span><span class="p">,</span> <span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="mf">0.5</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">)</span>
+    <span class="c1"># Video sampling (the video processor only).</span>
+    <span class="n">fps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">2.0</span>
+    <span class="n">min_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4</span>
+    <span class="n">max_frames</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">768</span>
+
+<div class="viewcode-block" id="Cosmos3MediaProcessorConfig.from_dict">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3MediaProcessorConfig.from_dict">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">"Cosmos3MediaProcessorConfig"</span><span class="p">:</span>
+        <span class="n">kwargs</span> <span class="o">=</span> <span class="n">_filtered</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">)</span>
+        <span class="n">size</span> <span class="o">=</span> <span class="n">d</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"size"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="s2">"shortest_edge"</span> <span class="ow">in</span> <span class="n">size</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"min_pixels"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">size</span><span class="p">[</span><span class="s2">"shortest_edge"</span><span class="p">])</span>
+        <span class="k">if</span> <span class="s2">"longest_edge"</span> <span class="ow">in</span> <span class="n">size</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"max_pixels"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">size</span><span class="p">[</span><span class="s2">"longest_edge"</span><span class="p">])</span>
+        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"image_mean"</span><span class="p">,</span> <span class="s2">"image_std"</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">:</span>
+                <span class="n">kwargs</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">x</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">[</span><span class="n">key</span><span class="p">])</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="Cosmos3ReasonerConfig">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3ReasonerConfig">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Cosmos3ReasonerConfig</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Everything the understanding tower needs beyond the DiT weights to be</span>
+<span class="sd">    served as a VLM (the Edge ``config.json``): the vision tower, the</span>
+<span class="sd">    patch-merger projector (``LayerNorm -&gt; 2x2 merge -&gt; Linear -&gt; GELU -&gt;</span>
+<span class="sd">    Linear`` into the text hidden size), the placeholder token ids, and the</span>
+<span class="sd">    media processors. The text tower itself is the DiT's understanding</span>
+<span class="sd">    pathway (``embed_tokens`` / ``layers.N.self_attn.to_*`` / ``mlp`` /</span>
+<span class="sd">    ``norm`` / ``lm_head``)."""</span>
+
+    <span class="n">vision</span><span class="p">:</span> <span class="n">Cosmos3VisionEncoderConfig</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">Cosmos3VisionEncoderConfig</span><span class="p">)</span>
+    <span class="n">image_processor</span><span class="p">:</span> <span class="n">Cosmos3MediaProcessorConfig</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">Cosmos3MediaProcessorConfig</span><span class="p">)</span>
+    <span class="n">video_processor</span><span class="p">:</span> <span class="n">Cosmos3MediaProcessorConfig</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="n">Cosmos3MediaProcessorConfig</span><span class="p">(</span><span class="n">min_pixels</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span> <span class="n">max_pixels</span><span class="o">=</span><span class="mi">25165824</span><span class="p">)</span>
+    <span class="p">)</span>
+    <span class="n">projector_input_hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1152</span>
+    <span class="n">projector_hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">11520</span>
+    <span class="n">projector_out_hidden_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2048</span>
+    <span class="n">use_postshuffle_norm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">image_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">19</span>
+    <span class="n">video_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">18</span>
+    <span class="n">vision_start_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">20</span>
+    <span class="n">vision_end_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">21</span>
+    <span class="n">eos_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">11</span>
+    <span class="n">max_position_embeddings</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">131072</span>
+    <span class="c1"># The chat template thinks by default (``enable_thinking``); a request may</span>
+    <span class="c1"># turn it off.</span>
+    <span class="n">enable_thinking</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="Cosmos3ReasonerConfig.from_dict">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3ReasonerConfig.from_dict">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="s2">"Cosmos3ReasonerConfig"</span><span class="p">:</span>
+        <span class="n">kwargs</span> <span class="o">=</span> <span class="n">_filtered</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">d</span><span class="p">)</span>
+        <span class="n">vision</span> <span class="o">=</span> <span class="n">d</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"vision_config"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="n">proj</span> <span class="o">=</span> <span class="n">d</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"projector_config"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="n">text</span> <span class="o">=</span> <span class="n">d</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"text_config"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="n">kwargs</span><span class="p">[</span><span class="s2">"vision"</span><span class="p">]</span> <span class="o">=</span> <span class="n">Cosmos3VisionEncoderConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span>
+            <span class="p">{</span><span class="o">**</span><span class="n">vision</span><span class="p">,</span> <span class="s2">"spatial_merge_size"</span><span class="p">:</span> <span class="n">proj</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"spatial_merge_size"</span><span class="p">,</span> <span class="n">vision</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"spatial_merge_size"</span><span class="p">,</span> <span class="mi">2</span><span class="p">))}</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="s2">"input_hidden_size"</span> <span class="ow">in</span> <span class="n">proj</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"projector_input_hidden_size"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">proj</span><span class="p">[</span><span class="s2">"input_hidden_size"</span><span class="p">])</span>
+        <span class="k">if</span> <span class="s2">"merger_intermediate_size"</span> <span class="ow">in</span> <span class="n">proj</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"projector_hidden_size"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">proj</span><span class="p">[</span><span class="s2">"merger_intermediate_size"</span><span class="p">])</span>
+        <span class="k">elif</span> <span class="s2">"projector_hidden_size"</span> <span class="ow">in</span> <span class="n">d</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"projector_hidden_size"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">d</span><span class="p">[</span><span class="s2">"projector_hidden_size"</span><span class="p">])</span>
+        <span class="k">if</span> <span class="s2">"out_hidden_size"</span> <span class="ow">in</span> <span class="n">proj</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"projector_out_hidden_size"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">proj</span><span class="p">[</span><span class="s2">"out_hidden_size"</span><span class="p">])</span>
+        <span class="k">elif</span> <span class="s2">"hidden_size"</span> <span class="ow">in</span> <span class="n">text</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"projector_out_hidden_size"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">text</span><span class="p">[</span><span class="s2">"hidden_size"</span><span class="p">])</span>
+        <span class="k">if</span> <span class="s2">"use_postshuffle_norm"</span> <span class="ow">in</span> <span class="n">proj</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"use_postshuffle_norm"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">proj</span><span class="p">[</span><span class="s2">"use_postshuffle_norm"</span><span class="p">])</span>
+        <span class="n">eos</span> <span class="o">=</span> <span class="n">text</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"eos_token_id"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">eos</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
+            <span class="n">eos</span> <span class="o">=</span> <span class="n">eos</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">if</span> <span class="n">eos</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"eos_token_id"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">eos</span><span class="p">)</span>
+        <span class="k">if</span> <span class="s2">"max_position_embeddings"</span> <span class="ow">in</span> <span class="n">text</span><span class="p">:</span>
+            <span class="n">kwargs</span><span class="p">[</span><span class="s2">"max_position_embeddings"</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">text</span><span class="p">[</span><span class="s2">"max_position_embeddings"</span><span class="p">])</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+</div>
+
+
+
+<span class="c1"># ``model_type`` of a checkpoint whose top-level config.json describes the</span>
+<span class="c1"># reasoner (vision tower + projector over the DiT's text pathway).</span>
+<span class="n">REASONER_MODEL_TYPES</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="s2">"cosmos3_edge"</span><span class="p">})</span>
+<span class="c1"># transformer/config.json ``backbone_type`` of the Edge checkpoints, and the</span>
+<span class="c1"># model card's serving recipe for them: 832x480 video (121 frames, 20 UniPC</span>
+<span class="c1"># steps on the native flow schedule at flow shift 12), 640x640 images,</span>
+<span class="c1"># cover-scale + center-crop image conditioning (the diffusers 0.40 pipeline</span>
+<span class="c1"># recipe), action modes at flow shift 10. Applied by ``from_pretrained`` where</span>
+<span class="c1"># a field still holds the Nano default, so a yaml overrides any of them.</span>
+<span class="n">EDGE_BACKBONE_TYPE</span> <span class="o">=</span> <span class="s2">"cosmos3_edge_nemotron_dense"</span>
+<span class="n">EDGE_RECIPE_DEFAULTS</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">"conditioning_resize"</span><span class="p">:</span> <span class="s2">"aspect_crop"</span><span class="p">,</span>
+    <span class="s2">"image_size_default"</span><span class="p">:</span> <span class="p">(</span><span class="mi">640</span><span class="p">,</span> <span class="mi">640</span><span class="p">),</span>
+    <span class="s2">"video_size_default"</span><span class="p">:</span> <span class="p">(</span><span class="mi">832</span><span class="p">,</span> <span class="mi">480</span><span class="p">),</span>
+    <span class="s2">"num_frames_video"</span><span class="p">:</span> <span class="mi">121</span><span class="p">,</span>
+    <span class="s2">"num_inference_steps_video"</span><span class="p">:</span> <span class="mi">20</span><span class="p">,</span>
+    <span class="s2">"flow_shift_video"</span><span class="p">:</span> <span class="mf">12.0</span><span class="p">,</span>
+    <span class="s2">"flow_shift_action"</span><span class="p">:</span> <span class="mf">10.0</span><span class="p">,</span>
+<span class="p">}</span>
 
 
 <div class="viewcode-block" id="Cosmos3Config">
@@ -1005,6 +1190,21 @@ window.runMermaid = runMermaid;</script>
     <span class="n">qk_norm_for_text</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">use_moe</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>  <span class="c1"># MoT two-FFN split (mlp / mlp_moe_gen), NOT sparse experts</span>
 
+    <span class="c1"># ----- backbone family -----</span>
+    <span class="c1"># Nano/Super descend from Qwen3-VL: SwiGLU MLPs (gate/up/down) and the</span>
+    <span class="c1"># diffusers RMSNorm rounding (normalize, round to bf16, multiply by the</span>
+    <span class="c1"># weight). Edge descends from a dense Nemotron LM: ``hidden_act="relu2"``</span>
+    <span class="c1"># (down(relu(up(x))^2), no gate) and the Nemotron RMSNorm ordering (the</span>
+    <span class="c1"># weight multiplies in fp32, one rounding at the end). Both are read from</span>
+    <span class="c1"># transformer/config.json; ``hidden_act`` selects the norm family like the</span>
+    <span class="c1"># diffusers reference does.</span>
+    <span class="n">hidden_act</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"silu"</span>
+    <span class="n">backbone_type</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Edge only: the generation tower attends to a re-normalized view of the</span>
+    <span class="c1"># understanding K (``layers.N.self_attn.k_norm_und_for_gen``); the text</span>
+    <span class="c1"># tower's own causal attention keeps the raw K.</span>
+    <span class="n">use_und_k_norm_for_gen</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
     <span class="c1"># ----- capability flags + modality heads -----</span>
     <span class="n">action_gen</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">max_action_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span>
@@ -1021,6 +1221,40 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># audio_decoder node with its ~1.9 GB AVAE). Requires the checkpoint to ship</span>
     <span class="c1"># sound_tokenizer/; set False to serve video-only and skip loading it.</span>
     <span class="n">enable_sound</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># Serve opt-in windowed autoregressive video (the video_gen_ar walk plus</span>
+    <span class="c1"># the vae_decoder_ar node and its streaming decoder partition). Off by</span>
+    <span class="c1"># default: the served node set, walks and partitions are unchanged unless</span>
+    <span class="c1"># a deployment enables it, and requests only run windowed when they ask</span>
+    <span class="c1"># for a ``window_mode``.</span>
+    <span class="n">enable_windowed_video</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Cap on how many windows one request may span (bounds the AR loop's</span>
+    <span class="c1"># static iteration count together with max_inference_steps).</span>
+    <span class="n">max_windows</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span>
+    <span class="c1"># Windowed-request defaults, in pixel frames (quantized to latent frames</span>
+    <span class="c1"># server-side; the Wan VAE downsamples time by scale_factor_temporal).</span>
+    <span class="c1"># The overlap default matches the V2V recipe's two pinned latent frames —</span>
+    <span class="c1"># one-frame conditioning visibly degrades the continuation.</span>
+    <span class="n">window_frames_default</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">29</span>
+    <span class="n">overlap_frames_default</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span>
+    <span class="c1"># kv-mode committed-context horizon (61 px = 16 latent frames): frames</span>
+    <span class="c1"># older than this behind the commit frontier are released from the cache.</span>
+    <span class="c1"># A request may pass context_frames=0 to retain everything.</span>
+    <span class="n">context_frames_default</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">61</span>
+    <span class="c1"># Latent frames of already-generated context re-decoded ahead of each</span>
+    <span class="c1"># window so the causal VAE's conv stack is warm at the kept frames; the</span>
+    <span class="c1"># context-derived pixels are trimmed. Raise if window boundaries seam.</span>
+    <span class="n">windowed_decode_context_latents</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span>
+    <span class="c1"># Sessions (``session_id`` on a windowed request): the DiT node keeps the</span>
+    <span class="c1"># last window's clean latents and the streaming decoder its decode</span>
+    <span class="c1"># context per session, so a later request with ``resume_session`` picks</span>
+    <span class="c1"># the rollout up where the previous one ended. This many idle sessions</span>
+    <span class="c1"># are kept (most recent first); a session with a request in flight is</span>
+    <span class="c1"># never evicted, and a second request on it is refused.</span>
+    <span class="n">session_store_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span>
+    <span class="c1"># Idle sessions expire after this many seconds unless the request set</span>
+    <span class="c1"># ``session_timeout_s`` (capped at the max); ``end_session`` drops one early.</span>
+    <span class="n">session_timeout_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">600.0</span>
+    <span class="n">session_timeout_max_s</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">3600.0</span>
     <span class="n">video_temporal_causal</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="n">freeze_und</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
@@ -1048,6 +1282,39 @@ window.runMermaid = runMermaid;</script>
     <span class="n">num_inference_steps_action</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">30</span>
     <span class="n">guidance_scale_action</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
     <span class="n">flow_shift_action</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">5.0</span>
+    <span class="c1"># Default output size (width, height) for image and video requests that</span>
+    <span class="c1"># send no ``size``: Nano/Super serve 1024^2 images and the same square for</span>
+    <span class="c1"># video unless the deployment says otherwise; Edge is 480p-native (the</span>
+    <span class="c1"># yaml sets 640x640 images and 832x480 video).</span>
+    <span class="n">image_size_default</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="mi">1024</span><span class="p">)</span>
+    <span class="n">video_size_default</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Classifier-free guidance defaults for image/video requests (action</span>
+    <span class="c1"># requests use ``guidance_scale_action``).</span>
+    <span class="n">guidance_scale</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">6.0</span>
+    <span class="c1"># Flow shifts: text-to-image follows the reference t2i recipe (3.0);</span>
+    <span class="c1"># video keeps the checkpoint scheduler's shift unless set (Edge: 12.0).</span>
+    <span class="n">flow_shift_image</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="mf">3.0</span>
+    <span class="n">flow_shift_video</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># How an image-to-video conditioning frame reaches the generation size:</span>
+    <span class="c1"># "stretch" (plain bilinear resize; the diffusers 0.39 pipeline the Nano</span>
+    <span class="c1"># checkpoints were validated against) or "aspect_crop" (cover-scale,</span>
+    <span class="c1"># antialiased resize, center crop, 8-bit rounding; the diffusers 0.40 /</span>
+    <span class="c1"># vLLM-Omni recipe, set by the Edge yamls). See components/conditioning.py.</span>
+    <span class="n">conditioning_resize</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"stretch"</span>
+    <span class="c1"># ``model_index.json``: the pipeline sets the UniPC schedule from</span>
+    <span class="c1"># explicitly linspaced flow sigmas (1 - 1/T ... 0) instead of the</span>
+    <span class="c1"># scheduler's own timestep spacing. Edge checkpoints set it; the karras</span>
+    <span class="c1"># transform is off on that path (the reference recipes pass</span>
+    <span class="c1"># ``use_karras_sigmas=False``) unless a request re-enables it.</span>
+    <span class="n">use_native_flow_schedule</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># ``modular_model_index.json`` of the 4-step distilled task checkpoints</span>
+    <span class="c1"># (Super-Text2Image-4Step / Image2Video-4Step): the sampler is a fixed</span>
+    <span class="c1"># sigma list [1.0, 0.9375, 0.8333, 0.625] driven by a FlowMatchEuler SDE</span>
+    <span class="c1"># step (``x0 = x - sigma * v``, ``x' = (1 - sigma') x0 + sigma' noise``),</span>
+    <span class="c1"># classifier-free guidance is baked into the weights (scale forced to 1),</span>
+    <span class="c1"># and the step count is the list's length.</span>
+    <span class="n">is_distilled</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">distilled_sigmas</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># ----- denoise CUDA-graph capture (serving knobs) -----</span>
     <span class="c1"># Capture the fixed-shape denoise step as a CUDA graph (the launch-bound-tier</span>
@@ -1058,10 +1325,39 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># (720p+, video) run eager+dense where the graph is net-slower. The env var</span>
     <span class="c1"># COSMOS3_GRAPH_MAX_LATENT_AREA overrides this.</span>
     <span class="n">graph_max_latent_area</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2000</span>
+    <span class="c1"># Video denoise steps to capture as CUDA graphs, as (height, width,</span>
+    <span class="c1"># frames) pixel tiers: a plain t2v/i2v clip length and/or the windowed</span>
+    <span class="c1"># rollout's window length. Pays only for small, launch-bound tiers: at</span>
+    <span class="c1"># 832x480 the captured (paged-attention) step measured slower than the</span>
+    <span class="c1"># eager dense FA3 one, so the Edge yaml leaves this empty.</span>
+    <span class="c1"># The graph is built with every latent frame declared noisy and carries</span>
+    <span class="c1"># the clean/noisy layout as a per-token mask input, so one graph per shape</span>
+    <span class="c1"># serves t2v, i2v (anchor frame) and chained windows (overlap frames);</span>
+    <span class="c1"># kv-mode windows run eager (their commit iteration is a different step).</span>
+    <span class="c1"># Empty = no video capture. COSMOS3_GEN_CAPTURE_VIDEO ("480x832x29,...",</span>
+    <span class="c1"># height x width x frames) overrides.</span>
+    <span class="n">gen_capture_video</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">()</span>
     <span class="c1"># torch.compile the denoise compute (the generation-layer stack around the</span>
     <span class="c1"># attention op). Always a win in serving; the parity tests set False to keep</span>
     <span class="c1"># their bit-exact bounds on the eager step.</span>
     <span class="n">compile_denoise</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># torch.compile the reasoner's captured decode step before the CUDA-graph</span>
+    <span class="c1"># capture: at bs=1 the eager step is ~1240 kernels, ~1000 of them the</span>
+    <span class="c1"># norms', rotary's and residuals' pointwise pieces; fused, the step runs</span>
+    <span class="c1"># at the weight-streaming floor (H100: 4.2 -&gt; 2.05 ms/token). Env override</span>
+    <span class="c1"># COSMOS3_REASONER_COMPILE=0/1 for A/B.</span>
+    <span class="n">compile_reasoner_decode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># torch.compile the reasoner's eager prefill (text and vision prompts; the</span>
+    <span class="c1"># decode step has its own captured graph). The eager prefill of a ~300-token</span>
+    <span class="c1"># image prompt is ~1250 kernels for ~5 ms of GPU work (24 ms wall on an</span>
+    <span class="c1"># H100, launch-bound), so the fusion would take a third of that. Off by</span>
+    <span class="c1"># default: with dynamic shapes (one compile for every prompt length) torch</span>
+    <span class="c1"># 2.11's inductor fails in its joint-graph noop pass ("'SymInt' object has</span>
+    <span class="c1"># no attribute 'size'"), and a static compile recompiles per prompt length</span>
+    <span class="c1"># until automatic dynamic shapes route it into the same failure. Env</span>
+    <span class="c1"># override COSMOS3_REASONER_PREFILL_COMPILE=0/1 for the A/B once fixed</span>
+    <span class="c1"># upstream; the padded prefill graph (like the DiT's) is the real answer.</span>
+    <span class="n">compile_reasoner_prefill</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># Which attention backends the DiT node declares (see</span>
     <span class="c1"># Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the</span>
     <span class="c1"># paged FlashInfer backend the understanding prefill and the captured</span>
@@ -1074,9 +1370,34 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># ----- sub-configs -----</span>
     <span class="n">vae</span><span class="p">:</span> <span class="n">Cosmos3VAEConfig</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">Cosmos3VAEConfig</span><span class="p">)</span>
     <span class="n">scheduler</span><span class="p">:</span> <span class="n">Cosmos3SchedulerConfig</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">Cosmos3SchedulerConfig</span><span class="p">)</span>
+    <span class="c1"># The understanding tower served as a VLM (vision tower + projector);</span>
+    <span class="c1"># None for checkpoints that ship no reasoner (Nano/Super generators).</span>
+    <span class="n">reasoner</span><span class="p">:</span> <span class="n">Cosmos3ReasonerConfig</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># Serve the reasoner walks (and load the vision tower) when the checkpoint</span>
+    <span class="c1"># has them; a deployment may switch them off to serve the generator alone.</span>
+    <span class="n">enable_reasoner</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># Default sampling temperature for reasoner requests that send none</span>
+    <span class="c1"># (0 = greedy). The checkpoint's generation_config samples; the M* default</span>
+    <span class="c1"># keeps the other chat models' 0.6.</span>
+    <span class="n">reasoner_temperature</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.6</span>
 
     <span class="c1"># ----- provenance -----</span>
     <span class="n">local_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">nemotron_norm</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether every RMSNorm uses the Nemotron ordering (fp32 weight</span>
+<span class="sd">        multiply, then one cast) — the dense relu2 backbone family."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span> <span class="o">==</span> <span class="s2">"relu2"</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">gated_mlp</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""SwiGLU (gate/up/down) MLPs vs the dense two-projection relu2 ones."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">hidden_act</span> <span class="o">!=</span> <span class="s2">"relu2"</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">serves_reasoner</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">reasoner</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="Cosmos3Config.from_transformer_dict">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3Config.from_transformer_dict">[docs]</a>
@@ -1118,6 +1439,43 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">sched_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
             <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">sched_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
                 <span class="n">cfg</span><span class="o">.</span><span class="n">scheduler</span> <span class="o">=</span> <span class="n">Cosmos3SchedulerConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">))</span>
+
+        <span class="n">index_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"model_index.json"</span>
+        <span class="k">if</span> <span class="n">index_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">index_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">index</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+            <span class="n">cfg</span><span class="o">.</span><span class="n">use_native_flow_schedule</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">index</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"use_native_flow_schedule"</span><span class="p">,</span> <span class="kc">False</span><span class="p">))</span>
+
+        <span class="k">if</span> <span class="n">cfg</span><span class="o">.</span><span class="n">backbone_type</span> <span class="o">==</span> <span class="n">EDGE_BACKBONE_TYPE</span><span class="p">:</span>
+            <span class="n">defaults</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">()</span>
+            <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">EDGE_RECIPE_DEFAULTS</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span> <span class="o">==</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">defaults</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
+                    <span class="nb">setattr</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+
+        <span class="n">modular_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"modular_model_index.json"</span>
+        <span class="k">if</span> <span class="n">modular_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">modular_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">modular</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+            <span class="n">sigmas</span> <span class="o">=</span> <span class="n">modular</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"distilled_sigmas"</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">modular</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"is_distilled"</span><span class="p">)</span> <span class="ow">and</span> <span class="n">sigmas</span><span class="p">:</span>
+                <span class="n">cfg</span><span class="o">.</span><span class="n">is_distilled</span> <span class="o">=</span> <span class="kc">True</span>
+                <span class="n">cfg</span><span class="o">.</span><span class="n">distilled_sigmas</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">s</span><span class="p">)</span> <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">sigmas</span><span class="p">)</span>
+
+        <span class="n">top_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="s2">"config.json"</span>
+        <span class="k">if</span> <span class="n">top_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">top_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">top</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">top</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"model_type"</span><span class="p">)</span> <span class="ow">in</span> <span class="n">REASONER_MODEL_TYPES</span> <span class="ow">and</span> <span class="p">(</span><span class="n">root</span> <span class="o">/</span> <span class="s2">"vision_encoder"</span><span class="p">)</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+                <span class="n">reasoner</span> <span class="o">=</span> <span class="n">Cosmos3ReasonerConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">top</span><span class="p">)</span>
+                <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">attr</span> <span class="ow">in</span> <span class="p">(</span>
+                    <span class="p">(</span><span class="s2">"preprocessor_config.json"</span><span class="p">,</span> <span class="s2">"image_processor"</span><span class="p">),</span>
+                    <span class="p">(</span><span class="s2">"video_preprocessor_config.json"</span><span class="p">,</span> <span class="s2">"video_processor"</span><span class="p">),</span>
+                <span class="p">):</span>
+                    <span class="n">proc_path</span> <span class="o">=</span> <span class="n">root</span> <span class="o">/</span> <span class="n">name</span>
+                    <span class="k">if</span> <span class="n">proc_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+                        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">proc_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                            <span class="nb">setattr</span><span class="p">(</span><span class="n">reasoner</span><span class="p">,</span> <span class="n">attr</span><span class="p">,</span> <span class="n">Cosmos3MediaProcessorConfig</span><span class="o">.</span><span class="n">from_dict</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)))</span>
+                <span class="n">cfg</span><span class="o">.</span><span class="n">reasoner</span> <span class="o">=</span> <span class="n">reasoner</span>
 
         <span class="k">return</span> <span class="n">cfg</span></div>
 </div>

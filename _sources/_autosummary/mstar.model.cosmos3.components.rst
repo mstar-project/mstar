@@ -27,7 +27,10 @@ mstar.model.cosmos3.components
    :toctree:
    :recursive:
 
+   conditioning
    packing
+   reasoner
    sound_tokenizer
    transformer
+   vision
 
