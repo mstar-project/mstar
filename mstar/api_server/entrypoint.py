@@ -29,7 +29,7 @@ from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.multimodal import PromptPart
-from mstar.model.registry import HF_MODELS
+from mstar.model.registry import model_init_kwargs
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
@@ -121,9 +121,8 @@ def _conductor_process_target(
         )
 
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
         cache_dir=cache_dir,
-        **yaml_model_kwargs,
+        **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
     conductor = Conductor(
         model=model,
@@ -1538,9 +1537,8 @@ def main(argv: list[str] | None = None):
     # (tokenization only — no GPU weights needed)
     from mstar.model.registry import get_model_class
     model = get_model_class(model_name)(
-        model_path_hf=HF_MODELS.get(model_name, {}).get("model_path_hf", ""),
         cache_dir=args.cache_dir,
-        **yaml_model_kwargs,
+        **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
 
     global api_server

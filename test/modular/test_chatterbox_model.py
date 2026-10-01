@@ -46,7 +46,7 @@ from mstar.model.chatterbox.submodules import (
     T3Submodule,
     VoiceCache,
 )
-from mstar.model.registry import HF_MODELS, get_model_class
+from mstar.model.registry import HF_MODELS, get_model_class, model_init_kwargs
 from mstar.model.submodule_base import ModelInputsFromEngine
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
@@ -175,6 +175,8 @@ def test_cli_adapter_and_benchmark_entries_are_registered():
 
         assert DEFAULT_CONFIGS["chatterbox"] == "chatterbox.yaml"
         assert DEFAULT_CONFIGS["chatterbox_turbo"] == "chatterbox_turbo.yaml"
+        assert DEFAULT_CONFIGS["chatterbox_multilingual"] == "chatterbox_multilingual.yaml"
+        assert 'language_id="fr"' in _next_steps("chatterbox_multilingual", "0.0.0.0", 8000)
         assert isinstance(ADAPTER_REGISTRY["chatterbox"], ChatterboxAdapter)
         assert isinstance(ADAPTER_REGISTRY["chatterbox_turbo"], ChatterboxAdapter)
         assert 'voice="default"' in _next_steps("chatterbox", "0.0.0.0", 8000)
@@ -1238,6 +1240,11 @@ def test_multilingual_variant_config_and_registry():
     assert get_model_class("chatterbox_multilingual") is ChatterboxModel
     yaml_cfg = yaml.safe_load((CONFIGS / "chatterbox_multilingual.yaml").read_text())
     assert yaml_cfg["model"] == "chatterbox_multilingual"
+
+
+def test_registry_kwargs_build_the_multilingual_model():
+    """The servers construct models from ``model_init_kwargs``; the variant has to arrive."""
+    assert ChatterboxModel(**model_init_kwargs("chatterbox_multilingual")).config.is_multilingual
 
 
 def test_language_id_reaches_the_multilingual_tokenizer_only(caplog):

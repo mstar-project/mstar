@@ -103,6 +103,12 @@ HF_MODELS: dict[str, dict] = {
 }
 
 
+def model_init_kwargs(name: str) -> dict:
+    """Constructor kwargs the registry pins for ``name``: the checkpoint repo
+    and, where one repo serves several models, the variant."""
+    return {"model_path_hf": "", **HF_MODELS.get(name, {})}
+
+
 def get_model_class(name: str) -> type[Model]:
     if name not in MODEL_REGISTRY:
         raise KeyError(f"Unknown model name: {name!r}. Available: {list(MODEL_REGISTRY.keys())}")
