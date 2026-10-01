@@ -1546,8 +1546,7 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># file read for exactly those).</span>
             <span class="n">data</span> <span class="o">=</span> <span class="n">_serialize_tensor</span><span class="p">(</span><span class="n">t</span><span class="p">)</span>
             <span class="n">path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
-            <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_create_shm_file</span><span class="p">(</span><span class="n">path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-                <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_write_shm_file</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">data</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_shm_files</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">path</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_arena_ts</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -1625,7 +1624,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">tensor_infos</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">],</span>
         <span class="n">skip_cuda_sync</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="p">):</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
         <span class="n">queued</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="n">placements</span> <span class="o">=</span> <span class="n">_Placements</span><span class="o">.</span><span class="n">empty</span><span class="p">()</span>
@@ -1652,7 +1651,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        uuid, and placement goes back as two columns rather than a whole</span>
 <span class="sd">        descriptor. The whole batch stages inside one stream context and syncs</span>
 <span class="sd">        once at the end, rather than one host-blocking sync per request."""</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
         <span class="n">queued</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="n">placements</span> <span class="o">=</span> <span class="n">_Placements</span><span class="o">.</span><span class="n">empty</span><span class="p">()</span>

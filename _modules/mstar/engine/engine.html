@@ -1523,8 +1523,10 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
                     <span class="s2">"KV </span><span class="si">%s</span><span class="s2">: prefix cache on with cpu_offload_pages 0: a decode "</span>
                     <span class="s2">"step that finds nothing to evict holds its requests until "</span>
-                    <span class="s2">"they time out. max_concurrent_requests caps how many run "</span>
-                    <span class="s2">"at once, and cpu_offload_pages gives the worker a victim"</span><span class="p">,</span>
+                    <span class="s2">"they time out. Set max_concurrent_requests to the pool's "</span>
+                    <span class="s2">"pages over the pages one request needs. cpu_offload_pages "</span>
+                    <span class="s2">"gives the worker a victim, but one that shares most of its "</span>
+                    <span class="s2">"prompt frees little"</span><span class="p">,</span>
                     <span class="n">key</span><span class="p">,</span>
                 <span class="p">)</span>
 

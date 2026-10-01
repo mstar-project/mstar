@@ -785,7 +785,7 @@ The default stream is never blocked by store writes.</p>
 <dt class="sig sig-object py" id="mstar.communication.tensors.AsyncMooncakeReader.submit">
 <span class="sig-name descname"><span class="pre">submit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">read_info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#AsyncMooncakeReader.submit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.AsyncMooncakeReader.submit" title="Link to this definition">#</a></dt>
 <dd><p>Non-blocking: enqueue a batch of READs.</p>
-<p>Records a CUDA event on the current stream to ensure GPU data
+<p>On a device, records a CUDA event on the current stream to ensure GPU data
 is ready before the background thread reads it.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>

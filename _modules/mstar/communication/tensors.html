@@ -882,10 +882,12 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.communication.tensors</h1><div class="highlight"><pre>
-<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
+<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">errno</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">platform</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">stat</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
@@ -1043,22 +1045,21 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">max_batch_size</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="n">ThreadPoolExecutor</span><span class="p">(</span><span class="n">max_workers</span><span class="o">=</span><span class="n">max_workers</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_pending</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Future</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="k">if</span> <span class="n">device</span> <span class="o">!=</span> <span class="s2">"cpu"</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_copy_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_copy_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">()</span>
+        <span class="c1"># none on the host: host buffers have no GPU work to wait for, and a stream or event would</span>
+        <span class="c1"># create a CUDA context on a GPU that other processes may have filled</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_copy_stream</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Stream</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"cuda"</span> <span class="k">else</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="AsyncMooncakeReader.submit">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.AsyncMooncakeReader.submit">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">read_info</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TransferReadInfo</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Future</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Non-blocking: enqueue a batch of READs.</span>
 
-<span class="sd">        Records a CUDA event on the current stream to ensure GPU data</span>
+<span class="sd">        On a device, records a CUDA event on the current stream to ensure GPU data</span>
 <span class="sd">        is ready before the background thread reads it.</span>
 <span class="sd">        """</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">read_info</span><span class="p">:</span>
             <span class="k">return</span>
-        <span class="n">event</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span><span class="o">.</span><span class="n">record_event</span><span class="p">()</span>
+        <span class="n">event</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_stream</span><span class="p">()</span><span class="o">.</span><span class="n">record_event</span><span class="p">()</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_copy_stream</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="n">future</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_do_read</span><span class="p">,</span> <span class="n">read_info</span><span class="p">,</span> <span class="n">event</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">future</span><span class="p">)</span>
         <span class="c1"># Prune completed futures to avoid unbounded growth</span>
@@ -1066,10 +1067,11 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">future</span></div>
 
 
-    <span class="k">def</span><span class="w"> </span><span class="nf">_do_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">read_info</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="s2">"TransferReadInfo"</span><span class="p">],</span> <span class="n">event</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_do_read</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">read_info</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="s2">"TransferReadInfo"</span><span class="p">],</span> <span class="n">event</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">Event</span> <span class="o">|</span> <span class="kc">None</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">"""Worker thread: wait for GPU data via CUDA event, then PUT."""</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_copy_stream</span><span class="o">.</span><span class="n">wait_event</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_copy_stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">event</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_copy_stream</span><span class="o">.</span><span class="n">wait_event</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_copy_stream</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
         <span class="n">start_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
 
@@ -1288,6 +1290,9 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">my_session_id</span> <span class="o">=</span> <span class="n">my_session_id</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span> <span class="o">=</span> <span class="n">enable_prof</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">device</span>
+        <span class="c1"># by the manager's device, not torch.cuda.is_available() alone: a host manager holds only host tensors,</span>
+        <span class="c1"># and its first sync would create a CUDA context on a GPU that other processes may have filled</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="s2">"cuda"</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">communicator</span> <span class="o">=</span> <span class="n">communicator</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">transfer_engine</span> <span class="o">=</span> <span class="n">transfer_engine</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span> <span class="o">=</span> <span class="n">TensorStore</span><span class="p">()</span>
@@ -1427,7 +1432,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># step), so the unconditional default-stream sync here would</span>
         <span class="c1"># uselessly drain GPU(N+1). Pass ``skip_cuda_sync=True`` from</span>
         <span class="c1"># those call sites.</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
         <span class="n">request_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Rid</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
@@ -1468,7 +1473,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        will ever read them, and a stored tensor nothing references is only</span>
 <span class="sd">        freed when its request is torn down.</span>
 <span class="sd">        """</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
 
         <span class="n">flat_uuids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
@@ -1811,8 +1816,13 @@ window.runMermaid = runMermaid;</script>
         <span class="n">ready</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Rid</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
         <span class="n">still_pending</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="n">uuid_to_time</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># the async reader finishes a request's reads in any order, so a read</span>
+        <span class="c1"># that is done waits for the ones started before it: a streamed token</span>
+        <span class="c1"># must not reach the client ahead of the one before it</span>
+        <span class="n">waiting</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="n">Rid</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">ep</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">pending</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="o">.</span><span class="n">done</span><span class="p">():</span>
+            <span class="n">done</span> <span class="o">=</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="o">.</span><span class="n">done</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">done</span> <span class="ow">and</span> <span class="n">ep</span><span class="o">.</span><span class="n">request_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">waiting</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">ep</span><span class="o">.</span><span class="n">future</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                     <span class="n">ep</span><span class="o">.</span><span class="n">future</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
                 <span class="k">for</span> <span class="n">edge</span> <span class="ow">in</span> <span class="n">ep</span><span class="o">.</span><span class="n">graph_edges</span><span class="p">:</span>
@@ -1825,6 +1835,7 @@ window.runMermaid = runMermaid;</script>
                         <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span><span class="p">:</span>
                             <span class="n">uuid_to_time</span><span class="p">[</span><span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">ep</span><span class="o">.</span><span class="n">rx_time</span>
             <span class="k">else</span><span class="p">:</span>
+                <span class="n">waiting</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">ep</span><span class="o">.</span><span class="n">request_id</span><span class="p">)</span>
                 <span class="n">still_pending</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ep</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">pending</span> <span class="o">=</span> <span class="n">still_pending</span>
 
@@ -2162,7 +2173,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="MooncakeCommunicationManager.register_for_send">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.MooncakeCommunicationManager.register_for_send">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">register_for_send</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">tensor_infos</span><span class="p">,</span> <span class="n">skip_cuda_sync</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">info</span> <span class="ow">in</span> <span class="n">tensor_infos</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_register_one</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">info</span><span class="o">.</span><span class="n">uuid</span><span class="p">)</span></div>
@@ -2178,7 +2189,7 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Uuid-driven form. Registration here reads nothing off a descriptor</span>
 <span class="sd">        but the uuid -- the tensor itself comes from the store -- so taking</span>
 <span class="sd">        uuids avoids rebuilding one per tensor."""</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">uuids</span> <span class="ow">in</span> <span class="n">per_request</span><span class="p">:</span>
             <span class="k">for</span> <span class="n">uuid</span> <span class="ow">in</span> <span class="n">uuids</span><span class="p">:</span>
@@ -2331,6 +2342,10 @@ window.runMermaid = runMermaid;</script>
     <span class="k">return</span> <span class="n">t</span>
 
 
+<span class="c1"># Docker gives a container 64 MB of /dev/shm, and one video or audio tensor can outgrow that</span>
+<span class="n">_SHM_DIR_WARN_BYTES</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">30</span>
+
+
 <span class="k">def</span><span class="w"> </span><span class="nf">_default_shm_dir</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Return the default shared-memory directory for the current platform."""</span>
     <span class="k">if</span> <span class="n">platform</span><span class="o">.</span><span class="n">system</span><span class="p">()</span> <span class="o">==</span> <span class="s2">"Linux"</span> <span class="ow">and</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">isdir</span><span class="p">(</span><span class="s2">"/dev/shm"</span><span class="p">):</span>
@@ -2391,6 +2406,17 @@ window.runMermaid = runMermaid;</script>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">shm_dir</span> <span class="o">=</span> <span class="n">shm_dir</span> <span class="ow">or</span> <span class="n">_default_shm_dir</span><span class="p">()</span>
         <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">shm_dir</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="c1"># at boot, not at the first large send: that failure would be the only other sign of a small dir</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">st</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">statvfs</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">shm_dir</span><span class="p">)</span>
+            <span class="n">shm_total</span> <span class="o">=</span> <span class="n">st</span><span class="o">.</span><span class="n">f_frsize</span> <span class="o">*</span> <span class="n">st</span><span class="o">.</span><span class="n">f_blocks</span>
+        <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+            <span class="n">shm_total</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">shm_total</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">shm_total</span> <span class="o">&lt;</span> <span class="n">_SHM_DIR_WARN_BYTES</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">"SHM: </span><span class="si">%s</span><span class="s2"> holds only </span><span class="si">%d</span><span class="s2"> MiB and every tensor in flight is written there, so a large one will "</span>
+                <span class="s2">"fail its send with ENOSPC. Give it more room (docker --shm-size), or pass "</span>
+                <span class="s2">"--tensor-comm-protocol TCP, which is slower"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">shm_dir</span><span class="p">,</span> <span class="n">shm_total</span> <span class="o">&gt;&gt;</span> <span class="mi">20</span><span class="p">)</span>
 
         <span class="c1"># uuid → file path for sender-side cleanup</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_shm_files</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
@@ -2449,13 +2475,42 @@ window.runMermaid = runMermaid;</script>
                     <span class="s2">"deployment's namespace"</span>
                 <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_write_shm_file</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Write one tensor's bytes to ``path``.</span>
+
+<span class="sd">        A full shm dir fails the write part way, and no cleanup knows the partial file: left behind, it</span>
+<span class="sd">        would keep the space it took, and the next request would find the dir fuller still.</span>
+<span class="sd">        """</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_create_shm_file</span><span class="p">(</span><span class="n">path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">OSError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">os</span><span class="o">.</span><span class="n">unlink</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">FileNotFoundError</span><span class="p">:</span>
+                <span class="k">pass</span>
+            <span class="k">if</span> <span class="n">exc</span><span class="o">.</span><span class="n">errno</span> <span class="o">!=</span> <span class="n">errno</span><span class="o">.</span><span class="n">ENOSPC</span><span class="p">:</span>
+                <span class="k">raise</span>
+            <span class="n">free</span> <span class="o">=</span> <span class="n">shutil</span><span class="o">.</span><span class="n">disk_usage</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">shm_dir</span><span class="p">)</span><span class="o">.</span><span class="n">free</span>
+            <span class="k">if</span> <span class="n">free</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">):</span>
+                <span class="n">reason</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">shm_dir</span><span class="si">}</span><span class="s2"> has </span><span class="si">{</span><span class="n">free</span><span class="si">}</span><span class="s2"> bytes free, too few for a </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)</span><span class="si">}</span><span class="s2">-byte tensor"</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">reason</span> <span class="o">=</span> <span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">shm_dir</span><span class="si">}</span><span class="s2"> reported no space for a </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)</span><span class="si">}</span><span class="s2">-byte tensor, with </span><span class="si">{</span><span class="n">free</span><span class="si">}</span><span class="s2"> bytes free after "</span>
+                    <span class="s2">"the failed write: it may be out of inodes, or other writers held the space meanwhile"</span>
+                <span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">OSError</span><span class="p">(</span>
+                <span class="n">errno</span><span class="o">.</span><span class="n">ENOSPC</span><span class="p">,</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">reason</span><span class="si">}</span><span class="s2">. Give it more room (docker --shm-size), or pass --tensor-comm-protocol TCP, which is slower"</span><span class="p">,</span>
+            <span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
+
 <div class="viewcode-block" id="SharedMemoryCommunicationManager.register_for_send">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.SharedMemoryCommunicationManager.register_for_send">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">register_for_send</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="n">Rid</span><span class="p">,</span> <span class="n">tensor_infos</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">],</span>
         <span class="n">skip_cuda_sync</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="p">):</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
         <span class="c1"># Producer's completion event is already waited on upstream, so the</span>
         <span class="c1"># source tensors are device-visible on entry. Running the D2H on a</span>
@@ -2480,7 +2535,7 @@ window.runMermaid = runMermaid;</script>
     <span class="p">):</span>
 <span class="w">        </span><span class="sd">"""Uuid-driven form. This path reads nothing off a descriptor but the</span>
 <span class="sd">        uuid, so taking uuids avoids rebuilding one per tensor."""</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">():</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">skip_cuda_sync</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_cuda</span><span class="p">:</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">default_stream</span><span class="p">()</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
         <span class="n">ctx</span> <span class="o">=</span> <span class="p">(</span>
             <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">stream</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_d2h_stream</span><span class="p">)</span>
@@ -2502,8 +2557,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">t0</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">perf_counter</span><span class="p">()</span>
         <span class="n">data</span> <span class="o">=</span> <span class="n">_serialize_tensor</span><span class="p">(</span><span class="n">tensor</span><span class="p">)</span>
         <span class="n">path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shm_path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">my_entity_id</span><span class="p">,</span> <span class="n">uuid</span><span class="p">)</span>
-        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_create_shm_file</span><span class="p">(</span><span class="n">path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
-            <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_write_shm_file</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">data</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_shm_files</span><span class="p">[</span><span class="n">uuid</span><span class="p">]</span> <span class="o">=</span> <span class="n">path</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">tensor_store</span><span class="o">.</span><span class="n">set_metadata</span><span class="p">(</span><span class="n">uuid</span><span class="p">,</span> <span class="n">mem_registered</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_prof</span><span class="p">:</span>

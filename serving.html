@@ -892,10 +892,13 @@ cached pages. A single request opts out by sending <code class="docutils literal
 travels with its other <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>.</p>
 <p>A cached prompt no longer reserves its pages, so the pool no longer limits how many
 requests are admitted. It has to hold the decode of every request allowed to run at once,
-and a decode step that finds no free page holds its requests until they time out. Two
-settings prevent that. <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> caps how many requests run at once, and
-the pool’s pages divided by the pages one request needs, prompt and output together, is a
-safe value. <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code> gives a full pool a request to move to the host.</p>
+and a decode step that finds no free page holds its requests until they time out.
+<code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> prevents that. It caps how many requests run at once, and the
+pool’s pages divided by the pages one request needs, prompt and output together, is a
+safe value. <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code> lets a full pool move a request to the host. An offload
+frees only the device pages no other running request reads, though, so a request that
+shares most of its prompt frees little. Offload helps a pool that runs short now and then.
+It doesn’t replace the cap.</p>
 <p><strong>Single GPU.</strong> Everything on rank 0:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">model</span><span class="p">:</span><span class="w"> </span><span class="s">"bagel"</span>
 <span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32768</span>
