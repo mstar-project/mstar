@@ -223,6 +223,8 @@ class PerRequestInfo:
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
     pending_new_token_counts: dict[str, int] = field(default_factory=dict)
     stream_buffers: dict[str, StreamBuffer] = field(default_factory=dict)  # edge_name -> StreamBuffer
+    # edges whose final chunk a built step consumed; a returned chunk leaves again
+    ended_streams: set[str] = field(default_factory=set)
     current_output_chunks: list[str] = field(default_factory=list)
     output_loop_indices: dict[str, NestedLoopIndices] = field(default_factory=dict)
 

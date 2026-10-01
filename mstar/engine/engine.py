@@ -202,9 +202,12 @@ class ExecutingBatch:
     per_request_input_tensors: Mapping[str, NameToTensorList] = field(
         default_factory=dict
     )
-    # rids whose consumed streaming input was the final chunk — this step
-    # reports the partition done
+    # rids for which this step ends every finite stream into the node; the
+    # consumer flushes what it held back
     final_stream_rids: set[str] = field(default_factory=set)
+    # rids for which this step ends every finite stream into the partition;
+    # this step reports the partition done
+    stream_partition_done_rids: set[str] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -603,8 +606,8 @@ class Engine:
                     fwd_info=batch.per_request_info[rid],
                     inputs=batch.per_request_input_tensors.get(rid, {}),
                     resources=self._submodules[batch.node_name].resources,
-                    # a stream consumer's last chunk: the step that must flush
-                    # whatever it held back (a vocoder's crossfade tail, the
+                    # the step that ends the last of the node's streams: it must
+                    # flush whatever it held back (a vocoder's crossfade tail, the
                     # look-ahead frames a token encoder withholds)
                     is_final_stream_chunk=rid in batch.final_stream_rids,
                 )
