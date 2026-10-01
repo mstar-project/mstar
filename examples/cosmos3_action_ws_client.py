@@ -40,6 +40,8 @@ def main() -> None:
     ap.add_argument("--fps", type=float, default=15.0, help="control rate the chunk is consumed at (for the budget)")
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--pipeline", type=int, default=1, help="observations in flight (1 = strict request/response)")
+    ap.add_argument("--warmup", type=int, default=1,
+                    help="leading chunks excluded from the rates (the first request of a shape pays JIT/capture)")
     args = ap.parse_args()
 
     with open(args.image, "rb") as f:
@@ -68,6 +70,7 @@ def main() -> None:
     uri = f"ws://{args.host}:{args.port}/generate/ws"
     latencies: list[float] = []
     sent: dict[str, float] = {}
+    finished_at: list[float] = []
     with websockets.sync.client.connect(uri, max_size=None) as ws:
         t_start = time.perf_counter()
         next_i = 0
@@ -88,16 +91,23 @@ def main() -> None:
                       f"latency {latencies[-1] * 1000:.0f} ms")
             if reply.get("finish"):
                 done += 1
+                finished_at.append(time.perf_counter())
                 if next_i < args.iters:
                     sent[f"obs-{next_i}"] = time.perf_counter()
                     ws.send(observation(next_i))
                     next_i += 1
         wall = time.perf_counter() - t_start
-    med = statistics.median(latencies)
+    warm = min(args.warmup, len(latencies) - 1) if len(latencies) > 1 else 0
+    steady = latencies[warm:]
+    steady_wall = finished_at[-1] - (finished_at[warm - 1] if warm else t_start)
+    n = len(steady)
+    med = statistics.median(steady)
     budget = args.chunk / args.fps
-    print(f"\n{args.iters} chunks in {wall:.2f}s: {args.iters / wall:.2f} chunks/s, "
-          f"{args.iters * args.chunk / wall:.1f} actions/s; latency median {med * 1000:.0f} ms, "
-          f"p95 {sorted(latencies)[int(0.95 * (len(latencies) - 1))] * 1000:.0f} ms; "
+    warm_ms = ", ".join(f"{x * 1000:.0f} ms" for x in latencies[:warm])
+    print(f"\n{args.iters} chunks in {wall:.2f}s (first {warm} excluded as warmup: {warm_ms}); "
+          f"steady state {n} chunks in {steady_wall:.2f}s: "
+          f"{n / steady_wall:.2f} chunks/s, {n * args.chunk / steady_wall:.1f} actions/s; "
+          f"latency median {med * 1000:.0f} ms, p95 {sorted(steady)[int(0.95 * (n - 1))] * 1000:.0f} ms; "
           f"budget for {args.chunk} actions at {args.fps:g} Hz = {budget:.2f}s -> RTF {budget / med:.2f}")
 
 
