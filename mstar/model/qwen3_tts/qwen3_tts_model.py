@@ -562,6 +562,9 @@ class Qwen3TTSModel(Model):
         import soundfile
         import torchaudio.functional as audio_functional
 
+        # Bound the clip before decoding it: a small compressed file can hold hours of audio.
+        info = soundfile.info(filepath)
+        self._check_reference_duration(info.frames / info.samplerate if info.samplerate else 0.0)
         waveform, sample_rate = soundfile.read(filepath, dtype="float32", always_2d=True)
         audio = torch.from_numpy(waveform).mean(dim=1)
         target_rate = self.config.codec.input_sample_rate
@@ -643,6 +646,14 @@ class Qwen3TTSModel(Model):
             )
         return instruct
 
+    def _check_reference_duration(self, seconds: float) -> None:
+        low, high = self.config.reference_min_seconds, self.config.reference_max_seconds
+        if not low <= seconds <= high:
+            raise ValueError(
+                f"Qwen3-TTS reference clip is {seconds:.2f} s; it must be "
+                f"between {low:g} and {high:g} s"
+            )
+
     def _resolve_reference(
         self, kwargs: dict[str, Any], tensors: NameToTensorList | None, input_modalities: list[str],
     ) -> tuple[str, int]:
@@ -666,6 +677,9 @@ class Qwen3TTSModel(Model):
                 "Qwen3-TTS Base clones a voice from exactly one reference clip "
                 f"(got {len(clips)}); pass it as the request's audio input"
             )
+        # Both modes run the speaker encoder over the whole clip.
+        num_samples = int(clips[0].reshape(-1).shape[0])
+        self._check_reference_duration(num_samples / self.config.codec.input_sample_rate)
         ref_text = str(kwargs.get("ref_text") or "").strip()
         if kwargs.get("x_vector_only_mode", False):
             return "", 0
@@ -674,7 +688,6 @@ class Qwen3TTSModel(Model):
                 "Qwen3-TTS Base needs 'ref_text' (the reference clip's transcript) "
                 "unless 'x_vector_only_mode' is set"
             )
-        num_samples = int(clips[0].reshape(-1).shape[0])
         frames = self.config.codec.frames_for_samples(num_samples)
         if frames < 1:
             raise ValueError("Qwen3-TTS reference clip is empty")

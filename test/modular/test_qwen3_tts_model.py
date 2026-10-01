@@ -462,6 +462,48 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
         )
 
 
+@pytest.mark.parametrize("x_vector_only_mode", [False, True])
+@pytest.mark.parametrize("seconds", [0.5, 31.0])
+def test_qwen3_tts_base_rejects_reference_clips_outside_the_duration_bounds(seconds, x_vector_only_mode):
+    model = _variant_model("base")
+    clip = torch.zeros(int(seconds * 24000))
+    with pytest.raises(ValueError, match="must be between 1 and 30 s"):
+        model.process_prompt(
+            "hello", input_modalities=["audio", "text"], output_modalities=["audio"],
+            tensors={"audio_inputs": [clip]}, ref_text="x", x_vector_only_mode=x_vector_only_mode,
+        )
+
+
+def test_qwen3_tts_reference_bounds_are_inclusive():
+    model = _variant_model("base")
+    for seconds in (1, 30):
+        tensors = model.process_prompt(
+            "hello", input_modalities=["audio", "text"], output_modalities=["audio"],
+            tensors={"audio_inputs": [torch.zeros(seconds * 24000)]}, ref_text="x",
+        )
+        assert tensors["ref_frames"][0].item() == seconds * 24000 // 1920 + (seconds * 24000 % 1920 > 0)
+
+
+def test_qwen3_tts_load_audio_rejects_a_long_clip_before_decoding(tmp_path, monkeypatch):
+    soundfile = pytest.importorskip("soundfile")
+    np = pytest.importorskip("numpy")
+    model = _variant_model("base")
+    path = tmp_path / "long.wav"
+    soundfile.write(path, np.zeros(31 * 8000, dtype=np.float32), 8000)
+
+    def no_decode(*args, **kwargs):
+        raise AssertionError("the clip was decoded")
+
+    monkeypatch.setattr(soundfile, "read", no_decode)
+    with pytest.raises(ValueError, match="31.00 s"):
+        model.load_audio(str(path), "cpu")
+
+    monkeypatch.undo()
+    ok = tmp_path / "ok.wav"
+    soundfile.write(ok, np.zeros(2 * 8000, dtype=np.float32), 8000)
+    assert model.load_audio(str(ok), "cpu").data.shape == (2 * 24000,)
+
+
 def test_qwen3_tts_base_declares_clone_walks_and_routes_reference_audio():
     model = _variant_model("base")
     walks = model.get_graph_walk_graphs()

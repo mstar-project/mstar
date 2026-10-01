@@ -370,6 +370,10 @@ class Qwen3TTSModelConfig:
     # Present only on Base checkpoints (``speaker_encoder_config`` in
     # config.json); CustomVoice and VoiceDesign carry no speaker encoder.
     speaker_encoder: Qwen3TTSSpeakerEncoderConfig | None = None
+    # Accepted reference-clip duration (Base), as vLLM-Omni: longer clips exhaust
+    # the worker or degrade the clone, shorter ones are too little speech.
+    reference_min_seconds: float = 1.0
+    reference_max_seconds: float = 30.0
 
     SUPPORTED_MODEL_TYPES = ("custom_voice", "voice_design", "base")
 
