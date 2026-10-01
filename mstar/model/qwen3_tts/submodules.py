@@ -74,8 +74,10 @@ from mstar.model.qwen3_tts.config import (
     Qwen3TTSModelConfig,
 )
 from mstar.model.submodule_base import (
+    EMPTY_INPUT_METADATA,
     ARNodeInputs,
     ARNodeSubmodule,
+    InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -1004,15 +1006,16 @@ class CodecSubmodule(ARNodeSubmodule):
         )
 
     @staticmethod
-    def _codec_chunk(stream_chunks: Mapping[str, StreamChunkInfo] | None) -> StreamChunkInfo | None:
+    def _codec_chunk(input_metadata: InputMetadata | None) -> StreamChunkInfo | None:
         """This window's geometry from the stream buffer (offset, context, items, final)."""
-        return (stream_chunks or {}).get("codec_tokens")
+        return input_metadata.stream_chunks.get("codec_tokens") if input_metadata else None
 
     def prepare_inputs(
         self,
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
     ) -> ARNodeInputs:
         """Remove EOS frames and pad one stream window to its capture bucket.
@@ -1022,8 +1025,8 @@ class CodecSubmodule(ARNodeSubmodule):
         captured window that fits so the ramp's windows and the terminal tail
         all replay CUDA graphs.
         """
-        del graph_walk
-        chunk = self._codec_chunk(kwargs.get("stream_chunks"))
+        del graph_walk, kwargs
+        chunk = self._codec_chunk(input_metadata)
         state = self.request_state(fwd_info.rid_handle)
         if "ref_frames" in inputs and "skip_samples" not in state:
             # Voice clone: the stream leads with the last ``left_context_frames``
@@ -1176,21 +1179,21 @@ class CodecSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         per_request_info: Mapping[str, CurrentForwardPassInfo],
-        per_request_stream_chunks: Mapping[str, Mapping[str, StreamChunkInfo]] | None = None,
+        per_request_input_metadata: Mapping[str, InputMetadata] | None = None,
         **kwargs: Any,
     ) -> Any:
         """The widest window bucket in this batch, which ``preprocess`` pads to.
 
-        Derived from the batch's stream chunk info (available before
-        ``prepare_inputs`` runs, so a pre-planned lease can find its capture);
-        the state written by ``prepare_inputs`` is the fallback for callers
-        without it.
+        Derived from the batch's stream chunk info (``per_request_input_metadata``,
+        available before ``prepare_inputs`` runs, so a pre-planned lease can
+        find its capture); the state written by ``prepare_inputs`` is the
+        fallback for callers without it.
         """
         del graph_walk, kwargs
-        per_request_stream_chunks = per_request_stream_chunks or {}
+        per_request_input_metadata = per_request_input_metadata or {}
         buckets = set()
         for request_id in per_request_info:
-            chunk = self._codec_chunk(per_request_stream_chunks.get(request_id))
+            chunk = self._codec_chunk(per_request_input_metadata.get(request_id))
             if chunk is not None:
                 buckets.add(self._bucket(max(chunk.num_items, 1)))
             else:

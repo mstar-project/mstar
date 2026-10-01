@@ -231,7 +231,7 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
 
     The consumer learns how many leading items of a window are context from
     ``StreamChunk.context_items`` (the worker passes it along as
-    ``engine_inputs.per_request_stream_chunks[rid][edge].context_items``), so it can trim
+    ``input_metadata.stream_chunks[edge].context_items``), so it can trim
     the duplicated output without re-deriving this schedule.
     """
 

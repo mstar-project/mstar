@@ -41,6 +41,7 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
+from mstar.model.submodule_base import InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.utils.containers import ParallelList, RecentSet
@@ -1152,13 +1153,13 @@ class Worker:
                 self.tensor_manager.get_tensor, batch.request_to_worker_graph,
             )
         )
-        per_request_stream_chunks: dict[int, dict[str, StreamChunkInfo]] = {}
+        per_request_input_metadata: dict[int, InputMetadata] = {}
         for request_id, inputs in per_request_inputs.items():
             per_request_info[request_id] = self.request_state.get_fwd_info(
                 request_id, batch_partition
             )
             if chunks := self._stream_chunks_for(request_id, batch.node_name, inputs):
-                per_request_stream_chunks[request_id] = chunks
+                per_request_input_metadata[request_id] = InputMetadata(stream_chunks=chunks)
 
         return self._make_executing_batch(
             node_name=batch.node_name,
@@ -1167,7 +1168,7 @@ class Worker:
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
             final_edges=final_edges,
-            per_request_stream_chunks=per_request_stream_chunks,
+            per_request_input_metadata=per_request_input_metadata,
         )
 
     def _settle_final_streams(
@@ -1212,7 +1213,7 @@ class Worker:
         per_request_input_tensors: dict[int, NameToTensorList],
         per_request_info: dict[int, CurrentForwardPassInfo],
         final_edges: dict[int, set[str]] | None = None,
-        per_request_stream_chunks: dict[int, dict[str, StreamChunkInfo]] | None = None,
+        per_request_input_metadata: dict[int, InputMetadata] | None = None,
     ) -> ExecutingBatch:
         """One step's batch, with the step context the engine drives it through.
 
@@ -1229,7 +1230,7 @@ class Worker:
             per_request_input_tensors=per_request_input_tensors,
             final_stream_rids=final_stream_rids,
             stream_partition_done_rids=stream_partition_done_rids,
-            per_request_stream_chunks=per_request_stream_chunks or {},
+            per_request_input_metadata=per_request_input_metadata or {},
             step_context=StepContext(
                 request_ids=tuple(request_ids),
                 graph_walk=graph_walk,
@@ -1772,8 +1773,8 @@ class Worker:
         loop runs. Leader and follower differ only in how they pick the rids."""
         spec_node = spec_target.node_name
         request_ids = list(request_to_worker_graph)
-        per_request_stream_chunks = {
-            rid: chunks for rid in request_ids
+        per_request_input_metadata = {
+            rid: InputMetadata(stream_chunks=chunks) for rid in request_ids
             if (chunks := self._stream_chunks_for(rid, spec_node, per_request_inputs[rid]))
         }
         spec_batch = ScheduledBatch(
@@ -1800,7 +1801,7 @@ class Worker:
                 for rid, edges in consumed_streaming_edges.items()
                 if any(se.chunk.is_final for se in edges)
             },
-            per_request_stream_chunks=per_request_stream_chunks,
+            per_request_input_metadata=per_request_input_metadata,
         )
         return Speculation(
             scheduled_batch=spec_batch,
@@ -2026,7 +2027,7 @@ class Worker:
                 speculation.node_batch.per_request_input_tensors.pop(r, None)
                 speculation.node_batch.per_request_info.pop(r, None)
                 speculation.scheduled_batch.request_to_worker_graph.pop(r, None)
-                speculation.node_batch.per_request_stream_chunks.pop(r, None)
+                speculation.node_batch.per_request_input_metadata.pop(r, None)
                 # Its final chunks go back below; it must not flush or report done.
                 speculation.node_batch.final_stream_rids.discard(r)
                 speculation.node_batch.stream_partition_done_rids.discard(r)

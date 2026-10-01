@@ -35,7 +35,7 @@ from mstar.model.qwen3_tts.config import (
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 from mstar.model.qwen3_tts.submodules import CodecSubmodule, TalkerSubmodule
 from mstar.model.registry import HF_MODELS, get_model_class
-from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
+from mstar.model.submodule_base import ARNodeInputs, InputMetadata, ModelInputsFromEngine
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
@@ -1320,7 +1320,8 @@ def test_qwen3_tts_codec_postprocess_uses_its_own_pass_geometry():
     def prepare(codes, context):
         chunk = StreamChunkInfo(start_offset=0, context_items=context, num_items=codes.shape[0], is_final=False)
         return submodule.prepare_inputs(
-            "codec_chunk", fwd_info, {"codec_tokens": [codes]}, stream_chunks={"codec_tokens": chunk},
+            "codec_chunk", fwd_info, {"codec_tokens": [codes]},
+            input_metadata=InputMetadata(stream_chunks={"codec_tokens": chunk}),
         )
 
     first = prepare(torch.ones(1, 4, dtype=torch.long), 0)
@@ -1372,9 +1373,9 @@ def test_qwen3_tts_codec_filters_eos_and_pads_to_capture_shape():
         "codec_chunk",
         SimpleNamespace(request_id="request", rid_handle="request"),
         {"codec_tokens": [codes]},
-        stream_chunks={"codec_tokens": StreamChunkInfo(
+        input_metadata=InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(
             start_offset=1, context_items=1, num_items=3, is_final=False,
-        )},
+        )}),
     )
 
     # Three items (one of them EOS) pad up to the smallest captured window (4).
@@ -1432,7 +1433,8 @@ def test_qwen3_tts_streaming_policy_ramps_and_flushes_only_new_tail_audio():
     tail_codes = tail.data["data"].view(3, 1).expand(3, 4)
     prepared = codec.prepare_inputs(
         "codec_chunk", SimpleNamespace(request_id="request", rid_handle="request"),
-        {"codec_tokens": [tail_codes]}, stream_chunks={"codec_tokens": tail.info},
+        {"codec_tokens": [tail_codes]},
+        input_metadata=InputMetadata(stream_chunks={"codec_tokens": tail.info}),
     )
     assert prepared.tensor_inputs["codec_tokens"].shape == (4, 4)   # 3 frames padded to the 4-frame bucket
     outputs = {"audio_chunk": [torch.arange(16)]}
@@ -1486,9 +1488,9 @@ def test_qwen3_tts_codec_batches_and_declares_cuda_graphs():
     # The batch's capture key is the bucket its requests pad to: read off the
     # stream chunk info when present (before prepare_inputs), else off the state.
     def chunks(num_items):
-        return {"codec_tokens": StreamChunkInfo(
+        return InputMetadata(stream_chunks={"codec_tokens": StreamChunkInfo(
             start_offset=0, context_items=0, num_items=num_items, is_final=False,
-        )}
+        )})
 
     infos = {"a": None, "b": None}
     assert submodule.cg_key_info("codec_chunk", infos, {"a": chunks(3), "b": chunks(4)}) == 4
