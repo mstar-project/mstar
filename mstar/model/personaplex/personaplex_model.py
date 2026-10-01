@@ -33,7 +33,7 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
-from mstar.engine.resources.kv.config import KVConfig, KVSpec
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
@@ -89,7 +89,7 @@ class PersonaPlexModel(Model):
         submodule, not a resource (worklog §4.4; Qwen3-TTS precedent).
         """
         c = self.lm_config
-        kv = KVConfig(
+        kv = PagedKVConfig(
             num_layers=c.num_layers, num_kv_heads=c.num_heads, head_dim=c.head_dim,
             max_seq_len=cfg.MAX_TEMPORAL_FORWARDS, num_qo_heads=c.num_heads,
         )

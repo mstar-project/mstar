@@ -15,13 +15,17 @@ import torch
 
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import ResultTensors
-from mstar.communication.tensors import TensorCommunicationManager, TensorStore
+from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
+from mstar.communication.tensors import SharedMemoryCommunicationManager, TensorCommunicationManager
 from mstar.graph.base import GraphEdge, Loop, Sequential, TensorPointerInfo
 from mstar.graph.graph_io import WorkerGraphIO
+from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput
+from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.personaplex import config as cfg
 from mstar.model.personaplex.personaplex_model import GENERATE_AUDIO_WALK, PersonaPlexModel
 from mstar.model.personaplex.voice import load_voice_preset, resolve_voice_path
+from mstar.utils.containers import ParallelList
 
 CONFIG_PATH = str(Path(__file__).resolve().parents[2] / "configs" / "personaplex.yaml")
 LM_WALKS = (cfg.CONDITIONING_WALK, cfg.GENERATE_WALK, GENERATE_AUDIO_WALK)
@@ -109,7 +113,7 @@ def test_t9_lm_loop_backs_are_consumed_and_outputs_routed():
 
 
 def _step(model, metadata, persist):
-    return model.get_partition_forward_pass_args("default", metadata, persist)
+    return model.get_partition_forward_pass_args("default", metadata, persist, incoming_connections=[])
 
 
 def test_t9_schedule_encode_condition_generate_done_with_persisted_state():
@@ -152,14 +156,14 @@ def test_t9_audio_only_requests_use_the_walk_without_text_emission():
     assert args.full_metadata.kwargs["walk_schedule"][-1] == GENERATE_AUDIO_WALK
 
 
-@pytest.mark.parametrize("with_text", [False, True], ids=["audio-only", "audio-plus-text"])
-def test_t9_data_worker_emits_requested_modalities(with_text):
+@pytest.mark.parametrize("with_text,reverse_ready", [(False, False), (True, False), (True, True)],
+                         ids=["audio-only", "audio-plus-text", "audio-read-first"])
+def test_t9_data_worker_emits_requested_modalities(with_text, reverse_ready):
     """Exercise transfer setup and the real edge-name to ResultChunk boundary.
 
-    The worker sends ``ResultTensors.modality = edge.output_modality``
-    (worker.py:1055-1059) and ``_read_result_tensor`` renames the edge to
-    ``f"{modality}_output"`` (data_worker.py:419), so the producer name
-    ``text_frame`` never reaches postprocessing.
+    The graph runtime sends ``ResultTensors.modality = edge.output_modality``;
+    ``_read_result_tensor`` renames the edge to ``f"{modality}_output"``, so
+    the producer name ``text_frame`` never reaches postprocessing.
     """
     model = _model()
     walk = model.get_graph_walk_graphs()[cfg.GENERATE_WALK if with_text else GENERATE_AUDIO_WALK]
@@ -184,21 +188,22 @@ def test_t9_data_worker_emits_requested_modalities(with_text):
             self.ready.extend(graph_edges)
 
         def get_ready_tensors(self):
-            return {"request": self.ready}
+            return {"request": list(reversed(self.ready)) if reverse_ready else self.ready}
 
-        def get_tensor(self, request_id, uuid):
-            assert request_id == "request"
+        def get_tensor(self, uuid):
             return tensors[uuid]
 
-        def dereference(self, request_id, uuid):
-            self.released.append((request_id, uuid))
+        def dereference(self, uuid):
+            self.released.append(uuid)
 
     worker = types.SimpleNamespace(
         tensor_manager=ReadyTensors(), model=model, out_queue=SimpleQueue(),
         request_model_kwargs={},
         tensor_uuid_to_metadata_per_request={},
+        request_output_state={}, enable_nvtx=False,
     )
-    worker._fail_request = lambda _rid, exc, _stage: pytest.fail(f"data worker failed: {exc}")
+    worker._queue_completed_output = types.MethodType(PreprocessWorkerThread._queue_completed_output, worker)
+    worker._fail_request = lambda _rid, exc, _stage, **_kw: pytest.fail(f"data worker failed: {exc}")
     for edge in edges:
         PreprocessWorkerThread._read_result_tensor(worker, ResultTensors(
             request_id="request", modality=edge.output_modality,
@@ -213,7 +218,7 @@ def test_t9_data_worker_emits_requested_modalities(with_text):
         assert chunks[0].data == b" w4"
     assert chunks[-1].data == (torch.tensor([0.5]) * 32767).to(torch.int16).numpy().tobytes()
     assert chunks[-1].metadata == {"sample_rate": 24000, "num_channels": 1}
-    assert set(worker.tensor_manager.released) == {("request", uuid) for uuid in tensors}
+    assert set(worker.tensor_manager.released) == set(tensors)
 
 
 def test_t9_conductor_backstops_budget_and_missing_inputs():
@@ -239,33 +244,122 @@ def test_t9_worker_graphs_from_yaml_keep_accumulated_edges():
     assert all(wg.ranks == [0] for wg in graphs)
 
 
+def _personaplex_runtime(tensor_manager):
+    model = _model()
+    graphs = model.get_worker_graphs(CONFIG_PATH)
+    walks = {wg.worker_graph_id: wg.graph_walks for wg in graphs}
+    loops = {wg.worker_graph_id: set(wg.section.get_loops()) for wg in graphs}
+    nodes = {wg.worker_graph_id: set(wg.section.get_nodes()) for wg in graphs}
+    runtime = PythonGraphRuntime(
+        my_worker_id="worker_0", my_worker_graphs=graphs,
+        all_wg_ids_to_graph_walks=walks, all_wg_ids_to_dyn_loops=loops,
+        all_wg_ids_to_nodes=nodes, node_to_partition=dict.fromkeys(model.nodes, "default"),
+        sharding_config=model.get_sharding_config(CONFIG_PATH), tensor_manager=tensor_manager,
+    )
+    generate_ids = [wg.worker_graph_id for wg in graphs if cfg.GENERATE_WALK in wg.graph_walks]
+    mapping = ParallelList([wg.worker_graph_id for wg in graphs], [["worker_0"] for _ in graphs])
+    rid = runtime.add_request("request", "default", cfg.GENERATE_WALK, generate_ids, mapping)
+    return runtime, rid
+
+
+def test_t9_python_graph_runtime_admits_personaplex_generate_walk():
+    """The new runtime must accept the split PersonaPlex worker graphs."""
+    runtime, rid = _personaplex_runtime(_Comm())
+    assert runtime.get_rid_string(rid) == "request"
+    assert {"lm_state", "agent_frame", "text_frame"} <= set(
+        runtime.get_output_signals("LM", cfg.GENERATE_WALK))
+    assert runtime.get_output_signals("MimiDecoder", cfg.GENERATE_WALK) == ["audio_output"]
+    runtime.remove_request(rid)
+
+
+def test_t9_python_runtime_routes_accumulated_personaplex_frames(tmp_path):
+    """Route two LM frames through the runtime for text emission and Mimi decode."""
+    manager = SharedMemoryCommunicationManager(
+        my_entity_id="worker_0", hostname="localhost", device="cpu",
+        communicator=types.SimpleNamespace(send=lambda *a, **kw: None), shm_dir=str(tmp_path),
+    )
+    runtime, rid = _personaplex_runtime(manager)
+    manager.register_request(rid, runtime.get_sharding_config(rid))
+    block = ColumnarEdgeSpecs.empty()
+    for name in ("lm_state", "user_audio_codes", "agent_frame", "text_frame"):
+        block.add_edge(rid, GraphEdge(next_node="LM", name=name))
+    assert runtime.ingest_inputs_batch(block) == []
+    lm_wg = runtime.get_worker_graph_id_for_node("LM", cfg.GENERATE_WALK)
+    outputs = runtime.get_output_signals("LM", cfg.GENERATE_WALK)
+    agent_uuids, text_uuids = [], []
+    for frame in range(2):
+        if frame == 1:
+            runtime.stop_loops_batched(
+                "default", cfg.GENERATE_WALK, "LM", ParallelList([rid], [[cfg.DECODE_LOOP]]),
+            )
+        stored = manager.store_and_return_tensor_info_batch(
+            [rid], {rid: {
+                "lm_state": [torch.tensor([frame])],
+                "agent_frame": [torch.full((8,), frame)],
+                "text_frame": [torch.tensor([frame + 4])],
+            }}, outputs,
+        )
+        manager.increment_ref_batch_uniform(stored.flat_uuids, 1)
+        agent_uuids.append(stored.flat_uuids[outputs.index("agent_frame")])
+        text_uuids.append(stored.flat_uuids[outputs.index("text_frame")])
+        routed = runtime.complete_and_route_batch(RouteInput(
+            partition="default", graph_walk=cfg.GENERATE_WALK, node_name="LM",
+            output_signals=outputs, wg_ids=ParallelList([rid], [lm_wg]),
+            tensors=stored.flat_uuids, num_tensors=stored.num_tensors,
+        ))
+    completion = runtime._peek_completion(routed.completion_id).routing[rid]
+    assert [(edge.name, [info.uuid for info in edge.tensor_info])
+            for edge in completion.emit_to_client] == [("text_frame", text_uuids)]
+    assert [(edge.name, [info.uuid for info in edge.tensor_info])
+            for edge in completion.routed_to_this_worker_graph] == [("agent_frame", agent_uuids)]
+    # Only the emitted text needs transport staging; agent frames stay local.
+    assert set(routed.register_uuids) == set(text_uuids)
+    decoder_wg = runtime.get_worker_graph_id_for_node("MimiDecoder", cfg.GENERATE_WALK)
+    decoder = runtime._queues[decoder_wg].per_request_queues[rid].get_node("MimiDecoder")
+    assert [info.uuid for info in decoder.ready_signals.ready_inputs["agent_frame"].tensor_info] == agent_uuids
+    audio = manager.store_and_return_tensor_info_batch(
+        [rid], {rid: {"audio_output": [torch.zeros(1, 1920)]}}, ["audio_output"],
+    )
+    manager.increment_ref_batch_uniform(audio.flat_uuids, 1)
+    decoded = runtime.complete_and_route_batch(RouteInput(
+        partition="default", graph_walk=cfg.GENERATE_WALK, node_name="MimiDecoder",
+        output_signals=["audio_output"], wg_ids=ParallelList([rid], [decoder_wg]),
+        tensors=audio.flat_uuids, num_tensors=audio.num_tensors,
+    ))
+    emitted = runtime._peek_completion(decoded.completion_id).routing[rid].emit_to_client
+    assert [(edge.name, edge.output_modality) for edge in emitted] == [("audio_output", "audio")]
+
+
 # --------------------------------------------------------------------------- T8 accumulated outputs
 
 
 class _Comm:
-    """Refcount stand-in exposing what the real Loop/NodeInputs/fanout code touches."""
+    """Use the real Python tensor bookkeeper with the current graph-I/O calls."""
 
     def __init__(self):
-        self.tensor_store = TensorStore()
+        self.tensor_store = TensorStore(bookkeeping=PythonTensorBookkeeping())
 
-    def increment_ref(self, rid, uuid, n=1):
-        self.tensor_store.increment_ref(rid, uuid, n=n)
+    def increment_ref(self, uuid, n=1):
+        self.tensor_store.increment_ref(uuid, n=n)
 
-    def dereference(self, rid, uuid, n=1):
-        self.tensor_store.dereference(rid, uuid, n=n)
+    def dereference(self, uuid, n=1):
+        self.tensor_store.dereference(uuid, n=n)
+
+    def dereference_batch_uniform(self, uuids, n=1):
+        self.tensor_store.dereference_batch_uniform(uuids, n=n)
+
+    def dereference_batch(self, uuids, counts):
+        self.tensor_store.dereference_batch(uuids, counts)
 
     set_output_ref_counts = TensorCommunicationManager.set_output_ref_counts
 
 
-def _drive(walk, initial, *, finish_after=None, rid="r0"):
+def _drive(walk, initial, *, finish_after=None, rid=1):
     """Run a walk on one worker the way worker.py's post-forward path does.
 
-    Real: WorkerGraphIO, Loop caching, NodeInputs.clear, TensorStore,
-    set_output_ref_counts. Transcribed (single worker): safety hold of 1 per
-    produced tensor (worker.py:2213-2230), input cleanup before
-    mark_node_complete (2045-2057), local ingest or client emission
-    (node_manager_utils.py:392-531), fanout adjustment (2252-2270), and the
-    API server's receipt ack for emitted tensors (worker.py:513-518).
+    Real: WorkerGraphIO, Loop caching, NodeInputs.clear, TensorStore and
+    set_output_ref_counts. The single-worker routing and safety hold are
+    transcribed from PythonGraphRuntime.complete_and_route_batch.
     """
     comm = _Comm()
     io = WorkerGraphIO(walk)
@@ -274,17 +368,18 @@ def _drive(walk, initial, *, finish_after=None, rid="r0"):
     out = {"client": [], "decoder_frames": None, "rejected": [], "persisted": []}
 
     def tensor(name, it):
-        uuid = f"{name}@{it}#{next(uid)}"
-        comm.tensor_store.put_tensor(rid, uuid, torch.tensor([it]))
+        uuid = next(uid)
         produced[uuid] = (name, it)
-        return TensorPointerInfo(dims=[1], dtype="int64", nbytes=8, address=0, stride=[1], uuid=uuid,
+        info = TensorPointerInfo(dims=[1], dtype=torch.int64, nbytes=8, address=0, stride=[1], uuid=uuid,
                                  source_session_id="s", source_entity="w0")
+        comm.tensor_store.put_tensor(rid, uuid, torch.tensor([it]), info)
+        return info
 
     pending = []
     for edge in initial:
         if edge.tensor_info == ["external"]:
             info = tensor(edge.name, -1)
-            comm.increment_ref(rid, info.uuid)  # held by the conductor's persisted forward-pass arg
+            comm.increment_ref(info.uuid)  # held by the conductor's persisted forward-pass arg
             edge.tensor_info = [info]
         pending.append(edge)
     while not io.wg_state_registry.is_done:
@@ -303,7 +398,7 @@ def _drive(walk, initial, *, finish_after=None, rid="r0"):
         hold = set()
         for out_name in dict.fromkeys(e.name for e in node.outputs):
             info = tensor(out_name, it)
-            comm.increment_ref(rid, info.uuid)
+            comm.increment_ref(info.uuid)
             hold.add(info.uuid)
             for e in node.outputs:
                 if e.name == out_name:
@@ -324,12 +419,13 @@ def _drive(walk, initial, *, finish_after=None, rid="r0"):
                 out["client"].append((e.name, [produced[i.uuid] for i in e.tensor_info]))
             elif e.persist:
                 out["persisted"].append((e.name, [produced[i.uuid] for i in e.tensor_info]))
-        comm.set_output_ref_counts(rid, hold, routed)
+        comm.set_output_ref_counts(hold, routed)
         for e in outs:
             if e.next_node == EMIT_TO_CLIENT:
                 for i in e.tensor_info:
-                    comm.dereference(rid, i.uuid)
-    refs = {produced[u]: comm.tensor_store.per_req_tensors[rid][u].ref_cnt for u in produced if produced[u][1] >= 0}
+                    comm.dereference(i.uuid)
+    refs = {produced[u]: comm.tensor_store.bookkeeping._ref_info[u].ref_cnt
+            for u in produced if produced[u][1] >= 0}
     return out, runs, refs
 
 
