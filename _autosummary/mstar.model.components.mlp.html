@@ -654,10 +654,10 @@ need TP.
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>) – whether the linears have a bias term.</p></li>
-<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>intermediate_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>activation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>Callable</em>)</p></li>
+<li><p><strong>bias</strong> (<em>bool</em>) – whether the linears have a bias term.</p></li>
+<li><p><strong>hidden_size</strong> (<em>int</em>)</p></li>
+<li><p><strong>intermediate_size</strong> (<em>int</em>)</p></li>
+<li><p><strong>activation</strong> (<em>str</em><em> | </em><em>Callable</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -693,11 +693,11 @@ registered hooks while the latter silently ignores them.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – input/output feature dim.</p></li>
-<li><p><strong>intermediate_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – gate/up output and down input feature dim.</p></li>
-<li><p><strong>activation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>Callable</em>) – activation applied to the gate path. Either an HF
+<li><p><strong>hidden_size</strong> (<em>int</em>) – input/output feature dim.</p></li>
+<li><p><strong>intermediate_size</strong> (<em>int</em>) – gate/up output and down input feature dim.</p></li>
+<li><p><strong>activation</strong> (<em>str</em><em> | </em><em>Callable</em>) – activation applied to the gate path. Either an HF
 string (<code class="docutils literal notranslate"><span class="pre">silu</span></code> / <code class="docutils literal notranslate"><span class="pre">gelu</span></code> / <code class="docutils literal notranslate"><span class="pre">gelu_tanh</span></code>) or a callable.</p></li>
-<li><p><strong>bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>) – whether the linears have a bias term.</p></li>
+<li><p><strong>bias</strong> (<em>bool</em>) – whether the linears have a bias term.</p></li>
 </ul>
 </dd>
 </dl>
@@ -749,12 +749,12 @@ transformer FFNs, use <code class="docutils literal notranslate"><span class="pr
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>input_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – input feature dim.</p></li>
-<li><p><strong>intermediate_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – hidden feature dim.</p></li>
-<li><p><strong>output_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>) – output feature dim. Defaults to <code class="docutils literal notranslate"><span class="pre">input_size</span></code> if
+<li><p><strong>input_size</strong> (<em>int</em>) – input feature dim.</p></li>
+<li><p><strong>intermediate_size</strong> (<em>int</em>) – hidden feature dim.</p></li>
+<li><p><strong>output_size</strong> (<em>int</em><em> | </em><em>None</em>) – output feature dim. Defaults to <code class="docutils literal notranslate"><span class="pre">input_size</span></code> if
 None.</p></li>
-<li><p><strong>activation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>Callable</em>) – activation between the two linears.</p></li>
-<li><p><strong>bias</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>) – whether the linears have a bias term.</p></li>
+<li><p><strong>activation</strong> (<em>str</em><em> | </em><em>Callable</em>) – activation between the two linears.</p></li>
+<li><p><strong>bias</strong> (<em>bool</em>) – whether the linears have a bias term.</p></li>
 </ul>
 </dd>
 </dl>

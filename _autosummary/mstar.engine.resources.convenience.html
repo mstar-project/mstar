@@ -613,7 +613,7 @@
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.convenience.AttentionCallable">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.convenience.</span></span><span class="sig-name descname"><span class="pre">AttentionCallable</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">attn</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/convenience.html#AttentionCallable"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.convenience.AttentionCallable" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <p>A convenience wrapper around kv and attn that wraps the KV write and
 attention call in one pure-tensor function, with helper methods for
 setting layer and label information.</p>
@@ -639,7 +639,7 @@ explicitly rather than use this.</p>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>label</strong> (<em>str</em>)</p></li>
 <li><p><strong>attn</strong> (<a class="reference internal" href="mstar.engine.resources.attn.base.html#mstar.engine.resources.attn.base.AttentionManager" title="mstar.engine.resources.attn.base.AttentionManager"><em>AttentionManager</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
@@ -651,7 +651,7 @@ explicitly rather than use this.</p>
 
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.convenience.AttentionCallable.label">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">label</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.convenience.AttentionCallable.label" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">label</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></span><a class="headerlink" href="#mstar.engine.resources.convenience.AttentionCallable.label" title="Link to this definition">#</a></dt>
 <dd><p>This step’s label. Read through to the resource, not stored here, so
 one instance can drive a whole stack of per-layer callables — and so a
 layer that no longer takes a label as an argument can still reach it
@@ -663,7 +663,7 @@ layer that no longer takes a label as an argument can still reach it
 <span class="sig-name descname"><span class="pre">set_layer_idx</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">layer_idx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/convenience.html#AttentionCallable.set_layer_idx"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.convenience.AttentionCallable.set_layer_idx" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>layer_idx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+<dd class="field-odd"><p><strong>layer_idx</strong> (<em>int</em>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>

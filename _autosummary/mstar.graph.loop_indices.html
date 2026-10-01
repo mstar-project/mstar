@@ -615,7 +615,7 @@
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.graph.loop_indices.NestedLoopIndices">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.graph.loop_indices.</span></span><span class="sig-name descname"><span class="pre">NestedLoopIndices</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">loop_name_order</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loop_indices</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">wg_fwd_pass_idx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/graph/loop_indices.html#NestedLoopIndices"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.graph.loop_indices.NestedLoopIndices" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <p>A snapshot of where execution is across nested loops at a given moment.</p>
 <p>Used by the conductor’s stop-loop ordering to decide whether a freshly-
 received stop request is “newer” than a previously-applied one — so we
@@ -623,9 +623,9 @@ don’t double-stop the same loop when re-ordering messages.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>loop_name_order</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
-<li><p><strong>loop_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-<li><p><strong>wg_fwd_pass_idx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>loop_name_order</strong> (<em>list</em><em>[</em><em>str</em><em>]</em>)</p></li>
+<li><p><strong>loop_indices</strong> (<em>dict</em><em>[</em><em>str</em><em>, </em><em>int</em><em>]</em>)</p></li>
+<li><p><strong>wg_fwd_pass_idx</strong> (<em>int</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -641,23 +641,23 @@ re-stop it again when <code class="docutils literal notranslate"><span class="pr
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>other</strong> (<a class="reference internal" href="#mstar.graph.loop_indices.NestedLoopIndices" title="mstar.graph.loop_indices.NestedLoopIndices"><em>NestedLoopIndices</em></a><em> | </em><em>None</em>)</p></li>
-<li><p><strong>target_loop_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>target_loop_name</strong> (<em>str</em><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+<dd class="field-even"><p>bool</p>
 </dd>
 </dl>
 </dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.graph.loop_indices.NestedLoopIndices.loop_indices">
-<span class="sig-name descname"><span class="pre">loop_indices</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.graph.loop_indices.NestedLoopIndices.loop_indices" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">loop_indices</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.graph.loop_indices.NestedLoopIndices.loop_indices" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.graph.loop_indices.NestedLoopIndices.loop_name_order">
-<span class="sig-name descname"><span class="pre">loop_name_order</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.graph.loop_indices.NestedLoopIndices.loop_name_order" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">loop_name_order</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">list</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.graph.loop_indices.NestedLoopIndices.loop_name_order" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -675,7 +675,7 @@ re-stop it again when <code class="docutils literal notranslate"><span class="pr
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.graph.loop_indices.NestedLoopIndices.wg_fwd_pass_idx">
-<span class="sig-name descname"><span class="pre">wg_fwd_pass_idx</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.graph.loop_indices.NestedLoopIndices.wg_fwd_pass_idx" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">wg_fwd_pass_idx</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.graph.loop_indices.NestedLoopIndices.wg_fwd_pass_idx" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>

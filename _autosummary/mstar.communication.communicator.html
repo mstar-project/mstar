@@ -658,13 +658,13 @@
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.communication.communicator.BaseCommunicator">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.communicator.</span></span><span class="sig-name descname"><span class="pre">BaseCommunicator</span></span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#BaseCommunicator"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.BaseCommunicator" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/abc.html#abc.ABC" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ABC</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">ABC</span></code></p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.communicator.BaseCommunicator.get_all_new_messages">
 <span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">get_all_new_messages</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#BaseCommunicator.get_all_new_messages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.BaseCommunicator.get_all_new_messages" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a></p>
+<dd class="field-odd"><p>list</p>
 </dd>
 </dl>
 </dd></dl>
@@ -675,7 +675,7 @@
 <dd><p>entity_id: worker_xyz, conductor, or api_server</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+<dd class="field-odd"><p><strong>entity_id</strong> (<em>str</em>)</p>
 </dd>
 </dl>
 </dd></dl>
@@ -685,7 +685,7 @@
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.communication.communicator.CommProtocol">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.communication.communicator.</span></span><span class="sig-name descname"><span class="pre">CommProtocol</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">values</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#CommProtocol"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.CommProtocol" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/enum.html#enum.Enum" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Enum</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">Enum</span></code></p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.communication.communicator.CommProtocol.IPC">
 <span class="sig-name descname"><span class="pre">IPC</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'IPC'</span></span><a class="headerlink" href="#mstar.communication.communicator.CommProtocol.IPC" title="Link to this definition">#</a></dt>
@@ -738,11 +738,11 @@ silently, so the factory warns when the imported version differs.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>my_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>push_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>my_id</strong> (<em>str</em>)</p></li>
+<li><p><strong>push_ids</strong> (<em>list</em><em>[</em><em>str</em><em>]</em>)</p></li>
 <li><p><strong>protocol</strong> (<a class="reference internal" href="#mstar.communication.communicator.CommProtocol" title="mstar.communication.communicator.CommProtocol"><em>CommProtocol</em></a>)</p></li>
-<li><p><strong>ipc_socket_path_prefix</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>codec</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><em>type</em></a><em>[</em><a class="reference internal" href="mstar.communication.codec.html#mstar.communication.codec.Codec" title="mstar.communication.codec.Codec"><em>Codec</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>ipc_socket_path_prefix</strong> (<em>str</em>)</p></li>
+<li><p><strong>codec</strong> (<em>type</em><em>[</em><a class="reference internal" href="mstar.communication.codec.html#mstar.communication.codec.Codec" title="mstar.communication.codec.Codec"><em>Codec</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -751,7 +751,7 @@ silently, so the factory warns when the imported version differs.</p>
 <span class="sig-name descname"><span class="pre">get_all_new_messages</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">blocking</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">timeout_s</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#ZMQCommunicator.get_all_new_messages"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator.get_all_new_messages" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a></p>
+<dd class="field-odd"><p>list</p>
 </dd>
 </dl>
 </dd></dl>
@@ -769,7 +769,7 @@ method so call sites work against either transport.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.communication.communicator.ZMQCommunicator.push_sockets">
-<span class="sig-name descname"><span class="pre">push_sockets</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Socket</span><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><span class="pre">bytes</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator.push_sockets" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">push_sockets</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Socket</span><span class="p"><span class="pre">[</span></span><span class="pre">bytes</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.communication.communicator.ZMQCommunicator.push_sockets" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -788,7 +788,7 @@ method so call sites work against either transport.</p>
 <dd><p>entity_id: worker_xyz, conductor, or api_server</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+<dd class="field-odd"><p><strong>entity_id</strong> (<em>str</em>)</p>
 </dd>
 </dl>
 </dd></dl>

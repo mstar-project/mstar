@@ -670,7 +670,7 @@ silently break parity if the checkpoint drifted.</p>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.omnivoice.config.</span></span><span class="sig-name descname"><span class="pre">OmniVoiceBackboneConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">hidden_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1024</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_hidden_layers</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">28</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_attention_heads</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_key_value_heads</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">8</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">128</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">intermediate_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">3072</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">vocab_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">151676</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rms_norm_eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-06</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rope_theta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1000000.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_position_embeddings</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">40960</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tie_word_embeddings</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/config.html#OmniVoiceBackboneConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <p>The Qwen3 body, read bidirectionally.</p>
 <p>Identical in shape to <code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code> at 0.6B, with two differences that
 matter at serving time: attention is <strong>non-causal</strong> (every position sees the
@@ -681,73 +681,73 @@ steps.  <code class="docutils literal notranslate"><span class="pre">use_cache</
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>hidden_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>num_hidden_layers</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>num_attention_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>num_key_value_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>intermediate_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>vocab_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>rms_norm_eps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>rope_theta</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>max_position_embeddings</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>tie_word_embeddings</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>hidden_size</strong> (<em>int</em>)</p></li>
+<li><p><strong>num_hidden_layers</strong> (<em>int</em>)</p></li>
+<li><p><strong>num_attention_heads</strong> (<em>int</em>)</p></li>
+<li><p><strong>num_key_value_heads</strong> (<em>int</em>)</p></li>
+<li><p><strong>head_dim</strong> (<em>int</em>)</p></li>
+<li><p><strong>intermediate_size</strong> (<em>int</em>)</p></li>
+<li><p><strong>vocab_size</strong> (<em>int</em>)</p></li>
+<li><p><strong>rms_norm_eps</strong> (<em>float</em>)</p></li>
+<li><p><strong>rope_theta</strong> (<em>float</em>)</p></li>
+<li><p><strong>max_position_embeddings</strong> (<em>int</em>)</p></li>
+<li><p><strong>tie_word_embeddings</strong> (<em>bool</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig.head_dim">
-<span class="sig-name descname"><span class="pre">head_dim</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">128</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.head_dim" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">head_dim</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">128</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.head_dim" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig.hidden_size">
-<span class="sig-name descname"><span class="pre">hidden_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1024</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.hidden_size" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">hidden_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1024</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.hidden_size" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig.intermediate_size">
-<span class="sig-name descname"><span class="pre">intermediate_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">3072</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.intermediate_size" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">intermediate_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">3072</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.intermediate_size" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig.max_position_embeddings">
-<span class="sig-name descname"><span class="pre">max_position_embeddings</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">40960</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.max_position_embeddings" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">max_position_embeddings</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">40960</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.max_position_embeddings" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig.num_attention_heads">
-<span class="sig-name descname"><span class="pre">num_attention_heads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">16</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.num_attention_heads" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">num_attention_heads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">16</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.num_attention_heads" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig.num_hidden_layers">
-<span class="sig-name descname"><span class="pre">num_hidden_layers</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">28</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.num_hidden_layers" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">num_hidden_layers</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">28</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.num_hidden_layers" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig.num_key_value_heads">
-<span class="sig-name descname"><span class="pre">num_key_value_heads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">8</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.num_key_value_heads" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">num_key_value_heads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">8</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.num_key_value_heads" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig.rms_norm_eps">
-<span class="sig-name descname"><span class="pre">rms_norm_eps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1e-06</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.rms_norm_eps" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">rms_norm_eps</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1e-06</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.rms_norm_eps" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig.rope_theta">
-<span class="sig-name descname"><span class="pre">rope_theta</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1000000.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.rope_theta" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">rope_theta</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1000000.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.rope_theta" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig.tie_word_embeddings">
-<span class="sig-name descname"><span class="pre">tie_word_embeddings</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.tie_word_embeddings" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">tie_word_embeddings</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.tie_word_embeddings" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceBackboneConfig.vocab_size">
-<span class="sig-name descname"><span class="pre">vocab_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">151676</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.vocab_size" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">vocab_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">151676</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig.vocab_size" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -755,40 +755,40 @@ steps.  <code class="docutils literal notranslate"><span class="pre">use_cache</
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.omnivoice.config.</span></span><span class="sig-name descname"><span class="pre">OmniVoiceConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">backbone</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">generation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_audio_codebook</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">8</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">audio_vocab_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1025</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">audio_mask_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1024</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">24000</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">frame_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">25.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_target_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">30.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_batch_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_packed_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">24576</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">load_dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'float16'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">checkpoint_dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/config.html#OmniVoiceConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <p>OmniVoice model configuration.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>backbone</strong> (<a class="reference internal" href="#mstar.model.omnivoice.config.OmniVoiceBackboneConfig" title="mstar.model.omnivoice.config.OmniVoiceBackboneConfig"><em>OmniVoiceBackboneConfig</em></a>)</p></li>
 <li><p><strong>generation</strong> (<a class="reference internal" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults" title="mstar.model.omnivoice.config.OmniVoiceGenerationDefaults"><em>OmniVoiceGenerationDefaults</em></a>)</p></li>
-<li><p><strong>num_audio_codebook</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>audio_vocab_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>audio_mask_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>sample_rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>frame_rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>max_target_seconds</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>max_batch_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>max_packed_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>load_dtype</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>checkpoint_dtype</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>num_audio_codebook</strong> (<em>int</em>)</p></li>
+<li><p><strong>audio_vocab_size</strong> (<em>int</em>)</p></li>
+<li><p><strong>audio_mask_id</strong> (<em>int</em>)</p></li>
+<li><p><strong>sample_rate</strong> (<em>int</em>)</p></li>
+<li><p><strong>frame_rate</strong> (<em>float</em>)</p></li>
+<li><p><strong>max_target_seconds</strong> (<em>float</em>)</p></li>
+<li><p><strong>max_batch_size</strong> (<em>int</em>)</p></li>
+<li><p><strong>max_packed_tokens</strong> (<em>int</em>)</p></li>
+<li><p><strong>load_dtype</strong> (<em>str</em>)</p></li>
+<li><p><strong>checkpoint_dtype</strong> (<em>str</em><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig.audio_embedding_rows">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">audio_embedding_rows</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.audio_embedding_rows" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">audio_embedding_rows</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.audio_embedding_rows" title="Link to this definition">#</a></dt>
 <dd><p>Rows in <code class="docutils literal notranslate"><span class="pre">audio_embeddings</span></code> — one codebook’s vocab per row block.</p>
 </dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig.audio_mask_id">
-<span class="sig-name descname"><span class="pre">audio_mask_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1024</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.audio_mask_id" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">audio_mask_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1024</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.audio_mask_id" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig.audio_vocab_size">
-<span class="sig-name descname"><span class="pre">audio_vocab_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1025</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.audio_vocab_size" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">audio_vocab_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1025</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.audio_vocab_size" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -798,12 +798,12 @@ steps.  <code class="docutils literal notranslate"><span class="pre">use_cache</
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig.checkpoint_dtype">
-<span class="sig-name descname"><span class="pre">checkpoint_dtype</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.checkpoint_dtype" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">checkpoint_dtype</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.checkpoint_dtype" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig.frame_rate">
-<span class="sig-name descname"><span class="pre">frame_rate</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">25.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.frame_rate" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">frame_rate</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">25.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.frame_rate" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -813,32 +813,32 @@ steps.  <code class="docutils literal notranslate"><span class="pre">use_cache</
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig.load_dtype">
-<span class="sig-name descname"><span class="pre">load_dtype</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'float16'</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.load_dtype" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">load_dtype</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'float16'</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.load_dtype" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig.max_batch_size">
-<span class="sig-name descname"><span class="pre">max_batch_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">16</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.max_batch_size" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">max_batch_size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">16</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.max_batch_size" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig.max_packed_tokens">
-<span class="sig-name descname"><span class="pre">max_packed_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">24576</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.max_packed_tokens" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">max_packed_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">24576</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.max_packed_tokens" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig.max_target_seconds">
-<span class="sig-name descname"><span class="pre">max_target_seconds</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">30.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.max_target_seconds" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">max_target_seconds</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">30.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.max_target_seconds" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig.num_audio_codebook">
-<span class="sig-name descname"><span class="pre">num_audio_codebook</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">8</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.num_audio_codebook" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">num_audio_codebook</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">8</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.num_audio_codebook" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceConfig.sample_rate">
-<span class="sig-name descname"><span class="pre">sample_rate</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">24000</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.sample_rate" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">sample_rate</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">24000</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.sample_rate" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py method">
@@ -846,10 +846,10 @@ steps.  <code class="docutils literal notranslate"><span class="pre">use_cache</
 <span class="sig-name descname"><span class="pre">seconds_for_target_tokens</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/config.html#OmniVoiceConfig.seconds_for_target_tokens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.seconds_for_target_tokens" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+<dd class="field-odd"><p><strong>tokens</strong> (<em>int</em>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)">float</a></p>
+<dd class="field-even"><p>float</p>
 </dd>
 </dl>
 </dd></dl>
@@ -859,10 +859,10 @@ steps.  <code class="docutils literal notranslate"><span class="pre">use_cache</
 <span class="sig-name descname"><span class="pre">target_tokens_for_seconds</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">seconds</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/config.html#OmniVoiceConfig.target_tokens_for_seconds"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceConfig.target_tokens_for_seconds" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>seconds</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p>
+<dd class="field-odd"><p><strong>seconds</strong> (<em>float</em>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+<dd class="field-even"><p>int</p>
 </dd>
 </dl>
 </dd></dl>
@@ -872,7 +872,7 @@ steps.  <code class="docutils literal notranslate"><span class="pre">use_cache</
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceGenerationDefaults">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.omnivoice.config.</span></span><span class="sig-name descname"><span class="pre">OmniVoiceGenerationDefaults</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">num_step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">32</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">guidance_scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">t_shift</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layer_penalty_factor</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">5.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position_temperature</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">5.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">class_temperature</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">denoise</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_step</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">64</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/config.html#OmniVoiceGenerationDefaults"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <p>Per-request decoding knobs and their defaults.</p>
 <p>Every one of these is per-request: they ride <code class="docutils literal notranslate"><span class="pre">step_metadata</span></code> and are
 resolved once in <code class="docutils literal notranslate"><span class="pre">OmniVoiceModel.get_initial_forward_pass_args</span></code>.  This is
@@ -881,55 +881,55 @@ port has to pick one value for the whole server.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>num_step</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>guidance_scale</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>t_shift</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>layer_penalty_factor</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>position_temperature</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>class_temperature</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>denoise</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
-<li><p><strong>max_num_step</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>num_step</strong> (<em>int</em>)</p></li>
+<li><p><strong>guidance_scale</strong> (<em>float</em>)</p></li>
+<li><p><strong>t_shift</strong> (<em>float</em>)</p></li>
+<li><p><strong>layer_penalty_factor</strong> (<em>float</em>)</p></li>
+<li><p><strong>position_temperature</strong> (<em>float</em>)</p></li>
+<li><p><strong>class_temperature</strong> (<em>float</em>)</p></li>
+<li><p><strong>denoise</strong> (<em>bool</em>)</p></li>
+<li><p><strong>max_num_step</strong> (<em>int</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.class_temperature">
-<span class="sig-name descname"><span class="pre">class_temperature</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.class_temperature" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">class_temperature</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.class_temperature" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.denoise">
-<span class="sig-name descname"><span class="pre">denoise</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.denoise" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">denoise</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.denoise" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.guidance_scale">
-<span class="sig-name descname"><span class="pre">guidance_scale</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">2.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.guidance_scale" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">guidance_scale</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">2.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.guidance_scale" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.layer_penalty_factor">
-<span class="sig-name descname"><span class="pre">layer_penalty_factor</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">5.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.layer_penalty_factor" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">layer_penalty_factor</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">5.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.layer_penalty_factor" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.max_num_step">
-<span class="sig-name descname"><span class="pre">max_num_step</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">64</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.max_num_step" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">max_num_step</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">64</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.max_num_step" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.num_step">
-<span class="sig-name descname"><span class="pre">num_step</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">32</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.num_step" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">num_step</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">32</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.num_step" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.position_temperature">
-<span class="sig-name descname"><span class="pre">position_temperature</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">5.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.position_temperature" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">position_temperature</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">5.0</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.position_temperature" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.t_shift">
-<span class="sig-name descname"><span class="pre">t_shift</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0.1</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.t_shift" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">t_shift</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0.1</span></span><a class="headerlink" href="#mstar.model.omnivoice.config.OmniVoiceGenerationDefaults.t_shift" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>

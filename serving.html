@@ -896,6 +896,16 @@ safe value. <code class="docutils literal notranslate"><span class="pre">cpu_off
 <span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">LLM</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]}</span>
 </pre></div>
 </div>
+<p><strong>Several workers on one GPU.</strong> A worker is one process per rank, and by default rank
+<code class="docutils literal notranslate"><span class="pre">n</span></code> runs on device <code class="docutils literal notranslate"><span class="pre">n</span></code>. <code class="docutils literal notranslate"><span class="pre">rank_devices</span></code> maps ranks onto devices explicitly, so two
+node groups can run as separate workers on the same GPU: a heavy autoregressive node then
+never waits for a light node’s steps on its worker loop (a TTS talker and its codec):</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">node_groups</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">Talker</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]}</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">node_names</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">Codec</span><span class="p p-Indicator">],</span><span class="nt"> ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">1</span><span class="p p-Indicator">]}</span>
+<span class="nt">rank_devices</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt">1</span><span class="p">:</span><span class="w"> </span><span class="nv">0</span><span class="p p-Indicator">}</span>
+</pre></div>
+</div>
 <p><strong>Disaggregation.</strong> The same node can live on different GPUs <em>per graph walk</em> — e.g.
 prefill, decode, and image generation on three GPUs:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">node_groups</span><span class="p">:</span>

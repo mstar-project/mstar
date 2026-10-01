@@ -723,7 +723,7 @@ without a GPU toolchain present.</p>
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>remote_kv_info</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo" title="mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo"><em>CudaIpcKVTransferInfo</em></a>)</p></li>
-<li><p><strong>read_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.transfer.KVReadInfo" title="mstar.engine.resources.kv.transfer.KVReadInfo"><em>KVReadInfo</em></a><em>]</em>)</p></li>
+<li><p><strong>read_info</strong> (<em>list</em><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.transfer.KVReadInfo" title="mstar.engine.resources.kv.transfer.KVReadInfo"><em>KVReadInfo</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -739,28 +739,28 @@ without a GPU toolchain present.</p>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">CudaIpcKVTransferInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">cuda_share</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'tuple'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'tuple'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stride</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'tuple'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">offset</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">requires_grad</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'bool'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'KVLayout'</span></span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#CudaIpcKVTransferInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>cuda_share</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a>)</p></li>
-<li><p><strong>size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a>)</p></li>
-<li><p><strong>stride</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a>)</p></li>
-<li><p><strong>offset</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>requires_grad</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>cuda_share</strong> (<em>tuple</em>)</p></li>
+<li><p><strong>size</strong> (<em>tuple</em>)</p></li>
+<li><p><strong>stride</strong> (<em>tuple</em>)</p></li>
+<li><p><strong>offset</strong> (<em>int</em>)</p></li>
+<li><p><strong>dtype</strong> (<em>str</em>)</p></li>
+<li><p><strong>requires_grad</strong> (<em>bool</em>)</p></li>
 <li><p><strong>layout</strong> (<a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVLayout" title="mstar.engine.resources.kv.config.KVLayout"><em>KVLayout</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.cuda_share">
-<span class="sig-name descname"><span class="pre">cuda_share</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.cuda_share" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">cuda_share</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">tuple</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.cuda_share" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.dtype">
-<span class="sig-name descname"><span class="pre">dtype</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.dtype" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">dtype</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.dtype" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -770,22 +770,22 @@ without a GPU toolchain present.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.offset">
-<span class="sig-name descname"><span class="pre">offset</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.offset" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">offset</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.offset" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.requires_grad">
-<span class="sig-name descname"><span class="pre">requires_grad</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.requires_grad" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">requires_grad</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.requires_grad" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.size">
-<span class="sig-name descname"><span class="pre">size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.size" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">size</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">tuple</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.size" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.stride">
-<span class="sig-name descname"><span class="pre">stride</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.stride" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">stride</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">tuple</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo.stride" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -793,41 +793,41 @@ without a GPU toolchain present.</p>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVReadInfo">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">KVReadInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">layer_idx</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">local_page_idx</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">remote_page_idx</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">token_start</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">token_end</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVReadInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVReadInfo" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>layer_idx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>local_page_idx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>remote_page_idx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>token_start</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>token_end</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>layer_idx</strong> (<em>int</em>)</p></li>
+<li><p><strong>local_page_idx</strong> (<em>int</em>)</p></li>
+<li><p><strong>remote_page_idx</strong> (<em>int</em>)</p></li>
+<li><p><strong>token_start</strong> (<em>int</em>)</p></li>
+<li><p><strong>token_end</strong> (<em>int</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVReadInfo.layer_idx">
-<span class="sig-name descname"><span class="pre">layer_idx</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVReadInfo.layer_idx" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">layer_idx</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVReadInfo.layer_idx" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVReadInfo.local_page_idx">
-<span class="sig-name descname"><span class="pre">local_page_idx</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVReadInfo.local_page_idx" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">local_page_idx</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVReadInfo.local_page_idx" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVReadInfo.remote_page_idx">
-<span class="sig-name descname"><span class="pre">remote_page_idx</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVReadInfo.remote_page_idx" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">remote_page_idx</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVReadInfo.remote_page_idx" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVReadInfo.token_end">
-<span class="sig-name descname"><span class="pre">token_end</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVReadInfo.token_end" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">token_end</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVReadInfo.token_end" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVReadInfo.token_start">
-<span class="sig-name descname"><span class="pre">token_start</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVReadInfo.token_start" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">token_start</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVReadInfo.token_start" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -835,13 +835,13 @@ without a GPU toolchain present.</p>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVTransferEngine">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">KVTransferEngine</span></span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferEngine"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferEngine" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/abc.html#abc.ABC" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ABC</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">ABC</span></code></p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVTransferEngine.get_kv_transfer_info">
 <span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferEngine.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.get_kv_transfer_info" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a></p>
+<dd class="field-odd"><p><em>Any</em></p>
 </dd>
 </dl>
 </dd></dl>
@@ -851,7 +851,7 @@ without a GPU toolchain present.</p>
 <span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">read_batched_async</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">remote_kv_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">read_info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferEngine.read_batched_async"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.read_batched_async" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>read_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.transfer.KVReadInfo" title="mstar.engine.resources.kv.transfer.KVReadInfo"><em>KVReadInfo</em></a><em>]</em>)</p>
+<dd class="field-odd"><p><strong>read_info</strong> (<em>list</em><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.transfer.KVReadInfo" title="mstar.engine.resources.kv.transfer.KVReadInfo"><em>KVReadInfo</em></a><em>]</em>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><em>Future</em> | None</p>
@@ -869,7 +869,7 @@ without a GPU toolchain present.</p>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVTransferManager">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">KVTransferManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">transfer_engine_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferManager" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -896,11 +896,11 @@ without a GPU toolchain present.</p>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>start_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>end_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>local_page_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-<li><p><strong>remote_page_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-<li><p><strong>kv_transfer_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>)</p></li>
+<li><p><strong>start_len</strong> (<em>int</em>)</p></li>
+<li><p><strong>end_len</strong> (<em>int</em>)</p></li>
+<li><p><strong>local_page_indices</strong> (<em>list</em><em>[</em><em>int</em><em>]</em>)</p></li>
+<li><p><strong>remote_page_indices</strong> (<em>list</em><em>[</em><em>int</em><em>]</em>)</p></li>
+<li><p><strong>kv_transfer_info</strong> (<em>Any</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -936,7 +936,7 @@ without a GPU toolchain present.</p>
 <span class="sig-name descname"><span class="pre">read_batched_async</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">remote_kv_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">read_info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#LocalOnlyKVTransferEngine.read_batched_async"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.LocalOnlyKVTransferEngine.read_batched_async" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>read_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.transfer.KVReadInfo" title="mstar.engine.resources.kv.transfer.KVReadInfo"><em>KVReadInfo</em></a><em>]</em>)</p>
+<dd class="field-odd"><p><strong>read_info</strong> (<em>list</em><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.transfer.KVReadInfo" title="mstar.engine.resources.kv.transfer.KVReadInfo"><em>KVReadInfo</em></a><em>]</em>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><em>Future</em> | None</p>
@@ -959,7 +959,7 @@ without a GPU toolchain present.</p>
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>kv_cache</strong> (<a class="reference internal" href="mstar.engine.resources.kv.cache.html#mstar.engine.resources.kv.cache.KVCache" title="mstar.engine.resources.kv.cache.KVCache"><em>KVCache</em></a>)</p></li>
-<li><p><strong>entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>entity_id</strong> (<em>str</em>)</p></li>
 <li><p><strong>transfer_engine</strong> (<a class="reference internal" href="mstar.communication.tensors.html#mstar.communication.tensors.MooncakeTransferEngine" title="mstar.communication.tensors.MooncakeTransferEngine"><em>MooncakeTransferEngine</em></a>)</p></li>
 </ul>
 </dd>
@@ -981,7 +981,7 @@ without a GPU toolchain present.</p>
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>remote_kv_info</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo" title="mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo"><em>MooncakeKVTransferInfo</em></a>)</p></li>
-<li><p><strong>read_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.transfer.KVReadInfo" title="mstar.engine.resources.kv.transfer.KVReadInfo"><em>KVReadInfo</em></a><em>]</em>)</p></li>
+<li><p><strong>read_info</strong> (<em>list</em><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.transfer.KVReadInfo" title="mstar.engine.resources.kv.transfer.KVReadInfo"><em>KVReadInfo</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1000,25 +1000,25 @@ without a GPU toolchain present.</p>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">MooncakeKVTransferInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">entity_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">session_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">data_ptr</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'KVLayout'</span></span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#MooncakeKVTransferInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>session_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>data_ptr</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>entity_id</strong> (<em>str</em>)</p></li>
+<li><p><strong>session_id</strong> (<em>str</em>)</p></li>
+<li><p><strong>data_ptr</strong> (<em>int</em>)</p></li>
 <li><p><strong>layout</strong> (<a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVLayout" title="mstar.engine.resources.kv.config.KVLayout"><em>KVLayout</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.data_ptr">
-<span class="sig-name descname"><span class="pre">data_ptr</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.data_ptr" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">data_ptr</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.data_ptr" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.entity_id">
-<span class="sig-name descname"><span class="pre">entity_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.entity_id" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">entity_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.entity_id" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1028,7 +1028,7 @@ without a GPU toolchain present.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.session_id">
-<span class="sig-name descname"><span class="pre">session_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.session_id" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">session_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.session_id" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1036,24 +1036,24 @@ without a GPU toolchain present.</p>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.TransferEngineInfo">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">TransferEngineInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">my_entity_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">my_session_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">transfer_engine</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'TensorTransferEngine'</span></span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#TransferEngineInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>my_entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>my_session_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>my_entity_id</strong> (<em>str</em>)</p></li>
+<li><p><strong>my_session_id</strong> (<em>str</em>)</p></li>
 <li><p><strong>transfer_engine</strong> (<a class="reference internal" href="mstar.communication.tensors.html#mstar.communication.tensors.TensorTransferEngine" title="mstar.communication.tensors.TensorTransferEngine"><em>TensorTransferEngine</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.TransferEngineInfo.my_entity_id">
-<span class="sig-name descname"><span class="pre">my_entity_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.my_entity_id" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">my_entity_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.my_entity_id" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.TransferEngineInfo.my_session_id">
-<span class="sig-name descname"><span class="pre">my_session_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.my_session_id" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">my_session_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.my_session_id" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">

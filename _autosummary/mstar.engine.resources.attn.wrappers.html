@@ -643,7 +643,7 @@
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.wrappers.FlashInferDecodeWrapper">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.wrappers.</span></span><span class="sig-name descname"><span class="pre">FlashInferDecodeWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">workspace_buffer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_pages</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.device('cuda')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_cuda_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_nvtx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/wrappers.html#FlashInferDecodeWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.wrappers.FlashInferDecodeWrapper" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <p>Batched decode attention with paged KV cache.</p>
 <p>Optimized for the common decode case where each request appends
 exactly 1 new token. Uses BatchDecodeWithPagedKVCacheWrapper.</p>
@@ -651,16 +651,16 @@ exactly 1 new token. Uses BatchDecodeWithPagedKVCacheWrapper.</p>
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>workspace_buffer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – FlashInfer workspace</p></li>
-<li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of query/output heads</p></li>
-<li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of key/value heads</p></li>
-<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – dimension per head</p></li>
-<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – KV cache page size</p></li>
-<li><p><strong>batch_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>) – required for CUDA graph mode (max requests in batch)</p></li>
-<li><p><strong>max_num_pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>) – required for CUDA graph mode (max pages across all requests)</p></li>
+<li><p><strong>num_qo_heads</strong> (<em>int</em>) – number of query/output heads</p></li>
+<li><p><strong>num_kv_heads</strong> (<em>int</em>) – number of key/value heads</p></li>
+<li><p><strong>head_dim</strong> (<em>int</em>) – dimension per head</p></li>
+<li><p><strong>page_size</strong> (<em>int</em>) – KV cache page size</p></li>
+<li><p><strong>batch_size</strong> (<em>int</em><em> | </em><em>None</em>) – required for CUDA graph mode (max requests in batch)</p></li>
+<li><p><strong>max_num_pages</strong> (<em>int</em><em> | </em><em>None</em>) – required for CUDA graph mode (max pages across all requests)</p></li>
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>) – torch device</p></li>
-<li><p><strong>use_cuda_graph</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>) – if True, pre-allocate static buffers for graph capture</p></li>
-<li><p><strong>enable_nvtx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
-<li><p><strong>backend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>use_cuda_graph</strong> (<em>bool</em>) – if True, pre-allocate static buffers for graph capture</p></li>
+<li><p><strong>enable_nvtx</strong> (<em>bool</em>)</p></li>
+<li><p><strong>backend</strong> (<em>str</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -709,7 +709,7 @@ the append; after append it becomes last_page_len).</p>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.attn.wrappers.</span></span><span class="sig-name descname"><span class="pre">FlashInferPrefillWrapper</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">workspace_buffer</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_qo_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_kv_heads</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_total_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_num_pages</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">torch.device('cuda')</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_cuda_graph</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">enable_nvtx</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">backend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/wrappers.html#FlashInferPrefillWrapper"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.wrappers.FlashInferPrefillWrapper" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
 <p>Batched prefill attention with paged KV cache.</p>
 <p>Wraps flashinfer.BatchPrefillWithPagedKVCacheWrapper with optional
 CUDA graph mode using static buffers. KV writes are the KVManager’s job.</p>
@@ -717,17 +717,17 @@ CUDA graph mode using static buffers. KV writes are the KVManager’s job.</p>
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>workspace_buffer</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>) – FlashInfer workspace (256MB+ recommended)</p></li>
-<li><p><strong>num_qo_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of query/output heads</p></li>
-<li><p><strong>num_kv_heads</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – number of key/value heads</p></li>
-<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – dimension per head</p></li>
-<li><p><strong>page_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>) – KV cache page size</p></li>
-<li><p><strong>batch_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>) – required for CUDA graph mode (max requests in batch)</p></li>
-<li><p><strong>max_total_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>) – required for CUDA graph mode (max total new tokens across batch)</p></li>
-<li><p><strong>max_num_pages</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>) – required for CUDA graph mode (max pages across all requests)</p></li>
+<li><p><strong>num_qo_heads</strong> (<em>int</em>) – number of query/output heads</p></li>
+<li><p><strong>num_kv_heads</strong> (<em>int</em>) – number of key/value heads</p></li>
+<li><p><strong>head_dim</strong> (<em>int</em>) – dimension per head</p></li>
+<li><p><strong>page_size</strong> (<em>int</em>) – KV cache page size</p></li>
+<li><p><strong>batch_size</strong> (<em>int</em><em> | </em><em>None</em>) – required for CUDA graph mode (max requests in batch)</p></li>
+<li><p><strong>max_total_tokens</strong> (<em>int</em><em> | </em><em>None</em>) – required for CUDA graph mode (max total new tokens across batch)</p></li>
+<li><p><strong>max_num_pages</strong> (<em>int</em><em> | </em><em>None</em>) – required for CUDA graph mode (max pages across all requests)</p></li>
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>) – torch device</p></li>
-<li><p><strong>use_cuda_graph</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>) – if True, pre-allocate static buffers for graph capture</p></li>
-<li><p><strong>enable_nvtx</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
-<li><p><strong>backend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>use_cuda_graph</strong> (<em>bool</em>) – if True, pre-allocate static buffers for graph capture</p></li>
+<li><p><strong>enable_nvtx</strong> (<em>bool</em>)</p></li>
+<li><p><strong>backend</strong> (<em>str</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -751,7 +751,7 @@ per-token bookkeeping below.</p>
 <li><p><strong>paged_kv_indptr</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>paged_kv_indices</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>paged_kv_last_page_len</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>causal</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>causal</strong> (<em>bool</em>)</p></li>
 <li><p><strong>dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.14)"><em>dtype</em></a>)</p></li>
 </ul>
 </dd>
@@ -790,7 +790,7 @@ wrappers with a stand-in module and toy head dims) is not checked.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>head_dim</strong> (<em>int</em>)</p></li>
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
