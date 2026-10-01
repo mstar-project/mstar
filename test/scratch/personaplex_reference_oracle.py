@@ -8,6 +8,8 @@ Modes:
             hidden states, text/depth logits and greedy tokens (T13-LM).
   mimi      tiny random MimiModel run per 1920-sample frame in streaming mode,
             as offline.py does: latents, codes, tie margins and decoded PCM (T13-Mimi).
+  offline   the whole offline.py pipeline (warmup, .pt voice, persona, user WAV,
+            per-frame encode/step/decode, trim) on the tiny LM and Mimi, greedy.
 
 No mstar imports, checkpoints or network access at runtime. Run in an isolated
 torch<2.5 environment with the pinned NVIDIA package installed. Setup and replay
@@ -395,6 +397,96 @@ def _record_mimi() -> dict:
             "real_state_dict_shapes": real_manifest, "cases": cases, "interleaved": interleaved}
 
 
+def _record_offline(lm_module, lm_kwargs: dict, scratch: Path) -> dict:
+    """Run NVIDIA's offline.py steps 4-12 ([PP] offline.py:200-307) without files or the tokenizer.
+
+    Same tiny LM (with randomised norm scales) and Mimi as the lm/mimi modes.
+    The voice preset is made by NVIDIA's own embed_codes on a token-primed pass
+    and loaded with load_voice_prompt_embeddings; the persona is given as token
+    ids; the user audio is stereo and not a multiple of 1920 samples.
+    """
+    import copy
+
+    import numpy as np
+    from moshi import offline
+
+    config = _lm_config(
+        lm_kwargs, dim=64, num_heads=4, num_layers=2, hidden_scale=4.125,
+        depformer_dim=32, depformer_num_heads=2, depformer_num_layers=2,
+        depformer_dim_feedforward=int(4.125 * 32),
+    )
+    lm_model = lm_module.LMModel(**config, device="cpu", dtype=torch.float32).eval()
+    for name, param in lm_model.named_parameters():
+        if name.endswith(".alpha"):
+            param.copy_(1 + 0.25 * torch.randn_like(param))
+    mimi_data = _record_mimi()
+    from moshi.models import loaders
+
+    mimi = _build_mimi(_mimi_kwargs(loaders)["tiny"])
+    mimi.load_state_dict(mimi_data["state_dict"])
+    mimi.set_num_codebooks(8)
+    other_mimi = copy.deepcopy(mimi)
+
+    # .pt preset from NVIDIA's embed_codes, as save_voice_prompt_embeddings does ([PP] models/lm.py:977-983).
+    maker = lm_module.LMGen(lm_model, device="cpu", use_sampling=False, sample_rate=24000, frame_rate=12.5)
+    sine = torch.tensor(lm_module.SINE_TOKENS).view(1, 8, 1)
+    embeddings = []
+    with maker.streaming(1):
+        for index in range(4):
+            voice = (torch.arange(8).view(1, 8, 1) * 37 + 100 + index * 11) % lm_model.card
+            out = maker.step(sine, voice, 3, return_embeddings=index > 0)
+            if index > 0:
+                embeddings.append(out[1])
+        preset = {"embeddings": torch.stack(embeddings), "cache": maker._streaming_state.cache.clone()}
+    preset_path = scratch / "voice.pt"
+    torch.save(preset, preset_path)
+
+    persona = [7, 11, 19, 23]
+    frames, extra = 130, 777
+    t = np.arange(frames * MIMI_FRAME + extra) / 24000
+    user_audio = np.stack([0.3 * np.sin(2 * np.pi * 330 * t) * np.sin(2 * np.pi * 0.7 * t),
+                           0.3 * np.sin(2 * np.pi * 120 * t)]).astype(np.float32)
+
+    # [PP] offline.py:207-221
+    lm_gen = lm_module.LMGen(
+        lm_model, audio_silence_frame_cnt=int(0.5 * mimi.frame_rate), sample_rate=mimi.sample_rate,
+        device="cpu", frame_rate=mimi.frame_rate, use_sampling=False,
+    )
+    mimi.streaming_forever(1)
+    other_mimi.streaming_forever(1)
+    lm_gen.streaming_forever(1)
+    frame_size = int(mimi.sample_rate / mimi.frame_rate)
+    offline.warmup(mimi, other_mimi, lm_gen, "cpu", frame_size)  # [PP] offline.py:226
+    lm_gen.load_voice_prompt_embeddings(str(preset_path))  # [PP] offline.py:231-233
+    lm_gen.text_prompt_tokens = persona  # in place of sentencepiece.encode(...) at offline.py:241-243
+    mimi.reset_streaming()  # [PP] offline.py:251-255
+    other_mimi.reset_streaming()
+    lm_gen.reset_streaming()
+    lm_gen.step_system_prompts(mimi)
+    mimi.reset_streaming()
+    generated, text_tokens, user_codes = [], [], []
+    for encoded in lm_module.encode_from_sphn(  # [PP] offline.py:268-296
+        mimi, lm_module._iterate_audio(user_audio, sample_interval_size=lm_gen._frame_size, pad=True), max_batch=1,
+    ):
+        for c in range(encoded.shape[-1]):
+            step_in = encoded[:, :, c : c + 1]
+            user_codes.append(step_in.clone())
+            tokens = lm_gen.step(step_in)
+            if tokens is None:
+                continue
+            generated.append(offline.decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens))
+            text_tokens.append(int(tokens[0, 0, 0]))
+    pcm = np.concatenate(generated, axis=-1)  # [PP] offline.py:298-307
+    total = user_audio.shape[-1]
+    pcm = pcm[:total] if pcm.shape[-1] > total else np.concatenate([pcm, np.zeros(total - pcm.shape[-1], pcm.dtype)])
+    return {
+        "lm_kwargs": config, "lm_state_dict": dict(lm_model.state_dict()),
+        "mimi_kwargs": _mimi_kwargs(loaders), "mimi_state_dict": dict(mimi.state_dict()),
+        "voice_preset": preset, "persona_tokens": persona, "user_audio": torch.from_numpy(user_audio),
+        "user_codes": torch.cat(user_codes, -1), "text_tokens": text_tokens, "pcm": torch.from_numpy(pcm),
+    }
+
+
 def _content_hash(fixture: dict) -> str:
     # Invocation paths remain useful provenance, but do not define content identity.
     content = {key: value for key, value in fixture.items() if key != "argv"}
@@ -417,7 +509,7 @@ def _tensor_digest(value) -> object:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True, help="clean NVIDIA/personaplex checkout at the pin")
-    parser.add_argument("--mode", choices=("trace", "manifest", "lm", "mimi"), default="trace")
+    parser.add_argument("--mode", choices=("trace", "manifest", "lm", "mimi", "offline"), default="trace")
     parser.add_argument("--out", type=Path, required=True, help="output directory for the fixture")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--user-frames", type=int, default=20)
@@ -449,6 +541,23 @@ def main() -> None:
         output.write_text(json.dumps(fixture, separators=(",", ":")) + "\n")
         print(f"Recorded {len(fixture['parameters'])} parameters, {fixture['num_parameters']} values to {output}")
         print(f"source={PIN}; torch={torch.__version__}; content_sha256={fixture['content_sha256']}")
+        return
+    if args.mode == "offline":
+        import tempfile
+
+        with torch.no_grad(), no_compile(), tempfile.TemporaryDirectory() as scratch:
+            data = _record_offline(lm_module, _lm_kwargs, Path(scratch))
+        fixture = {"schema_version": 1, **provenance, "argv": sys.argv[1:], "use_sampling": False, "device": "cpu",
+                   "dtype": "float32", **data}
+        digest = {key: _tensor_digest(value) for key, value in fixture.items() if key != "argv"}
+        fixture["content_sha256"] = hashlib.sha256(
+            json.dumps(digest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        output = args.out / "reference_offline.pt"
+        torch.save(fixture, output)
+        print(f"Recorded offline replay: {len(data['text_tokens'])} frames, {data['pcm'].shape[-1]} samples")
+        print(f"source={PIN}; torch={torch.__version__}; bytes={output.stat().st_size}")
+        print(f"content_sha256={fixture['content_sha256']}")
         return
     if args.mode == "mimi":
         with torch.no_grad(), no_compile():

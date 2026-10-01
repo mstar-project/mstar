@@ -388,3 +388,75 @@ def test_mimi_submodules_match_nvidia_streaming_and_trim():
     torch.testing.assert_close(pcm, case["pcm_from_codes"][..., : meta["num_samples"]], rtol=1e-6, atol=1e-6)
     with pytest.raises(ValueError, match="agent frames"):
         decoder.prepare_inputs("generate", info, {"agent_frame": agent[:-1]})
+
+
+def _code_margins(codec, pcm):
+    """Best-vs-second codebook distance per (codebook, frame) along HF's residual path."""
+    quantizer = codec.model.quantizer
+    latent = codec.encode_latent(pcm)
+    margins = []
+    for rvq, count in ((quantizer.semantic_residual_vector_quantizer, 1),
+                       (quantizer.acoustic_residual_vector_quantizer, 7)):
+        residual = rvq.input_proj(latent) if rvq.input_proj is not None else latent
+        for layer in rvq.layers[:count]:
+            embed = layer.codebook.embed
+            dist = torch.cdist(residual[0].T[None].float(), embed[None].float())[0]
+            top = dist.topk(2, largest=False).values
+            margins.append(top[:, 1] - top[:, 0])
+            residual = residual - embed[dist.argmin(-1)].T[None]
+    return torch.stack(margins)
+
+
+@torch.no_grad()
+def test_offline_replay_end_to_end_matches_nvidia_offline_py():
+    """NVIDIA's offline.py pipeline vs M*'s three submodules wired as the graph wires them.
+
+    Tiny random LM and Mimi, greedy: warmup + reset, .pt voice replay, persona,
+    131 user frames from stereo audio (channel 0 used, last frame zero-padded,
+    > 124 frames so Mimi's ring mask matters), per-frame decode, trim to input.
+    """
+    pytest.importorskip("safetensors", reason="mstar.model.loader imports safetensors")
+    with _without_triton_stub():
+        pytest.importorskip("transformers", reason="the Mimi codec builds transformers.MimiModel")
+    data = _fixture("PERSONAPLEX_REFERENCE_OFFLINE", "reference_offline.pt")
+    from mstar.model.personaplex.components import mimi as mimi_mod
+    from mstar.model.personaplex.weights import load_lm_weights
+
+    lm = PersonaPlexLM(cfg.LMArchConfig.from_reference_kwargs(data["lm_kwargs"])).eval()
+    load_lm_weights(lm, data["lm_state_dict"].items())
+    tiny = data["mimi_kwargs"]["tiny"]
+    with _without_triton_stub():
+        mimi_config = mimi_mod.mimi_config_kwargs(tiny["seanet"], tiny["transformer"], tiny["quantizer"])
+        codec = mimi_mod.load_mimi_codec(data["mimi_state_dict"], mimi_config)
+    audio = data["user_audio"][0]  # PersonaPlexModel.load_audio keeps channel 0
+    num_samples = audio.shape[-1]
+    n_user = -(-num_samples // 1920)
+    preset, persona = data["voice_preset"], torch.tensor(data["persona_tokens"])
+    meta = _meta(preset["embeddings"].shape[0], len(persona), n_user)
+    meta["num_samples"] = num_samples
+    info = SimpleNamespace(step_metadata=meta)
+
+    encoder = MimiEncoderSubmodule(codec)
+    prepared = encoder.prepare_inputs(cfg.ENCODE_USER_AUDIO_WALK, info, {"audio_inputs": [audio]})
+    codes = encoder.forward(cfg.ENCODE_USER_AUDIO_WALK, None, **prepared.tensor_inputs)["user_audio_codes"][0]
+    reference_codes = data["user_codes"]
+    # Codes may differ only where fp32 makes the nearest codebook entry a tie; a
+    # residual quantizer then changes that frame's later codebooks too.
+    margins = _code_margins(codec, prepared.tensor_inputs["pcm"])
+    mismatch = (codes != reference_codes)[0]
+    for frame in mismatch.any(0).nonzero().view(-1).tolist():
+        first = int(mismatch[:, frame].nonzero()[0])
+        assert margins[first, frame] < 1e-6, (frame, first, float(margins[first, frame]))
+    assert mismatch.any(0).float().mean() < 0.02
+
+    # Later stages run on NVIDIA's codes so a tie upstream cannot cascade into them.
+    run = _Run(LMSubmodule(lm), meta, preset, persona, reference_codes)
+    _, state = run.walk(cfg.CONDITIONING_WALK, None)
+    generated, _ = run.walk(cfg.GENERATE_WALK, state)
+    assert [int(out["text_frame"][0]) for out in generated] == data["text_tokens"]
+
+    decoder = MimiDecoderSubmodule(codec)
+    node = decoder.prepare_inputs(cfg.GENERATE_WALK, info, {"agent_frame": [o["agent_frame"][0] for o in generated]})
+    pcm = decoder.forward(cfg.GENERATE_WALK, None, **node.tensor_inputs, **node.kwargs)["audio_output"][0]
+    assert pcm.shape == (1, 1, num_samples)
+    torch.testing.assert_close(pcm[0, 0], data["pcm"], rtol=1e-5, atol=1e-5)
