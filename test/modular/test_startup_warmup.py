@@ -34,7 +34,7 @@ def test_warmup_requests_run_as_generate_requests(caplog) -> None:
     specs = [
         {"text": "a drone over a coast", "output_modalities": ["video"], "model_kwargs": {"num_frames": 121}},
         {"text": "hi", "output_modalities": "text,audio"},
-        {"image": "/tmp/obs.jpg", "text": "pick up the mug", "output_modalities": ["action"]},
+        {"files": ["/tmp/obs.jpg"], "text": "pick up the mug", "output_modalities": ["action"]},
     ]
     with caplog.at_level(logging.INFO, logger="mstar.api_server.entrypoint"):
         entrypoint._run_warmup_requests(fake, specs)
@@ -50,6 +50,46 @@ def test_warmup_requests_run_as_generate_requests(caplog) -> None:
     assert caplog.text.count("done in") == 3
 
 
+def test_warmup_files_of_any_modality_keep_prompt_order() -> None:
+    fake = _FakeServer()
+    spec = {
+        "files": [
+            "/tmp/a.jpg",
+            "/tmp/speech.wav",
+            "/tmp/b.png",
+            {"path": "/tmp/clip.bin", "modality": "video"},
+        ],
+        "text": "describe",
+    }
+    entrypoint._run_warmup_requests(fake, [spec])
+    (req,) = fake.submitted
+    assert req["file_paths"] == {
+        "image": ["/tmp/a.jpg", "/tmp/b.png"],
+        "audio": ["/tmp/speech.wav"],
+        "video": ["/tmp/clip.bin"],
+    }
+    assert req["input_modalities"] == ["image", "audio", "image", "video", "text"]
+    assert [(p.modality, p.index) for p in req["prompt_parts"]] == [
+        ("image", 0), ("audio", 0), ("image", 1), ("video", 0), ("text", 0),
+    ]
+    assert req["output_modalities"] == ["text"]
+
+
+def test_malformed_warmups_are_skipped(caplog) -> None:
+    fake = _FakeServer()
+    with caplog.at_level(logging.WARNING, logger="mstar.api_server.entrypoint"):
+        entrypoint._run_warmup_requests(fake, [
+            {"files": ["/tmp/blob.xyz"]},           # modality unknown
+            {"image": "/tmp/a.jpg"},                # unknown key
+            {"text": "x", "model_kwargs": [1]},     # model_kwargs not a mapping
+            {"text": "ok"},
+        ])
+    assert fake.collected == ["warmup-3"]
+    assert "set 'modality'" in caplog.text
+    assert "unknown key(s) ['image']" in caplog.text
+    assert "model_kwargs must be a mapping" in caplog.text
+
+
 def test_a_failing_warmup_is_logged_and_skipped(caplog) -> None:
     fake = _FakeServer(fail_on="warmup-0")
     with caplog.at_level(logging.WARNING, logger="mstar.api_server.entrypoint"):
@@ -62,7 +102,7 @@ def test_a_failing_warmup_is_logged_and_skipped(caplog) -> None:
     assert fake.collected == ["warmup-0", "warmup-2"]
 
 
-def test_hf_image_references_resolve_from_the_cache(monkeypatch) -> None:
+def test_hf_file_references_resolve_from_the_cache(monkeypatch) -> None:
     calls = []
 
     def fake_download(repo_id, filename):
@@ -72,16 +112,16 @@ def test_hf_image_references_resolve_from_the_cache(monkeypatch) -> None:
     import huggingface_hub
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
-    assert entrypoint._resolve_warmup_image("/tmp/obs.jpg") == "/tmp/obs.jpg"
+    assert entrypoint._resolve_warmup_path("/tmp/obs.jpg") == "/tmp/obs.jpg"
     assert (
-        entrypoint._resolve_warmup_image("hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg")
+        entrypoint._resolve_warmup_path("hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg")
         == "/cache/nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg"
     )
     assert calls == [("nvidia/Cosmos3-Edge", "assets/example_i2v_input.jpg")]
     fake = _FakeServer()
-    spec = {"image": "hf://nvidia/Cosmos3-Edge/assets/x.jpg", "output_modalities": ["video"]}
+    spec = {"files": ["hf://nvidia/Cosmos3-Edge/assets/x.jpg"], "output_modalities": ["video"]}
     entrypoint._run_warmup_requests(fake, [spec])
     assert fake.submitted[0]["file_paths"] == {"image": ["/cache/nvidia/Cosmos3-Edge/assets/x.jpg"]}
     # a malformed reference is a failed warmup, not a crash
-    entrypoint._run_warmup_requests(fake, [{"image": "hf://nvidia", "output_modalities": ["video"]}])
+    entrypoint._run_warmup_requests(fake, [{"files": ["hf://nvidia.jpg"], "output_modalities": ["video"]}])
     assert len(fake.submitted) == 1

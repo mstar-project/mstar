@@ -65,6 +65,6 @@ warmup_requests:
     output_modalities: [video]
     model_kwargs: {num_frames: 121, num_inference_steps: 4}
   - text: warmup
-    image: hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
     output_modalities: [video]
     model_kwargs: {window_mode: kv, num_frames: 57, num_inference_steps: 4}

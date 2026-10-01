@@ -35,6 +35,6 @@ node_groups:
 # the observation.
 warmup_requests:
   - text: warmup
-    image: hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_i2v_input.jpg]
     output_modalities: [action]
     model_kwargs: {action_mode: policy, domain_name: droid_lerobot, raw_action_dim: 10}

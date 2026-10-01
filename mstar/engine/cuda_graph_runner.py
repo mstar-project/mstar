@@ -58,13 +58,39 @@ def agree_across_ranks(
     return [bool(value) for value in gathered.tolist()]
 
 
+#: Handles for padding rows. Real handles are >= 0 (they index the worker's rid
+#: table) and -1 is CurrentForwardPassInfo's unstamped default, so counting down
+#: from -2 collides with neither. A padding row IS its handle everywhere the
+#: engine keys by rid; the name it was minted from is kept only so logs and
+#: CurrentForwardPassInfo.request_id stay readable. Memoized per name because a
+#: submodule keys its per-request state by the handle: one shared value would
+#: collapse every padding row onto the same state.
+_DUMMY_HANDLE_BASE = -2
+_dummy_handles: dict[str, int] = {}
+_dummy_names: dict[int, str] = {}
+
+
+def dummy_rid_handle(name: str) -> int:
+    handle = _dummy_handles.get(name)
+    if handle is None:
+        handle = _dummy_handles[name] = _DUMMY_HANDLE_BASE - len(_dummy_handles)
+        _dummy_names[handle] = name
+    return handle
+
+
+def dummy_rid_name(handle: int) -> str:
+    """The name a padding-row handle was minted from. Debug/logging only."""
+    return _dummy_names.get(handle, f"__cg_unknown_{handle}__")
+
+
 def dummy_metadata(
-    rids: list[str], graph_walk: str,
-) -> dict[str, CurrentForwardPassInfo]:
+    rids: list[int], graph_walk: str,
+) -> dict[int, CurrentForwardPassInfo]:
     """Stand-in request info for padding rows, which have no real request."""
     return {
         rid: CurrentForwardPassInfo(
-            request_id=rid,
+            request_id=dummy_rid_name(rid),
+            rid_handle=rid,
             graph_walk=graph_walk,
             fwd_index=0,
             random_seed=0,
@@ -104,6 +130,38 @@ def capture_into_graph(run, pool, device, autocast_dtype):
         raise
     torch.cuda.synchronize(device)
     return graph, output
+
+
+def capture_with_static_outputs(run, warm_outputs, pool, device, autocast_dtype):
+    """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
+
+    ``warm_outputs`` is what ``run`` returned on a warm-up call (``{name:
+    Tensor}``); it fixes the shapes and dtypes. The captured graph ends with a
+    device-to-device copy of each output into a buffer allocated here, before
+    the capture, from the ordinary allocator.
+
+    Why not hand out the graph's own output tensors: blocks a graph frees
+    while it is being captured go back to the pool and are handed to the
+    graphs captured after it, so an output that lived in the pool could sit
+    exactly where an earlier-captured graph keeps its scratch and be
+    overwritten by that graph's next replay. That is harmless while a pool
+    belongs to one region whose graphs replay one at a time and whose
+    outputs are consumed before the next replay, but not once a node's
+    regions share one pool and replay in data-dependent order. Buffers outside
+    the pool stay valid until this graph's own next replay, whatever else the
+    node runs in between.
+    """
+    static_outputs = {
+        name: torch.empty_like(value) for name, value in warm_outputs.items()
+    }
+
+    def captured():
+        for name, value in run().items():
+            static_outputs[name].copy_(value)
+        return static_outputs
+
+    graph, _ = capture_into_graph(captured, pool, device, autocast_dtype)
+    return graph, static_outputs
 
 
 def fail_if_graphs_required(missing: list[str]) -> None:
@@ -148,21 +206,27 @@ class DummyRowPool:
         self._prefix = prefix
         self._step_runner = step_runner
         self._resources = resources
-        self._held: dict[str, list[str]] = {}
+        self._held: dict[str, list[int]] = {}
 
-    def names(self, key: str, bs: int) -> list[str]:
-        return [f"__cg_{self._prefix}_{key}_{i}__" for i in range(bs)]
+    def handles(self, key: str, bs: int) -> list[int]:
+        """``bs`` padding-row handles for ``key``. Negative and stable per
+        (prefix, key, index), so they never collide with a real request's
+        handle nor with another pool's rows."""
+        return [
+            dummy_rid_handle(f"__cg_{self._prefix}_{key}_{i}__")
+            for i in range(bs)
+        ]
 
-    def ensure(self, key: str, bs: int) -> list[str]:
+    def ensure(self, key: str, bs: int) -> list[int]:
         """``bs`` rows for ``key``, ingesting any this pool hasn't opened yet."""
         held = self._held.setdefault(key, [])
-        names = self.names(key, bs)
-        for rid in names[len(held):]:
+        rids = self.handles(key, bs)
+        for rid in rids[len(held):]:
             self._step_runner.ingest_request(rid)
             held.append(rid)
-        return names
+        return rids
 
-    def reset(self, rids: list[str], free: bool=False) -> None:
+    def reset(self, rids: list[int], free: bool=False) -> None:
         for rid in rids:
             for resource in self._resources.values():
                 resource.reset_request(rid, free=free)
@@ -189,8 +253,8 @@ class CudaGraphSlot:
     static_input_keys: tuple[str, ...]
     static_outputs: dict
     # padding rows address these; their streams stay resident between steps
-    dummy_rids: list[str]
-    dummy_metadata: dict[str, CurrentForwardPassInfo]
+    dummy_rids: list[int]
+    dummy_metadata: dict[int, CurrentForwardPassInfo]
     config_idx: int
 
 
@@ -588,7 +652,7 @@ class CudaGraphRunner:
         return self._compiled_forwards[spec.config_idx]
 
     def _dummy_engine_inputs(
-        self, dummy_rids: list[str], graph_walk: str,
+        self, dummy_rids: list[int], graph_walk: str,
     ) -> ModelInputsFromEngine:
         return ModelInputsFromEngine(
             request_ids=list(dummy_rids),
@@ -813,7 +877,7 @@ class CudaGraphRunner:
         )
         return [*inputs, *padding]
 
-    def step_ids(self, lease: SlotLease, request_ids: list[str]) -> list[str]:
+    def step_ids(self, lease: SlotLease, request_ids: list[int]) -> list[int]:
         """The padded addressing for one step: real ids first, then the slot's
         padding ids. Plans, commits, and advances address real request state by
         its own id; only the padding rows run against the slot's own state."""
@@ -821,9 +885,9 @@ class CudaGraphRunner:
         return [*request_ids, *dummy_rids[len(request_ids):lease.bucket.bs]]
 
     def step_metadata(
-        self, lease: SlotLease, request_ids: list[str],
-        per_request_info: Mapping[str, CurrentForwardPassInfo],
-    ) -> dict[str, CurrentForwardPassInfo]:
+        self, lease: SlotLease, request_ids: list[int],
+        per_request_info: Mapping[int, CurrentForwardPassInfo],
+    ) -> dict[int, CurrentForwardPassInfo]:
         slot = self.slot_for(lease)
         meta = {rid: per_request_info[rid] for rid in request_ids}
         for rid in slot.dummy_rids[len(request_ids):lease.bucket.bs]:
@@ -914,7 +978,7 @@ class PiecewiseGraphData:
     graph: torch.cuda.CUDAGraph
     static_inputs: dict[str, torch.Tensor]
     static_outputs: dict[str, torch.Tensor]
-    dummy_rids: list[str]
+    dummy_rids: list[int]
     shape: PiecewiseCaptureShape
     bucket: BucketKey
 
@@ -952,8 +1016,10 @@ class PiecewiseOutput:
         """The leading ``real_len`` slice WITHOUT copying.
 
         The result aliases the runner-owned static output buffer and is
-        OVERWRITTEN by the next ``run``. Read it within the same step; use
-        ``get`` when you need something that outlives the step.
+        OVERWRITTEN by the next ``run`` of this runner. Nothing else writes
+        there: the buffers live outside the graph memory pool, so replays of
+        other regions sharing the node's pool leave them alone. Read it within
+        the same step; use ``get`` when you need something that outlives it.
         """
         value = self._outputs.get(key)
         if value is None:
@@ -994,6 +1060,7 @@ class PiecewiseCudaGraphRunner:
         num_slots: int,
         joint_comm_group: JointGroups | None = None,
         node_name: str | None = None,
+        memory_pool=None,
     ):
         self._label = label
         self._config = config
@@ -1011,7 +1078,7 @@ class PiecewiseCudaGraphRunner:
         )
 
         self._graphs: dict[PiecewiseGraphKey, PiecewiseGraphData] = {}
-        self._memory_pool = None
+        self._memory_pool = memory_pool
         # (bs, total_tokens) shapes that failed to capture and run eagerly
         self.dropped_shapes: list[tuple[int, int]] = []
         self._dummy_rows = DummyRowPool(
@@ -1031,10 +1098,10 @@ class PiecewiseCudaGraphRunner:
         if self._max_slots <= 1 or self._config.declare_step is None:
             return
         for shape in self._config.get_capture_shapes(self._capture_batch_sizes):
-            # names, not `ensure`: the declaration only labels its rows, and
+            # handles, not `ensure`: the declaration only labels its rows, and
             # ingesting here would run before the buffers are built
             step = self._config.declare_step(
-                self._dummy_rows.names(self._dummy_key(shape, 0), shape.bs),
+                self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
                 list(shape.seq_lens),
             )
             if step is not None and any(
@@ -1096,7 +1163,8 @@ class PiecewiseCudaGraphRunner:
             return
 
         torch.cuda.set_device(self._device)
-        self._memory_pool = torch.cuda.graphs.graph_pool_handle()
+        if self._memory_pool is None:
+            self._memory_pool = torch.cuda.graphs.graph_pool_handle()
 
         shapes = self.prepare_for_capture()
         if not shapes:
@@ -1182,24 +1250,25 @@ class PiecewiseCudaGraphRunner:
             )
 
         def run_fn():
-            return fn(call)
+            return self._normalize_output(fn(call))
 
         try:
             self._plan(step, shape)
             torch.cuda.synchronize()
+            warm_outputs = None
             for _ in range(self.NUM_WARMUP):
                 with autocast_scope(self._autocast_dtype):
-                    run_fn()
+                    warm_outputs = run_fn()
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the shapes the first plan did
                 self._dummy_rows.reset(dummy_rids)
                 self._plan(step, shape)
             torch.cuda.synchronize()
 
-            graph, raw_outputs = capture_into_graph(
-                run_fn, self._memory_pool, self._device, self._autocast_dtype,
+            graph, static_outputs = capture_with_static_outputs(
+                run_fn, warm_outputs, self._memory_pool, self._device,
+                self._autocast_dtype,
             )
-            static_outputs = self._normalize_output(raw_outputs)
         finally:
             # pages stay with the dummy streams: replay's padding rows address
             # the same ids, so their plan finds the storage already resident
@@ -1219,7 +1288,7 @@ class PiecewiseCudaGraphRunner:
     def _call_inputs(
         self,
         static_inputs: dict[str, torch.Tensor],
-        step_ids: list[str],
+        step_ids: list[int],
     ) -> PiecewiseCallInputs:
         """What the region is handed, over the padded capture batch.
 
@@ -1238,7 +1307,7 @@ class PiecewiseCudaGraphRunner:
         )
 
     def _declare(
-        self, request_ids: list[str], seq_lens: list[int],
+        self, request_ids: list[int], seq_lens: list[int],
         bucket: BucketKey, capture: bool, slot: int,
         real_bs: int | None = None,
     ):
@@ -1353,7 +1422,7 @@ class PiecewiseCudaGraphRunner:
     def run(
         self,
         static_inputs: dict[str, torch.Tensor],
-        request_ids: list[str] | None = None,
+        request_ids: list[int] | None = None,
         seq_lens: list[int] | None = None,
         real_bs: int | None = None,
     ) -> PiecewiseOutput:

@@ -226,7 +226,7 @@ def test_windowed_kv_prefill_state_and_pacing(monkeypatch) -> None:
         "window_mode": "kv", "total_latent_units": 12, "window_latent_units": 4,
         "overlap_latent_units": 0, "context_latent_units": 6,
     }
-    fwd = SimpleNamespace(request_id="r")
+    fwd = SimpleNamespace(request_id="r", rid_handle="r")
     ni = sub._prepare_windowed_prefill(fwd, md, list(range(7)), list(range(9)), 64, 64, 24.0, 6.0, 4, "cpu")
     assert ni.kwargs["cfg"] and ni.kwargs["seq_lens"] == {COND_LABEL: 7, UNCOND_LABEL: 9}
     st = sub.request_states["r"]
@@ -312,7 +312,7 @@ def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
     )
     x0 = torch.arange(4, dtype=torch.float32).view(1, 1, 4, 1, 1).expand(
         sub._window_latent_shape(64, 64, 4)).contiguous()
-    fwd = SimpleNamespace(request_id="r", random_seed=0)
+    fwd = SimpleNamespace(request_id="r", rid_handle="r", random_seed=0)
 
     # Commit iteration (global 4 = window 0's 5th iteration).
     ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x0], "time_index": [torch.tensor([4])]})
@@ -699,7 +699,7 @@ def test_session_tail_store_and_resume(monkeypatch) -> None:
         "overlap_latent_units": 0, "context_latent_units": 0,
         "session_id": "c", "resume_latent_units": 2,
     }
-    fwd = SimpleNamespace(request_id="r", random_seed=0)
+    fwd = SimpleNamespace(request_id="r", rid_handle="r", random_seed=0)
     sub._prepare_windowed_prefill(fwd, md, list(range(7)), None, 64, 64, 24.0, 1.0, 3, "cpu")
     st = sub.request_states["r"]
     stride = st["ar_tokens_per_unit"]
@@ -764,7 +764,7 @@ _SESSION_MD = {
 
 
 def _prefill(sub, rid, md):
-    fwd = SimpleNamespace(request_id=rid, random_seed=0)
+    fwd = SimpleNamespace(request_id=rid, rid_handle=rid, random_seed=0)
     sub._prepare_windowed_prefill(fwd, md, list(range(7)), None, 64, 64, 24.0, 1.0, 3, "cpu")
 
 

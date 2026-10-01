@@ -552,7 +552,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         node_inputs = self._get_prefill_node_inputs(cond, uncond)
         self._slim_statics(cond, uncond)
-        st = self.request_state(fwd_info.request_id)
+        st = self.request_state(fwd_info.rid_handle)
         st.add_all(
             cond=cond,
             uncond=uncond,
@@ -639,7 +639,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if session_id:
             # Pins the session for this request: a second request on a live
             # session is refused, and the store never evicts it mid-rollout.
-            self._sessions.begin(str(session_id), fwd_info.request_id)
+            self._sessions.begin(str(session_id), fwd_info.rid_handle)
         resume_units = int(md.get("resume_latent_units", 0) or 0)
         resume_tail = None
         if resume_units:
@@ -652,7 +652,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         tokens_per_unit = cond["num_vision_tokens"] // w0.units
         self._slim_statics(cond, uncond)
         iters_per_window = steps + 1 if is_kv else steps
-        st = self.request_state(fwd_info.request_id)
+        st = self.request_state(fwd_info.rid_handle)
         if resume_tail is not None:
             shape = self._window_latent_shape(height, width, w0.units)
             dtype = self.transformer.proj_in.weight.dtype
@@ -680,7 +680,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             ar_iters_per_window=iters_per_window,
             ar_total_iters=schedule.num_windows * iters_per_window,
             ar_kv_mode=is_kv,
-            ar_rid=fwd_info.request_id,
+            ar_rid=fwd_info.rid_handle,
             ar_tokens_per_unit=tokens_per_unit,
             ar_cond_ids=list(cond_ids),
             ar_uncond_ids=list(uncond_ids) if uncond_ids is not None else None,
@@ -1023,7 +1023,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         node_inputs = self._get_prefill_node_inputs(cond, uncond)
         self._slim_statics(cond, uncond)
-        self.request_state(fwd_info.request_id).add_all(
+        self.request_state(fwd_info.rid_handle).add_all(
             cond=cond,
             uncond=uncond,
             gs=gs,
@@ -1045,7 +1045,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def _prepare_image_gen(
         self, graph_walk, fwd_info, inputs, device,
     ) -> ARNodeInputs:
-        st = self.request_states[fwd_info.request_id]
+        st = self.request_states[fwd_info.rid_handle]
         windowed = "ar_schedule" in st
         if "latents" not in inputs or len(inputs["latents"]) == 0:
             self._ingest_cond_latents(st, inputs, device)
@@ -1143,7 +1143,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return token_mask, frame_mask
 
     def _prepare_video_sound_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
-        st = self.request_states[fwd_info.request_id]
+        st = self.request_states[fwd_info.rid_handle]
         if "latents" not in inputs or len(inputs["latents"]) == 0:
             self._ingest_cond_latents(st, inputs, device)
             # First iteration: video noise first, then sound noise from the same
@@ -1182,7 +1182,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         )
 
     def _prepare_action_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
-        st = self.request_states[fwd_info.request_id]
+        st = self.request_states[fwd_info.rid_handle]
         if "latents" not in inputs or len(inputs["latents"]) == 0:
             self._ingest_cond_latents(st, inputs, device)
             # First iteration: build the joint [video | action] latents. Per the
@@ -2894,7 +2894,7 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
                     raise ValueError("Cosmos3 reasoner vision prefill received no vision embeddings.")
                 tensors["vision_embeds"] = vision[0]
             # Decoding continues at max(position) + 1 on every axis.
-            self.request_state(fwd_info.request_id).add_all(
+            self.request_state(fwd_info.rid_handle).add_all(
                 next_pos=int(position_ids.max().item()) + 1,
             )
             return ARNodeInputs(
@@ -2903,7 +2903,7 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
                 tensor_inputs=tensors,
             )
         if graph_walk == REASONER_DECODE_WALK:
-            st = self.request_states[fwd_info.request_id]
+            st = self.request_states[fwd_info.rid_handle]
             token = inputs["text_inputs"][0].reshape(-1)[-1:]
             pos = st["next_pos"]
             st.add("next_pos", pos + 1)

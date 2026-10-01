@@ -154,7 +154,7 @@ def test_distilled_i2v_loop_repins_anchor(tmp_path, monkeypatch) -> None:
         return vel
 
     monkeypatch.setattr(sub, "_denoise", fake_denoise)
-    fwd = SimpleNamespace(request_id="r", random_seed=3, graph_walk="video_gen")
+    fwd = SimpleNamespace(request_id="r", rid_handle="r", random_seed=3, graph_walk="video_gen")
     ei = SimpleNamespace(request_ids=["r"], per_request_states=None, resources={"attn": "paged"}, step=None)
     inputs = {"cond_latents": [anchor]}
     for step in range(4):
@@ -174,14 +174,14 @@ def test_distilled_i2v_loop_repins_anchor(tmp_path, monkeypatch) -> None:
     st2 = sub.request_state("r2")
     st2.add_all(**{k: st[k] for k in ("cond", "uncond", "gs", "guidance_interval", "latent_shape", "num_sound")},
                 scheduler=sub._new_scheduler(4, torch.device("cpu")))
-    fwd2 = SimpleNamespace(request_id="r2", random_seed=3, graph_walk="video_gen")
+    fwd2 = SimpleNamespace(request_id="r2", rid_handle="r2", random_seed=3, graph_walk="video_gen")
     ni = sub.prepare_inputs("video_gen", fwd2, {"cond_latents": [anchor]})
     ei2 = SimpleNamespace(request_ids=["r2"], per_request_states=None, resources={"attn": "paged"}, step=None)
     first2 = sub.forward("video_gen", ei2, **sub.preprocess("video_gen", ei2, [ni]))["latents"][0]
     st3 = sub.request_state("r3")
     st3.add_all(**{k: st[k] for k in ("cond", "uncond", "gs", "guidance_interval", "latent_shape", "num_sound")},
                 scheduler=sub._new_scheduler(4, torch.device("cpu")))
-    fwd3 = SimpleNamespace(request_id="r3", random_seed=3, graph_walk="video_gen")
+    fwd3 = SimpleNamespace(request_id="r3", rid_handle="r3", random_seed=3, graph_walk="video_gen")
     ni = sub.prepare_inputs("video_gen", fwd3, {"cond_latents": [anchor]})
     ei3 = SimpleNamespace(request_ids=["r3"], per_request_states=None, resources={"attn": "paged"}, step=None)
     first3 = sub.forward("video_gen", ei3, **sub.preprocess("video_gen", ei3, [ni]))["latents"][0]

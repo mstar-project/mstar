@@ -243,7 +243,7 @@ def test_reasoner_submodule_step_and_stop(tmp_path) -> None:
     ids = torch.tensor([5, 6, 7, 19, 19, 8])
     pos = torch.zeros(3, 6, dtype=torch.long)
     pos[:, :] = torch.arange(6)
-    fwd = types.SimpleNamespace(request_id="r", step_metadata={})
+    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={})
     inp = sub.prepare_inputs(
         Cosmos3Model.REASONER_PREFILL_VISION_WALK, fwd,
         {"text_inputs": [ids], "position_ids": [pos], "vision_embeds": [torch.zeros(2, 8)]},
@@ -287,7 +287,7 @@ def test_reasoner_padded_decode_batch_shares_one_device(tmp_path) -> None:
 
     model = _model(tmp_path)
     sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config)
-    fwd = types.SimpleNamespace(request_id="r", step_metadata={})
+    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={})
     sub.request_state("r").add_all(next_pos=6)
 
     token = torch.tensor([42])

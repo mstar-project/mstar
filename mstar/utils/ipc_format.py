@@ -44,8 +44,8 @@ class WorkerMessageType(Enum):
 @dataclass
 class NewRequest(MessageBody):
     request_id: str
-    partition_worker_graph_ids: list[str]
-    worker_graph_to_workers: dict[str, list[str]]
+    partition_worker_graph_ids: list[int]
+    worker_graph_to_workers: dict[int, list[str]]
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
 
@@ -75,20 +75,23 @@ class InputSignals(MessageBody):
     inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
     partition_name: str = "default"
-    producer_done: set = field(default_factory=set)
+    # Producer partition names. Declared, not a bare ``set``: a bare one is
+    # untyped on the wire, so an empty set a Rust sender writes came back a
+    # list.
+    producer_done: set[str] = field(default_factory=set)
 
 
 @dataclass
 class TensorReceived(MessageBody):
     request_id: str
-    successful_tensors: dict[str, int] # uuid -> graph edge count
-    failed_tensor_ids: list[str] # uuids
+    successful_tensors: dict[int, int] # uuid -> graph edge count
+    failed_tensor_ids: list[int] # uuids
 
 
 @dataclass
 class UnpersistTensors(MessageBody):
     request_id: str
-    uuid_to_ref_count: dict[str, int]
+    uuid_to_ref_count: dict[int, int]
 
 @dataclass
 class StopLoops(MessageBody):
@@ -146,11 +149,11 @@ class NewRequestConductor(MessageBody):
 @dataclass
 class WorkerGraphsDone(MessageBody):
     request_id: str
-    worker_graph_ids: list[str]
+    worker_graph_ids: list[int]
     is_first_tp_rank: bool
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_token_counts: dict[str, int] = field(default_factory=dict) # name to token counts
-    output_signal_names: int = field(default=0)
+    output_signal_names: list[str] = field(default_factory=list)
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)

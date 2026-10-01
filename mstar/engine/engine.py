@@ -176,7 +176,11 @@ class SubmoduleManagement:
 class ExecutingBatch:
     node_name: str
 
-    per_request_info: Mapping[str, CurrentForwardPassInfo]
+    # Keyed by the worker's integer rid handle. CUDA-graph capture pads with
+    # its own rows, which carry negative handles from the same space (see
+    # cuda_graph_runner.dummy_rid_handle), so a padded batch is still int-keyed
+    # throughout.
+    per_request_info: Mapping[int, CurrentForwardPassInfo]
     step_context: StepContext
 
     running_batched: bool = False
@@ -192,7 +196,7 @@ class ExecutingBatch:
     # The rids the staged plan was built over. The plan is theirs exactly —
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
-    preplanned_rids: tuple[str, ...] | None = None
+    preplanned_rids: tuple[int, ...] | None = None
 
     # Declared once for the batch (pre-plan declares it first when it runs)
     # and driven from here on
@@ -505,6 +509,14 @@ class Engine:
             submodule_mgmt.joint_comm_group.world_size,
         )
         runners: dict[str, PiecewiseCudaGraphRunner] = {}
+        # One graph memory pool for all of the node's regions (see
+        # ``PiecewiseCudaGraphRunner``): its captured-memory footprint becomes
+        # the largest region's rather than the sum over regions.
+        memory_pool = (
+            torch.cuda.graphs.graph_pool_handle()
+            if configs and getattr(self._device, "type", None) == "cuda" and torch.cuda.is_available()
+            else None
+        )
         for label, config in configs.items():
             runner = PiecewiseCudaGraphRunner(
                 label=f"{node_name}_{label}",
@@ -516,6 +528,7 @@ class Engine:
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
                 node_name=node_name,
+                memory_pool=memory_pool,
             )
             runners[label] = runner
         return runners

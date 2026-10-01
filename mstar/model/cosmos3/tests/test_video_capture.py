@@ -94,7 +94,7 @@ def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
         ar_steps=3, ar_iters_per_window=3, ar_total_iters=9, ar_kv_mode=False,
     )
     x = torch.zeros(1, ch, 3, 4, 4)
-    fwd = SimpleNamespace(request_id="r", random_seed=0)
+    fwd = SimpleNamespace(request_id="r", rid_handle="r", random_seed=0)
     ni = sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x], "time_index": [torch.tensor([4])]})
     t = ni.tensor_inputs
     assert torch.equal(t["noisy_token_mask"], torch.tensor([0.0] * 4 + [1.0] * 8))

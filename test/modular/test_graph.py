@@ -233,3 +233,51 @@ def test_eos_clears_ready_signals():
     ar_decode = io.nodes["ar_decode"]
     assert not ar_decode.ready_signals.ready_names
     assert not ar_decode.ready_next_iter.ready_names
+
+
+def test_inner_loop_finishing_its_parent_routes_the_parents_outputs():
+    """``prep`` runs first, so the inner loop is the LAST of the outer's
+    entities to finish: the event that completes it also completes the outer.
+    The outer's declared outputs come back on that cascade inside
+    ``Loop.complete_iter``.
+
+    Discarding the cascade result loses them, and the outer keeps iterating
+    past ``max_iters`` instead of handing off -- the decoder never runs and
+    nothing reaches the client. Cascading before the inner's tensor_info is
+    populated has the same effect one level up, since the parent caches these
+    very edges on the way through.
+    """
+    graph = Sequential(sections=[
+        Loop(
+            name="outer",
+            section=Sequential(sections=[
+                GraphNode(
+                    name="prep", input_names={"latents"},
+                    outputs=[GraphEdge(name="latents", next_node="step")],
+                ),
+                Loop(
+                    name="inner",
+                    section=GraphNode(
+                        name="step", input_names={"latents"},
+                        outputs=[GraphEdge(name="latents", next_node="step")],
+                    ),
+                    outputs=[GraphEdge(name="latents", next_node="prep")],
+                    max_iters=2,
+                ),
+            ]),
+            outputs=[GraphEdge(name="latents", next_node="decoder")],
+            max_iters=2,
+        ),
+        GraphNode(
+            name="decoder", input_names={"latents"},
+            outputs=[GraphEdge(name="image", next_node="EMIT_TO_CLIENT")],
+        ),
+    ])
+    io = WorkerGraphIO(graph)
+    log = []
+    result = run_graph(io, [GraphEdge(name="latents", next_node="prep")],
+                       on_node_complete=lambda n, m: log.append(n))
+
+    # 2 outer iterations, 2 inner steps each, then the hand-off.
+    assert log == ["prep", "step", "step", "prep", "step", "step", "decoder"], log
+    assert len(result) == 1 and result[0].name == "image"

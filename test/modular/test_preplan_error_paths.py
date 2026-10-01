@@ -19,6 +19,7 @@ import torch
 
 from mstar.engine.engine import Engine
 from mstar.worker import worker as worker_mod
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
 
 
@@ -35,16 +36,21 @@ def _fake_worker() -> Worker:
     w.pushed_back = []
     w._fail_requests = lambda errors: w.failed.append(dict(errors))
     w._reset_skip_plan_flags = w.resets.append
-    queue = SimpleNamespace(push_back_node=lambda rid, node: w.pushed_back.append(rid))
-    w.worker_graphs_manager = SimpleNamespace(queues={0: queue})
+    w.despeculated = []
+    w._graph_runtime = SimpleNamespace(
+        push_back_node=lambda node_name, rids, wg_ids: w.pushed_back.extend(rids),
+        set_speculatively_scheduled=(
+            lambda node_name, wg_id, rids, value: w.despeculated.extend(rids)
+        ),
+    )
     return w
 
 
 def _speculation(plan_future, *rids: str, continuing=()) -> worker_mod.Speculation:
-    nodes = {rid: SimpleNamespace(_speculatively_scheduled=True) for rid in rids}
     return worker_mod.Speculation(
-        scheduled_batch=SimpleNamespace(
-            node_objects=nodes, request_to_worker_graph={rid: 0 for rid in rids},
+        scheduled_batch=ScheduledBatch(
+            node_name="dit", graph_walk="w",
+            request_to_worker_graph={rid: 0 for rid in rids},
         ),
         node_batch=SimpleNamespace(node_name="dit"),
         consumed_edges=set(),
@@ -78,7 +84,7 @@ def test_main_loop_error_drops_an_armed_unsubmitted_speculation() -> None:
     Worker._handle_main_loop_error(w, RuntimeError("boom"), (None, None), None, spec)
     assert w.resets == [spec.node_batch]
     assert spec.plan_future is None
-    assert all(not n._speculatively_scheduled for n in spec.scheduled_batch.node_objects.values())
+    assert sorted(w.despeculated) == ["a", "b"]
     assert w.pushed_back == ["b"]
     assert w.failed == [{"a": "Error in worker: RuntimeError: boom"}]
 
@@ -90,7 +96,7 @@ def test_main_loop_error_leaves_a_submitted_speculation_alone() -> None:
     spec = _speculation(None, "a")
     Worker._handle_main_loop_error(w, RuntimeError("boom"), (None, None), None, spec)
     assert w.resets == [] and w.pushed_back == []
-    assert spec.scheduled_batch.node_objects["a"]._speculatively_scheduled
+    assert w.despeculated == []  # nothing de-speculated: not this handler's batch
 
 
 def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
