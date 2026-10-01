@@ -137,6 +137,14 @@ class PrefillStep:
 
 # TODO: implement MoE variants
 class Qwen3_5DenseModel(Model):
+    # Image preprocessing is a few small ops per request (decode, the HF fast
+    # image processor), and a pool of one thread per core only slows them:
+    # each op waits on whichever of its threads a co-tenant descheduled. At
+    # 64 threads, 1 in ~8 4B image preprocesses took 35-130 ms instead of
+    # ~5 ms, and c=1 TTFT p95 was 152 ms; at 4, preprocessing held at 7-10 ms
+    # and p95 at 49 ms. One thread is steadier but slower (13 ms).
+    PREPROCESS_TORCH_THREADS = 4
+
     def __init__(
         self,
         model_path_hf: str,

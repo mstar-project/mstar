@@ -78,7 +78,9 @@ class BatchedModelOutput:
         per_rid_outputs = {}
         packed_outputs = {}
         for k, v in output.items():
-            if k.startswith("__") and k.endswith("__"):
+            # request ids reach here as the worker's integer handles, so only
+            # a str key can name a packed output
+            if isinstance(k, str) and k.startswith("__") and k.endswith("__"):
                 packed_outputs[k] = v
             else:
                 per_rid_outputs[k] = v

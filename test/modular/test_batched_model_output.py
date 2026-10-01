@@ -19,6 +19,14 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.worker.worker import Worker
 
 
+def test_coerce_takes_integer_request_handles():
+    """The worker interns request ids to ints; a submodule returning
+    ``{rid: outputs}`` (Qwen3.5's vision encoder) must not crash coerce."""
+    out = BatchedModelOutput.coerce({3: {"vision_embeds": [1]}, "__packed__": 2})
+    assert out.per_rid_outputs == {3: {"vision_embeds": [1]}}
+    assert out.packed_outputs == {"__packed__": 2}
+
+
 def test_coerce_splits_on_the_dunder_convention():
     out = BatchedModelOutput.coerce(
         {"r0": {"new_token": [1]}, "__packed__": "batch", "r1": {}}
