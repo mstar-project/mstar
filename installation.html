@@ -332,6 +332,14 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
@@ -592,6 +600,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#no-matching-wheel-build-from-source">No matching wheel — build from source</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-4-waypoint-fa3-sm90-kernel">flash-attn-4 (Waypoint, FA3 sm90 kernel)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#matching-your-cuda-toolkit">Matching your CUDA toolkit</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-the-install">Verify the install</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-rust-support">Optional: Rust support</a></li>
@@ -714,18 +723,26 @@ see <a class="reference internal" href="#omnivoice-omnivoice">omnivoice (OmniVoi
 <td><p>V-JEPA 2 runtime: <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>, <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>,
 <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code> (<code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code> also adds <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[audio]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[waypoint]</span></code></p></td>
+<td><p>Index-hosted Waypoint dependencies: <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
+and <code class="docutils literal notranslate"><span class="pre">tensordict</span></code> for reference validation. The pinned TAEHV implementation
+must be installed separately as shown below; keeping its direct URL out of
+package metadata allows <code class="docutils literal notranslate"><span class="pre">m-star</span></code> to be published on PyPI. <strong>Also needs</strong>
+<code class="docutils literal notranslate"><span class="pre">flash-attn-4</span></code>, which is installed separately —
+see <a class="reference internal" href="#flash-attn-4-waypoint-fa3-sm90-kernel">flash-attn-4 (Waypoint, FA3 sm90 kernel)</a>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[audio]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">soundfile</span></code> — only needed to return <strong>non-WAV</strong> audio containers (mp3/flac/…)
 from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[dev]</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[dev]</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">ruff</span></code> + <code class="docutils literal notranslate"><span class="pre">pytest</span></code> for linting and the test suite.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[all]</span></code></p></td>
-<td><p>The union of every model extra above — installs the full runtime for all model
-families in one shot. Convenient for a machine that serves multiple models; heavier
-and slower to install than a single family’s extra. (Still excludes <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> —
-see <a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a>.)</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[all]</span></code></p></td>
+<td><p>The union of the index-hosted dependencies from every model extra above.
+Convenient for a machine that serves multiple models; heavier and slower to
+install than a single family’s extra. It excludes the separately installed
+TAEHV and <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> packages; see below and <a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a>.</p></td>
 </tr>
 </tbody>
 </table>
@@ -734,11 +751,29 @@ see <a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[bagel,audio,dev]"</span>
 </pre></div>
 </div>
+<p>Waypoint’s dependencies and pinned TAEHV source are two installs. PyPI and other
+standards-conformant indices reject distributions whose metadata declares a direct-URL
+dependency, so the <code class="docutils literal notranslate"><span class="pre">waypoint</span></code> extra intentionally does not name TAEHV. Check the
+installer version before installing its source archive: an old pip may report success
+while producing an empty <code class="docutils literal notranslate"><span class="pre">UNKNOWN</span></code> wheel.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>--version<span class="w">                 </span><span class="c1"># must be 0.4.0 or newer</span>
+uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[waypoint]"</span>
+uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--no-deps<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">"taehv @ https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip"</span>
+</pre></div>
+</div>
+<p>Or, in an existing Python 3.12 environment:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--upgrade<span class="w"> </span><span class="s2">"pip&gt;=24.3"</span>
+python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[waypoint]"</span>
+python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--no-deps<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">"taehv @ https://github.com/madebyollin/taehv/archive/7dc60ec6601af2e668e31bc70acc4cb3665e4c22.zip"</span>
+</pre></div>
+</div>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
-<p>If you’re just getting started or have the disk/time to spare, <code class="docutils literal notranslate"><span class="pre">.[all]</span></code> is the
-recommended install — it pulls every model family’s runtime so any model works out of
-the box, with no need to track which extra goes with which model:</p>
+<p>If you’re just getting started or have the disk/time to spare, <code class="docutils literal notranslate"><span class="pre">.[all]</span></code> installs all
+index-hosted model dependencies in one shot. Waypoint still needs the pinned TAEHV
+command above, and Qwen3-Omni still needs <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>-e<span class="w"> </span><span class="s2">".[all,dev]"</span>
 </pre></div>
 </div>
@@ -759,13 +794,15 @@ transport for disaggregated deployments.</p>
 autoregressive backbones (every model with a <code class="docutils literal notranslate"><span class="pre">KV_CACHE</span></code> node runs attention through it).</p></li>
 <li><p><strong>flash-attn</strong> — used by Qwen3-Omni. <strong>Not installed by any extra</strong>; install it separately
 (see <a class="reference internal" href="#flash-attn-qwen3-omni">flash-attn (Qwen3-Omni)</a>).</p></li>
+<li><p><strong>flash-attn-4</strong> — Waypoint’s flex-attention <code class="docutils literal notranslate"><span class="pre">FLASH</span></code> backend. <strong>Not installed by any
+extra</strong>; install it separately (see <a class="reference internal" href="#flash-attn-4-waypoint-fa3-sm90-kernel">flash-attn-4 (Waypoint, FA3 sm90 kernel)</a>).</p></li>
 <li><p><strong>mooncake-transfer-engine</strong> — RDMA tensor transport for multi-GPU, disaggregated
 deployments. Single-node deployments can use shared-memory (<code class="docutils literal notranslate"><span class="pre">SHM</span></code>) or <code class="docutils literal notranslate"><span class="pre">TCP</span></code> transport
 instead (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>).</p></li>
 </ul>
-<p>Apart from <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code>, these are installed by the extras above. Your installed <code class="docutils literal notranslate"><span class="pre">torch</span></code>
-must match your system CUDA toolkit — <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code> handles that for you (next
-section).</p>
+<p>Apart from <code class="docutils literal notranslate"><span class="pre">flash-attn</span></code> and <code class="docutils literal notranslate"><span class="pre">flash-attn-4</span></code>, these are installed by the extras above. Your
+installed <code class="docutils literal notranslate"><span class="pre">torch</span></code> must match your system CUDA toolkit — <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code> handles
+that for you (next section).</p>
 </section>
 <section id="omnivoice-omnivoice">
 <h2>omnivoice (OmniVoice)<a class="headerlink" href="#omnivoice-omnivoice" title="Link to this heading">#</a></h2>
@@ -854,6 +891,34 @@ python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import
 </pre></div>
 </div>
 </section>
+</section>
+<section id="flash-attn-4-waypoint-fa3-sm90-kernel">
+<h2>flash-attn-4 (Waypoint, FA3 sm90 kernel)<a class="headerlink" href="#flash-attn-4-waypoint-fa3-sm90-kernel" title="Link to this heading">#</a></h2>
+<p>Waypoint’s DiT attention runs torch flex-attention with the <code class="docutils literal notranslate"><span class="pre">FLASH</span></code> backend by
+default. That backend needs the <strong>flash-attn-4</strong> package, which provides
+<code class="docutils literal notranslate"><span class="pre">flash_attn.cute</span></code> — the CuTe DSL rewrite of flash-attn; on H100 it runs the
+FA3-style sm90 kernel with TMA and warpgroup specialisation. It is <strong>not on
+PyPI</strong> as of 2026-09-17, and it is <strong>not</strong> pulled in by any extra.</p>
+<p>FLASH needs <strong>torch 2.11 or newer</strong>: older torch does not pass flash-attn-4 the
+block-sparse block size, and capture fails with <code class="docutils literal notranslate"><span class="pre">Block</span> <span class="pre">sparse</span> <span class="pre">tensors</span> <span class="pre">...</span>
+<span class="pre">require</span> <span class="pre">explicit</span> <span class="pre">sparse_block_size[0]</span></code>. Note this rules out the flash-attn
+prebuilt wheels above, which stop at <code class="docutils literal notranslate"><span class="pre">torch2.10</span></code>.</p>
+<p>Install it from the upstream repo’s <code class="docutils literal notranslate"><span class="pre">flash_attn/cute</span></code> subdirectory, pinned to
+the revision this was tested against (with <code class="docutils literal notranslate"><span class="pre">nvidia-cutlass-dsl</span></code> 4.7.1 and
+torch 2.12.1):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/Dao-AILab/flash-attention
+git<span class="w"> </span>-C<span class="w"> </span>flash-attention<span class="w"> </span>checkout<span class="w"> </span>1bda8f9290cd48d030f1516f0e680cd464ef3554
+uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--torch-backend<span class="o">=</span>auto<span class="w"> </span>./flash-attention/flash_attn/cute
+</pre></div>
+</div>
+<p>This is pure Python plus <code class="docutils literal notranslate"><span class="pre">nvidia-cutlass-dsl</span></code> — there is no CUDA extension to
+build. Its kernels are JIT-compiled on first use, which adds roughly a minute to
+the first server startup.</p>
+<p>If <code class="docutils literal notranslate"><span class="pre">flash-attn-4</span></code> isn’t importable or torch is older than 2.11, the server
+logs a warning and falls back to the previous Triton flex kernel. It is correct
+but slower — about 1.8x per attention call at 720p. Set
+<code class="docutils literal notranslate"><span class="pre">MSTAR_FLEX_BACKEND=TRITON</span></code> to choose it explicitly, or
+<code class="docutils literal notranslate"><span class="pre">MSTAR_FLEX_BACKEND=FLASH</span></code> to fail at startup instead of falling back.</p>
 </section>
 <section id="matching-your-cuda-toolkit">
 <h2>Matching your CUDA toolkit<a class="headerlink" href="#matching-your-cuda-toolkit" title="Link to this heading">#</a></h2>
@@ -1037,6 +1102,7 @@ Boxes with no system cuDNN, or a matching one, are unaffected, as are CUDA 13 in
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#no-matching-wheel-build-from-source">No matching wheel — build from source</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flash-attn-4-waypoint-fa3-sm90-kernel">flash-attn-4 (Waypoint, FA3 sm90 kernel)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#matching-your-cuda-toolkit">Matching your CUDA toolkit</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-the-install">Verify the install</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-rust-support">Optional: Rust support</a></li>

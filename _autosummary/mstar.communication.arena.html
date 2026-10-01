@@ -332,6 +332,14 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
@@ -651,12 +659,12 @@ transport. See <span class="xref std std-doc">environment_variables</span> for a
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>my_entity_id</strong> (<em>str</em>)</p></li>
-<li><p><strong>hostname</strong> (<em>str</em>)</p></li>
-<li><p><strong>device</strong> (<em>str</em>)</p></li>
+<li><p><strong>my_entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>hostname</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>device</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>communicator</strong> (<a class="reference internal" href="mstar.communication.communicator.html#mstar.communication.communicator.BaseCommunicator" title="mstar.communication.communicator.BaseCommunicator"><em>BaseCommunicator</em></a>)</p></li>
-<li><p><strong>shm_dir</strong> (<em>str</em><em> | </em><em>None</em>)</p></li>
-<li><p><strong>enable_prof</strong> (<em>bool</em>)</p></li>
+<li><p><strong>shm_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>enable_prof</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -685,9 +693,9 @@ syncs to 1 when registering many tensors in a row.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>request_id</strong> (<em>int</em><em> | </em><em>str</em>)</p></li>
-<li><p><strong>tensor_infos</strong> (<em>list</em><em>[</em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.TensorPointerInfo" title="mstar.graph.base.TensorPointerInfo"><em>TensorPointerInfo</em></a><em>]</em>)</p></li>
-<li><p><strong>skip_cuda_sync</strong> (<em>bool</em>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>tensor_infos</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.TensorPointerInfo" title="mstar.graph.base.TensorPointerInfo"><em>TensorPointerInfo</em></a><em>]</em>)</p></li>
+<li><p><strong>skip_cuda_sync</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -703,8 +711,8 @@ once at the end, rather than one host-blocking sync per request.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>per_request</strong> (<a class="reference internal" href="mstar.utils.containers.html#mstar.utils.containers.ParallelList" title="mstar.utils.containers.ParallelList"><em>ParallelList</em></a><em>[</em><em>int</em><em> | </em><em>str</em><em>, </em><em>list</em><em>[</em><em>int</em><em>]</em><em>]</em>)</p></li>
-<li><p><strong>skip_cuda_sync</strong> (<em>bool</em>)</p></li>
+<li><p><strong>per_request</strong> (<a class="reference internal" href="mstar.utils.containers.html#mstar.utils.containers.ParallelList" title="mstar.utils.containers.ParallelList"><em>ParallelList</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>]</em>)</p></li>
+<li><p><strong>skip_cuda_sync</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -712,7 +720,7 @@ once at the end, rather than one host-blocking sync per request.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.communication.arena.ArenaShmCommunicationManager.stamps_shm_placement">
-<span class="sig-name descname"><span class="pre">stamps_shm_placement</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager.stamps_shm_placement" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">stamps_shm_placement</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.communication.arena.ArenaShmCommunicationManager.stamps_shm_placement" title="Link to this definition">#</a></dt>
 <dd><p>Whether this transport writes placement onto a descriptor AFTER routing
 has already copied it. Only the SHM arena does (<code class="docutils literal notranslate"><span class="pre">shm_segment</span></code> /
 <code class="docutils literal notranslate"><span class="pre">shm_offset</span></code>); the per-uuid file and Mooncake paths derive everything
@@ -726,9 +734,9 @@ and <code class="docutils literal notranslate"><span class="pre">refresh_shm_pla
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>request_id</strong> (<em>int</em><em> | </em><em>str</em>)</p></li>
-<li><p><strong>graph_edges</strong> (<em>list</em><em>[</em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><em>GraphEdge</em></a><em>]</em>)</p></li>
-<li><p><strong>graph_walk</strong> (<em>str</em><em> | </em><em>None</em>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>graph_edges</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><em>GraphEdge</em></a><em>]</em>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -742,7 +750,7 @@ and <code class="docutils literal notranslate"><span class="pre">refresh_shm_pla
 <cite>largest_free_block</cite> collapsing while <cite>free_bytes</cite> stays high.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>dict</p>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a></p>
 </dd>
 </dl>
 </dd></dl>

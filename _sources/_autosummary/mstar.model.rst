@@ -44,5 +44,6 @@
    utils
    vjepa2
    wan22
+   waypoint
    whisper
 

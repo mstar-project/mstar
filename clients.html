@@ -332,6 +332,14 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
@@ -639,7 +647,7 @@ replaces it.</p></td>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">output_modalities</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">text</span></code></p></td>
 <td><p>Comma-separated desired outputs (e.g. <code class="docutils literal notranslate"><span class="pre">text</span></code>, <code class="docutils literal notranslate"><span class="pre">image</span></code>, <code class="docutils literal notranslate"><span class="pre">audio</span></code>, <code class="docutils literal notranslate"><span class="pre">video</span></code>,
-<code class="docutils literal notranslate"><span class="pre">action</span></code>).</p></td>
+<code class="docutils literal notranslate"><span class="pre">video_frame</span></code>, <code class="docutils literal notranslate"><span class="pre">action</span></code>). <code class="docutils literal notranslate"><span class="pre">video_frame</span></code> is streaming-only raw RGB24.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">streaming</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
@@ -667,7 +675,11 @@ replaces it.</p></td>
 </pre></div>
 </div>
 <p>A streaming response is <code class="docutils literal notranslate"><span class="pre">application/x-ndjson</span></code> — one JSON object per line as chunks
-arrive. <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/health</span></code> returns <code class="docutils literal notranslate"><span class="pre">{&quot;status&quot;:</span> <span class="pre">&quot;healthy&quot;}</span></code>.</p>
+arrive. A client that sends <code class="docutils literal notranslate"><span class="pre">Accept:</span> <span class="pre">application/vnd.mstar.frames</span></code> receives
+length-framed binary chunks instead, which skips the base64 pass on multi-megabyte
+<code class="docutils literal notranslate"><span class="pre">video_frame</span></code> payloads; a server without the framing keeps answering NDJSON, so a
+client must parse by the response <code class="docutils literal notranslate"><span class="pre">Content-Type</span></code>. <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/health</span></code> returns
+<code class="docutils literal notranslate"><span class="pre">{&quot;status&quot;:</span> <span class="pre">&quot;healthy&quot;}</span></code>.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># text (non-streaming → JSON)</span>
 curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8000/generate<span class="w"> </span>-F<span class="w"> </span><span class="s1">'text=Hello'</span><span class="w"> </span>-F<span class="w"> </span><span class="s1">'streaming=false'</span>
 
@@ -778,7 +790,15 @@ when <code class="docutils literal notranslate"><span class="pre">stream=False</
 <li><p><code class="docutils literal notranslate"><span class="pre">AudioBuffer</span></code> — decoded PCM with <code class="docutils literal notranslate"><span class="pre">.sample_rate</span></code>; <code class="docutils literal notranslate"><span class="pre">.to_wav(path)</span></code>, <code class="docutils literal notranslate"><span class="pre">.to_numpy()</span></code>,
 <code class="docutils literal notranslate"><span class="pre">len(...)</span></code>.</p></li>
 <li><p>Stream events — <code class="docutils literal notranslate"><span class="pre">TextChunk(text)</span></code>, <code class="docutils literal notranslate"><span class="pre">ImageChunk(data)</span></code> (<code class="docutils literal notranslate"><span class="pre">.save(path)</span></code>),
-<code class="docutils literal notranslate"><span class="pre">AudioChunk(pcm,</span> <span class="pre">sample_rate)</span></code>.</p></li>
+<code class="docutils literal notranslate"><span class="pre">AudioChunk(pcm,</span> <span class="pre">sample_rate)</span></code>, and <code class="docutils literal notranslate"><span class="pre">VideoFrameChunk(data,</span> <span class="pre">metadata)</span></code>. A
+video-frame chunk validates its width, height, fps, pixel format and frame range;
+<code class="docutils literal notranslate"><span class="pre">.to_numpy()</span></code> returns a zero-copy <code class="docutils literal notranslate"><span class="pre">[frame_count,</span> <span class="pre">height,</span> <span class="pre">width,</span> <span class="pre">3]</span></code> uint8 view.
+Raw <code class="docutils literal notranslate"><span class="pre">video_frame</span></code> requests require <code class="docutils literal notranslate"><span class="pre">stream=True</span></code>. The SDK asks for the binary
+framing automatically for <code class="docutils literal notranslate"><span class="pre">video_frame</span></code>; other modalities opt in with
+<code class="docutils literal notranslate"><span class="pre">MStarClient(prefer_binary=True)</span></code>. The server does not pace generation to the
+consumer: frames are produced at model speed and buffered by the API server until
+read, bounded by the request’s frame count, so a consumer slower than realtime
+accumulates that backlog in server memory (about 11 MiB per chunk at 720p).</p></li>
 </ul>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">res</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="p">(</span><span class="s2">"Hello!"</span><span class="p">)</span>                       <span class="c1"># GenerateResult</span>
 <span class="nb">print</span><span class="p">(</span><span class="n">res</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>
@@ -841,8 +861,10 @@ semantics. Point any OpenAI client at <code class="docutils literal notranslate"
 </tbody>
 </table>
 </div>
-<p>Models without an OpenAI surface (<code class="docutils literal notranslate"><span class="pre">pi05</span></code>, <code class="docutils literal notranslate"><span class="pre">vjepa2</span></code>, <code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code>) return <code class="docutils literal notranslate"><span class="pre">404</span></code> on
-<code class="docutils literal notranslate"><span class="pre">/v1/*</span></code>; use <code class="docutils literal notranslate"><span class="pre">/generate</span></code> or the SDK for them.</p>
+<p>Models without an OpenAI surface (<code class="docutils literal notranslate"><span class="pre">pi05</span></code>, <code class="docutils literal notranslate"><span class="pre">vjepa2</span></code>, <code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code>, <code class="docutils literal notranslate"><span class="pre">waypoint</span></code>)
+return <code class="docutils literal notranslate"><span class="pre">404</span></code> on <code class="docutils literal notranslate"><span class="pre">/v1/*</span></code>; use <code class="docutils literal notranslate"><span class="pre">/generate</span></code> or the SDK for them. In particular,
+Waypoint emits live RGB frame chunks and is not routed through the encoded-video
+<code class="docutils literal notranslate"><span class="pre">/v1/videos/generations</span></code> endpoint.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># chat</span>
 <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"bagel"</span><span class="p">,</span> <span class="n">messages</span><span class="o">=</span><span class="p">[{</span><span class="s2">"role"</span><span class="p">:</span> <span class="s2">"user"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">:</span> <span class="s2">"hi"</span><span class="p">}])</span>
 

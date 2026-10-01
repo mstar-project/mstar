@@ -34,5 +34,6 @@ mstar.engine.resources.kv
    manager
    plan
    prefix_index
+   ring
    transfer
 

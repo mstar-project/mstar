@@ -32,6 +32,7 @@ mstar.engine.resources.attn
    cross
    dense
    flashinfer
+   flex
    ragged
    wrappers
    xpu

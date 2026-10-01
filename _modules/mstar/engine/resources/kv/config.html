@@ -685,6 +685,14 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../../_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
@@ -879,6 +887,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">without pulling FlashInfer in behind it.</span>
 <span class="sd">"""</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
@@ -901,21 +910,23 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="KVConfig">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVConfig">[docs]</a>
-<span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">KVConfig</span><span class="p">:</span>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">KVConfig</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The model geometry every KV storage strategy needs, and nothing else.</span>
+
+<span class="sd">    What a cache *holds* (layers, heads, head dim) is a checkpoint fact and</span>
+<span class="sd">    lives here; how it is *stored* — paged or ringed, is storage policy and</span>
+<span class="sd">    lives in a subclass. ``KVSpec`` dispatches on which one it was handed.</span>
+
+<span class="sd">    ``kw_only`` is load-bearing, not style: ``num_qo_heads`` carries a default</span>
+<span class="sd">    here while both subclasses add required fields, which is an invalid</span>
+<span class="sd">    positional dataclass field order.</span>
+<span class="sd">    """</span>
+
     <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">num_kv_heads</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span>
-    <span class="n">max_num_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2048</span>
-    <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128</span>
-    <span class="n">num_qo_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="n">layout</span><span class="p">:</span> <span class="n">KVLayout</span> <span class="o">=</span> <span class="n">KVLayout</span><span class="o">.</span><span class="n">NHD</span>
-    <span class="c1"># pages of pinned host memory to keep for offloading; 0 disables it</span>
-    <span class="n">cpu_offload_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
-    <span class="c1"># folded into the root, not checked at match time</span>
-    <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
-    <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">num_qo_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -930,7 +941,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        Idempotent because one KVConfig is shared by the KV resource and the</span>
 <span class="sd">        attention resources planned against it, and each shards on construction.</span>
-<span class="sd">        ``num_shards`` is the instance world size (tp * sp): Ulysses SP</span>
+<span class="sd">        ``num_shards`` is the instance session size (tp * sp): Ulysses SP</span>
 <span class="sd">        all-to-alls heads, so attention runs at head-degree tp*sp.</span>
 <span class="sd">        """</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">divide</span>
@@ -941,6 +952,140 @@ window.runMermaid = runMermaid;</script>
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">=</span> <span class="n">divide</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_unsharded_kv_heads</span><span class="p">,</span> <span class="n">num_shards</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">num_qo_heads</span> <span class="o">=</span> <span class="n">divide</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_unsharded_qo_heads</span><span class="p">,</span> <span class="n">num_shards</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="KVConfig.apply_yaml_overrides">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVConfig.apply_yaml_overrides">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Patch this deployment's tunables; see ``NodeResourceSpec``.</span>
+
+<span class="sd">        Abstract so each storage policy names exactly what it accepts and lets</span>
+<span class="sd">        the rest raise — a paged key against a ring config is a typo, and the</span>
+<span class="sd">        spec's contract is that a typo is loud.</span>
+<span class="sd">        """</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="PagedKVConfig">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PagedKVConfig</span><span class="p">(</span><span class="n">KVConfig</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Fixed-size pages, appended to as a sequence grows. The default."""</span>
+
+    <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">max_num_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2048</span>
+    <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128</span>
+    <span class="n">layout</span><span class="p">:</span> <span class="n">KVLayout</span> <span class="o">=</span> <span class="n">KVLayout</span><span class="o">.</span><span class="n">NHD</span>
+    <span class="c1"># pages of pinned host memory to keep for offloading; 0 disables it</span>
+    <span class="n">cpu_offload_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># folded into the root, not checked at match time</span>
+    <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
+    <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="PagedKVConfig.apply_yaml_overrides">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.apply_yaml_overrides">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">max_num_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">cpu_offload_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""How much cache this deployment gets, and how it is cut up."""</span>
+        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="p">(</span>
+            <span class="p">(</span><span class="s2">"max_num_pages"</span><span class="p">,</span> <span class="n">max_num_pages</span><span class="p">),</span>
+            <span class="p">(</span><span class="s2">"page_size"</span><span class="p">,</span> <span class="n">page_size</span><span class="p">),</span>
+            <span class="p">(</span><span class="s2">"max_seq_len"</span><span class="p">,</span> <span class="n">max_seq_len</span><span class="p">),</span>
+            <span class="p">(</span><span class="s2">"cpu_offload_pages"</span><span class="p">,</span> <span class="n">cpu_offload_pages</span><span class="p">),</span>
+            <span class="p">(</span><span class="s2">"prefix_cache_salt"</span><span class="p">,</span> <span class="n">prefix_cache_salt</span><span class="p">),</span>
+            <span class="p">(</span><span class="s2">"prefix_cache"</span><span class="p">,</span> <span class="n">prefix_cache</span><span class="p">),</span>
+        <span class="p">):</span>
+            <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="RingKVLayerConfig">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.RingKVLayerConfig">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RingKVLayerConfig</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""One layer's ring geometry. Layers can hold frames at different strides."""</span>
+
+    <span class="n">ring_frames</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">ring_buckets</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">pinned_dilation</span><span class="p">:</span> <span class="nb">int</span></div>
+
+
+
+<div class="viewcode-block" id="RingKVConfig">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.RingKVConfig">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RingKVConfig</span><span class="p">(</span><span class="n">KVConfig</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A fixed horizon of frame slots per layer, overwritten in place.</span>
+
+<span class="sd">    Every layer's storage is allocated once and reused for the life of the process,</span>
+<span class="sd">    and a write to an occupied slot is the intended behaviour.</span>
+<span class="sd">    """</span>
+
+    <span class="n">tokens_per_frame</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">layers</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">RingKVLayerConfig</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+    <span class="c1"># How many sessions are resident at once. NOT a batch.</span>
+    <span class="n">num_sessions</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">total_sessions</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Resident sessions plus one shared scratch session for padding rows.</span>
+
+<span class="sd">        A replay padded to its capture bucket parks the dummy tail on this session</span>
+<span class="sd">        (see ``RingKVManager.plan``); it is never handed to a request, so</span>
+<span class="sd">        resident capacity stays ``num_sessions`` and the deployment knob keeps its</span>
+<span class="sd">        meaning. The ring buffer and the flex mask both size on this count so the</span>
+<span class="sd">        padding session is a real, addressable span.</span>
+<span class="sd">        """</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_sessions</span> <span class="o">+</span> <span class="mi">1</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">__post_init__</span><span class="p">()</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">)</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"ring geometry has </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layers</span><span class="p">)</span><span class="si">}</span><span class="s2"> layers but num_layers is "</span>
+                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_layers</span><span class="si">}</span><span class="s2">; each layer's ring is declared separately."</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="p">(</span>
+            <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_sessions</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span>
+            <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_sessions</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span>
+            <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_sessions</span> <span class="o">&lt;</span> <span class="mi">1</span>
+        <span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"num_sessions must be a positive int; got </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_sessions</span><span class="si">!r}</span><span class="s2">. A node serving "</span>
+                <span class="s2">"zero sessions refuses every request at admit."</span>
+            <span class="p">)</span>
+
+<div class="viewcode-block" id="RingKVConfig.apply_yaml_overrides">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.RingKVConfig.apply_yaml_overrides">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_sessions</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""``num_sessions`` only. Nothing else here is a deployment knob."""</span>
+        <span class="k">if</span> <span class="n">kwargs</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
+                <span class="s2">"ring KV geometry is a checkpoint fact, not a deployment tunable; "</span>
+                <span class="sa">f</span><span class="s2">"got </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">kwargs</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="k">if</span> <span class="n">num_sessions</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">if</span> <span class="p">(</span>
+                <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">num_sessions</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span>
+                <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">num_sessions</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span>
+                <span class="ow">or</span> <span class="n">num_sessions</span> <span class="o">&lt;</span> <span class="mi">1</span>
+            <span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"num_sessions must be a positive int; got </span><span class="si">{</span><span class="n">num_sessions</span><span class="si">!r}</span><span class="s2">. A node serving "</span>
+                    <span class="s2">"zero sessions refuses every request at admit."</span>
+                <span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">num_sessions</span> <span class="o">=</span> <span class="n">num_sessions</span></div>
 </div>
 
 
@@ -1003,32 +1148,21 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">resource_class</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"type[Resource]"</span><span class="p">:</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">RingKVConfig</span><span class="p">):</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.ring.manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">RingKVManager</span>
+
+            <span class="k">return</span> <span class="n">RingKVManager</span>
+
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVManager</span>
 
         <span class="k">return</span> <span class="n">KVManager</span>
 
 <div class="viewcode-block" id="KVSpec.apply_yaml_overrides">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVSpec.apply_yaml_overrides">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span>
-        <span class="bp">self</span><span class="p">,</span>
-        <span class="n">max_num_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">page_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">cpu_offload_pages</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">prefix_cache_salt</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-        <span class="n">prefix_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-    <span class="p">):</span>
-<span class="w">        </span><span class="sd">"""How much cache this deployment gets, and how it is cut up."""</span>
-        <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="p">(</span>
-            <span class="p">(</span><span class="s2">"max_num_pages"</span><span class="p">,</span> <span class="n">max_num_pages</span><span class="p">),</span>
-            <span class="p">(</span><span class="s2">"page_size"</span><span class="p">,</span> <span class="n">page_size</span><span class="p">),</span>
-            <span class="p">(</span><span class="s2">"max_seq_len"</span><span class="p">,</span> <span class="n">max_seq_len</span><span class="p">),</span>
-            <span class="p">(</span><span class="s2">"cpu_offload_pages"</span><span class="p">,</span> <span class="n">cpu_offload_pages</span><span class="p">),</span>
-            <span class="p">(</span><span class="s2">"prefix_cache_salt"</span><span class="p">,</span> <span class="n">prefix_cache_salt</span><span class="p">),</span>
-            <span class="p">(</span><span class="s2">"prefix_cache"</span><span class="p">,</span> <span class="n">prefix_cache</span><span class="p">),</span>
-        <span class="p">):</span>
-            <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Forwarded to the config: which keys are legal is a property of the</span>
+<span class="sd">        storage strategy, so the config answers for them."""</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">apply_yaml_overrides</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
 </div>
 
 
@@ -1077,6 +1211,16 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># itself this step, applied at commit. It rides with the step rather than</span>
     <span class="c1"># living on the stream, so an offload has nothing to lose.</span>
     <span class="n">retention</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="n">RetentionPolicy</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="RingKVStep">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.RingKVStep">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RingKVStep</span><span class="p">(</span><span class="n">ResourceStep</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""One ring clock per request in the step's batch."""</span>
+
+    <span class="n">frames</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="o">...</span><span class="p">]</span></div>
 
 </pre></div>
 

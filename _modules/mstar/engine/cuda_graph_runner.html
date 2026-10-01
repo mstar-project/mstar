@@ -685,6 +685,14 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
@@ -893,6 +901,7 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">BucketKey</span><span class="p">,</span> <span class="n">CGSlotSpec</span><span class="p">,</span> <span class="n">Resource</span><span class="p">,</span> <span class="n">SlotLease</span><span class="p">,</span> <span class="n">StepContext</span><span class="p">,</span> <span class="n">StepRunner</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span><span class="p">,</span> <span class="n">NodeSubmodule</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">profiler</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -1513,8 +1522,12 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># same GPU addresses; replay writes real values into them.</span>
             <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="nb">list</span><span class="p">(</span><span class="n">static_inputs</span><span class="o">.</span><span class="n">items</span><span class="p">()):</span>
                 <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+                    <span class="n">seq_dim_override</span> <span class="o">=</span> <span class="p">(</span>
+                        <span class="n">config</span><span class="o">.</span><span class="n">input_seq_dims</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span> <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">input_seq_dims</span> <span class="k">else</span> <span class="kc">None</span>
+                    <span class="p">)</span>
                     <span class="n">static_inputs</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_intern_static_buffer</span><span class="p">(</span>
-                        <span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="n">seq_len</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span>
+                        <span class="n">spec</span><span class="o">.</span><span class="n">config_idx</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span>
+                        <span class="n">seq_len</span><span class="o">=</span><span class="n">spec</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">seq_dim_override</span><span class="o">=</span><span class="n">seq_dim_override</span><span class="p">,</span>
                     <span class="p">)</span>
             <span class="n">static_input_keys</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span>
                 <span class="n">key</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">static_inputs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
@@ -1603,7 +1616,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_intern_static_buffer</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">config_idx</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">value</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-        <span class="n">seq_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">seq_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">seq_dim_override</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Return a slice view into the shared buffer for (config_idx, key).</span>
 
@@ -1611,6 +1624,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        largest-first) bucket's shape; smaller buckets reslice its leading dim.</span>
 <span class="sd">        If ``seq_len`` is given, the seq dim is moved to the front for storage and</span>
 <span class="sd">        back on return, so the captured forward sees the original layout.</span>
+<span class="sd">        ``seq_dim_override``, from the config's ``input_seq_dims``, is used</span>
+<span class="sd">        instead of `_seq_dim`'s size-based guess when a caller already knows</span>
+<span class="sd">        which dim varies with the bucket (`_seq_dim` can pick the wrong dim</span>
+<span class="sd">        when an unrelated axis happens to match ``seq_len``).</span>
 <span class="sd">        """</span>
         <span class="n">buf_key</span> <span class="o">=</span> <span class="p">(</span><span class="n">config_idx</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">seq_len</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -1621,7 +1638,10 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># — and the buffer is shared, so its layout cannot vary anyway</span>
             <span class="n">seq_dim</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_static_buffer_seq_dims</span><span class="p">[</span><span class="n">buf_key</span><span class="p">]</span>
         <span class="k">else</span><span class="p">:</span>
-            <span class="n">seq_dim</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_seq_dim</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">)</span>
+            <span class="n">seq_dim</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="n">seq_dim_override</span> <span class="k">if</span> <span class="n">seq_dim_override</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="k">else</span> <span class="bp">self</span><span class="o">.</span><span class="n">_seq_dim</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">)</span>
+            <span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_static_buffer_seq_dims</span><span class="p">[</span><span class="n">buf_key</span><span class="p">]</span> <span class="o">=</span> <span class="n">seq_dim</span>
         <span class="n">stored</span> <span class="o">=</span> <span class="n">value</span><span class="o">.</span><span class="n">movedim</span><span class="p">(</span><span class="n">seq_dim</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="k">if</span> <span class="n">seq_dim</span> <span class="o">!=</span> <span class="mi">0</span> <span class="k">else</span> <span class="n">value</span>
         <span class="n">shared</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_shared_static_buffers</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">buf_key</span><span class="p">)</span>
@@ -1874,7 +1894,13 @@ window.runMermaid = runMermaid;</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_replay</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">lease</span><span class="p">:</span> <span class="n">SlotLease</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
         <span class="n">slot</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">slot_for</span><span class="p">(</span><span class="n">lease</span><span class="p">)</span>
+        <span class="c1"># The launch, not the GPU work: replay is async, so this range measures</span>
+        <span class="c1"># enqueue cost only. GPU-side duration comes from --cuda-graph-trace.</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_enable_nvtx</span><span class="p">:</span>
+            <span class="n">profiler</span><span class="o">.</span><span class="n">range_push</span><span class="p">(</span><span class="sa">f</span><span class="s2">"cg.replay.slot[</span><span class="si">{</span><span class="n">lease</span><span class="o">.</span><span class="n">slot</span><span class="si">}</span><span class="s2">]"</span><span class="p">)</span>
         <span class="n">slot</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">replay</span><span class="p">()</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_enable_nvtx</span><span class="p">:</span>
+            <span class="n">profiler</span><span class="o">.</span><span class="n">range_pop</span><span class="p">()</span>
         <span class="k">return</span> <span class="n">slot</span><span class="o">.</span><span class="n">static_outputs</span>
 
 <div class="viewcode-block" id="CudaGraphRunner.run_forward">

@@ -331,6 +331,14 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
@@ -941,24 +949,32 @@ that depends on nothing: it names no cache, because it has none.</p></li>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec(config=KVConfig(...))</span></code></p></td>
-<td><p>A paged KV cache. <code class="docutils literal notranslate"><span class="pre">KVConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">num_layers</span></code>, <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code>,
-<code class="docutils literal notranslate"><span class="pre">head_dim</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> and <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>. It also holds five fields that
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec(config=PagedKVConfig(...))</span></code></p></td>
+<td><p>A paged KV cache. <code class="docutils literal notranslate"><span class="pre">KVConfig</span></code> is the abstract base for common model geometry;
+<code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code> adds <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> and five fields that
 a deployment can tune: <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>, <code class="docutils literal notranslate"><span class="pre">page_size</span></code>, <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>
 (the number of pinned host pages used for offload; 0 disables offload),
 <code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code> and <code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec(config=AttentionConfig(kv_cache=...))</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec(config=RingKVConfig(...))</span></code></p></td>
+<td><p>A fixed-capacity frame ring. It adds <code class="docutils literal notranslate"><span class="pre">tokens_per_frame</span></code>, one
+<code class="docutils literal notranslate"><span class="pre">RingKVLayerConfig</span></code> per layer, and the deployment-tunable <code class="docutils literal notranslate"><span class="pre">num_sessions</span></code>.
+Ring storage is currently paired with FlexAttention.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec(config=AttentionConfig(kv_cache=...))</span></code></p></td>
 <td><p>Self-attention planned over the named cache. <code class="docutils literal notranslate"><span class="pre">backend</span></code> selects
-<code class="docutils literal notranslate"><span class="pre">AttnBackend.FLASHINFER</span></code> (the default) or <code class="docutils literal notranslate"><span class="pre">AttnBackend.DENSE</span></code>.
+<code class="docutils literal notranslate"><span class="pre">AttnBackend.FLASHINFER</span></code> (the default), <code class="docutils literal notranslate"><span class="pre">AttnBackend.DENSE</span></code> or
+<code class="docutils literal notranslate"><span class="pre">AttnBackend.FLEX</span></code>. FlashInfer and dense attention require a
+<code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code>; FlexAttention requires a <code class="docutils literal notranslate"><span class="pre">RingKVConfig</span></code>.
 <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> selects a kernel generation: <code class="docutils literal notranslate"><span class="pre">&quot;auto&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;fa2&quot;</span></code> or
-<code class="docutils literal notranslate"><span class="pre">&quot;fa3&quot;</span></code>.</p></td>
+<code class="docutils literal notranslate"><span class="pre">&quot;fa3&quot;</span></code> when the FlashInfer backend is selected.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec(config=CrossAttentionConfig(...))</span></code></p></td>
-<td><p>Attention over a context that is written once and never extended. See
-<a class="reference internal" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder models)</a>.</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec(config=CrossAttentionConfig(...))</span></code></p></td>
+<td><p>Attention over a paged context that is written once and never extended. Only
+the FlashInfer backend is implemented. See <a class="reference internal" href="#cross-attention-encoder-decoder-models">Cross-attention (encoder-decoder
+models)</a>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec(config=RaggedAttentionConfig(...))</span></code></p></td>
 <td><p>Cacheless (ragged) varlen self-attention over the segments packed into one
 forward. Nothing is paged, and nothing carries to the next step.
 <code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">num_qo_heads</span></code>, <code class="docutils literal notranslate"><span class="pre">num_kv_heads</span></code> and
@@ -967,7 +983,7 @@ defaults to <code class="docutils literal notranslate"><span class="pre">head_di
 CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code> and
 <code class="docutils literal notranslate"><span class="pre">max_tokens_per_request</span></code>. See <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">PositionSpec(config=PositionConfig(kv_cache=...))</span></code></p></td>
 <td><p>Position tracking and RoPE. <code class="docutils literal notranslate"><span class="pre">scheme</span></code> is <code class="docutils literal notranslate"><span class="pre">PosScheme.SEQUENTIAL</span></code> or
 <code class="docutils literal notranslate"><span class="pre">PosScheme.BLOCK</span></code>. The RoPE parameters are set here: <code class="docutils literal notranslate"><span class="pre">rope_theta</span></code>,
 <code class="docutils literal notranslate"><span class="pre">rope_scale</span></code>, and the Llama-3.1 parameters <code class="docutils literal notranslate"><span class="pre">low_freq_factor</span></code>,
@@ -975,7 +991,7 @@ CUDA-graph ceilings <code class="docutils literal notranslate"><span class="pre"
 embeddings also declares this spec, because it needs the position counter. Such a
 model never applies RoPE.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetion_penalty=...)</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">SamplerSpec(vocab_size=...,</span> <span class="pre">enable_repetion_penalty=...)</span></code></p></td>
 <td><p>A sampler with its own per-request parameter buffers, philox stream, and optional
 seen-token mask. <code class="docutils literal notranslate"><span class="pre">enable_repetion_penalty</span></code> declares a capability, not an
 intention. It selects which kernel variant is recorded into the captured graph.
@@ -992,7 +1008,7 @@ appears in no spec, so it receives no resources:</p>
 
 <span class="c1"># mstar/model/orpheus/orpheus_model.py</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">get_node_resources</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">]:</span>
-    <span class="n">kv_config</span> <span class="o">=</span> <span class="n">KVConfig</span><span class="p">(</span>
+    <span class="n">kv_config</span> <span class="o">=</span> <span class="n">PagedKVConfig</span><span class="p">(</span>
         <span class="n">num_layers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">,</span>
         <span class="n">num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_key_value_heads</span><span class="p">,</span>
         <span class="n">head_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
@@ -1567,6 +1583,9 @@ one place. This field replaces the removed <code class="docutils literal notrans
 engine’s eager batch size for the walk. The default is <code class="docutils literal notranslate"><span class="pre">True</span></code>, so the engine never
 batches beyond a captured size.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compile</span></code> runs <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> before capture. The default is <code class="docutils literal notranslate"><span class="pre">True</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">required</span></code> makes every bucket in the config mandatory. If capture fails locally or
+on another participating rank, warmup raises after rank-wide agreement instead of
+dropping the bucket and falling back to eager execution. The default is <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">BatchedCudaGraphConfig</span></code> also accepts <code class="docutils literal notranslate"><span class="pre">total_tokens_multiplier</span></code>. Use it when one
 request’s step commits KV across several labels that are combined into a single plan, as
@@ -1678,6 +1697,9 @@ them.</p></li>
 default.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">compile</span></code> runs <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> on <code class="docutils literal notranslate"><span class="pre">capture_fn</span></code> before capture. The default is
 <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">required</span></code> makes every declared shape mandatory. If any participating rank cannot
+capture one, warmup raises instead of leaving that shape on the eager path. The default
+is <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>
 </ul>
 <p><strong>Splitting the declaration.</strong> When a region leases its own slot, exactly one of the two
 declarations must own each resource. The common pattern is for the outer <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>
@@ -1838,12 +1860,19 @@ that a misspelled setting is never silently ignored:</p>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code> with <code class="docutils literal notranslate"><span class="pre">PagedKVConfig</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>, <code class="docutils literal notranslate"><span class="pre">page_size</span></code>, <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, <code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>,
 <code class="docutils literal notranslate"><span class="pre">prefix_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code> / <code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> / <code class="docutils literal notranslate"><span class="pre">dense</span></code>), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code> with <code class="docutils literal notranslate"><span class="pre">RingKVConfig</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">num_sessions</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (<code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> / <code class="docutils literal notranslate"><span class="pre">dense</span></code> / <code class="docutils literal notranslate"><span class="pre">flex</span></code>),
+<code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code> (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">CrossAttentionSpec</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">backend</span></code> (only <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> is implemented), <code class="docutils literal notranslate"><span class="pre">flashinfer_backend</span></code>
 (<code class="docutils literal notranslate"><span class="pre">auto</span></code> / <code class="docutils literal notranslate"><span class="pre">fa2</span></code> / <code class="docutils literal notranslate"><span class="pre">fa3</span></code>)</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec</span></code></p></td>
@@ -1856,8 +1885,9 @@ not the model.</p></td>
 </table>
 </div>
 <p>Tune the cache shape on the KV resource, not on the attention resource that reads it. For
-example, <code class="docutils literal notranslate"><span class="pre">configs/qwen3tts.yaml</span></code> selects FA2 under <code class="docutils literal notranslate"><span class="pre">talker_attn</span></code>, while
-<code class="docutils literal notranslate"><span class="pre">configs/cosmos3_nano.yaml</span></code> sets the page count under its KV key.</p>
+example, <code class="docutils literal notranslate"><span class="pre">configs/qwen3tts.yaml</span></code> selects FA2 under <code class="docutils literal notranslate"><span class="pre">talker_attn</span></code>,
+<code class="docutils literal notranslate"><span class="pre">configs/cosmos3_nano.yaml</span></code> sets the page count under its paged KV key, and
+<code class="docutils literal notranslate"><span class="pre">configs/waypoint.yaml</span></code> sets the resident world count under its ring KV key.</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>A top-level <code class="docutils literal notranslate"><span class="pre">kv_cache:</span></code> block is no longer read. It raises an error at load time,

@@ -332,6 +332,14 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
@@ -674,7 +682,7 @@ so an upstream rename fails at boot rather than at the first request.</p>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.CanvasItem">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.omnivoice.components.backbone.</span></span><span class="sig-name descname"><span class="pre">CanvasItem</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefix_audio_mask</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">guidance_scale</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flat_start</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flat_u_start</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/components/backbone.html#CanvasItem"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>One request’s contribution to a step’s packed batch.</p>
 <p><code class="docutils literal notranslate"><span class="pre">prefix_ids</span></code> is <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">N]</span></code> — style tokens, then text tokens, then the
 reference audio tokens when cloning.  <code class="docutils literal notranslate"><span class="pre">tokens</span></code> is <code class="docutils literal notranslate"><span class="pre">[1,</span> <span class="pre">C,</span> <span class="pre">T]</span></code>, the live
@@ -686,39 +694,39 @@ head GEMM, so building it would be close to twice the work for nothing.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>request_id</strong> (<em>str</em>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>prefix_ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>prefix_audio_mask</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>tokens</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>guidance_scale</strong> (<em>float</em>)</p></li>
-<li><p><strong>flat_start</strong> (<em>int</em>)</p></li>
-<li><p><strong>flat_u_start</strong> (<em>int</em>)</p></li>
+<li><p><strong>guidance_scale</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>flat_start</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>flat_u_start</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.CanvasItem.cond_len">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">cond_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.cond_len" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">cond_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.cond_len" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.CanvasItem.does_cfg">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">does_cfg</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.does_cfg" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">does_cfg</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.does_cfg" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.CanvasItem.flat_start">
-<span class="sig-name descname"><span class="pre">flat_start</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">-1</span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.flat_start" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">flat_start</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">-1</span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.flat_start" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.CanvasItem.flat_u_start">
-<span class="sig-name descname"><span class="pre">flat_u_start</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">-1</span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.flat_u_start" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">flat_u_start</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">-1</span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.flat_u_start" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.CanvasItem.guidance_scale">
-<span class="sig-name descname"><span class="pre">guidance_scale</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">float</span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.guidance_scale" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">guidance_scale</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><span class="pre">float</span></a></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.guidance_scale" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -733,12 +741,12 @@ head GEMM, so building it would be close to twice the work for nothing.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.CanvasItem.request_id">
-<span class="sig-name descname"><span class="pre">request_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.request_id" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">request_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.request_id" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.CanvasItem.target_len">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">target_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.target_len" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">target_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.CanvasItem.target_len" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -788,7 +796,7 @@ logits are never read.</p>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.PackedCanvas">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.omnivoice.components.backbone.</span></span><span class="sig-name descname"><span class="pre">PackedCanvas</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">packed_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">audio_mask</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">position_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">doc_lens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tgt_index</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flat_target_total</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">flat_uncond_total</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">items</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/omnivoice/components/backbone.html#PackedCanvas"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.PackedCanvas" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></p>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>One step’s packed inputs, plus the index that gathers its logits.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -796,11 +804,11 @@ logits are never read.</p>
 <li><p><strong>packed_ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>audio_mask</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
 <li><p><strong>position_ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>doc_lens</strong> (<em>list</em><em>[</em><em>int</em><em>]</em>)</p></li>
+<li><p><strong>doc_lens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 <li><p><strong>tgt_index</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>flat_target_total</strong> (<em>int</em>)</p></li>
-<li><p><strong>flat_uncond_total</strong> (<em>int</em>)</p></li>
-<li><p><strong>items</strong> (<em>list</em><em>[</em><a class="reference internal" href="#mstar.model.omnivoice.components.backbone.CanvasItem" title="mstar.model.omnivoice.components.backbone.CanvasItem"><em>CanvasItem</em></a><em>]</em>)</p></li>
+<li><p><strong>flat_target_total</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>flat_uncond_total</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>items</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.omnivoice.components.backbone.CanvasItem" title="mstar.model.omnivoice.components.backbone.CanvasItem"><em>CanvasItem</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -811,22 +819,22 @@ logits are never read.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.PackedCanvas.doc_lens">
-<span class="sig-name descname"><span class="pre">doc_lens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">list</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.PackedCanvas.doc_lens" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">doc_lens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.PackedCanvas.doc_lens" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.PackedCanvas.flat_target_total">
-<span class="sig-name descname"><span class="pre">flat_target_total</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.PackedCanvas.flat_target_total" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">flat_target_total</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.PackedCanvas.flat_target_total" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.PackedCanvas.flat_uncond_total">
-<span class="sig-name descname"><span class="pre">flat_uncond_total</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">int</span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.PackedCanvas.flat_uncond_total" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">flat_uncond_total</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.PackedCanvas.flat_uncond_total" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.omnivoice.components.backbone.PackedCanvas.items">
-<span class="sig-name descname"><span class="pre">items</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">list</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.model.omnivoice.components.backbone.CanvasItem" title="mstar.model.omnivoice.components.backbone.CanvasItem"><span class="pre">CanvasItem</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.PackedCanvas.items" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">items</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.model.omnivoice.components.backbone.CanvasItem" title="mstar.model.omnivoice.components.backbone.CanvasItem"><span class="pre">CanvasItem</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.omnivoice.components.backbone.PackedCanvas.items" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -857,7 +865,7 @@ scoring would discard those logits anyway.</p>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p>tuple[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a> | None]</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a> | None]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -895,8 +903,8 @@ read a later document’s canvas as a continuation of the previous request’s.<
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>items</strong> (<em>list</em><em>[</em><a class="reference internal" href="#mstar.model.omnivoice.components.backbone.CanvasItem" title="mstar.model.omnivoice.components.backbone.CanvasItem"><em>CanvasItem</em></a><em>]</em>)</p></li>
-<li><p><strong>audio_mask_id</strong> (<em>int</em>)</p></li>
+<li><p><strong>items</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.omnivoice.components.backbone.CanvasItem" title="mstar.model.omnivoice.components.backbone.CanvasItem"><em>CanvasItem</em></a><em>]</em>)</p></li>
+<li><p><strong>audio_mask_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.14)"><em>device</em></a>)</p></li>
 </ul>
 </dd>

@@ -34,7 +34,7 @@ NDJSON stream.
    * - ``output_modalities``
      - ``text``
      - Comma-separated desired outputs (e.g. ``text``, ``image``, ``audio``, ``video``,
-       ``action``).
+       ``video_frame``, ``action``). ``video_frame`` is streaming-only raw RGB24.
    * - ``streaming``
      - ``true``
      - ``true`` → NDJSON stream of chunks; ``false`` → one JSON document.
@@ -58,7 +58,11 @@ A non-streaming response groups outputs by modality, each payload base64-encoded
    }
 
 A streaming response is ``application/x-ndjson`` — one JSON object per line as chunks
-arrive. ``GET /health`` returns ``{"status": "healthy"}``.
+arrive. A client that sends ``Accept: application/vnd.mstar.frames`` receives
+length-framed binary chunks instead, which skips the base64 pass on multi-megabyte
+``video_frame`` payloads; a server without the framing keeps answering NDJSON, so a
+client must parse by the response ``Content-Type``. ``GET /health`` returns
+``{"status": "healthy"}``.
 
 .. code-block:: bash
 
@@ -164,7 +168,15 @@ Result and event types live in ``mstar.client``:
 - ``AudioBuffer`` — decoded PCM with ``.sample_rate``; ``.to_wav(path)``, ``.to_numpy()``,
   ``len(...)``.
 - Stream events — ``TextChunk(text)``, ``ImageChunk(data)`` (``.save(path)``),
-  ``AudioChunk(pcm, sample_rate)``.
+  ``AudioChunk(pcm, sample_rate)``, and ``VideoFrameChunk(data, metadata)``. A
+  video-frame chunk validates its width, height, fps, pixel format and frame range;
+  ``.to_numpy()`` returns a zero-copy ``[frame_count, height, width, 3]`` uint8 view.
+  Raw ``video_frame`` requests require ``stream=True``. The SDK asks for the binary
+  framing automatically for ``video_frame``; other modalities opt in with
+  ``MStarClient(prefer_binary=True)``. The server does not pace generation to the
+  consumer: frames are produced at model speed and buffered by the API server until
+  read, bounded by the request's frame count, so a consumer slower than realtime
+  accumulates that backlog in server memory (about 11 MiB per chunk at 720p).
 
 .. code-block:: python
 
@@ -217,8 +229,10 @@ Endpoints and model coverage:
      - ``bagel``
      - Image editing (image + prompt → image).
 
-Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``) return ``404`` on
-``/v1/*``; use ``/generate`` or the SDK for them.
+Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``, ``waypoint``)
+return ``404`` on ``/v1/*``; use ``/generate`` or the SDK for them. In particular,
+Waypoint emits live RGB frame chunks and is not routed through the encoded-video
+``/v1/videos/generations`` endpoint.
 
 .. code-block:: python
 

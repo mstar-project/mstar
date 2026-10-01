@@ -328,6 +328,14 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
@@ -600,13 +608,16 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.attn.flashinfer.html#module-mstar.engine.resources.attn.flashinfer" title="mstar.engine.resources.attn.flashinfer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">flashinfer</span></code></a></p></td>
 <td><p>Paged attention through FlashInfer's prefill/decode wrappers.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.attn.ragged.html#module-mstar.engine.resources.attn.ragged" title="mstar.engine.resources.attn.ragged"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ragged</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.attn.flex.html#module-mstar.engine.resources.attn.flex" title="mstar.engine.resources.attn.flex"><code class="xref py py-obj docutils literal notranslate"><span class="pre">flex</span></code></a></p></td>
+<td><p>Attention over a ring KV cache, through a compiled <code class="docutils literal notranslate"><span class="pre">flex_attention</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.attn.ragged.html#module-mstar.engine.resources.attn.ragged" title="mstar.engine.resources.attn.ragged"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ragged</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.attn.wrappers.html#module-mstar.engine.resources.attn.wrappers" title="mstar.engine.resources.attn.wrappers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">wrappers</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.attn.wrappers.html#module-mstar.engine.resources.attn.wrappers" title="mstar.engine.resources.attn.wrappers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">wrappers</span></code></a></p></td>
 <td><p>FlashInfer utility wrappers for batched paged attention.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.resources.attn.xpu.html#module-mstar.engine.resources.attn.xpu" title="mstar.engine.resources.attn.xpu"><code class="xref py py-obj docutils literal notranslate"><span class="pre">xpu</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.resources.attn.xpu.html#module-mstar.engine.resources.attn.xpu" title="mstar.engine.resources.attn.xpu"><code class="xref py py-obj docutils literal notranslate"><span class="pre">xpu</span></code></a></p></td>
 <td><p>Paged attention through vllm-xpu-kernels.</p></td>
 </tr>
 </tbody>

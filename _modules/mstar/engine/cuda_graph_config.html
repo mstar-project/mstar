@@ -685,6 +685,14 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.wan22.submodules.html">mstar.model.wan22.submodules</a></li>
 </ul>
 </details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.waypoint.submodules.html">mstar.model.waypoint.submodules</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
@@ -913,6 +921,12 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># (eager) batch size for the walk. Default True keeps the conservative</span>
         <span class="c1"># behavior: never batch beyond a captured graph size.</span>
         <span class="n">caps_eager_batch_size</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="c1"># Maps a static-input key, as returned by the submodule's</span>
+        <span class="c1"># ``preprocess``, to the dim that varies with the bucket. Overrides</span>
+        <span class="c1"># the runner's size-matching guess (``CudaGraphRunner._seq_dim``),</span>
+        <span class="c1"># which can pick the wrong dim when an unrelated axis happens to</span>
+        <span class="c1"># match the bucket's token count.</span>
+        <span class="n">input_seq_dims</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">capture_graph_walk</span> <span class="o">=</span> <span class="n">capture_graph_walk</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">replay_graph_walks</span> <span class="o">=</span> <span class="n">replay_graph_walks</span> <span class="ow">or</span> <span class="p">[</span><span class="n">capture_graph_walk</span><span class="p">]</span>
@@ -921,6 +935,7 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">capture_batch_sizes</span> <span class="o">=</span> <span class="n">capture_batch_sizes</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">capture_forward_method</span> <span class="o">=</span> <span class="n">capture_forward_method</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">caps_eager_batch_size</span> <span class="o">=</span> <span class="n">caps_eager_batch_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">input_seq_dims</span> <span class="o">=</span> <span class="n">input_seq_dims</span>
 
 <div class="viewcode-block" id="CudaGraphConfig.get_config_type">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_config.html#mstar.engine.cuda_graph_config.CudaGraphConfig.get_config_type">[docs]</a>
@@ -959,6 +974,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">capture_forward_method</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"forward_batched"</span><span class="p">,</span>
         <span class="n">caps_eager_batch_size</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
         <span class="n">total_tokens_multiplier</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
+        <span class="n">input_seq_dims</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
             <span class="n">capture_graph_walk</span><span class="o">=</span><span class="n">capture_graph_walk</span><span class="p">,</span>
@@ -968,6 +984,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">capture_batch_sizes</span><span class="o">=</span><span class="n">capture_batch_sizes</span><span class="p">,</span>
             <span class="n">capture_forward_method</span><span class="o">=</span><span class="n">capture_forward_method</span><span class="p">,</span>
             <span class="n">caps_eager_batch_size</span><span class="o">=</span><span class="n">caps_eager_batch_size</span><span class="p">,</span>
+            <span class="n">input_seq_dims</span><span class="o">=</span><span class="n">input_seq_dims</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">single_request_inputs</span> <span class="o">=</span> <span class="n">single_request_inputs</span>
         <span class="c1"># ``single_request_inputs.input_seq_len`` is also read per-label by the</span>
@@ -1029,7 +1046,8 @@ window.runMermaid = runMermaid;</script>
         <span class="nb">compile</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
         <span class="n">capture_batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">capture_forward_method</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"forward_batched"</span><span class="p">,</span>
-        <span class="n">caps_eager_batch_size</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="n">caps_eager_batch_size</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="n">input_seq_dims</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span>
             <span class="n">capture_graph_walk</span><span class="o">=</span><span class="n">capture_graph_walk</span><span class="p">,</span>
@@ -1038,7 +1056,8 @@ window.runMermaid = runMermaid;</script>
             <span class="nb">compile</span><span class="o">=</span><span class="nb">compile</span><span class="p">,</span>
             <span class="n">capture_batch_sizes</span><span class="o">=</span><span class="n">capture_batch_sizes</span><span class="p">,</span>
             <span class="n">capture_forward_method</span><span class="o">=</span><span class="n">capture_forward_method</span><span class="p">,</span>
-            <span class="n">caps_eager_batch_size</span><span class="o">=</span><span class="n">caps_eager_batch_size</span>
+            <span class="n">caps_eager_batch_size</span><span class="o">=</span><span class="n">caps_eager_batch_size</span><span class="p">,</span>
+            <span class="n">input_seq_dims</span><span class="o">=</span><span class="n">input_seq_dims</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">make_node_input</span> <span class="o">=</span> <span class="n">make_node_input</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">capture_token_lengths</span> <span class="o">=</span> <span class="n">capture_token_lengths</span>
