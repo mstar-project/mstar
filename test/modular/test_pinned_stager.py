@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from mstar.utils.h2d import PinnedStager
+from mstar.utils.h2d import H2DMirror, PinnedStager
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -57,3 +57,55 @@ def test_too_many_values_rejected():
     with pytest.raises(ValueError):
         PinnedStager(torch.int32).copy_(torch.zeros(2, dtype=torch.int32, device="cuda"),
                                         [1, 2, 3], pad_value=0)
+
+
+@cuda
+def test_mirror_skips_a_copy_the_destination_already_holds(monkeypatch):
+    dst = torch.zeros(6, dtype=torch.int32, device="cuda")
+    st, mirror = PinnedStager(torch.int32), H2DMirror()
+    issued = []
+    real_copy = torch.Tensor.copy_
+    monkeypatch.setattr(
+        torch.Tensor, "copy_",
+        lambda self, src, non_blocking=False: (
+            issued.append(1), real_copy(self, src, non_blocking=non_blocking)
+        )[1],
+    )
+    st.copy_(dst, [1, 2], pad_value=0, mirror=mirror)
+    st.copy_(dst, [1, 2], pad_value=0, mirror=mirror)   # same: skipped
+    assert len(issued) == 1
+    st.copy_(dst, [1, 3], pad_value=0, mirror=mirror)   # new values
+    st.copy_(dst, [1, 3], pad_value=-1, mirror=mirror)  # same values, new padding
+    st.copy_(dst, [1, 3, 0], pad_value=-1, mirror=mirror)  # different length
+    assert len(issued) == 4
+    monkeypatch.undo()
+    torch.cuda.synchronize()
+    assert dst.tolist() == [1, 3, 0, -1, -1, -1]
+
+
+@cuda
+def test_invalidated_mirror_copies_again():
+    dst = torch.zeros(3, dtype=torch.int32, device="cuda")
+    st, mirror = PinnedStager(torch.int32), H2DMirror()
+    st.copy_(dst, [4, 5, 6], mirror=mirror)
+    torch.cuda.synchronize()
+    dst.zero_()                 # written some other way...
+    mirror.invalidate()         # ...which its owner says
+    st.copy_(dst, [4, 5, 6], mirror=mirror)
+    torch.cuda.synchronize()
+    assert dst.tolist() == [4, 5, 6]
+
+
+@cuda
+def test_mirror_compares_values_not_the_object_passed():
+    """A caller passing a reused (and since rewritten) array still copies."""
+    import numpy as np
+
+    dst = torch.zeros(2, dtype=torch.int32, device="cuda")
+    st, mirror = PinnedStager(torch.int32), H2DMirror()
+    host = np.array([1, 2], dtype=np.int32)
+    st.copy_(dst, host, mirror=mirror)
+    host[:] = [7, 8]
+    st.copy_(dst, host, mirror=mirror)
+    torch.cuda.synchronize()
+    assert dst.tolist() == [7, 8]

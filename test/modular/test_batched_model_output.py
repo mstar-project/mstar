@@ -93,7 +93,11 @@ class _StubWorker:
         self._pinned_d2h_buffers = defaultdict(list)
 
     _get_pinned_d2h_buffer = Worker._get_pinned_d2h_buffer
-    _prematerialize_batched = Worker._prematerialize_batched
+    _d2h_batched = Worker._d2h_batched
+
+    def _prematerialize_batched(self, buffers, side, request_ids):
+        """The worker's batched path: one D2H, then per-request row views."""
+        return Worker._rows_to_per_rid(self._d2h_batched(buffers, side), request_ids)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

@@ -1309,6 +1309,15 @@ class SamplerBuffers:
     # Last-known config per rid — change-detect for ``update_request_config``
     # so steady-state per-step calls do zero GPU work (for the scalar rows).
     _cached_config: dict[str, SamplingConfig] = field(default_factory=dict, repr=False)
+    # Bumped on every scalar master-row write, so ``gather_static`` can tell
+    # a config change apart from a batch it already gathered.
+    _config_version: int = field(default=0, repr=False)
+    # cg slot -> (rids, padded_bs, _config_version) of the last
+    # ``gather_static``: a steady decode batch matches it every step, and then
+    # its per-step buffers already hold exactly these rows.
+    _static_key: dict[int, tuple[tuple[str, ...], int, int]] = field(
+        default_factory=dict, repr=False
+    )
 
     @property
     def tracks_seen_tokens(self) -> bool:
@@ -1408,6 +1417,7 @@ class SamplerBuffers:
         self.top_p.write_master_row(slot, p)
         self.seed.write_master_row(slot, cfg.seed)
         self.rep_penalty.write_master_row(slot, float(cfg.repetition_penalty))
+        self._config_version += 1
 
     def _grow_master(self, new_capacity: int) -> None:
         """Double-and-copy the master buffers up to at least ``new_capacity``.
@@ -1568,7 +1578,21 @@ class SamplerBuffers:
     ) -> None:
         """Gather the per-request scalar config (temp/top_k/top_p/seed/penalty)
         into ``cg_slot``. Safe to pre-plan: these change only on a config
-        update, never step to step."""
+        update, never step to step.
+
+        Skipped when ``cg_slot`` last gathered this same batch and no master
+        row has been written since: its buffers (written only here) already
+        hold these rows. Not with a slot awaiting init, whose rows the staging
+        below writes -- that is also what catches a request id re-registered
+        onto a new slot."""
+        rids = tuple(request_ids)
+        if (
+            not self._pending_init
+            and self._static_key.get(cg_slot)
+            == (rids, padded_bs, self._config_version)
+        ):
+            self._last_real_bs[cg_slot] = len(request_ids)
+            return
         self._stage_slot_idx(request_ids, padded_bs, cg_slot)
         # H2D copies only -- this runs in the pre-plan (see HostBuffer). The
         # device-side index row is uploaded by gather_dynamic.
@@ -1576,6 +1600,8 @@ class SamplerBuffers:
         for buf in self._scalar_buffers():
             buf.gather(rows, padded_bs, cg_slot)
         self._last_real_bs[cg_slot] = len(request_ids)
+        # read after staging: an init it ran bumped the version
+        self._static_key[cg_slot] = (rids, padded_bs, self._config_version)
 
     def gather_dynamic(
         self, request_ids: list[str], padded_bs: int, cg_slot: int,

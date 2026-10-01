@@ -63,6 +63,7 @@ from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
     BatchedModelOutput,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -509,6 +510,39 @@ class LLMSubmodule(ARNodeSubmodule):
             >= request_info.max_tokens
         )
         return {"decode_loop"} if hit_eos or out_of_budget else set()
+
+    def check_stop_batched(
+        self,
+        request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+    ) -> dict[str, set[str]] | None:
+        """``check_stop`` for every request, off one ``tolist`` of the token
+        row rather than an ``.item()`` (and a stop-id set rebuilt) per request.
+        """
+        tokens = host_rows.buffers.get("new_token")
+        if not torch.is_tensor(tokens) or tokens.dim() == 0:
+            return None
+        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        stop_ids = self.config.stop_token_ids
+        stops: dict[str, set[str]] = {}
+        for rid in request_ids:
+            i = row_of.get(rid)
+            if i is None or i >= len(values):
+                continue  # no row, no output: the per-request path skips it too
+            info = request_infos[rid]
+            hit_eos = (
+                not info.resource_configs[SAMPLER].ignore_eos
+                and values[i] in stop_ids
+            )
+            out_of_budget = (
+                info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
+                >= info.max_tokens
+            )
+            if hit_eos or out_of_budget:
+                stops[rid] = {"decode_loop"}
+        return stops
 
 
 class VisionEncoderSubmodule(NodeSubmodule):

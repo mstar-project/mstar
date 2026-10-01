@@ -292,6 +292,7 @@ class FlashInferDecodeWrapper:
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
         dtype: torch.dtype = torch.bfloat16,
+        kv_lens: torch.Tensor | None = None,
         **kwargs
     ):
         """Plan decode attention and compute KV write locations.
@@ -318,6 +319,8 @@ class FlashInferDecodeWrapper:
                 head_dim=self.head_dim,
                 page_size=self.page_size,
                 q_data_type=dtype,
+                # host lengths, so plan skips rebuilding them (`get_seq_lens`)
+                seq_lens=kv_lens,
             )
         finally:
             if self.enable_nvtx:

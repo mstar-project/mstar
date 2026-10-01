@@ -43,6 +43,7 @@ from mstar.engine.resources.step import (
 from mstar.model.submodule_base import (
     ARNodeInputs,
     BatchedModelOutput,
+    HostRows,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
@@ -1210,6 +1211,7 @@ class Engine:
 
     def check_stop_for_batch(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        host_rows: HostRows | None = None,
     ) -> dict[str, set[str]]:
         """Each rid's ``submodule.check_stop``, as rid -> loops that should stop.
 
@@ -1219,8 +1221,26 @@ class Engine:
         request onto the batch, because letting it escape would abandon the
         check for the rest of the batch and leave their loops running past
         their stop condition.
+
+        With ``host_rows`` (the step's row-addressed outputs on the host), a
+        submodule implementing ``check_stop_batched`` checks the batch in one
+        call; if it raises, the per-request path runs instead, so a failure
+        still lands on its own request.
         """
         submodule = self._submodules[batch.node_name].submodule
+        if host_rows is not None:
+            try:
+                batched = submodule.check_stop_batched(
+                    batch.request_ids, batch.per_request_info, host_rows,
+                )
+            except Exception:
+                logger.debug(
+                    "batched check_stop failed (node=%s); checking per request",
+                    batch.node_name, exc_info=True,
+                )
+                batched = None
+            if batched is not None:
+                return batched
         stops: dict[str, set[str]] = {}
         for rid in batch.request_ids:
             rid_outputs = outputs.get(rid)

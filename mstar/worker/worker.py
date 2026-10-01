@@ -40,7 +40,7 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
-from mstar.model.submodule_base import BatchedModelOutput
+from mstar.model.submodule_base import BatchedModelOutput, HostRows
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.utils.containers import ParallelList, RecentSet
@@ -2313,12 +2313,14 @@ class Worker:
         # so this can carry a device transfer as well as the stop logic.
         _t_stop = _time.perf_counter() if self._phase_period else 0.0
         engine = self.engine_manager.get_engine(batch_N.node_name)
-        cpu_outputs = self._prematerialize_for_check_stop(
+        cpu_outputs, host_rows = self._prematerialize_for_check_stop(
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
         _pp_stage("prematerialize")
-        stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs)
+        stops = engine.check_stop_for_batch(
+            batch_N.node_batch, cpu_outputs, host_rows=host_rows,
+        )
         if self._phase_period:
             self._phase_record(
                 "worker.postprocess.check_stop", _time.perf_counter() - _t_stop,
@@ -2379,11 +2381,16 @@ class Worker:
         # mints, so nothing is keyed by request and signal only to be taken
         # apart again here.
         _t_store = _time.perf_counter() if self._phase_period else 0.0
+        # The stop check's host copies go along: a transport that sends from
+        # host memory reuses them instead of copying the same rows down again.
+        # They are views of pinned buffers the next step reuses, which is fine
+        # because the sends below are their last reader.
         stored = self.tensor_manager.store_and_return_tensor_info_batch(
             rids, outputs, signals,
             node_name=batch_N.node_name,
             graph_walk=batch_N.graph_walk,
             skip_cuda_sync=True,
+            cpu_tensors=cpu_outputs,
         )
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
@@ -2535,26 +2542,23 @@ class Worker:
         return buffers[index]
 
 
-    def _prematerialize_batched(
-        self,
-        buffers: dict,
-        side: torch.cuda.Stream,
-        request_ids: list[int],
-    ) -> dict[int, NameToTensorList]:
-        """One device-to-host copy per named buffer, sliced per request after.
+    def _d2h_batched(
+        self, buffers: dict, side: torch.cuda.Stream,
+    ) -> dict[str, torch.Tensor]:
+        """One device-to-host copy per named buffer, landed before this returns.
 
         The per-rid form costs a copy per tensor per request — 48 of them at a
         decode batch of 16, each carrying a single token — and every one is a
         launch plus a completion the host waits on. A submodule that hands over
-        the whole batch tensor instead pays one, and the per-rid views below
-        are slices of pinned memory, so they cost nothing.
+        the whole batch tensor instead pays one; ``_rows_to_per_rid`` then
+        takes per-request views of the pinned memory, which cost nothing.
 
-        Row i belongs to ``request_ids[i]``, which has to be the order the
-        forward ran the requests in (``BatchedModelOutput.row_request_ids``),
-        not this batch's current request list: by the time the stop check
-        runs, requests whose loops stopped a step ago have been dropped from
-        that list. A padded replay leaves extra rows past the real ones; they
-        are simply not read.
+        Row i belongs to the i-th request in the order the forward ran them
+        (``BatchedModelOutput.row_request_ids``), not this batch's current
+        request list: by the time the stop check runs, requests whose loops
+        stopped a step ago have been dropped from that list. A padded replay
+        leaves extra rows past the real ones; they are simply not read. The
+        host buffers are reused by the next step.
         """
         host: dict[str, torch.Tensor] = {}
         with torch.cuda.stream(side):
@@ -2568,8 +2572,7 @@ class Worker:
                 buf.copy_(tensor, non_blocking=True)
                 host[name] = buf
         side.synchronize()
-
-        return Worker._rows_to_per_rid(host, request_ids)
+        return host
 
     @staticmethod
     def _rows_to_per_rid(
@@ -2577,13 +2580,18 @@ class Worker:
     ) -> dict[int, NameToTensorList]:
         """Slice row-addressed buffers into the per-rid form ``check_stop``
         reads: row i goes to ``request_ids[i]``."""
+        # One ``split`` per buffer makes every row view in a single call, where
+        # slicing row by row was a Python-level indexing op per request.
+        rows = {
+            name: buf.split(1)
+            for name, buf in host.items()
+            if torch.is_tensor(buf) and buf.shape
+        }
         out: dict[int, NameToTensorList] = {}
         for i, rid in enumerate(request_ids):
-            per_rid: NameToTensorList = {}
-            for name, buf in host.items():
-                if torch.is_tensor(buf) and buf.shape and i < buf.shape[0]:
-                    per_rid[name] = [buf[i : i + 1]]
-            out[rid] = per_rid
+            out[rid] = {
+                name: [views[i]] for name, views in rows.items() if i < len(views)
+            }
         return out
 
     def _prematerialize_for_check_stop(
@@ -2591,7 +2599,7 @@ class Worker:
         outputs: "BatchedModelOutput",
         completion_event: torch.cuda.Event | None,
         request_ids: list[int] | None = None,
-    ) -> dict[int, NameToTensorList]:
+    ) -> tuple[dict[int, NameToTensorList], HostRows | None]:
         """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
         don't trigger a default-stream sync. With same-thread async,
@@ -2600,12 +2608,20 @@ class Worker:
         block waiting for N+1 to finish, defeating the overlap.
 
         Returns per-rid outputs with the CUDA tensors replaced by CPU
-        copies. Skipped (returns ``outputs`` unchanged) when there's no
-        completion event (CPU execution) or when CUDA is unavailable.
+        copies, and -- when the submodule handed over row-addressed buffers --
+        those buffers on the host as ``HostRows``, for a batched stop check.
+        Skipped (returns ``outputs`` unchanged) when there's no completion
+        event (CPU execution) or when CUDA is unavailable.
 
         AR engines emit small per-rid output dicts (sampled token + maybe
         a code) so the cost is negligible. If a future engine emits large
         tensors here (e.g. activations), revisit.
+
+        The host tensors are views of pinned buffers the next step reuses, so
+        they are only good until then. That covers their one other reader: a
+        transport that sends from host memory (``needs_cpu_tensor``) gets them
+        through the store, and sends in ``_register_outputs`` -- later in the
+        same ``_postprocess_batch`` -- and never reads them once registered.
         """
         source = outputs.get_check_stop_input()
         # Rows of a batch-addressed buffer belong to the requests in the order
@@ -2617,10 +2633,14 @@ class Worker:
         if not torch.cuda.is_available() or completion_event is None:
             if outputs.check_stop_buffers is not None and row_rids is not None:
                 # host tensors already (a CPU device): only the re-keying
-                return Worker._rows_to_per_rid(outputs.check_stop_buffers, row_rids)
-            return source
+                host = outputs.check_stop_buffers
+                return (
+                    Worker._rows_to_per_rid(host, row_rids),
+                    HostRows(tuple(row_rids), host),
+                )
+            return source, None
         if not source:
-            return source
+            return source, None
 
         if self._d2h_stream is None:
             self._d2h_stream = get_stream(CHECK_STOP, self.device)
@@ -2628,8 +2648,10 @@ class Worker:
         side.wait_event(completion_event)
 
         if outputs.check_stop_buffers is not None and row_rids is not None:
-            return self._prematerialize_batched(
-                outputs.check_stop_buffers, side, row_rids,
+            host = self._d2h_batched(outputs.check_stop_buffers, side)
+            return (
+                Worker._rows_to_per_rid(host, row_rids),
+                HostRows(tuple(row_rids), host),
             )
 
         cpu_per_rid: dict = {}
@@ -2660,7 +2682,7 @@ class Worker:
                     cpu_per_rid[rid][name] = new_list
         side.synchronize()
 
-        return cpu_per_rid
+        return cpu_per_rid, None
 
     def _apply_pending_removes_safe_to_drop(
         self, in_flight_rids: set[int]

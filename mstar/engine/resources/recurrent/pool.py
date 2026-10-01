@@ -30,7 +30,7 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
-from mstar.utils.h2d import PinnedStager
+from mstar.utils.h2d import H2DMirror, PinnedStager
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,9 @@ class RecurrentStatePool(Resource):
 
         self._cg_max_bs = 0
         self._cg_addressing: dict[CGSlotKey, RecurrentAddressing] = {}
+        # (slot_indices, has_state) mirrors per captured buffer: a steady batch
+        # addresses the same slots every step, so its copies are skipped
+        self._cg_mirrors: dict[CGSlotKey, tuple[H2DMirror, H2DMirror]] = {}
         # copy-only H2D for the addressing, see `_build_addressing`
         self._index_stager = PinnedStager(torch.int32)
         self._state_stager = PinnedStager(torch.bool)
@@ -397,7 +400,7 @@ class RecurrentStatePool(Resource):
                 )
 
         num_rows = len(indices)
-        target = self._addressing_buffers(label, ctx, num_rows)
+        target, mirrors = self._addressing_buffers(label, ctx, num_rows)
         # Built on the host and copied in: the values come from Python
         # bookkeeping, so building them on device would sync. The tail is
         # cleared too rather than left at last step's values -- attention keeps
@@ -406,8 +409,12 @@ class RecurrentStatePool(Resource):
         # index here is a write to a slot whose request is not in this step.
         # The clear rides the same copy (padding written on the host): this
         # runs in the pre-plan, beside a live graph, so no device-side fill.
-        self._index_stager.copy_(target.slot_indices, indices, pad_value=pad)
-        self._state_stager.copy_(target.has_state, has_state, pad_value=False)
+        self._index_stager.copy_(
+            target.slot_indices, indices, pad_value=pad, mirror=mirrors[0],
+        )
+        self._state_stager.copy_(
+            target.has_state, has_state, pad_value=False, mirror=mirrors[1],
+        )
         return RecurrentAddressing(
             slot_indices=target.slot_indices,
             has_state=target.has_state,
@@ -416,8 +423,9 @@ class RecurrentStatePool(Resource):
 
     def _addressing_buffers(
         self, label: str, ctx: StepContext, num_rows: int,
-    ) -> RecurrentAddressing:
-        """The buffers this step fills.
+    ) -> tuple[RecurrentAddressing, tuple[H2DMirror | None, H2DMirror | None]]:
+        """The buffers this step fills, and their mirrors (captured buffers
+        only: the eager ones are reallocated as they grow).
 
         Under capture they are static and per (bucket, slot, label), built on
         the first plan for that key and sized to the largest batch any runner
@@ -429,18 +437,19 @@ class RecurrentStatePool(Resource):
             buf = self._eager_addressing.get(label)
             if buf is None or buf.slot_indices.numel() < num_rows:
                 buf = self._eager_addressing[label] = self._new_buffers(num_rows)
-            return buf
+            return buf, (None, None)
 
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         buf = self._cg_addressing.get(key)
         if buf is None:
             size = max(self._cg_max_bs, lease.bucket.bs, num_rows)
             buf = self._cg_addressing[key] = self._new_buffers(size)
+            self._cg_mirrors[key] = (H2DMirror(), H2DMirror())
         assert buf.slot_indices.numel() >= num_rows, (
             f"recurrent addressing for {key} holds "
             f"{buf.slot_indices.numel()} rows but this step planned {num_rows}"
         )
-        return buf
+        return buf, self._cg_mirrors[key]
 
     def _new_buffers(self, size: int) -> RecurrentAddressing:
         return RecurrentAddressing(
@@ -476,5 +485,6 @@ class RecurrentStatePool(Resource):
     def cleanup(self):
         self._blocks.clear()
         self._cg_addressing.clear()
+        self._cg_mirrors.clear()
         self._eager_addressing.clear()
         self._current.clear()

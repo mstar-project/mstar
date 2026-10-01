@@ -5,13 +5,25 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
+
+
+class HostRows(NamedTuple):
+    """A step's row-addressed outputs (``check_stop_buffers``) on the host.
+
+    Row i of every buffer belongs to ``request_ids[i]``, the order the forward
+    ran the requests in; a padded replay leaves extra rows past the real ones.
+    """
+
+    request_ids: tuple
+    buffers: dict[str, torch.Tensor]
+
 
 if TYPE_CHECKING:
     from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
@@ -795,6 +807,22 @@ class NodeSubmodule(torch.nn.Module, ABC):
         Default: no stops.
         """
         return set()
+
+    def check_stop_batched(
+        self, request_ids: list[str],
+        request_infos: dict[str, CurrentForwardPassInfo],
+        host_rows: HostRows,
+    ) -> dict[str, set[str]] | None:
+        """``check_stop`` for the whole batch at once, off the host rows.
+
+        Optional. Returns rid -> loops to stop (rids with none left out), and
+        must agree with ``check_stop`` for every rid; None means "use the
+        per-request path". It runs once per step instead of once per request,
+        which is the point for an AR submodule whose stop test is one token.
+        A raise falls back to the per-request path, which then attributes the
+        failure to the request it belongs to.
+        """
+        return None
 
     def cleanup_request(self, request_id: str):
         """Remove per-request state when a request completes. The engines call
