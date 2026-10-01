@@ -805,7 +805,10 @@ request, and the engine passes each config to its resource when the request is i
 There are two <code class="docutils literal notranslate"><span class="pre">ResourceReqConfig</span></code> subclasses:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span></code>,
-<code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code> and <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>. The conductor fills in the per-request seed.</p></li>
+<code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code>, <code class="docutils literal notranslate"><span class="pre">min_p</span></code> and <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>. The conductor fills in the
+per-request seed. <code class="docutils literal notranslate"><span class="pre">min_p</span></code> follows the HF processor order (after the penalty and
+temperature, before top-k/top-p) and needs <code class="docutils literal notranslate"><span class="pre">enable_min_p=True</span></code> on the node’s
+<code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code>, which adds the filter to that node’s captured sampler only.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">KVReqConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">needed_labels</span></code>, <code class="docutils literal notranslate"><span class="pre">needed_labels_per_node</span></code> and
 <code class="docutils literal notranslate"><span class="pre">needed_labels_per_node_walk</span></code>. These name the cache streams that the request will
 actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
