@@ -17,7 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.stream_buffer import (  # noqa: E402
-    StreamBuffer, StreamChunkInfo, StreamingEdge,
+    StreamBuffer,
+    StreamChunkInfo,
+    StreamingEdge,
 )
 from mstar.worker.worker import Worker  # noqa: E402
 

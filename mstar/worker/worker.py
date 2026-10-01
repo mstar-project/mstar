@@ -983,7 +983,11 @@ class Worker:
     def _mark_stream_ingested(
         self, request_id: int, streaming_edge: StreamingEdge
     ) -> None:
-        """Remember the chunk the graph accepted, for the batch that consumes it."""
+        """
+        Remember the chunk the graph accepted, for the batch that consumes it.
+        NOTE: it works to store a single ingested_chunk field because
+        streaming edges are always ingested with can_buffer=False.
+        """
         req_info = self.request_state.per_request_info.get(request_id)
         if req_info is None:
             return
