@@ -883,6 +883,7 @@ window.runMermaid = runMermaid;</script>
   <h1>Source code for mstar.streaming.stream_buffer</h1><div class="highlight"><pre>
 <span></span><span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">deque</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -898,7 +899,39 @@ window.runMermaid = runMermaid;</script>
     <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span>
     <span class="n">chunk_index</span><span class="p">:</span> <span class="nb">int</span>
     <span class="n">start_offset</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># global position of the first item in this chunk</span>
-    <span class="n">is_final</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span></div>
+    <span class="n">is_final</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># leading items of this chunk that an earlier chunk already delivered</span>
+    <span class="c1"># (sliding-window overlap / left context); the consumer trims their output</span>
+    <span class="n">context_items</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># items in this chunk (context included); lets a consumer pick its</span>
+    <span class="c1"># capture bucket before the chunk tensor is unpacked</span>
+    <span class="n">num_items</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">info</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"StreamChunkInfo"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">StreamChunkInfo</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">start_offset</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_items</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_items</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_final</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="StreamChunkInfo">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamChunkInfo">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">StreamChunkInfo</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A chunk's place in its stream, without its data."""</span>
+    <span class="n">start_offset</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">context_items</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">num_items</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">is_final</span><span class="p">:</span> <span class="nb">bool</span></div>
+
+
+
+<div class="viewcode-block" id="StreamingEdge">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamingEdge">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">StreamingEdge</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A synthetic streaming-input edge and the chunk it carries."""</span>
+    <span class="n">edge</span><span class="p">:</span> <span class="n">GraphEdge</span>
+    <span class="n">chunk</span><span class="p">:</span> <span class="n">StreamChunkInfo</span></div>
 
 
 
@@ -920,13 +953,18 @@ window.runMermaid = runMermaid;</script>
     <span class="n">from_partition</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">policy</span><span class="p">:</span> <span class="n">ChunkPolicy</span>
 
-    <span class="n">_waiting_graph_edges</span><span class="p">:</span> <span class="n">deque</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">deque</span><span class="p">)</span>
+    <span class="n">_waiting_graph_edges</span><span class="p">:</span> <span class="n">deque</span><span class="p">[</span><span class="n">StreamingEdge</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">deque</span><span class="p">)</span>
+    <span class="c1"># last chunk the graph accepted; read by the batch that consumes it</span>
+    <span class="n">ingested_chunk</span><span class="p">:</span> <span class="n">StreamChunkInfo</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">_buffer</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
     <span class="n">_tensor_ids_in_order</span><span class="p">:</span> <span class="n">deque</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="n">deque</span><span class="p">)</span>
     <span class="n">_id_to_tensor</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="n">_consumed</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">_chunks_popped</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># global position just past the last item ever handed out; everything</span>
+    <span class="c1"># before it in a later window is context, not new data</span>
+    <span class="n">_delivered_end</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">producer_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># Set once a chunk has been popped with ``is_final=True`` (the terminal</span>
     <span class="c1"># flush). Guards the empty-buffer final flush below so it fires exactly</span>
@@ -972,7 +1010,7 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="StreamBuffer.pop_waiting_edge">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.pop_waiting_edge">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">pop_waiting_edge</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">GraphEdge</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">pop_waiting_edge</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">StreamingEdge</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_waiting_graph_edges</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_waiting_graph_edges</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span></div>
 
@@ -1043,15 +1081,18 @@ window.runMermaid = runMermaid;</script>
             <span class="n">chunk_index</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span><span class="p">,</span>
             <span class="n">start_offset</span><span class="o">=</span><span class="n">offset</span><span class="p">,</span>
             <span class="n">is_final</span><span class="o">=</span><span class="n">is_final</span><span class="p">,</span>
+            <span class="n">context_items</span><span class="o">=</span><span class="nb">min</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_delivered_end</span> <span class="o">-</span> <span class="n">offset</span><span class="p">,</span> <span class="mi">0</span><span class="p">),</span> <span class="nb">len</span><span class="p">(</span><span class="n">items</span><span class="p">)),</span>
+            <span class="n">num_items</span><span class="o">=</span><span class="nb">len</span><span class="p">(</span><span class="n">items</span><span class="p">),</span>
         <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_delivered_end</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_delivered_end</span><span class="p">,</span> <span class="n">offset</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="n">items</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span> <span class="o">+=</span> <span class="mi">1</span>
         <span class="k">return</span> <span class="n">chunk</span></div>
 
 
 <div class="viewcode-block" id="StreamBuffer.store_uningested_edge">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.store_uningested_edge">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">store_uningested_edge</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">edge</span><span class="p">:</span> <span class="n">GraphEdge</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_waiting_graph_edges</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">edge</span><span class="p">)</span></div>
+    <span class="k">def</span><span class="w"> </span><span class="nf">store_uningested_edge</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">streaming_edge</span><span class="p">:</span> <span class="n">StreamingEdge</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_waiting_graph_edges</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">streaming_edge</span><span class="p">)</span></div>
 
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_collate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">items</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>

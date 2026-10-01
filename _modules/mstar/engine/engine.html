@@ -934,6 +934,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Model</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.stream_buffer</span><span class="w"> </span><span class="kn">import</span> <span class="n">StreamChunkInfo</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -1106,6 +1107,11 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># rids for which this step ends every finite stream into the node; the</span>
     <span class="c1"># consumer flushes what it held back</span>
     <span class="n">final_stream_rids</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">set</span><span class="p">)</span>
+    <span class="c1"># rid -&gt; {input_name: chunk info} for rids consuming a streamed input</span>
+    <span class="n">per_request_stream_chunks</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"StreamChunkInfo"</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span>
+    <span class="p">)</span>
+
     <span class="c1"># rids for which this step ends every finite stream into the partition;</span>
     <span class="c1"># this step reports the partition done</span>
     <span class="n">stream_partition_done_rids</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">set</span><span class="p">)</span>
@@ -1991,6 +1997,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">per_request_states</span><span class="o">=</span><span class="n">LazyRequestStates</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="n">rids</span><span class="p">),</span>
             <span class="n">captured</span><span class="o">=</span><span class="n">lease</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">step</span><span class="o">=</span><span class="n">step</span><span class="p">,</span>
+            <span class="n">per_request_stream_chunks</span><span class="o">=</span><span class="n">batch</span><span class="o">.</span><span class="n">per_request_stream_chunks</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="k">if</span> <span class="n">nvtx</span><span class="p">:</span>
             <span class="n">range_push</span><span class="p">(</span><span class="s2">"engine.preprocess"</span><span class="p">)</span>

@@ -882,6 +882,7 @@ window.runMermaid = runMermaid;</script>
                   
   <h1>Source code for mstar.streaming.chunk_policy</h1><div class="highlight"><pre>
 <span></span><span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Sequence</span>
 
 
 <div class="viewcode-block" id="ChunkPolicy">
@@ -1167,6 +1168,84 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.RampChunkPolicy.continue_after_producer_done">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">continue_after_producer_done</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_continue_after_done</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="ScheduledLeftContextChunkPolicy">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ScheduledLeftContextChunkPolicy</span><span class="p">(</span><span class="n">ChunkPolicy</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Left-context chunking whose chunk sizes follow a ramp.</span>
+
+<span class="sd">    Streaming vocoders want the first audio out as early as possible and</span>
+<span class="sd">    larger chunks once the stream is running. Chunk ``k`` delivers</span>
+<span class="sd">    ``schedule[k]`` new items (``chunk`` once the schedule is exhausted) with</span>
+<span class="sd">    up to ``left_context`` already-delivered items in front of them, so a</span>
+<span class="sd">    causal decoder can warm up on frames it has processed before. Unlike</span>
+<span class="sd">    ``LeftContextChunkPolicy`` the first chunk may be smaller than the</span>
+<span class="sd">    context: the context is whatever has been delivered so far, capped.</span>
+
+<span class="sd">    Example (Qwen3-TTS, 12 Hz frames): ``schedule=(4, 8, 16)``, ``chunk=25``,</span>
+<span class="sd">    ``left_context=25`` pops windows of 4, 4+8, 12+16, 25+25, 25+25, ...</span>
+<span class="sd">    items and the first audio leaves after four frames instead of 300.</span>
+
+<span class="sd">    The consumer learns how many leading items of a window are context from</span>
+<span class="sd">    ``StreamChunk.context_items`` (the worker passes it along as</span>
+<span class="sd">    ``step_metadata["stream_chunks"][edge]["context_items"]``), so it can trim</span>
+<span class="sd">    the duplicated output without re-deriving this schedule.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">schedule</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">chunk</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">left_context</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">chunk</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="ow">or</span> <span class="nb">any</span><span class="p">(</span><span class="n">size</span> <span class="o">&lt;=</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">size</span> <span class="ow">in</span> <span class="n">schedule</span><span class="p">)</span> <span class="ow">or</span> <span class="n">left_context</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"chunk sizes must be positive and left_context non-negative"</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_schedule</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">size</span><span class="p">)</span> <span class="k">for</span> <span class="n">size</span> <span class="ow">in</span> <span class="n">schedule</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chunk</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_left_context</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">left_context</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_delivered</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># new items handed to the consumer so far</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_new_items</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_schedule</span><span class="p">):</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_schedule</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span><span class="p">]</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chunk</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_context</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_left_context</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_delivered</span><span class="p">)</span>
+
+<div class="viewcode-block" id="ScheduledLeftContextChunkPolicy.is_ready">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.is_ready">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_ready</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">buffer_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">buffer_len</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">window_size</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="ScheduledLeftContextChunkPolicy.window_size">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.window_size">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">window_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_context</span><span class="p">()</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">_new_items</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="ScheduledLeftContextChunkPolicy.next_chunk_size">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.next_chunk_size">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">next_chunk_size</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">buffer_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="c1"># The buffer pointer sits ``context`` items before the first new item.</span>
+        <span class="c1"># After this pop it must sit ``next context`` items before the next</span>
+        <span class="c1"># chunk's first new item.</span>
+        <span class="n">delivered_after</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_delivered</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">_new_items</span><span class="p">()</span>
+        <span class="n">next_context</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_left_context</span><span class="p">,</span> <span class="n">delivered_after</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">delivered_after</span> <span class="o">-</span> <span class="n">next_context</span><span class="p">)</span> <span class="o">-</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_delivered</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_context</span><span class="p">())</span></div>
+
+
+<div class="viewcode-block" id="ScheduledLeftContextChunkPolicy.register_chunk">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.register_chunk">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">register_chunk</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">register_chunk</span><span class="p">(</span><span class="n">chunk_size</span><span class="p">)</span>
+        <span class="c1"># A regular pop delivers exactly this chunk's new items. The only</span>
+        <span class="c1"># other caller is the terminal flush (producer done, window not</span>
+        <span class="c1"># full), after which no data-carrying chunk follows, so treating it</span>
+        <span class="c1"># the same keeps the bookkeeping trivially correct where it matters.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_delivered</span> <span class="o">+=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_new_items</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span> <span class="o">+=</span> <span class="mi">1</span></div>
 </div>
 
 </pre></div>

@@ -19,6 +19,8 @@ mstar.streaming.stream\_buffer
    
       StreamBuffer
       StreamChunk
+      StreamChunkInfo
+      StreamingEdge
    
    
 

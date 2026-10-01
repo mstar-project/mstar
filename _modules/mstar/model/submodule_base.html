@@ -900,6 +900,7 @@ window.runMermaid = runMermaid;</script>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="n">CudaGraphConfig</span><span class="p">,</span> <span class="n">PiecewiseCudaGraphConfig</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">PiecewiseCudaGraphRunner</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.engine</span><span class="w"> </span><span class="kn">import</span> <span class="n">ExecutingBatch</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.stream_buffer</span><span class="w"> </span><span class="kn">import</span> <span class="n">StreamChunkInfo</span>
 
 
 <div class="viewcode-block" id="NodeInputs">
@@ -1195,6 +1196,11 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># dim) reads it here. The forward method itself is chosen by the config's</span>
     <span class="c1"># ``capture_forward_method``, so most submodules never need this.</span>
     <span class="n">captured</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="c1"># rid -&gt; {input_name: StreamChunkInfo}; only rids consuming a streamed input</span>
+    <span class="n">per_request_stream_chunks</span><span class="p">:</span> <span class="s2">"Mapping[str, Mapping[str, StreamChunkInfo]]"</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
+        <span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span>
+    <span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
