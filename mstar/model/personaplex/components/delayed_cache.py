@@ -175,6 +175,36 @@ class DelayedTokenCache:
         self._prepared = False
         return output
 
+    def state_tensor(self, step: int) -> torch.Tensor:
+        """Pack cache, mask, offset and a walk step counter as ``[B, 2*17*4 + 2]`` int64.
+
+        This is the LM's ``lm_state`` graph edge; a prepared-but-uncommitted
+        cache is never packed.
+        """
+        if self._prepared:
+            raise RuntimeError("commit the prepared step before packing the cache")
+        batch = self.cache.shape[0]
+        scalars = torch.tensor([self.offset, step], dtype=torch.long, device=self.cache.device).expand(batch, 2)
+        return torch.cat((self.cache.flatten(1), self.provided.long().flatten(1), scalars), dim=1)
+
+    @classmethod
+    def from_state_tensor(cls, state: torch.Tensor) -> tuple["DelayedTokenCache", int]:
+        """Inverse of ``state_tensor``; returns the cache and the step counter."""
+        size = NUM_CODEBOOKS * CACHE_SIZE
+        if state.dim() != 2 or state.shape[1] != 2 * size + 2 or state.dtype != torch.long:
+            raise ValueError(f"lm_state must be int64 [B, {2 * size + 2}], got {state.dtype} {tuple(state.shape)}")
+        scalars = state[:, 2 * size :]
+        if not torch.equal(scalars, scalars[:1].expand_as(scalars)) or bool((scalars < 0).any()):
+            raise ValueError("lm_state rows disagree on offset/step or hold negative values")
+        cache = cls(state.shape[0], device=state.device)
+        cache.cache.copy_(state[:, :size].view_as(cache.cache))
+        provided = state[:, size : 2 * size]
+        if bool(((provided != 0) & (provided != 1)).any()):
+            raise ValueError("lm_state provided mask must be 0/1")
+        cache.provided.copy_(provided.view_as(cache.provided).bool())
+        cache.offset = int(scalars[0, 0])
+        return cache, int(scalars[0, 1])
+
     def load(self, cache: torch.Tensor) -> None:
         """Restore only voice tokens ([PP] lm.py:1031-1038), retaining offset/mask.
 

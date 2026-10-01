@@ -208,6 +208,20 @@ class MimiCodec(nn.Module):
         return m.decoder(self._transformer(m.decoder_transformer, x))
 
 
+def load_mimi_codec(
+    state_dict: dict[str, torch.Tensor], config_kwargs: dict | None = None, device: torch.device | str = "cpu"
+) -> MimiCodec:
+    """Build ``MimiCodec`` from NVIDIA-named Mimi weights (strict), in fp32 on ``device``."""
+    model = build_hf_mimi(config_kwargs)
+    config = model.config
+    expected = {name: tensor.shape for name, tensor in model.state_dict().items()}
+    converted = convert_mimi_state_dict(
+        state_dict, expected, num_heads=config.num_attention_heads, num_kv_heads=config.num_key_value_heads
+    )
+    model.load_state_dict(converted, strict=True)
+    return MimiCodec(model.to(device=device, dtype=torch.float32).eval())
+
+
 def pad_to_frames(pcm: torch.Tensor) -> torch.Tensor:
     """Zero-pad the last frame to 1920 samples, as ``_iterate_audio(pad=True)`` does ([PP] models/lm.py:131-150)."""
     remainder = pcm.shape[-1] % FRAME_SIZE

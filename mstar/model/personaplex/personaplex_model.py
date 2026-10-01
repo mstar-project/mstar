@@ -45,9 +45,11 @@ from .voice import load_voice_preset, resolve_voice_path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_REPO = "nvidia/personaplex-7b-v1"  # [PP] models/loaders.py:44
-TEXT_TOKENIZER_NAME = "tokenizer_spm_32k_3.model"  # [PP] models/loaders.py:41
-GENERATE_AUDIO_WALK = "generate_audio"
+DEFAULT_REPO = "nvidia/personaplex-7b-v1"  # [PP] models/loaders.py:45
+TEXT_TOKENIZER_NAME = "tokenizer_spm_32k_3.model"  # [PP] models/loaders.py:42
+LM_CHECKPOINT_NAME = "model.safetensors"  # [PP] models/loaders.py:43
+MIMI_CHECKPOINT_NAME = "tokenizer-e351c8d8-checkpoint125.safetensors"  # [PP] models/loaders.py:44
+GENERATE_AUDIO_WALK = cfg.GENERATE_AUDIO_WALK
 LM_LOOP_BACKS = {
     cfg.CONDITIONING_WALK: ("lm_state",),
     cfg.GENERATE_WALK: ("lm_state", "agent_frame", "text_frame"),
@@ -389,8 +391,36 @@ class PersonaPlexModel(Model):
         self, node_name: str, device="cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None, sp_group=None,
     ) -> torch.nn.Module | None:
+        del tp_group, autocast_dtype, sp_group  # single GPU; submodules load in their own dtypes
         if self.skip_weight_loading:
             return None
-        raise NotImplementedError(
-            "PersonaPlex submodules are not implemented yet (planned Commit 5); use skip_weight_loading=True"
-        )
+        if node_name not in self._submodule_cache:
+            self._submodule_cache[node_name] = self._create_submodule(node_name, device)
+        return self._submodule_cache[node_name]
+
+    def _download(self, filename: str) -> str:
+        from huggingface_hub import hf_hub_download
+
+        return hf_hub_download(self.model_path_hf, filename, cache_dir=self.cache_dir)
+
+    def _create_submodule(self, node_name: str, device) -> torch.nn.Module:
+        """Load one node from the (gated) checkpoint. Not yet run on the real files (worklog T15)."""
+        from .submodules import LMSubmodule, MimiDecoderSubmodule, MimiEncoderSubmodule
+
+        if node_name == cfg.LM_NODE:
+            from .weights import build_lm, iter_lm_checkpoint
+
+            path = self._download(LM_CHECKPOINT_NAME)
+            lm = build_lm(self.lm_config, iter_lm_checkpoint(path, device=device), device=device)
+            logger.info("Loaded PersonaPlex LM from %s", path)
+            return LMSubmodule(lm)
+        if node_name in (cfg.MIMI_ENCODER_NODE, cfg.MIMI_DECODER_NODE):
+            from safetensors.torch import load_file
+
+            from .components.mimi import load_mimi_codec
+
+            # Separate instances per node, like Wan2.2's VAEs; NVIDIA's other_mimi is omitted (R18).
+            codec = load_mimi_codec(load_file(self._download(MIMI_CHECKPOINT_NAME)), device=device)
+            cls = MimiEncoderSubmodule if node_name == cfg.MIMI_ENCODER_NODE else MimiDecoderSubmodule
+            return cls(codec)
+        raise ValueError(f"PersonaPlex has no node {node_name!r}")

@@ -116,7 +116,7 @@ class TemporalAttentionBackend(Protocol):
 
 
 class DenseTemporalCache:
-    """Pure-torch reference backend for ``[B, T, H, D]`` inputs.
+    """Pure-torch reference backend for ``[B, T, H, D]`` (or token-major ``[B, H, D]``) inputs.
 
     Keeps every key, so it is exact causal attention; this equals NVIDIA's
     3000-slot ring for at most ``MAX_TEMPORAL_FORWARDS`` positions
@@ -131,12 +131,17 @@ class DenseTemporalCache:
         self._pending = 0
 
     def rope(self, q, k):
+        if q.dim() == 3:  # token-major, one token per request
+            q, k = self.rope(q[:, None], k[:, None])
+            return q[:, 0], k[:, 0]
         T = q.shape[-3]
         self._pending = T
         positions = torch.arange(self.offset, self.offset + T, device=q.device)
         return apply_rope_adjacent(q, k, positions, self.rope_theta)
 
     def attend(self, layer_idx, q, k, v):
+        if q.dim() == 3:
+            return self.attend(layer_idx, q[:, None], k[:, None], v[:, None])[:, 0]
         if self.keys[layer_idx] is not None:
             k = torch.cat((self.keys[layer_idx], k), dim=-3)
             v = torch.cat((self.values[layer_idx], v), dim=-3)
@@ -218,10 +223,14 @@ class TemporalTransformer(nn.Module):
         return x + self.text_emb(codes[:, 0])
 
     def forward_embeddings(
-        self, x: torch.Tensor, backend: TemporalAttentionBackend
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the normed hidden state fed to the depformer and the text logits ([PP] models/lm.py:447-455)."""
+        self, x: torch.Tensor, backend: TemporalAttentionBackend, *, text_logits: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return the normed hidden state fed to the depformer and the text logits ([PP] models/lm.py:447-455).
+
+        ``text_logits=False`` skips the 32000-way head for fully forced
+        (conditioning) frames, whose samples the cache discards.
+        """
         for layer_idx, layer in enumerate(self.transformer.layers):
             x = layer(x, layer_idx, backend)
         x = self.out_norm(x)
-        return x, self.text_linear(x)
+        return x, self.text_linear(x) if text_logits else None

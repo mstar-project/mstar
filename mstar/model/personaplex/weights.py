@@ -90,3 +90,20 @@ def iter_lm_checkpoint(path: str, device: torch.device | str = "cpu") -> Iterato
     from mstar.model.loader.iterators import iter_safetensors_file
 
     yield from iter_safetensors_file(path, device=device)
+
+
+def build_lm(
+    config: LMArchConfig, weights: Iterable[tuple[str, torch.Tensor]], *,
+    device: torch.device | str = "cpu", dtype: torch.dtype = torch.bfloat16,
+) -> PersonaPlexLM:
+    """Materialise the LM directly in ``dtype`` on ``device`` and load it strictly.
+
+    Built on meta and cast before ``to_empty`` so storage is allocated once in
+    the target dtype (``Model.get_submodule`` contract). NVIDIA also casts every
+    tensor to one dtype, norm scales included ([PP] models/loaders.py:253-260).
+    """
+    with torch.device("meta"):
+        lm = PersonaPlexLM(config)
+    lm = lm.to(dtype=dtype).to_empty(device=device)
+    load_lm_weights(lm, ((key, tensor.to(device=device, dtype=dtype)) for key, tensor in weights))
+    return lm.eval()

@@ -454,8 +454,6 @@ def test_t14_dummy_mode_builds_without_submodules_or_network():
     assert pos.interleave is True and pos.rope_theta == 10000.0 and pos.kv_cache == cfg.LM_KV
     assert specs[cfg.TEXT_SAMPLER].vocab_size == 32000 and specs[cfg.DEPTH_SAMPLER].vocab_size == 2048
     assert model.get_max_output_tokens() == 2999 and model.get_autocast_dtype() is None
-    with pytest.raises(NotImplementedError, match="Commit 5"):
-        PersonaPlexModel().get_submodule("LM")
 
 
 def test_t14_sampling_configs_default_to_reference_and_greedy_is_temperature_zero():

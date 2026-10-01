@@ -160,6 +160,7 @@ SYSTEM_TAG = "<system>"  # [PP] offline.py:83-90 (wrap_with_system_tags)
 # M* graph and resource names (not from the reference).
 LM_NODE, MIMI_ENCODER_NODE, MIMI_DECODER_NODE = "LM", "MimiEncoder", "MimiDecoder"
 ENCODE_USER_AUDIO_WALK, CONDITIONING_WALK, GENERATE_WALK = "encode_user_audio", "conditioning", "generate"
+GENERATE_AUDIO_WALK = "generate_audio"  # generate without emitting text
 CONDITIONING_LOOP, DECODE_LOOP = "cond_loop", "decode_loop"
 LM_KV, LM_ATTN, LM_POS = "lm_kv", "lm_attn", "lm_pos"
 TEXT_SAMPLER, DEPTH_SAMPLER = "text_sampler", "depth_sampler"
