@@ -21,7 +21,12 @@ from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStor
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
-from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, RouteInput
+from mstar.graph.runtime.base import (
+    ColumnarEdgeSpecs,
+    EdgeSpec,
+    RouteInput,
+    SpeculationPrepInput,
+)
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
@@ -520,6 +525,76 @@ def test_speculate_node_agrees_across_a_loop(lock):
         lock.route("ar_decode", rid, ["token"], [uuid])
         lock._both(f"speculate_node(ar_decode) post-route {uuid}",
                    lambda rt, b, s: _spec(rt, "ar_decode", rid))
+
+
+def _external_input_loop_graph():
+    """The wan22 / waypoint shape: the loop node has an external input ``ctx``
+    the loop re-injects every iteration, next to its own loop-back ``token``."""
+    return Sequential(sections=[
+        GraphNode(
+            name="prefill", input_names={"prompt"},
+            outputs=[
+                GraphEdge(name="token", next_node="ar_decode"),
+                GraphEdge(name="ctx", next_node="ar_decode"),
+            ],
+        ),
+        Loop(
+            name="ar_loop",
+            section=GraphNode(
+                name="ar_decode", input_names={"token", "ctx"},
+                outputs=[GraphEdge(name="token", next_node="ar_decode")],
+            ),
+            outputs=[GraphEdge(name="token", next_node="post_processor")],
+            max_iters=4,
+        ),
+    ])
+
+
+def _prep_same_node(rt, node, rid):
+    out = rt.prep_spec_rids(SpeculationPrepInput(
+        spec_node_name=node, curr_node_name=node, graph_walk=WALK, rids=[rid],
+        room_for_continuing=None, streaming_edges=[], streaming_edges_per_rid=[0],
+    ))
+    return (
+        list(out.ready_rids),
+        sorted((sig, list(uuids)) for _r, sig, uuids, _f
+               in out.input_edges.edge_tuples()),
+    )
+
+
+def test_same_node_speculation_with_a_held_external_input_agrees():
+    """A loop's external input lives in the current slot and is re-injected
+    every iteration; it never reaches the next-iter slot. Both runtimes must
+    still offer the same-node next iteration as a speculation target and hand
+    the held input over with the prepped edges (Python: GraphNode
+    .is_ready_for_speculation / _prep_spec_rid; Rust: held_mask)."""
+    lock = Lockstep(_external_input_loop_graph())
+    rid = lock.admit()
+    lock.put(101)
+    lock.ingest(rid, "prompt", "prefill", [101])
+    lock.pop("prefill", rid)
+    lock.put(201)
+    lock.put(301)
+
+    def route_two(rt, _b, s):
+        out = rt.complete_and_route_batch(RouteInput(
+            partition="default", graph_walk=WALK, node_name="prefill",
+            output_signals=["token", "ctx"], wg_ids=ParallelList([rid], [WG_ID]),
+            tensors=[201, 301], num_tensors=[1, 1],
+        ))
+        _finish_teardown(s, out.freed_inputs)
+        return (sorted(out.register_uuids), sorted(out.register_rids))
+
+    lock._both("route(prefill, token+ctx)", route_two)
+    lock.ready()
+    lock.pop("ar_decode", rid)
+    targets = lock._both("speculate_node(ar_decode)",
+                         lambda rt, b, s: _spec(rt, "ar_decode", rid))
+    assert [(t[0], t[2]) for t in targets] == [("ar_decode", True)]
+    prep = lock._both("prep_spec_rids(ar_decode)",
+                      lambda rt, b, s: _prep_same_node(rt, "ar_decode", rid))
+    assert prep == ([rid], [("ctx", [301])])
+    lock.refcounts([101, 201, 301])
 
 
 def test_speculative_flag_survives_completion(lock):
