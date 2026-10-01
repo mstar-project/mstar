@@ -86,3 +86,29 @@ T13-LM loads that state dict through the strict M* key map and replays the
 whole greedy loop with M*'s cache, temporal transformer and depformer, so token
 errors cascade instead of being masked. This shows algorithmic equivalence with
 random weights only; it is not checkpoint, bf16 or GPU parity.
+
+Commit 3: Mimi streaming reference (T7, T13-Mimi)
+-------------------------------------------------
+
+.. code-block:: bash
+
+   /tmp/personaplex-oracle/bin/python test/scratch/personaplex_reference_oracle.py \
+     --source /tmp/personaplex-3428dfd9 --mode mimi --out /tmp/personaplex-fixtures
+   PERSONAPLEX_REFERENCE_MIMI=/tmp/personaplex-fixtures/reference_mimi.pt \
+     python -m pytest test/modular/test_personaplex_mimi.py -v   # needs transformers
+
+``mimi`` builds NVIDIA's ``MimiModel`` with the loader's kwargs shrunk to 32
+channels, 8 filters and 2 transformer layers (strides, kernels, causal padding,
+RoPE, 250-step context and 32x2048 codebooks unchanged). It spreads the
+zero-initialised codebooks over real-ish latents so codes vary, then runs the
+model **one 1920-sample frame per call in streaming mode**, as ``offline.py``
+does. Recorded: latents, 8-codebook codes, the best-vs-second codebook distance
+margin per code (so fp32 ties can be excluded), PCM decoded from the codes and
+from random codes, for 7 and 160 frames (160 > 124, where NVIDIA's ring KV
+starts to differ from plain causal attention); an ``offline.py``-style run with
+warmup, reset and interleaved encode/decode; the tiny state dict; and the
+full-size model's key/shape manifest (no weights). About 11 MB.
+
+The M* side converts the state dict with the vendored HF v4.45.0 table and
+compares ``MimiCodec`` (HF submodules + the ring mask) against those outputs. The
+recorder itself imports no transformers code.

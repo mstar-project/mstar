@@ -6,6 +6,8 @@ Modes:
   manifest  state-dict keys/shapes of the full-size LMModel, built on meta (T5).
   lm        tiny random fp32 LMModel: its weights plus every forward's inputs,
             hidden states, text/depth logits and greedy tokens (T13-LM).
+  mimi      tiny random MimiModel run per 1920-sample frame in streaming mode,
+            as offline.py does: latents, codes, tie margins and decoded PCM (T13-Mimi).
 
 No mstar imports, checkpoints or network access at runtime. Run in an isolated
 torch<2.5 environment with the pinned NVIDIA package installed. Setup and replay
@@ -267,6 +269,132 @@ def _record_lm(lm_module, lm_kwargs: dict, user_frames: int) -> tuple[dict, dict
     return config, {"state_dict": {k: v.clone() for k, v in model.state_dict().items()}, "cases": cases}
 
 
+MIMI_FRAME = 1920
+
+
+def _mimi_kwargs(loaders) -> dict:
+    """Reference Mimi kwargs ([PP] models/loaders.py:48-90) and a shrunken copy.
+
+    The copy keeps the strides, kernels, codebook count/size, causal padding,
+    RoPE and 250-step attention context; only channel widths and depth shrink.
+    """
+    real = {"seanet": dict(loaders._seanet_kwargs), "transformer": dict(loaders._transformer_kwargs),
+            "quantizer": dict(loaders._quantizer_kwargs)}
+    seanet = dict(real["seanet"], dimension=32, n_filters=8)
+    tiny = {
+        "seanet": seanet,
+        "transformer": dict(real["transformer"], d_model=32, num_heads=2, num_layers=2, dim_feedforward=64,
+                            input_dimension=32, output_dimensions=[32]),
+        "quantizer": dict(real["quantizer"], dimension=16, input_dimension=32, output_dimension=32),
+    }
+    return {"real": real, "tiny": tiny}
+
+
+def _build_mimi(kwargs: dict):
+    from moshi.models import compression
+    from moshi.modules import SEANetDecoder, SEANetEncoder, transformer
+    from moshi.quantization import SplitResidualVectorQuantizer
+
+    encoder = SEANetEncoder(**kwargs["seanet"])
+    return compression.MimiModel(
+        encoder, SEANetDecoder(**kwargs["seanet"]), SplitResidualVectorQuantizer(**kwargs["quantizer"]),
+        channels=1, sample_rate=24000, frame_rate=12.5, encoder_frame_rate=24000 / encoder.hop_length,
+        causal=True, resample_method="conv",
+        encoder_transformer=transformer.ProjectedTransformer(device="cpu", **kwargs["transformer"]),
+        decoder_transformer=transformer.ProjectedTransformer(device="cpu", **kwargs["transformer"]),
+    ).eval()
+
+
+def _mimi_audio(frames: int, seed: int) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    t = torch.arange(frames * MIMI_FRAME) / 24000
+    x = 0.2 * torch.sin(2 * torch.pi * 220 * t) + 0.1 * torch.sin(2 * torch.pi * 1375 * t * (1 + t))
+    return (x + 0.05 * torch.randn(x.shape, generator=g)).view(1, 1, -1)
+
+
+def _code_margins(mimi, latent: torch.Tensor) -> torch.Tensor:
+    """Best-vs-second codebook distance per (codebook, frame) along NVIDIA's residual path."""
+    margins = []
+    for rvq, count in ((mimi.quantizer.rvq_first, 1), (mimi.quantizer.rvq_rest, mimi.num_codebooks - 1)):
+        residual = rvq.input_proj(latent) if rvq.input_proj is not None else latent
+        for layer in rvq.vq.layers[:count]:
+            embedding = layer._codebook.embedding
+            dists = torch.cdist(residual[0].T[None], embedding[None])[0]
+            top = dists.topk(2, largest=False).values
+            margins.append(top[:, 1] - top[:, 0])
+            residual = residual - embedding[dists.argmin(-1)].T[None]
+    return torch.stack(margins)
+
+
+def _record_mimi() -> dict:
+    from moshi.models import loaders
+
+    kwargs = _mimi_kwargs(loaders)
+    mimi = _build_mimi(kwargs["tiny"])
+    mimi.set_num_codebooks(8)  # [PP] models/loaders.py:162
+    # Codebooks start at zero; spread them over the latents of real-ish audio so codes vary.
+    g = torch.Generator().manual_seed(5)
+    latent = mimi._encode_to_unquantized_latent(_mimi_audio(160, seed=3))
+    for rvq in (mimi.quantizer.rvq_first, mimi.quantizer.rvq_rest):
+        z = rvq.input_proj(latent) if rvq.input_proj is not None else latent
+        scale = float(z.std())
+        for index, layer in enumerate(rvq.vq.layers):
+            book = layer._codebook
+            picks = torch.randint(0, z.shape[-1], (book.codebook_size,), generator=g)
+            sample = z[0, :, picks].T + 0.3 * scale * torch.randn(book.codebook_size, book.dim, generator=g)
+            book.embedding_sum.copy_(sample * 0.5**index)
+            book.cluster_usage.fill_(1.0)
+            book._initialized.fill_(1.0)
+            book._embedding = None
+
+    def stream_encode(audio):
+        codes, latents = [], []
+        with mimi.streaming(1):
+            for i in range(audio.shape[-1] // MIMI_FRAME):
+                chunk = audio[..., i * MIMI_FRAME:(i + 1) * MIMI_FRAME]
+                latents.append(mimi._encode_to_unquantized_latent(chunk))
+        with mimi.streaming(1):
+            for i in range(audio.shape[-1] // MIMI_FRAME):
+                codes.append(mimi.encode(audio[..., i * MIMI_FRAME:(i + 1) * MIMI_FRAME]))
+        return torch.cat(latents, -1), torch.cat(codes, -1)
+
+    def stream_decode(codes):
+        with mimi.streaming(1):
+            return torch.cat([mimi.decode(codes[..., i:i + 1]) for i in range(codes.shape[-1])], -1)
+
+    cases = []
+    for frames in (7, 160):
+        audio = _mimi_audio(frames, seed=frames)
+        latent, codes = stream_encode(audio)
+        random_codes = torch.randint(0, mimi.cardinality, (1, 8, frames), generator=g)
+        cases.append({
+            "frames": frames, "audio": audio, "latent": latent, "codes": codes,
+            "margins": _code_margins(mimi, latent), "random_codes": random_codes,
+            "pcm_from_codes": stream_decode(codes), "pcm_from_random_codes": stream_decode(random_codes),
+        })
+    # offline.py: one streaming instance, 4 zero-frame warmup steps, reset, then
+    # per-frame encode and decode interleaved ([PP] offline.py:93-111, 222-255).
+    frames = 40
+    audio = _mimi_audio(frames, seed=9)
+    agent = torch.randint(0, mimi.cardinality, (1, 8, frames), generator=g)
+    mimi.streaming_forever(1)
+    for _ in range(4):
+        mimi.decode(mimi.encode(torch.zeros(1, 1, MIMI_FRAME)))
+    mimi.reset_streaming()
+    encoded, decoded = [], []
+    for i in range(frames):
+        encoded.append(mimi.encode(audio[..., i * MIMI_FRAME:(i + 1) * MIMI_FRAME]))
+        decoded.append(mimi.decode(agent[..., i:i + 1]))
+    interleaved = {"audio": audio, "agent_codes": agent, "codes": torch.cat(encoded, -1),
+                   "pcm": torch.cat(decoded, -1)}
+    # Full-size key/shape manifest (no weights) so the conversion's coverage is
+    # checked against the real architecture without the gated checkpoint.
+    full = _build_mimi(kwargs["real"])
+    real_manifest = {name: list(t.shape) for name, t in full.state_dict().items()}
+    return {"mimi_kwargs": kwargs, "num_codebooks": 8, "state_dict": dict(mimi.state_dict()),
+            "real_state_dict_shapes": real_manifest, "cases": cases, "interleaved": interleaved}
+
+
 def _content_hash(fixture: dict) -> str:
     # Invocation paths remain useful provenance, but do not define content identity.
     content = {key: value for key, value in fixture.items() if key != "argv"}
@@ -289,7 +417,7 @@ def _tensor_digest(value) -> object:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True, help="clean NVIDIA/personaplex checkout at the pin")
-    parser.add_argument("--mode", choices=("trace", "manifest", "lm"), default="trace")
+    parser.add_argument("--mode", choices=("trace", "manifest", "lm", "mimi"), default="trace")
     parser.add_argument("--out", type=Path, required=True, help="output directory for the fixture")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--user-frames", type=int, default=20)
@@ -321,6 +449,21 @@ def main() -> None:
         output.write_text(json.dumps(fixture, separators=(",", ":")) + "\n")
         print(f"Recorded {len(fixture['parameters'])} parameters, {fixture['num_parameters']} values to {output}")
         print(f"source={PIN}; torch={torch.__version__}; content_sha256={fixture['content_sha256']}")
+        return
+    if args.mode == "mimi":
+        with torch.no_grad(), no_compile():
+            data = _record_mimi()
+        fixture = {"schema_version": 1, **provenance, "argv": sys.argv[1:], "device": "cpu", "dtype": "float32",
+                   **data}
+        digest = {key: _tensor_digest(value) for key, value in fixture.items() if key != "argv"}
+        fixture["content_sha256"] = hashlib.sha256(
+            json.dumps(digest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        output = args.out / "reference_mimi.pt"
+        torch.save(fixture, output)
+        print(f"Recorded Mimi cases {[c['frames'] for c in data['cases']]} + interleaved to {output}")
+        print(f"source={PIN}; torch={torch.__version__}; bytes={output.stat().st_size}")
+        print(f"content_sha256={fixture['content_sha256']}")
         return
     if args.mode == "lm":
         with torch.no_grad(), no_compile():
