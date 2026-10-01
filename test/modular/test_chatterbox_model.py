@@ -463,8 +463,9 @@ def _t3_submodule(variant="chatterbox"):
 
 
 def _fwd_info(rid, cfg_weight=0.5, temperature=0.8, max_new=1000):
+    # the wire id differs from the handle, so state keyed by the wrong one shows
     return SimpleNamespace(
-        request_id=rid,
+        request_id=f"wire-{rid}", rid_handle=rid,
         step_metadata={"cfg_weight": cfg_weight, "exaggeration": 0.5, "min_p": 0.05,
                        "max_new_tokens": max_new, "is_prefill": True},
         resource_configs={T3_SAMPLER: SimpleNamespace(temperature=temperature, ignore_eos=False)},
@@ -622,7 +623,7 @@ def test_t3_stop_on_eos_and_token_budget():
     sub.postprocess("a", info, out)
     assert sub.check_stop("a", info, out) == {"decode_loop"}  # 3 generated >= max_new 3
     sub.cleanup_request("a")
-    assert "a" not in sub.request_states
+    assert not sub.request_states
 
 
 # ---------------------------------------------------------------------------
@@ -674,7 +675,7 @@ class _FakeS3Gen(torch.nn.Module):
 
 def _s3_info(seed=7, watermark=False, rid="r"):
     return SimpleNamespace(
-        request_id=rid, random_seed=seed,
+        request_id=f"wire-{rid}", rid_handle=rid, random_seed=seed,
         step_metadata={"n_cfm_timesteps": 4, "watermark": watermark},
     )
 
@@ -829,8 +830,9 @@ def test_s3gen_batches_requests_into_one_flow_solve_and_matches_sequential():
     while their flow solves go through one rows call."""
     batched, fake_b = _s3_submodule()
     single, fake_s = _s3_submodule()
-    chunks = {"a": [torch.arange(1, 21), torch.arange(21, 41), torch.tensor([41, 42])],
-              "b": [torch.arange(101, 116), torch.arange(116, 131), torch.tensor([])]}
+    # handle 0 is a real request
+    chunks = {0: [torch.arange(1, 21), torch.arange(21, 41), torch.tensor([41, 42])],
+              1: [torch.arange(101, 116), torch.arange(116, 131), torch.tensor([])]}
     finals = [False, False, True]
 
     expected = {rid: [] for rid in chunks}
@@ -849,7 +851,7 @@ def test_s3gen_batches_requests_into_one_flow_solve_and_matches_sequential():
         ]
         assert batched.can_batch(None, inputs)
         packed = batched.preprocess("s3gen_chunk", None, inputs)
-        assert packed["request_id"] == ["a", "b"] and packed["is_final"] == [final, final]
+        assert packed["rid"] == [0, 1] and packed["is_final"] == [final, final]
         out = batched.forward_batched("s3gen_chunk", None, **packed)
         for rid in chunks:
             got[rid].append(out[rid]["audio_chunk"][0])
@@ -857,17 +859,20 @@ def test_s3gen_batches_requests_into_one_flow_solve_and_matches_sequential():
     for rid in chunks:
         for mine, theirs in zip(got[rid], expected[rid], strict=True):
             assert torch.equal(mine, theirs)
-    # every step solves both streams in one padded batch ("b"'s empty final
+    # every step solves both streams in one padded batch (1's empty final
     # flush still finalises its three withheld look-ahead tokens)
     assert fake_b.rows_calls == [2, 2, 2]
     assert set(fake_s.rows_calls) == {1}
+    for rid in chunks:
+        batched.cleanup_request(rid)
+    assert not batched.request_states
 
 
 def test_s3gen_batching_is_bounded_and_single_requests_keep_the_plain_path():
     sub, _ = _s3_submodule()
     one = [sub.prepare_inputs("s3gen_chunk", _s3_info(rid="a"), {SPEECH_TOKENS: [torch.tensor([1, 2])]})]
     assert not sub.can_batch(None, one)
-    assert set(sub.preprocess("s3gen_chunk", None, one)) >= {SPEECH_TOKENS, "request_id", "ref", "is_final"}
+    assert set(sub.preprocess("s3gen_chunk", None, one)) >= {SPEECH_TOKENS, "rid", "ref", "is_final"}
     many = one * (sub.MAX_BATCH_SIZE + 1)
     assert not sub.can_batch(None, many) and sub.can_batch(None, one * 2)
 

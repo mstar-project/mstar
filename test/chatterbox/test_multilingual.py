@@ -154,7 +154,7 @@ def test_t3_greedy_tokens_match_reference(snapshot, tokenizers):
     res.bind(model, T3_ATTN, T3_KV, T3_POS)
     resources = {T3_ATTN: res.kv_attn, T3_KV: res.kv_attn, T3_POS: res.pos, T3_SAMPLER: FakeGreedySampler()}
     info = SimpleNamespace(
-        request_id="r",
+        request_id="r", rid_handle="r",
         step_metadata={"cfg_weight": cfg_weight, "exaggeration": exaggeration, "min_p": 0.05,
                        "max_new_tokens": 1000, "is_prefill": True},
         resource_configs={T3_SAMPLER: SimpleNamespace(temperature=0.0, ignore_eos=False)},

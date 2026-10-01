@@ -148,10 +148,11 @@ def test_batched_streams_match_their_single_runs(setup):
         start = sum(sizes[:step])
         return tokens[start:start + sizes[step]], step == len(sizes) - 1
 
-    def prepared(rid, step, request_id=None):
+    def prepared(rid, step, handle=None):
         toks, final = chunk(rid, step)
         info = SimpleNamespace(
-            request_id=request_id or rid, random_seed=21, step_metadata={"n_cfm_timesteps": 4},
+            request_id=rid, rid_handle=rid if handle is None else handle,
+            random_seed=21, step_metadata={"n_cfm_timesteps": 4},
         )
         return sub.prepare_inputs("s3gen_chunk", info, {SPEECH_TOKENS: [toks]}, is_final_stream_chunk=final)
 
@@ -161,16 +162,16 @@ def test_batched_streams_match_their_single_runs(setup):
             inp = prepared(rid, step)
             single[rid].append(sub.forward("s3gen_chunk", None, **inp.tensor_inputs, **inp.kwargs)["audio_chunk"][0])
 
-    # the batched pass runs under its own request ids, so it starts from fresh state
+    # the batched pass runs under its own handles, so it starts from fresh state
     batched = {rid: [] for rid in schedules}
     for step in range(steps):
         live = [rid for rid in schedules if chunk(rid, step) is not None]
-        inputs = [prepared(rid, step, request_id=f"{rid}-batched") for rid in live]
+        inputs = [prepared(rid, step, handle=f"{rid}-batched") for rid in live]
         if len(inputs) > 1:
             out = sub.forward_batched("s3gen_chunk", None, **sub.preprocess("s3gen_chunk", None, inputs))
         else:
             inp = inputs[0]
-            out = {inp.kwargs["request_id"]: sub.forward("s3gen_chunk", None, **inp.tensor_inputs, **inp.kwargs)}
+            out = {inp.kwargs["rid"]: sub.forward("s3gen_chunk", None, **inp.tensor_inputs, **inp.kwargs)}
         for rid in live:
             batched[rid].append(out[f"{rid}-batched"]["audio_chunk"][0])
 

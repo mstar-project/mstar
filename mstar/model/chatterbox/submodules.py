@@ -73,6 +73,14 @@ DECODE_LOOP = "decode_loop"
 PREFILL_WALKS = ("prefill", "prefill_voice")
 
 
+def _rid(fwd_info: CurrentForwardPassInfo) -> int:
+    """The worker's handle for the request; the engine keys outputs and
+    cleanup by it, so per-request state must be too."""
+    if fwd_info.rid_handle == -1:
+        raise ValueError(f"request {fwd_info.request_id!r} reached the worker without a rid handle")
+    return fwd_info.rid_handle
+
+
 class VoiceCache:
     """Small LRU of per-voice conditioning, keyed by the clip's content hash,
     so a voice that is uploaded again (or a preset) is conditioned once."""
@@ -239,7 +247,7 @@ class T3Submodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         del kwargs
         device = self.get_device()
-        state = self.request_state(fwd_info.request_id)
+        state = self.request_state(_rid(fwd_info))
         if graph_walk in PREFILL_WALKS:
             requires_cfg = self._requires_cfg(fwd_info.step_metadata)
             text_ids = inputs[TEXT_INPUTS][0].to(device, torch.long).reshape(-1)
@@ -585,12 +593,12 @@ class S3GenSubmodule(NodeSubmodule):
         tokens, lens = self.s3_tokenizer([wav16])
         return self.s3gen.embed_reference(wav24[None], wav16[None], tokens[:, : int(lens[0])])
 
-    def _reference(self, inputs: NameToTensorList, request_id: str = ""):
+    def _reference(self, inputs: NameToTensorList, rid: int | None = None):
         """The request's reference conditioning: computed (or fetched from the
         per-voice cache) from the clip that rides with the first chunk, then
         kept in the request's state for the chunks that follow, which carry
         the voice edges without tensors."""
-        state = self.request_state(request_id) if request_id else None
+        state = self.request_state(rid) if rid is not None else None
         if inputs.get(REF_AUDIO):
             key = int(inputs[VOICE_KEY][0].reshape(-1)[0].item())
             ref = self.cache.get(key)
@@ -629,11 +637,12 @@ class S3GenSubmodule(NodeSubmodule):
         # ``drop_invalid_tokens`` + ``< 6561`` filter)
         tokens = raw[raw < self.config.s3gen.vocab_size]
         meta = fwd_info.step_metadata
+        rid = _rid(fwd_info)
         return NodeInputs(
             tensor_inputs={SPEECH_TOKENS: tokens},
             kwargs={
-                "request_id": fwd_info.request_id,
-                "ref": self._reference(inputs, fwd_info.request_id),
+                "rid": rid,
+                "ref": self._reference(inputs, rid),
                 "n_timesteps": int(meta.get("n_cfm_timesteps", self.config.generation.n_cfm_timesteps)),
                 "watermark": bool(meta.get("watermark", self.config.generation.watermark)),
                 "seed": int(fwd_info.random_seed),
@@ -787,8 +796,8 @@ class S3GenSubmodule(NodeSubmodule):
         wav = self.synthesize_chunk(state, tokens, True, ref, n_timesteps, self._generator(seed, device))
         return self._finish(wav, watermark)
 
-    def _stream(self, request_id: str, seed: int) -> tuple[StreamState, torch.Generator]:
-        state = self.request_state(request_id)
+    def _stream(self, rid: int, seed: int) -> tuple[StreamState, torch.Generator]:
+        state = self.request_state(rid)
         if state.get("stream") is None:
             device = self.get_device()
             state.add_all(
@@ -819,31 +828,32 @@ class S3GenSubmodule(NodeSubmodule):
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, speech_tokens: torch.Tensor,
-        request_id: str = "", ref=None, n_timesteps: int = 10, watermark: bool = True,
+        rid: int, ref=None, n_timesteps: int = 10, watermark: bool = True,
         seed: int = 0, is_final: bool = True, **kwargs,
     ) -> NameToTensorList:
         del graph_walk, engine_inputs, kwargs
-        stream, generator = self._stream(request_id, seed)
+        stream, generator = self._stream(rid, seed)
         plan = self._plan_chunk(stream, speech_tokens, is_final, ref, generator)
         wav = self._solve([plan], [n_timesteps])[0]
         return {AUDIO_CHUNK: [self._finish(wav, watermark)]}
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, speech_tokens: list[torch.Tensor],
-        request_id: list[str], ref: list, n_timesteps: list[int], watermark: list[bool],
+        rid: list[int], ref: list, n_timesteps: list[int], watermark: list[bool],
         seed: list[int], is_final: list[bool], **kwargs,
-    ) -> dict[str, NameToTensorList]:
+    ) -> dict[int, NameToTensorList]:
         """Several requests' chunks in one step: their flow solves share a
-        padded batch, the vocoder runs per request behind its own cache."""
+        padded batch, the vocoder runs per request behind its own cache.
+        Keyed by rid handle, which is how the engine reads the outputs back."""
         del graph_walk, engine_inputs, kwargs
         plans = []
-        for rid, tokens, r, s, final in zip(request_id, speech_tokens, ref, seed, is_final, strict=True):
-            stream, generator = self._stream(rid, s)
+        for handle, tokens, r, s, final in zip(rid, speech_tokens, ref, seed, is_final, strict=True):
+            stream, generator = self._stream(handle, s)
             plans.append(self._plan_chunk(stream, tokens, final, r, generator))
         wavs = self._solve(plans, list(n_timesteps))
         return {
-            rid: {AUDIO_CHUNK: [self._finish(wav, wm)]}
-            for rid, wav, wm in zip(request_id, wavs, watermark, strict=True)
+            handle: {AUDIO_CHUNK: [self._finish(wav, wm)]}
+            for handle, wav, wm in zip(rid, wavs, watermark, strict=True)
         }
 
 
