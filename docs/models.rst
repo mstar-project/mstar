@@ -60,6 +60,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
+   * - ``personaplex`` *(Unvalidated)*
+     - ``nvidia/personaplex-7b-v1`` (gated)
+     - Full-duplex speech LM (Moshi architecture), served as an offline replay of a
+       preloaded user WAV: temporal transformer + depformer + Mimi codec.
    * - ``pi05``
      - ``lerobot/pi05_base``
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
@@ -151,6 +155,8 @@ Notes
 
 - Models marked *(Beta)* are functionally supported but not yet
   performance-optimized; treat their throughput/latency as provisional.
+- Models marked *(Unvalidated)* have not yet run on their real checkpoint or a
+  GPU; see the model's section for what has been checked.
 - The IDs above are representative. You may use local paths or compatible variants.
 - Some families accept multimodal input (image/audio/video); see the model's
   ``process_prompt`` for the inputs it expects.
@@ -1165,3 +1171,60 @@ own scaling follows PEFT: an ``alpha`` key in the weights, else the ``lora_alpha
 ``use_rslora``) of an ``adapter_config.json`` / ``config.json`` next to them, else ``alpha = r``;
 ``scale`` multiplies that (a public rank-64 rsLoRA adapter lands within 53 dB of diffusers'
 fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).
+
+
+PersonaPlex (``personaplex``) *(Unvalidated)*
+----------------------------------------------
+
+NVIDIA PersonaPlex-7B is a frame-synchronous, full-duplex speech model. M*
+serves it as an **offline, preloaded-input replay**: the whole user WAV arrives
+with the request, the model advances once per 80 ms frame across all of it, and
+the response is an agent audio track time-aligned to the input (plus the
+agent's text stream). It is not turn-based: the agent may speak while the user
+speaks. Live ingress, barge-in, streamed output, batching above 1 and tensor
+parallelism are out of scope.
+
+.. code-block:: bash
+
+   pip install -e ".[personaplex]"
+   # Accept NVIDIA's license on Hugging Face, extract voices.tgz from the repo,
+   # set model_kwargs.voice_dir in a copy of configs/personaplex.yaml, then:
+   mstar-serve --config my_personaplex.yaml --port 8000
+
+Request: ``/generate`` with one audio input (decoded at 24 kHz; **channel 0** is
+used, not a downmix) and output modalities ``audio`` or ``audio`` + ``text``.
+``model_kwargs``:
+
+- ``voice`` (required): a preset name in ``voice_dir`` (``NATF2`` or
+  ``NATF2.pt``). Presets are loaded with ``torch.load(weights_only=True)`` and
+  validated; raw-WAV voice prompts are not supported yet.
+- ``text_prompt``: the persona, wrapped in ``<system>`` tags as NVIDIA does;
+  defaults to NVIDIA's offline default. The request prompt may carry it instead.
+- ``temp_text`` / ``topk_text`` (0.7 / 25), ``temp_audio`` / ``topk_audio``
+  (0.8 / 250), ``greedy``. Seeded sampled output does not reproduce NVIDIA's,
+  whose RNG stream differs; parity is defined on greedy and forced paths.
+
+Limits: voice embeddings + 12 silence frames + persona tokens + user frames must
+not exceed **2999** temporal forwards, so user audio is capped at
+(2999 − conditioning frames) × 80 ms, just under 4 minutes. NVIDIA's 3000-slot
+ring KV equals dense causal attention only up to that point. Output audio is trimmed to the input's sample count and lags it
+by one frame, as in NVIDIA's ``offline.py``. Text frames that are padding or
+special tokens produce empty chunks.
+
+Validation status:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Check
+     - Status
+   * - Delayed token cache vs NVIDIA ``LMGen`` integer trace (CPU)
+     - Passing
+   * - Temporal transformer + depformer vs NVIDIA ``LMGen``, tiny random fp32 weights, greedy (CPU)
+     - Passing
+   * - Mimi (HF submodules + ring-faithful mask) vs NVIDIA streaming Mimi, tiny random weights (CPU)
+     - Passing
+   * - Graph walks, accumulated outputs and request validation (CPU, dummy mode)
+     - Passing
+   * - Real checkpoint load (LM and Mimi), bf16 numerics, GPU parity, serving, audio quality
+     - **Not run** (gated checkpoint and GPU access pending)

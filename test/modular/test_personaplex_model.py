@@ -476,3 +476,18 @@ def test_t14_postprocess_text_pieces_and_pcm16():
     with pytest.raises(ValueError, match="modality"):
         model.postprocess(torch.zeros(1), "image")
     assert model.get_output_sample_rate() == 24000
+
+
+def test_registry_hf_entry_and_yaml_agree():
+    import yaml
+
+    from mstar.model.registry import HF_MODELS, MODEL_REGISTRY, get_model_class
+
+    assert get_model_class("personaplex") is PersonaPlexModel
+    assert MODEL_REGISTRY["personaplex"] == ("mstar.model.personaplex.personaplex_model", "PersonaPlexModel")
+    assert HF_MODELS["personaplex"] == {"model_path_hf": "nvidia/personaplex-7b-v1"}
+    with open(CONFIG_PATH) as f:
+        deployment = yaml.safe_load(f)
+    assert deployment["model"] == "personaplex" and deployment["max_seq_len"] == cfg.MAX_TEMPORAL_FORWARDS
+    assert set(deployment["model_kwargs"]) == {"voice_dir"}
+    assert {n for g in deployment["node_groups"] for n in g["node_names"]} == set(_model().nodes)
