@@ -484,7 +484,7 @@ def test_t3_prefill_inputs_and_cfg_step_declaration():
     assert inputs[1].input_seq_len == cond_len + 3 + 2
     assert inputs[0].resource_step_info is True
     assert inputs[0].tensor_inputs["uncond_embeds"].shape == inputs[0].input_embeds.shape
-    assert sub.request_state("a")["speech_step"] == 1
+    assert sub.request_state("a")["generated"] == 0
 
     batch = ExecutingBatch(
         node_name="T3", step_context=_step_context("prefill", ["a", "b"]),
@@ -517,12 +517,19 @@ def test_t3_decode_inputs_track_speech_positions_and_no_cfg_is_single_stream():
     sub = _t3_submodule()
     info = _fwd_info("a", cfg_weight=0.0)
     sub.prepare_inputs("prefill", info, {TEXT_INPUTS: [torch.tensor([255, 5, 0])]})
+    sub.postprocess("a", info, {SPEECH_TOKENS: [torch.tensor([17])]})
     d1 = sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([17])]})
+    # a step re-driven after a refused admit keeps its position
+    retry = sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([17])]})
+    assert torch.equal(retry.input_embeds, d1.input_embeds)
+    sub.postprocess("a", info, {SPEECH_TOKENS: [torch.tensor([18])]})
     d2 = sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([18])]})
     assert d1.input_seq_len == 1 and d1.resource_step_info is False
-    assert sub.request_state("a")["speech_step"] == 3
     expected = sub.model.speech_emb(torch.tensor([18])) + sub.model.speech_pos_emb(torch.tensor([2]))
     assert torch.allclose(d2.input_embeds, expected)
+    sub.request_state("a").add("generated", sub.t3.speech_pos_table_size)
+    with pytest.raises(ValueError, match="past the T3 table"):
+        sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([18])]})
 
     step = sub.declare_step("decode", ["a"], [d1])
     assert step.cg_key_info is False and step.steps[T3_KV].combined_labels == {}

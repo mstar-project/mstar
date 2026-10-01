@@ -264,13 +264,19 @@ class T3Submodule(ARNodeSubmodule):
                 tensor_inputs["uncond_embeds"] = self.model.build_prefill_embeds(
                     cond, text_ids, uncond=True,
                 )
-            state.add_all(speech_step=1, generated=0, requires_cfg=requires_cfg)
+            state.add_all(generated=0, requires_cfg=requires_cfg)
         elif graph_walk == "decode":
             requires_cfg = bool(state["requires_cfg"])
-            step = int(state["speech_step"])
+            # The input token's speech position is how many tokens were
+            # sampled, which only postprocess advances: a step re-driven after
+            # a refused admit must not move it.
+            step = int(state["generated"])
+            if step >= self.t3.speech_pos_table_size:
+                raise ValueError(
+                    f"speech position {step} is past the T3 table ({self.t3.speech_pos_table_size})"
+                )
             token = inputs[PREV_TOKEN][0].to(device, torch.long).reshape(-1)
             embeds = self.model.embed_speech(token, torch.tensor([step], device=device))
-            state.add("speech_step", step + 1)
             tensor_inputs = self._scalar_inputs(fwd_info, requires_cfg)
         else:
             raise ValueError(f"Unknown T3 walk {graph_walk!r}")

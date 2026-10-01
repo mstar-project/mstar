@@ -212,7 +212,7 @@ def test_t3_greedy_tokens_match_reference(variant, cfg_weight, exaggeration):
     assert got == expected
     # bookkeeping the loop control relies on
     state = sub.request_state("r")
-    assert state["generated"] == N_STEPS and state["speech_step"] == N_STEPS
+    assert state["generated"] == N_STEPS
     assert config.t3.cond_len == (34 if variant == "chatterbox" else 376)
 
 
