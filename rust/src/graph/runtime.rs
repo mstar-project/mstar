@@ -2160,7 +2160,7 @@ impl GraphRuntime {
             let was_speculative = state.is_spec_scheduled(node);
             let completed = state.complete(&g, node, &out_tensors);
             let pre_shard_edges = completed.edges;
-            let freed_inputs = completed.freed;
+            let mut freed_inputs = completed.freed;
             // A loop that cached this node's outputs holds a reference on
             // each, as `Loop.maybe_cache_output` takes one. Applied before
             // `freed_inputs`, which can release the same tensors (an advance
@@ -2278,11 +2278,12 @@ impl GraphRuntime {
                 None => vec![wg],
             };
             for w in sweep {
-                let Some(st) = self.state_mut(w, rid) else { continue };
+                let Some(st) = Self::state_in(&mut self.states, w, rid)
+                else { continue };
                 if !st.is_done {
                     continue;
                 }
-                st.reset();
+                freed_inputs.extend(st.reset(&self.graphs[w as usize]));
                 completed_wgs
                     .entry(rid)
                     .or_default()

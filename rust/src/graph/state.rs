@@ -324,6 +324,12 @@ impl RequestState {
                 return false;
             }
         }
+        if g.node(node).loop_id.is_some_and(|lid| self.loop_or_ancestor_done(g, lid)) {
+            // The loop finished and cleared its body, so a late edge belongs
+            // to no iteration. The slot keeps it for `reset`; queueing the
+            // node would start the body again.
+            return true;
+        }
         // An ingest bubbles through every enclosing loop, each recording it if
         // it is external at that level (Loop.ingest_external_input recursing
         // via _managing_registry), then reaches the root's ready sets.
@@ -331,6 +337,18 @@ impl RequestState {
         self.refresh_ready(node);
         self.note_ingested_for_streaming(node);
         true
+    }
+
+    /// Whether loop `lid`, or any loop enclosing it, finished this pass.
+    fn loop_or_ancestor_done(&self, g: &CompiledGraph, lid: LoopId) -> bool {
+        let mut cur = Some(lid);
+        while let Some(l) = cur {
+            if self.loops[l as usize].done {
+                return true;
+            }
+            cur = g.lp(l).parent;
+        }
+        false
     }
 
     fn record_external(
@@ -549,6 +567,11 @@ impl RequestState {
         &mut self, g: &CompiledGraph, lid: LoopId, edges_from: usize,
         out: &mut Vec<RoutedEdge>, filtered: &mut Vec<(Sym, NodeId)>,
     ) {
+        if self.loop_or_ancestor_done(g, lid) {
+            // A finished loop takes no completion: counting it would finish
+            // the loop again and send its outputs with an emptied cache.
+            return;
+        }
         let lspec = g.lp(lid);
         self.cache_outputs(g, lid, edges_from, out);
 
@@ -831,7 +854,14 @@ impl RequestState {
     // -- lifecycle -----------------------------------------------------------
 
     /// Python's `WorkerGraphIO.clear()` — end of a full forward pass.
-    pub fn reset(&mut self) {
+    ///
+    /// Returns the uuids to dereference: what the slots still held, as
+    /// `ReadySignals.clear` releases it (a late edge a finished loop parked).
+    pub fn reset(&mut self, g: &CompiledGraph) -> Vec<u64> {
+        for n in 0..self.nodes.len() as NodeId {
+            self.release_slot(g, n, false);
+            self.release_slot(g, n, true);
+        }
         for n in self.nodes.iter_mut() {
             n.clear();
         }
@@ -844,6 +874,7 @@ impl RequestState {
         self.is_done = false;
         self.spec_dirty.clear();
         self.seed_streaming_ready();
+        std::mem::take(&mut self.refs_released)
     }
 }
 
@@ -1104,6 +1135,60 @@ mod tests {
         assert!(st.is_ready(enc), "marking does not withdraw a queued node");
     }
 
+    /// enc -> [loop L: dec], one iteration, -> post. `post` keeps the worker
+    /// graph from being done when the loop finishes.
+    fn loop_then_post() -> (StrToId, GraphRef) {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("enc", &["x"], &[], vec![edge("h", "dec"), edge("tok", "dec")]),
+            node("dec", &["h", "tok"], &[], vec![edge("tok", "dec")]),
+            node("post", &["tok"], &[], vec![edge("y", "emit_to_client")]),
+        ];
+        let loops = vec![LoopArg {
+            name: "L".into(), max_iters: 1, parent: None,
+            member_nodes: vec!["dec".into()],
+            outputs: vec![edge("tok", "post")],
+            accumulated: vec![],
+            loop_back: vec![("tok".into(), "dec".into())],
+            external_inputs: vec![("h".into(), "dec".into())],
+        }];
+        let g = compile_one(&mut it, &nodes, &loops).unwrap();
+        (it, g)
+    }
+
+    #[test]
+    fn a_finished_loop_does_not_requeue_its_body() {
+        // Found by fuzzer/tier0 graph_io. Finishing clears the body, so a
+        // late edge used to queue it again; the rerun finished the loop a
+        // second time and sent its outputs with an emptied cache.
+        let (it, g) = loop_then_post();
+        let (enc, dec) = (0, 1);
+        let tok = it.get("tok").unwrap();
+        let mut st = RequestState::new(g.clone());
+        st.complete(&g, enc, &[vec![t(2)], vec![t(3)]]);
+        st.ingest(&g, dec, 0, &[t(2)], true, false);
+        st.ingest(&g, dec, 1, &[t(3)], true, false);
+        st.clear_consumed_inputs(&g, dec);
+        let done = st.complete(&g, dec, &[vec![t(10)]]);
+        assert!(st.loop_finished(0));
+        assert!(!st.is_done, "`post` has not run");
+        assert!(done.edges.iter().any(|e| e.name == tok && uuids(e) == vec![10]));
+
+        // A duplicate delivery of edges the body consumes.
+        assert!(st.ingest(&g, dec, 0, &[t(4)], true, false));
+        assert!(st.ingest(&g, dec, 1, &[t(5)], true, false));
+        assert!(!st.is_ready(dec), "the body of a finished loop was queued");
+
+        // A late completion of the body does not finish the loop again.
+        let late = st.complete(&g, dec, &[vec![t(20)]]);
+        assert!(late.edges.iter().all(|e| e.dest != Dest::Local(2)),
+            "the loop sent its outputs a second time");
+        assert!(!st.is_done);
+
+        // `reset` releases what the late edges left in the slots, `h` aside.
+        assert_eq!(st.reset(&g), vec![5]);
+    }
+
     #[test]
     fn reset_restores_a_fresh_request() {
         let (_, g) = decode_loop();
@@ -1112,7 +1197,9 @@ mod tests {
         st.ingest(&g, enc, 0, &[t(1)], false, false);
         st.complete(&g, enc, &[vec![t(2)], vec![t(3)]]);
         st.ingest(&g, dec, 0, &[t(2)], true, false);
-        st.reset();
+        st.ingest(&g, dec, 1, &[t(3)], true, false);
+        // `h` is held for the loop; the rest of what the slots hold goes.
+        assert_eq!(st.reset(&g), vec![3]);
         assert!(!st.is_ready(enc) && !st.is_ready(dec));
         assert!(!st.has_input(dec, 0, false));
         assert_eq!(st.loop_indices(), vec![0]);

@@ -327,3 +327,58 @@ def test_streaming_inputs_propagate_to_ready_signals():
     assert node.ready_next_iter.streaming_inputs == {"a"}
     assert node.speculative_signals.streaming_inputs == {"a"}
     assert node.consumes_stream is True
+
+
+def test_duplicate_completion_does_not_advance_the_registry():
+    """A registry records which entities completed, not how many
+    completions it saw. With a count, one entity that completes twice
+    completes the iteration, and a sibling never runs. Found by
+    fuzzer/tier0 graph_io."""
+    from mstar.graph.base import Parallel
+
+    par = Parallel([
+        GraphNode(
+            name="a",
+            input_names={"in_a"},
+            outputs=[GraphEdge(name="out_a", next_node="EMIT_TO_CLIENT")],
+        ),
+        GraphNode(
+            name="b",
+            input_names={"in_b"},
+            outputs=[GraphEdge(name="out_b", next_node="EMIT_TO_CLIENT")],
+        ),
+    ])
+    io = WorkerGraphIO(par)
+    registry = io.wg_state_registry
+
+    io.mark_node_complete("a")
+    assert registry._num_completed_entities == 1
+    assert not registry.is_done
+
+    # The same entity again, from a duplicate delivery. It must not count
+    # for "b", which has not run.
+    io.mark_node_complete("a")
+    assert registry._num_completed_entities == 1
+    assert not registry.is_done, "the registry is done with 'b' never run"
+
+    io.mark_node_complete("b")
+    assert registry.is_done
+
+
+def test_finished_loop_does_not_requeue_its_body():
+    """A Loop clears its inner registry when it finishes. That returns the
+    registry to its start. An edge that arrives after this must not queue a
+    node of the body, because the body would run again. Found by
+    fuzzer/tier0 graph_io."""
+    io = WorkerGraphIO(_ar_loop_graph(max_iters=1))
+    _drive(io, [GraphEdge(name="prompt", next_node="prefill")])
+
+    loop = io.loops["ar_loop"]
+    assert loop.is_done
+    assert io.wg_state_registry.is_done
+
+    # A duplicate delivery of an edge the loop body consumes.
+    for name in ("token", "kv_cache"):
+        io.ingest_input(GraphEdge(name=name, next_node="ar_decode"))
+    assert "ar_decode" not in io.ready_node_names, \
+        "the body of a finished loop was queued again"
