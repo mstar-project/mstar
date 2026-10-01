@@ -275,9 +275,12 @@ class MlaAbsorbManager(AttentionManager):
         self, label: str, kv_out: KVPlanOutput,
         step: AttentionStep, ctx: StepContext, lease: SlotLease | None,
     ) -> PlanState:
-        indptrs = kv_out.device_indptrs(self._device)
-        state = PlanState(qo_indptr=indptrs.qo_indptr)
+        # CPU tensors throughout: FlashInfer copies these into its own static
+        # buffers during plan, so handing it device tensors here would only
+        # force a synchronous D2H (`.to("cpu")`) inside `wrapper.plan`.
+        indptrs = kv_out.cpu_indptrs
         if not self._has_mla_kernel:
+            state = PlanState(qo_indptr=kv_out.device_indptrs(self._device).qo_indptr)
             state.sdpa = self._sdpa_plan(kv_out)
             return state
 
@@ -296,18 +299,19 @@ class MlaAbsorbManager(AttentionManager):
             kv_len_arr=torch.tensor(
                 [view.length for view in kv_out.views],
                 dtype=torch.int32,
-            ).to(self._device, non_blocking=True),
+            ),
             causal=step.causal,
             dtype=self._dtype,
         )
-        state.wrapper = wrapper
         if lease is not None:
             # `select_last_hidden` is captured in the graph, so it must read the
             # wrapper's static buffer (refreshed by every plan), not this plan's
             # fresh device tensor: a replay would otherwise gather with whatever
             # now lives at the capture-time address and sample a garbage token.
-            state.qo_indptr = wrapper._qo_indptr_buf
-        return state
+            qo_indptr = wrapper._qo_indptr_buf
+        else:
+            qo_indptr = kv_out.device_indptrs(self._device).qo_indptr
+        return PlanState(qo_indptr=qo_indptr, wrapper=wrapper)
 
     def _sdpa_plan(self, kv_out: KVPlanOutput) -> MlaSdpaPlan:
         """The eager fallback's gather layout, entirely off the KV plan's

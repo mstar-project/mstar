@@ -43,7 +43,11 @@ from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.convenience import AttentionCallable
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.manager import KVManager
-from mstar.engine.resources.kv.plan import KVPlanOutput, SequenceView
+from mstar.engine.resources.kv.plan import (
+    KVPlanOutput,
+    SequenceView,
+    build_paged_indptrs,
+)
 
 # Real Kimi latent dims; flashinfer's MLA wrapper is hard-locked to these.
 REAL_CKV, REAL_KPE = 512, 64
@@ -336,6 +340,82 @@ def _reference(
     mask = torch.arange(key.shape[0])[None, :] <= q_pos[:, None]
     weights = scores.masked_fill(~mask, float("-inf")).softmax(-1)
     return torch.einsum("hqk,kd->hqd", weights, key[:, :ckv]).transpose(0, 1)
+
+
+class TestPlanLabelCpuHandoff:
+    """`_plan_label` must hand FlashInfer CPU tensors — it copies them into
+    its own static buffers — and, under a lease, must not upload the indptrs
+    itself: `select_last_hidden` reads the wrapper's static buffer instead."""
+
+    class _StubWrapper:
+        def __init__(self):
+            self.plan_kwargs: dict | None = None
+            self._qo_indptr_buf = torch.tensor([0, 1, 2], dtype=torch.int32)
+
+        def plan(self, **kwargs):
+            self.plan_kwargs = kwargs
+
+    @staticmethod
+    def _kv_out() -> KVPlanOutput:
+        views = [
+            TestSdpaPlan._view("r0", [0], length=2, to_compute=1),
+            TestSdpaPlan._view("r1", [1], length=5, to_compute=1),
+        ]
+        return KVPlanOutput(cpu_indptrs=build_paged_indptrs(views, PAGE_SIZE), views=views)
+
+    @staticmethod
+    def _ctx(lease=None) -> StepContext:
+        return StepContext(
+            request_ids=("r0", "r1"), graph_walk="decode", slot=0,
+            capture=lease is not None, slot_lease=lease,
+        )
+
+    def test_plan_gets_cpu_tensors_and_the_views_lengths(self):
+        manager = _manager()
+        manager._has_mla_kernel = True
+        stub = self._StubWrapper()
+        manager._eager_wrapper = lambda label, slot: stub
+        kv_out = self._kv_out()
+
+        manager._plan_label("main", kv_out, AttentionStep(segments=()), self._ctx(), lease=None)
+
+        tensors = [v for v in stub.plan_kwargs.values() if isinstance(v, torch.Tensor)]
+        assert tensors and all(t.device.type == "cpu" for t in tensors)
+        assert stub.plan_kwargs["kv_len_arr"].dtype == torch.int32
+        assert stub.plan_kwargs["kv_len_arr"].tolist() == [v.length for v in kv_out.views]
+
+    def test_leased_decode_step_uploads_nothing_and_returns_the_static_buffer(self):
+        from mstar.engine.resources import SlotLease
+        from mstar.engine.resources.step import BucketKey
+
+        manager = _manager()
+        manager._has_mla_kernel = True
+        stub = self._StubWrapper()
+        manager._cg_wrapper = lambda lease, label, num_rows: stub
+        kv_out = self._kv_out()
+        lease = SlotLease(slot=0, bucket=BucketKey(graph_walk="decode", bs=2, num_tokens=2))
+
+        state = manager._plan_label(
+            "main", kv_out, AttentionStep(segments=()), self._ctx(lease), lease,
+        )
+
+        assert kv_out.cuda_indptrs is None
+        assert state.qo_indptr is stub._qo_indptr_buf
+
+    def test_unleased_decode_step_returns_the_device_qo_indptr(self):
+        manager = _manager()
+        manager._has_mla_kernel = True
+        stub = self._StubWrapper()
+        manager._eager_wrapper = lambda label, slot: stub
+        kv_out = self._kv_out()
+
+        state = manager._plan_label(
+            "main", kv_out, AttentionStep(segments=()), self._ctx(), lease=None,
+        )
+
+        torch.testing.assert_close(
+            state.qo_indptr, kv_out.cpu_indptrs.qo_indptr.to(manager._device)
+        )
 
 
 class TestBackendSelection:
