@@ -885,6 +885,17 @@ class APIServer:
         logger.info("Client cancelled request %s; releasing resources", request_id)
         self.preprocess_worker.abort_request(request_id)
 
+    def release_request(self, request_id: str) -> None:
+        """Drop a request whose results will never be read: abort it if it is
+        still running, else just forget it (an ended request needs no abort)."""
+        with self.request_lock:
+            req = self.pending_requests.get(request_id)
+            finished = req is not None and req.event.is_set()
+            if finished:
+                self.pending_requests.pop(request_id)
+        if not finished:
+            self.abort_request(request_id)
+
     # ----------------------------------------------------------
     # Cleanup
     # ----------------------------------------------------------
