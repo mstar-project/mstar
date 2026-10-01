@@ -194,6 +194,8 @@ class OpenAIAdapter:
     speech_chunk_max_chars: int = 400
     # sub-requests kept in flight ahead of the one being streamed
     speech_chunk_lookahead: int = 2
+    # most sub-requests one input may split into; longer inputs get a 400
+    speech_chunk_max_pieces: int = 32
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
