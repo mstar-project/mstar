@@ -40,9 +40,9 @@ from mstar.conductor.request_info import (
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
 )
 from mstar.graph.base import (
     GraphEdge,
@@ -53,7 +53,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata, video_metadata_dict
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
@@ -293,7 +293,7 @@ class VJepa2Model(Model):
         # a one-shot forward with nothing for the engine to build
         if self.config.predictor_kind != "ac":
             return []
-        kv = KVConfig(
+        kv = PagedKVConfig(
             num_layers=self.config.ac_predictor.depth,
             num_kv_heads=self.config.ac_predictor.num_heads,
             head_dim=self.config.ac_predictor.predictor_embed_dim // self.config.ac_predictor.num_heads,
@@ -570,8 +570,6 @@ class VJepa2Model(Model):
         but is intentionally ignored — decode stays on CPU, later steps
         move tensors to GPU as needed.
         """
-        from dataclasses import asdict
-
         from torchcodec.decoders import VideoDecoder
 
         target_frames = self.config.frames_per_clip
@@ -628,7 +626,7 @@ class VJepa2Model(Model):
         video = frames.float() / 255.0
 
         try:
-            metadata = asdict(metadata_obj) if metadata_obj is not None else {}
+            metadata = video_metadata_dict(metadata_obj) if metadata_obj is not None else {}
         except TypeError:
             metadata = {}
         metadata["sampled_indices"] = indices

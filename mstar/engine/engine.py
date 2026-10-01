@@ -51,6 +51,7 @@ from mstar.utils.profiler import mark, range_pop, range_push
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
+    from mstar.streaming.stream_buffer import StreamChunkInfo
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +177,11 @@ class SubmoduleManagement:
 class ExecutingBatch:
     node_name: str
 
-    per_request_info: Mapping[str, CurrentForwardPassInfo]
+    # Keyed by the worker's integer rid handle. CUDA-graph capture pads with
+    # its own rows, which carry negative handles from the same space (see
+    # cuda_graph_runner.dummy_rid_handle), so a padded batch is still int-keyed
+    # throughout.
+    per_request_info: Mapping[int, CurrentForwardPassInfo]
     step_context: StepContext
 
     running_batched: bool = False
@@ -192,7 +197,7 @@ class ExecutingBatch:
     # The rids the staged plan was built over. The plan is theirs exactly —
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
-    preplanned_rids: tuple[str, ...] | None = None
+    preplanned_rids: tuple[int, ...] | None = None
 
     # Declared once for the batch (pre-plan declares it first when it runs)
     # and driven from here on
@@ -202,9 +207,17 @@ class ExecutingBatch:
     per_request_input_tensors: Mapping[str, NameToTensorList] = field(
         default_factory=dict
     )
-    # rids whose consumed streaming input was the final chunk — this step
-    # reports the partition done
+    # rids for which this step ends every finite stream into the node; the
+    # consumer flushes what it held back
     final_stream_rids: set[str] = field(default_factory=set)
+    # rid -> {input_name: chunk info} for rids consuming a streamed input
+    per_request_stream_chunks: Mapping[str, Mapping[str, "StreamChunkInfo"]] = field(
+        default_factory=dict
+    )
+
+    # rids for which this step ends every finite stream into the partition;
+    # this step reports the partition done
+    stream_partition_done_rids: set[str] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -505,6 +518,14 @@ class Engine:
             submodule_mgmt.joint_comm_group.world_size,
         )
         runners: dict[str, PiecewiseCudaGraphRunner] = {}
+        # One graph memory pool for all of the node's regions (see
+        # ``PiecewiseCudaGraphRunner``): its captured-memory footprint becomes
+        # the largest region's rather than the sum over regions.
+        memory_pool = (
+            torch.cuda.graphs.graph_pool_handle()
+            if configs and getattr(self._device, "type", None) == "cuda" and torch.cuda.is_available()
+            else None
+        )
         for label, config in configs.items():
             runner = PiecewiseCudaGraphRunner(
                 label=f"{node_name}_{label}",
@@ -516,6 +537,7 @@ class Engine:
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
                 node_name=node_name,
+                memory_pool=memory_pool,
             )
             runners[label] = runner
         return runners
@@ -603,6 +625,10 @@ class Engine:
                     fwd_info=batch.per_request_info[rid],
                     inputs=batch.per_request_input_tensors.get(rid, {}),
                     resources=self._submodules[batch.node_name].resources,
+                    # the step that ends the last of the node's streams: it must
+                    # flush whatever it held back (a vocoder's crossfade tail, the
+                    # look-ahead frames a token encoder withholds)
+                    is_final_stream_chunk=rid in batch.final_stream_rids,
                 )
                 if req_inputs is not None:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
@@ -707,6 +733,14 @@ class Engine:
                     batch.outputs = self._exec_single(batch)
             batch.outputs_ready.set()
             return batch.outputs
+        except Exception:
+            # A raise before the plan was promoted (declare, admit) would leave
+            # the stage for the next step's admit to find. Drop it here. The
+            # lease is released by _exec_single's own finally.
+            if batch.preplanned_rids is not None and self._runner.staged:
+                self._runner.clear_preplan()
+                batch.preplanned_rids = None
+            raise
         finally:
             batch.preplan_event = None
             batch.release_waiters()
@@ -1027,6 +1061,7 @@ class Engine:
             per_request_states=LazyRequestStates(submodule, rids),
             captured=lease is not None,
             step=step,
+            per_request_stream_chunks=batch.per_request_stream_chunks,
         )
         if nvtx:
             range_push("engine.preprocess")
@@ -1495,8 +1530,8 @@ class Engine:
             cg_runner = self._submodules[batch.node_name].cuda_graph_runner
             if lease is not None and cg_runner is not None:
                 cg_runner.release(lease, len(batch.request_ids))
-        for resource in self._resources.values():
-            resource.clear_preplan()
+        # through the runner, so its record of the staged step goes too
+        self._runner.clear_preplan()
 
     # ── Eviction ────────────────────────────────────────────────────────
     #

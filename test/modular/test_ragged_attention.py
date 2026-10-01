@@ -6,6 +6,8 @@ re-planned before each replay against a different varlen layout, with the
 segment count padded out by zero-length segments. Everything runs at
 head_dim=72, which FlashInfer has no kernel for, so the pad-to-128 path is
 always exercised.
+
+CPU-only head-dimension validation lives in ``test_ragged_attention_cpu.py``.
 """
 
 from __future__ import annotations
@@ -36,11 +38,7 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedManager
-from mstar.engine.resources.attn.ragged.wrappers import (
-    SUPPORTED_HEAD_DIMS,
-    RaggedPrefillWrapper,
-    padded_head_dim,
-)
+from mstar.engine.resources.attn.ragged.wrappers import RaggedPrefillWrapper
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
 pytestmark = pytest.mark.skipif(
@@ -118,18 +116,6 @@ def graph_wrapper() -> RaggedPrefillWrapper:
 
 
 # --- head-dim padding ------------------------------------------------------
-
-@pytest.mark.parametrize(
-    ("head_dim", "expected"), [(64, 64), (72, 128), (128, 128), (129, 256), (256, 256)]
-)
-def test_padded_head_dim_rounds_up(head_dim, expected):
-    assert padded_head_dim(head_dim) == expected
-
-
-def test_padded_head_dim_rejects_oversized():
-    with pytest.raises(ValueError, match="exceeds the largest supported"):
-        padded_head_dim(SUPPORTED_HEAD_DIMS[-1] + 1)
-
 
 def test_sm_scale_uses_true_head_dim_not_padded():
     """FlashInfer's own default would derive it from the padded dim."""

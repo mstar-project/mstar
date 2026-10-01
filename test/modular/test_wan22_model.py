@@ -62,7 +62,7 @@ def _make_model() -> Wan22Model:
 def _tensor_info(name: str) -> TensorPointerInfo:
     """Minimal TensorPointerInfo stand-in for persist-signal plumbing."""
     return TensorPointerInfo(
-        dims=[1], dtype="torch.float32", nbytes=4, address=0, stride=[1],
+        dims=[1], dtype=torch.float32, nbytes=4, address=0, stride=[1],
         uuid=f"uuid-{name}", source_session_id="test:0", source_entity="test",
     )
 
