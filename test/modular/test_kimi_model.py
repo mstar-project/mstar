@@ -10,7 +10,11 @@ from mstar.conductor.request_info import (
     CurrentForwardPassInfo,
 )
 from mstar.engine.resources import (
-    AttentionSpec, KVSpec, PositionSpec, SamplerSpec, SamplingReqConfig,
+    AttentionSpec,
+    KVSpec,
+    PositionSpec,
+    SamplerSpec,
+    SamplingReqConfig,
 )
 from mstar.graph.base import Loop
 from mstar.model.kimi_k2_7.config import SAMPLER, KimiK2Config
