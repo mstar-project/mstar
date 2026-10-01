@@ -80,7 +80,7 @@ uv pip install \
   "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ```
 
-Other models: `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
+Other models: `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve kokoro` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
 
 **Python SDK** — works for every model (text, image, audio, video):
 
@@ -96,7 +96,7 @@ for event in client.chat("Tell me a story", stream=True):   # streaming
     print(getattr(event, "text", ""), end="", flush=True)
 ```
 
-**OpenAI-compatible API** — drop-in for `bagel`, `cosmos3`, `qwen3_omni`, and `orpheus`:
+**OpenAI-compatible API** — drop-in for `bagel`, `cosmos3`, `qwen3_omni`, `orpheus`, and `kokoro`:
 
 ```python
 from openai import OpenAI

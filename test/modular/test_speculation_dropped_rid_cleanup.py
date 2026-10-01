@@ -29,12 +29,13 @@ def _speculation(rids: list[str]) -> Speculation:
     return Speculation(
         scheduled_batch=SimpleNamespace(
             request_to_worker_graph={r: "wg" for r in rids},
-            node_objects={r: object() for r in rids},
         ),
         node_batch=SimpleNamespace(
             request_ids=list(rids),
             per_request_input_tensors={r: {} for r in rids},
             per_request_info={r: object() for r in rids},
+            final_stream_rids=set(rids),
+            stream_partition_done_rids=set(rids),
         ),
         consumed_edges={("tok", NODE)},
         continuing_rids=set(rids),
@@ -48,7 +49,7 @@ def _speculation(rids: list[str]) -> Speculation:
 def test_dropped_rid_gets_its_own_edges_back():
     returned: list[tuple[str, str]] = []
     worker = SimpleNamespace(
-        _return_speculative_streaming_edge=lambda rid, edge: returned.append((rid, edge.name)),
+        _return_streaming_edge=lambda rid, edge: returned.append((rid, edge.name)),
     )
     # The dropped rid goes first: the threading loop leaves its variable bound
     # to the LAST rid it visited, so a cleanup that read that leftover would
@@ -65,7 +66,7 @@ def test_dropped_rid_gets_its_own_edges_back():
         spec.node_batch.per_request_input_tensors,
         spec.node_batch.per_request_info,
         spec.scheduled_batch.request_to_worker_graph,
-        spec.scheduled_batch.node_objects,
+        spec.scheduled_batch.request_to_worker_graph,
     ):
         assert set(table) == {"keep"}
 

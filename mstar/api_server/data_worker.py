@@ -259,6 +259,18 @@ class PreprocessWorker:
             self.thread.join()
 
 
+def warm_up_model(model) -> None:
+    """Run the model's ``warmup_preprocess`` once; a failure is logged, not
+    fatal, because the same work happens again on the first request."""
+    warm = getattr(model, "warmup_preprocess", None)
+    if model is None or not callable(warm):
+        return
+    try:
+        warm()
+    except Exception:  # noqa: BLE001 — warm-up is best effort
+        logger.exception("model.warmup_preprocess failed; the first request will do the work")
+
+
 class PreprocessWorkerThread:
     def __init__(
         self,
@@ -406,9 +418,7 @@ class PreprocessWorkerThread:
         )
         # also persist all of the input signals
         for info in all_infos:
-            self.tensor_manager.set_persist(
-                input.request_id, info.uuid, persist=True
-            )
+            self.tensor_manager.set_persist(info.uuid, persist=True)
 
         self.request_model_kwargs[input.request_id] = model_kwargs
         msg = ConductorMessage(
@@ -552,10 +562,7 @@ class PreprocessWorkerThread:
                     # escape to run()'s catch-all would abandon the rest of this
                     # pass and leave the client waiting on the request timeout.
                     try:
-                        tensor = self.tensor_manager.get_tensor(
-                            request_id=request_id,
-                            uuid=tensor_info.uuid
-                        )
+                        tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
                         postprocessed = self.model.postprocess(
                             tensor, modality,
                             request_kwargs=self.request_model_kwargs.get(request_id),
@@ -586,10 +593,7 @@ class PreprocessWorkerThread:
                     self.tensor_uuid_to_metadata_per_request.get(
                         request_id, {}
                     ).pop(tensor_info.uuid, None)
-                    self.tensor_manager.dereference(
-                        request_id=request_id,
-                        uuid=tensor_info.uuid
-                    )
+                    self.tensor_manager.dereference(tensor_info.uuid)
         return did_work
 
     def _process_messages(self):
@@ -598,19 +602,15 @@ class PreprocessWorkerThread:
             did_work = True
             if message.message_type == WorkerMessageType.TENSOR_RECEIVED:
                 body: TensorReceived = message.body
-                for (uuid, ref_cnt) in body.successful_tensors.items():
-                    self.tensor_manager.dereference(
-                        body.request_id, uuid, n=ref_cnt
-                    )
+                self.tensor_manager.dereference_batch(
+                    list(body.successful_tensors),
+                    list(body.successful_tensors.values()),
+                )
             elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
                 body: UnpersistTensors = message.body
                 for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
-                    self.tensor_manager.increment_ref(
-                        body.request_id, uuid, n=ref_cnt
-                    )
-                    self.tensor_manager.set_persist(
-                        body.request_id, uuid, persist=False
-                    )
+                    self.tensor_manager.increment_ref(uuid, n=ref_cnt)
+                    self.tensor_manager.set_persist(uuid, persist=False)
             elif message.message_type == WorkerMessageType.DRAIN_REQUEST:
                 body: DrainRequest = message.body
                 self._begin_drain(body.request_id)
@@ -671,6 +671,10 @@ class PreprocessWorkerThread:
         self.in_flight_requests.discard(request_id)
 
     def run(self):
+        # A thread told to stop before it starts (teardown tests build one with
+        # only its queues) has nothing to warm up.
+        if not self.stop_event.is_set():
+            warm_up_model(getattr(self, "model", None))
         while not self.stop_event.is_set():
             did_work = False
             try:

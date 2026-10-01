@@ -1,7 +1,8 @@
+import itertools
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
 from typing import NamedTuple, Type
-from uuid import uuid4
 
 import torch
 import yaml
@@ -57,6 +58,14 @@ class PrefixStream(NamedTuple):
     decode_walk: str | None = None
 
 
+def video_metadata_dict(metadata_obj) -> dict:
+    # torchcodec>=0.9 reports pixel_aspect_ratio as a Fraction, which the wire codec rejects.
+    return {k: float(v) if isinstance(v, Fraction) else v for k, v in asdict(metadata_obj).items()}
+
+
+_wg_id_counter = itertools.count(1 << 20)
+
+
 @dataclass
 class WorkerGraph:
     section: GraphSection
@@ -83,7 +92,13 @@ class WorkerGraph:
     _instance_ranks: list[list[int]] = field(default_factory=list)
     _tp_comm_size: int = 1
     _group_id: int = field(default=-1)  # original index into config's node_groups
-    worker_graph_id: str = field(default_factory=lambda: str(uuid4()))
+
+    # Dense index over the deployment's worker graphs, reassigned by the
+    # conductor so every process agrees on it. The default only keeps a
+    # standalone WorkerGraph unique; it is not stable across processes, which
+    # is why the conductor -- the one place that sees every graph -- owns the
+    # real numbering.
+    worker_graph_id: int = field(default_factory=lambda: next(_wg_id_counter))
 
     def __post_init__(self):
         if (self.tp_size > 1 or self.sp_size > 1) and not self._tp_ranks:
@@ -222,6 +237,11 @@ def _divide_into_worker_graphs(
             node_groups=node_groups,
             input_streams=input_streams,
         )
+        # A streamed external input is dropped, so the loop takes the NEXT
+        # chunk every iteration. TODO: that makes "N steps on ONE chunk" (flow
+        # matching over a streamed latent) inexpressible. Honouring it instead
+        # means changing this, Loop._is_streamed_input, and the Rust held_mask
+        # together, or the two runtimes disagree.
         ext_inps = set([
             (name, dest) for name, dest in graph._external_inputs \
                 if name not in input_streams
@@ -520,7 +540,7 @@ class Model(ABC):
 
         decoder = VideoDecoder(filepath, device=device)
         video = torch.stack([frame for frame in decoder]).float() / 255.0
-        return TensorAndMetadata(data=video, metadata=asdict(decoder.metadata))
+        return TensorAndMetadata(data=video, metadata=video_metadata_dict(decoder.metadata))
 
     @abstractmethod
     def postprocess(
@@ -592,6 +612,25 @@ class Model(ABC):
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for
         audio. Mono default (the speech models); stereo models override."""
         return 1
+
+    def warmup_preprocess(self) -> None:
+        """Called once in the preprocess worker before it takes requests.
+
+        Build what ``process_prompt`` needs lazily (a G2P front end, a
+        tokenizer, a feature extractor) so the first request does not pay for
+        it. The default does nothing.
+        """
+        return None
+
+    def get_voices(self) -> list[str] | None:
+        """The speaker ids a speech model accepts as ``voice``, for
+        ``GET /v1/audio/voices``. ``None`` (the default) means the model has no
+        fixed voice list, and the route answers 404."""
+        return None
+
+    def get_default_voice(self) -> str | None:
+        """The ``voice`` used when a speech request names none."""
+        return None
 
     # ------------------------------------------------------------------
     # Partition API (optional, backward-compatible defaults)

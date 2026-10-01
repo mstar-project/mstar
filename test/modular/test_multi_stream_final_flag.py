@@ -45,7 +45,7 @@ def _worker(rids=("r",)):
         for rid in rids
     }
     worker = SimpleNamespace(
-        worker_graphs_manager=SimpleNamespace(per_request_info=per_request_info),
+        request_state=SimpleNamespace(per_request_info=per_request_info),
         _consumer_node_cache={name: node for name, (node, _) in TOPOLOGY.items()},
         _stream_partition={name: PARTITION for name in TOPOLOGY},
     )
@@ -106,7 +106,7 @@ def test_requests_in_one_batch_are_tracked_apart():
 def test_a_returned_final_chunk_reopens_its_stream():
     worker = _worker()
     _step(worker, "vocoder", {"r": {"codes"}})  # a speculative step takes the final chunk...
-    Worker._return_speculative_streaming_edge(worker, "r", _final_edge("codes"))  # ...and is discarded
+    Worker._return_streaming_edge(worker, "r", _final_edge("codes"))  # ...and is discarded
 
     assert _step(worker, "vocoder", {"r": {"pitch"}}) == (set(), set())
     assert _step(worker, "vocoder", {"r": {"codes"}}) == ({"r"}, set())
@@ -115,7 +115,32 @@ def test_a_returned_final_chunk_reopens_its_stream():
 def test_returned_final_chunk_goes_back_to_its_buffer():
     worker = _worker()
     edge = _final_edge("codes")
-    Worker._return_speculative_streaming_edge(worker, "r", edge)
+    Worker._return_streaming_edge(worker, "r", edge)
 
-    sbuf = worker.worker_graphs_manager.per_request_info["r"].stream_buffers["codes"]
+    sbuf = worker.request_state.per_request_info["r"].stream_buffers["codes"]
     assert sbuf.pop_waiting_edge() is edge
+
+
+def test_a_dropped_speculative_rid_neither_flushes_nor_reports_done():
+    worker = _worker()
+    worker._return_streaming_edge = lambda *a: Worker._return_streaming_edge(worker, *a)
+    _step(worker, "captioner", {"r": {"captions"}})
+    _step(worker, "vocoder", {"r": {"codes"}})
+    edge = _final_edge("pitch")
+    batch = Worker._make_executing_batch(
+        worker, node_name="vocoder", graph_walk="chunk", request_ids=["r"],
+        per_request_input_tensors={"r": {}}, per_request_info={"r": None},
+        final_edges={"r": {"pitch"}},
+    )
+    assert (batch.final_stream_rids, batch.stream_partition_done_rids) == ({"r"}, {"r"})
+    speculation = SimpleNamespace(
+        node_batch=batch, continuing_rids={"r"}, consumed_edges=[("loop", None)],
+        scheduled_batch=SimpleNamespace(request_to_worker_graph={"r": 0}),
+        consumed_streaming_edges={"r": [edge]},
+    )
+
+    Worker._thread_outputs_to_speculative(worker, speculation, outputs_N={})
+
+    assert speculation.dropped == {"r"}
+    assert (batch.final_stream_rids, batch.stream_partition_done_rids) == (set(), set())
+    assert _step(worker, "vocoder", {"r": {"pitch"}}) == ({"r"}, {"r"})
