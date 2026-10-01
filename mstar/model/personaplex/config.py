@@ -152,6 +152,18 @@ class LMArchConfig:
         )
 
 
+DEFAULT_TEXT_PROMPT = (  # [PP] offline.py:335
+    "You are a wise and friendly teacher. Answer questions or provide advice in a clear and engaging way."
+)
+SYSTEM_TAG = "<system>"  # [PP] offline.py:83-90 (wrap_with_system_tags)
+
+# M* graph and resource names (not from the reference).
+LM_NODE, MIMI_ENCODER_NODE, MIMI_DECODER_NODE = "LM", "MimiEncoder", "MimiDecoder"
+ENCODE_USER_AUDIO_WALK, CONDITIONING_WALK, GENERATE_WALK = "encode_user_audio", "conditioning", "generate"
+CONDITIONING_LOOP, DECODE_LOOP = "cond_loop", "decode_loop"
+LM_KV, LM_ATTN, LM_POS = "lm_kv", "lm_attn", "lm_pos"
+TEXT_SAMPLER, DEPTH_SAMPLER = "text_sampler", "depth_sampler"
+
 TEXT_TEMPERATURE = 0.7  # [PP] models/lm.py:653; offline.py:363-374
 AUDIO_TEMPERATURE = 0.8  # [PP] models/lm.py:652; offline.py:363-374
 TEXT_TOP_K = 25  # [PP] models/lm.py:655; offline.py:363-374

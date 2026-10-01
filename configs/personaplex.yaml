@@ -1,0 +1,25 @@
+model: "personaplex"
+
+# One temporal forward per 80 ms frame: voice embeddings + 12 silence frames +
+# persona tokens + user frames. NVIDIA's 3000-slot ring KV equals dense causal
+# attention for at most 2999 forwards, so requests beyond that are rejected.
+max_seq_len: 2999
+
+model_kwargs:
+  # Directory of extracted .pt voice presets (NVIDIA's gated voices.tgz).
+  # Requests name a preset with model_kwargs["voice"]; without a directory
+  # every request is rejected with a clear error.
+  voice_dir: null
+
+# Single GPU: every node on rank 0.
+node_groups:
+  - node_names:
+      - MimiEncoder
+      - MimiDecoder
+    ranks:
+      - 0
+
+  - node_names:
+      - LM
+    ranks:
+      - 0
