@@ -50,7 +50,7 @@ def test_to_input_tensors_groups_per_rid_and_names_the_final_chunks():
         1: {"token": ["t10"], "kv": ["t11", "t12"]},
         2: {"token": ["t20"]},
     }
-    assert out.final_stream_rids == {1}
+    assert out.final_stream_edges == {1: {"kv"}}
 
 
 def test_a_rid_with_nothing_ready_still_gets_an_entry_when_seeded():

@@ -19,7 +19,7 @@ import torch
 
 from mstar.engine.resources.attn import cross as cross_mod
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.kv.config import KVConfig
+from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import (
     KVPlanOutput,
     KVPlanOutputs,
@@ -68,7 +68,7 @@ def _manager() -> cross_mod.FlashInferCrossManager:
         context_label=CONTEXT,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
-        kv_config=KVConfig(
+        kv_config=PagedKVConfig(
             num_layers=2, num_kv_heads=4, head_dim=64, max_seq_len=512,
             max_num_pages=64, page_size=16,
         ),

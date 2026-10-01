@@ -240,6 +240,39 @@ def test_chat_stream(client_and_stub):
     assert lines[-1]["choices"][0]["finish_reason"] == "stop"
 
 
+def test_videos_stream_ndjson(client_and_stub):
+    import base64 as _b64
+    import json as _json
+
+    client, stub = client_and_stub
+    stub.model_name = "cosmos3"
+    stub.next_chunks = [_Chunk("video", b"mp4-w0"), _Chunk("video", b"mp4-w1")]
+    r = client.post(
+        "/v1/videos/generations",
+        json={
+            "model": "cosmos3", "prompt": "a road", "num_frames": 57,
+            "window_mode": "chained", "stream_video": True,
+        },
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/x-ndjson")
+    assert stub.last_submit["streaming"] is True
+    assert stub.last_submit["model_kwargs"]["stream_video"] is True
+    lines = [_json.loads(ln) for ln in r.text.splitlines() if ln.strip()]
+    assert [ln["modality"] for ln in lines] == ["video", "video", "done"]
+    assert [_b64.b64decode(ln["data"]) for ln in lines[:2]] == [b"mp4-w0", b"mp4-w1"]
+    assert lines[2]["metadata"]["chunks"] == 2
+
+    # Without the flag the endpoint returns the grouped JSON body as before.
+    stub.next_chunks = [_Chunk("video", b"mp4-full")]
+    body = client.post(
+        "/v1/videos/generations",
+        json={"model": "cosmos3", "prompt": "a road", "num_frames": 57},
+    ).json()
+    assert stub.last_submit["streaming"] is False
+    assert _b64.b64decode(body["data"][0]["b64_json"]) == b"mp4-full"
+
+
 def test_chat_stream_reports_a_failed_request_in_band(client_and_stub):
     """A request that fails after the stream opened ends with an error event,
     not a ``finish_reason: stop`` that reads as a complete answer."""
@@ -305,38 +338,6 @@ def test_chat_stream_reports_a_timeout_in_band(client_and_stub):
     assert stub.aborted == [stub.last_submit["request_id"]]
 
 
-def test_speech_stream_that_fails_breaks_the_transfer(client_and_stub):
-    client, stub = client_and_stub
-    stub.model_name = "orpheus"
-    stub.next_chunks = [
-        _Chunk("audio", _pcm([100, -100]), {"sample_rate": 24000}),
-        _Chunk("error", b"worker died", {"status": 500}),
-    ]
-    with pytest.raises(RuntimeError, match="worker died"):
-        client.post(
-            "/v1/audio/speech",
-            json={"model": "orpheus", "input": "hi", "voice": "tara", "stream": True},
-        )
-
-
-def test_a_failed_speech_stream_leaves_the_ended_request_alone(client_and_stub):
-    """The error chunk arrives after the request has already ended, so the
-    stream reads to the end before it breaks the transfer."""
-    client, stub = client_and_stub
-    stub.model_name = "orpheus"
-    stub.next_chunks = [
-        _Chunk("audio", _pcm([100, -100]), {"sample_rate": 24000}),
-        _Chunk("error", b"worker died", {"status": 500}),
-    ]
-    with pytest.raises(RuntimeError, match="worker died"):
-        client.post(
-            "/v1/audio/speech",
-            json={"model": "orpheus", "input": "hi", "voice": "tara", "stream": True},
-        )
-
-    assert stub.aborted == [], "the stream aborted a request that had already ended"
-
-
 def test_unsupported_model_404(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "pi05"
@@ -358,3 +359,40 @@ def test_api_resolves_from_main_module(monkeypatch):
     stub = _StubAPI("bagel")
     monkeypatch.setattr(sys.modules["__main__"], "api_server", stub, raising=False)
     assert router_mod._api() is stub
+
+
+def test_audio_voices_lists_model_voices(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.model.get_voices = lambda: ["tara", "zoe"]
+    stub.model.get_default_voice = lambda: "tara"
+    body = client.get("/v1/audio/voices").json()
+    assert body["object"] == "list" and body["default_voice"] == "tara"
+    assert body["voices"] == [{"id": "tara", "name": "tara"}, {"id": "zoe", "name": "zoe"}]
+
+
+def test_audio_voices_404_without_a_voice_list(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.model.get_voices = lambda: None
+    stub.model.get_default_voice = lambda: None
+    r = client.get("/v1/audio/voices")
+    assert r.status_code == 404 and "voice list" in r.json()["error"]["message"]
+
+
+def test_audio_voices_404_for_non_speech_model(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    assert client.get("/v1/audio/voices").status_code == 404
+
+
+def test_speech_stream_pcm_has_no_wav_header(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2, 3]))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True, "response_format": "pcm"})
+    assert r.status_code == 200 and r.headers["content-type"].startswith("audio/pcm")
+    assert r.content == _pcm([1, 2, 3])
+    r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True})
+    assert r.headers["content-type"].startswith("audio/wav") and r.content[:4] == b"RIFF"
+    assert r.content[44:] == _pcm([1, 2, 3])

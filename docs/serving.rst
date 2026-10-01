@@ -184,6 +184,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        conductor's queue.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``warmup_requests``
+     - *(optional)* Requests the server runs after the workers are ready and before it
+       binds, so no client pays a shape's first-request cost (torch.compile of a step,
+       a cold cache). Each entry is a ``/generate`` request in yaml form: ``text``,
+       ``output_modalities``, ``model_kwargs``, and ``files``, a list of media
+       inputs in prompt order (text follows them). A file is a path or
+       ``hf://<owner>/<repo>/<path>`` (a file in a model's HF repo); its modality
+       comes from the extension, or give ``{path: ..., modality: ...}``. A
+       malformed or failing warmup is logged and skipped.
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /
@@ -235,6 +244,18 @@ It doesn't replace the cap.
      - {node_names: [vit_encoder], ranks: [0]}
      - {node_names: [vae_encoder, vae_decoder], ranks: [0]}
      - {node_names: [LLM], ranks: [0]}
+
+**Several workers on one GPU.** A worker is one process per rank, and by default rank
+``n`` runs on device ``n``. ``rank_devices`` maps ranks onto devices explicitly, so two
+node groups can run as separate workers on the same GPU: a heavy autoregressive node then
+never waits for a light node's steps on its worker loop (a TTS talker and its codec):
+
+.. code-block:: yaml
+
+   node_groups:
+     - {node_names: [Talker], ranks: [0]}
+     - {node_names: [Codec], ranks: [1]}
+   rank_devices: {1: 0}
 
 **Disaggregation.** The same node can live on different GPUs *per graph walk* — e.g.
 prefill, decode, and image generation on three GPUs:

@@ -31,9 +31,9 @@ from mstar.conductor.request_info import CurrentForwardConductorMetadata, Partit
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     ResourceReqConfig,
@@ -283,7 +283,15 @@ class OrpheusModel(Model):
         if prompt is None:
             return {}
 
-        voice = kwargs.get("voice", "tara")
+        # An explicit empty/None voice keeps the unprefixed prompt.
+        voice = kwargs.get("voice", self.config.default_voice)
+        if voice:
+            voice = str(voice).lower()
+            if voice not in self.config.available_voices:
+                supported = ", ".join(self.config.available_voices)
+                raise ValueError(
+                    f"Unsupported Orpheus voice {voice!r}; supported: {supported}"
+                )
 
         # Format: "{voice}: {text}"
         adapted_prompt = f"{voice}: {prompt}" if voice else prompt
@@ -361,7 +369,7 @@ class OrpheusModel(Model):
         )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        kv_config = KVConfig(
+        kv_config = PagedKVConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.head_dim,
@@ -423,6 +431,12 @@ class OrpheusModel(Model):
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
+
+    def get_voices(self) -> list[str]:
+        return list(self.config.available_voices)
+
+    def get_default_voice(self) -> str:
+        return self.config.default_voice
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
