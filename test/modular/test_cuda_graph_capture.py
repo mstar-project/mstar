@@ -20,7 +20,11 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_runner import CudaGraphRunner
+from mstar.engine.cuda_graph_runner import (
+    CudaGraphRunner,
+    capture_into_graph,
+    fail_if_graphs_required,
+)
 from mstar.engine.resources import BucketKey, CGSlotSpec
 
 requires_cuda = pytest.mark.skipif(
@@ -52,6 +56,7 @@ class _FakeRunner:
     warmup_and_capture = CudaGraphRunner.warmup_and_capture
     _register_slot = CudaGraphRunner._register_slot
     _buckets_captured_everywhere = CudaGraphRunner._buckets_captured_everywhere
+    _report_dropped = CudaGraphRunner._report_dropped
 
     def __init__(
         self, specs, fail: set[tuple[str, int]] = frozenset(), num_slots=2,
@@ -222,3 +227,82 @@ def test_single_slot_runners_still_register():
     (bucket,) = runner._buckets.values()
     assert bucket.slots == ["decode:slot0"]
     assert runner.declared == [], "nothing to pre-plan with a single slot"
+
+
+@requires_cuda
+def test_a_dropped_bucket_is_listed_and_logged_as_an_error(caplog):
+    """A bucket that runs eagerly is a 10-20x latency cliff, so it has to be
+    visible in the log and to the engine's strict mode."""
+    runner = _FakeRunner(
+        _specs(walks=("decode", "prefill")), fail={("decode", 1)},
+    )
+
+    with caplog.at_level("ERROR", logger="mstar.engine.cuda_graph_runner"):
+        runner.warmup_and_capture()
+
+    assert [key.graph_walk for key in runner.dropped_buckets] == ["decode"]
+    summary = [r for r in caplog.records if "captured 1 of 2 buckets" in r.message]
+    assert summary and summary[0].levelname == "ERROR"
+
+    clean = _FakeRunner(_specs(walks=("decode", "prefill")))
+    clean.warmup_and_capture()
+    assert clean.dropped_buckets == []
+
+
+@requires_cuda
+def test_a_failed_capture_leaves_the_pool_and_stream_usable():
+    """A capture that dies part way used to leave the allocator recording
+    into the shared pool (every later bucket then failed with "already
+    recording to mempool_id") and the thread on the capture stream."""
+    device = torch.device("cuda")
+    x = torch.ones(8, device=device)
+    pool = torch.cuda.graph_pool_handle()
+
+    def bad():
+        # a pageable host-to-device copy is not permitted while capturing
+        return x + torch.tensor([1.0], device=device)
+
+    with pytest.raises(RuntimeError):
+        capture_into_graph(bad, pool, device, None)
+
+    assert torch.cuda.current_stream(device) == torch.cuda.default_stream(device)
+
+    graph, out = capture_into_graph(lambda: x * 2, pool, device, None)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert out.tolist() == [2.0] * 8
+
+
+def test_required_graphs_turn_a_dropped_bucket_into_a_startup_failure(monkeypatch):
+    monkeypatch.delenv("MSTAR_REQUIRE_CUDA_GRAPHS", raising=False)
+    fail_if_graphs_required(["node decode[bs=1]"])
+
+    monkeypatch.setenv("MSTAR_REQUIRE_CUDA_GRAPHS", "1")
+    fail_if_graphs_required([])
+    with pytest.raises(RuntimeError, match="node decode"):
+        fail_if_graphs_required(["node decode[bs=1]"])
+
+
+@requires_cuda
+def test_a_recompile_during_capture_fails_with_the_guard_that_broke():
+    """dynamo saves the CUDA RNG state before compiling, which CUDA refuses
+    mid capture, so a forward that would recompile inside the capture cannot
+    succeed. Fail it before any CUDA call, naming the guard."""
+    device = torch.device("cuda")
+    x = torch.ones(4, device=device)
+
+    @torch.compile(dynamic=False)
+    def scale(t, n):
+        return t * n
+
+    scale(x, 1)  # warm: compiled and cached for n == 1
+    pool = torch.cuda.graph_pool_handle()
+
+    with pytest.raises(RuntimeError, match="recompile"):
+        capture_into_graph(lambda: scale(x, 2), pool, device, None)
+
+    graph, out = capture_into_graph(lambda: scale(x, 1), pool, device, None)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert out.tolist() == [1.0] * 4
+

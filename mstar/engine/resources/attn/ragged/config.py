@@ -7,6 +7,8 @@ a submodule can declare a step without pulling FlashInfer in behind it.
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import torch
+
 from mstar.engine.resources.spec import NodeResourceSpec
 
 if TYPE_CHECKING:
@@ -40,6 +42,12 @@ class RaggedAttentionConfig:
     max_tokens_per_request: int | None = None
 
     flashinfer_backend: str = "auto"
+
+    # Activation dtype of the q / k / v the node hands the kernel (and of its
+    # output). A cacheless attention doesn't need to adhere to the dtype of its
+    # KV cache, so it is free to declare a separate dtype here; when None, the
+    # engine's KV dtype (which is actually a misnamed autocast dtype) is used.
+    dtype: torch.dtype | None = None
 
     def __post_init__(self):
         if self.sm_scale is None:

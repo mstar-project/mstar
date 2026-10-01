@@ -101,3 +101,14 @@ def test_tts_forwards_voice_and_reference_audio():
     assert calls[-1]["audio"] == [b"RIFF"]
     assert calls[-1]["input_modalities"] == ("audio", "text")
     assert calls[-1]["ref_text"] == "the transcript" and calls[-1]["voice"] is None
+
+
+def test_voices_lists_ids():
+    c = MStarClient("http://x")
+    resp = mock.Mock()
+    voices = [{"id": "tara", "name": "tara"}, {"id": "zoe", "name": "zoe"}]
+    resp.json.return_value = {"object": "list", "voices": voices}
+    with mock.patch.object(c._session, "get", return_value=resp) as get:
+        assert c.voices() == ["tara", "zoe"]
+    get.assert_called_once_with("http://x/v1/audio/voices", timeout=c.timeout)
+    resp.raise_for_status.assert_called_once()

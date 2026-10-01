@@ -39,6 +39,8 @@ class QueryPacking(NamedTuple):
 
 
 class CrossAttentionManager(AttentionResource):
+    prefix_skip_safe = True
+
     # Remains abstract except for build; will build based
     # on the attention backend
 
