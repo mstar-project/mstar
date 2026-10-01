@@ -70,8 +70,8 @@ def _request_data(workers):
     return RequestData(
         persist_signals={},
         persist_signal_ref_cnt={},
-        worker_graph_to_workers={"wg": list(workers)},
-        all_worker_graph_ids={"wg"},
+        worker_graph_to_workers={0: list(workers)},
+        all_worker_graph_ids={0},
         max_output_tokens=1,
         random_seed=0,
         resource_configs={},
@@ -253,6 +253,20 @@ def test_conductor_process_target_watches_the_api_server():
     watch_at = source.index("watch_parent(")
     assert "signal.SIGINT" in source[watch_at:source.index("\n", watch_at)]
     assert watch_at < source.index("get_model_class")
+
+
+def test_conductor_process_target_rearms_sigint_before_watching():
+    """An inherited SIGINT ignore would make the watchdog's graceful stop a
+    no-op, so the handler is installed before the watchdog starts."""
+    import inspect
+
+    from mstar.api_server import entrypoint
+
+    source = inspect.getsource(entrypoint._conductor_process_target)
+    install_at = source.index(
+        "signal.signal(signal.SIGINT, signal.default_int_handler)"
+    )
+    assert install_at < source.index("watch_parent(")
 
 
 def test_worker_without_a_multiprocessing_parent_keeps_running():

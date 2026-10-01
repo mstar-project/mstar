@@ -24,7 +24,10 @@ from mstar.api_server.request_types import (
 )
 from mstar.communication.communicator import BaseCommunicator, CommProtocol, make_communicator
 from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
-from mstar.model.base import Model
+from mstar.engine.resources.kv.config import KVSpec
+from mstar.engine.resources.kv.keys import chain
+from mstar.engine.resources.spec import apply_yaml_overrides
+from mstar.model.base import Model, ProcessPromptOutput
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils.ipc_format import (
     AbortRequest,
@@ -47,6 +50,16 @@ def _preprocess_loop(**kwargs):
     worker.run()
 
 
+def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
+    """Page size per KV resource, after this deployment's YAML has been applied."""
+    specs = model.get_node_resources()
+    apply_yaml_overrides(specs, model_config)
+    return {
+        spec.resource_key: spec.config.page_size
+        for spec in specs if isinstance(spec, KVSpec)
+    }
+
+
 NameToLoopIndices = dict[str, NestedLoopIndices]
 
 
@@ -58,7 +71,8 @@ class PreprocessWorker:
         socket_path_prefix: str = "/tmp/mstar",
         tensor_comm_protocol: CommProtocol = CommProtocol.RDMA,
         tcp_transfer_device="",
-        enable_prof: bool=False
+        enable_prof: bool=False,
+        model_config: dict | None = None,
     ):
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -108,7 +122,8 @@ class PreprocessWorker:
                 communicator=self.communicator,
                 tensor_manager=self.tensor_manager,
                 model=model,
-                enable_prof=enable_prof
+                enable_prof=enable_prof,
+                model_config=model_config,
             )
         )
         self.thread.start()
@@ -244,6 +259,18 @@ class PreprocessWorker:
             self.thread.join()
 
 
+def warm_up_model(model) -> None:
+    """Run the model's ``warmup_preprocess`` once; a failure is logged, not
+    fatal, because the same work happens again on the first request."""
+    warm = getattr(model, "warmup_preprocess", None)
+    if model is None or not callable(warm):
+        return
+    try:
+        warm()
+    except Exception:  # noqa: BLE001 — warm-up is best effort
+        logger.exception("model.warmup_preprocess failed; the first request will do the work")
+
+
 class PreprocessWorkerThread:
     def __init__(
         self,
@@ -260,8 +287,19 @@ class PreprocessWorkerThread:
         tensor_manager,
         device: str = "cpu",
         model: Model | None = None,
-        enable_prof: bool=False
+        enable_prof: bool=False,
+        model_config: dict | None = None,
     ):
+        # keying a stream needs the deployment's page size as well as the
+        # model's declaration, so a worker built without a config keys no stream
+        self._prefix_streams = (
+            model.prefix_key_streams()
+            if model is not None and model_config else {}
+        )
+        # resolved as the worker does at load, so both split a prompt into the same pages
+        self._prefix_page_sizes = (
+            _kv_page_sizes(model, model_config) if self._prefix_streams else {}
+        )
         self.in_queue = in_queue
         self.result_tensor_queue = result_tensor_queue
         self.cleanup_request_queue = cleanup_request_queue
@@ -332,6 +370,11 @@ class PreprocessWorkerThread:
         # image_grid_thw, audio_features, audio_seqlens from the raw tensors
         # loaded above).  process_prompt receives the raw multimodal tensors
         # and returns any additional tensors to merge into the final dict.
+        model_kwargs = dict(input.model_kwargs or {})
+        # only this worker keys a prompt: a client that sent its own could name
+        # another request's pages and be served that request's KV
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode"):
+            model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -340,10 +383,21 @@ class PreprocessWorkerThread:
                 tensors=tensors,
                 input_metadata=input_metadata,
                 prompt_parts=input.prompt_parts,
-                **(input.model_kwargs or {}),
+                **model_kwargs,
             )
+            if isinstance(prompt_tensors, ProcessPromptOutput):
+                model_kwargs.update(prompt_tensors.metadata)
+                prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
+            # after the update: the chain keys the tensors the request will
+            # actually be prefilled with
+            prefix_keys, prefix_tail, prefix_decode = self._prefix_keys(tensors)
+            if prefix_keys:
+                model_kwargs["prefix_keys"] = prefix_keys
+                model_kwargs["prefix_tail"] = prefix_tail
+                if prefix_decode:
+                    model_kwargs["prefix_decode"] = prefix_decode
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
             byte_data = input.text.encode("utf-8")
@@ -364,11 +418,9 @@ class PreprocessWorkerThread:
         )
         # also persist all of the input signals
         for info in all_infos:
-            self.tensor_manager.set_persist(
-                input.request_id, info.uuid, persist=True
-            )
+            self.tensor_manager.set_persist(info.uuid, persist=True)
 
-        self.request_model_kwargs[input.request_id] = input.model_kwargs or {}
+        self.request_model_kwargs[input.request_id] = model_kwargs
         msg = ConductorMessage(
             message_type=ConductorMessageType.NEW_REQUEST,
             body=NewRequestConductor(
@@ -377,7 +429,7 @@ class PreprocessWorkerThread:
                 initial_input_modalities=input.input_modalities,
                 initial_output_modalities=input.output_modalities,
                 input_metadata=input_metadata,
-                model_kwargs=input.model_kwargs
+                model_kwargs=model_kwargs
             ),
         )
         self.communicator.send("conductor", msg)
@@ -393,6 +445,33 @@ class PreprocessWorkerThread:
                 preprocess_finish_time=time.perf_counter(),
                 inputs=self._summarize_inputs(input),
             ))
+
+    def _prefix_keys(self, tensors: dict) -> tuple[dict, dict, dict]:
+        """Key each page of every declared stream, by resource and label.
+
+        Returns the keys, the prompt tail past the last whole page, and the output
+        tensor each stream's sampled ids arrive in. The keys are unrooted.
+        """
+        keys: dict[str, dict[str, list[bytes]]] = {}
+        tails: dict[str, dict[str, list[int]]] = {}
+        decode: dict[str, dict[str, str]] = {}
+        for resource_key, by_label in self._prefix_streams.items():
+            page_size = self._prefix_page_sizes[resource_key]
+            for label, stream in by_label.items():
+                ids = tensors.get(stream.tensor)
+                if stream.keyed_by != "ids" or not ids:
+                    continue
+                flat = ids[0].flatten().tolist()
+                pages = [
+                    flat[at:at + page_size]
+                    for at in range(0, len(flat), page_size)
+                ]
+                keys.setdefault(resource_key, {})[label] = chain(pages)
+                whole = len(flat) // page_size
+                tails.setdefault(resource_key, {})[label] = flat[whole * page_size:]
+                if stream.decode_walk is not None:
+                    decode.setdefault(resource_key, {})[label] = stream.tensor
+        return keys, tails, decode
 
     @staticmethod
     def _summarize_inputs(input: PreprocessInput) -> list[InputInfo]:
@@ -483,10 +562,7 @@ class PreprocessWorkerThread:
                     # escape to run()'s catch-all would abandon the rest of this
                     # pass and leave the client waiting on the request timeout.
                     try:
-                        tensor = self.tensor_manager.get_tensor(
-                            request_id=request_id,
-                            uuid=tensor_info.uuid
-                        )
+                        tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
                         postprocessed = self.model.postprocess(
                             tensor, modality,
                             request_kwargs=self.request_model_kwargs.get(request_id),
@@ -517,10 +593,7 @@ class PreprocessWorkerThread:
                     self.tensor_uuid_to_metadata_per_request.get(
                         request_id, {}
                     ).pop(tensor_info.uuid, None)
-                    self.tensor_manager.dereference(
-                        request_id=request_id,
-                        uuid=tensor_info.uuid
-                    )
+                    self.tensor_manager.dereference(tensor_info.uuid)
         return did_work
 
     def _process_messages(self):
@@ -529,19 +602,15 @@ class PreprocessWorkerThread:
             did_work = True
             if message.message_type == WorkerMessageType.TENSOR_RECEIVED:
                 body: TensorReceived = message.body
-                for (uuid, ref_cnt) in body.successful_tensors.items():
-                    self.tensor_manager.dereference(
-                        body.request_id, uuid, n=ref_cnt
-                    )
+                self.tensor_manager.dereference_batch(
+                    list(body.successful_tensors),
+                    list(body.successful_tensors.values()),
+                )
             elif message.message_type == WorkerMessageType.UNPERSIST_TENSORS:
                 body: UnpersistTensors = message.body
                 for (uuid, ref_cnt) in body.uuid_to_ref_count.items():
-                    self.tensor_manager.increment_ref(
-                        body.request_id, uuid, n=ref_cnt
-                    )
-                    self.tensor_manager.set_persist(
-                        body.request_id, uuid, persist=False
-                    )
+                    self.tensor_manager.increment_ref(uuid, n=ref_cnt)
+                    self.tensor_manager.set_persist(uuid, persist=False)
             elif message.message_type == WorkerMessageType.DRAIN_REQUEST:
                 body: DrainRequest = message.body
                 self._begin_drain(body.request_id)
@@ -602,6 +671,10 @@ class PreprocessWorkerThread:
         self.in_flight_requests.discard(request_id)
 
     def run(self):
+        # A thread told to stop before it starts (teardown tests build one with
+        # only its queues) has nothing to warm up.
+        if not self.stop_event.is_set():
+            warm_up_model(getattr(self, "model", None))
         while not self.stop_event.is_set():
             did_work = False
             try:

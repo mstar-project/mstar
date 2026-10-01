@@ -18,7 +18,7 @@ from mstar.streaming.chunk_policy import (
     ScheduledLeftContextChunkPolicy,
     SlidingWindowChunkPolicy,
 )
-from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 
 
 def _drive(policy, total_items, drain_before_done=True):
@@ -120,11 +120,17 @@ def test_existing_policies_report_context_items(policy, expected):
     assert _new_items(chunks) == list(range(10))
 
 
-def test_graph_edge_clone_keeps_stream_chunk_geometry():
-    edge = GraphEdge(next_node="Codec", name="codec_tokens", _final_stream_chunk=True,
-                     _stream_chunk_offset=7, _stream_chunk_context=3, _stream_chunk_items=12)
-    clone = edge.clone()
-    assert (clone._stream_chunk_offset, clone._stream_chunk_context, clone._stream_chunk_items,
-            clone._final_stream_chunk) == (7, 3, 12, True)
-    plain = GraphEdge(next_node="x", name="y")
-    assert plain._stream_chunk_context is None and plain._stream_chunk_items is None
+def test_returned_streaming_edge_keeps_its_chunk_info():
+    buffer = StreamBuffer(request_id="r", edge_name="codec_tokens", from_partition="Talker",
+                          policy=FixedChunkPolicy(chunk_size=3))
+    info = StreamChunkInfo(start_offset=7, context_items=3, num_items=12, is_final=True)
+    edge = GraphEdge(next_node="Codec", name="codec_tokens", _final_stream_chunk=True)
+    buffer.store_uningested_edge(StreamingEdge(edge, info))
+    assert buffer.pop_waiting_edge() == (edge, info)
+    assert buffer.pop_waiting_edge() is None
+
+
+def test_chunk_info_matches_chunk():
+    chunks = _drive(LeftContextChunkPolicy(chunk=4, left_context=1), total_items=10)
+    for c in chunks:
+        assert c.info == (c.start_offset, c.context_items, c.num_items, c.is_final)

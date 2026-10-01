@@ -4,6 +4,7 @@ Kept free of the manager and its kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -32,6 +33,9 @@ class KVConfig:
     layout: KVLayout = KVLayout.NHD
     # pages of pinned host memory to keep for offloading; 0 disables it
     cpu_offload_pages: int = 0
+    # folded into the root, not checked at match time
+    prefix_cache_salt: str = ""
+    prefix_cache: bool = True
 
     def __post_init__(self):
         if self.num_qo_heads is None:
@@ -63,6 +67,30 @@ class KVReqConfig(ResourceReqConfig):
     needed_labels: list[str] | None = None
     needed_labels_per_node: dict[str, list[str]] = field(default_factory=dict)
     needed_labels_per_node_walk: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    # label -> one key per page, from the preprocess worker
+    prefix_keys: dict[str, list[bytes]] | None = None
+    # label -> prompt tokens past the last whole page, keyed once generation fills it
+    prefix_tail: dict[str, list[int]] | None = None
+    # label -> the output tensor its sampled ids arrive in, if the stream keys generation
+    prefix_decode: dict[str, str] | None = None
+    prefix_cache: bool = True
+
+    def apply_conductor_config(
+        self,
+        prefix_keys: dict[str, list[bytes]] | None=None,
+        prefix_tail: dict[str, list[int]] | None=None,
+        prefix_decode: dict[str, str] | None=None,
+        prefix_cache: bool | None=None,
+        **kwargs,
+    ):
+        if prefix_keys is not None:
+            self.prefix_keys = prefix_keys
+        if prefix_tail is not None:
+            self.prefix_tail = prefix_tail
+        if prefix_decode is not None:
+            self.prefix_decode = prefix_decode
+        if prefix_cache is not None:
+            self.prefix_cache = prefix_cache
 
     def get_labels(self, node: str, walk: str):
         if (node, walk) in self.needed_labels_per_node_walk:
@@ -90,6 +118,8 @@ class KVSpec(NodeResourceSpec):
         page_size: int | None = None,
         max_seq_len: int | None = None,
         cpu_offload_pages: int | None = None,
+        prefix_cache_salt: str | None = None,
+        prefix_cache: bool | None = None,
     ):
         """How much cache this deployment gets, and how it is cut up."""
         for name, value in (
@@ -97,9 +127,37 @@ class KVSpec(NodeResourceSpec):
             ("page_size", page_size),
             ("max_seq_len", max_seq_len),
             ("cpu_offload_pages", cpu_offload_pages),
+            ("prefix_cache_salt", prefix_cache_salt),
+            ("prefix_cache", prefix_cache),
         ):
             if value is not None:
                 setattr(self.config, name, value)
+
+
+@dataclass(frozen=True)
+class RetentionPolicy:
+    """FIFO retention for a stream that keeps committing (windowed / rolling
+    generation): once the committed tokens behind ``protected_prefix`` exceed
+    ``context_budget``, the oldest unprotected pages are released.
+
+    A committing step declares it for its stream on ``KVStep.retention`` and
+    ``KVManager.commit`` applies it, so the release happens between steps as
+    far as every planner is concerned: a pre-plan of the next step gates on
+    this commit and sees the compacted stream. Whole pages only (the page
+    straddling the prefix boundary and a partial tail page stay), so the
+    realized context can run over the budget by up to a page; the excess is
+    re-offered at the next commit. ``protected_prefix`` tokens at the head (a
+    text prompt, say) are never released.
+    """
+    context_budget: int
+    # front tokens the window never releases; only pages within them are indexed
+    protected_prefix: int = 0
+
+    def __post_init__(self):
+        if self.context_budget <= 0:
+            raise ValueError(f"context_budget must be > 0, got {self.context_budget}")
+        if self.protected_prefix < 0:
+            raise ValueError(f"protected_prefix must be >= 0, got {self.protected_prefix}")
 
 
 @dataclass(frozen=True)
@@ -111,3 +169,7 @@ class KVStep(ResourceStep):
     combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
+    # (request_id, label) -> the retention a committing stream declares for
+    # itself this step, applied at commit. It rides with the step rather than
+    # living on the stream, so an offload has nothing to lose.
+    retention: Mapping[tuple[str, str], RetentionPolicy] = field(default_factory=dict)

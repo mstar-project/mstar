@@ -20,6 +20,8 @@ output list plus its node name, returning the nodes that became ready.
 """
 from copy import deepcopy
 
+import torch
+
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -192,7 +194,7 @@ def test_speculative_signals_sees_tensor_info_via_shared_reference():
     # Simulate _store_outputs_and_finish_loops appending tensor_info on the
     # producer side (mutation in place, NOT replacement of the list).
     fake_info = TensorPointerInfo(
-        dims=[1], dtype="float32", nbytes=4, address=0,
+        dims=[1], dtype=torch.float32, nbytes=4, address=0,
         stride=[1], uuid="uuid-deadbeef", source_session_id="test",
         source_entity="test",
     )

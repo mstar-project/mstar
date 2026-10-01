@@ -233,6 +233,77 @@ sampling parameters. The engine no longer reads it directly. Pass its result int
    through ``SamplingReqConfig`` are stored in buffers whose addresses do not change
    across replays, so they stay per-request and remain safe under CUDA graphs.
 
+Cross-request prefix reuse
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Two requests that begin with the same tokens fill the same KV pages, and the second can
+attend the pages the first filled instead of recomputing them. A model opts in with two
+methods. Both have defaults, and a model that overrides neither is never cached. The
+deployment switch and the per-request opt-out are described under **Resource overrides**
+in :doc:`serving`.
+
+``prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]``
+   Return ``{resource_key: {label: PrefixStream}}``, one entry for each KV cache stream
+   whose pages are keyed. A :class:`mstar.model.base.PrefixStream` has four fields:
+
+   - ``tensor`` names the request tensor that holds the stream's token ids, as
+     ``process_prompt`` returns it.
+   - ``keyed_by`` is ``"ids"``: each page is keyed by its token ids, chained from the key
+     of the page before it.
+   - ``walk`` names the graph walk that writes the keyed span. Only this walk is probed
+     for a match. If any walk other than ``walk`` and ``decode_walk`` writes into the
+     stream, the stream stops being keyed.
+   - ``decode_walk`` names the walk whose input is the token just sampled, so that the
+     generated tokens are chained onto the prompt's keys and a later request that
+     re-sends the reply matches it too. ``None`` keys the prompt only.
+
+   BAGEL keys the text walk of its LLM and the decode that follows it:
+
+   .. code-block:: python
+
+      return {"kv": {"main": PrefixStream(
+          "text_inputs", "ids", "prefill_text", "decode",
+      )}}
+
+   Orpheus keys its prompt walk and its decode walk:
+
+   .. code-block:: python
+
+      return {
+          KV_CACHE: {"main": PrefixStream("text_inputs", "ids", "prefill", "decode")},
+      }
+
+``checkpoint_path(self) -> str | None``
+   Return the local directory that holds the weights and ``config.json``. The cache
+   hashes the checkpoint's safetensors index and config into the root of every key, so
+   naming the checkpoint is what keeps two builds off each other's pages. The default
+   returns ``None``, which leaves the weights out of the root. A model without a
+   checkpoint therefore needs ``prefix_cache_salt`` set to use the cache at all. Without
+   one, the engine keeps the cache shut and logs why.
+
+A model that declares a stream is checked at load time. Loading fails in three cases:
+
+- A position resource over a keyed cache uses a scheme other than sequential. A page is
+  reusable only where its tokens land at the positions they were written at. The message
+  is ``resource '<key>' places positions by <scheme>, but it sits over ['<kv key>'],
+  which the model keyed for prefix reuse; either drop the stream or give the resource a
+  sequential scheme``.
+- A resource on a keyed node does not set ``prefix_skip_safe``. A hit takes the front of
+  the request away from every resource on the node, including resources that never saw
+  those tokens. The message is ``resource '<key>' cannot serve a request whose prefix
+  came from the cache, but it sits on ['<node>'], which the model keyed for prefix
+  reuse; either drop the stream or give the resource the prefix hooks``.
+- A stream names a walk that the model does not run. The message is ``<Model> keys
+  '<resource key>'/'<label>' on ['<walk>'], which it never runs; its walks are [...]``.
+
+Some requests stay uncached even when the model declares a stream. The engine checks each
+request's inputs on the keyed walk and cuts a prefix only from inputs that the default
+``split_inputs`` can slice. A request whose inputs carry ``tensor_inputs``, ``kwargs`` or
+``resource_step_info`` is never probed; BAGEL's guided requests carry ``requires_cfg``
+there. The keys stop at a prompt's first input that is not a token, so a BAGEL prompt is
+keyed over its leading text only. A stream under a sliding window files pages only up to
+its protected prefix, which the window never releases.
+
 .. _Step 2a — Declare your resources:
 
 Step 2a — Declare your resources
@@ -267,9 +338,10 @@ The spec types are:
      - What it builds
    * - ``KVSpec(config=KVConfig(...))``
      - A paged KV cache. ``KVConfig`` holds ``num_layers``, ``num_kv_heads``,
-       ``head_dim``, ``max_seq_len`` and ``num_qo_heads``. It also holds three fields that
-       a deployment can tune: ``max_num_pages``, ``page_size`` and ``cpu_offload_pages``
-       (the number of pinned host pages used for offload; 0 disables offload).
+       ``head_dim``, ``max_seq_len`` and ``num_qo_heads``. It also holds five fields that
+       a deployment can tune: ``max_num_pages``, ``page_size``, ``cpu_offload_pages``
+       (the number of pinned host pages used for offload; 0 disables offload),
+       ``prefix_cache`` and ``prefix_cache_salt``.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
        ``AttnBackend.FLASHINFER`` (the default) or ``AttnBackend.DENSE``.
@@ -1210,7 +1282,8 @@ that a misspelled setting is never silently ignored:
    * - Spec
      - Accepts
    * - ``KVSpec``
-     - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``
+     - ``max_num_pages``, ``page_size``, ``max_seq_len``, ``cpu_offload_pages``,
+       ``prefix_cache``, ``prefix_cache_salt``
    * - ``AttentionSpec`` / ``CrossAttentionSpec``
      - ``backend`` (``flashinfer`` / ``dense``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``)
@@ -1589,6 +1662,7 @@ Checklist
          [ ] postprocess
          [ ] get_submodule
          [ ] (optional) get_request_resource_configs
+         [ ] (optional) prefix_key_streams + checkpoint_path   — cross-request prefix reuse
    [ ] mstar/model/registry.py                    — add to MODEL_REGISTRY (+ HF_MODELS)
    [ ] configs/<your_model>.yaml                  — node_groups → ranks (+ resources: overrides)
    [ ] (optional) async partitions if pipelined

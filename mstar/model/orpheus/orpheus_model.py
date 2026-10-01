@@ -42,7 +42,7 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.base import ForwardPassArgs, Model, PrefixStream
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import SlidingWindowChunkPolicy
@@ -283,7 +283,15 @@ class OrpheusModel(Model):
         if prompt is None:
             return {}
 
-        voice = kwargs.get("voice", "tara")
+        # An explicit empty/None voice keeps the unprefixed prompt.
+        voice = kwargs.get("voice", self.config.default_voice)
+        if voice:
+            voice = str(voice).lower()
+            if voice not in self.config.available_voices:
+                supported = ", ".join(self.config.available_voices)
+                raise ValueError(
+                    f"Unsupported Orpheus voice {voice!r}; supported: {supported}"
+                )
 
         # Format: "{voice}: {text}"
         adapted_prompt = f"{voice}: {prompt}" if voice else prompt
@@ -350,6 +358,17 @@ class OrpheusModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
 
+    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+        """The LLM's prompt is its token ids, and so is every step after it."""
+        return {
+            KV_CACHE: {"main": PrefixStream("text_inputs", "ids", "prefill", "decode")},
+        }
+
+    def checkpoint_path(self) -> str:
+        return _resolve_local_hf_snapshot(
+            self.model_path_hf, cache_dir=self.cache_dir,
+        )
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         kv_config = KVConfig(
             num_layers=self.config.num_hidden_layers,
@@ -413,6 +432,12 @@ class OrpheusModel(Model):
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
+
+    def get_voices(self) -> list[str]:
+        return list(self.config.available_voices)
+
+    def get_default_voice(self) -> str:
+        return self.config.default_voice
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

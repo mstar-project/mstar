@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from uuid import uuid4
 
+import torch
+
 
 @dataclass(frozen=True)
 class NodeAndGraphWalk:
@@ -17,11 +19,11 @@ class NodeAndGraphWalk:
 @dataclass
 class TensorPointerInfo:
     dims: list[int]
-    dtype: str
+    dtype: torch.dtype
     nbytes: int
     address: int
     stride: list[int]
-    uuid: str  # for indexing storage
+    uuid: int  # (entity_index << 48) | counter; see communication/tensor_uuid.py
     source_session_id: str  # "{HOSTNAME}:{client_engine.get_rpc_port()}"
     source_entity: str  # which {worker, api_server} the tensor is on
     offset: int = 0 # offset, in bytes, of the read (e.g., for in-transport sharding
@@ -74,12 +76,6 @@ class GraphEdge:
     # set on a synthetic streaming-input edge carrying the final chunk, so the
     # consuming pass (not the earlier ingest) reports the partition done
     _final_stream_chunk: bool = field(default=False)
-    # set on a synthetic streaming-input edge: where the chunk starts in the
-    # stream and how many of its leading items were delivered before (context);
-    # None on every other edge
-    _stream_chunk_offset: int | None = field(default=None)
-    _stream_chunk_context: int | None = field(default=None)
-    _stream_chunk_items: int | None = field(default=None)
 
     # Set for sharded configurations
     _total_fanin: int = 1
@@ -96,9 +92,6 @@ class GraphEdge:
             output_modality=self.output_modality,
             _persist_for_loop=self._persist_for_loop,
             _final_stream_chunk=self._final_stream_chunk,
-            _stream_chunk_offset=self._stream_chunk_offset,
-            _stream_chunk_context=self._stream_chunk_context,
-            _stream_chunk_items=self._stream_chunk_items,
         )
 
 
@@ -173,7 +166,7 @@ class ReadySignals:
         self._tensor_manager = None
         self._request_id = None
 
-    def register_communication_info(self, communication_manager, request_id: str):
+    def register_communication_info(self, communication_manager, request_id: int):
         self._tensor_manager = communication_manager
         self._request_id =  request_id
 
@@ -188,19 +181,24 @@ class ReadySignals:
         if self.is_ready:
             return
         self.is_ready = self.input_names.issubset(self.ready_names)
-        # ready once the only missing inputs are streaming ones (which arrive incrementally)
+        # Ready once the only missing inputs are streaming ones, which arrive
+        # incrementally
         self.is_ready_for_streaming = self.is_ready or \
             self.is_ready_for_streaming or (
-            self.input_names.issuperset(self.ready_names.union(self.streaming_inputs))
+            self.input_names.issubset(self.ready_names.union(self.streaming_inputs))
         )
 
     def clear(self):
         if self._tensor_manager is not None:
-            for edge in self.ready_inputs.values():
-                if edge._persist_for_loop:
-                    continue
-                for info in edge.tensor_info:
-                    self._tensor_manager.dereference(self._request_id, info.uuid)
+            # One crossing for the node's whole input set: this runs on every
+            # pass, and a node with several multi-tensor inputs pays per
+            # tensor otherwise.
+            self._tensor_manager.dereference_batch_uniform([
+                info.uuid
+                for edge in self.ready_inputs.values()
+                if not edge._persist_for_loop
+                for info in edge.tensor_info
+            ])
         self.ready_inputs.clear()
         self.ready_names.clear()
         self.is_ready = False
@@ -222,7 +220,7 @@ class ReadySignals:
             return None
         self.ready_names.discard(edge_name)
         self.is_ready = self.input_names.issubset(self.ready_names)
-        self.is_ready_for_streaming = self.is_ready or self.input_names.issuperset(
+        self.is_ready_for_streaming = self.is_ready or self.input_names.issubset(
             self.ready_names | self.streaming_inputs
         )
         return edge
@@ -271,7 +269,7 @@ class GraphNode(GraphSection):
         self._tensor_manager = None
         self._request_id = None
 
-    def register_communication_info(self, communication_manager, request_id: str):
+    def register_communication_info(self, communication_manager, request_id: int):
         self.ready_signals.register_communication_info(
             communication_manager, request_id
         )
@@ -517,13 +515,20 @@ class Loop(GraphSection):
         self._uncache_outputs()
 
     def ingest_external_input(self, graph_edge: GraphEdge):
-        # track one copy of each external input for re-injection on the next iteration
+        # track one copy of each external input for re-injection on the next
+        # iteration -- except a streamed one: each iteration takes the NEXT
+        # chunk, and re-injecting this one would feed it again.
         if (graph_edge.name, graph_edge.next_node) in self._external_inputs \
-                and graph_edge.name not in self._ingested_external_input_names:
+                and graph_edge.name not in self._ingested_external_input_names \
+                and not self._is_streamed_input(graph_edge):
             self._ingested_external_inputs.append(graph_edge)
             self._ingested_external_input_names.add(graph_edge.name)
             graph_edge._persist_for_loop = True
         self._managing_registry.register_ingested_input(graph_edge)
+
+    def _is_streamed_input(self, graph_edge: GraphEdge) -> bool:
+        node = self.section.get_nodes().get(graph_edge.next_node)
+        return node is not None and graph_edge.name in node._streaming_inputs
 
     def complete_iter(self):
         """Called when every entity in the loop's section has finished for this iteration.
@@ -541,18 +546,27 @@ class Loop(GraphSection):
             # register_ingested_input before termination — cleaning those up is deferred
             # (they're harmless since reset_for_iter won't be called after the loop is done).
             self.inner_registry.clear()
-            self._managing_registry.mark_entity_complete(self.name)
             for edge in self.outputs:
                 edge.tensor_info = self._cached_outputs.get(edge.name, [])
             for edge in self.accumulated_outputs:
                 edge.tensor_info = self._accumulated_cache.get(edge.name, [])
+            # Cascade only once our tensor_info is populated -- the parent
+            # caches these edges on the way through -- and keep what it hands
+            # back. Both matter only for NESTED loops: cascading first makes a
+            # parent cache still-empty tensor_info, and discarding the result
+            # means a parent that finishes in this same event never routes its
+            # own outputs. Our declared outputs come back inside ``outer``
+            # (the parent reads them off ``managed_entities``) already filtered
+            # by its loop-back, so they are not added again here; the
+            # accumulated ones are disjoint by name and ride separately.
+            outer = self._managing_registry.mark_entity_complete(self.name)
 
             # Don't dereference, becaue the tensors will be used downstream
             self._cached_outputs.clear()
             self._accumulated_cache.clear()
             return NodeCompletionOutput(
-                output_edges=self.outputs + self.accumulated_outputs,
-                filtered_signals=self._loop_back_inputs
+                output_edges=list(outer.output_edges) + self.accumulated_outputs,
+                filtered_signals=self._loop_back_inputs | outer.filtered_signals,
             )
         else:
             self._advance_one_iter()
@@ -560,7 +574,7 @@ class Loop(GraphSection):
                 output_edges=self._ingested_external_inputs
             )
 
-    def register_communication_info(self, communication_manager, request_id: str):
+    def register_communication_info(self, communication_manager, request_id: int):
         self._tensor_manager = communication_manager
         self._request_id = request_id
 
@@ -583,13 +597,13 @@ class Loop(GraphSection):
                 ).extend(edge.tensor_info)
                 if self._tensor_manager is not None:
                     for info in edge.tensor_info:
-                        self._tensor_manager.increment_ref(self._request_id, info.uuid)
+                        self._tensor_manager.increment_ref(info.uuid)
 
             elif edge.name in self._accumulated_output_names:
                 self._accumulated_cache.setdefault(edge.name, []).extend(edge.tensor_info)
                 if self._tensor_manager is not None:
                     for info in edge.tensor_info:
-                        self._tensor_manager.increment_ref(self._request_id, info.uuid)
+                        self._tensor_manager.increment_ref(info.uuid)
 
 
     def __post_init__(self):
@@ -628,16 +642,20 @@ class Loop(GraphSection):
 
     def _uncache_outputs(self):
         if self._tensor_manager is not None and self._request_id is not None:
-            for tensor_infos in self._cached_outputs.values():
-                for info in tensor_infos:
-                    self._tensor_manager.dereference(self._request_id, info.uuid)
+            self._tensor_manager.dereference_batch_uniform([
+                info.uuid
+                for tensor_infos in self._cached_outputs.values()
+                for info in tensor_infos
+            ])
         self._cached_outputs.clear()
 
     def _uncache_accumulated_outputs(self):
         if self._tensor_manager is not None and self._request_id is not None:
-            for tensor_infos in self._accumulated_cache.values():
-                for info in tensor_infos:
-                    self._tensor_manager.dereference(self._request_id, info.uuid)
+            self._tensor_manager.dereference_batch_uniform([
+                info.uuid
+                for tensor_infos in self._accumulated_cache.values()
+                for info in tensor_infos
+            ])
         self._accumulated_cache.clear()
 
     def reset_for_outer_iter(self):
@@ -723,6 +741,27 @@ class LoopStateRegistry(GraphStateRegistry):
     def register_ingested_input(self, graph_edge: GraphEdge):
         self.loop.ingest_external_input(graph_edge)
 
+    def reset_for_iter(self):
+        super().reset_for_iter()
+        self._reseed_streaming_ready()
+
+    def clear(self):
+        super().clear()
+        self._reseed_streaming_ready()
+
+    def _reseed_streaming_ready(self):
+        """The member nodes' inputs were just cleared, so their streaming
+        readiness goes back to its seed. Without this a node whose inputs are
+        ALL streaming leaves the set when it first fills and nothing puts it
+        back -- no non-streaming input will ever arrive to -- so every chunk
+        after the first iteration's is refused."""
+        root = self.loop._managing_registry
+        while isinstance(root, LoopStateRegistry):
+            root = root.loop._managing_registry
+        for name, entity in self.managed_entities.items():
+            if isinstance(entity, GraphNode):
+                root.reseed_streaming_ready(name)
+
 
 class WorkerGraphStateRegistry(GraphStateRegistry):
     def __init__(self, graph_section: GraphSection):
@@ -773,7 +812,19 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         entity = self.managed_entities.get(entity_name)
         if isinstance(entity, GraphNode):
             entity.ready_signals.clear()
+            # The registry's set has to follow the node-level clear down.
+            # Left alone, the name lingers after its inputs are gone and the
+            # node reads as streaming-ready with nothing ingested.
+            self.reseed_streaming_ready(entity_name)
         return output
+
+    def reseed_streaming_ready(self, node_name: str):
+        """Back to the seeded membership for a node whose inputs were just
+        cleared: in the set only if its inputs are ALL streaming."""
+        if node_name in self.only_streaming_inputs:
+            self.ready_for_streaming.add(node_name)
+        else:
+            self.ready_for_streaming.discard(node_name)
 
     def reset_for_iter(self):
         super().reset_for_iter()
@@ -793,4 +844,7 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
         self.ready_names.clear()
         self.ready_for_streaming = set(self.only_streaming_inputs)
         self.ready_next_iter.clear()
-        self.ready_for_streaming = set(self.only_streaming_inputs)
+        # The NEXT-iter set, not `ready_for_streaming` a second time: the
+        # duplicate assignment left ready_streaming_next_iter holding names
+        # from before the clear.
+        self.ready_streaming_next_iter = set(self.only_streaming_inputs)

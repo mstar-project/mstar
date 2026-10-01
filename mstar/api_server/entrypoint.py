@@ -17,12 +17,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import msgpack
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from mstar.api_server import media_io
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
@@ -75,6 +77,13 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    # A server started as a background job of a non-interactive shell inherits
+    # SIGINT ignored, and Python keeps an inherited ignore, so the graceful stop
+    # below (and _shutdown_conductor_process's) would be a no-op. Make it real.
+    # default_int_handler rather than SIG_DFL because it raises
+    # KeyboardInterrupt, which unwinds conductor.run() into the finally that
+    # shuts the conductor down, where SIG_DFL would kill the process on the spot.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     # Started before the model load so an API server that dies during it is
     # still caught. SIGINT is the conductor's graceful stop (run() unwinds into
     # shutdown(), terminating the workers), matching _shutdown_conductor_process.
@@ -184,6 +193,7 @@ class APIServer:
         model_name: str = "dummy",
         log_stats: bool = False,
         log_stats_file: str | None = None,
+        model_config: dict | None = None,
     ):
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -204,6 +214,7 @@ class APIServer:
 
         self.preprocess_worker = PreprocessWorker(
             model=model,
+            model_config=model_config,
             hostname=hostname,
             socket_path_prefix=socket_path_prefix,
             tensor_comm_protocol=tensor_comm_protocol,
@@ -765,6 +776,138 @@ class APIServer:
         if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
             self._msg_thread.join(timeout=2)
 
+
+def _resolve_warmup_path(path: str) -> str:
+    """A warmup file is a local path, or ``hf://<owner>/<repo>/<path>`` for a
+    file shipped with a model (its example inputs), taken from the HF cache."""
+    if not path.startswith("hf://"):
+        return path
+    parts = path[len("hf://"):].split("/", 2)
+    if len(parts) != 3:
+        raise ValueError(f"hf:// path needs <owner>/<repo>/<path>, got {path!r}")
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=f"{parts[0]}/{parts[1]}", filename=parts[2])
+
+
+@dataclass
+class WarmupMedia:
+    """One media input of a warmup request: a local or ``hf://`` path and its
+    modality (from the extension unless the yaml names it)."""
+
+    path: str
+    modality: str
+
+    @classmethod
+    def from_config(cls, entry: Any) -> "WarmupMedia":
+        if isinstance(entry, str):
+            entry = {"path": entry}
+        if not isinstance(entry, dict) or not entry.get("path"):
+            raise ValueError(f"a warmup file is a path or a mapping with 'path', got {entry!r}")
+        path = str(entry["path"])
+        modality = entry.get("modality") or _detect_modality(path)
+        if modality not in SUPPORTED_MODALITIES:
+            raise ValueError(
+                f"cannot determine modality for warmup file {path!r}; set 'modality'"
+            )
+        return cls(path=path, modality=modality)
+
+
+@dataclass
+class WarmupRequest:
+    """One entry of the deployment's ``warmup_requests``: a ``/generate``
+    request in yaml form. ``files`` are the media inputs in prompt order
+    (any modality, any number), followed by ``text`` as on ``/generate``."""
+
+    text: str | None = None
+    files: list[WarmupMedia] = field(default_factory=list)
+    output_modalities: list[str] = field(default_factory=lambda: ["text"])
+    model_kwargs: dict | None = None
+
+    @classmethod
+    def from_config(cls, spec: Any) -> "WarmupRequest":
+        if not isinstance(spec, dict):
+            raise ValueError("not a mapping")
+        unknown = set(spec) - {"text", "files", "output_modalities", "model_kwargs"}
+        if unknown:
+            raise ValueError(f"unknown key(s) {sorted(unknown)}")
+        out_mods = spec.get("output_modalities") or ["text"]
+        if isinstance(out_mods, str):
+            out_mods = [m.strip() for m in out_mods.split(",") if m.strip()]
+        files = spec.get("files") or []
+        if not isinstance(files, list):
+            files = [files]
+        model_kwargs = spec.get("model_kwargs") or None
+        if model_kwargs is not None and not isinstance(model_kwargs, dict):
+            raise ValueError("model_kwargs must be a mapping")
+        return cls(
+            text=spec.get("text") or None,
+            files=[WarmupMedia.from_config(f) for f in files],
+            output_modalities=list(out_mods),
+            model_kwargs=model_kwargs,
+        )
+
+    def submit(self, server: APIServer, request_id: str) -> str:
+        """Submit to ``server`` the way ``/generate`` would, ``hf://`` files
+        resolved from the cache."""
+        file_paths: dict[str, list[str]] = {}
+        parts: list[PromptPart] = []
+        for media in self.files:
+            paths = file_paths.setdefault(media.modality, [])
+            parts.append(PromptPart(modality=media.modality, index=len(paths)))
+            paths.append(_resolve_warmup_path(media.path))
+        if self.text:
+            parts.append(PromptPart(modality="text", text=self.text))
+        return server.submit_request(
+            text=self.text,
+            file_paths=file_paths or None,
+            input_modalities=[p.modality for p in parts],
+            output_modalities=self.output_modalities,
+            model_kwargs=self.model_kwargs,
+            prompt_parts=parts or None,
+            streaming=False,
+            request_id=request_id,
+        )
+
+
+def _run_warmup_requests(server: APIServer, specs: list) -> None:
+    """Run the deployment's ``warmup_requests`` once the workers are ready and
+    before the server binds, so the first client does not pay what a first
+    request of a shape costs (torch.compile of a denoise step, a cold
+    inductor cache). Each spec is parsed into a :class:`WarmupRequest`. A
+    warmup that is malformed or fails is logged and skipped; it must not keep
+    the server from coming up.
+    """
+    if not isinstance(specs, list):
+        logger.warning("warmup_requests must be a list; ignoring %r", type(specs).__name__)
+        return
+
+    async def _one(request: WarmupRequest, request_id: str) -> None:
+        await server.collect_results(request.submit(server, request_id))
+
+    for index, spec in enumerate(specs):
+        try:
+            request = WarmupRequest.from_config(spec)
+        except ValueError as exc:
+            logger.warning("warmup_requests[%d] skipped: %s", index, exc)
+            continue
+        t0 = time.perf_counter()
+        try:
+            asyncio.run(_one(request, f"warmup-{index}"))
+        except Exception as exc:  # noqa: BLE001 — a cold server is better than none
+            logger.warning(
+                "warmup request %d/%d failed after %.1f s: %s",
+                index + 1, len(specs), time.perf_counter() - t0,
+                getattr(exc, "detail", exc),
+            )
+            continue
+        logger.info(
+            "warmup request %d/%d (%s) done in %.1f s",
+            index + 1, len(specs), ",".join(request.output_modalities),
+            time.perf_counter() - t0,
+        )
+
+
 # ------------------------------------------------------------------
 # FastAPI application
 # ------------------------------------------------------------------
@@ -794,6 +937,220 @@ api_server: APIServer | None = None
 from mstar.api_server.openai.router import router as openai_router  # noqa: E402
 
 app.include_router(openai_router)
+
+
+def _decode_ws_files(
+    files: list | None, upload_dir: Path,
+) -> tuple[dict[str, list[str]], list[PromptPart]]:
+    """Persist a websocket message's media (``{"name", "data"}`` entries;
+    ``data`` raw bytes in a msgpack frame, base64 text in a JSON frame) under
+    the upload dir, grouped by the modality of each file name, the way the
+    multipart ``/generate`` route does. A message rejected halfway leaves no
+    files behind."""
+    if files is not None and not isinstance(files, list):
+        raise ValueError("files must be a list of {name, data} objects")
+    file_paths: dict[str, list[str]] = {}
+    parts: list[PromptPart] = []
+    saved: list[Path] = []
+    try:
+        for entry in files or []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                raise ValueError("each file needs a string name")
+            name = entry["name"]
+            modality = _detect_modality(name)
+            if modality == "unknown":
+                raise ValueError(f"Cannot determine modality for file: {name}")
+            data = entry.get("data")
+            if isinstance(data, str):
+                # the decoder the data-URL paths use: unpadded or wrapped
+                # base64 is fine, a bad alphabet is the client's error
+                data = media_io._decode_base64_payload(data)
+            if not isinstance(data, (bytes, bytearray)):
+                raise ValueError(f"file {name!r} carries no data")
+            base = os.path.basename(name) or "upload"
+            save_path = upload_dir / f"{uuid.uuid4()}_{base}"
+            save_path.write_bytes(bytes(data))
+            saved.append(save_path)
+            paths = file_paths.setdefault(modality, [])
+            parts.append(PromptPart(modality=modality, index=len(paths)))
+            paths.append(str(save_path))
+    except Exception:
+        for path in saved:
+            path.unlink(missing_ok=True)
+        raise
+    return file_paths, parts
+
+
+def _ws_modalities(value, key: str) -> list[str] | None:
+    """A modality list as a message may spell it: a comma-separated string or
+    a list of strings. Anything else is rejected by name."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [m.strip() for m in value.split(",") if m.strip()]
+    if isinstance(value, list) and all(isinstance(m, str) for m in value):
+        return list(value)
+    raise ValueError(f"{key} must be a comma-separated string or a list of strings")
+
+
+def _schedule_upload_cleanup(file_paths: dict[str, list[str]], delay_s: float = 60.0) -> None:
+    """Delete a request's uploaded files once the preprocess worker has had
+    time to read them. Shared by the HTTP and WebSocket routes."""
+    def _cleanup(paths: dict[str, list[str]]) -> None:
+        time.sleep(delay_s)
+        for ps in paths.values():
+            for p in ps:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except OSError:
+                    pass
+    threading.Thread(target=_cleanup, args=(file_paths,), daemon=True).start()
+
+
+def _ws_input_layout(
+    text: str | None, input_modalities: list[str] | None, parts: list[PromptPart],
+) -> tuple[list[str], list[PromptPart]]:
+    """Resolve a websocket message's input layout the way ``/generate`` does:
+    an explicit list is the layout (a text prompt keeps its slot), else the
+    order the files and text arrived in."""
+    if text:
+        parts = [*parts, PromptPart(modality="text", text=text)]
+    if input_modalities is not None:
+        in_mods = list(input_modalities)
+        if text and "text" not in in_mods:
+            in_mods.append("text")
+        if not text:
+            in_mods = [m for m in in_mods if m != "text"]
+        return in_mods, []
+    return [p.modality for p in parts], parts
+
+
+@app.websocket("/generate/ws")
+async def generate_ws(websocket: WebSocket):
+    """``/generate`` over one persistent WebSocket, for control loops.
+
+    Each incoming message is one request with the ``/generate`` fields —
+    ``text``, ``files`` (``[{"name", "data"}]``), ``input_modalities``,
+    ``output_modalities``, ``model_kwargs``, ``request_id`` — either a JSON
+    text frame (``data`` base64) or a msgpack binary frame (``data`` raw
+    bytes). Every result chunk comes back as a frame of the same encoding,
+    ``{"request_id", "modality", "data", "metadata"}``, followed by
+    ``{"request_id", "finish": true}``. A rejected message answers
+    ``{"request_id", "error": ...}``, and so does a request that fails after
+    it was accepted (with the HTTP ``status`` it would have had); no finish
+    follows an error. Messages may be pipelined: a client can
+    send the next observation before the previous action chunk has returned,
+    and the ``request_id`` tells the replies apart. Closing the socket aborts
+    whatever is still in flight.
+    """
+    if api_server is None:
+        await websocket.close(code=1013, reason="Server not ready")
+        return
+    await websocket.accept()
+    tasks: set[asyncio.Task] = set()
+    # Pipelined requests reply from separate tasks; one frame at a time.
+    send_lock = asyncio.Lock()
+
+    async def send(payload: dict, binary: bool) -> None:
+        async with send_lock:
+            if binary:
+                await websocket.send_bytes(msgpack.packb(payload, use_bin_type=True))
+            else:
+                if isinstance(payload.get("data"), (bytes, bytearray)):
+                    payload = {**payload, "data": base64.b64encode(payload["data"]).decode("ascii")}
+                await websocket.send_text(json.dumps(payload))
+
+    async def serve_one(message: dict, binary: bool) -> None:
+        request_id = message.get("request_id")
+        file_paths: dict[str, list[str]] | None = None
+        try:
+            if request_id is not None and not isinstance(request_id, str):
+                raise ValueError("request_id must be a string")
+            out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or ["text"]
+            text = message.get("text")
+            if text is not None and not isinstance(text, str):
+                raise ValueError("text must be a string")
+            if not text and not message.get("files"):
+                raise ValueError("message carries neither text nor files")
+            file_paths, parts = await run_in_threadpool(
+                _decode_ws_files, message.get("files"), api_server.upload_dir,
+            )
+            in_mods, parts = _ws_input_layout(
+                text, _ws_modalities(message.get("input_modalities"), "input_modalities"), parts,
+            )
+            model_kwargs = message.get("model_kwargs")
+            if isinstance(model_kwargs, str):
+                model_kwargs = json.loads(model_kwargs)
+            if model_kwargs is not None and not isinstance(model_kwargs, dict):
+                raise ValueError("model_kwargs must be a JSON object")
+            request_id = api_server.submit_request(
+                text=text,
+                file_paths=file_paths or None,
+                input_modalities=in_mods,
+                output_modalities=out_mods,
+                model_kwargs=model_kwargs,
+                prompt_parts=parts or None,
+                streaming=True,
+                request_id=request_id,
+            )
+            # Cancelling this task (socket closed mid-stream) tears the
+            # iterator down, and its ``finally`` aborts the engine request.
+            failed = False
+            async for chunk in api_server.iter_result_chunks(request_id):
+                if chunk.modality == "error":
+                    # The request failed after it was accepted. This is the
+                    # iterator's last chunk, so the loop ends here; the error
+                    # is the reply and no finish follows.
+                    failed = True
+                    await send({
+                        "request_id": request_id,
+                        "error": bytes(chunk.data).decode("utf-8", "replace"),
+                        "status": chunk.metadata.get("status", 500),
+                    }, binary)
+                    continue
+                await send({
+                    "request_id": request_id, "modality": chunk.modality,
+                    "data": bytes(chunk.data), "metadata": chunk.metadata,
+                }, binary)
+            if not failed:
+                await send({"request_id": request_id, "finish": True}, binary)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            raise
+        except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
+            logger.exception("generate/ws request failed")
+            try:
+                await send({"request_id": request_id, "error": str(exc)}, binary)
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            if file_paths:
+                _schedule_upload_cleanup(file_paths)
+
+    try:
+        while True:
+            frame = await websocket.receive()
+            if frame.get("type") == "websocket.disconnect":
+                break
+            binary = frame.get("bytes") is not None
+            try:
+                if binary:
+                    message = msgpack.unpackb(frame["bytes"], raw=False)
+                else:
+                    message = json.loads(frame.get("text") or "")
+            except Exception as exc:  # noqa: BLE001 — a bad frame is reported, not fatal
+                await send({"request_id": None, "error": f"undecodable frame: {exc}"}, binary)
+                continue
+            if not isinstance(message, dict):
+                await send({"request_id": None, "error": "message must be an object"}, binary)
+                continue
+            task = asyncio.create_task(serve_one(message, binary))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        for task in list(tasks):
+            task.cancel()
 
 
 @app.post("/generate")
@@ -923,17 +1280,7 @@ async def generate(
     finally:
         # Deferred cleanup of uploaded files
         if file_paths:
-            def _cleanup(paths: dict[str, list[str]]) -> None:
-                time.sleep(60)
-                for ps in paths.values():
-                    for p in ps:
-                        try:
-                            Path(p).unlink(missing_ok=True)
-                        except OSError:
-                            pass
-            threading.Thread(
-                target=_cleanup, args=(file_paths,), daemon=True
-            ).start()
+            _schedule_upload_cleanup(file_paths)
 
 
 @app.get("/health")
@@ -1055,6 +1402,7 @@ def main(argv: list[str] | None = None):
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
         model_name=model_name,
+        model_config=config,
         tcp_transfer_device=args.tcp_transfer_device,
         log_stats=log_stats,
         log_stats_file=args.log_stats_file,
@@ -1087,6 +1435,12 @@ def main(argv: list[str] | None = None):
         # Block until all workers have finished setup, so the server only binds
         # (and logs "Starting…") once it can actually serve requests.
         api_server.finalize_setup()
+        # The deployment's warmup requests run here, before the bind: a
+        # client never sees the first request of a shape.
+        warmups = config.get("warmup_requests") or []
+        if warmups:
+            logger.info("Running %d warmup request(s) before binding", len(warmups))
+            _run_warmup_requests(api_server, warmups)
         if args.rust_frontend:
             import tempfile
 
