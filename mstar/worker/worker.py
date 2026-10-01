@@ -472,6 +472,11 @@ class Worker:
                     if hasattr(section, 'input_names') and conn.edge_name in section.input_names:
                         self._consumer_node_cache[conn.edge_name] = section.name
 
+        # edge_name -> partition the stream feeds
+        self._stream_partition: dict[str, str] = {
+            conn.edge_name: conn.to_partition for conn in self._my_consumer_connections
+        }
+
     def _get_node_names_for_partition(self, partition_name: str, model: Model) -> list[str]:
         """Get the node names that belong to a partition."""
         walks = model.get_graph_walk_graphs()
@@ -967,6 +972,9 @@ class Worker:
         sbuf = req_info.stream_buffers.get(edge.name)
         if sbuf is not None:
             sbuf.store_uningested_edge(edge)
+        # The step that took the final chunk will not run; the stream is live again.
+        if edge._final_stream_chunk:
+            req_info.ended_streams.discard(edge.name)
 
     def _poll_stream_buffers(self) -> None:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
@@ -1093,14 +1101,14 @@ class Worker:
         batch_partition = self.request_state.get_partition_for_node(batch.node_name)
 
         # One walk of the columns for both: each rid's inputs as tensors, and
-        # the rids whose edge carried a stream's final chunk. Only this side can
+        # per rid, the edges that carried a stream's final chunk. Only this side can
         # turn a uuid back into a tensor, which is why the runtime reports uuids
         # and the resolution happens here.
         #
         # Seeded with the batch's rids rather than just the ones that have
         # edges: a rid with nothing ready still needs an entry, because
         # per_request_info is keyed off these and the engine indexes it by rid.
-        per_request_inputs, final_stream_rids = (
+        per_request_inputs, final_edges = (
             batch.input_edges.to_input_tensors(
                 self.tensor_manager.get_tensor, batch.request_to_worker_graph,
             )
@@ -1116,8 +1124,42 @@ class Worker:
             request_ids=list(batch.request_to_worker_graph),
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
-            final_stream_rids=final_stream_rids,
+            final_edges=final_edges,
         )
+
+    def _settle_final_streams(
+        self, node_name: str, final_edges: dict[int, set[str]],
+    ) -> tuple[set[int], set[int]]:
+        """Record the streams whose final chunk this step consumes, per rid.
+
+        Returns two sets, ``(node_done, partition_done)``: the rids whose
+        streams into ``node_name`` have all ended once this step runs, and
+        the rids whose streams into the partition have. The second is a
+        subset of the first. Streams end in any order and over several
+        steps, so one final chunk alone means only that its own stream ended. A
+        ``continue_after_producer_done`` stream never sends a final chunk;
+        it holds neither back.
+        """
+        node_done: set[int] = set()
+        partition_done: set[int] = set()
+        for rid, edges in final_edges.items():
+            req_info = self.request_state.per_request_info.get(rid)
+            if req_info is None:
+                node_done.add(rid)
+                partition_done.add(rid)
+                continue
+            req_info.ended_streams |= edges
+            partition = self._stream_partition.get(next(iter(edges)))
+            live = [
+                edge_name for edge_name, sbuf in req_info.stream_buffers.items()
+                if edge_name not in req_info.ended_streams
+                and not sbuf.policy.continue_after_producer_done()
+            ]
+            if all(self._consumer_node_cache.get(e) != node_name for e in live):
+                node_done.add(rid)
+            if all(self._stream_partition.get(e) != partition for e in live):
+                partition_done.add(rid)
+        return node_done, partition_done
 
     def _make_executing_batch(
         self,
@@ -1126,18 +1168,23 @@ class Worker:
         request_ids: list[int],
         per_request_input_tensors: dict[int, NameToTensorList],
         per_request_info: dict[int, CurrentForwardPassInfo],
-        final_stream_rids: set[int] | None = None,
+        final_edges: dict[int, set[str]] | None = None,
     ) -> ExecutingBatch:
         """One step's batch, with the step context the engine drives it through.
 
-        The context starts unleased and eager; a slot is reserved later, once
-        the real token count is known.
+        ``final_edges`` maps a rid to the streams whose final chunk the step
+        consumes. The context starts unleased and eager; a slot is reserved
+        later, once the real token count is known.
         """
+        final_stream_rids, stream_partition_done_rids = self._settle_final_streams(
+            node_name, final_edges or {},
+        )
         return ExecutingBatch(
             node_name=node_name,
             per_request_info=per_request_info,
             per_request_input_tensors=per_request_input_tensors,
-            final_stream_rids=final_stream_rids or set(),
+            final_stream_rids=final_stream_rids,
+            stream_partition_done_rids=stream_partition_done_rids,
             step_context=StepContext(
                 request_ids=tuple(request_ids),
                 graph_walk=graph_walk,
@@ -1693,8 +1740,9 @@ class Worker:
                 rid: self.request_state.get_fwd_info(rid, pending.partition)
                 for rid in request_ids
             },
-            final_stream_rids={
-                rid for rid, edges in consumed_streaming_edges.items()
+            final_edges={
+                rid: {e.name for e in edges if e._final_stream_chunk}
+                for rid, edges in consumed_streaming_edges.items()
                 if any(e._final_stream_chunk for e in edges)
             },
         )
@@ -1904,6 +1952,9 @@ class Worker:
                 speculation.node_batch.per_request_input_tensors.pop(r, None)
                 speculation.node_batch.per_request_info.pop(r, None)
                 speculation.scheduled_batch.request_to_worker_graph.pop(r, None)
+                # Its final chunks go back below; it must not flush or report done.
+                speculation.node_batch.final_stream_rids.discard(r)
+                speculation.node_batch.stream_partition_done_rids.discard(r)
                 for edge in speculation.consumed_streaming_edges.get(r, []):
                     self._return_streaming_edge(r, edge)
                 speculation.consumed_streaming_edges.pop(r, None)
@@ -2381,7 +2432,7 @@ class Worker:
 
         # The consuming pass (not the earlier ingest) reports the partition
         # done, so it rides this pass's WGD with the final output loop index.
-        for rid in batch_N.node_batch.final_stream_rids:
+        for rid in batch_N.node_batch.stream_partition_done_rids:
             self._graph_runtime.mark_stream_partition_done(rid, batch_N.partition)
 
         # set this before send_outputs so that we can send updated profiling info to the conductor

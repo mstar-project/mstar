@@ -34,6 +34,8 @@ def _speculation(rids: list[str]) -> Speculation:
             request_ids=list(rids),
             per_request_input_tensors={r: {} for r in rids},
             per_request_info={r: object() for r in rids},
+            final_stream_rids=set(rids),
+            stream_partition_done_rids=set(rids),
         ),
         consumed_edges={("tok", NODE)},
         continuing_rids=set(rids),
