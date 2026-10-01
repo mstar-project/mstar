@@ -86,6 +86,7 @@ from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
+    chat_turns,
     check_attachments,
     check_plan,
     find_media_spans,
@@ -505,9 +506,10 @@ class BagelModel(Model):
     # embeddings, so only the pad interior is dropped from the text spans.
     IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
 
-    # VLM_UNDERSTANDING_SUFFIX minus the text it used to interpolate, which is
-    # now written at its own place in the prompt.
-    UNDERSTANDING_TAIL = "<|im_end|>\n<|im_start|>assistant\n"
+    # One understanding turn, its attachments inside it: the system prompt's
+    # comes first, and the reply opens after the last.
+    VLM_TURN = "<|im_start|>{role}\n{content}<|im_end|>\n"
+    VLM_REPLY = "<|im_start|>assistant\n"
 
     def _placeholder_specs(self) -> dict[str, tuple[int, int, int]]:
         """``(start, pad, end)`` sentinel ids, read off the tokenizer.
@@ -528,15 +530,38 @@ class BagelModel(Model):
     ) -> str:
         """Write the request out in order, attachments as placeholders.
 
-        Understanding opens the user turn before the attachments and closes it
-        after the last; a text run following an attachment carries the newline
-        the old suffix supplied, so every layout that template could express
-        renders to the same string. Generation leaves attachments outside the
-        turn — the prefill_vae/vit walks put the input image ahead of the
-        prompt — and wraps what follows.
+        Understanding writes each turn in its own role block. A text run
+        following an attachment carries the newline the old suffix supplied,
+        and a turn ending on one closes after a newline too, so every layout a
+        single user turn could express renders to the string that template
+        gave. Generation leaves attachments outside the turn — the
+        prefill_vae/vit walks put the input image ahead of the prompt — and
+        wraps what follows.
         """
-        # Understanding's old suffix supplied this newline; generation's did not.
-        sep = "\n" if is_understanding else ""
+        if is_understanding:
+            blocks = [self.VLM_TURN.format(role="system", content=system_prompt)]
+            for turn in chat_turns(parts):
+                body, after_attachment = self._render_body(turn.parts, sep="\n")
+                if after_attachment:
+                    body.append("\n")
+                blocks.append(self.VLM_TURN.format(role=turn.role, content="".join(body)))
+            return "".join(blocks) + self.VLM_REPLY
+
+        # Generation: attachments written before any text stay outside the turn.
+        body, _ = self._render_body(parts, sep="")
+        lead = 0
+        while lead < len(body) and body[lead] == self.IMAGE_PLACEHOLDER:
+            lead += 1
+        return "".join(body[:lead]) + self.GEN_TEMPLATE.format(
+            prompt="".join(body[lead:])
+        )
+
+    def _render_body(self, parts: list[PromptPart], sep: str) -> tuple[list[str], bool]:
+        """Write ``parts`` out in order, and say whether the last is an attachment.
+
+        ``sep`` opens a text run that follows an attachment: understanding's old
+        suffix supplied that newline, generation's did not.
+        """
         body: list[str] = []
         after_attachment = False
         for part in parts:
@@ -547,19 +572,7 @@ class BagelModel(Model):
                 continue
             body.append(self.IMAGE_PLACEHOLDER)
             after_attachment = True
-
-        if is_understanding:
-            head = self.VLM_UNDERSTANDING_PREFIX.format(system_prompt=system_prompt)
-            tail = "\n" + self.UNDERSTANDING_TAIL if after_attachment else self.UNDERSTANDING_TAIL
-            return head + "".join(body) + tail
-
-        # Generation: attachments written before any text stay outside the turn.
-        lead = 0
-        while lead < len(body) and body[lead] == self.IMAGE_PLACEHOLDER:
-            lead += 1
-        return "".join(body[:lead]) + self.GEN_TEMPLATE.format(
-            prompt="".join(body[lead:])
-        )
+        return body, after_attachment
 
     def _encode_text(self, text: str) -> torch.Tensor:
         """Tokenize a text segment, falling back to raw bytes when no tokenizer
@@ -600,11 +613,11 @@ class BagelModel(Model):
             think_mode = kwargs.get("think_mode", self.config.think_mode)
             system_prompt = self.BAGEL_DEFAULT_SYSTEM_PROMPT
 
-            parts = parts_from_modalities(
-                input_modalities,
-                [p.text or "" for p in prompt_parts if p.modality == TEXT]
-                if prompt_parts is not None else prompt,
-            )
+            texts, roles = prompt, None
+            if prompt_parts is not None:
+                texts = [p.text or "" for p in prompt_parts if p.modality == TEXT]
+                roles = [p.role for p in prompt_parts]
+            parts = parts_from_modalities(input_modalities, texts, roles)
             unsupported = {p.modality for p in parts} - {TEXT, "image"}
             if unsupported:
                 raise ValueError(
@@ -616,6 +629,11 @@ class BagelModel(Model):
                     parts, {"image": len(tensors.get("image_inputs", []))},
                 )
 
+            body = parts
+            if is_understanding and len(parts) > 1 and parts[0].role == "system":
+                # a leading system message takes the default's place; a lone
+                # one stays the turn it was, not an empty one after the default
+                system_prompt, body = parts[0].text, parts[1:]
             if think_mode and is_understanding:
                 system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
 
@@ -623,12 +641,17 @@ class BagelModel(Model):
                 # No attachment: one span, one walk, nothing to scan.
                 segments = [self._encode_text(
                     self.VLM_UNDERSTANDING_TEMPLATE.format(
-                        system_prompt=system_prompt, prompt=prompt
+                        system_prompt=system_prompt,
+                        # one bare block per turn, joined on the template's own seam; a
+                        # legacy layout can lack a text slot, so its prompt goes as sent
+                        prompt=prompt if prompt_parts is None else "<|im_end|><|im_start|>".join(
+                            "".join(p.text or "" for p in turn.parts) for turn in chat_turns(body)
+                        ),
                     )
                 )]
             else:
                 text = self._render_prompt(
-                    parts,
+                    body,
                     is_understanding=is_understanding,
                     system_prompt=system_prompt,
                 )
@@ -710,7 +733,11 @@ class BagelModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            detok = self.tokenizer.decode(output)
+            # the end token closes the turn, not the reply: a client sends the
+            # reply back as an assistant message, whose template writes it again
+            detok = self.tokenizer.decode(
+                [i for i in output.reshape(-1).tolist() if i != self.eos_token_id]
+            )
             logger.debug("OUTPUT TEXT %s", detok)
             return detok.encode("utf-8")
         if modality == "image":

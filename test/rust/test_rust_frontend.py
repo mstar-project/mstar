@@ -48,13 +48,14 @@ class _StubAPIServer:
 
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
-                       model_kwargs=None, streaming=True, request_id=None):
+                       model_kwargs=None, prompt_parts=None, streaming=True,
+                       request_id=None):
         if text and "boom" in text:
             raise ValueError("scripted ingest failure")
         self.submitted.append({
             "rid": request_id, "text": text,
             "in": input_modalities, "out": output_modalities,
-            "mk": model_kwargs, "files": file_paths,
+            "mk": model_kwargs, "files": file_paths, "parts": prompt_parts,
             "streaming": streaming,
         })
         return request_id
@@ -125,6 +126,37 @@ def test_chat_roundtrip(stack):
     (sub,) = stub.submitted
     assert "Say hello." in sub["text"]
     assert sub["out"] == ["text"]
+
+
+def test_a_chats_roles_reach_the_bridge(stack):
+    """The chat renders as its own turns, as it does on the default server."""
+    port, stub, _bridge, _proc = stack
+    _post_json(port, "/v1/chat/completions", {"model": "qwen3_omni", "messages": [
+        {"role": "user", "content": "Name a color."},
+        {"role": "assistant", "content": "Blue."},
+        {"role": "user", "content": "Another."},
+    ]})
+    (sub,) = stub.submitted
+    assert [(p.role, p.text) for p in sub["parts"] or []] == [
+        ("user", "Name a color."), ("assistant", "Blue."), ("user", "Another."),
+    ], "the Rust frontend joined the chat into one user turn"
+
+
+def test_a_single_user_message_arrives_as_one_user_part(stack):
+    port, stub, _bridge, _proc = stack
+    _chat(port, "Say hello.")
+    (sub,) = stub.submitted
+    assert [(p.modality, p.role, p.text) for p in sub["parts"] or []] == [
+        ("text", "user", "Say hello."),
+    ], "a one-message chat did not arrive as the one user turn it renders as"
+
+
+def test_generate_arrives_without_parts(stack):
+    """``/generate`` has no messages, so the model takes its legacy layout."""
+    port, stub, _bridge, _proc = stack
+    _generate(port, urlencoded=True)
+    (sub,) = stub.submitted
+    assert sub["parts"] is None, "a /generate submit carried chat parts"
 
 
 def _post_raw(port, path, raw_bytes, timeout=15):

@@ -107,6 +107,7 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
         run: cargo test --release --no-default-features
+      - run: cargo test --release --manifest-path rust/server/Cargo.toml
       - name: Build the Rust frontend (mstar-server)
         working-directory: rust/server
         run: cargo build --release

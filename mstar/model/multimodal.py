@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -31,12 +32,15 @@ class PromptPart:
     """One element of a prompt, in request order.
 
     ``index`` is the position within its own modality's list, so a media part
-    addresses ``tensors[f"{modality}_inputs"][index]``.
+    addresses ``tensors[f"{modality}_inputs"][index]``. ``role`` is the chat
+    role of the message the part came from, ``None`` from entrypoints with no
+    messages.
     """
 
     modality: str
     text: str | None = None
     index: int = 0
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,28 +58,78 @@ class MediaSpan:
 
 
 def parts_from_modalities(
-    input_modalities: list[str], texts: Iterable[str] | str | None = None
+    input_modalities: list[str],
+    texts: Iterable[str] | str | None = None,
+    roles: Iterable[str | None] | None = None,
 ) -> list[PromptPart]:
     """Rebuild the parts for a layout, filling the text slots from ``texts``.
 
     ``input_modalities`` is one entry per part, in order, and is the layout
     every consumer plans from. Rebuilding from it beats carrying a second copy
     of the ordering that could drift. Unfilled text slots carry ``None``, which
-    is enough to plan with.
+    is enough to plan with. ``roles`` is one per part, in the same order.
     """
     if isinstance(texts, str):
         texts = [texts]
     remaining = iter(texts or ())
+    part_roles = iter(roles or ())
     parts: list[PromptPart] = []
     seen: dict[str, int] = {}
     for modality in input_modalities:
+        role = next(part_roles, None)
         if modality == TEXT:
-            parts.append(PromptPart(modality=TEXT, text=next(remaining, None)))
+            parts.append(PromptPart(modality=TEXT, text=next(remaining, None), role=role))
         else:
             index = seen.get(modality, 0)
-            parts.append(PromptPart(modality=modality, index=index))
+            parts.append(PromptPart(modality=modality, index=index, role=role))
             seen[modality] = index + 1
     return parts
+
+
+class Turn(NamedTuple):
+    """The parts of consecutive messages of one role."""
+
+    role: str
+    parts: list[PromptPart]
+
+
+def chat_turns(parts: list[PromptPart]) -> list[Turn]:
+    """Group ``parts`` into turns, starting a new one at every role change.
+
+    A part with no role is the user's, so a request from an entrypoint with no
+    messages renders as the one user turn it always did.
+    """
+    turns: list[Turn] = []
+    for part in parts:
+        role = part.role or "user"
+        if not turns or turns[-1].role != role:
+            turns.append(Turn(role, []))
+        turns[-1].parts.append(part)
+    return turns
+
+
+def messages_from_parts(
+    parts: list[PromptPart], default_system: str | None = None,
+) -> list[dict]:
+    """One OpenAI-style message per turn of ``parts``, for a chat template to take as is.
+
+    An attachment is an empty ``{"type": modality, modality: ""}`` item: the
+    template writes its placeholder there, in the turn it belongs to, and the
+    tokenized prompt is scanned for it. ``default_system`` leads only when no
+    part is a system message's, wherever that message sits: a template writes
+    every system message it is given, so both would reach the model.
+    """
+    messages = [
+        {"role": turn.role, "content": [
+            {"type": TEXT, "text": part.text or ""} if part.modality == TEXT
+            else {"type": part.modality, part.modality: ""}
+            for part in turn.parts
+        ]}
+        for turn in chat_turns(parts)
+    ]
+    if default_system is not None and not any(m["role"] == "system" for m in messages):
+        messages.insert(0, {"role": "system", "content": default_system})
+    return messages
 
 
 def prefill_plan(

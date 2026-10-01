@@ -407,6 +407,7 @@ def _submit(server: APIServer, args: SubmitArgs, prefix: str) -> str:
         input_modalities=args.input_modalities,
         output_modalities=args.output_modalities,
         model_kwargs=args.model_kwargs,
+        prompt_parts=args.prompt_parts,
         streaming=True,
         request_id=rid,
     )
@@ -475,11 +476,6 @@ async def _stream_chunks(server: APIServer, rid: str, context):
 # ----------------------------------------------------------------------
 # realtime
 # ----------------------------------------------------------------------
-
-# Template end-of-turn tokens stripped from transcript deltas (they close the
-# model's chat turn; they are not speech transcript).
-_TEMPLATE_END_TOKENS = ("<|im_end|>",)
-
 
 def _event_id() -> str:
     return f"event_{uuid.uuid4().hex}"
@@ -680,8 +676,7 @@ class RealtimeBridge:
                 async for chunk in _stream_chunks(self.server, rid, context):
                     if chunk.modality == "text":
                         delta = chunk.data.decode("utf-8", "replace")
-                        for token in _TEMPLATE_END_TOKENS:
-                            delta = delta.replace(token, "")
+                        # the reply's end token decodes to nothing: no delta for it
                         if not delta:
                             continue
                         text_parts.append(delta)

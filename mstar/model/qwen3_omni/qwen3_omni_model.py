@@ -61,6 +61,7 @@ from mstar.model.multimodal import (
     check_attachments,
     check_plan,
     find_media_spans,
+    messages_from_parts,
     parts_from_modalities,
     prefill_plan,
     split_around_spans,
@@ -1113,7 +1114,21 @@ class Qwen3OmniModel(Model):
         for waveform in raw_audio_inputs:
             np_audios.append(waveform.cpu().numpy())
 
-        # HF puts modality content INSIDE the user turn, each attachment
+        # input_modalities is the layout, here and in the schedule builder;
+        # prompt_parts only fills its text slots and roles.
+        texts, roles = prompt, None
+        if prompt_parts is not None:
+            texts = [p.text or "" for p in prompt_parts if p.modality == TEXT]
+            roles = [p.role for p in prompt_parts]
+        parts = parts_from_modalities(input_modalities, texts, roles)
+        if attached:
+            check_attachments(parts, {
+                "image": len(raw_image_inputs),
+                "audio": len(raw_audio_inputs),
+                "video": len(raw_video_inputs),
+            })
+
+        # HF puts modality content INSIDE its message's turn, each attachment
         # rendered as ``<|x_start|><|x_pad|><|x_end|>`` at its own place:
         #
         #   <|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>{prompt}<|im_end|>
@@ -1124,37 +1139,12 @@ class Qwen3OmniModel(Model):
         # (``ThinkerSubmodule._wrap_audio_input``) and the encoder embeddings
         # replace the pad tokens, so the Thinker's spans are what lies between
         # the placeholders.
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are Qwen, a virtual human developed by the "
-                    "Qwen team, Alibaba Group, capable of perceiving "
-                    "auditory and visual inputs, as well as generating "
-                    "text and speech."
-                ),
-            },
-        ]
-        # input_modalities is the layout, here and in the schedule builder;
-        # prompt_parts only fills its text slots.
-        parts = parts_from_modalities(
-            input_modalities,
-            [p.text or "" for p in prompt_parts if p.modality == TEXT]
-            if prompt_parts is not None else prompt,
-        )
-        if attached:
-            check_attachments(parts, {
-                "image": len(raw_image_inputs),
-                "audio": len(raw_audio_inputs),
-                "video": len(raw_video_inputs),
-            })
-        content = [
-            {"type": TEXT, "text": part.text or ""} if part.modality == TEXT
-            else {"type": part.modality, part.modality: ""}
-            for part in parts
-        ]
-        if content:
-            messages.append({"role": "user", "content": content})
+        messages = messages_from_parts(parts, default_system=(
+            "You are Qwen, a virtual human developed by the "
+            "Qwen team, Alibaba Group, capable of perceiving "
+            "auditory and visual inputs, as well as generating "
+            "text and speech."
+        ))
 
         text = self._processor.apply_chat_template(
             messages,
@@ -1238,7 +1228,11 @@ class Qwen3OmniModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            detok = self.tokenizer.decode(output)
+            # the end token closes the turn, not the reply: a client sends the
+            # reply back as an assistant message, whose template writes it again
+            detok = self.tokenizer.decode(
+                [i for i in output.reshape(-1).tolist() if i != self.config.im_end_token_id]
+            )
             return detok.encode("utf-8")
         elif modality == "audio":
             if output.numel() == 0:

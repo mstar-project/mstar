@@ -40,6 +40,19 @@ def test_bagel_chat_decodes_image_input(tmp_path):
     assert "image" in sa.input_modalities and "text" in sa.input_modalities
 
 
+def test_a_chat_request_keeps_each_message_role(tmp_path):
+    req = ChatCompletionRequest(model="bagel", messages=[
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Name a color."},
+        {"role": "assistant", "content": "Blue."},
+        {"role": "user", "content": "Another."},
+    ])
+    sa = adapters.BagelAdapter().chat_to_request(req, tmp_path)
+    assert [(p.role, p.text) for p in sa.prompt_parts] == [
+        ("system", "Be brief."), ("user", "Name a color."), ("assistant", "Blue."), ("user", "Another."),
+    ], "a ChatMessage's role was dropped, so the chat reaches the model as one user turn"
+
+
 def test_qwen3_chat_audio_and_sampling(tmp_path):
     req = ChatCompletionRequest(
         model="qwen3_omni",

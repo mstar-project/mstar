@@ -21,12 +21,24 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::media;
 use crate::protocol::{
     ChatCompletionRequest, Content, ImageGenerationRequest, SpeechRequest, VideoGenerationRequest,
 };
+
+/// One element of a chat prompt, in request order: mstar's `PromptPart`,
+/// field for field, so the bridge builds one from each as it arrives.
+#[derive(Debug, Clone, Serialize)]
+pub struct Part {
+    pub modality: String,
+    pub text: Option<String>,
+    /// The position within its own modality's attachments.
+    pub index: usize,
+    pub role: String,
+}
 
 /// The arguments the bridge submits to the conductor (mirrors mstar's
 /// `SubmitArgs` / `PreprocessInput`).
@@ -42,6 +54,8 @@ pub struct SubmitArgs {
     pub input_modalities: Vec<String>,
     pub output_modalities: Vec<String>,
     pub model_kwargs: Map<String, Value>,
+    /// A chat's parts, in order; empty on every other path.
+    pub parts: Vec<Part>,
 }
 
 impl Default for SubmitArgs {
@@ -53,48 +67,43 @@ impl Default for SubmitArgs {
             input_modalities: Vec::new(),
             output_modalities: vec!["text".to_string()],
             model_kwargs: Map::new(),
+            parts: Vec::new(),
         }
     }
 }
 
-/// Flatten OpenAI chat `messages` into (text, file_paths, input_modalities).
+/// Flatten OpenAI chat `messages` into (text, file_paths, input_modalities, parts).
 ///
-/// Text parts across all messages are newline-joined. Image/audio/video content
-/// parts are persisted under `upload_dir` and grouped by modality. Multi-turn
-/// role structure is flattened (a v1 simplification, as in mstar — the models
-/// apply their own prompt formatting downstream).
+/// `parts` is the ordered sequence as written; the other three derive from
+/// it: text newline-joined, attachments persisted under `upload_dir` and
+/// grouped by modality, `input_modalities` the per-part modality sequence.
+/// So an attachment's position and a repeated modality both survive. Each
+/// part carries its message's role, so a reply stays its own turn. The rules
+/// are `flatten_messages` in `api_server/openai/adapters.py`, line for line.
 pub fn flatten_messages(
     messages: &[crate::protocol::ChatMessage],
     upload_dir: &Path,
     allow_remote: bool,
-) -> Result<(Option<String>, BTreeMap<String, Vec<String>>, Vec<String>), String> {
-    let mut text_parts: Vec<String> = Vec::new();
+) -> Result<(Option<String>, BTreeMap<String, Vec<String>>, Vec<String>, Vec<Part>), String> {
+    let mut parts: Vec<Part> = Vec::new();
     let mut file_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    // Modalities in first-encounter order (Python builds `input_modalities` from
-    // an insertion-ordered dict; a BTreeMap would sort them, which can perturb
-    // downstream walk construction that reads this list positionally).
-    let mut mod_order: Vec<String> = Vec::new();
-
-    let add_file = |modality: String,
-                    path: String,
-                    fp: &mut BTreeMap<String, Vec<String>>,
-                    order: &mut Vec<String>| {
-        if !order.contains(&modality) {
-            order.push(modality.clone());
-        }
-        fp.entry(modality).or_default().push(path);
-    };
 
     for msg in messages {
+        // any other role reads as user, where every message went before, not as
+        // itself: Qwen3-Omni's template drops a developer message, text and all
+        let role = match msg.role.as_str() {
+            "system" | "assistant" => msg.role.as_str(),
+            _ => "user",
+        };
         let content = match &msg.content {
             None => continue,
             Some(Content::Text(s)) => {
                 if !s.is_empty() {
-                    text_parts.push(s.clone());
+                    add_text(&mut parts, s, role);
                 }
                 continue;
             }
-            Some(Content::Parts(parts)) => parts,
+            Some(Content::Parts(content)) => content,
         };
         for part in content {
             let obj = match part.as_object() {
@@ -106,32 +115,18 @@ pub fn flatten_messages(
                 "text" => {
                     if let Some(t) = obj.get("text").and_then(Value::as_str) {
                         if !t.is_empty() {
-                            text_parts.push(t.to_string());
+                            add_text(&mut parts, t, role);
                         }
                     }
                 }
-                "image_url" => {
-                    let url = nested_url(obj, "image_url");
+                "image_url" | "video_url" | "audio_url" => {
+                    let url = nested_url(obj, ptype);
                     if !url.is_empty() {
+                        let fallback = ptype.trim_end_matches("_url");
+                        refuse_outside_user(role, fallback)?;
                         let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
-                        let m = if m == "unknown" { "image".to_string() } else { m };
-                        add_file(m, p, &mut file_paths, &mut mod_order);
-                    }
-                }
-                "video_url" => {
-                    let url = nested_url(obj, "video_url");
-                    if !url.is_empty() {
-                        let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
-                        let m = if m == "unknown" { "video".to_string() } else { m };
-                        add_file(m, p, &mut file_paths, &mut mod_order);
-                    }
-                }
-                "audio_url" => {
-                    let url = nested_url(obj, "audio_url");
-                    if !url.is_empty() {
-                        let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
-                        let m = if m == "unknown" { "audio".to_string() } else { m };
-                        add_file(m, p, &mut file_paths, &mut mod_order);
+                        let m = if m == "unknown" { fallback.to_string() } else { m };
+                        add_file(&mut parts, &mut file_paths, m, p, role);
                     }
                 }
                 "input_audio" => {
@@ -141,8 +136,9 @@ pub fn flatten_messages(
                         let data = ia.get("data").and_then(Value::as_str).unwrap_or("");
                         let fmt = ia.get("format").and_then(Value::as_str).unwrap_or("wav");
                         if !data.is_empty() {
+                            refuse_outside_user(role, "audio")?;
                             let (m, p) = media::save_base64(data, fmt, "audio", upload_dir)?;
-                            add_file(m, p, &mut file_paths, &mut mod_order);
+                            add_file(&mut parts, &mut file_paths, m, p, role);
                         }
                     }
                 }
@@ -151,18 +147,67 @@ pub fn flatten_messages(
         }
     }
 
-    // First-encounter order (see `mod_order`), matching Python's insertion-
-    // ordered dict rather than the BTreeMap's sorted keys.
-    let mut input_modalities = mod_order;
-    let text = if text_parts.is_empty() {
-        None
-    } else {
-        Some(text_parts.join("\n"))
-    };
-    if text.is_some() {
-        input_modalities.push("text".to_string());
+    let texts: Vec<&str> = parts.iter().filter_map(|p| p.text.as_deref()).collect();
+    let text = if texts.is_empty() { None } else { Some(texts.join("\n")) };
+    let input_modalities = parts.iter().map(|p| p.modality.clone()).collect();
+    Ok((text, file_paths, input_modalities, parts))
+}
+
+/// The layout has no text slot for the turn break a template writes between
+/// two attachments, so an attachment stays in a user turn. Checked before the
+/// attachment is persisted: a refused request never reaches the upload cleanup.
+fn refuse_outside_user(role: &str, modality: &str) -> Result<(), String> {
+    if role == "user" {
+        return Ok(());
     }
-    Ok((text, file_paths, input_modalities))
+    Err(format!(
+        "{} message cannot carry {} attachment",
+        with_article(role),
+        with_article(modality)
+    ))
+}
+
+fn with_article(word: &str) -> String {
+    let article = if word.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+    format!("{article} {word}")
+}
+
+fn add_file(
+    parts: &mut Vec<Part>,
+    file_paths: &mut BTreeMap<String, Vec<String>>,
+    modality: String,
+    path: String,
+    role: &str,
+) {
+    let paths = file_paths.entry(modality.clone()).or_default();
+    parts.push(Part {
+        modality,
+        text: None,
+        index: paths.len(),
+        role: role.to_string(),
+    });
+    paths.push(path);
+}
+
+fn add_text(parts: &mut Vec<Part>, text: &str, role: &str) {
+    // Adjacent text parts were newline-joined before ordering was kept; merge
+    // them here, across messages of one role too (the layout has no slot for
+    // the boundary between them), so only text an attachment or a role change
+    // separates gets its own part.
+    if let Some(last) = parts.last_mut() {
+        if last.modality == "text" && last.role == role {
+            let merged = last.text.get_or_insert_with(String::new);
+            merged.push('\n');
+            merged.push_str(text);
+            return;
+        }
+    }
+    parts.push(Part {
+        modality: "text".to_string(),
+        text: Some(text.to_string()),
+        index: 0,
+        role: role.to_string(),
+    });
 }
 
 /// `{ "<key>": { "url": "..." } }` -> the url string (or "").
@@ -276,7 +321,7 @@ impl Adapter {
     ) -> Result<SubmitArgs, String> {
         match self {
             Adapter::Bagel => {
-                let (text, file_paths, in_mods) =
+                let (text, file_paths, in_mods, parts) =
                     flatten_messages(&req.messages, upload_dir, allow_remote)?;
                 let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
                 // BAGEL reads sampling from model config; only max/seed are honored.
@@ -299,10 +344,11 @@ impl Adapter {
                     input_modalities: in_mods,
                     output_modalities: vec!["text".to_string()],
                     model_kwargs: mk,
+                    parts,
                 })
             }
             Adapter::Qwen3Omni => {
-                let (text, file_paths, in_mods) =
+                let (text, file_paths, in_mods, parts) =
                     flatten_messages(&req.messages, upload_dir, allow_remote)?;
                 let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
                 // Speech output also emits text, so request both when audio asked.
@@ -338,6 +384,7 @@ impl Adapter {
                     input_modalities: in_mods,
                     output_modalities: out_mods,
                     model_kwargs: mk,
+                    parts,
                 })
             }
             Adapter::Orpheus | Adapter::Cosmos3 => {
@@ -372,6 +419,7 @@ impl Adapter {
                     input_modalities: vec!["text".to_string()],
                     output_modalities: vec!["text".to_string(), "audio".to_string()],
                     model_kwargs: mk,
+                    parts: Vec::new(),
                 })
             }
             Adapter::Orpheus => {
@@ -398,6 +446,7 @@ impl Adapter {
                     input_modalities: vec!["text".to_string()],
                     output_modalities: vec!["audio".to_string()],
                     model_kwargs: mk,
+                    parts: Vec::new(),
                 })
             }
             Adapter::Bagel | Adapter::Cosmos3 => {
@@ -420,6 +469,7 @@ impl Adapter {
                     input_modalities: vec!["text".to_string()],
                     output_modalities: vec!["image".to_string()],
                     model_kwargs: mk,
+                    parts: Vec::new(),
                 })
             }
             Adapter::Cosmos3 => {
@@ -437,6 +487,7 @@ impl Adapter {
                     input_modalities: vec!["text".to_string()],
                     output_modalities: vec!["image".to_string()],
                     model_kwargs: mk,
+                    parts: Vec::new(),
                 })
             }
             _ => Err("image generation is not supported by this model".to_string()),
@@ -486,6 +537,7 @@ impl Adapter {
                             input_modalities: vec!["image".to_string(), "text".to_string()],
                             output_modalities: vec!["video".to_string()],
                             model_kwargs: mk,
+                            parts: Vec::new(),
                         })
                     }
                     (None, Some(video)) => {
@@ -499,6 +551,7 @@ impl Adapter {
                             input_modalities: vec!["video".to_string(), "text".to_string()],
                             output_modalities: vec!["video".to_string()],
                             model_kwargs: mk,
+                            parts: Vec::new(),
                         })
                     }
                     (None, None) => Ok(SubmitArgs {
@@ -508,6 +561,7 @@ impl Adapter {
                         input_modalities: vec!["text".to_string()],
                         output_modalities: vec!["video".to_string()],
                         model_kwargs: mk,
+                        parts: Vec::new(),
                     }),
                 }
             }
@@ -532,6 +586,7 @@ impl Adapter {
                     input_modalities: vec!["image".to_string(), "text".to_string()],
                     output_modalities: vec!["image".to_string()],
                     model_kwargs: extra_kwargs,
+                    parts: Vec::new(),
                 })
             }
             _ => Err("image editing is not supported by this model".to_string()),
@@ -550,4 +605,122 @@ fn chat_voice(req: &ChatCompletionRequest) -> Option<String> {
         .get("voice")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ChatMessage;
+
+    type Flattened = (Option<String>, BTreeMap<String, Vec<String>>, Vec<String>, Vec<Part>);
+
+    fn flatten(messages: &str, upload_dir: &Path) -> Result<Flattened, String> {
+        let messages: Vec<ChatMessage> = serde_json::from_str(messages).unwrap();
+        flatten_messages(&messages, upload_dir, false)
+    }
+
+    fn described(parts: &[Part]) -> Vec<(&str, &str, Option<&str>, usize)> {
+        parts
+            .iter()
+            .map(|p| (p.modality.as_str(), p.role.as_str(), p.text.as_deref(), p.index))
+            .collect()
+    }
+
+    #[test]
+    fn a_reply_stays_its_own_part() {
+        let (text, _, in_mods, parts) = flatten(
+            r#"[{"role":"system","content":"Be brief."},
+                {"role":"user","content":"Name a color."},
+                {"role":"assistant","content":"Blue."},
+                {"role":"user","content":"Another."}]"#,
+            Path::new("/unused"),
+        )
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("Be brief.\nName a color.\nBlue.\nAnother."));
+        assert_eq!(in_mods, ["text", "text", "text", "text"]);
+        assert_eq!(
+            described(&parts),
+            [
+                ("text", "system", Some("Be brief."), 0),
+                ("text", "user", Some("Name a color."), 0),
+                ("text", "assistant", Some("Blue."), 0),
+                ("text", "user", Some("Another."), 0),
+            ],
+            "text merged across a role change, so the reply lands inside a user turn"
+        );
+    }
+
+    #[test]
+    fn messages_of_one_role_stay_one_part() {
+        let (_, _, in_mods, parts) = flatten(
+            r#"[{"role":"user","content":"First."},{"role":"user","content":"Second."}]"#,
+            Path::new("/unused"),
+        )
+        .unwrap();
+        assert_eq!(in_mods, ["text"]);
+        assert_eq!(
+            described(&parts),
+            [("text", "user", Some("First.\nSecond."), 0)],
+            "two user messages no longer render as the one turn they do on the default server"
+        );
+    }
+
+    #[test]
+    fn an_attachment_keeps_its_place_between_text() {
+        let (text, file_paths, in_mods, parts) = flatten(
+            r#"[{"role":"user","content":[
+                {"type":"text","text":"A"},
+                {"type":"image_url","image_url":{"url":"/in/a.png"}},
+                {"type":"text","text":"B"}]}]"#,
+            Path::new("/unused"),
+        )
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("A\nB"));
+        assert_eq!(file_paths["image"], ["/in/a.png"]);
+        assert_eq!(in_mods, ["text", "image", "text"], "the layout lost the image's place");
+        assert_eq!(
+            described(&parts),
+            [
+                ("text", "user", Some("A"), 0),
+                ("image", "user", None, 0),
+                ("text", "user", Some("B"), 0),
+            ],
+            "text written after the image moved ahead of it"
+        );
+    }
+
+    #[test]
+    fn two_images_are_indexed_in_order() {
+        let (_, file_paths, in_mods, parts) = flatten(
+            r#"[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"/in/a.png"}},
+                {"type":"image_url","image_url":{"url":"/in/b.png"}},
+                {"type":"text","text":"Compare."}]}]"#,
+            Path::new("/unused"),
+        )
+        .unwrap();
+        assert_eq!(file_paths["image"], ["/in/a.png", "/in/b.png"]);
+        assert_eq!(in_mods, ["image", "image", "text"]);
+        assert_eq!(
+            parts.iter().map(|p| p.index).collect::<Vec<_>>(),
+            [0, 1, 0],
+            "the second image does not address the second upload"
+        );
+    }
+
+    #[test]
+    fn an_attachment_outside_a_user_message_is_refused_before_it_is_saved() {
+        let dir = std::env::temp_dir().join(format!("mstar_adapters_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = flatten(
+            r#"[{"role":"assistant","content":[
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}}]}]"#,
+            &dir,
+        )
+        .unwrap_err();
+        let saved = std::fs::read_dir(&dir).unwrap().count();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(err, "an assistant message cannot carry an image attachment");
+        assert_eq!(saved, 0, "a refused attachment was saved, and nothing cleans it up");
+    }
 }
