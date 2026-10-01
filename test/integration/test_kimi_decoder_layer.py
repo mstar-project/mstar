@@ -188,7 +188,10 @@ def test_dense_decoder_layer_matches_reference():
     pos = torch.arange(T, device=DEVICE)
 
     bind_fakes(layer, cfg.qk_head_dim ** -0.5, pos)
-    got = layer(h)
+    # The layer returns (unreduced mlp partial, residual); world_size is 1
+    # here so resolving the final hidden state is just the add.
+    mlp_partial, residual = layer(h, None)
+    got = residual + mlp_partial
     expected = _ref_decoder_layer(layer, cfg, h, pos)
 
     assert got.shape == (T, cfg.hidden_size)
@@ -207,7 +210,8 @@ def test_moe_decoder_layer_matches_reference():
     pos = torch.arange(T, device=DEVICE)
 
     bind_fakes(layer, cfg.qk_head_dim ** -0.5, pos)
-    got = layer(h)
+    mlp_partial, residual = layer(h, None)
+    got = residual + mlp_partial
     expected = _ref_decoder_layer(layer, cfg, h, pos)
 
     assert got.shape == (T, cfg.hidden_size)

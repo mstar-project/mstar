@@ -16,6 +16,13 @@ attempted outside CUDA-graph capture -- in practice the first eager forward
 before capture. A call before the workspace exists, or one whose shape the
 workspace can't hold, falls back to NCCL.
 
+``mstar::flashinfer_all_reduce_add_rmsnorm`` additionally fuses the residual
+add and the RMSNorm that follow every all-reduce in the Kimi-K2.7 decoder
+(pattern ``kARResidualRMSNorm``), so each of the two reduce points per layer
+costs one kernel instead of three. ``KimiDecoderLayer`` and
+``KimiLanguageModel`` call it through ``all_reduce_add_rmsnorm`` in place of
+a plain ``all_reduce`` followed by a residual add and a norm.
+
 Only the shape- and config-level decisions (backend flag, dtype, token cap)
 are made in Python. Everything that depends on process state -- does the
 workspace exist, are we capturing, is the buffer sufficient -- lives inside
@@ -181,3 +188,85 @@ def all_reduce(comm_group, input_: torch.Tensor) -> torch.Tensor:
     flat = input_.reshape(tokens, hidden)
     out = torch.ops.mstar.flashinfer_all_reduce(flat, comm_group.allreduce_handle)
     return out.view(orig_shape)
+
+
+@torch.library.custom_op("mstar::flashinfer_all_reduce_add_rmsnorm", mutates_args=())
+def flashinfer_all_reduce_add_rmsnorm(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    handle: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-reduce ``input_`` (tokens, hidden), add ``residual`` and RMSNorm
+    the sum -- FlashInfer's ``kARResidualRMSNorm`` pattern -- through
+    FlashInfer when its workspace can serve the call and through NCCL + torch
+    otherwise. Returns ``(residual_out, norm_out)``: ``residual_out`` is the
+    new residual stream, ``norm_out`` the normalized input to the next
+    sub-layer."""
+    comm_group = _groups[handle]
+    tokens, hidden = input_.shape
+    workspace = None
+    if enabled():
+        workspace = get_or_create(handle, tokens, hidden, input_.dtype)
+    if workspace is None or not workspace.is_buffer_size_sufficient(
+        comm_group.world_size, tokens, hidden, input_.dtype,
+    ):
+        summed = input_.clone()
+        dist.all_reduce(summed, group=comm_group.device_group)
+        residual_out = residual + summed
+        # Can't take the RMSNorm module across the op boundary; call the
+        # same backend-neutral op it dispatches through.
+        norm_out = torch.ops.mstar.rms_norm(residual_out, weight, eps)
+        return residual_out, norm_out
+    from flashinfer import comm
+
+    residual_out = torch.empty_like(input_)
+    norm_out = torch.empty_like(input_)
+    comm.allreduce_fusion(
+        input_, workspace, pattern=comm.AllReduceFusionPattern.kARResidualRMSNorm,
+        residual_in=residual, rms_gamma=weight, rms_eps=eps,
+        residual_out=residual_out, norm_out=norm_out,
+    )
+    return residual_out, norm_out
+
+
+@flashinfer_all_reduce_add_rmsnorm.register_fake
+def _flashinfer_all_reduce_add_rmsnorm_fake(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    handle: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(input_), torch.empty_like(input_)
+
+
+def all_reduce_add_rmsnorm(
+    comm_group, input_: torch.Tensor, residual: torch.Tensor, norm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """residual_out = all_reduce(input_) + residual; norm_out =
+    norm(residual_out). Fused through FlashInfer when it can serve the call;
+    plain NCCL (or no reduce at world_size 1) + torch add + the ``norm``
+    module's own forward otherwise -- the exact kernel sequence the model
+    ran before this fusion, so those paths stay bit-identical to it."""
+    if comm_group is None or comm_group.world_size == 1:
+        residual_out = residual + input_
+        return residual_out, norm(residual_out)
+    orig_shape = input_.shape
+    hidden = orig_shape[-1]
+    tokens = input_.numel() // hidden
+    if (
+        not _ENABLED
+        or input_.dtype not in _SUPPORTED_DTYPES
+        or tokens > _MAX_TOKENS
+    ):
+        dist.all_reduce(input_, group=comm_group.device_group)
+        residual_out = residual + input_
+        return residual_out, norm(residual_out)
+    flat = input_.reshape(tokens, hidden)
+    residual_flat = residual.reshape(tokens, hidden)
+    residual_out, norm_out = torch.ops.mstar.flashinfer_all_reduce_add_rmsnorm(
+        flat, residual_flat, norm.weight, norm.variance_epsilon, comm_group.allreduce_handle,
+    )
+    return residual_out.view(orig_shape), norm_out.view(orig_shape)

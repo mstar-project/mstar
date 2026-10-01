@@ -65,9 +65,11 @@ class KimiMLAAttention(nn.Module):
             comm_group, config.kv_lora_rank,
             h * (config.qk_nope_head_dim + config.v_head_dim), bias=False)
 
+        # Unreduced: KimiDecoderLayer fuses this all-reduce with the residual
+        # add and the following RMSNorm.
         self.o_proj = RowParallelLinear(
             comm_group, h * config.v_head_dim, config.hidden_size,
-            bias=False, input_is_parallel=True, reduce_results=True)
+            bias=False, input_is_parallel=True, reduce_results=False)
 
         rope = config.rope_scaling
         self.rotary = KimiYarnRotaryEmbedding(

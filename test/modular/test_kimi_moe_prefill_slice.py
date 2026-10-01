@@ -76,7 +76,7 @@ def _fake_moe_sum_reduce(input_, output, routed_scaling_factor=1.0):
     output.copy_(input_.sum(dim=1) * routed_scaling_factor)
 
 
-def test_moe_tp_single_all_reduce_per_forward(monkeypatch):
+def test_moe_tp_returns_unreduced_partial(monkeypatch):
     monkeypatch.setattr(fused_moe, "fused_experts", _fake_fused_experts)
     monkeypatch.setattr(fused_moe, "moe_sum_reduce_triton", _fake_moe_sum_reduce)
 
@@ -89,7 +89,9 @@ def test_moe_tp_single_all_reduce_per_forward(monkeypatch):
         h = torch.randn(num_tokens, cfg.hidden_size) * 0.1
         out = block(h)
         assert out.shape == h.shape
-        assert group.all_reduce_calls == 1
+        # The block returns its rank-local partial; KimiDecoderLayer owns
+        # the all-reduce now.
+        assert group.all_reduce_calls == 0
 
 
 def test_moe_tp1_matches_pre_change_reference():

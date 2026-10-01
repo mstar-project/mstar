@@ -19,6 +19,7 @@ import torch.distributed as dist
 
 from mstar.distributed import flashinfer_allreduce as fia
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.norm import RMSNorm
 
 
 class _FakeWorkspace:
@@ -208,4 +209,164 @@ def test_custom_op_fake_matches_real_shape(monkeypatch):
     x = torch.randn(4, 8, dtype=torch.bfloat16)
     torch.library.opcheck(
         torch.ops.mstar.flashinfer_all_reduce, (x, group.allreduce_handle),
+    )
+
+
+def _expected_fused(residual, summed, norm):
+    """Reference for the unfused paths: the exact pre-fusion computation --
+    an add followed by the real ``RMSNorm`` module's own forward."""
+    residual_out = residual + summed
+    return residual_out, norm(residual_out)
+
+
+def test_fused_add_rmsnorm_uses_flashinfer_pattern(monkeypatch):
+    _enable(monkeypatch)
+    _mock_nccl(monkeypatch)
+    from flashinfer import comm
+
+    calls = {"create": [], "fusion": []}
+
+    def create(**kwargs):
+        calls["create"].append(kwargs)
+        return _FakeWorkspace()
+
+    def fusion(input_, ws, pattern, **kwargs):
+        calls["fusion"].append((pattern, kwargs))
+        kwargs["residual_out"].fill_(1.0)
+        kwargs["norm_out"].fill_(2.0)
+        return input_
+
+    monkeypatch.setattr(comm, "create_allreduce_fusion_workspace", create)
+    monkeypatch.setattr(comm, "allreduce_fusion", fusion)
+
+    group = _group(4)
+    x = torch.randn(3, 8, dtype=torch.bfloat16)
+    residual = torch.randn(3, 8, dtype=torch.bfloat16)
+    norm = RMSNorm(8, eps=1e-6).to(torch.bfloat16)
+
+    residual_out, norm_out = fia.all_reduce_add_rmsnorm(group, x, residual, norm)
+
+    assert residual_out.shape == x.shape and norm_out.shape == x.shape
+    torch.testing.assert_close(residual_out, torch.full_like(x, 1.0))
+    torch.testing.assert_close(norm_out, torch.full_like(x, 2.0))
+    assert len(calls["fusion"]) == 1
+    pattern, kwargs = calls["fusion"][0]
+    assert pattern is comm.AllReduceFusionPattern.kARResidualRMSNorm
+    assert torch.equal(kwargs["residual_in"], residual)
+    assert kwargs["rms_gamma"] is norm.weight
+    assert kwargs["rms_eps"] == norm.variance_epsilon
+
+
+def test_fused_world_size_one_matches_rmsnorm_module():
+    group = _group(1)
+    x = torch.randn(3, 8, dtype=torch.float32)
+    residual = torch.randn(3, 8, dtype=torch.float32)
+    norm = RMSNorm(8, eps=1e-6)
+    norm.weight.data.normal_()
+
+    residual_out, norm_out = fia.all_reduce_add_rmsnorm(group, x, residual, norm)
+
+    expected_residual, expected_norm = _expected_fused(residual, x, norm)
+    assert torch.equal(residual_out, expected_residual)
+    assert torch.equal(norm_out, expected_norm)
+
+
+def test_fused_backend_off_matches_rmsnorm_module(monkeypatch):
+    monkeypatch.setattr(fia, "_ENABLED", False)
+    _mock_nccl(monkeypatch)  # records the call, leaves the tensor as is
+
+    group = _group(2)
+    x = torch.randn(3, 8, dtype=torch.float32)
+    residual = torch.randn(3, 8, dtype=torch.float32)
+    norm = RMSNorm(8, eps=1e-6)
+    norm.weight.data.normal_()
+
+    residual_out, norm_out = fia.all_reduce_add_rmsnorm(group, x, residual, norm)
+
+    expected_residual, expected_norm = _expected_fused(residual, x, norm)
+    assert torch.equal(residual_out, expected_residual)
+    assert torch.equal(norm_out, expected_norm)
+
+
+def test_fused_token_cap_matches_rmsnorm_module(monkeypatch):
+    _enable(monkeypatch)
+    monkeypatch.setattr(fia, "_MAX_TOKENS", 2)
+    _mock_nccl(monkeypatch)
+
+    group = _group(2)
+    x = torch.randn(3, 8, dtype=torch.float32)  # 3 tokens > the cap of 2
+    residual = torch.randn(3, 8, dtype=torch.float32)
+    norm = RMSNorm(8, eps=1e-6)
+    norm.weight.data.normal_()
+
+    residual_out, norm_out = fia.all_reduce_add_rmsnorm(group, x, residual, norm)
+
+    expected_residual, expected_norm = _expected_fused(residual, x, norm)
+    assert torch.equal(residual_out, expected_residual)
+    assert torch.equal(norm_out, expected_norm)
+
+
+def test_fused_capture_without_workspace_matches_rmsnorm_module(monkeypatch):
+    _enable(monkeypatch, capturing=True)
+    _mock_nccl(monkeypatch)
+    fi = _mock_flashinfer(monkeypatch)
+
+    group = _group(2)
+    x = torch.randn(3, 8, dtype=torch.bfloat16)
+    residual = torch.randn(3, 8, dtype=torch.bfloat16)
+    norm = RMSNorm(8, eps=1e-6).to(torch.bfloat16)
+    norm.weight.data.normal_()
+
+    residual_out, norm_out = fia.all_reduce_add_rmsnorm(group, x, residual, norm)
+
+    assert not fi["create"] and not fi["fusion"]
+    expected_residual, expected_norm = _expected_fused(residual, x, norm)
+    assert torch.equal(residual_out, expected_residual)
+    assert torch.equal(norm_out, expected_norm)
+
+
+def test_fused_bf16_dtype_preserved(monkeypatch):
+    _enable(monkeypatch)
+    _mock_nccl(monkeypatch)
+    _mock_flashinfer(monkeypatch)
+
+    group = _group(4)
+    x = torch.randn(3, 8, dtype=torch.bfloat16)
+    residual = torch.randn(3, 8, dtype=torch.bfloat16)
+    norm = RMSNorm(8, eps=1e-6).to(torch.bfloat16)
+
+    residual_out, norm_out = fia.all_reduce_add_rmsnorm(group, x, residual, norm)
+
+    assert residual_out.dtype == torch.bfloat16
+    assert norm_out.dtype == torch.bfloat16
+
+
+def test_fused_op_fake_matches_real_shape(monkeypatch):
+    """Unlike ``_mock_flashinfer``, this fills ``residual_out``/``norm_out``:
+    opcheck re-invokes the op through AOTDispatcher and compares outputs
+    against the eager call, so leaving them as uninitialized ``empty_like``
+    memory would make the two calls disagree for reasons unrelated to the op
+    itself."""
+    _enable(monkeypatch)
+    _mock_nccl(monkeypatch)
+    from flashinfer import comm
+
+    def create(**kwargs):
+        return _FakeWorkspace()
+
+    def fusion(input_, ws, pattern, **kwargs):
+        kwargs["residual_out"].copy_(input_)
+        kwargs["norm_out"].copy_(input_)
+        return input_
+
+    monkeypatch.setattr(comm, "create_allreduce_fusion_workspace", create)
+    monkeypatch.setattr(comm, "allreduce_fusion", fusion)
+
+    group = _group(2)
+    x = torch.randn(4, 8, dtype=torch.bfloat16)
+    residual = torch.randn(4, 8, dtype=torch.bfloat16)
+    weight = torch.randn(8, dtype=torch.bfloat16)
+    torch.library.opcheck(
+        torch.ops.mstar.flashinfer_all_reduce_add_rmsnorm,
+        (x, residual, weight, 1e-6, group.allreduce_handle),
     )

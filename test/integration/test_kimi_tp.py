@@ -103,6 +103,15 @@ def _run(module, h, head_dim, pos):
     return module(h)
 
 
+def _run_decoder(layer, h, head_dim, pos):
+    """A decoder layer, which returns (unreduced mlp partial, residual):
+    resolve the final hidden state with the layer's own comm group."""
+    bind_fakes(layer, head_dim ** -0.5, pos)
+    mlp_partial, residual = layer(h, None)
+    comm_group = layer.comm_group or CommGroup.trivial()
+    return residual + comm_group.all_reduce(mlp_partial)
+
+
 def _inputs(cfg: KimiK2Config, num_tokens: int, seed: int):
     g = torch.Generator().manual_seed(seed)
     h = (torch.randn(num_tokens, cfg.hidden_size, generator=g) * 0.1).to(DEVICE, DTYPE)
@@ -210,9 +219,11 @@ def _nccl_worker(rank: int, world_size: int, port: int, result_path: str) -> Non
         _load_decoder(dec, src)
         assert isinstance(dec.mlp, KimiSparseMoeBlock)
 
-        attn_tp2 = _run(attn, h, cfg.padded_head_dim, pos)
-        moe_tp2 = moe(h)
-        dec_tp2 = _run(dec, h, cfg.padded_head_dim, pos)
+        # attn/moe now return unreduced partials (the decoder layer owns the
+        # reduce); all-reduce them here for the apples-to-apples comparison.
+        attn_tp2 = cg.all_reduce(_run(attn, h, cfg.padded_head_dim, pos))
+        moe_tp2 = cg.all_reduce(moe(h))
+        dec_tp2 = _run_decoder(dec, h, cfg.padded_head_dim, pos)
 
         attn_ref = KimiMLAAttention(cfg, CommGroup.trivial()).to(DEVICE, DTYPE)
         _load_attention(attn_ref, src)
@@ -223,7 +234,7 @@ def _nccl_worker(rank: int, world_size: int, port: int, result_path: str) -> Non
 
         o_attn = _run(attn_ref, h, cfg.padded_head_dim, pos)
         o_moe = moe_ref(h)
-        o_dec = _run(dec_ref, h, cfg.padded_head_dim, pos)
+        o_dec = _run_decoder(dec_ref, h, cfg.padded_head_dim, pos)
 
         diffs = {
             "attn": (attn_tp2 - o_attn).abs().max().item(),

@@ -73,7 +73,11 @@ Communication
        FlashInfer isn't installed, the dtype isn't bf16/fp16, the
        per-comm-group workspace hasn't been created yet (only legal outside
        CUDA-graph capture and torch.compile tracing), or the token count
-       exceeds ``MSTAR_FLASHINFER_ALLREDUCE_MAX_TOKENS``.
+       exceeds ``MSTAR_FLASHINFER_ALLREDUCE_MAX_TOKENS``. With
+       ``flashinfer``, the Kimi-K2.7 decoder stack also fuses each
+       all-reduce with the residual add and RMSNorm that follow it (pattern
+       ``kARResidualRMSNorm``), one kernel instead of three per reduce
+       point.
    * - ``MSTAR_FLASHINFER_ALLREDUCE_MAX_TOKENS``
      - ``1024``
      - Token-count cap of the FlashInfer all-reduce workspace, read when

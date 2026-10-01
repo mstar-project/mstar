@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.distributed.flashinfer_allreduce import all_reduce_add_rmsnorm
 from mstar.model.kimi_k2_7.components.decoder_layer import KimiDecoderLayer
 from mstar.model.kimi_k2_7.components.language_model import (
     build_embedding,
@@ -19,6 +20,7 @@ class KimiLanguageModel(nn.Module):
         self, config: KimiK2Config, comm_group: CommGroup | None = None
     ) -> None:
         super().__init__()
+        self.comm_group = comm_group
         self.embed_tokens = build_embedding(config, comm_group=comm_group)
         self.layers = nn.ModuleList(
             [
@@ -42,11 +44,15 @@ class KimiLanguageModel(nn.Module):
         # the label once, advance the index per layer. Passing them as
         # arguments instead would make inductor specialize on the int.
         self.layers[0].self_attn.attend.bind_step(label)
+        residual = None
         for layer_idx, decoder_layer in enumerate(self.layers):
             decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
-            hidden_states = decoder_layer(hidden_states)
+            hidden_states, residual = decoder_layer(hidden_states, residual)
         # the advance is the runner's now, off the step declaration
-        return self.norm(hidden_states)
+        _, hidden_states = all_reduce_add_rmsnorm(
+            self.comm_group, hidden_states, residual, self.norm,
+        )
+        return hidden_states
 
 
 class KimiForCausalLM(nn.Module):

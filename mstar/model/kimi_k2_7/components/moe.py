@@ -260,7 +260,6 @@ class KimiSparseMoeBlock(nn.Module):
         super().__init__()
         if comm_group is None:
             comm_group = CommGroup.trivial()
-        self.comm_group = comm_group
         self.tp_size = comm_group.world_size
         self.tp_rank = comm_group.rank
         self.hidden_size = config.hidden_size
@@ -400,10 +399,8 @@ class KimiSparseMoeBlock(nn.Module):
                 )
         shared = self.shared_expert(flat)
         out = routed + shared
-        if self.tp_size > 1:
-            # routed and shared are both rank-local partials now; one
-            # all-reduce here replaces the three the block used to issue.
-            out = self.comm_group.all_reduce(out)
+        # Rank-local partial even at tp_size > 1: KimiDecoderLayer fuses the
+        # cross-rank all-reduce with the residual add and the following norm.
         return out.view(input_shape)
 
     def _route(

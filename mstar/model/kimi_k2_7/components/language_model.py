@@ -48,6 +48,9 @@ def build_dense_mlp(
         comm_group=comm_group,
         activation=config.hidden_act,
         bias=False,
+        # Unreduced: KimiDecoderLayer fuses this all-reduce with the residual
+        # add and the following RMSNorm.
+        reduce_results=False,
     )
 
 
