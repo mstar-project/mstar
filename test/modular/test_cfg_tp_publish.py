@@ -14,7 +14,7 @@ from mstar.conductor.request_info import (
     PartitionState,
     merge_publish_info,
 )
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import (
     KVManager,
     KVSequenceInfo,
@@ -77,7 +77,7 @@ def test_conductor_merges_kv_publish_info_from_every_tp_rank():
 
 def _tp2_manager(rank: int, entity_id: str, shm_dir: str) -> KVManager:
     return KVManager(
-        cfg=KVConfig(
+        cfg=PagedKVConfig(
             num_layers=1,
             num_kv_heads=2,
             num_qo_heads=2,

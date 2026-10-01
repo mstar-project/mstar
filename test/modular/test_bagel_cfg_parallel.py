@@ -8,7 +8,7 @@ import yaml
 
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.kv.cache import KVCache
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig
+from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
 from mstar.engine.resources.kv.manager import (
     CacheStream,
     KVManager,
@@ -133,7 +133,7 @@ def test_combine_cfg_is_parameterless():
 
 
 def _kv_cache(tensor: torch.Tensor) -> KVCache:
-    config = KVConfig(
+    config = PagedKVConfig(
         max_num_pages=tensor.shape[1],
         page_size=tensor.shape[3],
         num_layers=tensor.shape[0],
@@ -390,7 +390,7 @@ def test_shm_read_failure_is_returned_on_a_future(tmp_path):
 
 def test_shm_read_failure_is_latched_to_one_request(tmp_path):
     manager = KVManager(
-        cfg=KVConfig(
+        cfg=PagedKVConfig(
             max_num_pages=4,
             page_size=4,
             num_layers=1,
@@ -471,7 +471,7 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
 
 def _shm_consumer_manager(tmp_path) -> KVManager:
     return KVManager(
-        cfg=KVConfig(
+        cfg=PagedKVConfig(
             max_num_pages=4,
             page_size=4,
             num_layers=1,

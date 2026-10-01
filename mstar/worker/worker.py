@@ -27,6 +27,7 @@ from mstar.communication.tensors import (
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine import apply_torch_config
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AllocationFailed, StepContext
 from mstar.engine.resources.kv.transfer import (
@@ -492,6 +493,11 @@ class Worker:
                     if hasattr(section, 'input_names') and conn.edge_name in section.input_names:
                         self._consumer_node_cache[conn.edge_name] = section.name
 
+        # edge_name -> partition the stream feeds
+        self._stream_partition: dict[str, str] = {
+            conn.edge_name: conn.to_partition for conn in self._my_consumer_connections
+        }
+
     def _get_node_names_for_partition(self, partition_name: str, model: Model) -> list[str]:
         """Get the node names that belong to a partition."""
         walks = model.get_graph_walk_graphs()
@@ -645,6 +651,7 @@ class Worker:
 
         for node_name in self.engine_manager.evictable_nodes():
             self._last_active.pop((request_id, node_name), None)
+        logger.info("Request cleanup complete: %s", body.request_id)
 
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
@@ -987,6 +994,9 @@ class Worker:
         sbuf = req_info.stream_buffers.get(edge.name)
         if sbuf is not None:
             sbuf.store_uningested_edge(edge)
+        # The step that took the final chunk will not run; the stream is live again.
+        if edge._final_stream_chunk:
+            req_info.ended_streams.discard(edge.name)
 
     def _poll_stream_buffers(self) -> None:
         """Check all active StreamBuffers; when a chunk is ready, feed it as a normal input."""
@@ -1113,14 +1123,14 @@ class Worker:
         batch_partition = self.request_state.get_partition_for_node(batch.node_name)
 
         # One walk of the columns for both: each rid's inputs as tensors, and
-        # the rids whose edge carried a stream's final chunk. Only this side can
+        # per rid, the edges that carried a stream's final chunk. Only this side can
         # turn a uuid back into a tensor, which is why the runtime reports uuids
         # and the resolution happens here.
         #
         # Seeded with the batch's rids rather than just the ones that have
         # edges: a rid with nothing ready still needs an entry, because
         # per_request_info is keyed off these and the engine indexes it by rid.
-        per_request_inputs, final_stream_rids = (
+        per_request_inputs, final_edges = (
             batch.input_edges.to_input_tensors(
                 self.tensor_manager.get_tensor, batch.request_to_worker_graph,
             )
@@ -1136,8 +1146,42 @@ class Worker:
             request_ids=list(batch.request_to_worker_graph),
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
-            final_stream_rids=final_stream_rids,
+            final_edges=final_edges,
         )
+
+    def _settle_final_streams(
+        self, node_name: str, final_edges: dict[int, set[str]],
+    ) -> tuple[set[int], set[int]]:
+        """Record the streams whose final chunk this step consumes, per rid.
+
+        Returns two sets, ``(node_done, partition_done)``: the rids whose
+        streams into ``node_name`` have all ended once this step runs, and
+        the rids whose streams into the partition have. The second is a
+        subset of the first. Streams end in any order and over several
+        steps, so one final chunk alone means only that its own stream ended. A
+        ``continue_after_producer_done`` stream never sends a final chunk;
+        it holds neither back.
+        """
+        node_done: set[int] = set()
+        partition_done: set[int] = set()
+        for rid, edges in final_edges.items():
+            req_info = self.request_state.per_request_info.get(rid)
+            if req_info is None:
+                node_done.add(rid)
+                partition_done.add(rid)
+                continue
+            req_info.ended_streams |= edges
+            partition = self._stream_partition.get(next(iter(edges)))
+            live = [
+                edge_name for edge_name, sbuf in req_info.stream_buffers.items()
+                if edge_name not in req_info.ended_streams
+                and not sbuf.policy.continue_after_producer_done()
+            ]
+            if all(self._consumer_node_cache.get(e) != node_name for e in live):
+                node_done.add(rid)
+            if all(self._stream_partition.get(e) != partition for e in live):
+                partition_done.add(rid)
+        return node_done, partition_done
 
     def _make_executing_batch(
         self,
@@ -1146,18 +1190,23 @@ class Worker:
         request_ids: list[int],
         per_request_input_tensors: dict[int, NameToTensorList],
         per_request_info: dict[int, CurrentForwardPassInfo],
-        final_stream_rids: set[int] | None = None,
+        final_edges: dict[int, set[str]] | None = None,
     ) -> ExecutingBatch:
         """One step's batch, with the step context the engine drives it through.
 
-        The context starts unleased and eager; a slot is reserved later, once
-        the real token count is known.
+        ``final_edges`` maps a rid to the streams whose final chunk the step
+        consumes. The context starts unleased and eager; a slot is reserved
+        later, once the real token count is known.
         """
+        final_stream_rids, stream_partition_done_rids = self._settle_final_streams(
+            node_name, final_edges or {},
+        )
         return ExecutingBatch(
             node_name=node_name,
             per_request_info=per_request_info,
             per_request_input_tensors=per_request_input_tensors,
-            final_stream_rids=final_stream_rids or set(),
+            final_stream_rids=final_stream_rids,
+            stream_partition_done_rids=stream_partition_done_rids,
             step_context=StepContext(
                 request_ids=tuple(request_ids),
                 graph_walk=graph_walk,
@@ -1407,7 +1456,7 @@ class Worker:
         engine = self.engine_manager.get_engine(spec_node_batch.node_name)
         engine.reset_pre_plan_for_batch(spec_node_batch)
 
-    def _init_cuda_executor_thread(self) -> None:
+    def _init_engine_thread(self) -> None:
         """Pin this executor thread to the worker's accelerator device.
 
         The CUDA current device is per-thread and defaults to 0. PyTorch
@@ -1416,9 +1465,13 @@ class Worker:
         resolve against the THREAD's device — on a worker whose model
         lives on a non-zero device, work issued from an unpinned thread
         lands on device 0's stream, unordered with the real compute.
+
+        It also applies mstar's torch config, because dynamo config is
+        per-thread since torch 2.12 and this thread compiles.
         """
         if self.device.type != "cpu" and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
+        apply_torch_config()
 
     @contextmanager
     def _span(self, name: str):
@@ -1462,7 +1515,13 @@ class Worker:
         from mstar.utils.profiler import range_pop, range_push
 
         engine = self.engine_manager.get_engine(batch.node_name)
-        logger.debug("Executing batch for node %s", node_batch.node_name)
+        if logger.isEnabledFor(logging.DEBUG):
+            # test/waypoint/serve_rollout.py parses this line (wire ids, logged
+            # before prepare_inputs runs) to recover the DiT schedule.
+            logger.debug(
+                "Executing: %s graph_walk=%s %s", node_batch.node_name,
+                batch.graph_walk, [self._rid_str(r) for r in node_batch.request_ids],
+            )
         if self.enable_nvtx:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)
@@ -1711,8 +1770,9 @@ class Worker:
                 rid: self.request_state.get_fwd_info(rid, pending.partition)
                 for rid in request_ids
             },
-            final_stream_rids={
-                rid for rid, edges in consumed_streaming_edges.items()
+            final_edges={
+                rid: {e.name for e in edges if e._final_stream_chunk}
+                for rid, edges in consumed_streaming_edges.items()
                 if any(e._final_stream_chunk for e in edges)
             },
         )
@@ -1732,6 +1792,22 @@ class Worker:
             consumed_streaming_edges=consumed_streaming_edges,
             tp_seq=tp_seq,
         )
+
+    def _is_tearing_down(self, rid: int) -> bool:
+        """Removed, aborted or failed: no further speculative work for ``rid``.
+
+        A deferred drain only fires once the rid leaves ``_in_flight_rids``,
+        and a same-node speculation chain keeps it there every step, so a
+        drain the chain does not see would never fire and the rollout would
+        run to ``max_iters`` for a client that has gone.
+
+        ``rid`` is the worker handle; ``_pending_drains``/``_draining_rids``
+        hold wire strings.
+        """
+        if rid in self._pending_removes or rid in self.scheduler.failed_rids:
+            return True
+        wire = self._rid_str(rid)
+        return wire in self._pending_drains or wire in self._draining_rids
 
     def _try_speculate_next(
         self,
@@ -1782,9 +1858,10 @@ class Worker:
         spec_target = (spec_node_name, batch_N.graph_walk)
         max_continuing = self.scheduler.room_for_continuing(spec_target)
 
-        # Removes are filtered here; prep_spec_rids assumes that.
+        # Removes, aborts and failures are filtered here; prep_spec_rids
+        # assumes that.
         candidates = [
-            r for r in batch_N.request_to_worker_graph if r not in self._pending_removes
+            r for r in batch_N.request_to_worker_graph if not self._is_tearing_down(r)
         ]
         # Polling the StreamBuffers stays on this side: they hold real tensors.
         polled: list[tuple[int, GraphEdge]] = []
@@ -1922,6 +1999,9 @@ class Worker:
                 speculation.node_batch.per_request_input_tensors.pop(r, None)
                 speculation.node_batch.per_request_info.pop(r, None)
                 speculation.scheduled_batch.request_to_worker_graph.pop(r, None)
+                # Its final chunks go back below; it must not flush or report done.
+                speculation.node_batch.final_stream_rids.discard(r)
+                speculation.node_batch.stream_partition_done_rids.discard(r)
                 for edge in speculation.consumed_streaming_edges.get(r, []):
                     self._return_streaming_edge(r, edge)
                 speculation.consumed_streaming_edges.pop(r, None)
@@ -2416,7 +2496,7 @@ class Worker:
 
         # The consuming pass (not the earlier ingest) reports the partition
         # done, so it rides this pass's WGD with the final output loop index.
-        for rid in batch_N.node_batch.final_stream_rids:
+        for rid in batch_N.node_batch.stream_partition_done_rids:
             self._graph_runtime.mark_stream_partition_done(rid, batch_N.partition)
 
         # set this before send_outputs so that we can send updated profiling info to the conductor
@@ -2806,7 +2886,7 @@ class Worker:
         # 1-worker GPU thread.
         gpu_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix=f"mstar-gpu-{self.worker_id}",
-            initializer=self._init_cuda_executor_thread,
+            initializer=self._init_engine_thread,
         )
         logger.info(
             "Worker %s: engine runs on dedicated GPU thread",
@@ -2834,7 +2914,7 @@ class Worker:
         if pre_plan_spec:
             plan_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix=f"mstar-plan-{self.worker_id}",
-                initializer=self._init_cuda_executor_thread,
+                initializer=self._init_engine_thread,
             )
             logger.info(
                 "Worker %s: plan_executor enabled — speculative plan() "

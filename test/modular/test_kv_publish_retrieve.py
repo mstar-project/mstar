@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 
@@ -72,7 +72,7 @@ def _stub(monkeypatch):
 
 def _manager(max_num_pages=64, page_size=16) -> KVManager:
     return KVManager(
-        cfg=KVConfig(
+        cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
             max_num_pages=max_num_pages, page_size=page_size,
         ),

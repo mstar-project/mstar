@@ -637,10 +637,11 @@ def test_prep_respects_room_for_continuing(runtime):
 def _two_node_runtime():
     """a -> b, where b ALSO needs an input a does not produce.
 
-    A same-node loop-back is a poor subject for not-ready: it checks the
-    next-iter slot, which a loop's external input never occupies, so such a
-    loop simply cannot be speculated. A cross-node target checks the current
-    slot, which is the case the prep filters actually see.
+    A same-node loop-back is a poor subject for not-ready: its held external
+    inputs are carried over from the current slot and the loop-back itself is
+    supplied by the speculative ingest, so nothing is ever missing. A
+    cross-node target checks the current slot, which is the case the prep
+    filters actually see.
     """
     wg = WorkerGraph(
         section=Sequential(sections=[

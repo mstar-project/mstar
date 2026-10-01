@@ -36,6 +36,7 @@ def _fake_worker() -> Worker:
     w.pushed_back = []
     w._fail_requests = lambda errors: w.failed.append(dict(errors))
     w._reset_skip_plan_flags = w.resets.append
+    w._rid_str = str
     w.despeculated = []
     w._graph_runtime = SimpleNamespace(
         push_back_node=lambda node_name, rids, wg_ids: w.pushed_back.extend(rids),
@@ -111,7 +112,7 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
     released = []
     node_batch = SimpleNamespace(
         node_name="dit", launch_started_event=None, preplanned_rids=("a",),
-        release_waiters=lambda: released.append(True),
+        request_ids=("a",), release_waiters=lambda: released.append(True),
     )
     batch = SimpleNamespace(node_name="dit", graph_walk="decode")
     with pytest.raises(RuntimeError, match="bad inputs"):

@@ -41,7 +41,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
             --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -e ".[dev]"
+          # flex_attention imports torch._inductor, which needs Triton even on
+          # CPU; 3.5.1 is the version torch 2.9.1 pins.
+          python -m pip install triton==3.5.1
+          python -m pip install -e ".[dev,waypoint]"
           python -m pip check
       - name: Run CPU core tests
         env:

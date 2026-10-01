@@ -202,6 +202,8 @@ class PerRequestInfo:
     """
     # edge_name -> StreamBuffer
     stream_buffers: dict[str, StreamBuffer] = field(default_factory=dict)
+    # edges whose final chunk a built step consumed; a returned chunk leaves again
+    ended_streams: set[str] = field(default_factory=set)
     per_partition_info: dict[str, PerPartitionInfo] = field(default_factory=dict)
 
 
