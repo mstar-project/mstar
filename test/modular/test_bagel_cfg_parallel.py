@@ -1,4 +1,5 @@
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,6 +50,7 @@ def _bare_model() -> BagelModel:
     )
     model._has_cfg_parallel = True
     model._has_llm_disaggregation = False
+    model._image_gen_remote_handoff = False
     return model
 
 
@@ -122,9 +124,16 @@ def test_bagel_configs_detect_only_graph_walk_split_llm_as_disaggregated():
 
     model.get_worker_graphs(str(root / "configs/bagel_cfg_parallel.yaml"))
     assert not model._has_llm_disaggregation
+    assert not model._image_gen_remote_handoff
 
     model.get_worker_graphs(str(root / "configs/bagel_pd_disaggregated.yaml"))
     assert model._has_llm_disaggregation
+    assert not model._image_gen_remote_handoff
+
+    model.get_worker_graphs(str(root / "configs/bagel_img_disaggregated.yaml"))
+    assert model._image_gen_remote_handoff
+    image_gen = model.get_graph_walk_graphs()["image_gen"]
+    assert not image_gen.sections[0].section.enable_async_scheduling
 
 
 def test_combine_cfg_is_parameterless():
@@ -210,6 +219,57 @@ def test_shm_publication_refreshes_when_seq_len_changes(tmp_path):
     producer.remove_request("request")
     assert not Path(info.path).exists()
     assert not Path(refreshed.path).exists()
+
+
+def test_shm_remove_waits_for_in_progress_publication(tmp_path, monkeypatch):
+    source = torch.zeros((1, 1, 2, 4, 1, 1), dtype=torch.float32)
+    producer = ShmKVTransferEngine(
+        _kv_cache(source), "producer", str(tmp_path),
+    )
+    saving = threading.Event()
+    continue_save = threading.Event()
+    removed = threading.Event()
+    errors = []
+    save = torch.save
+
+    def blocked_save(*args, **kwargs):
+        saving.set()
+        assert continue_save.wait(timeout=5)
+        save(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "save", blocked_save)
+
+    def publish():
+        try:
+            producer.get_kv_transfer_info(
+                request_id="request", label="main",
+                page_indices=[0], seq_len=1,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    def remove():
+        try:
+            producer.remove_request("request")
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            removed.set()
+
+    publish_thread = threading.Thread(target=publish)
+    remove_thread = threading.Thread(target=remove)
+    publish_thread.start()
+    assert saving.wait(timeout=5)
+    remove_thread.start()
+    assert not removed.wait(timeout=0.05)
+    continue_save.set()
+    publish_thread.join(timeout=5)
+    remove_thread.join(timeout=5)
+
+    assert not publish_thread.is_alive()
+    assert not remove_thread.is_alive()
+    assert not errors
+    assert not list(tmp_path.glob("*.pt"))
 
 
 def test_shm_publication_refreshes_when_reset_generation_changes(tmp_path):
@@ -408,6 +468,7 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
         ),
         device=torch.device("cpu"),
         dtype=torch.float32,
+        needs_remote_transfer=True,
     )
     manager.ingest_request("broken", KVReqConfig(needed_labels=["main"]))
     manager.ingest_request("healthy", KVReqConfig(needed_labels=["main"]))
@@ -489,6 +550,7 @@ def _shm_consumer_manager(tmp_path) -> KVManager:
         ),
         device=torch.device("cpu"),
         dtype=torch.float32,
+        needs_remote_transfer=True,
     )
 
 

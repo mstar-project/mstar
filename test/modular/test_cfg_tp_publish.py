@@ -96,6 +96,7 @@ def _tp2_manager(rank: int, entity_id: str, shm_dir: str) -> KVManager:
         ),
         device=torch.device("cpu"),
         dtype=torch.float32,
+        needs_remote_transfer=True,
     )
 
 

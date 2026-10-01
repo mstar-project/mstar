@@ -1242,14 +1242,16 @@ class Engine:
         return stops
 
     def finalize_batch(
-        self, batch: ExecutingBatch
+        self, batch: ExecutingBatch,
+        publish_request_ids: list[int] | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         if self._enable_nvtx:
             range_push("engine.finalize_batch")
         try:
             # Returns rid -> {resource label -> published info}
             published = self._runner.publish(
-                batch.request_ids,
+                batch.request_ids if publish_request_ids is None
+                else publish_request_ids,
                 node_name=batch.node_name,
                 graph_walk=batch.step_context.graph_walk,
             )
@@ -1265,7 +1267,7 @@ class Engine:
     def finalize_stopped_requests(
         self,
         batch: ExecutingBatch,
-        request_ids: list[str],
+        request_ids: list[int],
     ) -> None:
         """Publish state that must include the last iteration of a stopped loop."""
         published = self._runner.publish_after_stop(

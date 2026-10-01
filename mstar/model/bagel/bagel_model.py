@@ -304,6 +304,9 @@ class BagelModel(Model):
         # Set when graph-walk-specific node groups place LLM cache consumers
         # in separate worker instances.
         self._has_llm_disaggregation = False
+        # The separate image-generation placement needs serial denoising
+        # until its published KV handoff and speculative scheduling agree.
+        self._image_gen_remote_handoff = False
 
     @property
     def _image_gen_walk(self) -> str:
@@ -892,6 +895,21 @@ class BagelModel(Model):
         self._has_llm_disaggregation = sum(
             "LLM" in group["node_names"] for group in node_groups
         ) > 1
+        def llm_ranks(walk: str) -> set[int]:
+            return {
+                rank
+                for group in node_groups
+                if "LLM" in group["node_names"]
+                and (not group.get("graph_walks") or walk in group["graph_walks"])
+                for rank in group["ranks"]
+            }
+
+        image_ranks = llm_ranks("image_gen")
+        self._image_gen_remote_handoff = bool(
+            image_ranks
+            and image_ranks.isdisjoint(llm_ranks("prefill_text"))
+            and image_ranks.isdisjoint(llm_ranks("decode"))
+        )
         return super().get_worker_graphs(config_path)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -984,6 +1002,11 @@ class BagelModel(Model):
                         GraphEdge(next_node="LLM", name="latents"),
                         GraphEdge(next_node="LLM", name="time_index"),
                     ],
+                    # A separate image-generation worker combines a remote
+                    # KV handoff with this loop. The Rust speculative path
+                    # produced nondeterministic seeded output on that layout;
+                    # serial steps preserve the handoff's output.
+                    enable_async_scheduling=not self._image_gen_remote_handoff,
                 ),
                 max_iters=self.config.num_timesteps - 1,
                 outputs=[

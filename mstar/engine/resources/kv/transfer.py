@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -406,6 +407,10 @@ class ShmKVTransferEngine(KVTransferEngine):
         # A descriptor must keep naming the same bytes while a consumer may
         # still be using it, even after this label is published again.
         self._published_paths: dict[tuple[str, str], set[str]] = {}
+        # Publication can serialize a large tensor while REMOVE_REQUEST is
+        # being applied on another thread. Keep registration and unlinking
+        # atomic so teardown cannot miss a newly replaced snapshot.
+        self._publication_lock = threading.Lock()
 
     def _path(self, request_id: str, label: str) -> str:
         key = (
@@ -421,6 +426,19 @@ class ShmKVTransferEngine(KVTransferEngine):
         page_indices: list[int] | None = None,
         seq_len: int | None = None,
         reset_generation: int | None = None,
+    ) -> ShmKVTransferInfo | None:
+        with self._publication_lock:
+            return self._get_kv_transfer_info_locked(
+                request_id, label, page_indices, seq_len, reset_generation,
+            )
+
+    def _get_kv_transfer_info_locked(
+        self,
+        request_id: str | None,
+        label: str | None,
+        page_indices: list[int] | None,
+        seq_len: int | None,
+        reset_generation: int | None,
     ) -> ShmKVTransferInfo | None:
         if (
             request_id is None
@@ -460,25 +478,31 @@ class ShmKVTransferEngine(KVTransferEngine):
         try:
             torch.save(packed, tmp_path)
             os.replace(tmp_path, path)
+            chunk = ShmKVSnapshotChunk(
+                path=path,
+                start_len=start_len,
+                end_len=seq_len,
+                page_indices=chunk_pages,
+            )
+            earlier_chunks = previous[1].chunks if append else None
+            info = ShmKVTransferInfo(
+                path=path,
+                page_indices=pages,
+                layout=self._kv_cache.layout,
+                chunks=(*earlier_chunks, chunk) if earlier_chunks else (chunk,),
+            )
+            self._published[key] = (version, info)
+            self._published_paths.setdefault(key, set()).add(path)
+            return info
+        except BaseException:
+            # A completed replace is not yet tracked if descriptor creation
+            # fails. Never leave a file that remove_request cannot find.
+            if os.path.exists(path):
+                os.unlink(path)
+            raise
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
-        chunk = ShmKVSnapshotChunk(
-            path=path,
-            start_len=start_len,
-            end_len=seq_len,
-            page_indices=chunk_pages,
-        )
-        earlier_chunks = previous[1].chunks if append else None
-        info = ShmKVTransferInfo(
-            path=path,
-            page_indices=pages,
-            layout=self._kv_cache.layout,
-            chunks=(*earlier_chunks, chunk) if earlier_chunks else (chunk,),
-        )
-        self._published[key] = (version, info)
-        self._published_paths.setdefault(key, set()).add(path)
-        return info
 
     def read_batched_async(
         self,
@@ -573,6 +597,10 @@ class ShmKVTransferEngine(KVTransferEngine):
         return None
 
     def remove_request(self, request_id: str) -> None:
+        with self._publication_lock:
+            self._remove_request_locked(request_id)
+
+    def _remove_request_locked(self, request_id: str) -> None:
         keys = [key for key in self._published_paths if key[0] == request_id]
         for key in keys:
             self._published.pop(key, None)
@@ -588,16 +616,18 @@ class ShmKVTransferEngine(KVTransferEngine):
         request_id: str,
         label: str,
     ) -> bool:
-        return (
-            isinstance(transfer_info, ShmKVTransferInfo)
-            and transfer_info.path in self._published_paths.get(
-                (request_id, label), ()
+        with self._publication_lock:
+            return (
+                isinstance(transfer_info, ShmKVTransferInfo)
+                and transfer_info.path in self._published_paths.get(
+                    (request_id, label), ()
+                )
             )
-        )
 
     def shutdown(self):
-        for request_id, _ in list(self._published_paths):
-            self.remove_request(request_id)
+        with self._publication_lock:
+            for request_id, _ in list(self._published_paths):
+                self._remove_request_locked(request_id)
 
 
 def make_deployment_kv_shm_dir(

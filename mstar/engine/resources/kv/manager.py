@@ -331,7 +331,7 @@ class KVManager(AttentionResource):
         transfer_engine_info: TransferEngineInfo,
         device: torch.device,
         dtype=torch.bfloat16,
-        needs_remote_transfer: bool = True,
+        needs_remote_transfer: bool = False,
     ):
         self.config = cfg
         if joint_comm_group is not None:

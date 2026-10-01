@@ -1575,7 +1575,10 @@ class Worker:
             # the next iter's prep and the conductor see it. Runs regardless
             # of success, allocation failure, or an uncaught raise —
             # finalize_batch reads whatever state the engine actually reached.
-            node_batch.resource_publish_info = engine.finalize_batch(node_batch)
+            publish_rids = self._publishable_request_ids(node_batch)
+            node_batch.resource_publish_info = engine.finalize_batch(
+                node_batch, publish_request_ids=publish_rids,
+            )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -1664,6 +1667,21 @@ class Worker:
     # ------------------------------------------------------------------
     # Speculation
     # ------------------------------------------------------------------
+
+    def _publishable_request_ids(self, batch: ExecutingBatch) -> list[int]:
+        """Do not create a late KV snapshot for an aborting request.
+
+        REMOVE_REQUEST is deferred while a GPU step is in flight. The
+        publication on that step's completion must still exclude the rid.
+        """
+        return [
+            rid for rid in batch.request_ids
+            if (info := batch.per_request_info.get(rid)) is not None
+            if rid not in self._pending_removes
+            and rid not in self.scheduler.failed_rids
+            and info.request_id not in self._pending_drains
+            and info.request_id not in self._draining_rids
+        ]
 
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
         if not self._graph_runtime.is_async_schedulable(
