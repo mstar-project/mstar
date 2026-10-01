@@ -36,7 +36,7 @@ Output = torch.Tensor | tuple[torch.Tensor, ...]
 
 
 @dataclass
-class _Entry:
+class _CapturedGraph:
     graph: object  # torch.cuda.CUDAGraph (or a stand-in with ``replay``)
     inputs: Tensors  # static buffers the graph reads
     output: Output  # static tensors the graph writes
@@ -66,7 +66,7 @@ class ShapeGraphs:
         # for a graph nobody replays
         self.capture_after = max(1, int(capture_after))
         self._seen: dict[tuple, int] = {}
-        self._graphs: OrderedDict[tuple, _Entry] = OrderedDict()
+        self._graphs: OrderedDict[tuple, _CapturedGraph] = OrderedDict()
         self._pool = None
         self.captures = 0
         self.replays = 0
@@ -131,11 +131,11 @@ class ShapeGraphs:
         return next(iter(tensors.values())).is_cuda
 
     @staticmethod
-    def _load(entry: _Entry, tensors: Tensors) -> None:
+    def _load(entry: _CapturedGraph, tensors: Tensors) -> None:
         for name, value in tensors.items():
             entry.inputs[name].copy_(value)
 
-    def _capture(self, key: tuple, tensors: Tensors, extra: tuple) -> _Entry:
+    def _capture(self, key: tuple, tensors: Tensors, extra: tuple) -> _CapturedGraph:
         while len(self._graphs) >= self.max_graphs:
             self._graphs.popitem(last=False)
         static = {name: value.clone() for name, value in tensors.items()}
@@ -144,7 +144,7 @@ class ShapeGraphs:
             return self._fn(static, extra)
 
         graph, output = self._record(run, next(iter(static.values())).device)
-        entry = _Entry(graph=graph, inputs=static, output=output)
+        entry = _CapturedGraph(graph=graph, inputs=static, output=output)
         self._graphs[key] = entry
         self.captures += 1
         return entry
