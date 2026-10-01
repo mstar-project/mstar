@@ -45,10 +45,10 @@ from mstar.conductor.request_info import (
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVReqConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     ResourceReqConfig,
@@ -233,7 +233,7 @@ class ChatterboxModel(Model):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         t3 = self.config.t3
         bb = t3.backbone
-        kv = KVConfig(
+        kv = PagedKVConfig(
             num_layers=bb.num_hidden_layers,
             num_kv_heads=bb.num_key_value_heads,
             head_dim=bb.head_dim,
