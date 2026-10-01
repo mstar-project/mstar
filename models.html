@@ -721,9 +721,9 @@ performance-optimized; treat their throughput/latency as provisional.</p></li>
 <section id="omnivoice-notes">
 <h3>OmniVoice notes<a class="headerlink" href="#omnivoice-notes" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><p>Zero-shot only: there are no built-in speakers. Pass <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> with its
+<li><p>Zero-shot only: there are no built-in speakers. Pass <code class="docutils literal notranslate"><span class="pre">reference_audio</span></code> with its
 transcript in <code class="docutils literal notranslate"><span class="pre">ref_text</span></code> to clone a voice, or describe one in <code class="docutils literal notranslate"><span class="pre">voice</span></code>.
-<code class="docutils literal notranslate"><span class="pre">ref_text</span></code> is required alongside <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code>.</p></li>
+<code class="docutils literal notranslate"><span class="pre">ref_text</span></code> is required alongside <code class="docutils literal notranslate"><span class="pre">reference_audio</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">language</span></code> takes either the name (<code class="docutils literal notranslate"><span class="pre">Vietnamese</span></code>) or the id (<code class="docutils literal notranslate"><span class="pre">vi</span></code>): a
 name is resolved to the id the model was trained on before the prompt is
 built, and an unrecognised value warns and falls back to language-agnostic
