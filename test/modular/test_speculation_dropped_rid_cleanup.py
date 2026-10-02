@@ -1,19 +1,17 @@
-"""``_thread_outputs_to_speculative`` cleans up a dropped rid under the dropped rid.
+"""``_thread_outputs_to_speculative`` returns a dropped rid's streaming edges
+under the dropped rid.
 
-A rid is dropped from the spec batch when batch N produced no loop-back output for
-it. Its consumed streaming edges stay in the node's ready slot — only their
-stream-ended marks come off (``_unend_stream``), since handing a still-ingested
-chunk back to its StreamBuffer would track it twice. A continuing rid's edges must
-be left alone entirely, or its chunk is fed twice. The cleanup loop runs over
-``dropped`` — every line in it has to address the dropped rid, not whatever the
-threading loop above it left bound.
+A rid is dropped from the spec batch when batch N produced no loop-back
+output for it. Its consumed streaming edges must go back to its own stream
+buffer, or the chunk is lost; a continuing rid's edges must stay consumed,
+or the chunk is fed twice. The cleanup loop runs over ``dropped`` — every
+line in it has to address the dropped rid, not whatever the threading loop
+above it left bound.
 """
 
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -53,14 +51,10 @@ def _speculation(rids: list[str]) -> Speculation:
     )
 
 
-def test_dropped_rid_cleanup_addresses_its_own_edges():
-    unended: list[tuple[str, str]] = []
+def test_dropped_rid_gets_its_own_edges_back():
+    returned: list[tuple[str, str]] = []
     worker = SimpleNamespace(
-        _unend_stream=lambda rid, se: unended.append((rid, se.edge.name)),
-        # Must not be reached: a still-ingested chunk is never re-buffered.
-        _return_streaming_edge=lambda rid, se: pytest.fail(
-            f"re-buffered an ingested chunk for {rid}"
-        ),
+        _return_streaming_edge=lambda rid, se: returned.append((rid, se.edge.name)),
     )
     # The dropped rid goes first: the threading loop leaves its variable bound
     # to the LAST rid it visited, so a cleanup that read that leftover would
@@ -81,6 +75,6 @@ def test_dropped_rid_cleanup_addresses_its_own_edges():
     ):
         assert set(table) == {"keep"}
 
-    # drop's own chunk was un-ended; keep's is untouched and stays consumed.
-    assert unended == [("drop", "audio_drop")]
+    # drop's chunk went back to drop's buffer; keep's stays consumed.
+    assert returned == [("drop", "audio_drop")]
     assert set(spec.consumed_streaming_edges) == {"keep"}

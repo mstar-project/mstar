@@ -3,10 +3,9 @@
 One stream's final chunk means only that stream ended. The step that consumes
 it is final for the node (``is_final_stream_chunk``) only if every other stream
 into the node already ended, and it reports the partition done only if every
-stream into the partition did. Streams end in any order, over several steps; an
-abandoned speculative step reopens the stream it had ended (``_unend_stream``,
-while its chunk stays in the node's ready slot); a ``continue_after_producer_done``
-stream never ends and holds nothing back.
+stream into the partition did. Streams end in any order, over several steps; a
+speculative step that hands its final chunk back reopens that stream; a
+``continue_after_producer_done`` stream never ends and holds nothing back.
 """
 
 import sys
@@ -55,7 +54,6 @@ def _worker(rids=("r",)):
         _stream_partition={name: PARTITION for name in TOPOLOGY},
     )
     worker._settle_final_streams = lambda *a: Worker._settle_final_streams(worker, *a)
-    worker._unend_stream = lambda *a: Worker._unend_stream(worker, *a)
     return worker
 
 
@@ -112,35 +110,27 @@ def test_requests_in_one_batch_are_tracked_apart():
     assert _step(worker, "vocoder", {"a": {"pitch"}, "b": {"pitch"}}) == ({"a"}, set())
 
 
-def test_an_abandoned_final_chunk_reopens_its_stream_without_being_rebuffered():
+def test_a_returned_final_chunk_reopens_its_stream():
     worker = _worker()
     _step(worker, "vocoder", {"r": {"codes"}})  # a speculative step takes the final chunk...
-    Worker._unend_stream(worker, "r", _final_edge("codes"))  # ...and is abandoned
+    Worker._return_streaming_edge(worker, "r", _final_edge("codes"))  # ...and is discarded
 
-    # Reopened: a later step is not final until that chunk is really consumed.
     assert _step(worker, "vocoder", {"r": {"pitch"}}) == (set(), set())
     assert _step(worker, "vocoder", {"r": {"codes"}}) == ({"r"}, set())
-    # And the chunk was NOT handed back: it is still in the node's ready slot,
-    # so a duplicate here is what would later dereference a freed tensor.
-    sbuf = worker.request_state.per_request_info["r"].stream_buffers["codes"]
-    assert sbuf.pop_waiting_edge() is None
 
 
-def test_a_refused_final_chunk_goes_back_to_its_buffer():
-    """The un-ingested path, unchanged: that chunk is in no ready slot, so it
-    has to go back or it is lost."""
+def test_returned_final_chunk_goes_back_to_its_buffer():
     worker = _worker()
     edge = _final_edge("codes")
     Worker._return_streaming_edge(worker, "r", edge)
 
     sbuf = worker.request_state.per_request_info["r"].stream_buffers["codes"]
     assert sbuf.pop_waiting_edge() is edge
-    # And it reopened the stream too.
-    assert worker.request_state.per_request_info["r"].ended_streams == set()
 
 
 def test_a_dropped_speculative_rid_neither_flushes_nor_reports_done():
     worker = _worker()
+    worker._return_streaming_edge = lambda *a: Worker._return_streaming_edge(worker, *a)
     _step(worker, "captioner", {"r": {"captions"}})
     _step(worker, "vocoder", {"r": {"codes"}})
     edge = _final_edge("pitch")

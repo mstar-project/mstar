@@ -1043,39 +1043,13 @@ class Worker:
                 result.append(edge)
         return result
 
-    def _unend_stream(
-        self, request_id: int, streaming_edge: StreamingEdge
-    ) -> None:
-        """The step that took this stream's final chunk will not run.
-
-        The build marked the stream ended (``_settle_final_streams``), so an
-        abandoned step has to un-mark it: until the chunk is really consumed, a
-        sibling node's build would otherwise leave this edge out of its ``live``
-        list and report the partition done early.
-
-        Safe to un-mark rather than lossy because the only reader runs at build
-        time and re-derives the flag from the chunk's input slot, which still
-        holds it (``_final_stream_chunk`` / Rust's ``Slot.final_chunk``) -- so
-        this must be paired with LEAVING the chunk ingested.
-        """
-        edge = streaming_edge.edge
-        if not edge._final_stream_chunk:
-            return
-        req_info = self.request_state.per_request_info.get(request_id)
-        if req_info is not None:
-            req_info.ended_streams.discard(edge.name)
-
     def _return_streaming_edge(
         self, request_id: int, streaming_edge: StreamingEdge
     ):
         """Hand a chunk back to its StreamBuffer after it was refused.
 
-        Only for a chunk the graph did NOT ingest: both polling paths, and a
-        speculative prep that rolled its own ingests back. A chunk still
-        sitting in a node's ready slot must go through ``_unend_stream``
-        instead -- handing it back as well leaves it tracked twice, and the
-        step that eventually runs dereferences a tensor the buffer still holds
-        a stale edge for.
+        Both polling paths use it: the plain one above and the speculative
+        prep, which rolls its ingests back per rid.
         """
         req_info = self.request_state.per_request_info.get(request_id)
         if req_info is None:
@@ -1083,7 +1057,10 @@ class Worker:
         sbuf = req_info.stream_buffers.get(streaming_edge.edge.name)
         if sbuf is not None:
             sbuf.store_uningested_edge(streaming_edge)
-        self._unend_stream(request_id, streaming_edge)
+        # The step that took the final chunk will not run; the stream is live again.
+        edge = streaming_edge.edge
+        if edge._final_stream_chunk:
+            req_info.ended_streams.discard(edge.name)
 
     def _mark_stream_ingested(
         self, request_id: int, streaming_edge: StreamingEdge
@@ -2185,14 +2162,11 @@ class Worker:
                 speculation.node_batch.per_request_info.pop(r, None)
                 speculation.scheduled_batch.request_to_worker_graph.pop(r, None)
                 speculation.node_batch.per_request_stream_chunks.pop(r, None)
-                # This step will not run, so it must not flush or report done.
+                # Its final chunks go back below; it must not flush or report done.
                 speculation.node_batch.final_stream_rids.discard(r)
                 speculation.node_batch.stream_partition_done_rids.discard(r)
-                # The chunks stay in the node's ready slot -- only the
-                # stream-ended marks come off. Handing them back to their
-                # StreamBuffers would track them twice (see _unend_stream).
                 for se in speculation.consumed_streaming_edges.get(r, []):
-                    self._unend_stream(r, se)
+                    self._return_streaming_edge(r, se)
                 speculation.consumed_streaming_edges.pop(r, None)
         speculation.continuing_rids = threaded_continuing
         speculation.dropped = dropped
@@ -3371,16 +3345,9 @@ class Worker:
                                 )
                                 speculation.plan_future = None
                             if not speculation.is_yield_away:
-                                # The chunks stay in their nodes' ready slots --
-                                # only the stream-ended marks come off. Handing
-                                # them back to their StreamBuffers would track
-                                # them twice (see _unend_stream). The slot copy
-                                # is consumed once the node runs again: a
-                                # continuing rid is re-readied by N's routing, a
-                                # fresh one by the push_back_node below.
                                 for rid, edges in speculation.consumed_streaming_edges.items():
                                     for se in edges:
-                                        self._unend_stream(rid, se)
+                                        self._return_streaming_edge(rid, se)
                                 # Fresh rids are not re-readied by N's routing
                                 # the way continuing rids are: give them back.
                                 sb = speculation.scheduled_batch
