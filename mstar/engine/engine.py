@@ -1327,6 +1327,24 @@ class Engine:
             outputs.setdefault(rid, {}).update(rid_out)
 
 
+    def capture_group(
+        self, node_name: str, graph_walk: str, request_id: int,
+        request_info: CurrentForwardPassInfo,
+    ) -> Any | None:
+        """The capture bucket this one request would replay, by
+        ``cg_key_info``; None when the walk has no capture.
+
+        A batch spanning two groups matches no capture and runs eager, so the
+        scheduler batches each group on its own.
+        """
+        submodule_mgmt = self._submodules[node_name]
+        cg_runner = submodule_mgmt.cuda_graph_runner
+        if cg_runner is None or not cg_runner.captures_walk(graph_walk):
+            return None
+        return submodule_mgmt.submodule.cg_key_info(
+            graph_walk, {request_id: request_info},
+        )
+
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """Most requests this node will take in one step, or None for no cap.
 
