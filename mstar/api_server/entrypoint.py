@@ -1485,17 +1485,20 @@ async def generate(
 
     if request_id is None:
         request_id = str(uuid.uuid4())
-    try:
-        session = api_server.sessions.resolve(
-            start_session=start_session,
-            resume_session=resume_session,
-            end_session=end_session,
-            session_id=session_id,
-            session_timeout_s=session_timeout_s,
-            request_id=request_id,
-        )
-    except SessionError as e:
-        raise HTTPException(status_code=e.status, detail=e.detail) from e
+    # Only a request that asks for a session consults the registry at all.
+    session = SessionRequest()
+    if start_session or resume_session or end_session or session_id:
+        try:
+            session = api_server.sessions.resolve(
+                start_session=start_session,
+                resume_session=resume_session,
+                end_session=end_session,
+                session_id=session_id,
+                session_timeout_s=session_timeout_s,
+                request_id=request_id,
+            )
+        except SessionError as e:
+            raise HTTPException(status_code=e.status, detail=e.detail) from e
 
     try:
         request_id = api_server.submit_request(
