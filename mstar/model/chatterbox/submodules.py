@@ -218,6 +218,11 @@ class T3Submodule(ARNodeSubmodule):
         flags = {self._requires_cfg(info.step_metadata) for info in per_request_info.values()}
         return flags.pop() if len(flags) == 1 else None
 
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        """A mixed batch runs eager one request at a time, so batch each guidance mode apart."""
+        del graph_walk
+        return self.supports_cfg
+
     def _scalar_inputs(self, fwd_info: CurrentForwardPassInfo, requires_cfg: bool) -> dict[str, torch.Tensor]:
         # sampling knobs (temperature, min_p, penalty) live in the request's
         # SamplingReqConfig and are applied by the sampler resource
