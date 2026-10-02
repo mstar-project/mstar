@@ -19,7 +19,7 @@ from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, EdgeSpec, RouteInput, SpeculationPrepInput
 from mstar.graph.runtime.python import PythonGraphRuntime
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
 from mstar.utils.containers import ParallelList
 
@@ -1848,3 +1848,100 @@ def test_accumulated_loop_outputs_are_staged_for_every_iteration(rollout):
         "ones the completing batch produced"
     )
     assert out.register_rids == [rid, rid]
+
+
+# --- a persisted output is staged only when a peer can read it ----------------
+
+@pytest.fixture(params=["python", "rust"])
+def persists_text(request):
+    """``encode_text`` persists its embedding; a later walk runs ``dit``.
+
+    ``vae_decoder`` is declared but not one of this worker's graphs, so a
+    request that uses it has a node elsewhere and one that does not has every
+    node here. Which it is, is decided per request at admission -- exactly
+    where a data-parallel deployment differs from a disaggregated one.
+    """
+    enc = WorkerGraph(
+        section=GraphNode(
+            name="encode_text", input_names={"text_inputs"},
+            outputs=[GraphEdge(name="text_embeds", next_node=EMPTY_DESTINATION,
+                               persist=True)],
+        ),
+        graph_walks={"encode"}, ranks=[0], worker_graph_id=0,
+    )
+    dit = WorkerGraph(
+        section=GraphNode(
+            name="dit", input_names={"text_embeds"},
+            outputs=[GraphEdge(name="image", next_node=EMIT_TO_CLIENT)],
+        ),
+        graph_walks={"image_gen"}, ranks=[0], worker_graph_id=1,
+    )
+    common = dict(
+        my_worker_id=WORKER, my_worker_graphs=[enc, dit],
+        all_wg_ids_to_graph_walks={0: {"encode"}, 1: {"image_gen"}, 2: {"image_gen"}},
+        all_wg_ids_to_dyn_loops={0: set(), 1: set(), 2: set()},
+        all_wg_ids_to_nodes={0: {"encode_text"}, 1: {"dit"}, 2: {"vae_decoder"}},
+        node_to_partition={
+            "encode_text": "default", "dit": "default", "vae_decoder": "default",
+        },
+        sharding_config=_sharding(),
+    )
+    if request.param == "python":
+        book = PythonTensorBookkeeping()
+        tm = _StubTensorManager(book)
+        return (PythonGraphRuntime(tensor_manager=tm, communicator=None,
+                                   **common), book, tm.tensor_store)
+    book = RustTensorBookkeeping()
+    return rust_runtime.RustGraphRuntime(bookkeeping=book, **common), book, None
+
+
+def _persist_one(pair, wg_ids, wg_workers):
+    """Admit with this worker assignment, run ``encode_text``, return the RouteOutput."""
+    rt, book, store = pair
+    rid = rt.add_request(
+        request_id="r1", partition="default", graph_walk="encode",
+        partition_worker_graph_ids=list(wg_ids),
+        worker_graph_to_workers=ParallelList(list(wg_ids), wg_workers),
+    )
+    rt.ingest_inputs_batch(
+        _ingest_block([rid], [_spec("text_inputs", "encode_text")])
+    )
+    rt.pop_rids("encode_text", "encode", [rid])
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)
+    return rid, rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk="encode", node_name="encode_text",
+            output_signals=["text_embeds"],
+            wg_ids=ParallelList([rid], [0]),
+            tensors=[1], num_tensors=[1],
+        ),
+    )
+
+
+def test_a_persisted_output_is_not_staged_when_the_request_stays_here(
+    persists_text,
+):
+    """Every node of this request runs on this worker, so the walk the conductor
+    feeds the embedding to runs here too, where the tensor already is. Staging
+    it would serialize 7.5 MiB to an shm file nobody reads.
+
+    This is also the data-parallel case: peer workers exist, but none of them
+    run THIS request, so the deployment's worker list is the wrong thing to
+    check.
+    """
+    _rid, out = _persist_one(persists_text, [0, 1], [[WORKER], [WORKER]])
+    assert out.register_uuids == []
+    assert out.register_rids == []
+
+
+def test_a_persisted_output_is_staged_when_a_peer_runs_the_request(
+    persists_text,
+):
+    """``vae_decoder`` runs on worker_1, so the walk the conductor feeds the
+    embedding to spans a worker that has to read it over the transport."""
+    rid, out = _persist_one(
+        persists_text, [0, 1, 2], [[WORKER], [WORKER], ["worker_1"]],
+    )
+    assert out.register_uuids == [1]
+    assert out.register_rids == [rid]

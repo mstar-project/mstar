@@ -1467,6 +1467,9 @@ impl GraphRuntime {
                     }
                 }
             }
+            let me = self.shard.me;
+            info.has_remote_nodes =
+                info.node_to_workers.values().flatten().any(|&w| w != me);
             // clone_empty() + setup(node_to_workers), per Python.
             info.shard = Some(
                 self.shard
@@ -2412,14 +2415,23 @@ impl GraphRuntime {
                 }
             }
 
+            // Whether a persisted output has a reader besides this worker. It
+            // goes back to the conductor, which feeds it to a later walk of
+            // this request; when every node of the request runs here, that walk
+            // reads the tensor where it already is and staging it is pure cost
+            let stage_persist =
+                self.info(rid).map_or(false, |i| i.has_remote_nodes);
+
             // Staged before the routed edges, so a persist signal is
             // registered for a remote read whether or not the fanout kept an
-            // edge for it -- Python stages `routing.persist` unconditionally.
-            for (_name, tensors) in &persist_pre {
-                for t in tensors {
-                    if staged.insert(t.uuid) {
-                        out.register_uuids.push(t.uuid);
-                        out.register_rids.push(rid);
+            // edge for it -- Python stages `routing.persist` the same way.
+            if stage_persist {
+                for (_name, tensors) in &persist_pre {
+                    for t in tensors {
+                        if staged.insert(t.uuid) {
+                            out.register_uuids.push(t.uuid);
+                            out.register_rids.push(rid);
+                        }
                     }
                 }
             }
@@ -2455,7 +2467,7 @@ impl GraphRuntime {
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
-                let remote = e.persist
+                let remote = (e.persist && stage_persist)
                     || e.declined_local
                     || (!is_local
                         && matches!(e.dest, Dest::External(_) | Dest::EmitToClient));

@@ -76,6 +76,13 @@ pub struct RequestInfo {
     /// (node, walk) -> the workers running it for THIS request. Per request
     /// because data-parallel replicas put the same node on different workers.
     pub node_to_workers: FxHashMap<(Sym, Sym), Vec<Sym>>,
+    /// True when some node above runs on a worker other than this one, i.e. when
+    /// a later walk of this request can land elsewhere. That is what decides
+    /// whether a persisted output has to be staged for a send; see the staging
+    /// loop in `complete_and_route_batch`. Per request, not per deployment: a
+    /// data-parallel replica has peer workers, but none of them run this
+    /// request, so its persist signals still stay home.
+    pub has_remote_nodes: bool,
     pub dyn_loop_to_workers: FxHashMap<(Sym, Sym), Vec<Sym>>,
     /// Loop name -> the stop observation this rank has. Worker-only, so it
     /// does not ride CurrentForwardPassInfo across the wire.
