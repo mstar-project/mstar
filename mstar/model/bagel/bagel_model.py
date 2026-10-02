@@ -261,20 +261,10 @@ class BagelModel(Model):
         model_path_hf: str,
         cache_dir: str | None = None,
         accelerator_graph: bool | None = None,
-        cuda_graph: bool | None = None,
         **kwargs
     ):
-        for name, value in (
-            ("accelerator_graph", accelerator_graph), ("cuda_graph", cuda_graph),
-        ):
-            if value is not None and not isinstance(value, bool):
-                raise ValueError(f"{name} must be a boolean")
-        if (
-            accelerator_graph is not None and cuda_graph is not None
-            and accelerator_graph != cuda_graph
-        ):
-            raise ValueError("accelerator_graph and cuda_graph must agree")
-        graph_override = accelerator_graph if accelerator_graph is not None else cuda_graph
+        if accelerator_graph is not None and not isinstance(accelerator_graph, bool):
+            raise ValueError("accelerator_graph must be a boolean")
         self.cache_dir = cache_dir
 
         config_path = hf_hub_download(
@@ -283,8 +273,8 @@ class BagelModel(Model):
         )
         with open(config_path) as f:
             self.config = load_bagel_config(json.load(f))
-        if graph_override is not None:
-            self.config.accelerator_graph = graph_override
+        if accelerator_graph is not None:
+            self.config.accelerator_graph = accelerator_graph
 
         self.model_path_hf = model_path_hf
 

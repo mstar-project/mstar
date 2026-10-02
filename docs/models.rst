@@ -104,9 +104,9 @@ BAGEL captures, including the optional ViT block loop, set this deployment optio
    model_kwargs:
      accelerator_graph: false
 
-``cuda_graph`` is accepted as a Waypoint-style alias. If both keys are present, their
-values must agree. Restart the server after changing this option. ``torch.compile``
-can still run with graph capture disabled.
+Restart the server after changing this option. ``torch.compile`` can still run
+with graph capture disabled. Optional ViT capture is enabled separately with
+``MSTAR_VIT_ACCELERATOR_GRAPH=1`` and also requires ``accelerator_graph: true``.
 
 OmniVoice notes
 ~~~~~~~~~~~~~~~

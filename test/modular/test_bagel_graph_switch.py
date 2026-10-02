@@ -30,17 +30,14 @@ def model_factory(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     ("options", "enabled"),
     [({}, True), ({"accelerator_graph": False}, False),
-     ({"accelerator_graph": True}, True), ({"cuda_graph": False}, False),
-     ({"cuda_graph": True}, True),
-     ({"accelerator_graph": False, "cuda_graph": False}, False)],
+     ({"accelerator_graph": True}, True)],
 )
 def test_model_resolves_graph_switch(model_factory, options, enabled):
     assert model_factory(**options).config.accelerator_graph is enabled
 
 
-@pytest.mark.parametrize("key", ["accelerator_graph", "cuda_graph"])
-def test_yaml_graph_switch_reaches_model(model_factory, key):
-    deployment = yaml.safe_load(f"model: bagel\nmodel_kwargs:\n  {key}: false\n")
+def test_yaml_graph_switch_reaches_model(model_factory):
+    deployment = yaml.safe_load("model: bagel\nmodel_kwargs:\n  accelerator_graph: false\n")
     assert model_factory(**deployment["model_kwargs"]).config.accelerator_graph is False
 
 
@@ -51,18 +48,16 @@ def test_checkpoint_graph_setting_is_overridden_by_deployment(model_factory, mon
 
 
 @pytest.mark.parametrize(
-    "options",
-    [{"accelerator_graph": True, "cuda_graph": False},
-     {"accelerator_graph": False, "cuda_graph": True},
-     {"accelerator_graph": "false"}, {"cuda_graph": 0}],
+    "value",
+    ["false", 0],
 )
-def test_invalid_graph_options_fail_before_downloading(monkeypatch, options):
+def test_invalid_graph_options_fail_before_downloading(monkeypatch, value):
     monkeypatch.setattr(
         bagel_model, "hf_hub_download",
         lambda **kwargs: pytest.fail("invalid switches should fail before downloading"),
     )
-    with pytest.raises(ValueError, match="boolean|must agree"):
-        bagel_model.BagelModel("test/bagel", **options)
+    with pytest.raises(ValueError, match="boolean"):
+        bagel_model.BagelModel("test/bagel", accelerator_graph=value)
 
 
 @pytest.mark.parametrize("device_type", ["cuda", "xpu"])
@@ -93,8 +88,15 @@ def test_enabled_cuda_capture_keeps_existing_recipes(monkeypatch):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_model_graph_switch_gates_optional_vit_capture(model_factory, monkeypatch, enabled):
-    monkeypatch.setenv("MSTAR_VIT_CUDA_GRAPH", "1")
+@pytest.mark.parametrize("vit_enabled", [False, True])
+@pytest.mark.parametrize("batching", [False, True])
+def test_model_graph_switch_gates_optional_vit_capture(
+    model_factory, monkeypatch, enabled, vit_enabled, batching,
+):
+    monkeypatch.setenv("MSTAR_VIT_ACCELERATOR_GRAPH", str(int(vit_enabled)))
+    monkeypatch.setenv("MSTAR_VIT_BATCHING", str(int(batching)))
+    monkeypatch.setenv("MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS", "1024,512")
+    monkeypatch.setenv("MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES", "4,1,2")
     model = model_factory(accelerator_graph=enabled)
     model.vit_model = nn.Identity()
     model.vit_model.vision_model = SimpleNamespace(
@@ -107,4 +109,8 @@ def test_model_graph_switch_gates_optional_vit_capture(model_factory, monkeypatc
     configs = vit.get_piecewise_accelerator_graph_configs(
         torch.device("cpu"), torch.float32,
     )
-    assert bool(configs) is enabled
+    assert bool(configs) is (enabled and vit_enabled)
+    if configs:
+        config = next(iter(configs.values()))
+        assert config.total_tokens == [512, 1024]
+        assert config.capture_batch_sizes == ([1, 2, 4] if batching else [1])

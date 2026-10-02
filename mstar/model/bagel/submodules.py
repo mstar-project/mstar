@@ -126,21 +126,21 @@ class ViTEncoderSubmodule(NodeSubmodule):
         self.vae_transform = ImageTransform(1024, 512, 16)
 
         self._vit_batching = os.environ.get("MSTAR_VIT_BATCHING", "0") == "1"
-        # CUDA-graph capture of the ViT block loop, over the engine's ragged
+        # Accelerator graph capture of the ViT block loop, over the engine's ragged
         # attention resource. Off by default: capture costs one graph per
         # (bs, token bucket) and the eager flash-attn path is already fast;
         # the win is removing per-layer launch overhead on small images.
-        self._cuda_graph_enabled = (
-            accelerator_graph and os.environ.get("MSTAR_VIT_CUDA_GRAPH", "0") == "1"
+        self._accelerator_graph_enabled = (
+            accelerator_graph and os.environ.get("MSTAR_VIT_ACCELERATOR_GRAPH", "0") == "1"
         )
-        self._cg_token_buckets = [
+        self._accelerator_graph_token_buckets = [
             int(t) for t in os.environ.get(
-                "MSTAR_VIT_CG_TOKEN_BUCKETS", "512,1024,2048,4096,4900"
+                "MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS", "512,1024,2048,4096,4900"
             ).split(",") if t.strip()
         ]  # 4900 == 70*70, the exact length the "vllm" preprocess option emits
-        self._cg_batch_sizes = [
+        self._accelerator_graph_batch_sizes = [
             int(b) for b in
-            os.environ.get("MSTAR_VIT_CG_BATCH_SIZES", "1,2,4").split(",")
+            os.environ.get("MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES", "1,2,4").split(",")
             if b.strip()
         ] if self._vit_batching else [1]
         # `prepare_inputs` emits exactly one varlen segment (one image) per
@@ -229,7 +229,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
     ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
         """Capture the ViT block loop, leaving patch-embed and the RoPE gathers
         eager — they are data-dependent indexing with no business in a graph."""
-        if not self._cuda_graph_enabled:
+        if not self._accelerator_graph_enabled:
             return {}
         vit_config = self.vit_model.vision_model.config
         hidden = vit_config.hidden_size
@@ -268,8 +268,8 @@ class ViTEncoderSubmodule(NodeSubmodule):
                 capture_fn=self._capture_block_loop,
                 make_static_inputs=make_static_inputs,
                 declare_step=declare_step,
-                total_tokens=sorted(self._cg_token_buckets),
-                capture_batch_sizes=sorted(self._cg_batch_sizes),
+                total_tokens=sorted(self._accelerator_graph_token_buckets),
+                capture_batch_sizes=sorted(self._accelerator_graph_batch_sizes),
             )
         }
 
