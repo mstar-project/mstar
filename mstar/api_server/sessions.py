@@ -65,6 +65,9 @@ class SessionRequest:
     # Set when the server minted the id, so it is reported back to the client.
     created: bool = False
     end_session: bool = False
+    # Continuing a session that already exists, rather than opening one. A
+    # model reads this to know the state it is resuming from.
+    resumed: bool = False
 
 
 class SessionRegistry:
@@ -164,6 +167,7 @@ class SessionRegistry:
         )
         return SessionRequest(
             session_id=resolved, created=created, end_session=end_session,
+            resumed=resume_session,
         )
 
     def _start_locked(

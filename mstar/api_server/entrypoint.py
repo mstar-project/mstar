@@ -485,7 +485,7 @@ class APIServer:
             file_paths=file_paths,
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            model_kwargs=model_kwargs,
+            model_kwargs=self._session_model_kwargs(model_kwargs, session),
             prompt_parts=prompt_parts,
             session_id=session.session_id if session else None,
             end_session=bool(session and session.end_session),
@@ -500,6 +500,31 @@ class APIServer:
             request_id, input_modalities, output_modalities,
         )
         return request_id
+
+    # The names a model reads the request's session under. Only the server may
+    # set them: a client naming another session would be served its state.
+    SESSION_KWARGS = ("session_id", "resume_session", "end_session")
+
+    @classmethod
+    def _session_model_kwargs(
+        cls, model_kwargs: dict | None, session: SessionRequest | None,
+    ) -> dict | None:
+        """``model_kwargs`` with the validated session in it, if there is one.
+
+        A model reads its session the way it reads a keyed prefix — off
+        ``model_kwargs``, filled in by the server — so a model written against
+        the session fields needs no new signature.
+        """
+        if model_kwargs is None and (session is None or session.session_id is None):
+            return None
+        resolved = dict(model_kwargs or {})
+        for name in cls.SESSION_KWARGS:
+            resolved.pop(name, None)
+        if session is not None and session.session_id is not None:
+            resolved["session_id"] = session.session_id
+            resolved["resume_session"] = session.resumed
+            resolved["end_session"] = session.end_session
+        return resolved
 
     # ----------------------------------------------------------
     # Result collection (background thread)

@@ -69,6 +69,15 @@ budget:
 - ``ERROR`` drops the state *and* fails the session's next request, so a client
   is told rather than silently served from a context it did not build.
 
+What a request's model sees
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A model reads the session off ``model_kwargs``, the way it reads a keyed prefix:
+the server fills in ``session_id``, ``resume_session`` and ``end_session`` from
+the validated request, so a model written against those names needs no new
+signature. They are stripped from whatever the client sent first — naming a
+session there would otherwise be a way to be served someone else's state.
+
 Submodule state
 ^^^^^^^^^^^^^^^
 
