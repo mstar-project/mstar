@@ -324,6 +324,13 @@ class CudaIpcKVTransferEngine(KVTransferEngine):
             )
             dst.copy_(src)
 
+        # A completed Future is the resource readiness gate. copy_ only
+        # enqueues device work; a speculative plan or replay on another
+        # stream must not read these pages before those writes finish.
+        # Wait in the transfer thread and cover only the copies queued here,
+        # rather than synchronizing the whole device on the scheduler thread.
+        torch.cuda.current_stream(self._device).record_event().synchronize()
+
     def shutdown(self):
         for fut in self._pending:
             fut.result()
