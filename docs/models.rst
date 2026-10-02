@@ -93,6 +93,21 @@ Notes
   ``process_prompt`` for the inputs it expects.
 - To add a new family, see :doc:`adding_models`.
 
+BAGEL graph capture
+~~~~~~~~~~~~~~~~~~~
+
+BAGEL enables its supported CUDA/XPU graph captures by default. To disable all
+BAGEL captures, including the optional ViT block loop, set this deployment option:
+
+.. code-block:: yaml
+
+   model_kwargs:
+     accelerator_graph: false
+
+``cuda_graph`` is accepted as a Waypoint-style alias. If both keys are present, their
+values must agree. Restart the server after changing this option. ``torch.compile``
+can still run with graph capture disabled.
+
 OmniVoice notes
 ~~~~~~~~~~~~~~~
 

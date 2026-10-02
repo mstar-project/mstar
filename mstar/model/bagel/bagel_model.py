@@ -260,8 +260,21 @@ class BagelModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        accelerator_graph: bool | None = None,
+        cuda_graph: bool | None = None,
         **kwargs
     ):
+        for name, value in (
+            ("accelerator_graph", accelerator_graph), ("cuda_graph", cuda_graph),
+        ):
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean")
+        if (
+            accelerator_graph is not None and cuda_graph is not None
+            and accelerator_graph != cuda_graph
+        ):
+            raise ValueError("accelerator_graph and cuda_graph must agree")
+        graph_override = accelerator_graph if accelerator_graph is not None else cuda_graph
         self.cache_dir = cache_dir
 
         config_path = hf_hub_download(
@@ -270,6 +283,8 @@ class BagelModel(Model):
         )
         with open(config_path) as f:
             self.config = load_bagel_config(json.load(f))
+        if graph_override is not None:
+            self.config.accelerator_graph = graph_override
 
         self.model_path_hf = model_path_hf
 
@@ -454,7 +469,8 @@ class BagelModel(Model):
                 connector=self.connector,
                 vit_pos_embed=self.vit_pos_embed,
                 vit_patch_size=self.config.vit_config.patch_size,
-                vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side
+                vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side,
+                accelerator_graph=self.config.accelerator_graph,
             )
         elif node_name == "vae_encoder":
             self._init_vae_components(device, autocast_dtype=autocast_dtype)

@@ -113,6 +113,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
         vit_pos_embed: nn.Module,
         vit_patch_size: int,
         vit_max_num_patch_per_side: int,
+        accelerator_graph: bool = True,
     ):
         super().__init__()
         self.vit_model = vit_model
@@ -129,7 +130,9 @@ class ViTEncoderSubmodule(NodeSubmodule):
         # attention resource. Off by default: capture costs one graph per
         # (bs, token bucket) and the eager flash-attn path is already fast;
         # the win is removing per-layer launch overhead on small images.
-        self._cuda_graph_enabled = os.environ.get("MSTAR_VIT_CUDA_GRAPH", "0") == "1"
+        self._cuda_graph_enabled = (
+            accelerator_graph and os.environ.get("MSTAR_VIT_CUDA_GRAPH", "0") == "1"
+        )
         self._cg_token_buckets = [
             int(t) for t in os.environ.get(
                 "MSTAR_VIT_CG_TOKEN_BUCKETS", "512,1024,2048,4096,4900"
@@ -759,6 +762,8 @@ class LLMSubmodule(ARNodeSubmodule):
         unaffected (they don't depend on this capture's snapshot
         semantics).
         """
+        if not self.config.accelerator_graph:
+            return []
 
         configs: list[BatchedAcceleratorGraphConfig | PackedAcceleratorGraphConfig] = []
         if device.type == "cuda":
