@@ -18,6 +18,12 @@ PREFIX=${SOCKET_PREFIX:-/tmp/mstar_${WHO}_session/}
 PYTHON=${PYTHON:-${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}}
 PYTHON=${PYTHON:-$([ -x .venv/bin/python ] && echo .venv/bin/python || echo python)}
 
+# FlashInfer JITs kernels with ninja, which ships in the venv's bin, so the
+# interpreter's directory goes on PATH too -- without it the worker fails every
+# request with FileNotFoundError: 'ninja'.
+PATH="$(cd "$(dirname "$PYTHON")" && pwd):$PATH"
+export PATH
+
 CUDA_VISIBLE_DEVICES=$DEVICES "$PYTHON" -m mstar.api_server.entrypoint \
     --config configs/test_text_session.yaml \
     --port "$PORT" \
