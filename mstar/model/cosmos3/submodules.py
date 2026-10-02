@@ -2071,16 +2071,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         so bake it once here and key it by latent shape; the per-prompt rotary
         positions, the latents and the timestep flow in as static-buffer inputs.
 
-        Set ``COSMOS3_DISABLE_CUDA_GRAPH=1`` to skip capture and run the denoise
-        loop eagerly (escape hatch for a misbehaving driver, and an A/B switch).
+        Set ``accelerator_graph: false`` in the deployment's model_kwargs or
+        ``COSMOS3_DISABLE_ACCELERATOR_GRAPH=1`` to skip capture and run eagerly.
         Set ``COSMOS3_GEN_CAPTURE_RES`` (e.g. ``"192x320,480x832"``, height x
         width) to override which resolutions are captured, and
         ``COSMOS3_GEN_CAPTURE_BS`` (e.g. ``"1,4,8"``) to also capture batched
         denoise steps so concurrent requests replay a padded graph instead of
         falling back to the eager path."""
-        disable_env = os.environ.get("COSMOS3_DISABLE_CUDA_GRAPH")
-        disabled = bool(disable_env) if disable_env is not None else not self.config.cuda_graph
-        if self.transformer is None or disabled:
+        if (
+            self.transformer is None or not self.config.accelerator_graph
+            or os.environ.get("COSMOS3_DISABLE_ACCELERATOR_GRAPH")
+        ):
             return []
         res_env = os.environ.get("COSMOS3_GEN_CAPTURE_RES")
         if res_env:
@@ -2214,7 +2215,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # Understanding-tower text prefill: cond+uncond packed into one combined
         # sequence (batched CFG). The dummy zeros are placeholders — the real
         # input_ids / mrope ids are copied into the static buffers at replay.
-        if not os.environ.get("COSMOS3_DISABLE_PREFILL_CUDA_GRAPH"):
+        if not os.environ.get("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH"):
             tok_env = os.environ.get("COSMOS3_PREFILL_CAPTURE_TOKENS")
             prefill_tokens = (
                 [int(x) for x in tok_env.split(",")] if tok_env
@@ -3029,7 +3030,10 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
         """Capture the decode step (one token per request) per batch-size
         bucket; prefills run eager (they are one-shot and shape-varied)."""
-        if self.transformer is None or os.environ.get("COSMOS3_DISABLE_CUDA_GRAPH"):
+        if (
+            self.transformer is None or not self.config.accelerator_graph
+            or os.environ.get("COSMOS3_DISABLE_ACCELERATOR_GRAPH")
+        ):
             return []
         bs_env = os.environ.get("COSMOS3_REASONER_CAPTURE_BS")
         sizes = [int(x) for x in bs_env.split(",")] if bs_env else list(self.decode_capture_batch_sizes)

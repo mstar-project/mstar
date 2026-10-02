@@ -995,8 +995,8 @@ def test_dit_prime_capture_can_be_declined_on_its_own(config):
     assert "noise" in configs[0].single_request_inputs.tensor_inputs
 
 
-def test_dit_declares_no_capture_when_cuda_graph_is_disabled(config):
-    eager_config = dataclasses.replace(config, cuda_graph=False)
+def test_dit_declares_no_capture_when_accelerator_graph_is_disabled(config):
+    eager_config = dataclasses.replace(config, accelerator_graph=False)
     with torch.device("meta"):
         dit = WaypointDiT(eager_config)
     dit.cast_serving_dtypes()
@@ -1441,10 +1441,10 @@ def test_ae_graphs_are_compiled_for_capture_but_remain_optional(encoder, decoder
     assert decoder.disable_autocast is True
 
 
-def test_ae_nodes_declare_no_capture_when_cuda_graph_is_disabled(
+def test_ae_nodes_declare_no_capture_when_accelerator_graph_is_disabled(
     taehv_weights, ae_config,
 ):
-    eager_config = dataclasses.replace(ae_config, cuda_graph=False)
+    eager_config = dataclasses.replace(ae_config, accelerator_graph=False)
     encoder = WaypointVaeEncoderSubmodule(taehv_weights, eager_config)
     fused = WaypointDitSubmodule(_FakeDit(eager_config), taehv_weights, eager_config)
 

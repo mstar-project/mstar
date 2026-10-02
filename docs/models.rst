@@ -93,20 +93,30 @@ Notes
   ``process_prompt`` for the inputs it expects.
 - To add a new family, see :doc:`adding_models`.
 
-BAGEL graph capture
-~~~~~~~~~~~~~~~~~~~
+Accelerator graph capture
+~~~~~~~~~~~~~~~~~~~~~~~~
 
-BAGEL enables its supported CUDA/XPU graph captures by default. To disable all
-BAGEL captures, including the optional ViT block loop, set this deployment option:
+BAGEL, Waypoint and Cosmos3 enable their supported accelerator graph captures
+by default. To disable capture for these models, set this deployment option:
 
 .. code-block:: yaml
 
    model_kwargs:
      accelerator_graph: false
 
-Restart the server after changing this option. ``torch.compile`` can still run
-with graph capture disabled. Optional ViT capture is enabled separately with
-``MSTAR_VIT_ACCELERATOR_GRAPH=1`` and also requires ``accelerator_graph: true``.
+Restart the server after changing this option. Model ``torch.compile`` settings
+are separate from the graph capture switch.
+
+For BAGEL, this also disables the optional ViT block loop capture. Optional
+ViT capture is enabled separately with ``MSTAR_VIT_ACCELERATOR_GRAPH=1`` and
+also requires ``accelerator_graph: true``.
+
+For Waypoint, this controls the VAE encoder and fused DiT/decoder captures.
+``capture_dit_prime`` controls prime capture when ``accelerator_graph`` is true.
+
+For Cosmos3, this disables denoise, understanding-tower prefill and reasoner
+decode captures. ``COSMOS3_DISABLE_ACCELERATOR_GRAPH`` and
+``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH`` provide environment controls.
 
 OmniVoice notes
 ~~~~~~~~~~~~~~~

@@ -1,4 +1,4 @@
-"""CPU checks for the video / windowed denoise CUDA-graph capture: one graph
+"""CPU checks for the video / windowed denoise Accelerator graph capture: one graph
 per latent shape built with every frame declared noisy, the request's
 clean/noisy layout carried as a per-token mask input. Covers the bucket
 declaration, the capture key (video, chained windows; never kv windows),
@@ -30,8 +30,8 @@ def _fake_transformer():
 def _dit_with_buckets(monkeypatch):
     monkeypatch.setenv("COSMOS3_GEN_CAPTURE_RES", "64x64")
     monkeypatch.setenv("COSMOS3_GEN_CAPTURE_VIDEO", "64x64x9")
-    monkeypatch.setenv("COSMOS3_DISABLE_PREFILL_CUDA_GRAPH", "1")
-    monkeypatch.delenv("COSMOS3_DISABLE_CUDA_GRAPH", raising=False)
+    monkeypatch.setenv("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH", "1")
+    monkeypatch.delenv("COSMOS3_DISABLE_ACCELERATOR_GRAPH", raising=False)
     sub = Cosmos3DiTSubmodule(
         transformer=_fake_transformer(), config=Cosmos3Config(compile_denoise=False), scheduler=None,
     )

@@ -154,7 +154,7 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
                 decode_latent, mode="max-autotune-no-cudagraphs",
                 fullgraph=False, dynamic=False,
             )
-            if config.cuda_graph else decode_latent
+            if config.accelerator_graph else decode_latent
         )
 
     def bind_node_resources(self, resources: dict) -> None:
@@ -519,7 +519,7 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         reuses the pool the rollout graph already sized.
         """
         del tp_world_size  # no sharded nodes; the ring and the mask do not shard
-        if not self.config.cuda_graph:
+        if not self.config.accelerator_graph:
             return []
         dtype = self.dit.dtype
         frame = (1, 1, *self.config.latent_shape)
@@ -704,7 +704,7 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
         self, device: torch.device, tp_world_size: int = 1
     ) -> list[AcceleratorGraphConfig]:
         del tp_world_size
-        if not self.config.cuda_graph:
+        if not self.config.accelerator_graph:
             return []
         configs = []
         for h, w in self._capture_hw:

@@ -173,14 +173,13 @@ class WaypointConfig:
 
     # Attempt fixed-shape accelerator graph capture for encoder/DiT/decoder prime and
     # rollout paths; disabled or failed capture falls back to eager forwards.
-    # Retains the legacy config key for existing deployments.
-    cuda_graph: bool = True
+    accelerator_graph: bool = True
 
     # Extra (H, W) seed shapes the vae_encoder captures a graph for; others run eager.
     seed_capture_sizes: tuple[tuple[int, int], ...] = ()
 
     # Also capture the one-time DiT prime/cache pass. Subordinate to
-    # cuda_graph: disabled serves prime through the compiled eager forward.
+    # accelerator_graph: disabled serves prime through the compiled eager forward.
     capture_dit_prime: bool = True
 
     # Rows carried per rollout step, one per resident world sharing the DiT

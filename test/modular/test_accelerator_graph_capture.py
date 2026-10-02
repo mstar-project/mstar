@@ -365,21 +365,18 @@ def test_a_failed_capture_leaves_the_pool_and_stream_usable():
 
 def test_required_graphs_turn_a_dropped_bucket_into_a_startup_failure(monkeypatch):
     monkeypatch.delenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", raising=False)
-    monkeypatch.delenv("MSTAR_REQUIRE_CUDA_GRAPHS", raising=False)
     fail_if_graphs_required(["node decode[bs=1]"])
 
-    monkeypatch.setenv("MSTAR_REQUIRE_CUDA_GRAPHS", "1")
+    monkeypatch.setenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "1")
     fail_if_graphs_required([])
     with pytest.raises(RuntimeError, match="node decode"):
         fail_if_graphs_required(["node decode[bs=1]"])
 
 
-def test_accelerator_graph_requirement_takes_precedence_over_legacy_setting(monkeypatch):
-    monkeypatch.setenv("MSTAR_REQUIRE_CUDA_GRAPHS", "1")
+def test_accelerator_graph_requirement_can_be_disabled_explicitly(monkeypatch):
     monkeypatch.setenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "0")
     fail_if_graphs_required(["node decode[bs=1]"])
 
-    monkeypatch.setenv("MSTAR_REQUIRE_CUDA_GRAPHS", "0")
     monkeypatch.setenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "1")
     with pytest.raises(RuntimeError, match="Accelerator graph|accelerator graph"):
         fail_if_graphs_required(["node decode[bs=1]"])

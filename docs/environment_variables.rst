@@ -65,8 +65,6 @@ Communication
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
-       ``MSTAR_REQUIRE_CUDA_GRAPHS`` remains an alias; the accelerator setting
-       takes precedence when both are set.
    * - ``MSTAR_SHM_ARENA``
      - ``0``
      - SHM tensor-transport implementation. ``0``: per-uuid files.
@@ -176,6 +174,17 @@ model, so they are named for it.
      - ``1,2,4``
      - Comma-separated batch sizes to capture. Read only when
        ``MSTAR_VIT_BATCHING=1``; otherwise only batch size 1 is captured.
+   * - ``COSMOS3_DISABLE_ACCELERATOR_GRAPH``
+     - unset
+     - Cosmos3: any nonempty value disables denoise, prefill and reasoner
+       decode capture. The deployment option
+       ``model_kwargs.accelerator_graph: false`` also disables all these
+       captures and cannot be overridden by this variable.
+   * - ``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH``
+     - unset
+     - Cosmos3: any nonempty value disables only the understanding-tower
+       prefill capture. Denoise and reasoner decode captures remain eligible
+       when ``model_kwargs.accelerator_graph`` is true.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
      - OmniVoice: load weights from this local directory instead of the
