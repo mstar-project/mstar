@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
     from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
     from mstar.engine.engine import ExecutingBatch
+    from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
 @dataclass
@@ -278,6 +279,11 @@ class ModelInputsFromEngine:
     # ``capture_forward_method``, so most submodules never need this.
     captured: bool = False
 
+    # rid -> {input_name: StreamChunkInfo}; only rids consuming a streamed input
+    per_request_stream_chunks: "Mapping[str, Mapping[str, StreamChunkInfo]]" = field(
+        default_factory=dict
+    )
+
     @property
     @torch.compiler.disable
     def single_request_info(self):
@@ -363,6 +369,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """
         del graph_walk, per_request_info
         return None
+
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        """Whether the scheduler batches each ``cg_key_info`` group apart.
+
+        A batch spanning two groups matches no capture. Opt in when that batch
+        runs worse than two captured ones, e.g. per-request eager; leave it off
+        when a batched eager forward handles the mix well.
+        """
+        del graph_walk
+        return False
 
     def request_state(self, request_id: str) -> PerRequestState:
         """The request's state, created on first access."""

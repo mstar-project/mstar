@@ -5,8 +5,11 @@ Loop-back nodes are re-armed implicitly by their re-injected inputs; a
 pure-streaming node has nothing to re-inject, so without an explicit re-arm it
 falls out of ``ready_for_streaming`` after the first chunk and the loop stalls
 (the Nemotron-Duplex talker / codec stream-consuming loops). This exercises the
-generic ``Loop._advance_one_iter`` → ``WorkerGraphStateRegistry.rearm_streaming``
-path, independent of any model.
+generic ``Loop._advance_one_iter`` → ``LoopStateRegistry.reset_for_iter`` →
+``_reseed_streaming_ready`` path, independent of any model.
+
+Covers the registry level across a loop iteration, which ``test_ready_signals``
+(``ReadySignals`` on its own) does not reach.
 """
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.graph_io import WorkerGraphIO

@@ -23,7 +23,31 @@ Communication
        ``1``: the Rust communicator, raising if the extension is missing.
        ``0``: always pyzmq. The two transports are wire-compatible, so
        this can be set per-process while the rest of the mesh stays on
-       pyzmq.
+       pyzmq. Under ``MSTAR_RUST_GRAPH=AUTO``, ``0`` also keeps that
+       worker's graph runtime on Python -- the Rust one cannot share a
+       pyzmq transport.
+   * - ``MSTAR_RUST_GRAPH``
+     - ``AUTO``
+     - Which graph runtime a worker builds (see
+       :func:`mstar.graph.runtime.utils.resolve_graph_runtime_type`).
+       ``AUTO``: Rust where the vendored ``rust/`` extension imports *and*
+       the Rust transport is in use, Python otherwise. ``1``: the Rust
+       runtime, failing at startup if the transport or the tensor bookkeeper
+       is a Python one -- it holds a share of both, so there is no degraded
+       mode to fall back to. ``0``: always the Python runtime. Resolved once
+       per process, because it also selects the tensor bookkeeper the
+       runtime and the tensor store must share.
+   * - ``MSTAR_WIRE_CODEC``
+     - ``msgpack``
+     - How messages are encoded on every communicator edge (see
+       :func:`mstar.communication.codec.default_codec`). ``msgpack``: the
+       typed encoding in :mod:`mstar.communication.wire`, language-neutral
+       so an edge can terminate in a Rust process. ``pickle``: the old
+       Python-only wire, kept for bisecting a wire problem. Both ends of an
+       edge must agree, so this is all-or-nothing for a mesh -- one process
+       set differently cannot talk to its peers. ``pickle`` is incompatible
+       with the Rust graph runtime, which builds its frames as typed
+       msgpack; that pairing fails at startup rather than mixing wires.
    * - ``MSTAR_ZMQ_TRANSPORT``
      - constructor's protocol
      - Overrides the communicator protocol (``IPC`` or ``TCP``) for a
@@ -48,6 +72,13 @@ Communication
        extension; raises if missing). ``AUTO``: the arena when the
        extension imports, files otherwise. Must match across the
        deployment — arena locations ride in the tensor descriptors.
+   * - ``MSTAR_KV_SHM_DIR``
+     - ``/dev/shm`` (or ``/tmp`` if unavailable)
+     - Base directory for host-staged KV snapshots when remote KV transfer
+       uses SHM. Each deployment creates a private child directory here;
+       request cleanup removes snapshots, and startup removes directories
+       left by dead deployments. All workers sharing KV snapshots must see
+       the same filesystem.
    * - ``MSTAR_SHM_ARENA_SEGMENT_MB``
      - ``256``
      - Size of each arena segment. The arena grows segment by segment;
@@ -282,3 +313,18 @@ Worker scheduling
        ``remove_request``, check the KV page bookkeeping (free list, owner
        counts, seals) against the streams holding the pages. Walks every
        live stream; tests and debugging only.
+
+Compilation
+-----------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 14 58
+
+   * - Variable
+     - Default
+     - Meaning
+   * - ``MSTAR_RECOMPILE_LIMIT``
+     - ``84``
+     - Dynamo's recompile limit, clamped to [8, 256]. Raise it if the logs
+       show ``hit config.recompile_limit``.

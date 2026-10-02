@@ -20,7 +20,7 @@ import torch
 from mstar.engine.engine import checkpoint_identity
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig
+from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PosScheme
 from mstar.engine.resources.position.manager import RopeManager
@@ -30,11 +30,18 @@ from mstar.model.base import Model
 class _StubTransfer:
     """No engine, no bytes moved."""
 
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
-    def get_kv_transfer_info(self):
-        return None
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del kwargs
+        return transfer_info == self.get_kv_transfer_info()
+
+    def remove_request(self, request_id):
+        del request_id
 
     def start_async_retrieve(self, **kwargs):
         del kwargs
@@ -55,7 +62,7 @@ def _kv(dtype=torch.float32, **overrides) -> KVManager:
     )
     cfg.update(overrides)
     return KVManager(
-        cfg=KVConfig(**cfg), name="kv", joint_comm_group=None,
+        cfg=PagedKVConfig(**cfg), name="kv", joint_comm_group=None,
         transfer_engine_info=None, device=torch.device("cpu"), dtype=dtype,
     )
 

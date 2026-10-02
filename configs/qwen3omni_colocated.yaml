@@ -1,5 +1,12 @@
 model: "qwen3_omni"
 max_seq_len: 32768
+# The KV pools default to 2,048 pages. The Thinker's is 24 GiB at 12 MiB a page,
+# and every node's weights on one 80 GB GPU leave about 12 GiB.
+resources:
+  thinker_kv:
+    max_num_pages: 256
+  talker_kv:
+    max_num_pages: 256
 node_groups:
   - node_names: [audio_encoder, vision_encoder, Code2Wav]
     ranks: [0]

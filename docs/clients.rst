@@ -34,7 +34,7 @@ NDJSON stream.
    * - ``output_modalities``
      - ``text``
      - Comma-separated desired outputs (e.g. ``text``, ``image``, ``audio``, ``video``,
-       ``action``).
+       ``video_frame``, ``action``). ``video_frame`` is streaming-only raw RGB24.
    * - ``streaming``
      - ``true``
      - ``true`` → NDJSON stream of chunks; ``false`` → one JSON document.
@@ -58,7 +58,11 @@ A non-streaming response groups outputs by modality, each payload base64-encoded
    }
 
 A streaming response is ``application/x-ndjson`` — one JSON object per line as chunks
-arrive. ``GET /health`` returns ``{"status": "healthy"}``.
+arrive. A client that sends ``Accept: application/vnd.mstar.frames`` receives
+length-framed binary chunks instead, which skips the base64 pass on multi-megabyte
+``video_frame`` payloads; a server without the framing keeps answering NDJSON, so a
+client must parse by the response ``Content-Type``. ``GET /health`` returns
+``{"status": "healthy"}``.
 
 .. code-block:: bash
 
@@ -72,6 +76,47 @@ arrive. ``GET /health`` returns ``{"status": "healthy"}``.
    curl -s http://localhost:8000/generate \
      -F 'text=hello there' -F 'output_modalities=audio' \
      -F 'model_kwargs={"voice":"tara"}' -F 'streaming=false'
+
+WebSocket ``/generate/ws``
+--------------------------
+
+``/generate/ws`` is the same request over one persistent WebSocket, for control loops
+that cannot afford an HTTP round trip per step (robot policies, streaming world models).
+Each message is one request with the ``/generate`` fields — ``text``, ``files`` as
+``[{"name": ..., "data": ...}]``, ``input_modalities``, ``output_modalities``,
+``model_kwargs``, ``request_id`` — sent either as a JSON text frame (``data`` base64) or
+as a msgpack binary frame (``data`` raw bytes). Replies use the same encoding as the
+message: one frame per result chunk, ``{"request_id", "modality", "data", "metadata"}``,
+then ``{"request_id", "finish": true}``. A rejected message answers
+``{"request_id", "error": ...}`` and the socket stays open; a request that fails after it
+was accepted ends the same way, with the HTTP ``status`` it would have had, and no
+``finish`` follows. Messages may be pipelined —
+send the next observation before the current action chunk has returned — and the
+``request_id`` tells the replies apart. Closing the socket aborts whatever is still in
+flight.
+
+.. code-block:: python
+
+   import msgpack, numpy as np, websockets.sync.client
+
+   with websockets.sync.client.connect("ws://localhost:8000/generate/ws", max_size=None) as ws:
+       ws.send(msgpack.packb({
+           "text": "pick up the mug",
+           "files": [{"name": "obs.jpg", "data": open("obs.jpg", "rb").read()}],
+           "output_modalities": ["action"],
+           "model_kwargs": {"action_mode": "policy", "domain_name": "droid_lerobot",
+                            "raw_action_dim": 10, "action_chunk_size": 32},
+           "request_id": "step-0",
+       }, use_bin_type=True))
+       while True:
+           reply = msgpack.unpackb(ws.recv(), raw=False)
+           if reply.get("modality") == "action":
+               actions = np.frombuffer(reply["data"], dtype=np.float32).reshape(32, -1)
+           if reply.get("finish") or reply.get("error"):
+               break
+
+``examples/cosmos3_action_ws_client.py`` is a complete openpi-style client that runs this
+loop at a fixed observation rate and reports chunks/s, actions/s and latency percentiles.
 
 Python SDK
 ----------
@@ -108,6 +153,8 @@ Convenience wrappers:
      - PNG ``bytes`` (e.g. BAGEL text-to-image).
    * - ``tts(text, *, voice=None, **kw)``
      - An ``AudioBuffer`` (``.to_wav(path)``, ``.to_numpy()``, ``len(...)`` samples).
+   * - ``voices()``
+     - The ``voice`` ids the served speech model accepts (``GET /v1/audio/voices``).
    * - ``stream(**kw)``
      - Sugar for ``generate(stream=True, ...)``.
    * - ``health()``
@@ -121,7 +168,15 @@ Result and event types live in ``mstar.client``:
 - ``AudioBuffer`` — decoded PCM with ``.sample_rate``; ``.to_wav(path)``, ``.to_numpy()``,
   ``len(...)``.
 - Stream events — ``TextChunk(text)``, ``ImageChunk(data)`` (``.save(path)``),
-  ``AudioChunk(pcm, sample_rate)``.
+  ``AudioChunk(pcm, sample_rate)``, and ``VideoFrameChunk(data, metadata)``. A
+  video-frame chunk validates its width, height, fps, pixel format and frame range;
+  ``.to_numpy()`` returns a zero-copy ``[frame_count, height, width, 3]`` uint8 view.
+  Raw ``video_frame`` requests require ``stream=True``. The SDK asks for the binary
+  framing automatically for ``video_frame``; other modalities opt in with
+  ``MStarClient(prefer_binary=True)``. The server does not pace generation to the
+  consumer: frames are produced at model speed and buffered by the API server until
+  read, bounded by the request's frame count, so a consumer slower than realtime
+  accumulates that backlog in server memory (about 11 MiB per chunk at 720p).
 
 .. code-block:: python
 
@@ -162,8 +217,21 @@ Endpoints and model coverage:
      - ``bagel``, ``qwen3_omni``
      - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.
    * - ``POST /v1/audio/speech``
-     - ``orpheus``, ``qwen3_omni``
-     - Text-to-speech.
+     - ``kokoro``, ``orpheus``, ``qwen3_omni``
+     - Text-to-speech (``kokoro`` streams sentence by sentence with ``stream=True``).
+   * - ``GET /v1/audio/voices``
+     - speech models that publish a voice list through their speech adapter (``kokoro``, ``orpheus``; 404 otherwise)
+     - The ``voice`` ids the served model accepts, plus its default.
+   * - ``POST /v1/audio/transcriptions``
+     - ``whisper_large``, ``higgs_audio``
+     - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
+       ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
+   * - ``WS /v1/realtime?intent=transcription``
+     - models whose adapter can continue a hypothesis
+     - Streaming speech-to-text: ``input_audio_buffer.append`` PCM16 chunks in,
+       ``conversation.item.input_audio_transcription.delta`` (append-only) and
+       ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
+       finishes the utterance.
    * - ``POST /v1/images/generations``
      - ``bagel``
      - Text-to-image.
@@ -171,8 +239,10 @@ Endpoints and model coverage:
      - ``bagel``
      - Image editing (image + prompt → image).
 
-Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``) return ``404`` on
-``/v1/*``; use ``/generate`` or the SDK for them.
+Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``, ``waypoint``)
+return ``404`` on ``/v1/*``; use ``/generate`` or the SDK for them. In particular,
+Waypoint emits live RGB frame chunks and is not routed through the encoded-video
+``/v1/videos/generations`` endpoint.
 
 .. code-block:: python
 
@@ -181,6 +251,12 @@ Models without an OpenAI surface (``pi05``, ``vjepa2``, ``vjepa2_ac``) return ``
 
    # text-to-speech
    client.audio.speech.create(model="orpheus", input="hello there", voice="tara")
+   # (mstar extension) the voices the served model accepts
+   requests.get("http://localhost:8000/v1/audio/voices").json()["voices"]
+
+   # speech-to-text
+   client.audio.transcriptions.create(model="whisper_large", file=open("speech.wav", "rb"),
+                                      language="en")
 
    # image generation
    client.images.generate(model="bagel", prompt="a cat in a hat")
@@ -194,6 +270,35 @@ Per-model notes:
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
   Non-OpenAI knobs (e.g. ``talker_top_k``, ``code_predictor_top_p``) go through
   ``extra_body``.
+- **Whisper / Higgs-Audio** — ``language`` (ISO-639-1) skips language detection,
+  ``prompt`` conditions the decoder on prior text (it reaches the model as
+  ``initial_prompt``), and ``response_format``
+  ``verbose_json`` / ``srt`` / ``vtt`` (or ``timestamp_granularities[]``) asks the
+  model for timestamps. Whisper's language and timestamp tokens travel in the
+  text stream and are lifted into ``language`` / ``segments`` by the server; a
+  streaming client receives only the spoken words. Uploads longer than the
+  model's clip (30 s for Whisper) are served as consecutive windows. By default
+  they run in order, openai-whisper style: each window gets the transcript so
+  far as ``initial_prompt`` and the first window's detected language, is decoded
+  with timestamps so the next window can start where its last closed segment
+  ended (no word is split by a boundary), and is decoded again when its text is
+  a repetition loop (gzip compression ratio above 2.4): first without the
+  conditioning text, then at rising temperatures — after which the transcript
+  so far stops conditioning later windows.
+  Leave ``temperature`` at 0 to get that fallback; a pinned temperature is used
+  as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
+  once, each cut at the quietest moment before its boundary. Segment timestamps
+  are offset to the whole file.
+- **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
+  session re-transcribes everything heard so far as one engine request whose assistant
+  turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``
+  tokens (the Qwen3-ASR SDK's streaming algorithm), so only the tail is ever revised.
+  Tune ``chunk_seconds`` / ``unfixed_chunks`` / ``unfixed_tokens`` under ``session.mstar``
+  in ``transcription_session.update``.
+- **Kokoro** — ``voice`` is one of the 54 bundled voices (default ``af_heart``) or a
+  blend such as ``af_bella+af_sky`` or ``af_bella(2)+af_sky(1)``; ``speed`` scales the
+  speaking rate (0.25-4.0). ``lang_code`` and ``phonemes`` go through ``extra_body``.
+  ``temperature`` / ``top_p`` are ignored: Kokoro does not sample.
 - **Orpheus** — set the speaker with ``voice`` — one of ``tara`` (default), ``zoe``,
   ``zac``, ``jess``, ``leo``, ``mia``, ``julia``, ``leah`` (the ``available_voices`` list
   in the Orpheus config).

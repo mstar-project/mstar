@@ -33,6 +33,12 @@ class CudaGraphConfig(ABC):
         # (eager) batch size for the walk. Default True keeps the conservative
         # behavior: never batch beyond a captured graph size.
         caps_eager_batch_size: bool = True,
+        # Maps a static-input key, as returned by the submodule's
+        # ``preprocess``, to the dim that varies with the bucket. Overrides
+        # the runner's size-matching guess (``CudaGraphRunner._seq_dim``),
+        # which can pick the wrong dim when an unrelated axis happens to
+        # match the bucket's token count.
+        input_seq_dims: dict[str, int] | None = None,
     ):
         self.capture_graph_walk = capture_graph_walk
         self.replay_graph_walks = replay_graph_walks or [capture_graph_walk]
@@ -41,6 +47,7 @@ class CudaGraphConfig(ABC):
         self.capture_batch_sizes = capture_batch_sizes
         self.capture_forward_method = capture_forward_method
         self.caps_eager_batch_size = caps_eager_batch_size
+        self.input_seq_dims = input_seq_dims
 
     @abstractmethod
     def get_config_type(self) -> CudaGraphConfigType:
@@ -67,6 +74,7 @@ class BatchedCudaGraphConfig(CudaGraphConfig):
         capture_forward_method: str = "forward_batched",
         caps_eager_batch_size: bool = True,
         total_tokens_multiplier: int = 1,
+        input_seq_dims: dict[str, int] | None = None,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -76,6 +84,7 @@ class BatchedCudaGraphConfig(CudaGraphConfig):
             capture_batch_sizes=capture_batch_sizes,
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
+            input_seq_dims=input_seq_dims,
         )
         self.single_request_inputs = single_request_inputs
         # ``single_request_inputs.input_seq_len`` is also read per-label by the
@@ -122,7 +131,8 @@ class PackedCudaGraphConfig(CudaGraphConfig):
         compile: bool = True,
         capture_batch_sizes: list[int] | None = None,
         capture_forward_method: str = "forward_batched",
-        caps_eager_batch_size: bool = True
+        caps_eager_batch_size: bool = True,
+        input_seq_dims: dict[str, int] | None = None,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -131,7 +141,8 @@ class PackedCudaGraphConfig(CudaGraphConfig):
             compile=compile,
             capture_batch_sizes=capture_batch_sizes,
             capture_forward_method=capture_forward_method,
-            caps_eager_batch_size=caps_eager_batch_size
+            caps_eager_batch_size=caps_eager_batch_size,
+            input_seq_dims=input_seq_dims,
         )
         self.make_node_input = make_node_input
         self.capture_token_lengths = capture_token_lengths
