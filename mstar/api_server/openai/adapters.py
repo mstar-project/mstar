@@ -792,6 +792,8 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
         # an open segment at the end of the stream: keep its text, no end
         parts.append("".join(buffer).strip())
     return language, segments, parts, start is not None
+
+
 class Qwen3ASRAdapter(OpenAIAdapter):
     """Qwen3-ASR: an LLM decoder that writes ``language {Name}<asr_text>{text}``
     (or the text alone when the language is forced). Hears up to 20 minutes
@@ -817,10 +819,14 @@ class Qwen3ASRAdapter(OpenAIAdapter):
             args.model_kwargs["assistant_prefix"] = prefix
         return args
 
-    def stream_delta(self, text: str) -> str:
-        # the language line and the tag are structure, not speech. They are
-        # short and arrive as whole tokens, so hide them token by token
-        return "" if text.strip().startswith(("language", ASR_TEXT_TAG)) or ASR_TEXT_TAG in text else text
+    def stream_text(self, raw: str) -> str:
+        # ``language {Name}<asr_text>`` is structure, not speech: hold it back
+        # until the tag closes it (a forced language is in the prompt instead)
+        _, tag, text = raw.partition(ASR_TEXT_TAG)
+        if tag:
+            return text
+        head = raw.lstrip()
+        return "" if head.startswith("language") or "language".startswith(head) else raw
 
     def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
         raw = text.strip()

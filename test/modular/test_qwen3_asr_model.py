@@ -408,4 +408,8 @@ def test_openai_adapter_parses_language_line_and_continues_hypotheses():
     assert ad.parse_transcript("language None<asr_text>", free).language is None
     assert ad.parse_transcript(" plain words ", req).text == "plain words"
     assert ad.parse_transcript(" plain words ", req).language == "en"
-    assert ad.stream_delta("language English<asr_text>") == "" and ad.stream_delta(" Hello") == " Hello"
+    # the header arrives token by token; none of it reaches the stream
+    for raw in ("lang", "language", "language English", "language English<asr", "language English<asr_text>"):
+        assert ad.stream_text(raw) == ""
+    assert ad.stream_text("language English<asr_text>He hoped") == "He hoped"
+    assert ad.stream_text(" Hello") == " Hello"  # a forced language writes no header
