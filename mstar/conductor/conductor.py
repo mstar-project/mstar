@@ -731,23 +731,33 @@ class Conductor:
                 )
                 for dest_worker, sliced_edge in fanout.items():
                     inputs_per_worker[dest_worker].append(sliced_edge)
-        # Groups that differ only by the walk or node that produced them (a
-        # transcript persisted across two walks) come back as several edges
-        # of one name. The consumer takes a repeated name as the next loop
-        # iteration's input, so merge them here, in order. TP fan-in edges
-        # stay apart, the consumer consolidates those by source rank.
+        # The split above yields one edge per (rank, node, walk), so a name
+        # produced across walks arrives as several. The consumer would take the
+        # second as the next iteration's input and drop the third, so rejoin
+        # them in persist order. Keyed by source rank: a TP fan-in edge stays
+        # one per rank, which is what the consumer consolidates on.
         for dest_worker, edges in inputs_per_worker.items():
             merged: list[GraphEdge] = []
-            first_by_key: dict[tuple[str, str], GraphEdge] = {}
+            first_by_key: dict[tuple[str, str, int], GraphEdge] = {}
             for edge in edges:
-                first = first_by_key.get((edge.name, edge.next_node))
-                if (
-                    first is not None and edge.tensor_info and first.tensor_info
-                    and edge._total_fanin == 1 and first._total_fanin == 1
-                ):
+                if not edge.tensor_info:
+                    merged.append(edge)  # signal-only, nothing to join
+                    continue
+                key = (
+                    edge.name, edge.next_node,
+                    edge.tensor_info[0].source_tp_rank,
+                )
+                first = first_by_key.get(key)
+                if first is not None:
+                    # Rank numbering only lines up if the contributors share a
+                    # source TP size, which is what fan-in counts.
+                    assert first._total_fanin == edge._total_fanin, (
+                        f"{edge.name}: contributors to one name disagree on "
+                        f"fan-in ({first._total_fanin} vs {edge._total_fanin})"
+                    )
                     first.tensor_info = first.tensor_info + edge.tensor_info
                     continue
-                first_by_key.setdefault((edge.name, edge.next_node), edge)
+                first_by_key[key] = edge
                 merged.append(edge)
             inputs_per_worker[dest_worker] = merged
         return inputs_per_worker
