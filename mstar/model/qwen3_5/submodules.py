@@ -85,6 +85,14 @@ class LLMSubmodule(ARNodeSubmodule):
     # because the interned static buffers are sized by the largest bucket in
     # the config; a longer prompt falls back to the eager path.
     PREFILL_VISION_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
+    # Requests per `prefill_vision` step, so a packed step stays inside the
+    # 4096-token top bucket: Food101-sized images (<=512 px) are ~300 tokens a
+    # request, so 14 already overflow it; 4 fit up to ~1000 tokens a request
+    # (about a 1000 px square image with its text). Past the top bucket the
+    # step drops to the eager path, where every new packed length recompiles.
+    # Chunked prefill replaces this cap.
+    PREFILL_VISION_MAX_BATCH_SIZE = 4
+    PREFILL_VISION_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
     def __init__(
         self,
@@ -154,7 +162,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 capture_graph_walk="prefill_vision",
                 capture_token_lengths=self.PREFILL_VISION_TOKEN_BUCKETS,
                 make_node_input=vision_dummy,
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
+                capture_batch_sizes=self.PREFILL_VISION_CAPTURE_BATCH_SIZES,
             ),
         ]
 
@@ -445,6 +453,11 @@ class LLMSubmodule(ARNodeSubmodule):
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs],
     ) -> bool:
         return True
+
+    def max_batch_size(self, graph_walk: str) -> int | None:
+        if graph_walk == "prefill_vision":
+            return self.PREFILL_VISION_MAX_BATCH_SIZE
+        return None
 
     def forward_batched(
         self,
