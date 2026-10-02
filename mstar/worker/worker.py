@@ -6,10 +6,10 @@ import threading
 import time
 import time as _time
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Container, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import partial
 from time import sleep
@@ -1425,8 +1425,6 @@ class Worker:
         )
 
 
-
-
     # ------------------------------------------------------------------
     # Main loop — async scheduling
     #
@@ -1797,6 +1795,40 @@ class Worker:
             )
         )
 
+    def _speculative_fwd_info(
+        self,
+        request_ids: list[int],
+        partition: str,
+        spec_target: SpeculationOutput,
+        continuing: Container[int],
+    ) -> dict[int, CurrentForwardPassInfo]:
+        """The step context a speculative batch runs each rid under.
+
+        A request's shared info is refreshed as each batch is built, so while
+        iteration k of a loop is in flight it reads k, and stays there until the
+        step lands. A speculative next iteration that ran under it would take k
+        again: a denoise step would run the same sigma twice, and the overshoot
+        past the last step would never be vetoed. So the speculative batch gets a
+        view of its own, with the counters it will run at: one past the in-flight
+        iteration for a continuing rid on a new iteration of its loop, and the
+        loops' current indices otherwise (a fresh rid's loop already advanced when
+        its last step routed). The mutable per-request tables are shared, so what
+        an engine records on the view is seen by later steps; the in-flight batch
+        keeps the shared info, so its stop check still reads k.
+        """
+        per_request_info = {}
+        for rid, new_iters in self._graph_runtime.get_dynamic_loop_iters(
+            request_ids, partition=partition,
+        ):
+            info = self.request_state.get_fwd_info(rid, partition)
+            counts = dict(info.dynamic_loop_iter_counts)
+            counts.update(new_iters)
+            if spec_target.is_new_loop_iter and rid in continuing:
+                loop = spec_target.loop_name
+                counts[loop] = counts.get(loop, 0) + 1
+            per_request_info[rid] = replace(info, dynamic_loop_iter_counts=counts)
+        return per_request_info
+
     def _assemble_speculation(
         self,
         pending: PendingBatch,
@@ -1832,10 +1864,9 @@ class Worker:
             graph_walk=pending.graph_walk,
             request_ids=request_ids,
             per_request_input_tensors=per_request_inputs,
-            per_request_info={
-                rid: self.request_state.get_fwd_info(rid, pending.partition)
-                for rid in request_ids
-            },
+            per_request_info=self._speculative_fwd_info(
+                request_ids, pending.partition, spec_target, set(continuing),
+            ),
             final_edges={
                 rid: {se.edge.name for se in edges if se.chunk.is_final}
                 for rid, edges in consumed_streaming_edges.items()
