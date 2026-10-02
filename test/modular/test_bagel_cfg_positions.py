@@ -23,7 +23,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.resources import KVConfig, PositionConfig, StepContext, StepRunner
+from mstar.engine.resources import PagedKVConfig, PositionConfig, StepContext, StepRunner
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.manager import RopeManager
@@ -48,7 +48,7 @@ class _Harness:
 
         self.device = device
         self.kv = KVManager(
-            cfg=KVConfig(
+            cfg=PagedKVConfig(
                 num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
                 max_num_pages=512, page_size=16,
             ),

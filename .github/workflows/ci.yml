@@ -41,7 +41,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
             --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -e ".[dev]"
+          # flex_attention imports torch._inductor, which needs Triton even on
+          # CPU; 3.5.1 is the version torch 2.9.1 pins.
+          python -m pip install triton==3.5.1
+          python -m pip install -e ".[dev,waypoint]"
+          # BAGEL's CPU graph/KV tests import these model modules without
+          # loading weights or requiring the CUDA-only BAGEL extras.
+          python -m pip install einops regex transformers
           python -m pip check
       - name: Run CPU core tests
         env:
@@ -97,7 +103,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
       - name: Cargo tests (transport + arena semantics)
         working-directory: rust
-        run: cargo test --release
+        # Off with extension-module (see rust/Cargo.toml): the test binary is an
+        # executable, so it links libpython rather than resolving CPython
+        # symbols at import time. setup-python's interpreter is --enable-shared,
+        # so point the loader at its libdir for the run.
+        env:
+          LD_LIBRARY_PATH: ${{ env.pythonLocation }}/lib
+        run: cargo test --release --no-default-features
       - name: Build the Rust frontend (mstar-server)
         working-directory: rust/server
         run: cargo build --release
@@ -109,7 +121,8 @@ jobs:
           pip install target/wheels/*.whl
       - name: Interop tests (transport + arena + frontend)
         run: |
-          pip install pytest pyzmq msgpack numpy
+          # pyyaml: the runtime tests reach mstar.model.base, which imports it
+          pip install pytest pyzmq msgpack numpy pyyaml
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level)
           pip install torch --index-url https://download.pytorch.org/whl/cpu

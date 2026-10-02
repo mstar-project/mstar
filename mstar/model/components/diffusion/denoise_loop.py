@@ -306,6 +306,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                 # every static input is row-leading ([tokens, features] or a per-batch scalar); a text
                 # embedding's hidden size can equal an edit bucket's token count (7680 for klein), which
                 # would otherwise be mistaken for the token axis
-                static_seq_dims={key: 0 for key in tensors},
+                input_seq_dims={key: 0 for key in tensors},
             ))
         return configs

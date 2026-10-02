@@ -1,3 +1,4 @@
+import fcntl
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -5,6 +6,7 @@ from enum import Enum
 
 import zmq
 
+from mstar.communication.codec import Codec, decode_each, default_codec
 from mstar.communication.event import EventWakeup
 
 logger = logging.getLogger(__name__)
@@ -14,6 +16,13 @@ logger = logging.getLogger(__name__)
 #: install - e.g. a stale wheel after an upgrade - takes over the mesh
 #: silently, so the factory warns when the imported version differs.
 EXPECTED_MSTAR_RUST_VERSION = "0.1.0"
+
+
+#: The entity whose endpoint stands for the whole deployment: the one every
+#: deployment has exactly one of. Two deployments that agree on this endpoint
+#: ARE the same deployment as far as anything keyed off it is concerned --
+#: notably the tensor-file namespace in ``mstar.communication.tensors``.
+DEPLOYMENT_ANCHOR_ENTITY = "conductor"
 
 
 class CommProtocol(Enum):
@@ -46,6 +55,43 @@ class BaseCommunicator(ABC):
             return f"tcp://{host}:{self._tcp_port(entity_id)}"
         raise NotImplementedError(f"Protocol {self.protocol} not yet supported yet")
 
+    def _lock_deployment(self, my_id: str) -> None:
+        """Claim this deployment, so a second one on the same IPC prefix fails
+        here instead of corrupting the first.
+
+        Only the anchor entity locks, and only over IPC. TCP needs no lock: two
+        deployments sharing a base port collide on ``bind`` already. IPC does
+        not -- libzmq UNLINKS an existing socket file and binds a fresh one, so
+        the second conductor comes up, silently steals every connection aimed
+        at the first, and derives the same tensor-file namespace (uuids are
+        per-entity counters, so both deployments then write, read and unlink
+        each other's ``mstar_<ns>_worker_0_<n>``).
+
+        An ``flock`` on a file beside the socket is what turns that into an
+        error. It is released by the kernel when the process exits however it
+        exits, so a crashed deployment leaves nothing to clean up; the fd is
+        kept on the instance purely so it outlives this call.
+        """
+        if self.protocol != CommProtocol.IPC or my_id != DEPLOYMENT_ANCHOR_ENTITY:
+            return
+        path = self._endpoint(my_id).removeprefix("ipc://") + ".lock"
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            raise RuntimeError(
+                f"another mstar deployment already holds {path}: its "
+                f"{my_id} is bound to the same IPC prefix "
+                f"({self.ipc_socket_path_prefix!r}). Two deployments cannot "
+                "share a prefix -- the second would take over the first's "
+                "sockets and tensor files. Give this one its own "
+                "ipc_socket_path_prefix, or run it over TCP."
+            ) from exc
+        # Never unlinked: another process may already hold an fd on this inode,
+        # and removing it would let a third lock a different one.
+        self._deployment_lock_fd = fd
+
     @staticmethod
     def _tcp_port(entity_id: str) -> int:
         base_port = int(os.getenv("MSTAR_ZMQ_TCP_BASE_PORT", "19000"))
@@ -73,8 +119,10 @@ class ZMQCommunicator(BaseCommunicator):
         push_ids: list[str],
         protocol: CommProtocol=CommProtocol.IPC,
         ipc_socket_path_prefix: str="/tmp/mstar/",
+        codec: type[Codec] | None = None,
         # TODO: for TCP
     ):
+        self.codec = codec or default_codec()
         self.context = zmq.Context.instance()
         transport = os.getenv("MSTAR_ZMQ_TRANSPORT", protocol.value).upper()
         self.protocol = CommProtocol(transport)
@@ -89,6 +137,7 @@ class ZMQCommunicator(BaseCommunicator):
         self.ipc_socket_path_prefix = ipc_socket_path_prefix
 
         if self.protocol == CommProtocol.IPC:
+            self._lock_deployment(my_id)
             self.pull_socket.bind(self._endpoint(my_id))
             self.pull_socket.setsockopt(zmq.LINGER, 0)
         elif self.protocol == CommProtocol.TCP:
@@ -133,16 +182,17 @@ class ZMQCommunicator(BaseCommunicator):
 
     def send(self, entity_id: str, msg):
         # TODO: maybe serialize to JSON instead if more efficient
+        # no str(): the repr is ~10us on an InputSignals and DEBUG is off here
         logger.debug(
             "%s to send a message %s to entity %s",
-            self.my_id, str(msg), entity_id
+            self.my_id, msg, entity_id
         )
         if entity_id not in self.push_sockets:
             sock = self.context.socket(zmq.PUSH)
             sock.connect(self._endpoint(entity_id))
             sock.setsockopt(zmq.LINGER, 0)
             self.push_sockets[entity_id] = sock
-        self.push_sockets[entity_id].send_pyobj(msg)
+        self.push_sockets[entity_id].send(self.codec.encode(msg))
 
     def get_all_new_messages(self, blocking=False, timeout_s=None) -> list:
         messages = []
@@ -161,13 +211,14 @@ class ZMQCommunicator(BaseCommunicator):
                 # zmq.NOBLOCK means zmq doesn't wait for a new message to be
                 # available, it returns a message if it exists or raises an error
                 # if no messages are available (error is caught below)
-                messages.append(self.pull_socket.recv_pyobj(
-                    flags=zmq.NOBLOCK
-                ))
-                logger.debug(
-                    "%s to received message %s",
-                    self.my_id, str(messages[-1])
-                )
+                frame = self.pull_socket.recv(flags=zmq.NOBLOCK)
+                decoded = decode_each(self.codec, [frame], self.my_id)
+                messages.extend(decoded)
+                # no str(): the repr is ~10us and DEBUG is off here
+                if decoded:
+                    logger.debug(
+                        "%s to received message %s", self.my_id, decoded[0]
+                    )
             except zmq.Again:
                 # zmq.Again actually means no messages left to read
                 break
@@ -185,7 +236,7 @@ def make_communicator(*args, **kwargs) -> BaseCommunicator:
     * ``1`` — the Rust communicator; raises if the extension is missing.
     * ``0`` — always the pyzmq ``ZMQCommunicator``.
 
-    The two are wire-compatible (same endpoints, same pickle frames), so the
+    The two are wire-compatible (same endpoints, same codec), so the
     flag can be set per-process — one entity at a time — while the rest of
     the mesh stays on pyzmq.
     """

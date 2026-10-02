@@ -22,7 +22,7 @@ from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
 from mstar.conductor.conductor import Conductor
 from mstar.engine.resources import SamplingReqConfig
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
 from mstar.model.base import PrefixStream, ProcessPromptOutput
 from mstar.model.orpheus.config import OrpheusModelConfig
@@ -48,13 +48,13 @@ class _RecordingCommunicator:
 class _StubTensorManager:
     """Stores no tensor; the request never reaches a device."""
 
-    def store_and_return_tensor_info(self, request_id, tensors):
+    def store_and_return_tensor_info(self, request_id, tensors, **kwargs):
         return {}
 
-    def register_for_send(self, request_id, tensor_infos):
+    def register_for_send(self, request_id, tensor_infos, **kwargs):
         pass
 
-    def set_persist(self, request_id, uuid, persist):
+    def set_persist(self, uuid, persist):
         pass
 
 
@@ -79,7 +79,7 @@ class _Model:
     def get_node_resources(self):
         return [KVSpec(
             resource_key="kv", nodes={"LLM"},
-            config=KVConfig(
+            config=PagedKVConfig(
                 num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
                 # the deployment overrides this; a key paged at 128 would
                 # never match one the engine paged at PAGE_SIZE

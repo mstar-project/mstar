@@ -40,6 +40,7 @@ class _Stub(Resource):
         plan_value=None,
         admit_outcome: AdmitOutcome | None = None,
         published=None,
+        final_published=None,
         retrieve_outcome: AdmitOutcome | None = None,
     ):
         self.name = name
@@ -47,6 +48,7 @@ class _Stub(Resource):
         self._plan_value = plan_value if plan_value is not None else f"{name}-plan"
         self._admit_outcome = admit_outcome
         self._published = published
+        self._final_published = final_published
         self._retrieve_outcome = retrieve_outcome
         self.calls: list[str] = []
         # plan_results as this resource saw it when its own plan ran
@@ -86,6 +88,12 @@ class _Stub(Resource):
     def publish(self, request_id):
         self.calls.append(f"publish:{request_id}")
         return self._published
+
+    def publish_after_stop(self, request_id, node_name, graph_walk):
+        self.calls.append(
+            f"publish_after_stop:{request_id}:{node_name}:{graph_walk}"
+        )
+        return self._final_published
 
     def build_cuda_graph_buffers(self, slots, max_bs, max_seq_len):
         self.calls.append(f"cg_buffers:{len(slots)}:{max_bs}:{max_seq_len}")
@@ -266,6 +274,18 @@ def test_publish_sweeps_every_resource_not_just_a_step_s_keys():
     kv = _Stub("kv", published="kv-info")
     runner = StepRunner({"kv": kv})
     assert runner.publish(["r1"]) == {"r1": {"kv": "kv-info"}}
+
+
+def test_publish_after_stop_uses_the_final_only_resource_hook():
+    kv = _Stub("kv", published="step-info", final_published="final-info")
+    runner = StepRunner({"kv": kv})
+
+    out = runner.publish_after_stop(
+        ["r1"], node_name="LLM", graph_walk="decode",
+    )
+
+    assert out == {"r1": {"kv": "final-info"}}
+    assert kv.calls == ["publish_after_stop:r1:LLM:decode"]
 
 
 # --- request lifetime ------------------------------------------------------
