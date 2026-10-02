@@ -108,6 +108,13 @@ def test_later_iterations_take_the_loop_back_latents_and_step_k():
     assert torch.equal(out.tensor_inputs["sigma_next"], sched.sigmas[3:4])
 
 
+def test_missing_loop_back_latents_past_iteration_zero_raises():
+    sub = ToyDenoise()
+    sub.prepare_inputs(WALK, _info("r0", 0), _inputs())
+    with pytest.raises(RuntimeError, match=r"\['latents'\] missing at iteration 2 of request r0"):
+        sub.prepare_inputs(WALK, _info("r0", 2), _inputs())
+
+
 def test_overshoot_iteration_is_vetoed():
     sub = ToyDenoise()
     sub.prepare_inputs(WALK, _info("r0", 0, steps=2), _inputs())
@@ -199,7 +206,7 @@ class TwoSpanDenoise(ToyDenoise):
 def test_declare_step_lists_every_attention_span_per_row():
     sub = TwoSpanDenoise(attn_resource_key="dit_attn")
     a = sub.prepare_inputs(WALK, _info("a", 0), _inputs())
-    b = sub.prepare_inputs(WALK, _info("b", 1), _inputs())
+    b = sub.prepare_inputs(WALK, _info("b", 1), _inputs(torch.ones(8, 4)))
     step = sub.declare_step(WALK, ["a", "b"], [a, b])
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [
         ("a", "image", 8), ("a", "main", 11), ("b", "image", 8), ("b", "main", 11),
@@ -248,6 +255,10 @@ def test_every_loop_back_edge_is_seeded_then_carried():
     later = sub.prepare_inputs(WALK, _info("r0", 1), carried)
     assert later.tensor_inputs[LATENTS] is carried[LATENTS][0]
     assert later.tensor_inputs["history"] is carried["history"][0]
+
+    # solver state lost on the way back is an error, not a fresh seed
+    with pytest.raises(RuntimeError, match=r"\['history'\] missing at iteration 1"):
+        sub.prepare_inputs(WALK, _info("r0", 1), {"cond": [torch.zeros(3)], LATENTS: [torch.ones(8, 4)]})
 
 
 def test_a_mapping_from_denoise_is_split_across_rows_and_edges():

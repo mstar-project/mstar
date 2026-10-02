@@ -303,13 +303,21 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         bucket_key: Hashable, k: int, device: torch.device,
     ) -> dict[str, torch.Tensor]:
         """This iteration's loop-back tensors: the previous iteration's outputs, or
-        seeds on the first one (where the Loop has nothing to route back yet)."""
-        if k == 0 or not inputs.get(self.LATENTS):
+        seeds on the first one (where the Loop has nothing to route back yet).
+
+        Past iteration 0 a missing edge is a routing bug: raise rather than reseed."""
+        if k == 0:
             generator = torch.Generator(device="cpu").manual_seed(fwd_info.random_seed)
             return {
                 name: tensor.to(device)
                 for name, tensor in self.seed_loop_back(fwd_info, bucket_key, generator).items()
             }
+        missing = [name for name in self.loop_back_names if not inputs.get(name)]
+        if missing:
+            raise RuntimeError(
+                f"{type(self).__name__}: loop-back edge(s) {missing} missing at iteration {k} "
+                f"of request {fwd_info.request_id}"
+            )
         return {name: inputs[name][0] for name in self.loop_back_names}
 
     def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
