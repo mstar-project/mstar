@@ -260,8 +260,11 @@ class BagelModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        accelerator_graph: bool | None = None,
         **kwargs
     ):
+        if accelerator_graph is not None and not isinstance(accelerator_graph, bool):
+            raise ValueError("accelerator_graph must be a boolean")
         self.cache_dir = cache_dir
 
         config_path = hf_hub_download(
@@ -270,6 +273,8 @@ class BagelModel(Model):
         )
         with open(config_path) as f:
             self.config = load_bagel_config(json.load(f))
+        if accelerator_graph is not None:
+            self.config.accelerator_graph = accelerator_graph
 
         self.model_path_hf = model_path_hf
 
@@ -454,7 +459,8 @@ class BagelModel(Model):
                 connector=self.connector,
                 vit_pos_embed=self.vit_pos_embed,
                 vit_patch_size=self.config.vit_config.patch_size,
-                vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side
+                vit_max_num_patch_per_side=self.config.vit_max_num_patch_per_side,
+                accelerator_graph=self.config.accelerator_graph,
             )
         elif node_name == "vae_encoder":
             self._init_vae_components(device, autocast_dtype=autocast_dtype)

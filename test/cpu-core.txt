@@ -19,7 +19,9 @@ test/modular/test_waypoint_benchmark_videos.py
 test/modular/test_waypoint_live_server_benchmark.py
 test/modular/test_flex_attention_resource.py
 test/modular/test_ring_kv_resource.py
-test/modular/test_cuda_graph_capture.py
+test/modular/test_accelerator_graph_capture.py
+test/modular/test_accelerator_graph_runtime.py
+test/modular/test_accelerator_graph_backend.py
 test/modular/test_binary_framing.py
 test/modular/test_video_frame_protocol.py
 test/modular/test_client_sdk.py
@@ -29,6 +31,8 @@ test/modular/test_api_completion_guard.py
 test/modular/test_speculation_external_inputs.py
 test/modular/test_cfg_tp_publish.py
 test/modular/test_bagel_cfg_parallel.py
+test/modular/test_bagel_graph_switch.py
+test/modular/test_cosmos3_graph_switch.py
 test/modular/test_kv_publish_retrieve.py
 test/modular/test_parallel_groups.py
 test/modular/test_preplan_error_paths.py

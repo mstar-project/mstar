@@ -1,4 +1,4 @@
-"""Registration of captured CUDA graph buckets.
+"""Registration of captured accelerator graph buckets.
 
 A bucket's slots are double buffers of one shape: replay(N) runs on one while
 pre-plan(N+1) writes the other. So a bucket is only usable with all of its
@@ -20,8 +20,8 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_runner import (
-    CudaGraphRunner,
+from mstar.engine.accelerator_graph_runner import (
+    AcceleratorGraphRunner,
     capture_into_graph,
     fail_if_graphs_required,
 )
@@ -30,22 +30,6 @@ from mstar.engine.resources import BucketKey, CGSlotSpec
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="capture allocates a graph pool"
 )
-
-
-@pytest.fixture(autouse=True)
-def fake_cuda_runtime(request, monkeypatch):
-    """The only real CUDA calls on this path are the graph pool handle and the
-    memory readings around it; `_FakeRunner` stands in for the capture itself.
-    Stubbing them keeps these policy tests running where there is no GPU.
-
-    Stubbed on a GPU too: `_FakeRunner` is on the CPU device, and the real
-    `memory_allocated(cpu)` raises once any earlier test has initialised CUDA.
-    Only the `requires_cuda` tests, which capture for real, keep the runtime."""
-    if requires_cuda.mark in request.node.iter_markers():
-        return
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 0)
-    monkeypatch.setattr(torch.cuda.graphs, "graph_pool_handle", object)
 
 
 class _Group:
@@ -69,10 +53,10 @@ class _Group:
 class _FakeRunner:
     """`warmup_and_capture` and `_register_slot` bound onto stubs."""
 
-    warmup_and_capture = CudaGraphRunner.warmup_and_capture
-    _register_slot = CudaGraphRunner._register_slot
-    _buckets_captured_everywhere = CudaGraphRunner._buckets_captured_everywhere
-    _report_dropped = CudaGraphRunner._report_dropped
+    warmup_and_capture = AcceleratorGraphRunner.warmup_and_capture
+    _register_slot = AcceleratorGraphRunner._register_slot
+    _buckets_captured_everywhere = AcceleratorGraphRunner._buckets_captured_everywhere
+    _report_dropped = AcceleratorGraphRunner._report_dropped
 
     def __init__(
         self, specs, fail: set[tuple[str, int]] = frozenset(), num_slots=2,
@@ -80,6 +64,11 @@ class _FakeRunner:
     ):
         # only carries the rank-agreement flag vector; nothing is captured here
         self._device = torch.device("cpu")
+        self._graph_backend = SimpleNamespace(
+            is_available=lambda: True,
+            graph_pool_handle=object,
+            memory_allocated=lambda: 0,
+        )
         self._submodule_name = "node"
         self._num_slots = num_slots
         self._specs = specs
@@ -102,7 +91,7 @@ class _FakeRunner:
     def _capture_one(self, spec):
         if (spec.bucket.graph_walk, spec.slot) in self._fail:
             raise RuntimeError("capture failed")
-        # stands in for the CudaGraphSlot; identity is what the test checks
+        # stands in for the AcceleratorGraphSlot; identity is what the test checks
         return f"{spec.bucket.graph_walk}:slot{spec.slot}"
 
     def _get_addtl_slot_specs(self, spec):
@@ -240,8 +229,8 @@ def test_single_slot_runners_still_register():
 class _InternRunner:
     """`_intern_static_buffer` bound onto the three fields it touches."""
 
-    _seq_dim = staticmethod(CudaGraphRunner._seq_dim)
-    _intern_static_buffer = CudaGraphRunner._intern_static_buffer
+    _seq_dim = staticmethod(AcceleratorGraphRunner._seq_dim)
+    _intern_static_buffer = AcceleratorGraphRunner._intern_static_buffer
 
     def __init__(self):
         self._shared_static_buffers = {}
@@ -254,9 +243,9 @@ def test_seq_dim_picks_the_only_matching_dim_even_at_batch_size_one():
     ``batch_size`` here because `_seq_dim` no longer takes one — it just
     scans for ``seq_len``, so a coincidental dim-0 size never shadows the
     real seq dim. This is the case from the PR review comment on
-    cuda_graph_runner.py:621."""
+    accelerator_graph_runner.py:621."""
     value = torch.zeros(1, 512)
-    assert CudaGraphRunner._seq_dim(value, seq_len=512) == 1
+    assert AcceleratorGraphRunner._seq_dim(value, seq_len=512) == 1
 
 
 def test_seq_dim_guesses_the_wrong_dim_when_button_collides_with_seq_len():
@@ -267,7 +256,7 @@ def test_seq_dim_guesses_the_wrong_dim_when_button_collides_with_seq_len():
     Waypoint overrides this guess — see
     `test_button_shares_its_buffer_via_input_seq_dims_override`."""
     value = torch.zeros(2, 1, 256)
-    assert CudaGraphRunner._seq_dim(value, seq_len=256) == 2
+    assert AcceleratorGraphRunner._seq_dim(value, seq_len=256) == 2
 
 
 def test_button_shares_its_buffer_via_input_seq_dims_override():
@@ -338,7 +327,7 @@ def test_a_dropped_bucket_is_listed_and_logged_as_an_error(caplog):
         _specs(walks=("decode", "prefill")), fail={("decode", 1)},
     )
 
-    with caplog.at_level("ERROR", logger="mstar.engine.cuda_graph_runner"):
+    with caplog.at_level("ERROR", logger="mstar.engine.accelerator_graph_runner"):
         runner.warmup_and_capture()
 
     assert [key.graph_walk for key in runner.dropped_buckets] == ["decode"]
@@ -375,12 +364,21 @@ def test_a_failed_capture_leaves_the_pool_and_stream_usable():
 
 
 def test_required_graphs_turn_a_dropped_bucket_into_a_startup_failure(monkeypatch):
-    monkeypatch.delenv("MSTAR_REQUIRE_CUDA_GRAPHS", raising=False)
+    monkeypatch.delenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", raising=False)
     fail_if_graphs_required(["node decode[bs=1]"])
 
-    monkeypatch.setenv("MSTAR_REQUIRE_CUDA_GRAPHS", "1")
+    monkeypatch.setenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "1")
     fail_if_graphs_required([])
     with pytest.raises(RuntimeError, match="node decode"):
+        fail_if_graphs_required(["node decode[bs=1]"])
+
+
+def test_accelerator_graph_requirement_can_be_disabled_explicitly(monkeypatch):
+    monkeypatch.setenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "0")
+    fail_if_graphs_required(["node decode[bs=1]"])
+
+    monkeypatch.setenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "1")
+    with pytest.raises(RuntimeError, match="Accelerator graph|accelerator graph"):
         fail_if_graphs_required(["node decode[bs=1]"])
 
 

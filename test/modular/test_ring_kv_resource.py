@@ -32,7 +32,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_runner import DummyRowPool
+from mstar.engine.accelerator_graph_runner import DummyRowPool
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import (
     KVSpec,
@@ -343,7 +343,7 @@ def test_two_capture_configs_can_each_open_and_claim():
             f"capture config {config_idx} was refused the ring: {outcome.reason}"
         )
         kv.plan(step, ctx)
-        for _ in range(2):  # CudaGraphRunner.NUM_WARMUP
+        for _ in range(2):  # AcceleratorGraphRunner.NUM_WARMUP
             _rollout(kv, frames=1)
             pool.reset(rids)
             assert kv.admit(step, ctx).ok
@@ -508,7 +508,7 @@ def test_remove_request_releases_the_world_and_the_registration():
 
 
 def test_supports_preplan_stays_false():
-    """It keeps `CudaGraphRunner._num_slots` at 1. Two slots exist so a plan for
+    """It keeps `AcceleratorGraphRunner._num_slots` at 1. Two slots exist so a plan for
     step N+1 can write buffers replay N is not reading; the only thing planned
     here is one `[B]` world index, so the second slot would be an identical
     graph at double the capture cost — and the only reason `_static_session_idx`
@@ -840,7 +840,7 @@ def test_post_warmup_validate_catches_a_committed_frame():
 
     kv.commit(_step("a", frame=4), _ctx("a"))  # a commit capture should never have made
 
-    with pytest.raises(RuntimeError, match="during CUDA graph capture"):
+    with pytest.raises(RuntimeError, match="during accelerator graph capture"):
         kv.post_warmup_validate()
 
 
@@ -932,11 +932,11 @@ def test_a_reused_world_starts_empty():
         assert not bool(layer.written[: layer.ring_len].any())
 
 
-def test_build_cuda_graph_buffers_allocates_nothing():
+def test_build_accelerator_graph_buffers_allocates_nothing():
     kv = _manager()
     before = _ptrs(kv)
 
-    kv.build_cuda_graph_buffers([], max_bs=1, max_seq_len=4096)
+    kv.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=4096)
 
     assert _ptrs(kv) == before
 

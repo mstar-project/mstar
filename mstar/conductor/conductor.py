@@ -1499,7 +1499,7 @@ class Conductor:
 
     def _wait_for_workers_ready(self) -> None:
         """Block until every worker reports ``SETUP_DONE`` (weight load + warmup
-        + CUDA-graph capture), so the main loop opens only once all workers can
+        + accelerator graph capture), so the main loop opens only once all workers can
         serve. Any non-``SETUP_DONE`` message that races in is stashed and
         replayed on the first main-loop iteration so it isn't lost. Raises
         ``DeadWorkerError`` if a worker exits before reporting.

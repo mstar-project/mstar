@@ -290,7 +290,7 @@ model_kwargs
 ------------
 
 ``model_kwargs`` are model parameters fixed at server start (not per request) — they are
-baked into the model's config dataclass and into CUDA-graph captures. For example, the
+baked into the model's config dataclass and into accelerator graph captures. For example, the
 Pi0.5 DROID variant fixes the action horizon:
 
 .. code-block:: yaml

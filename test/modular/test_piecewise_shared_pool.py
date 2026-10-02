@@ -5,26 +5,31 @@ import inspect
 import pytest
 import torch
 
-from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
+from mstar.engine.accelerator_graph_backend import AcceleratorGraphBackend
+from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 
 
 def test_runner_accepts_a_shared_pool_and_keeps_it():
-    assert "memory_pool" in inspect.signature(PiecewiseCudaGraphRunner.__init__).parameters
-    runner = object.__new__(PiecewiseCudaGraphRunner)
+    assert "memory_pool" in inspect.signature(PiecewiseAcceleratorGraphRunner.__init__).parameters
+    runner = object.__new__(PiecewiseAcceleratorGraphRunner)
     runner._memory_pool = None
-    # a runner built without a pool allocates its own at capture time (CUDA only)
-    src = inspect.getsource(PiecewiseCudaGraphRunner.warmup_and_capture)
+    # a runner built without a pool allocates its own at capture time
+    src = inspect.getsource(PiecewiseAcceleratorGraphRunner.warmup_and_capture)
     assert "if self._memory_pool is None" in src
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="graph pools need CUDA")
-def test_two_runners_share_the_pool_handle():
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
+def test_two_runners_share_the_pool_handle(device_type):
     from unittest import mock
 
-    pool = torch.cuda.graphs.graph_pool_handle()
-    make = lambda: PiecewiseCudaGraphRunner(  # noqa: E731
+    device = torch.device(device_type)
+    backend = AcceleratorGraphBackend(device)
+    if not backend.is_available():
+        pytest.skip(f"{device_type} is unavailable")
+    pool = backend.graph_pool_handle()
+    make = lambda: PiecewiseAcceleratorGraphRunner(  # noqa: E731
         label="r", config=mock.Mock(capture_batch_sizes=[1], declare_step=None), resources={},
-        step_runner=mock.Mock(), device=torch.device("cuda"), autocast_dtype=None, num_slots=1, memory_pool=pool,
+        step_runner=mock.Mock(), device=device, autocast_dtype=None, num_slots=1, memory_pool=pool,
     )
     a, b = make(), make()
     assert a._memory_pool is pool and b._memory_pool is pool
@@ -36,7 +41,7 @@ def test_region_outputs_are_copied_into_buffers_outside_the_pool(monkeypatch):
     capture, so another graph's replay can never land on it."""
     import torch
 
-    from mstar.engine import cuda_graph_runner as cgr
+    from mstar.engine import accelerator_graph_runner as cgr
 
     produced = {}
 

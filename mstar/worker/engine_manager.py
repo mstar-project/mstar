@@ -181,7 +181,7 @@ class EngineManager:
         return cls(engine=engine, node_names=set(node_names))
 
     def warmup_all(self) -> None:
-        """CUDA graph capture, for the whole forward and any piecewise region."""
+        """accelerator graph capture, for the whole forward and any piecewise region."""
         with torch.no_grad():
             self.engine.warmup()
 

@@ -309,7 +309,7 @@ class APIServer:
 
     def finalize_setup(self) -> None:
         """Block until the conductor signals that every worker has finished
-        setup (weight load + warmup + CUDA-graph capture), then start draining
+        setup (weight load + warmup + accelerator graph capture), then start draining
         results. Called before the HTTP server binds, so ``mstar`` only begins
         serving once it can actually handle requests. Raises
         ``DeadConductorError`` if the conductor exits first (it does when a
@@ -317,7 +317,7 @@ class APIServer:
         """
         logger.info(
             "Waiting for workers to finish setup "
-            "(loading weights, capturing CUDA graphs)..."
+            "(loading weights, capturing accelerator graphs)..."
         )
         while True:
             for message in self.communicator.get_all_new_messages():

@@ -9,12 +9,12 @@ from mstar.engine.resources import SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
 
 
-class CudaGraphConfigType(Enum):
+class AcceleratorGraphConfigType(Enum):
     BASIC_BATCHED = "basic_batched"
     FLASH_INFER_PACKED = "flash_infer_packed"
 
 
-class CudaGraphConfig(ABC):
+class AcceleratorGraphConfig(ABC):
     def __init__(
         self,
         capture_graph_walk: str,  # "decode"
@@ -23,7 +23,7 @@ class CudaGraphConfig(ABC):
         # Additional information added to the capture bucket key (e.g., requires_cfg).
         # Must be hashable.
         additional_key_info: Any | None = None,
-        compile: bool = True, # whether to run torch.compile before cuda graph capture
+        compile: bool = True, # whether to run torch.compile before accelerator graph capture
 
         # Per-config override for the set of batch sizes to capture
         capture_batch_sizes: list[int] | None = None,
@@ -35,7 +35,7 @@ class CudaGraphConfig(ABC):
         caps_eager_batch_size: bool = True,
         # Maps a static-input key, as returned by the submodule's
         # ``preprocess``, to the dim that varies with the bucket. Overrides
-        # the runner's size-matching guess (``CudaGraphRunner._seq_dim``),
+        # the runner's size-matching guess (``AcceleratorGraphRunner._seq_dim``),
         # which can pick the wrong dim when an unrelated axis happens to
         # match the bucket's token count.
         input_seq_dims: dict[str, int] | None = None,
@@ -50,7 +50,7 @@ class CudaGraphConfig(ABC):
         self.input_seq_dims = input_seq_dims
 
     @abstractmethod
-    def get_config_type(self) -> CudaGraphConfigType:
+    def get_config_type(self) -> AcceleratorGraphConfigType:
         pass
 
     @abstractmethod
@@ -62,7 +62,7 @@ class CudaGraphConfig(ABC):
         pass
 
 
-class BatchedCudaGraphConfig(CudaGraphConfig):
+class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
     def __init__(
         self,
         capture_graph_walk: str,  # "decode"
@@ -98,8 +98,8 @@ class BatchedCudaGraphConfig(CudaGraphConfig):
         # per-label span. Default 1 preserves every existing caller.
         self.total_tokens_multiplier = total_tokens_multiplier
 
-    def get_config_type(self) -> CudaGraphConfigType:
-        return CudaGraphConfigType.BASIC_BATCHED
+    def get_config_type(self) -> AcceleratorGraphConfigType:
+        return AcceleratorGraphConfigType.BASIC_BATCHED
 
     def get_total_tokens(self, bs: int) -> list[int]:
         return [self.single_request_inputs.input_seq_len * bs * self.total_tokens_multiplier]
@@ -119,7 +119,7 @@ def distribute_tokens(total_tokens: int, bs: int) -> list[int]:
     return seq_lens
 
 
-class PackedCudaGraphConfig(CudaGraphConfig):
+class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
     def __init__(
         self,
         capture_graph_walk: str,
@@ -147,8 +147,8 @@ class PackedCudaGraphConfig(CudaGraphConfig):
         self.make_node_input = make_node_input
         self.capture_token_lengths = capture_token_lengths
 
-    def get_config_type(self) -> CudaGraphConfigType:
-        return CudaGraphConfigType.FLASH_INFER_PACKED
+    def get_config_type(self) -> AcceleratorGraphConfigType:
+        return AcceleratorGraphConfigType.FLASH_INFER_PACKED
 
     def get_total_tokens(self, bs: int) -> list[int]:
         return self.capture_token_lengths
@@ -200,10 +200,10 @@ class PiecewiseCallInputs:
 
 
 @dataclass(kw_only=True)
-class PiecewiseCudaGraphConfig(ABC):
+class PiecewiseAcceleratorGraphConfig(ABC):
     """One inner callable of a submodule's forward, captured on its own.
 
-    Unlike ``CudaGraphConfig``, which describes a whole ``forward_batched``
+    Unlike ``AcceleratorGraphConfig``, which describes a whole ``forward_batched``
     the engine drives, this describes a SUB-REGION the submodule invokes
     itself while the surrounding preamble stays eager.
 
@@ -255,7 +255,7 @@ class PiecewiseCudaGraphConfig(ABC):
 
 
 @dataclass(kw_only=True)
-class PiecewiseBatchedConfig(PiecewiseCudaGraphConfig):
+class PiecewiseBatchedConfig(PiecewiseAcceleratorGraphConfig):
     """Equal-length batched capture: static input ``[bs, seq_len, D]``."""
     seq_len: int  # tokens per request
 
@@ -282,7 +282,7 @@ class PiecewiseBatchedConfig(PiecewiseCudaGraphConfig):
 
 
 @dataclass(kw_only=True)
-class PiecewisePackedConfig(PiecewiseCudaGraphConfig):
+class PiecewisePackedConfig(PiecewiseAcceleratorGraphConfig):
     """Packed variable-length capture: static input ``[total_tokens, D]``.
 
     One graph per (bs, token bucket). Each bucket is partitioned across ``bs``
