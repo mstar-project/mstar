@@ -222,6 +222,16 @@ Endpoints and model coverage:
    * - ``GET /v1/audio/voices``
      - speech models that publish a voice list through their speech adapter (``kokoro``, ``orpheus``; 404 otherwise)
      - The ``voice`` ids the served model accepts, plus its default.
+   * - ``POST /v1/audio/transcriptions``
+     - ``whisper_large``, ``higgs_audio``
+     - Speech-to-text (multipart upload; ``json`` / ``text`` / ``verbose_json`` /
+       ``srt`` / ``vtt``; streaming via ``transcript.text.delta`` events).
+   * - ``WS /v1/realtime?intent=transcription``
+     - models whose adapter can continue a hypothesis
+     - Streaming speech-to-text: ``input_audio_buffer.append`` PCM16 chunks in,
+       ``conversation.item.input_audio_transcription.delta`` (append-only) and
+       ``mstar.transcription.partial`` (whole current hypothesis) out; ``commit``
+       finishes the utterance.
    * - ``POST /v1/images/generations``
      - ``bagel``
      - Text-to-image.
@@ -244,6 +254,10 @@ Waypoint emits live RGB frame chunks and is not routed through the encoded-video
    # (mstar extension) the voices the served model accepts
    requests.get("http://localhost:8000/v1/audio/voices").json()["voices"]
 
+   # speech-to-text
+   client.audio.transcriptions.create(model="whisper_large", file=open("speech.wav", "rb"),
+                                      language="en")
+
    # image generation
    client.images.generate(model="bagel", prompt="a cat in a hat")
 
@@ -256,6 +270,31 @@ Per-model notes:
   ``Ethan``) and request audio output by including ``"audio"`` in ``modalities``.
   Non-OpenAI knobs (e.g. ``talker_top_k``, ``code_predictor_top_p``) go through
   ``extra_body``.
+- **Whisper / Higgs-Audio** — ``language`` (ISO-639-1) skips language detection,
+  ``prompt`` conditions the decoder on prior text (it reaches the model as
+  ``initial_prompt``), and ``response_format``
+  ``verbose_json`` / ``srt`` / ``vtt`` (or ``timestamp_granularities[]``) asks the
+  model for timestamps. Whisper's language and timestamp tokens travel in the
+  text stream and are lifted into ``language`` / ``segments`` by the server; a
+  streaming client receives only the spoken words. Uploads longer than the
+  model's clip (30 s for Whisper) are served as consecutive windows. By default
+  they run in order, openai-whisper style: each window gets the transcript so
+  far as ``initial_prompt`` and the first window's detected language, is decoded
+  with timestamps so the next window can start where its last closed segment
+  ended (no word is split by a boundary), and is decoded again when its text is
+  a repetition loop (gzip compression ratio above 2.4): first without the
+  conditioning text, then at rising temperatures — after which the transcript
+  so far stops conditioning later windows.
+  Leave ``temperature`` at 0 to get that fallback; a pinned temperature is used
+  as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
+  once, each cut at the quietest moment before its boundary. Segment timestamps
+  are offset to the whole file.
+- **Realtime transcription** — every ``chunk_seconds`` (default 2 s) of new audio the
+  session re-transcribes everything heard so far as one engine request whose assistant
+  turn is prefilled with the previous hypothesis minus its last ``unfixed_tokens``
+  tokens (the Qwen3-ASR SDK's streaming algorithm), so only the tail is ever revised.
+  Tune ``chunk_seconds`` / ``unfixed_chunks`` / ``unfixed_tokens`` under ``session.mstar``
+  in ``transcription_session.update``.
 - **Kokoro** — ``voice`` is one of the 54 bundled voices (default ``af_heart``) or a
   blend such as ``af_bella+af_sky`` or ``af_bella(2)+af_sky(1)``; ``speed`` scales the
   speaking rate (0.25-4.0). ``lang_code`` and ``phonemes`` go through ``extra_body``.
