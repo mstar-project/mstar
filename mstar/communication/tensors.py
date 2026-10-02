@@ -40,6 +40,8 @@ from mstar.communication.communicator import (
 from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
+from mstar.utils.profiler import PHASE_PERIOD, phase_record
+from mstar.utils.streams import RECV, SEND, TRANSFER_READ, get_stream
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +139,10 @@ class AsyncMooncakeReader:
         self._pending: list[Future] = []
         # none on the host: host buffers have no GPU work to wait for, and a stream or event would
         # create a CUDA context on a GPU that other processes may have filled
-        self._copy_stream = torch.cuda.Stream(device=device) if torch.device(device).type == "cuda" else None
+        self._copy_stream = (
+            get_stream(TRANSFER_READ, device)
+            if torch.device(device).type == "cuda" else None
+        )
 
     def submit(self, read_info: list[TransferReadInfo]) -> Future:
         """Non-blocking: enqueue a batch of READs.
@@ -356,7 +361,60 @@ class TensorCommunicationManager(ABC):
         self.buffered_shards: dict[Rid, dict[str, BufferedShards]] = {}
         self.uuid_to_shard_dim: dict[int, int | None] = {}
 
+    @property
+    def needs_cpu_tensor(self) -> bool:
+        """Whether this transport sends from host memory.
+
+        If so, the store methods keep a host copy the producer already has
+        (``cpu_tensors``) next to each device tensor, and sending reads that
+        instead of copying the device tensor down again. A transport that
+        reads device memory directly (TCP / RDMA) has no use for one, so they
+        are not stored.
+        """
+        return False
+
     # ---- shared: store ----
+    @staticmethod
+    def _host_copies_by_tensor(
+        tensors: NameToTensorList, cpu_tensors: NameToTensorList | None,
+    ) -> dict[int, torch.Tensor]:
+        """One request's host copies, keyed by ``id`` of the device tensor
+        each mirrors -- matched by name and position in the producer's output.
+
+        Keyed by the tensor rather than the name because outputs get renamed
+        on the way to their signal (Qwen3.5 stores ``new_token`` as
+        ``text_inputs``): the rename aliases the same tensor, so its copy
+        follows it.
+        """
+        if not cpu_tensors:
+            return {}
+        by_tensor: dict[int, torch.Tensor] = {}
+        for name, cpu_list in cpu_tensors.items():
+            device_list = tensors.get(name)
+            if not device_list or not isinstance(cpu_list, list):
+                continue
+            for device_tensor, cpu in zip(device_list, cpu_list, strict=False):
+                by_tensor[id(device_tensor)] = cpu
+        return by_tensor
+
+    def _cpu_counterpart(
+        self, by_tensor: dict[int, torch.Tensor], tensor: torch.Tensor,
+        canonical: torch.Tensor, shard_dim: int | None,
+    ) -> torch.Tensor | None:
+        """The producer's host copy of ``tensor``, if it gave a usable one.
+
+        Anything that is not a host tensor of the same shape and dtype is
+        dropped rather than trusted: the copy then comes from the device
+        tensor at send time, as it would with no host copy at all.
+        """
+        cpu = by_tensor.get(id(tensor))
+        if not torch.is_tensor(cpu) or cpu.device.type != "cpu":
+            return None
+        cpu = self._ensure_leading_shard_dim(shard_dim, cpu)
+        if cpu.shape != canonical.shape or cpu.dtype != canonical.dtype:
+            return None
+        return cpu
+
     def _ensure_leading_shard_dim(self, shard_dim: int | None, tensor: torch.Tensor):
         """Move ``shard_dim`` to dim 0, preserving the relative order of the
         remaining dims. The inverse is ``_undo_leading_shard_dim``."""
@@ -399,6 +457,8 @@ class TensorCommunicationManager(ABC):
         out_rids: list[int], out_uuids: list[int],
         out_tensors: list[torch.Tensor],
         out_infos: list[TensorPointerInfo] | None = None,
+        cpu_tensors: NameToTensorList | None = None,
+        out_cpu: list[torch.Tensor | None] | None = None,
     ) -> dict[str, list[TensorPointerInfo]]:
         """Mint uuids and descriptors for one request's outputs.
 
@@ -412,6 +472,10 @@ class TensorCommunicationManager(ABC):
             cfg, node_name, graph_walk,
         )
 
+        by_tensor = (
+            self._host_copies_by_tensor(tensors, cpu_tensors)
+            if out_cpu is not None else {}
+        )
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name, tensor_list in tensors.items():
             tensor_info[name] = []
@@ -446,6 +510,10 @@ class TensorCommunicationManager(ABC):
                 out_uuids.append(tensor_uuid)
                 out_tensors.append(canonical)
                 out_infos.append(info)
+                if out_cpu is not None:
+                    out_cpu.append(self._cpu_counterpart(
+                        by_tensor, tensor, canonical, shard_dim,
+                    ))
                 if cfg is not None:
                     self.uuid_to_shard_dim[tensor_uuid] = shard_dim
                 if self.enable_prof:
@@ -460,7 +528,13 @@ class TensorCommunicationManager(ABC):
         node_name: str | None=None,
         graph_walk: str | None=None,
         skip_cuda_sync: bool = False,
+        cpu_tensors: NameToTensorList | None = None,
     ) -> dict[str, list[TensorPointerInfo]]:
+        """Store one request's outputs and return their descriptors.
+
+        ``cpu_tensors`` mirrors ``tensors`` with host copies the caller already
+        made; they are kept only if ``needs_cpu_tensor``.
+        """
         # CUDA sync ensures GPU writes to ``tensors`` are visible before
         # callers hand out ``tensor.data_ptr()`` to peers (RDMA register,
         # SHM serialize). With same-thread async scheduling the caller
@@ -475,11 +549,16 @@ class TensorCommunicationManager(ABC):
         uuids: list[int] = []
         canonicals: list[torch.Tensor] = []
         infos: list[TensorPointerInfo] = []
+        want_cpu = cpu_tensors is not None and self.needs_cpu_tensor
+        cpus: list[torch.Tensor | None] | None = [] if want_cpu else None
         tensor_info = self._mint_tensor_infos(
             request_id, tensors, node_name, graph_walk,
             request_ids, uuids, canonicals, infos,
+            cpu_tensors=cpu_tensors if want_cpu else None, out_cpu=cpus,
         )
-        self.tensor_store.put_tensor_batch_multi(request_ids, uuids, canonicals, infos)
+        self.tensor_store.put_tensor_batch_multi(
+            request_ids, uuids, canonicals, infos, cpu_tensors=cpus,
+        )
         return tensor_info
 
     def store_and_return_tensor_info_batch(
@@ -490,6 +569,7 @@ class TensorCommunicationManager(ABC):
         node_name: str | None=None,
         graph_walk: str | None=None,
         skip_cuda_sync: bool = False,
+        cpu_tensors: dict[Rid, NameToTensorList] | None = None,
     ) -> StoredOutputs:
         """Store a whole output batch and return the columns routing needs.
 
@@ -506,6 +586,12 @@ class TensorCommunicationManager(ABC):
         Outputs under a name no signal carries are not stored at all: no edge
         will ever read them, and a stored tensor nothing references is only
         freed when its request is torn down.
+
+        ``cpu_tensors`` mirrors ``outputs`` with host copies the caller already
+        made (the stop check's, say), matched to the device tensors by name
+        and position before any signal lookup (see
+        ``_host_copies_by_tensor``); they are kept only if
+        ``needs_cpu_tensor``.
         """
         if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
@@ -515,6 +601,8 @@ class TensorCommunicationManager(ABC):
         signal_idxs: list[int] = []
         num_tensors: list[int] = []
         canonicals: list[torch.Tensor] = []
+        want_cpu = cpu_tensors is not None and self.needs_cpu_tensor
+        cpus: list[torch.Tensor | None] | None = [] if want_cpu else None
 
         columnar = self.tensor_store.has_put_tensor_batch_columns
         infos: list[TensorPointerInfo] = []
@@ -539,6 +627,11 @@ class TensorCommunicationManager(ABC):
         try:
             for request_id in request_ids:
                 tensors = outputs.get(request_id) or {}
+                by_tensor = (
+                    self._host_copies_by_tensor(
+                        tensors, cpu_tensors.get(request_id),
+                    ) if want_cpu else {}
+                )
                 cfg = self.sharding_configs.get(request_id)
                 source_tp_size, source_tp_rank = self._source_tp(
                     cfg, node_name, graph_walk,
@@ -572,6 +665,10 @@ class TensorCommunicationManager(ABC):
                         flat_rids.append(request_id)
                         signal_idxs.append(i)
                         canonicals.append(canonical)
+                        if want_cpu:
+                            cpus.append(self._cpu_counterpart(
+                                by_tensor, tensor, canonical, shard_dim,
+                            ))
                         if not columnar:
                             infos.append(self._tensor_info(
                                 canonical, tensor_uuid, source_tp_size,
@@ -586,11 +683,11 @@ class TensorCommunicationManager(ABC):
             if columnar:
                 columns.add_tensors_canonical(flat_uuids, canonicals)
                 self.tensor_store.put_tensor_batch_columns(
-                    flat_rids, canonicals, columns,
+                    flat_rids, canonicals, columns, cpu_tensors=cpus,
                 )
             else:
                 self.tensor_store.put_tensor_batch_multi(
-                    flat_rids, flat_uuids, canonicals, infos,
+                    flat_rids, flat_uuids, canonicals, infos, cpu_tensors=cpus,
                 )
         except Exception:
             # The per-tensor bookkeeping above is written before the store
@@ -1169,6 +1266,10 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             ret_value = self.transfer_engine.register_memory(
                 tensor.data_ptr(), tensor.nbytes
             )
+            if PHASE_PERIOD:
+                phase_record(
+                    "tensors.register_memory", time.perf_counter() - t0,
+                )
             if ret_value != 0:
                 raise RuntimeError(
                     f"Mooncake memory registration failed for request id "
@@ -1382,8 +1483,20 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         self._d2h_stream: torch.cuda.Stream | None = None
         self._h2d_stream: torch.cuda.Stream | None = None
         if torch.cuda.is_available() and str(device) != "cpu":
-            self._d2h_stream = torch.cuda.Stream(device=device)
-            self._h2d_stream = torch.cuda.Stream(device=device)
+            self._d2h_stream = get_stream(SEND, device)
+            self._h2d_stream = get_stream(RECV, device)
+
+    @property
+    def needs_cpu_tensor(self) -> bool:
+        # The send is a host write, so a host copy the producer already made
+        # saves the device-to-host copy here.
+        return True
+
+    def _send_source(self, uuid: int) -> torch.Tensor:
+        """What to serialize for ``uuid``: the stored host copy if there is
+        one, else the device tensor (which the write copies down)."""
+        cpu = self.tensor_store.get_cpu_tensor(uuid)
+        return cpu if cpu is not None else self.tensor_store.get_tensor(uuid)
 
     def _shm_path(self, entity_id: str, uuid: int) -> str:
         ns = f"{self._shm_namespace}_" if self._shm_namespace else ""
@@ -1502,7 +1615,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         CUDA sync and the copy-stream context."""
         if self.tensor_store.is_registered(uuid):
             return
-        tensor = self.tensor_store.get_tensor(uuid)
+        tensor = self._send_source(uuid)
         t0 = time.perf_counter()
         data = _serialize_tensor(tensor)
         path = self._shm_path(self.my_entity_id, uuid)

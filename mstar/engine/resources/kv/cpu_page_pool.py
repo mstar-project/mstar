@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator, PagedKVConfig
+from mstar.utils.streams import KV_OFFLOAD, get_stream
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ class CPUPagePool:
 
     def _get_stream(self) -> torch.cuda.Stream:
         if self._stream is None:
-            self._stream = torch.cuda.Stream()
+            self._stream = get_stream(KV_OFFLOAD)
         return self._stream
 
     def is_offloaded(self, rid: str) -> bool:

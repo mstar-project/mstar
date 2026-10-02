@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 import time as _time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
@@ -41,6 +41,7 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
+from mstar.model.submodule_base import BatchedModelOutput, HostRows
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.utils.containers import ParallelList, RecentSet
@@ -63,7 +64,9 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+from mstar.utils.numa import pin_to_device_numa_node
 from mstar.utils.profiler import PHASE_PERIOD, phase_buffer, range_pop, range_push
+from mstar.utils.streams import CHECK_STOP, get_stream
 from mstar.worker.engine_manager import EngineManager
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
@@ -225,12 +228,18 @@ class Worker:
         # record into it too; run() owns the periodic flush.
         self._phase_period = PHASE_PERIOD
         self._phase_buf = phase_buffer()
+        # (start, end) CUDA events per step, drained once they land
+        self._gpu_spans: deque = deque(maxlen=64)
 
         self.enable_prof = enable_prof
         self.profile_info = WorkerProfileInfo()
 
         if self.device.type != "cpu" and self.device.index is not None:
             torch.accelerator.set_device_index(self.device)
+            # put the pinned buffers on whichever node we land on.
+            pinned = pin_to_device_numa_node(self.device)
+            if pinned:
+                logger.info("Worker %s: pinned to %s", worker_id, pinned)
 
         # ``dist_init_method`` is normally provided by the conductor — it
         # picks a free TCP port at startup so multiple ``mstar`` runs on
@@ -1517,6 +1526,20 @@ class Worker:
         if self._phase_period > 0:
             self._phase_buf[name].append(dt)
 
+    def _drain_gpu_spans(self) -> None:
+        """Record the GPU times whose events have landed, leaving the rest.
+
+        Only completed pairs: reading one still in flight blocks the host on
+        the GPU, which is the thing being measured.
+        """
+        while self._gpu_spans:
+            start, end = self._gpu_spans[0]
+            if not end.query():
+                return
+            self._gpu_spans.popleft()
+            # elapsed_time is ms; the phase buffer holds seconds
+            self._phase_record("gpu_exec", start.elapsed_time(end) / 1000)
+
     def _execute_on_gpu_thread(
         self,
         batch: ScheduledBatch,
@@ -1570,17 +1593,35 @@ class Worker:
             # call is_stale after prepare_inputs because prepare_inputs may drop rids
             if plan_future is not None and engine.preplan_is_stale(node_batch):
                 engine.reset_pre_plan_for_batch(node_batch)
-            with self._span("worker.gpu_thread.exec"):
-                outputs = engine.exec_and_postprocess(node_batch)
             execution_stream = (
                 torch.accelerator.current_stream(self.device)
                 if self.device.type != "cpu"
                 else None
             )
+            # How long the step takes *on the device*, as opposed to the host
+            # time to submit it. Both are needed to say whether a slow iter was
+            # starved or just busy, and the phase timers only see the host.
+            gpu_start = None
+            if self._phase_period and execution_stream is not None:
+                gpu_start = torch.Event(enable_timing=True)
+                gpu_start.record(execution_stream)
+            if self._phase_period:
+                # after prepare_inputs, which can drop rids — this is the row
+                # count the forward really pays for
+                self._phase_record(
+                    f"rows.{batch.graph_walk}#", len(node_batch.request_ids),
+                )
+            with self._span("worker.gpu_thread.exec"):
+                outputs = engine.exec_and_postprocess(node_batch)
             if execution_stream is not None:
                 event = torch.Event()
                 event.record(execution_stream)
                 node_batch.completion_event = event
+                if gpu_start is not None:
+                    gpu_end = torch.Event(enable_timing=True)
+                    gpu_end.record(execution_stream)
+                    self._gpu_spans.append((gpu_start, gpu_end))
+                    self._drain_gpu_spans()
             return outputs
         finally:
             # Safety net: a step that raised before the forward would otherwise
@@ -2299,8 +2340,20 @@ class Worker:
 
     def _postprocess_batch(
         self, batch_N: PendingBatch,
-        outputs: dict[int, NameToTensorList],
+        outputs: BatchedModelOutput,
     ):
+        # Stage stopwatch, same names as the NVTX ranges below. A stamp rather
+        # than a nested `_span` per stage: this function has two early returns,
+        # and a clock read carries no unwind bookkeeping across them.
+        _pp_t = _time.perf_counter() if self._phase_period else 0.0
+        def _pp_stage(name: str) -> None:
+            nonlocal _pp_t
+            if not self._phase_period:
+                return
+            now = _time.perf_counter()
+            self._phase_buf[f"worker.postprocess.{name}"].append(now - _pp_t)
+            _pp_t = now
+
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
 
@@ -2314,6 +2367,7 @@ class Worker:
                 [batch_N.batch.request_to_worker_graph[r] for r in rids],
             )
         )
+        _pp_stage("cleanup_inputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.pending_loop_stops", synchronize=False)
@@ -2329,7 +2383,10 @@ class Worker:
                 valid_rids.discard(stopped_rid)
                 batch_N.batch.request_to_worker_graph.pop(stopped_rid, None)
                 batch_N.node_batch.per_request_info.pop(stopped_rid, None)
-        batch_N.node_batch.request_ids = list(valid_rids)
+        # keep the forward's order: other code walks this list positionally
+        batch_N.node_batch.request_ids = [
+            rid for rid in batch_N.node_batch.request_ids if rid in valid_rids
+        ]
         if not valid_rids:
             range_pop(synchronize=False)
             return
@@ -2345,6 +2402,7 @@ class Worker:
             if rid not in valid_rids:
                 batch_N.batch.request_to_worker_graph.pop(rid, None)
 
+        _pp_stage("pending_loop_stops")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.update_lru", synchronize=False)
@@ -2354,6 +2412,7 @@ class Worker:
         for rid in batch_N.node_batch.request_ids:
             self._last_active[(rid, batch_N.node_name)] = t
 
+        _pp_stage("update_lru")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.synchronize_completion_event", synchronize=False)
@@ -2371,6 +2430,7 @@ class Worker:
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
 
+        _pp_stage("completion_event_sync")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.check_stop", synchronize=False)
@@ -2385,10 +2445,14 @@ class Worker:
         # so this can carry a device transfer as well as the stop logic.
         _t_stop = _time.perf_counter() if self._phase_period else 0.0
         engine = self.engine_manager.get_engine(batch_N.node_name)
-        cpu_outputs = self._prematerialize_for_check_stop(
+        cpu_outputs, host_rows = self._prematerialize_for_check_stop(
             outputs, batch_N.node_batch.completion_event,
+            request_ids=batch_N.node_batch.request_ids,
         )
-        stops = engine.check_stop_for_batch(batch_N.node_batch, cpu_outputs)
+        _pp_stage("prematerialize")
+        stops = engine.check_stop_for_batch(
+            batch_N.node_batch, cpu_outputs, host_rows=host_rows,
+        )
         if self._phase_period:
             self._phase_record(
                 "worker.postprocess.check_stop", _time.perf_counter() - _t_stop,
@@ -2410,6 +2474,7 @@ class Worker:
                     range_pop(synchronize=False)
                 return
 
+        _pp_stage("check_stop")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.stop_loops", synchronize=False)
@@ -2430,6 +2495,7 @@ class Worker:
                 ),
             )
 
+        _pp_stage("stop_loops")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.route_outputs", synchronize=False)
@@ -2447,11 +2513,16 @@ class Worker:
         # mints, so nothing is keyed by request and signal only to be taken
         # apart again here.
         _t_store = _time.perf_counter() if self._phase_period else 0.0
+        # The stop check's host copies go along: a transport that sends from
+        # host memory reuses them instead of copying the same rows down again.
+        # They are views of pinned buffers the next step reuses, which is fine
+        # because the sends below are their last reader.
         stored = self.tensor_manager.store_and_return_tensor_info_batch(
             rids, outputs, signals,
             node_name=batch_N.node_name,
             graph_walk=batch_N.graph_walk,
             skip_cuda_sync=True,
+            cpu_tensors=cpu_outputs,
         )
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
@@ -2495,11 +2566,13 @@ class Worker:
         if route_output.freed_inputs.uuids:
             self.tensor_manager.cleanup_collectable(*route_output.freed_inputs)
 
+        _pp_stage("route_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
         with self._span("worker.postprocess.register_outputs"):
             self._register_outputs(route_output)
+        _pp_stage("register_outputs")
 
         # send outputs
         if self.enable_nvtx:
@@ -2581,6 +2654,7 @@ class Worker:
                 "worker.postprocess.send", _time.perf_counter() - _t_send,
             )
 
+        _pp_stage("send_outputs")
         if self.enable_nvtx:
             range_pop(synchronize=False)
 
@@ -2599,11 +2673,65 @@ class Worker:
             )
         return buffers[index]
 
+
+    def _d2h_batched(
+        self, buffers: dict, side: torch.cuda.Stream,
+    ) -> dict[str, torch.Tensor]:
+        """One device-to-host copy per named buffer, landed before this returns.
+
+        The per-rid form costs a copy per tensor per request — 48 of them at a
+        decode batch of 16, each carrying a single token — and every one is a
+        launch plus a completion the host waits on. A submodule that hands over
+        the whole batch tensor instead pays one; ``_rows_to_per_rid`` then
+        takes per-request views of the pinned memory, which cost nothing.
+
+        Row i belongs to the i-th request in the order the forward ran them
+        (``BatchedModelOutput.row_request_ids``), not this batch's current
+        request list: by the time the stop check runs, requests whose loops
+        stopped a step ago have been dropped from that list. A padded replay
+        leaves extra rows past the real ones; they are simply not read. The
+        host buffers are reused by the next step.
+        """
+        host: dict[str, torch.Tensor] = {}
+        with torch.cuda.stream(side):
+            for index, (name, tensor) in enumerate(buffers.items()):
+                if not (torch.is_tensor(tensor) and tensor.is_cuda):
+                    host[name] = tensor
+                    continue
+                buf = self._get_pinned_d2h_buffer(
+                    "check_stop_batched", tensor.shape, tensor.dtype, index,
+                )
+                buf.copy_(tensor, non_blocking=True)
+                host[name] = buf
+        side.synchronize()
+        return host
+
+    @staticmethod
+    def _rows_to_per_rid(
+        host: dict, request_ids: list[int],
+    ) -> dict[int, NameToTensorList]:
+        """Slice row-addressed buffers into the per-rid form ``check_stop``
+        reads: row i goes to ``request_ids[i]``."""
+        # One ``split`` per buffer makes every row view in a single call, where
+        # slicing row by row was a Python-level indexing op per request.
+        rows = {
+            name: buf.split(1)
+            for name, buf in host.items()
+            if torch.is_tensor(buf) and buf.shape
+        }
+        out: dict[int, NameToTensorList] = {}
+        for i, rid in enumerate(request_ids):
+            out[rid] = {
+                name: [views[i]] for name, views in rows.items() if i < len(views)
+            }
+        return out
+
     def _prematerialize_for_check_stop(
         self,
-        outputs: dict[int, NameToTensorList],
+        outputs: "BatchedModelOutput",
         completion_event: torch.cuda.Event | None,
-    ) -> dict[int, NameToTensorList]:
+        request_ids: list[int] | None = None,
+    ) -> tuple[dict[int, NameToTensorList], HostRows | None]:
         """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
         don't trigger a default-stream sync. With same-thread async,
@@ -2612,27 +2740,56 @@ class Worker:
         block waiting for N+1 to finish, defeating the overlap.
 
         Returns per-rid outputs with the CUDA tensors replaced by CPU
-        copies. Skipped (returns ``outputs`` unchanged) when there's no
-        completion event (CPU execution) or when CUDA is unavailable.
+        copies, and -- when the submodule handed over row-addressed buffers --
+        those buffers on the host as ``HostRows``, for a batched stop check.
+        Skipped (returns ``outputs`` unchanged) when there's no completion
+        event (CPU execution) or when CUDA is unavailable.
 
         AR engines emit small per-rid output dicts (sampled token + maybe
         a code) so the cost is negligible. If a future engine emits large
         tensors here (e.g. activations), revisit.
+
+        The host tensors are views of pinned buffers the next step reuses, so
+        they are only good until then. That covers their one other reader: a
+        transport that sends from host memory (``needs_cpu_tensor``) gets them
+        through the store, and sends in ``_register_outputs`` -- later in the
+        same ``_postprocess_batch`` -- and never reads them once registered.
         """
+        source = outputs.get_check_stop_input()
+        # Rows of a batch-addressed buffer belong to the requests in the order
+        # the forward ran them, which the engine stamped on the output.
+        row_rids = (
+            list(outputs.row_request_ids)
+            if outputs.row_request_ids is not None else request_ids
+        )
         if not torch.cuda.is_available() or completion_event is None:
-            return outputs
-        if not outputs:
-            return outputs
+            if outputs.check_stop_buffers is not None and row_rids is not None:
+                # host tensors already (a CPU device): only the re-keying
+                host = outputs.check_stop_buffers
+                return (
+                    Worker._rows_to_per_rid(host, row_rids),
+                    HostRows(tuple(row_rids), host),
+                )
+            return source, None
+        if not source:
+            return source, None
 
         if self._d2h_stream is None:
-            self._d2h_stream = torch.cuda.Stream(device=self.device)
+            self._d2h_stream = get_stream(CHECK_STOP, self.device)
         side = self._d2h_stream
         side.wait_event(completion_event)
+
+        if outputs.check_stop_buffers is not None and row_rids is not None:
+            host = self._d2h_batched(outputs.check_stop_buffers, side)
+            return (
+                Worker._rows_to_per_rid(host, row_rids),
+                HostRows(tuple(row_rids), host),
+            )
 
         cpu_per_rid: dict = {}
         buffer_indices: dict[tuple[str, torch.dtype, tuple[int, ...]], int] = defaultdict(int)
         with torch.cuda.stream(side):
-            for rid, name_to_list in outputs.items():
+            for rid, name_to_list in source.items():
                 if not isinstance(name_to_list, dict):
                     cpu_per_rid[rid] = name_to_list
                     continue
@@ -2657,7 +2814,7 @@ class Worker:
                     cpu_per_rid[rid][name] = new_list
         side.synchronize()
 
-        return cpu_per_rid
+        return cpu_per_rid, None
 
     def _apply_pending_removes_safe_to_drop(
         self, in_flight_rids: set[int]
@@ -2967,10 +3124,15 @@ class Worker:
             for name, vs in samples:
                 vs = sorted(vs)
                 n = len(vs)
-                p50 = vs[n // 2] * 1000
-                p95 = vs[min(n - 1, int(n * 0.95))] * 1000
-                mean = (sum(vs) / n) * 1000
-                parts.append(f"{name}: p50={p50:.2f}ms p95={p95:.2f}ms mean={mean:.2f}ms n={n}")
+                # a trailing '#' marks a count, not a duration
+                scale, unit = (1, "") if name.endswith("#") else (1000, "ms")
+                p50 = vs[n // 2] * scale
+                p95 = vs[min(n - 1, int(n * 0.95))] * scale
+                mean = (sum(vs) / n) * scale
+                parts.append(
+                    f"{name}: p50={p50:.2f}{unit} p95={p95:.2f}{unit} "
+                    f"mean={mean:.2f}{unit} n={n}"
+                )
             bs = (sum(phase_bs) / len(phase_bs)) if phase_bs else 0.0
             logger.info(
                 "Worker %s phase-timing iter=%d bs=%.2f: %s",
@@ -3238,7 +3400,8 @@ class Worker:
                             if self.enable_nvtx:
                                 range_pop(synchronize=False)
                                 range_push("worker.gpu_submit_queued", synchronize=False)
-                            spec_launch_started.wait(timeout=launch_wait_s)
+                            with self._span("worker.submit_spec.launch_wait"):
+                                spec_launch_started.wait(timeout=launch_wait_s)
                             if phase_period:
                                 _phase_record("submit_spec", _time.perf_counter() - _t0)
                             if self.enable_nvtx:

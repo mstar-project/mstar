@@ -14,6 +14,7 @@ add.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.rms_norm import run_rms_norm
@@ -57,8 +58,71 @@ class RMSNorm(nn.Module):
         out = run_rms_norm(flat, self.weight, eps=self.variance_epsilon)
         return out.reshape(orig_shape)
 
+    def forward_residual(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor,
+        comm_group=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``r = hidden_states + residual``; returns ``(norm(r), r)``.
+
+        The add and the norm stay in one graph, so inductor fuses them into
+        one reduction instead of folding the add into the producing GEMM as an
+        ``addmm`` (which costs a copy of ``residual`` into the GEMM's output).
+        Under tensor parallelism ``hidden_states`` is a row-parallel partial
+        sum and ``comm_group`` reduces it in the same fused kernel.
+        """
+        if comm_group is not None and comm_group.world_size > 1:
+            orig_shape = hidden_states.shape
+            normed, r = comm_group.allreduce_add_rmsnorm(
+                hidden_states.reshape(-1, orig_shape[-1]),
+                residual.reshape(-1, orig_shape[-1]),
+                self.weight, self.variance_epsilon,
+                weight_bias=1.0 if self.gemma_mode else 0.0,
+            )
+            return normed.reshape(orig_shape), r.reshape(orig_shape)
+        r = hidden_states + residual
+        return self(r), r
+
     def extra_repr(self) -> str:
         return f"{self.hidden_size}, eps={self.variance_epsilon}, gemma_mode={self.gemma_mode}"
+
+
+class RMSNormGated(nn.Module):
+    """RMSNorm scaled by a SiLU gate, for the delta-net family.
+
+    Normalizes over the last dim and then applies the gate — the order
+    matters and is the reverse of what the name suggests. Qwen3.5 and
+    Qwen3-Next both carry a ``[head_v_dim]`` weight, so this runs per head
+    over a ``[tokens, num_v_heads, head_v_dim]`` input.
+
+    Not folded into ``RMSNorm`` as a flag: the fp32 dance below is exactly
+    HF's, kept that way for parity, and differs from the FlashInfer fused
+    path ``RMSNorm`` takes.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.variance_epsilon = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(
+        self, hidden_states: torch.Tensor, gate: torch.Tensor,
+    ) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        x = hidden_states.to(torch.float32)
+        var = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(var + self.variance_epsilon)
+        # back to the input dtype before the weight, then gated in fp32. This
+        # follows HF's sequence of casts; the weight itself is kept fp32 (see
+        # GatedDeltaNet._apply), so the product is an fp32 one where HF's is
+        # rounded to the model dtype first — within a bf16 ulp of HF, and the
+        # same arithmetic vLLM's fused gated norm does.
+        x = self.weight * x.to(input_dtype)
+        x = x * F.silu(gate.to(torch.float32))
+        return x.to(input_dtype)
+
+    def extra_repr(self) -> str:
+        return f"{self.hidden_size}, eps={self.variance_epsilon}"
 
 
 class AdaRMSNorm(nn.Module):

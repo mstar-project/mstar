@@ -17,8 +17,9 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseCudaGraphConfig,
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils import profiler
+from mstar.utils.streams import PLAN, get_stream
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +253,7 @@ class CudaGraphSlot:
     # preprocess output as captured; tensor entries are the static buffers
     static_inputs: dict[str, Any]
     static_input_keys: tuple[str, ...]
-    static_outputs: dict
+    static_outputs: BatchedModelOutput
     # padding rows address these; their streams stay resident between steps
     dummy_rids: list[int]
     dummy_metadata: dict[int, CurrentForwardPassInfo]
@@ -621,6 +622,7 @@ class CudaGraphRunner:
             graph, output = capture_into_graph(
                 run_forward, self._memory_pool, self._device, self._autocast_dtype,
             )
+            output = BatchedModelOutput.coerce(output)
 
             return self._build_slot_from_capture(
                 output=output,
@@ -632,9 +634,11 @@ class CudaGraphRunner:
                 config_idx=spec.config_idx,
             )
         finally:
-            # pages stay with the dummy streams: replay's padding rows address
-            # the same ids, so their plan finds the storage already resident
-            self._dummy_rows.reset(dummy_rids)
+            # Capture ran the dummy rows as real requests, so hand their
+            # storage back now rather than carry it through the rest of the
+            # pass: a replay's padding rows address the sink (page and slot)
+            # and need none of it.
+            self._dummy_rows.reset(dummy_rids, free=True)
 
     def _forward_for(self, spec: CGSlotSpec):
         """The callable this bucket captures, compiled once per config.
@@ -961,11 +965,15 @@ class CudaGraphRunner:
     def release(self, lease: SlotLease, real_bs: int) -> None:
         """Return the padding rows to their at-rest state after a step.
 
-        Their pages stay resident (``free=False``), so the next step's plan for
-        this slot allocates nothing for the tail.
+        Padding rows are flagged on the step context (`is_padding_row`) and
+        the resources give them nothing: the KV cache runs them against
+        SINK_PAGE, the recurrent pool against its sink slot. So there is
+        nothing to keep resident here, and nothing that could fail to be
+        re-acquired on the next padded step either — a step's padding must
+        never compete with real requests for storage.
         """
         dummy_rids = self.slot_for(lease).dummy_rids
-        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs])
+        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs], free=True)
 
     def plan_stream(self) -> torch.cuda.Stream | None:
         """Dedicated stream for pre-planning.
@@ -979,7 +987,7 @@ class CudaGraphRunner:
         if not torch.cuda.is_available():
             return None
         if self._plan_stream is None:
-            self._plan_stream = torch.cuda.Stream(device=self._device)
+            self._plan_stream = get_stream(PLAN, self._device)
         return self._plan_stream
 
 

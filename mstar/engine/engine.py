@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import torch
@@ -41,13 +42,15 @@ from mstar.engine.resources.step import (
 )
 from mstar.model.submodule_base import (
     ARNodeInputs,
+    BatchedModelOutput,
+    HostRows,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
 )
 from mstar.profile.worker import ExecTimings
-from mstar.utils.profiler import mark, range_pop, range_push
+from mstar.utils.profiler import PHASE_PERIOD, mark, phase_record, range_pop, range_push
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -234,7 +237,7 @@ class ExecutingBatch:
 
     # This step's per-rid outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
-    outputs: dict[str, NameToTensorList] = field(default_factory=dict)
+    outputs: BatchedModelOutput = field(default_factory=BatchedModelOutput)
 
     # The next step reads N's outputs, and plans against N's committed state.
     # Two separate dependencies, so two events: whoever prepares N+1 can start
@@ -694,7 +697,7 @@ class Engine:
 
     def exec(
         self, batch: ExecutingBatch
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         """Run one step: declare → admit → plan → forward → commit.
 
         Captured replay and the eager forward are the same path. Under a lease
@@ -709,7 +712,9 @@ class Engine:
         # failed preparing, so there is no forward to run. Reaching one anyway
         # dies on an empty `inputs`; the walk's next step is scheduled as usual.
         if not batch.request_ids:
-            batch.outputs = {}
+            batch.outputs = BatchedModelOutput(
+                per_rid_outputs={rid: {} for rid in batch.request_ids}
+            )
             batch.outputs_ready.set()
             batch.release_waiters()
             return batch.outputs
@@ -751,7 +756,7 @@ class Engine:
 
     def _exec_single(
         self, batch: ExecutingBatch
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         """The one-forward path: batched (a lease replay or ``forward_batched``)
         or a single eager request."""
         submodule_mgmt = self._submodules[batch.node_name]
@@ -783,7 +788,9 @@ class Engine:
                 nvtx=self._enable_nvtx, step=batch.step
             )
             if not admit.ok:
-                return {rid: {} for rid in batch.request_ids}
+                return BatchedModelOutput(
+                    per_rid_outputs={rid: {} for rid in batch.request_ids}
+                )
 
             raw, batch.step = self._drive_step(
                 batch, submodule_mgmt, batch.request_ids, inputs, req_info,
@@ -791,12 +798,15 @@ class Engine:
                 step=batch.step, set_launch=True,
             )
             if raw is None:
-                return {rid: {} for rid in batch.request_ids}
+                return BatchedModelOutput(
+                    per_rid_outputs={rid: {} for rid in batch.request_ids}
+                )
             # Commit first: releasing `commit_done` here is what lets a pre-plan
             # of N+1 overlap this step's per-request tail.
             batch.commit_done.set()
             if self._enable_nvtx:
                 range_push("engine.collect_outputs")
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 out = self._collect_outputs(
                     submodule_mgmt, lease, raw, inputs, req_info,
@@ -804,6 +814,8 @@ class Engine:
                     step_request_ids=batch.step_context.padded_request_ids,
                 )
             finally:
+                if PHASE_PERIOD:
+                    phase_record("engine.collect_outputs", perf_counter() - t0)
                 if self._enable_nvtx:
                     range_pop()
             # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
@@ -836,7 +848,9 @@ class Engine:
         """
         nvtx = self._enable_nvtx
         submodule_mgmt = self._submodules[batch.node_name]
-        merged: dict[str, NameToTensorList] = {rid: {} for rid in batch.request_ids}
+        merged = BatchedModelOutput(
+            per_rid_outputs={rid: {} for rid in batch.request_ids}
+        )
         launched = False
 
         # Step 1: loop through all of the requests for admit errors.
@@ -892,7 +906,6 @@ class Engine:
                     step=steps[rid], set_launch=not launched,
                 )
                 if raw is None:
-                    merged[rid] = {}
                     continue
                 launched = True
                 if fence:
@@ -942,6 +955,7 @@ class Engine:
             self._maybe_lease_piecewise_regions(batch.node_name, ctx, inputs)
             if nvtx:
                 range_push("engine.declare_step")
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 step = submodule.declare_step(
                     graph_walk=batch.graph_walk, request_ids=rids, inputs=inputs,
@@ -949,6 +963,8 @@ class Engine:
                     piecewise_leases=ctx.piecewise_leases,
                 )
             finally:
+                if PHASE_PERIOD:
+                    phase_record("engine.declare_step", perf_counter() - t0)
                 if nvtx:
                     range_pop()
         if step is None:
@@ -961,9 +977,12 @@ class Engine:
 
         if nvtx:
             range_push("engine.admit")
+        t0 = perf_counter() if PHASE_PERIOD else 0.0
         try:
             admit_outcome = self._runner.admit(step)
         finally:
+            if PHASE_PERIOD:
+                phase_record("engine.admit", perf_counter() - t0)
             if nvtx:
                 range_pop()
 
@@ -1047,9 +1066,16 @@ class Engine:
                     "engine.plan.promoted" if batch.preplan_event is not None
                     else "engine.plan.fresh"
                 )
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 self._runner.plan(step)
             finally:
+                if PHASE_PERIOD:
+                    phase_record(
+                        "engine.plan.promoted" if batch.preplan_event is not None
+                        else "engine.plan.fresh",
+                        perf_counter() - t0,
+                    )
                 if nvtx:
                     range_pop()
 
@@ -1067,11 +1093,14 @@ class Engine:
         )
         if nvtx:
             range_push("engine.preprocess")
+        t0 = perf_counter() if PHASE_PERIOD else 0.0
         try:
             preprocessed = submodule.preprocess(
                 ctx.graph_walk, engine_inputs=engine_inputs, inputs=inputs,
             )
         finally:
+            if PHASE_PERIOD:
+                phase_record("engine.preprocess", perf_counter() - t0)
             if nvtx:
                 range_pop()
 
@@ -1085,21 +1114,27 @@ class Engine:
             # the launch/enqueue span, not the GPU work: `synchronize=True`
             # here would drain the stream and destroy the overlap
             range_push("engine.forward")
+        t0 = perf_counter() if PHASE_PERIOD else 0.0
         try:
             raw = self._forward(
                 batch, submodule_mgmt, cg_runner, engine_inputs, preprocessed,
                 lease, running_batched, request_ids, release_event,
             )
         finally:
+            if PHASE_PERIOD:
+                phase_record("engine.forward", perf_counter() - t0)
             if nvtx:
                 range_pop()
 
         if step is not None:
             if nvtx:
                 range_push("engine.commit")
+            t0 = perf_counter() if PHASE_PERIOD else 0.0
             try:
                 self._runner.commit(step)
             finally:
+                if PHASE_PERIOD:
+                    phase_record("engine.commit", perf_counter() - t0)
                 if nvtx:
                     range_pop()
         return raw, step
@@ -1115,7 +1150,7 @@ class Engine:
         running_batched: bool,
         request_ids: list[str],
         release_event: "threading.Event | None" = None,
-    ) -> dict:
+    ) -> BatchedModelOutput:
         """Replay the leased slot, or run the eager forward.
 
         ``release_event`` is set as late as possible before the call that drops
@@ -1129,19 +1164,23 @@ class Engine:
         if release_event is not None:
             release_event.set()
         if running_batched:
-            return submodule_mgmt.forward_batched(
-                graph_walk, engine_inputs=engine_inputs, **preprocessed
+            return BatchedModelOutput.coerce(
+                submodule_mgmt.forward_batched(
+                    graph_walk, engine_inputs=engine_inputs, **preprocessed
+                )
             )
         assert len(request_ids) == 1, (
             "the unbatched forward takes one request; batch of "
             f"{len(request_ids)} needs running_batched"
         )
-        return {request_ids[0]: submodule_mgmt.forward(
-            graph_walk, engine_inputs=engine_inputs, **preprocessed
-        )}
+        return BatchedModelOutput.coerce(
+            {request_ids[0]: submodule_mgmt.forward(
+                graph_walk, engine_inputs=engine_inputs, **preprocessed
+            )}
+        )
 
     def postprocess_batch(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: BatchedModelOutput,
     ) -> None:
         """Per-rid ``submodule.postprocess``, e.g. the non-capturable tail of a
         walk whose graph covered only the forward.
@@ -1151,14 +1190,17 @@ class Engine:
         """
         if self._enable_nvtx:
             range_push("engine.postprocess")
+        t0 = perf_counter() if PHASE_PERIOD else 0.0
         try:
             self._postprocess_batch(batch, outputs)
         finally:
+            if PHASE_PERIOD:
+                phase_record("engine.postprocess", perf_counter() - t0)
             if self._enable_nvtx:
                 range_pop()
 
     def _postprocess_batch(
-        self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        self, batch: ExecutingBatch, outputs: BatchedModelOutput,
     ) -> None:
         submodule = self._submodules[batch.node_name].submodule
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
@@ -1178,7 +1220,7 @@ class Engine:
 
     def exec_and_postprocess(
         self, batch: ExecutingBatch
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         """The forward and its per-rid tail, which belong to the same step: a
         walk that captured only its forward finishes in ``postprocess``.
 
@@ -1194,6 +1236,7 @@ class Engine:
 
     def check_stop_for_batch(
         self, batch: ExecutingBatch, outputs: dict[str, NameToTensorList],
+        host_rows: HostRows | None = None,
     ) -> dict[str, set[str]]:
         """Each rid's ``submodule.check_stop``, as rid -> loops that should stop.
 
@@ -1203,8 +1246,26 @@ class Engine:
         request onto the batch, because letting it escape would abandon the
         check for the rest of the batch and leave their loops running past
         their stop condition.
+
+        With ``host_rows`` (the step's row-addressed outputs on the host), a
+        submodule implementing ``check_stop_batched`` checks the batch in one
+        call; if it raises, the per-request path runs instead, so a failure
+        still lands on its own request.
         """
         submodule = self._submodules[batch.node_name].submodule
+        if host_rows is not None:
+            try:
+                batched = submodule.check_stop_batched(
+                    batch.request_ids, batch.per_request_info, host_rows,
+                )
+            except Exception:
+                logger.debug(
+                    "batched check_stop failed (node=%s); checking per request",
+                    batch.node_name, exc_info=True,
+                )
+                batched = None
+            if batched is not None:
+                return batched
         stops: dict[str, set[str]] = {}
         for rid in batch.request_ids:
             rid_outputs = outputs.get(rid)
@@ -1247,12 +1308,12 @@ class Engine:
         self,
         submodule_mgmt: SubmoduleManagement,
         lease: SlotLease | None,
-        raw_outputs: dict,
+        raw_outputs: BatchedModelOutput,
         inputs: list[NodeInputs],
         req_info: Mapping[str, CurrentForwardPassInfo],
         request_ids: list[str],
         step_request_ids: tuple[str, ...],
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         """Per-rid outputs for the real requests: drop the padding rows and map
         a captured graph's keys back to real ids.
 
@@ -1274,28 +1335,65 @@ class Engine:
             outputs, raw_outputs, request_ids, submodule,
             inputs[:len(request_ids)], req_info,
         )
-        return outputs
+        return BatchedModelOutput(
+            per_rid_outputs=outputs,
+            check_stop_buffers=raw_outputs.clone_check_stop_buffers(),
+            # row i of those buffers is request_ids[i] *as the forward ran
+            # them*; the worker maps rows through this rather than through
+            # its own, later-rewritten request list
+            row_request_ids=tuple(request_ids),
+        )
 
     def _merge_per_rid(
         self,
         outputs: dict[str, NameToTensorList],
-        raw_outputs: dict,
+        raw_outputs: BatchedModelOutput,
         request_ids: list[str],
         out_ids: list[str],
         submodule: NodeSubmodule,
         req_info: Mapping[str, CurrentForwardPassInfo],
     ) -> None:
-        """Fold the forward's per-rid entries into ``outputs``."""
-        for rid, out_id in zip(request_ids, out_ids, strict=False):
+        """Fold the forward's per-rid entries into ``outputs``.
+
+        Row-addressed outputs (``row_outputs``) are copied out of the graph's
+        buffers once for the whole batch and handed to each request as a view
+        of that one clone. Per-rid entries are still cloned individually —
+        nothing says they are rows of a single tensor. A name present in both
+        is the per-rid one: that is the more specific claim.
+
+        The clone still happens after ``filter_batched_output``, so a key the
+        submodule drops for this request is never copied. Taking a view is
+        free, so the row entries can be offered to the filter up front.
+        """
+        row_clones = raw_outputs.clone_row_outputs(len(request_ids))
+        for i, (rid, out_id) in enumerate(
+            zip(request_ids, out_ids, strict=False)
+        ):
             rid_out = raw_outputs.get(out_id)
-            if not isinstance(rid_out, dict):
+            # names served by a view of the batch clone — already copied out,
+            # so they must not be cloned again below
+            from_rows: set[str] = set()
+            candidates: dict[str, Any] = {}
+            for name, tensor in row_clones.items():
+                if isinstance(tensor, torch.Tensor) and tensor.dim() and (
+                    i < tensor.shape[0]
+                ):
+                    candidates[name] = [tensor[i : i + 1]]
+                    from_rows.add(name)
+            if isinstance(rid_out, dict):
+                for name, value in rid_out.items():
+                    candidates[name] = value
+                    from_rows.discard(name)
+            if not candidates:
                 continue
             # captured output keys are fixed for graph compat; the submodule
             # decides which of them this real request should receive
-            rid_out = submodule.filter_batched_output(req_info.get(rid), rid_out)
+            rid_out = submodule.filter_batched_output(req_info.get(rid), candidates)
             merged = outputs.setdefault(rid, {})
             for key, value in rid_out.items():
-                if isinstance(value, list):
+                if key in from_rows:
+                    merged[key] = value
+                elif isinstance(value, list):
                     merged[key] = [t.clone() for t in value]
                 elif isinstance(value, torch.Tensor):
                     merged[key] = [value.clone()]
@@ -1305,7 +1403,7 @@ class Engine:
     def _merge_unpacked(
         self,
         outputs: dict[str, NameToTensorList],
-        raw_outputs: dict,
+        raw_outputs: BatchedModelOutput,
         request_ids: list[str],
         submodule: NodeSubmodule,
         real_inputs: list[NodeInputs],
@@ -1317,7 +1415,7 @@ class Engine:
         depend on the real seq_lens, which only reach it through the plan.
         """
         unpacked = submodule.unpack_packed_outputs(
-            static_output=raw_outputs,
+            static_output=raw_outputs.packed_outputs,
             request_ids=request_ids,
             real_seq_lens=[inp.input_seq_len for inp in real_inputs],
             inputs=real_inputs,

@@ -1451,6 +1451,23 @@ async def shutdown_event():
 # CLI entry point
 # ------------------------------------------------------------------
 
+def _set_preprocess_threads(model, config: dict) -> None:
+    """Size torch's intra-op pool for this process's preprocessing.
+
+    The API server's torch work is the data worker's per-request media
+    preprocessing (``load_image``, ``process_prompt``). ``config.yaml``'s
+    ``preprocess_torch_threads`` wins, else the model's
+    ``PREPROCESS_TORCH_THREADS``; None leaves torch's default (one thread per
+    core). Only this process: the conductor and workers are spawned fresh.
+    """
+    threads = config.get("preprocess_torch_threads", model.PREPROCESS_TORCH_THREADS)
+    if threads is None:
+        return
+    import torch
+
+    torch.set_num_threads(int(threads))
+
+
 def main(argv: list[str] | None = None):
     import argparse
 
@@ -1542,6 +1559,7 @@ def main(argv: list[str] | None = None):
         cache_dir=args.cache_dir,
         **yaml_model_kwargs,
     )
+    _set_preprocess_threads(model, config)
 
     global api_server
     log_stats = args.log_stats or args.log_stats_file is not None
