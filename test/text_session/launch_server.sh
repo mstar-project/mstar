@@ -13,7 +13,12 @@ DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 # servers on one host steal each other's handshake.
 PREFIX=${SOCKET_PREFIX:-/tmp/mstar_${WHO}_session/}
 
-CUDA_VISIBLE_DEVICES=$DEVICES python -m mstar.api_server.entrypoint \
+# $PYTHON so a shell without the venv activated does not fall back to a system
+# interpreter that has none of the dependencies.
+PYTHON=${PYTHON:-${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}}
+PYTHON=${PYTHON:-$([ -x .venv/bin/python ] && echo .venv/bin/python || echo python)}
+
+CUDA_VISIBLE_DEVICES=$DEVICES "$PYTHON" -m mstar.api_server.entrypoint \
     --config configs/test_text_session.yaml \
     --port "$PORT" \
     --socket-path-prefix "$PREFIX" \
