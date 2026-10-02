@@ -106,7 +106,7 @@ bagel_xpu = [
     "torchaudio",
     "torchcodec",
     "transformers",
-    "vllm-xpu-kernels==0.1.15",
+    "vllm-xpu-kernels==0.1.15.4",
 ]
 
 cosmos3 = [
