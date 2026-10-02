@@ -6,6 +6,8 @@ side writes one latent per token rather than a K/V pair. See
 """
 
 import functools
+import logging
+import os
 from dataclasses import dataclass
 
 import torch
@@ -16,11 +18,19 @@ from mstar.engine.resources.attn.base import (
     WorkspacePool,
 )
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.attn.wrappers import FlashInferMLAWrapper
+from mstar.engine.resources.attn.wrappers import FA3MLAWrapper, FlashInferMLAWrapper, load_fa3
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import KVConfig
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
 from mstar.engine.resources.step import SlotLease, StepContext
+
+logger = logging.getLogger(__name__)
+
+# MSTAR_MLA_DECODE_BACKEND=fa3 runs decode steps on FlashAttention-3's MLA
+# kernel (vLLM's FLASH_ATTN_MLA); prefill stays on FlashInfer either way.
+MLA_DECODE_BACKEND = os.environ.get("MSTAR_MLA_DECODE_BACKEND", "flashinfer")
+# Split count captured into FA3 decode graphs (vLLM's default for full graphs).
+FA3_MLA_NUM_SPLITS = int(os.environ.get("MSTAR_FA3_MLA_NUM_SPLITS", "32"))
 
 
 @dataclass(frozen=True)
@@ -56,7 +66,7 @@ class PlanState:
     """One label's planned attention: the wrapper or the fallback's layout."""
     # device-side, for select_last_hidden
     qo_indptr: torch.Tensor
-    wrapper: FlashInferMLAWrapper | None = None
+    wrapper: FlashInferMLAWrapper | FA3MLAWrapper | None = None
     sdpa: MlaSdpaPlan | None = None
 
 
@@ -147,6 +157,15 @@ class MlaAbsorbManager(AttentionManager):
 
         self._cg_wrappers: dict[CGSlotKey, FlashInferMLAWrapper] = {}
         self._eager_wrappers: dict[EagerSlotKey, FlashInferMLAWrapper] = {}
+        # decode-only FA3 wrappers, keyed apart: a slot's prefill and decode
+        # plans must not share a wrapper of the other kind
+        self._fa3_decode = (
+            MLA_DECODE_BACKEND == "fa3" and self._has_mla_kernel and load_fa3() is not None
+        )
+        if MLA_DECODE_BACKEND == "fa3":
+            logger.info("MLA decode backend: %s", "fa3" if self._fa3_decode else "flashinfer (fa3 unavailable)")
+        self._fa3_cg_wrappers: dict[CGSlotKey, FA3MLAWrapper] = {}
+        self._fa3_eager_wrappers: dict[EagerSlotKey, FA3MLAWrapper] = {}
         self._current_plan_states: dict[str, PlanState] = {}
         self._preplan_states: dict[str, PlanState] = {}
         self._preplanned = False
@@ -221,6 +240,31 @@ class MlaAbsorbManager(AttentionManager):
             )
         return wrapper
 
+    def _fa3_wrapper(
+        self, label: str, slot: int, lease: SlotLease | None, num_rows: int,
+    ) -> FA3MLAWrapper:
+        """The FA3 decode wrapper for one (bucket, slot, label) under a lease,
+        else for one eager (label, slot)."""
+        if lease is not None:
+            key, table = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label), self._fa3_cg_wrappers
+        else:
+            key, table = EagerSlotKey(label=label, slot=slot), self._fa3_eager_wrappers
+        wrapper = table.get(key)
+        if wrapper is None:
+            wrapper = table[key] = FA3MLAWrapper(
+                num_heads=self._kv_config.num_qo_heads,
+                head_dim_ckv=self._ckv_dim,
+                head_dim_kpe=self._kv_config.head_dim - self._ckv_dim,
+                page_size=self._kv_config.page_size,
+                sm_scale=self._softmax_scale,
+                max_seq_len=self._kv_config.max_seq_len,
+                batch_size=num_rows if lease is not None else None,
+                device=self._device,
+                use_cuda_graph=lease is not None,
+                num_splits=FA3_MLA_NUM_SPLITS,
+            )
+        return wrapper
+
     def _eager_wrapper(self, label: str, slot: int) -> FlashInferMLAWrapper:
         """The persistent eager wrapper for one (label, slot). One class covers
         prefill and decode, so there is nothing to key on the step kind."""
@@ -284,7 +328,11 @@ class MlaAbsorbManager(AttentionManager):
             state.sdpa = self._sdpa_plan(kv_out)
             return state
 
-        if lease is not None:
+        if self._fa3_decode and kv_out.is_decode:
+            wrapper = self._fa3_wrapper(
+                label, ctx.slot, lease, num_rows=indptrs.qo_indptr.shape[0] - 1,
+            )
+        elif lease is not None:
             wrapper = self._cg_wrapper(
                 lease, label, num_rows=indptrs.qo_indptr.shape[0] - 1,
             )

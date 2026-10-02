@@ -307,6 +307,17 @@ Worker scheduling
        router and the routed experts, joined before their partials are summed.
        Behaves the same eagerly and under CUDA-graph capture. The Kimi TP configs
        set it through their ``env:`` section.
+   * - ``MSTAR_MLA_DECODE_BACKEND``
+     - ``flashinfer``
+     - ``fa3``: absorbed-MLA decode steps run FlashAttention-3's MLA kernel (``qv``),
+       loaded from a ``flash_attn_interface`` source install or else the
+       ``kernels-community/flash-attn3`` hub build (the ``kimi_k2_7`` extra installs
+       ``kernels``). Prefill stays on FlashInfer. Falls back to FlashInfer with a
+       warning when FA3 cannot load. The Kimi TP configs set it through ``env:``.
+   * - ``MSTAR_FA3_MLA_NUM_SPLITS``
+     - ``32``
+     - KV splits captured into FA3 MLA decode graphs; the per-step AOT scheduler
+       metadata spreads each step's real lengths over them.
    * - ``MSTAR_PRE_PLAN_SPEC``
      - ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread

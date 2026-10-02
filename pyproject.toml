@@ -135,6 +135,8 @@ kimi_k2_7 = [
     "tiktoken",
     "blobfile",
     "Pillow",
+    # FA3 MLA decode (MSTAR_MLA_DECODE_BACKEND=fa3) from the kernels-community hub build
+    "kernels",
 ]
 
 qwen3_omni = [

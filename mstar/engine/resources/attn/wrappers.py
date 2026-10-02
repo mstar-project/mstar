@@ -14,6 +14,7 @@ Adapted from VoxServe's flashinfer_utils.py for our KV cache layout:
 (VoxServe uses [n_pages, 2, page_size, n_heads, head_dim] without layer dim.)
 """
 
+import functools
 import logging
 
 import torch
@@ -416,4 +417,153 @@ class FlashInferMLAWrapper:
         return self.attn_wrapper.run(
             q_nope.to(self.dtype), q_pe.to(self.dtype),
             ckv_cache, kpe_cache, return_lse=False,
+        )
+
+
+# FlashAttention-3's MLA decode (``qv``), from a source install or the
+# kernels-community/flash-attn3 hub build. Pinned by the build's kernel version.
+FA3_KERNEL_REPO = "kernels-community/flash-attn3"
+FA3_KERNEL_VERSION = 1
+
+
+@functools.cache
+def load_fa3():
+    """The FA3 module, or ``None`` when neither source is available."""
+    try:
+        import flash_attn_interface as fa3  # a hopper/ source build
+        return fa3
+    except ImportError:
+        pass
+    try:
+        from kernels import get_kernel
+
+        return get_kernel(FA3_KERNEL_REPO, version=FA3_KERNEL_VERSION)
+    except Exception as ex:  # noqa: BLE001 -- not installed, offline, no matching build
+        logger.warning("FA3 MLA unavailable (%s); MLA decode stays on FlashInfer", ex)
+        return None
+
+
+class FA3MLAWrapper:
+    """FA3 MLA decode over the 4D latent cache, behind ``FlashInferMLAWrapper``'s
+    plan/run interface.
+
+    Decode only (one query token per request), so ``max_seqlen_q`` is 1 at
+    capture and replay alike. FA3 takes a padded ``page_table`` rather than
+    CSR indices and derives ``max_seqlen_k`` from its width, so the table is
+    sized to ``max_seq_len`` once and the captured kernel's arguments never
+    change. Splitting follows each step's real lengths through the AOT
+    scheduler metadata, which ``plan`` recomputes into a persistent buffer
+    (zero-padded past its live part), as vLLM's FlashAttnMLA backend does.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_heads: int,
+        head_dim_ckv: int,
+        head_dim_kpe: int,
+        page_size: int,
+        sm_scale: float,
+        max_seq_len: int,
+        batch_size: int | None = None,
+        device: torch.device = torch.device("cuda"),
+        use_cuda_graph: bool = False,
+        num_splits: int = 32,
+    ):
+        self.fa3 = load_fa3()
+        assert self.fa3 is not None, "FA3MLAWrapper needs FA3; gate on load_fa3()"
+        self.device = device
+        self.use_cuda_graph = use_cuda_graph
+        self.num_heads = num_heads
+        self.head_dim_ckv = head_dim_ckv
+        self.head_dim_kpe = head_dim_kpe
+        self.page_size = page_size
+        self.sm_scale = sm_scale
+        self.max_pages_per_seq = -(-max_seq_len // page_size)
+        # captured: a fixed split count sizes FA3's intermediates at capture;
+        # eager: 0 lets FA3 choose per call
+        self.num_splits = num_splits if use_cuda_graph else 0
+        self.batch_size = batch_size
+        self.dtype = None
+        self._rows = 0
+        if use_cuda_graph:
+            assert batch_size is not None, "batch_size required for CUDA graph mode"
+            self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+            self._seqlens_buf = torch.zeros(batch_size, dtype=torch.int32, device=device)
+            self._page_table_buf = torch.zeros(
+                batch_size, self.max_pages_per_seq, dtype=torch.int32, device=device)
+            self._sched_buf: torch.Tensor | None = None
+        self._sched: torch.Tensor | None = None
+
+    def _page_table(self, kv_indptr: torch.Tensor, kv_indices: torch.Tensor, rows: int) -> torch.Tensor:
+        counts = kv_indptr[1:rows + 1] - kv_indptr[:rows]
+        width = max(int(counts.max()), 1) if rows else 1
+        table = torch.zeros(rows, width, dtype=torch.int32)
+        for i in range(rows):
+            n = int(counts[i])
+            if n:
+                start = int(kv_indptr[i])
+                table[i, :n] = kv_indices[start:start + n]
+        return table
+
+    @torch.compiler.disable
+    def plan(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_len_arr: torch.Tensor,
+        *,
+        causal: bool = True,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        """Same arguments as ``FlashInferMLAWrapper.plan`` (CPU tensors): stage
+        the page table and lengths, then schedule the splits on the device."""
+        del causal  # one query per request: causal and non-causal coincide
+        self.dtype = dtype
+        rows = qo_indptr.shape[0] - 1
+        assert int(qo_indptr[-1]) == rows, "FA3MLAWrapper serves decode steps only"
+        self._rows = rows
+        table = self._page_table(kv_indptr, kv_indices, rows)
+        if self.use_cuda_graph:
+            assert rows <= self.batch_size and table.shape[1] <= self.max_pages_per_seq
+            self._qo_indptr_buf[: rows + 1].copy_(qo_indptr)
+            self._seqlens_buf[:rows].copy_(kv_len_arr)
+            self._page_table_buf[:rows, : table.shape[1]].copy_(table)
+            qo, seqlens, pt = self._qo_indptr_buf[: rows + 1], self._seqlens_buf[:rows], self._page_table_buf[:rows]
+        else:
+            qo = qo_indptr.to(self.device)
+            seqlens = kv_len_arr.to(self.device)
+            pt = table.to(self.device)
+        self._qo, self._seqlens, self._pt = qo, seqlens, pt
+        sched = self.fa3.get_scheduler_metadata(
+            rows, 1, pt.shape[1] * self.page_size, self.num_heads, 1, self.head_dim_kpe, seqlens,
+            dtype, headdim_v=self.head_dim_ckv, cu_seqlens_q=qo, page_size=self.page_size,
+            causal=True, num_splits=self.num_splits,
+        )
+        if self.use_cuda_graph:
+            if self._sched_buf is None:
+                # sized by the bucket's row count, fixed for this wrapper
+                self._sched_buf = torch.zeros(sched.numel(), dtype=sched.dtype, device=self.device)
+            n = sched.numel()
+            assert n <= self._sched_buf.numel(), (n, self._sched_buf.numel())
+            self._sched_buf[:n].copy_(sched)
+            self._sched_buf[n:].zero_()
+            sched = self._sched_buf
+        self._sched = sched
+
+    @torch.compiler.disable
+    def run(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the planned decode: ``[T, H, ckv]`` like the FlashInfer wrapper."""
+        return self.fa3.flash_attn_with_kvcache(
+            q_pe.to(self.dtype), kpe_cache.unsqueeze(-2), ckv_cache.unsqueeze(-2),
+            qv=q_nope.to(self.dtype), cache_seqlens=self._seqlens, page_table=self._pt,
+            cu_seqlens_q=self._qo, max_seqlen_q=1, softmax_scale=self.sm_scale, causal=True,
+            scheduler_metadata=self._sched, num_splits=self.num_splits,
         )
