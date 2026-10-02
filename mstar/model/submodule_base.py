@@ -370,6 +370,16 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk, per_request_info
         return None
 
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        """Whether the scheduler batches each ``cg_key_info`` group apart.
+
+        A batch spanning two groups matches no capture. Opt in when that batch
+        runs worse than two captured ones, e.g. per-request eager; leave it off
+        when a batched eager forward handles the mix well.
+        """
+        del graph_walk
+        return False
+
     def request_state(self, request_id: str) -> PerRequestState:
         """The request's state, created on first access."""
         state = self.request_states.get(request_id)
