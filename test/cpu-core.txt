@@ -31,3 +31,4 @@ test/modular/test_cfg_tp_publish.py
 test/modular/test_bagel_cfg_parallel.py
 test/modular/test_kv_publish_retrieve.py
 test/modular/test_parallel_groups.py
+test/modular/test_preplan_error_paths.py
