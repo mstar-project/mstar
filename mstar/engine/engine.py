@@ -41,7 +41,9 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
 )
 from mstar.model.submodule_base import (
+    EMPTY_INPUT_METADATA,
     ARNodeInputs,
+    InputMetadata,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
@@ -52,7 +54,6 @@ from mstar.utils.profiler import mark, range_pop, range_push
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
-    from mstar.streaming.stream_buffer import StreamChunkInfo
 
 logger = logging.getLogger(__name__)
 
@@ -211,10 +212,8 @@ class ExecutingBatch:
     # rids for which this step ends every finite stream into the node; the
     # consumer flushes what it held back
     final_stream_rids: set[str] = field(default_factory=set)
-    # rid -> {input_name: chunk info} for rids consuming a streamed input
-    per_request_stream_chunks: Mapping[str, Mapping[str, "StreamChunkInfo"]] = field(
-        default_factory=dict
-    )
+    # rid -> this step's InputMetadata; rids without any are absent
+    per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
     # rids for which this step ends every finite stream into the partition;
     # this step reports the partition done
@@ -656,6 +655,7 @@ class Engine:
                     # flush whatever it held back (a vocoder's crossfade tail, the
                     # look-ahead frames a token encoder withholds)
                     is_final_stream_chunk=rid in batch.final_stream_rids,
+                    input_metadata=batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA),
                 )
                 if req_inputs is not None:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
@@ -1088,7 +1088,7 @@ class Engine:
             per_request_states=LazyRequestStates(submodule, rids),
             captured=lease is not None,
             step=step,
-            per_request_stream_chunks=batch.per_request_stream_chunks,
+            per_request_input_metadata=batch.per_request_input_metadata,
         )
         if nvtx:
             range_push("engine.preprocess")
@@ -1468,6 +1468,7 @@ class Engine:
         # the same per-request facts its `declare_step` stamps on the step.
         batch.cg_key_info = submodule_mgmt.submodule.cg_key_info(
             batch.step_context.graph_walk, batch.per_request_info,
+            per_request_input_metadata=batch.per_request_input_metadata,
         )
         lease = cg_runner.lease_slot(
             graph_walk=batch.step_context.graph_walk,

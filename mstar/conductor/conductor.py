@@ -986,6 +986,7 @@ class Conductor:
                         request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
                         step_metadata=fwd_args.step_metadata,
+                        stream_lead_items=fwd_args.stream_lead_items,
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
