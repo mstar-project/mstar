@@ -301,6 +301,12 @@ Worker scheduling
        refuse to start on a mismatch. Leave ``MSTAR_ENGINE_STEP_SYNC`` at
        ``0`` with it: that throttle holds the GPU thread until step N drains,
        which serialises the very overlap this flag buys.
+   * - ``MSTAR_KIMI_SHARED_STREAM``
+     - ``0``
+     - ``1``: Kimi-K2.7's shared expert runs on a side CUDA stream beside the
+       router and the routed experts, joined before their partials are summed.
+       Behaves the same eagerly and under CUDA-graph capture. The Kimi TP configs
+       set it through their ``env:`` section.
    * - ``MSTAR_PRE_PLAN_SPEC``
      - ``1``
      - Pre-plan the speculative batch's attention on a dedicated thread

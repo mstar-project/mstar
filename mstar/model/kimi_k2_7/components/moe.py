@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +26,50 @@ _BACKEND_LOGGED = False
 # the MoE working set (partial expert output, all-reduce buffer, Marlin
 # internals) instead of letting it scale with the full prompt length.
 MOE_PREFILL_SLICE = 8192
+
+# MSTAR_KIMI_SHARED_STREAM=1 runs the shared expert on a side stream beside the
+# router and routed experts (what vLLM does). Off by default until measured.
+SHARED_EXPERT_STREAM = os.environ.get("MSTAR_KIMI_SHARED_STREAM", "0") == "1"
+
+
+class _SideStream:
+    """Run one branch on an auxiliary CUDA stream, joined back on demand.
+
+    Unlike a capture-only fork, both calls behave the same eagerly and under
+    CUDA-graph capture, so the compiled decode forward sees no
+    capture-dependent branch (it is captured under ``fail_on_recompile``).
+    Both calls are opaque to dynamo: the branch runs eagerly on the side
+    stream, and the graph break costs nothing once the step is captured.
+
+    Memory needs no ``record_stream``: the branch's input outlives the join on
+    the main stream, and each later launch is ordered after the main stream's
+    use of the previous output by its fork event.
+    """
+
+    def __init__(self) -> None:
+        self._stream: torch.cuda.Stream | None = None
+        self._fork: torch.cuda.Event | None = None
+        self._join: torch.cuda.Event | None = None
+
+    @torch._dynamo.disable
+    def launch(self, fn, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_cuda:
+            return fn(x)
+        if self._stream is None:
+            self._stream = torch.cuda.Stream(device=x.device)
+            self._fork, self._join = torch.cuda.Event(), torch.cuda.Event()
+        self._fork.record()
+        with torch.cuda.stream(self._stream):
+            self._fork.wait()
+            out = fn(x)
+            self._join.record()
+        return out
+
+    @torch._dynamo.disable
+    def join(self, out: torch.Tensor) -> torch.Tensor:
+        if out.is_cuda and self._join is not None:
+            self._join.wait()
+        return out
 
 
 def _gate_up_packed_loader(
@@ -346,6 +391,9 @@ class KimiSparseMoeBlock(nn.Module):
             # and all-reduces once, instead of this MLP reducing on its own.
             reduce_results=False,
         )
+        # Has no collective inside (reduce_results=False), so it is safe off
+        # the main stream.
+        self._shared_stream = _SideStream() if SHARED_EXPERT_STREAM else None
 
     def _attach_expert_weight_loaders(self) -> None:
         """Reattach per-shard loaders after ``_apply`` rebuilds parameters."""
@@ -383,6 +431,10 @@ class KimiSparseMoeBlock(nn.Module):
         input_shape = hidden_states.shape
         flat = hidden_states.view(-1, self.hidden_size).contiguous()
 
+        # The shared expert reads only `flat`: start it first, beside the
+        # router and the routed experts.
+        side = self._shared_stream
+        shared = side.launch(self.shared_expert, flat) if side is not None else None
         topk_weights, topk_ids = self.gate(flat)
         num_tokens = flat.shape[0]
         if num_tokens <= self.moe_prefill_slice:
@@ -397,7 +449,7 @@ class KimiSparseMoeBlock(nn.Module):
                 routed[start:end] = self._route(
                     flat[start:end], topk_weights[start:end], topk_ids[start:end]
                 )
-        shared = self.shared_expert(flat)
+        shared = side.join(shared) if side is not None else self.shared_expert(flat)
         out = routed + shared
         # Rank-local partial even at tp_size > 1: KimiDecoderLayer fuses the
         # cross-rank all-reduce with the residual add and the following norm.
