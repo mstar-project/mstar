@@ -596,6 +596,13 @@ class Engine:
             cfg = sessions_config.resources.get(key)
             if cfg is None:
                 continue
+            if type(resource).retain_session_state is Resource.retain_session_state:
+                # it would inherit the no-op hooks and silently hold nothing
+                raise ValueError(
+                    f"resource {key!r} is named in the sessions config but "
+                    f"{type(resource).__name__} does not implement the session "
+                    "hooks, so it would hold nothing across a session"
+                )
             resource.session_config = cfg
         # one pass is enough: a dependency chain deeper than resource ->
         # dependent (positions over KV) does not exist today

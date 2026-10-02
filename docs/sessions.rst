@@ -218,9 +218,11 @@ Limits in this version
   ``max_concurrent_requests`` allows, or a full pool will start refusing
   admission. (A session's state does follow its request through an offload
   while that request is running.)
-- Sessions are reachable through ``/generate`` and the SDK; the
-  OpenAI-compatible surfaces do not expose them, and neither does the optional
-  Rust frontend (``--rust-frontend``), whose submit path carries no session
-  fields.
+- Sessions are reachable through the ``POST /generate`` form and the SDK. The
+  other entry points carry no session fields: the ``/generate/ws`` control-loop
+  socket, the OpenAI-compatible routes, and the optional Rust frontend
+  (``--rust-frontend``). The WebSocket route is the one that most wants them —
+  it is how a Cosmos3-edge client drives a control loop, and continuing from the
+  state the previous step left is the same need sessions serve.
 - Only ``test_text_session`` declares session support. Any other deployment
   refuses sessions until its model opts in.

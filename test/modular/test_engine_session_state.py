@@ -20,6 +20,8 @@ from mstar.model.sessions import SessionResourceConfig, SessionsConfig
 
 
 class _Res(Resource):
+    """A resource that holds session state: the hooks are what qualifies it."""
+
     def __init__(self, deps: tuple[str, ...] = ()):
         self._deps = set(deps)
 
@@ -29,6 +31,9 @@ class _Res(Resource):
 
     def depends_on(self):
         return set(self._deps)
+
+    def retain_session_state(self, rid, session_id):
+        return
 
 
 def _engine(resources):
@@ -107,6 +112,19 @@ def test_a_dependency_on_a_plain_resource_marks_nothing():
 
     assert resources["kv"].session_config is None
     assert resources["pos"].session_config is not None
+
+
+def test_a_resource_without_the_session_hooks_is_refused():
+    # it would inherit the base no-ops and hold nothing, silently
+    class _Plain(Resource):
+        @classmethod
+        def build(cls, spec, info):
+            raise NotImplementedError
+
+    engine = _engine({"ring": _Plain()})
+
+    with pytest.raises(ValueError, match="does not implement the session hooks"):
+        engine._open_session_state(_specs("ring"), _config("ring"))
 
 
 def test_a_session_resource_the_model_does_not_declare_is_refused():
