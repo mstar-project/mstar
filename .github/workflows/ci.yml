@@ -45,6 +45,9 @@ jobs:
           # CPU; 3.5.1 is the version torch 2.9.1 pins.
           python -m pip install triton==3.5.1
           python -m pip install -e ".[dev,waypoint]"
+          # BAGEL's CPU graph/KV tests import these model modules without
+          # loading weights or requiring the CUDA-only BAGEL extras.
+          python -m pip install einops regex transformers
           python -m pip check
       - name: Run CPU core tests
         env:

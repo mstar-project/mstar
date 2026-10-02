@@ -6,6 +6,7 @@ from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import TensorCommunicationManager
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -1091,7 +1092,8 @@ class PythonGraphRuntime(GraphRuntime):
         graph_walk: str,
         last_node_run: str,
         loop_names: ParallelList[int, list[str]]
-    ):
+    ) -> list[int]:
+        stopped_rids = []
         for rid, names in loop_names:
             wanted = {
                 name for name in names
@@ -1104,6 +1106,8 @@ class PythonGraphRuntime(GraphRuntime):
                 PendingLoopStop(rid, graph_walk, name) for name in wanted
             )
             self._fan_out_loop_stops(rid, partition, wanted)
+            stopped_rids.append(rid)
+        return stopped_rids
 
     def _stop_loops_for_rid(
         self, rid: int, partition: str, loop_names: set[str],
@@ -1354,7 +1358,7 @@ class PythonGraphRuntime(GraphRuntime):
     def send_outputs(
         self,
         input: SendInput,
-    ):
+    ) -> list[int]:
         completion = self._completions.pop(input.completion_id)
         partition = completion.partition
         fwd_infos = dict(iter(input.per_request_info))
@@ -1367,6 +1371,11 @@ class PythonGraphRuntime(GraphRuntime):
         profiling = (
             {} if input.profiling is None else dict(iter(input.profiling))
         )
+        publications = (
+            {} if input.resource_publish_info is None
+            else dict(iter(input.resource_publish_info))
+        )
+        sent_rids: list[int] = []
 
         for rid, routing in completion.routing.items():
             fwd_info = fwd_infos.get(rid)
@@ -1425,6 +1434,7 @@ class PythonGraphRuntime(GraphRuntime):
                 )._speculatively_scheduled
                 self._send_worker_graphs_done(
                     rid, routing, info, fwd_info, partition,
+                    resource_publish_info=publications.get(rid, {}),
                     stream_tokens_consumed=consumed.get(rid, {}),
                     # A speculatively-scheduled node has not really finished
                     # the partition, so it must not report done.
@@ -1434,6 +1444,8 @@ class PythonGraphRuntime(GraphRuntime):
                     ),
                     profiling=profiling.get(rid),
                 )
+                sent_rids.append(rid)
+        return sent_rids
 
     def _send_input_signals(
         self, rid: int, worker_id: str, edges: list[GraphEdge],
@@ -1458,6 +1470,7 @@ class PythonGraphRuntime(GraphRuntime):
         info: GraphRuntimeRequestInfo,
         fwd_info: CurrentForwardPassInfo | None,
         partition: str,
+        resource_publish_info: dict[str, PublishedInfo],
         stream_tokens_consumed: dict[str, int],
         partition_done: bool,
         profiling: Profiling | None,
@@ -1496,9 +1509,7 @@ class PythonGraphRuntime(GraphRuntime):
                 persist_signals=persist_signals,
                 new_token_counts=new_token_counts,
                 output_signal_names=output_signal_names,
-                resource_publish_info=(
-                    {} if fwd_info is None else fwd_info.resource_publish_info
-                ),
+                resource_publish_info=resource_publish_info,
                 partition_name=partition,
                 partition_done=partition_done,
                 stream_tokens_consumed=stream_tokens_consumed,

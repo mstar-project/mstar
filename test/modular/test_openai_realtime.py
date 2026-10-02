@@ -52,10 +52,13 @@ class _StubAPI:
         self.upload_dir = Path(tempfile.mkdtemp())
         self.submits: list = []
         self.answers: list[str] = []  # raw generations, one per step, in order
+        self.audio_sizes: list[int] = []
         self._chunks: dict = {}
 
     def submit_request(self, **kw):
         self.submits.append(kw)
+        # the step's WAV is deleted once the step is done
+        self.audio_sizes.append(Path(kw["file_paths"]["audio"][0]).stat().st_size)
         answer = self.answers.pop(0) if self.answers else ""
         self._chunks[kw["request_id"]] = [_Chunk("text", answer.encode())]
         return kw["request_id"]
@@ -190,7 +193,8 @@ def test_session_streams_partials_deltas_and_completion(client_and_stub):
         assert events[-1]["transcript"] == "hello friend you today"
         # the tail flush (0.5 s) was a third step, and every step hears all audio so far
         assert len(stub.submits) == 3
-        durations = [Path(s["file_paths"]["audio"][0]).stat().st_size for s in stub.submits]
+        durations = stub.audio_sizes
+        assert not list(stub.upload_dir.iterdir())
         assert durations == sorted(durations) and durations[0] < durations[-1]
         # a committed utterance starts a fresh item
         ws.send_text(json.dumps({"type": "input_audio_buffer.clear"}))
@@ -233,6 +237,42 @@ def test_bad_events_report_errors_but_keep_the_session(client_and_stub):
         assert "unknown event" in json.loads(ws.receive_text())["error"]["message"]
         ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": "%%%"}))
         assert json.loads(ws.receive_text())["error"]["message"] == "audio is not base64"
+
+
+def test_bad_session_update_is_an_error_and_changes_nothing(client_and_stub):
+    client, stub = client_and_stub
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "input_audio_transcription": {"language": "fr"}, "mstar": {"chunk_seconds": "abc"},
+        }}))
+        assert json.loads(ws.receive_text())["type"] == "error"
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {}}))
+        session = json.loads(ws.receive_text())["session"]
+        assert session["input_audio_transcription"]["language"] is None
+        assert session["mstar"]["chunk_seconds"] == serving_realtime.DEFAULT_CHUNK_SECONDS
+
+
+def test_failed_step_does_not_reuse_its_request_id(client_and_stub):
+    client, stub = client_and_stub
+    submit = stub.submit_request
+
+    def failing_first(**kw):
+        rid = submit(**kw)
+        if len(stub.submits) == 1:
+            stub._chunks[rid] = [_Chunk("error", b"bad language")]
+        return rid
+
+    stub.submit_request = failing_first
+    stub.answers = ["", "language English<asr_text> hi"]
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2.0)}))
+        assert json.loads(ws.receive_text())["type"] == "error"
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2.0)}))
+        _recv_until(ws, "mstar.transcription.partial")
+    ids = [s["request_id"] for s in stub.submits]
+    assert len(ids) == 2 and len(set(ids)) == 2
 
 
 def test_realtime_is_gated_on_the_adapter(client_and_stub):

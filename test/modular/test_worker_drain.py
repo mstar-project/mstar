@@ -82,6 +82,22 @@ def _reads_done(w):
     ]
 
 
+def test_draining_and_pending_removal_rids_are_not_published():
+    w = _worker(known_rids=("healthy", "draining", "pending", "failed"))
+    w._draining_rids.add("draining")
+    w._pending_removes.add("pending")
+    w.scheduler.failed_rids.add("failed")
+    batch = SimpleNamespace(
+        request_ids=["healthy", "draining", "pending", "failed"],
+        per_request_info={
+            rid: SimpleNamespace(request_id=rid)
+            for rid in ("healthy", "draining", "pending", "failed")
+        },
+    )
+
+    assert w._publishable_request_ids(batch) == ["healthy"]
+
+
 def test_drain_acks_reads_done_when_no_inflight_reads():
     w = _worker(inflight_reads=False)
     Worker._drain_request(w, DrainRequest(request_id="X"))
