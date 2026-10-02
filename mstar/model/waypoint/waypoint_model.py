@@ -24,7 +24,7 @@ reference. The reconstructed seed frames are never sent to the client.
 
 The world state is the ring KV cache, an engine resource
 (``get_node_resources`` below) rather than a model-owned buffer, since a
-per-request ring cannot survive CUDA-graph capture.
+per-request ring cannot survive accelerator graph capture.
 
 ``num_sessions`` (resident worlds) and ``max_batch_size`` (rows sharing one
 forward step, set by ``step_batch_size <= num_sessions``) are separate knobs.

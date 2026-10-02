@@ -9,6 +9,7 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import JointGroups
 from mstar.engine.accelerator_graph_backend import (
+    AcceleratorGraphPool,
     CapturedGraph,
     get_accelerator_graph_backend,
 )
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
-def autocast_scope(dtype: torch.dtype | None, device_type: str = "cuda"):
+def autocast_scope(dtype: torch.dtype | None, device_type: str):
     """A forward's autocast scope; ``None`` (``disable_autocast``) runs the
     submodule in its own dtype and shuts out any ambient autocast."""
     return torch.amp.autocast(
@@ -111,7 +112,7 @@ def capture_into_graph(run, pool, device, autocast_dtype):
     way leaves two things behind that would sink every later capture on the
     same pool: the caching allocator keeps routing this thread's allocations
     into the pool (the next capture_begin fails with "already recording to
-    mempool_id"), and torch.cuda.graph never switches the thread back off its
+    mempool_id"), and the graph context never switches the thread back off its
     capture stream. Undo both before re-raising, so the buckets after a
     failed one still capture and the thread keeps running on the stream it
     came in on.
@@ -130,11 +131,15 @@ def capture_into_graph(run, pool, device, autocast_dtype):
             with backend.capture(graph, pool=pool):
                 output = run()
     except BaseException:
+        if isinstance(pool, AcceleratorGraphPool):
+            pool.failed_graph = graph
         backend.device_module.set_stream(prev_stream)
         backend.synchronize()
         _stop_recording_to_pool(device, pool)
         raise
     backend.synchronize()
+    if isinstance(pool, AcceleratorGraphPool):
+        pool.failed_graph = None
     return graph, output
 
 
@@ -171,19 +176,25 @@ def capture_with_static_outputs(run, warm_outputs, pool, device, autocast_dtype)
 
 
 def fail_if_graphs_required(missing: list[str]) -> None:
-    """MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
+    """MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1 turns a dropped bucket into a startup
     failure, for deployments that would rather not come up than serve the
     eager path at 10-20x the latency."""
-    if not missing or os.environ.get("MSTAR_REQUIRE_CUDA_GRAPHS", "0") != "1":
+    required = os.environ.get(
+        "MSTAR_REQUIRE_ACCELERATOR_GRAPHS",
+        os.environ.get("MSTAR_REQUIRE_CUDA_GRAPHS", "0"),
+    )
+    if not missing or required != "1":
         return
     raise RuntimeError(
-        "CUDA graph capture failed for " + ", ".join(missing)
-        + " and MSTAR_REQUIRE_CUDA_GRAPHS=1"
+        "accelerator graph capture failed for " + ", ".join(missing)
+        + " and accelerator graphs are required"
     )
 
 
 def _stop_recording_to_pool(device, pool) -> None:
     device = torch.device(device)
+    if isinstance(pool, AcceleratorGraphPool):
+        pool = pool.handle
     end = getattr(torch._C, f"_{device.type}_endAllocateToPool", None)
     if end is None:
         return
@@ -412,7 +423,7 @@ class AcceleratorGraphRunner:
             max_seq_len = max((
                 spec.bucket.num_tokens for spec in slot_specs
             ), default=1)
-            self._step_runner.build_cuda_graph_buffers(
+            self._step_runner.build_accelerator_graph_buffers(
                 slot_specs, max_bs=self.max_bs, max_seq_len=max_seq_len,
                 node_name=self._submodule_name,
             )
@@ -949,7 +960,7 @@ class AcceleratorGraphRunner:
     def _replay(self, lease: SlotLease) -> dict:
         slot = self.slot_for(lease)
         # The launch, not the GPU work: replay is async, so this range measures
-        # enqueue cost only. GPU-side duration comes from --cuda-graph-trace.
+        # enqueue cost only. GPU-side duration comes from the device profiler.
         if self._enable_nvtx:
             profiler.range_push(f"cg.replay.slot[{lease.slot}]")
         slot.graph.replay()
@@ -1075,7 +1086,7 @@ class PiecewiseGraphKey(NamedTuple):
 
 
 class PiecewiseAcceleratorGraphRunner:
-    """Captures one inner callable of a submodule's forward as a CUDA graph.
+    """Captures one inner callable of a submodule's forward as an accelerator graph.
 
     Where ``AcceleratorGraphRunner`` replays a whole ``forward_batched`` under engine
     control, this captures a SUB-REGION — a transformer block loop, say —
@@ -1185,7 +1196,7 @@ class PiecewiseAcceleratorGraphRunner:
             self._size_slots()
             shapes = self._config.get_capture_shapes(self._capture_batch_sizes)
             if shapes:
-                self._step_runner.build_cuda_graph_buffers(
+                self._step_runner.build_accelerator_graph_buffers(
                     [
                         CGSlotSpec(
                             bucket=self._bucket(shape), slot=slot,

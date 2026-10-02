@@ -200,7 +200,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     # The denoise loop is data-dependent (per-step timestep .item(), scheduler
     # step, classifier-free guidance combine), so torch.compile graph-breaks and
-    # buys little; CUDA-graph capture of the fixed-shape step is the accelerator.
+    # buys little; accelerator graph capture of the fixed-shape step is the accelerator.
     disable_torch_compile = True
 
     # Run the two classifier-free-guidance branches as a single batched forward
@@ -211,7 +211,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     # Cap on how many concurrent requests share one batched denoise step.
     max_gen_batch_size = 8
 
-    # t2i (num_frames=1) resolutions to capture a bs=1 denoise-step CUDA graph
+    # t2i (num_frames=1) resolutions to capture a bs=1 denoise-step accelerator graph
     # for; others run eager. The graph removes launch overhead (biggest at low
     # resolution) and replays identically to eager. Override with
     # COSMOS3_GEN_CAPTURE_RES; concurrent requests batch via the eager path.
@@ -244,7 +244,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             config.session_store_size, config.session_timeout_s, config.session_timeout_max_s,
         )
         # Compile the pure denoise compute (~1.2-1.3x/step; the kernels bake
-        # into the CUDA graphs at capture). fullgraph=False breaks at the
+        # into the accelerator graphs at capture). fullgraph=False breaks at the
         # attention; ``config.compile_denoise=False`` keeps the eager step for
         # the bit-exact parity tests.
         if config.compile_denoise and transformer is not None:
@@ -1100,7 +1100,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         elif step_index >= len(scheduler.timesteps):
             return None
         tensors = {"latents": latents, "time_index": time_index}
-        # The CUDA-graph capture reads the timestep, rotary positions and the
+        # The accelerator graph capture reads the timestep, rotary positions and the
         # clean/noisy token mask as static buffers (it can't reach the
         # per-request scheduler at replay), so materialize them here. The eager
         # path ignores these and recomputes from per-request state. Only built
@@ -1390,7 +1390,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return GenStepInfo(cfg=False, cfg_active=False, capture_key=None)
 
     def _preprocess_image_gen_captured(self, inputs) -> dict:
-        """Pack a denoise step's inputs for the CUDA-graph path.
+        """Pack a denoise step's inputs for the accelerator graph path.
 
         Runs with synthetic request ids (no per-request state). The
         static-input tensors (latents, timestep, rotary positions) are
@@ -2059,7 +2059,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return out
 
     # ------------------------------------------------------------------
-    # CUDA-graph capture of the denoise step. Only the transformer velocity
+    # accelerator graph capture of the denoise step. Only the transformer velocity
     # computation is captured; the guidance combine and the (Python, multistep)
     # scheduler step run eagerly afterwards.
     # ------------------------------------------------------------------
@@ -2129,7 +2129,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             latent_area = latent_shape[3] * latent_shape[4]
             if latent_area > max_area:
                 logger.info(
-                    "Cosmos3: skipping CUDA-graph capture for %dx%dx%d (latent H*W "
+                    "Cosmos3: skipping accelerator graph capture for %dx%dx%d (latent H*W "
                     "%d > %d -> graph net-slower than eager dense here -> eager)",
                     height, width, frames, latent_area, max_area,
                 )
@@ -2286,7 +2286,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         latents, vision_timesteps, position_ids_cond, position_ids_uncond, noisy_token_mask,
         **kwargs,
     ) -> dict:
-        """Velocity-only denoise forward captured into a CUDA graph: both guidance
+        """Velocity-only denoise forward captured into an accelerator graph: both guidance
         branches in one pass (the combined plan), no scheduler step. The token
         layout is baked per resolution; the latents, timestep and rotary positions
         are static-buffer inputs stacked on a leading batch dim. A single request
@@ -2297,7 +2297,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         layout = self._capture_layout[tuple(latents.shape[1:])]
         rids = engine_inputs.request_ids
         if latents.shape[0] == 1:
-            # Captured into the denoise CUDA graph. Under SP the Ulysses
+            # Captured into the denoise accelerator graph. Under SP the Ulysses
             # exchange must be all-gather (all-to-all is grouped p2p send/recv —
             # not graph-replayable); the flag holds across warmup/capture/replay
             # so those kernels compile during eager warmup. No-op without SP.
@@ -2601,7 +2601,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     latents) before decoding, matching the fused t2i pipeline's decode.
     """
 
-    # One-shot decode per request; CUDA-graph capture (not torch.compile) is the
+    # One-shot decode per request; accelerator graph capture (not torch.compile) is the
     # speedup path.
     disable_torch_compile = True
 
@@ -2847,10 +2847,10 @@ class Cosmos3ReasonerSubmodule(ARNodeSubmodule):
     """
 
     # The token loop is data-dependent at the Python level (per-step state,
-    # sampling); CUDA-graph capture of the decode step is the accelerator.
+    # sampling); accelerator graph capture of the decode step is the accelerator.
     disable_torch_compile = True
 
-    # Decode batch sizes captured as CUDA graphs (bucketed; larger batches
+    # Decode batch sizes captured as accelerator graphs (bucketed; larger batches
     # run the eager batched forward).
     decode_capture_batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
 

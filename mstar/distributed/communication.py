@@ -400,7 +400,7 @@ class WorkerParallelGroups:
         initialized in ``init_dist``). Otherwise calls ``dist.barrier()``
         on the default global process group, syncing participating and
         non-participating workers alike. Used where every rank must be
-        ready before proceeding — e.g. between CUDA-graph warmup and the
+        ready before proceeding — e.g. between accelerator graph warmup and the
         worker's main loop, so an instance leader can't send a
         ``ScheduleTPNode`` to a follower that's still inside
         ``engine.warmup``.

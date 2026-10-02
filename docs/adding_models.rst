@@ -972,6 +972,9 @@ The default is an empty list, which means eager execution. The backend in
 ``mstar/engine/accelerator_graph_backend.py`` selects ``torch.cuda.CUDAGraph`` for
 ``device.type == "cuda"`` and ``torch.xpu.XPUGraph`` for ``device.type == "xpu"``.
 Declare configs only for devices whose kernels and resources support capture.
+The graph-captured token sampler currently uses FlashInfer on CUDA; XPU forwards
+that sample tokens use the eager path. BAGEL's XPU ``image_gen_cfg`` capture does not
+sample tokens.
 
 For each config, the engine first runs ``torch.compile``, controlled by the config's
 ``compile`` flag, which defaults to ``True``. It then records an accelerator graph and
@@ -1728,7 +1731,7 @@ easy to get wrong, and they run on CPU:
      - The admit, plan and commit lifecycle driven by ``declare_step``.
    * - ``test/modular/vjepa2/fake_resources.py``
      - Stub resources for testing a submodule's step declaration without a GPU.
-   * - ``test/modular/test_cuda_graph_capture.py``
+   * - ``test/modular/test_accelerator_graph_capture.py``
      - Capture-bucket keys, including ``cg_key_info`` and ``additional_key_info``.
    * - ``test/modular/test_micro_scheduler.py``
      - Batch admission, and the paths for failed and backpressured requests.

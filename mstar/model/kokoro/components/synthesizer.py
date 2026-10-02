@@ -8,7 +8,7 @@ Two halves, split where the frame count becomes known:
   ``decode_frames`` is shaped by ``F``: the F0 and energy heads and the decoder.
 
 ``forward`` joins them with the single host read of ``F``. The submodule
-captures ``encode_text`` and ``decode_frames`` as CUDA graphs per bucket.
+captures ``encode_text`` and ``decode_frames`` as accelerator graphs per bucket.
 """
 
 from __future__ import annotations

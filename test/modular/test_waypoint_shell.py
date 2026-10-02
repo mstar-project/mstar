@@ -429,7 +429,7 @@ def test_no_prepared_tensor_carries_tokens_per_frame_in_its_shape(
     variant would put ``button``'s ``n_buttons=256`` in the crosshairs. With
     ``step_batch_size > 1``, 360p at bs=2 does collide with ``n_buttons``;
     that case is handled via the config's ``input_seq_dims`` override instead
-    (see ``get_accelerator_graph_configs`` and ``test_cuda_graph_capture.py``).
+    (see ``get_accelerator_graph_configs`` and ``test_accelerator_graph_capture.py``).
     """
     inputs = _controller_stream(config, frames=4)
     inputs["latent"] = [torch.zeros((1, 1, *config.latent_shape))]

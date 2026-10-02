@@ -19,7 +19,9 @@ test/modular/test_waypoint_benchmark_videos.py
 test/modular/test_waypoint_live_server_benchmark.py
 test/modular/test_flex_attention_resource.py
 test/modular/test_ring_kv_resource.py
-test/modular/test_cuda_graph_capture.py
+test/modular/test_accelerator_graph_capture.py
+test/modular/test_accelerator_graph_runtime.py
+test/modular/test_accelerator_graph_backend.py
 test/modular/test_binary_framing.py
 test/modular/test_video_frame_protocol.py
 test/modular/test_client_sdk.py

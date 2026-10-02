@@ -358,10 +358,10 @@ class Qwen3OmniCodePredictor(nn.Module):
 
     Two forward paths:
       * ``forward(embed, cache_manager)``  -- paged-FlashInfer eager path,
-        used as a fallback when CUDA graphs are disabled.
+        used as a fallback when accelerator graphs are disabled.
       * ``forward_depth_unrolled(...)``   -- SDPA + dense-KV path that runs
         every layer with per-token position IDs and a static KV cache tensor.
-        This is what the unrolled CUDA graph captures.
+        This is what the unrolled accelerator graph captures.
     """
 
     def __init__(self, config: Qwen3OmniModelConfig):
@@ -440,7 +440,7 @@ class Qwen3OmniCodePredictor(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    # SDPA + dense-KV depth forward (for unrolled CUDA-graph capture)
+    # SDPA + dense-KV depth forward (for unrolled accelerator graph capture)
     # ------------------------------------------------------------------
     def forward_depth_unrolled(
         self,

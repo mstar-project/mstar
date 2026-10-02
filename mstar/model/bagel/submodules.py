@@ -472,7 +472,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
 
         """Convert raw images to VAE encoder input format.
 
-        Computes patchified dimensions as Python ints for CUDA graph
+        Computes patchified dimensions as Python ints for accelerator graph
         compatibility (no .item() calls in forward).
 
         Full implementation should include:
@@ -499,7 +499,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
             image_tensor = self.transform(self.transform.resize_transform(img))
         device = image_tensor.device
 
-        # Compute patchified dimensions as ints (CUDA graph compatible)
+        # Compute patchified dimensions as ints (accelerator graph compatible)
         p = self.latent_patch_size
         ds = self.latent_downsample
         _, img_h, img_w = image_tensor.shape
@@ -557,7 +557,7 @@ class VAEEncoderSubmodule(NodeSubmodule):
         latent = self.vae_model.encode(padded_images, noise=vae_noise)
 
         p = self.latent_patch_size
-        # h, w are already ints from preprocess (CUDA graph compatible)
+        # h, w are already ints from preprocess (accelerator graph compatible)
         packed_latent = []
         for lat in latent:
             lat = lat[:, :h * p, :w * p].reshape(
@@ -747,7 +747,7 @@ class LLMSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[BatchedAcceleratorGraphConfig | PackedAcceleratorGraphConfig]:
-        """Declare CUDA graph captures for ``decode`` (cfg-off + cfg-on) and ``prefill_text`` (cfg-off only).
+        """Declare CUDA decode/prefill captures and the XPU ``image_gen_cfg`` capture.
 
         cfg-on prefill_text is intentionally NOT captured. BAGEL's cfg-on
         prefill_text declares a pre-forward fork of the main stream
@@ -1233,7 +1233,7 @@ class LLMSubmodule(ARNodeSubmodule):
         """embed_tokens -> LLM forward -> lm_head -> logits.
 
         Returns logits; token sampling is done by the engine post-forward
-        (outside CUDA graph capture).
+        (outside accelerator graph capture).
 
         When requires_cfg is True: also forward for cfg_img to keep its
         KV cache in sync (cfg_img tracks all text, no images).
@@ -1542,7 +1542,7 @@ class LLMSubmodule(ARNodeSubmodule):
             out = self._forward_prefill_text(
                 input_ids=input_ids,
                 requires_cfg=requires_cfg,
-                # sample for cuda graph compatibility
+                # sample for accelerator graph compatibility
                 sample_prefill_token=True,
                 **kwargs
             )
@@ -1690,7 +1690,7 @@ class VAEDecoderSubmodule(NodeSubmodule):
 
         Unwraps latents from list. Image dimensions (image_h, image_w)
         are provided via per-request metadata and converted to ints for
-        CUDA graph compatibility.
+        accelerator graph compatibility.
         """
         return NodeInputs(
             tensor_inputs={

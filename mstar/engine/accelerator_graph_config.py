@@ -23,7 +23,7 @@ class AcceleratorGraphConfig(ABC):
         # Additional information added to the capture bucket key (e.g., requires_cfg).
         # Must be hashable.
         additional_key_info: Any | None = None,
-        compile: bool = True, # whether to run torch.compile before cuda graph capture
+        compile: bool = True, # whether to run torch.compile before accelerator graph capture
 
         # Per-config override for the set of batch sizes to capture
         capture_batch_sizes: list[int] | None = None,

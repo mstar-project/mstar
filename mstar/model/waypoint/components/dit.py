@@ -356,7 +356,7 @@ class WaypointDiT(nn.Module):
         themselves via the unconditional scratch write at the ring tail).
         """
         # One reused sigma buffer, filled per step; a fresh allocation per step
-        # would defeat cudagraph capture.
+        # would defeat accelerator graph capture.
         sigma = x.new_empty((x.size(0), x.size(1)))
         # 5 sigmas, 4 diffs: the trailing 0.0 exists only to produce the last
         # step size. Sliced, not zipped ragged -- dynamo rejects a ragged zip
@@ -419,7 +419,7 @@ class WaypointDiT(nn.Module):
         The caller owns the ring clock and advances it once per committed frame.
         """
         # The .clone() is load-bearing and must stay OUTSIDE the compiled
-        # region: both passes share one CUDA-graph capture, so without it the
+        # region: both passes share one accelerator graph capture, so without it the
         # cache pass's first allocation can land on the denoise pass's freed
         # output buffer and stomp the latent it is reading -- baked into the
         # graph and repeated on every replay.

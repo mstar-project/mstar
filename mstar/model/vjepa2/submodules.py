@@ -496,12 +496,12 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         self.frames_per_second = int(frames_per_second)
         self.anticipation_seconds = float(anticipation_seconds)
 
-    # NOTE: this masked predictor does NOT opt into piecewise CUDA graphs
+    # NOTE: this masked predictor does NOT opt into piecewise accelerator graphs
     # (``get_piecewise_accelerator_graph_configs`` returns the base default of {}).
     # The non-AC predictor attends over n_ctxt + n_pred ≈ 8448 tokens using
     # plain SDPA (no FlashInfer). At that sequence length the O(N²) attention
     # dominates completely — Python kernel-launch overhead is negligible
-    # relative to the ~1.7 GB attention matrix per layer, so CUDA graphs give
+    # relative to the ~1.7 GB attention matrix per layer, so accelerator graphs give
     # no meaningful speedup and capture risks OOM on top of the ViT-g weights.
     # Piecewise graphs are only worth it for the AC predictor
     # (capture_seq_len=258, FlashInfer per-call overhead worth eliminating).
@@ -603,7 +603,7 @@ class VJepa2RolloutPredictorSubmodule(ARNodeSubmodule):
         Shape math is symmetric across B.
 
         Runs the predictor forward end-to-end (eager); see the class note on
-        why this predictor does not use piecewise CUDA graphs.
+        why this predictor does not use piecewise accelerator graphs.
         """
         b, n_ctxt, _ = encoder_hidden.shape
         device = encoder_hidden.device
@@ -1149,9 +1149,9 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         request_ids: list[str] | None = None,    # needed by PiecewiseAcceleratorGraphRunner
         runner: "PiecewiseAcceleratorGraphRunner | None" = None,
     ) -> torch.Tensor:
-        """One AC rollout step using either the CUDA-graph or eager path.
+        """One AC rollout step using either the accelerator graph or eager path.
 
-        The CUDA-graph path (when a ``block_loop`` PiecewiseAcceleratorGraphRunner is
+        The accelerator graph path (when a ``block_loop`` PiecewiseAcceleratorGraphRunner is
         available on ``engine_inputs``):
           1. Preamble (predictor_embed + action/state concat) runs eagerly.
           2. Position tensors are computed eagerly (hoisted out of the graph).
@@ -1164,7 +1164,7 @@ class VJepa2ACRolloutPredictorSubmodule(ARNodeSubmodule):
         p = self.predictor
 
         if runner is not None and runner.can_run(encoder_hidden.size(0)):
-            # --- CUDA-graph path ---
+            # --- accelerator graph path ---
             x, cond_tokens, b, t = p._prepare_sequence(
                 encoder_hidden, actions, states, extrinsics
             )

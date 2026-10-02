@@ -179,7 +179,7 @@ class SubmoduleManagement:
 class ExecutingBatch:
     node_name: str
 
-    # Keyed by the worker's integer rid handle. CUDA-graph capture pads with
+    # Keyed by the worker's integer rid handle. Accelerator graph capture pads with
     # its own rows, which carry negative handles from the same space (see
     # accelerator_graph_runner.dummy_rid_handle), so a padded batch is still int-keyed
     # throughout.
@@ -438,7 +438,7 @@ class Engine:
         default mode (fullgraph=False, dynamic=None), which in general provides
         performance gains without frequent slow recompiles.
         """
-        if not torch.accelerator.is_available():
+        if self._device.type not in {"cuda", "xpu"} or not self._device_module.is_available():
             return
 
         for node_name, submodule_mgmt in self._submodules.items():
@@ -522,8 +522,8 @@ class Engine:
             for bs, tokens in runner.dropped_shapes
         ])
 
-        # torch.compile applied after CUDA graph capture because the cuda
-        # graph runner compiles internally
+        # torch.compile applied after capture because the accelerator graph
+        # runner compiles internally
         self._compile_submodules()
 
         for resource in self._resources.values():
@@ -841,6 +841,7 @@ class Engine:
             # thread gates on. Skipped during capture: you can't sync mid-capture.
             if (
                 _ENGINE_STEP_SYNC
+                and self._device.type in {"cuda", "xpu"}
                 and not self._device_module.is_current_stream_capturing()
             ):
                 if self._enable_nvtx:
@@ -953,6 +954,7 @@ class Engine:
         # always eager (never capturing), but the guard is kept for parity.
         if (
             _ENGINE_STEP_SYNC
+            and self._device.type in {"cuda", "xpu"}
             and not self._device_module.is_current_stream_capturing()
         ):
             if nvtx:

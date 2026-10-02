@@ -416,7 +416,7 @@ class Cosmos3PackedMoTAttention(nn.Module):
         # tp*sp head-degree, then the result is re-sharded back. Trivial SP
         # group -> passthrough (byte-identical to the non-SP path). The captured
         # denoise forward sets prefer_all_gather (the all-to-all does not replay
-        # from a CUDA graph; all-gather does).
+        # from an accelerator graph; all-gather does).
         out = ulysses_attention(
             self.sp_group, q, k, v, attend, seq_sizes,
             prefer_all_gather=prefer_all_gather,

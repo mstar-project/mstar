@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import torch
@@ -12,6 +13,14 @@ class CapturedGraph(Protocol):
     def reset(self) -> None: ...
 
     def pool(self) -> Any: ...
+
+
+@dataclass
+class AcceleratorGraphPool:
+    handle: Any
+    # XPU's host allocator cannot reopen a pool after its last graph dies.
+    # Keep a failed capture alive until a successful capture owns the pool.
+    failed_graph: CapturedGraph | None = field(default=None, repr=False)
 
 
 class AcceleratorGraphBackend:
@@ -47,7 +56,7 @@ class AcceleratorGraphBackend:
         return graph_type()
 
     def graph_pool_handle(self) -> Any:
-        return self.device_module.graph_pool_handle()
+        return AcceleratorGraphPool(self.device_module.graph_pool_handle())
 
     def capture(
         self,
@@ -56,7 +65,9 @@ class AcceleratorGraphBackend:
         pool: Any = None,
         stream: Any = None,
     ) -> AbstractContextManager:
-        kwargs: dict[str, Any] = {"pool": pool}
+        kwargs: dict[str, Any] = {
+            "pool": pool.handle if isinstance(pool, AcceleratorGraphPool) else pool,
+        }
         if stream is not None:
             kwargs["stream"] = stream
         return self.device_module.graph(graph, **kwargs)

@@ -167,12 +167,13 @@ class WaypointConfig:
     reference_compat: bool = True
 
     # torch.compile the two outer regions (denoise pass, cache pass), matching
-    # the reference. Independent of CUDA graph capture and of FlexAttention,
+    # the reference. Independent of accelerator graph capture and of FlexAttention,
     # which stays compiled for correctness regardless.
     compile_dit: bool = True
 
-    # Attempt fixed-shape CUDA graph capture for encoder/DiT/decoder prime and
+    # Attempt fixed-shape accelerator graph capture for encoder/DiT/decoder prime and
     # rollout paths; disabled or failed capture falls back to eager forwards.
+    # Retains the legacy config key for existing deployments.
     cuda_graph: bool = True
 
     # Extra (H, W) seed shapes the vae_encoder captures a graph for; others run eager.

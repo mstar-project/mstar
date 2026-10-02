@@ -451,8 +451,8 @@ class Worker:
         # erase the overlap. The side stream waits on
         # ``output.completion_event`` (recorded after GPU(N)) and then runs
         # an isolated D→H, so the main thread only blocks on the copy.
-        # Lazy-initialized — workers without CUDA never touch it.
-        self._d2h_stream: "torch.cuda.Stream | None" = None
+        # Lazy-initialized — CPU workers never touch it.
+        self._d2h_stream: torch.Stream | None = None
         self._pinned_d2h_buffers: dict[
             tuple[str, torch.dtype, tuple[int, ...]], list[torch.Tensor]
         ] = defaultdict(list)
@@ -2676,36 +2676,39 @@ class Worker:
     def _prematerialize_for_check_stop(
         self,
         outputs: dict[int, NameToTensorList],
-        completion_event: torch.cuda.Event | None,
+        completion_event: torch.Event | None,
     ) -> dict[int, NameToTensorList]:
-        """Side-stream D→H of every CUDA tensor in ``outputs`` so the subsequent
+        """Side-stream D→H of every device tensor in ``outputs`` so the subsequent
         ``check_stop`` reads (typically ``.item()`` on the sampled token)
         don't trigger a default-stream sync. With same-thread async,
         GPU(N+1)'s kernels are already queued on default stream behind
         N's outputs by the time we get here — a default-stream sync would
         block waiting for N+1 to finish, defeating the overlap.
 
-        Returns per-rid outputs with the CUDA tensors replaced by CPU
+        Returns per-rid outputs with the device tensors replaced by CPU
         copies. Skipped (returns ``outputs`` unchanged) when there's no
-        completion event (CPU execution) or when CUDA is unavailable.
+        completion event (CPU execution) or when the device is unavailable.
 
         AR engines emit small per-rid output dicts (sampled token + maybe
         a code) so the cost is negligible. If a future engine emits large
         tensors here (e.g. activations), revisit.
         """
-        if not torch.cuda.is_available() or completion_event is None:
+        if completion_event is None or self.device.type not in {"cuda", "xpu"}:
+            return outputs
+        device_module = getattr(torch, self.device.type)
+        if not device_module.is_available():
             return outputs
         if not outputs:
             return outputs
 
         if self._d2h_stream is None:
-            self._d2h_stream = torch.cuda.Stream(device=self.device)
+            self._d2h_stream = device_module.Stream(device=self.device)
         side = self._d2h_stream
         side.wait_event(completion_event)
 
         cpu_per_rid: dict = {}
         buffer_indices: dict[tuple[str, torch.dtype, tuple[int, ...]], int] = defaultdict(int)
-        with torch.cuda.stream(side):
+        with device_module.stream(side):
             for rid, name_to_list in outputs.items():
                 if not isinstance(name_to_list, dict):
                     cpu_per_rid[rid] = name_to_list
@@ -2717,7 +2720,7 @@ class Worker:
                         continue
                     new_list = []
                     for t in tensors:
-                        if torch.is_tensor(t) and t.is_cuda:
+                        if torch.is_tensor(t) and t.device.type == self.device.type:
                             key = ("check_stop", t.dtype, tuple(t.shape))
                             idx = buffer_indices[key]
                             buffer_indices[key] += 1
@@ -2903,7 +2906,7 @@ class Worker:
                 )
 
         # Bound the load-time asymmetry between workers before any
-        # subgroup NCCL collective fires inside the per-bs CUDA-graph
+        # subgroup NCCL collective fires inside the per-bs accelerator graph
         # capture loop. Without this fence, a worker with a small model
         # (e.g. an 8B Talker) can finish loading, enter warmup, and hit
         # its first subgroup barrier while a worker with a 30B Thinker
@@ -2916,7 +2919,7 @@ class Worker:
         self.parallel_groups.barrier_all()
         self._verify_tp_async_sched_agrees()
 
-        # CUDA graph capture before entering the main loop
+        # accelerator graph capture before entering the main loop
         self.engine_manager.warmup_all()
 
         # Sync every worker before the main loop opens. Per-batch-size
@@ -2943,7 +2946,7 @@ class Worker:
             "permanent generation", self.worker_id, gc.get_freeze_count(),
         )
 
-        # Setup (weight load + warmup + CUDA-graph capture) is complete. Tell
+        # Setup (weight load + warmup + accelerator graph capture) is complete. Tell
         # the conductor this worker is ready. The conductor blocks its main
         # loop until every worker reports in, so the API server only advertises
         # readiness once all workers can actually serve.

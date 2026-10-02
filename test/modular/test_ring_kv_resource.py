@@ -840,7 +840,7 @@ def test_post_warmup_validate_catches_a_committed_frame():
 
     kv.commit(_step("a", frame=4), _ctx("a"))  # a commit capture should never have made
 
-    with pytest.raises(RuntimeError, match="during CUDA graph capture"):
+    with pytest.raises(RuntimeError, match="during accelerator graph capture"):
         kv.post_warmup_validate()
 
 
@@ -932,11 +932,11 @@ def test_a_reused_world_starts_empty():
         assert not bool(layer.written[: layer.ring_len].any())
 
 
-def test_build_cuda_graph_buffers_allocates_nothing():
+def test_build_accelerator_graph_buffers_allocates_nothing():
     kv = _manager()
     before = _ptrs(kv)
 
-    kv.build_cuda_graph_buffers([], max_bs=1, max_seq_len=4096)
+    kv.build_accelerator_graph_buffers([], max_bs=1, max_seq_len=4096)
 
     assert _ptrs(kv) == before
 

@@ -1,4 +1,4 @@
-"""Registration of captured CUDA graph buckets.
+"""Registration of captured accelerator graph buckets.
 
 A bucket's slots are double buffers of one shape: replay(N) runs on one while
 pre-plan(N+1) writes the other. So a bucket is only usable with all of its
@@ -30,22 +30,6 @@ from mstar.engine.resources import BucketKey, CGSlotSpec
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="capture allocates a graph pool"
 )
-
-
-@pytest.fixture(autouse=True)
-def fake_cuda_runtime(request, monkeypatch):
-    """The only real CUDA calls on this path are the graph pool handle and the
-    memory readings around it; `_FakeRunner` stands in for the capture itself.
-    Stubbing them keeps these policy tests running where there is no GPU.
-
-    Stubbed on a GPU too: `_FakeRunner` is on the CPU device, and the real
-    `memory_allocated(cpu)` raises once any earlier test has initialised CUDA.
-    Only the `requires_cuda` tests, which capture for real, keep the runtime."""
-    if requires_cuda.mark in request.node.iter_markers():
-        return
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device=None: 0)
-    monkeypatch.setattr(torch.cuda.graphs, "graph_pool_handle", object)
 
 
 class _Group:
@@ -380,12 +364,24 @@ def test_a_failed_capture_leaves_the_pool_and_stream_usable():
 
 
 def test_required_graphs_turn_a_dropped_bucket_into_a_startup_failure(monkeypatch):
+    monkeypatch.delenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", raising=False)
     monkeypatch.delenv("MSTAR_REQUIRE_CUDA_GRAPHS", raising=False)
     fail_if_graphs_required(["node decode[bs=1]"])
 
     monkeypatch.setenv("MSTAR_REQUIRE_CUDA_GRAPHS", "1")
     fail_if_graphs_required([])
     with pytest.raises(RuntimeError, match="node decode"):
+        fail_if_graphs_required(["node decode[bs=1]"])
+
+
+def test_accelerator_graph_requirement_takes_precedence_over_legacy_setting(monkeypatch):
+    monkeypatch.setenv("MSTAR_REQUIRE_CUDA_GRAPHS", "1")
+    monkeypatch.setenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "0")
+    fail_if_graphs_required(["node decode[bs=1]"])
+
+    monkeypatch.setenv("MSTAR_REQUIRE_CUDA_GRAPHS", "0")
+    monkeypatch.setenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "1")
+    with pytest.raises(RuntimeError, match="Accelerator graph|accelerator graph"):
         fail_if_graphs_required(["node decode[bs=1]"])
 
 

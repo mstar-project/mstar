@@ -409,16 +409,17 @@ class Cosmos3Config:
     is_distilled: bool = False
     distilled_sigmas: tuple[float, ...] | None = None
 
-    # ----- denoise CUDA-graph capture (serving knobs) -----
-    # Capture the fixed-shape denoise step as a CUDA graph (the launch-bound-tier
+    # ----- denoise accelerator graph capture (serving knobs) -----
+    # Capture the fixed-shape denoise step as an accelerator graph (the launch-bound-tier
     # accelerator). Set False to serve the denoise loop eagerly. The env var
     # COSMOS3_DISABLE_CUDA_GRAPH, when set, overrides this.
+    # Retains the legacy config key for existing deployments.
     cuda_graph: bool = True
     # Only capture resolutions whose latent H*W is at or below this; larger tiers
     # (720p+, video) run eager+dense where the graph is net-slower. The env var
     # COSMOS3_GRAPH_MAX_LATENT_AREA overrides this.
     graph_max_latent_area: int = 2000
-    # Video denoise steps to capture as CUDA graphs, as (height, width,
+    # Video denoise steps to capture as accelerator graphs, as (height, width,
     # frames) pixel tiers: a plain t2v/i2v clip length and/or the windowed
     # rollout's window length. Pays only for small, launch-bound tiers: at
     # 832x480 the captured (paged-attention) step measured slower than the
@@ -434,7 +435,7 @@ class Cosmos3Config:
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.
     compile_denoise: bool = True
-    # torch.compile the reasoner's captured decode step before the CUDA-graph
+    # torch.compile the reasoner's captured decode step before the accelerator graph
     # capture: at bs=1 the eager step is ~1240 kernels, ~1000 of them the
     # norms', rotary's and residuals' pointwise pieces; fused, the step runs
     # at the weight-streaming floor (H100: 4.2 -> 2.05 ms/token). Env override

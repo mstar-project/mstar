@@ -204,7 +204,7 @@ class Resource(ABC):
         return None
 
     def reset_request(self, rid: str, free: bool=False):
-        """For clearing dummy RIDs during cuda graph capture"""
+        """For clearing dummy RIDs during accelerator graph capture"""
         return
 
     # Pre-planning
@@ -276,7 +276,7 @@ class Resource(ABC):
 
     # Engine lifecycle
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec],
         max_bs: int, max_seq_len: int
     ) -> None:
@@ -294,7 +294,7 @@ class Resource(ABC):
     def post_warmup_validate(self):
         """
         For, e.g., the KV cache to check that num_free_pages is identical
-        across TP ranks after cuda graph capture.
+        across TP ranks after accelerator graph capture.
 
         Raises an error (fails loudly) if invalid.
         """

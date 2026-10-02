@@ -7,6 +7,10 @@ representative Hugging Face identifier.
 
 Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MODELS``).
 
+Graph capture uses the accelerator graph API for CUDA and XPU. Each model's attention
+and sampling kernels determine which devices it can capture on; see
+:doc:`adding_models` and use a configuration for your device.
+
 .. list-table:: Registered model families
    :header-rows: 1
    :widths: 14 34 30
@@ -139,7 +143,7 @@ Kokoro notes
   synthesis.
 - Output is 24 kHz mono PCM16. The model runs in fp32 by default: its vocoder is
   phase-sensitive, so reduced precision is opt-in. On CUDA the text half and the
-  frame half of the forward are captured as CUDA graphs per length bucket and the
+  frame half of the forward are captured as accelerator graphs per length bucket and the
   frame half is compiled with dynamic shapes, so the first start-up on a GPU takes
   about two minutes; rows of one step are grouped by frame bucket
   (``frame_grouping: single`` pads them into one group instead, kept for comparison).
@@ -158,12 +162,12 @@ Qwen3-TTS notes
 - The first integration supports the CustomVoice checkpoint and text-to-audio
   requests. ``voice`` selects one of the checkpoint's built-in speakers and
   ``language`` defaults to automatic detection.
-- Codec CUDA graphs are captured through batch size 8. The upstream decoder's
+- Codec accelerator graphs are captured through batch size 8. The upstream decoder's
   batch-16 capture can exhaust an H100 after Talker weights and CodePredictor
   graphs are resident; larger Codec batches therefore use the scheduler's safe
   ceiling.
 - Talker prefill remains eager because it runs once with variable sequence
-  lengths. Decode always uses the whole-walk CUDA Graph, with the 15-step
+  lengths. Decode always uses the whole-walk accelerator graph, with the 15-step
   CodePredictor loop captured inside it; request-local EOS suppression is
   carried as a graph tensor input so replay does not consult capture-slot dummy
   request state. Residual ``subtalker_*`` sampling is per-request through the
@@ -198,7 +202,7 @@ Cosmos3 environment requirements
 --------------------------------
 
 - ``flashinfer`` is required: it is the paged KV/attention backend used by the
-  prefill, the captured CUDA graphs, and multi-request batches.
+  prefill, the captured accelerator graphs, and multi-request batches.
 - The default denoise attention backend is ``dense_gen``
   (``Cosmos3Config.attention_backend``), which runs bs=1 eager generation
   attention as one FlashAttention-3 varlen kernel from the ``fa3-fwd`` wheel.
@@ -242,7 +246,7 @@ chat template opens a ``<think>`` block by default. ``extra_body`` knobs:
        {"type": "text", "text": "The task is to put the flower into the red bottle. Plan the next steps."}]}],
      "enable_thinking": false}'
 
-The decode step is captured into CUDA graphs per batch bucket and, by default,
+The decode step is captured into accelerator graphs per batch bucket and, by default,
 compiled first (``compile_reasoner_decode: true``; ``COSMOS3_REASONER_COMPILE=0``
 turns it off): the eager step is over a thousand tiny kernels, and the fused
 step runs at the weight-streaming floor (about twice the uncompiled rate at
@@ -344,7 +348,7 @@ The schedule is padded up to whole windows and the video trimmed back to
 ``num_frames``; a seeded request is deterministic end to end (later windows draw
 their noise from the same generator). Windowed requests batch with each other
 and with plain requests at the same walk. ``gen_capture_video`` lists (height,
-width, frames) tiers whose denoise steps replay a per-step CUDA graph (one graph per
+width, frames) tiers whose denoise steps replay a per-step accelerator graph (one graph per
 latent shape, the clean/noisy frame layout carried as a mask input; plain t2v/i2v and
 ``chained`` windows, never ``kv`` windows). It is empty by default: at 832x480 the
 graph, which captures the paged attention, measured 3-6% slower than the eager dense
@@ -447,6 +451,6 @@ travels with the request rather than living in a scheduler object on one rank.
 Requests are therefore independent and the loop is resumable across ranks.
 
 **Nothing is accelerated by default.** wan22 serves the DiT eager: no
-``torch.compile``, no CUDA-graph capture, no continuous batching, no component
+``torch.compile``, no accelerator graph capture, no continuous batching, no component
 offload, and the VAE decode is always tiled (which bounds its workspace so the
 untiled conv3d cannot OOM a 32 GiB card).

@@ -150,7 +150,7 @@ class Pi05ViTEncoderSubmodule(NodeSubmodule):
         )
 
     def get_accelerator_graph_configs(self, device: torch.device, tp_world_size: int = 1) -> list:
-        """CUDA graph capture config for the SigLIP encoder.
+        """accelerator graph capture config for the SigLIP encoder.
 
         Captures the batched encoder forward for bs ∈ [1, 2, 4] during the
         'prefill' walk. Each capture slot holds one request's pixel_values:
@@ -407,7 +407,7 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
         del tp_world_size
         return [
             # Action generation always has latents of the same size, so it is a
-            # similar paradigm to AR decode and can use the batched cuda graphs.
+            # similar paradigm to AR decode and can use the batched accelerator graphs.
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="action_gen",
                 single_request_inputs=ARNodeInputs(

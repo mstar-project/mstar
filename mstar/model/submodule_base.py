@@ -259,7 +259,7 @@ class ModelInputsFromEngine:
     piecewise_runners: dict[str, "PiecewiseAcceleratorGraphRunner"] = field(default_factory=dict)
 
     # The batch's per-request states, injected by the engine (None on paths
-    # that don't carry them, e.g. CUDA-graph capture with synthetic requests).
+    # that don't carry them, e.g. accelerator graph capture with synthetic requests).
     # Usually a ``LazyRequestStates`` view rather than a materialised dict.
     per_request_states: "Mapping[str, PerRequestState] | None" = None
 
@@ -271,7 +271,7 @@ class ModelInputsFromEngine:
     # submodule that declares no step.
     step: SubmoduleStep | None = None
 
-    # Whether this forward runs under a captured CUDA graph — either the
+    # Whether this forward runs under a captured accelerator graph — either the
     # capture itself or a replay. What ``cache_manager.is_captured`` used to
     # carry: a submodule whose ``preprocess`` packs differently for the
     # fixed-shape graph (cosmos3 stacks its denoise inputs on a leading batch
@@ -309,7 +309,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # Set True on a submodule whose forward does not benefit from (or is broken
     # by) torch.compile — e.g. a data-dependent denoise loop, or a one-shot
     # forward where the trace cost dwarfs the win. The KV-cache / stateless
-    # engines skip compiling such submodules (CUDA-graph capture is unaffected).
+    # engines skip compiling such submodules (accelerator graph capture is unaffected).
     disable_torch_compile: bool = False
 
     # Set True on a submodule that must run in its own parameter dtype — e.g. a
@@ -475,7 +475,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     ) -> NameToTensorList:
         """
         Pure tensor → NameToTensorList computation.
-        Compilable + CUDA-graphable.
+        Supports compilation and accelerator graph capture.
         """
         pass
 
@@ -559,8 +559,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``make_static_inputs`` can allocate the hidden-state buffer in the dtype
         the captured region runs under (avoids a copy-time upcast at replay).
 
-        A piecewise CUDA graph captures ONE inner callable of this submodule's
-        forward (e.g. a transformer block loop) as a CUDA graph while the
+        A piecewise accelerator graph captures ONE inner callable of this submodule's
+        forward (e.g. a transformer block loop) as an accelerator graph while the
         surrounding compute stays eager. The engine builds one
         ``PiecewiseAcceleratorGraphRunner`` per returned label and threads the runners
         into ``ModelInputsFromEngine.piecewise_runners`` so the submodule's
@@ -592,7 +592,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """Return True if this submodule supports accelerator graphs.
 
         Default: derives from ``get_accelerator_graph_configs`` — if any declared
-        config can replay for this batch's graph_walk, CUDA graphs are
+        config can replay for this batch's graph_walk, accelerator graphs are
         supported. We check ``cfg.replay_graph_walks`` (not just
         ``cfg.capture_graph_walk``) so aliased walks — e.g. Qwen3-Omni's
         ``prefill_audio`` reusing the ``prefill_text`` capture, or
@@ -633,7 +633,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
         Per-request postprocessing on the submodule outputs.
 
         Runs on the GPU thread inside ``execute_batch``, after the forward
-        (eager, batched, or CUDA-graph replay). ``inputs`` is the request's
+        (eager, batched, or accelerator graph replay). ``inputs`` is the request's
         ``prepare_inputs`` result for this step, so a submodule can finish a
         step the captured graph could not hold (e.g. combine guidance branches
         and run a Python multistep scheduler against the step's input latents).
