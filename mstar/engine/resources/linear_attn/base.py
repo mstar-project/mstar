@@ -13,7 +13,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnSpec,
     LinearAttnVariant,
 )
-from mstar.engine.resources.recurrent.config import DeltaNetGeometry
+from mstar.engine.resources.recurrent.config import DeltaNetGeometry, Mamba2Geometry
 
 logger = logging.getLogger(__name__)
 
@@ -31,16 +31,28 @@ class LinearAttnManager(AttentionResource):
         if info.joint_comm_group is not None:
             pool_config.shard(info.joint_comm_group.world_size)
 
-        # Reading geometry off the pool is also the check that the two were
-        # built for the same model: `from_blocks` raises on shapes that are not
-        # this family's.
-        geometry = DeltaNetGeometry.from_blocks(pool_config.blocks)
-
         backend = spec.config.backend
         if backend is not LinearAttnBackend.FLASHINFER:
             raise ValueError(f"Unknown linear attention backend {backend!r}")
 
         variant = spec.config.variant
+        if variant is LinearAttnVariant.MAMBA2:
+            # Its own kernels (Triton), planned against the same pool.
+            from mstar.engine.resources.linear_attn.mamba2 import Mamba2Manager
+
+            return Mamba2Manager(
+                config=spec.config,
+                geometry=Mamba2Geometry.from_blocks(pool_config.blocks),
+                num_layers=pool_config.num_layers,
+                state_dtype=pool_config.blocks["ssm"].dtype,
+                has_sink=not pool_config.disable_sink_slot,
+                device=info.device,
+            )
+
+        # Reading geometry off the pool is also the check that the two were
+        # built for the same model: `from_blocks` raises on shapes that are not
+        # this family's.
+        geometry = DeltaNetGeometry.from_blocks(pool_config.blocks)
         if variant is LinearAttnVariant.GDN:
             from mstar.engine.resources.linear_attn.gdn import GDNManager
 
