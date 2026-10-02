@@ -345,6 +345,18 @@ class Qwen3_5VisionModel(nn.Module):
         submodule declares one segment per frame and the ragged attention
         resource plans the layout, outside the graph.
         """
+        hidden, cos, sin = self.embed(pixel_values, indices, weights, position_ids)
+        return self.merger(self.encode(hidden, cos, sin))
+
+    def embed(
+        self,
+        pixel_values: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Patch embed plus the resampled position table, and the rope for
+        the blocks: everything before the block loop, per patch."""
         n = pixel_values.shape[0]
         # Same grid, separate inputs: without this each leading dim gets its
         # own symbol and nothing downstream lines up.
@@ -358,7 +370,13 @@ class Qwen3_5VisionModel(nn.Module):
         hidden = hidden + pos.to(hidden.dtype)
 
         cos, sin = self.rotary_pos_emb(position_ids)
-        cos, sin = cos.to(hidden.dtype), sin.to(hidden.dtype)
+        return hidden, cos.to(hidden.dtype), sin.to(hidden.dtype)
+
+    def encode(
+        self, hidden: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    ) -> torch.Tensor:
+        """The block loop, ``[patches, hidden]`` in and out -- the part a
+        CUDA graph can hold (see ``VisionEncoderSubmodule``)."""
         for block in self.blocks:
             hidden = block(hidden, cos, sin)
-        return self.merger(hidden)
+        return hidden

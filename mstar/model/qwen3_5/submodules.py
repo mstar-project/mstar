@@ -11,6 +11,7 @@ built here and threaded in as cos/sin.
 """
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -21,6 +22,10 @@ from mstar.engine.cuda_graph_config import (
     BatchedCudaGraphConfig,
     CudaGraphConfig,
     PackedCudaGraphConfig,
+    PiecewiseCallInputs,
+    PiecewiseCaptureShape,
+    PiecewiseCudaGraphConfig,
+    PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.attn.base import AttentionManager
@@ -31,7 +36,7 @@ from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import Segment, SubmoduleStep
+from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
     text_position_ids,
@@ -558,6 +563,10 @@ class LLMSubmodule(ARNodeSubmodule):
         return stops
 
 
+# The vision tower's block loop, as a piecewise capture region
+VISION_BLOCK_LOOP = "vision_block_loop"
+
+
 class VisionEncoderSubmodule(NodeSubmodule):
     """Qwen3.5's ViT, which turns pixel patches into LLM-width embeddings.
 
@@ -566,11 +575,18 @@ class VisionEncoderSubmodule(NodeSubmodule):
     together is declared as this step's segments rather than split for inside
     it — both so that the tower's only symbolic shape is its token count.
 
-    Several requests go through together too: `preprocess` concatenates their
-    patch runs and `forward_batched` cuts the embeddings back apart. The tower
-    is fixed-cost per call (24 blocks of dispatch) and its work is per patch,
-    so one wide call beats several narrow ones.
+    Several requests can go through together: `preprocess` concatenates their
+    patch runs and `forward_batched` cuts the embeddings back apart. But the
+    block loop is captured as a CUDA graph (see `get_piecewise_cuda_graph_configs`)
+    one image at a time, which beats batching: eager, the tower is launch-bound
+    -- ~500 kernels for ~4 ms of GPU work in a ~20 ms forward on 9B -- so the
+    encoder takes one request a step.
     """
+
+    # Patch-count buckets of the captured block loop, one image per replay.
+    # Merged tokens are a quarter of these: 16384 patches is the LLM's 4096
+    # `prefill_vision` bucket. A larger image runs the loop eagerly.
+    BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
 
     def __init__(
         self, model: Qwen3_5VisionModel, config: Qwen3_5VisionConfig,
@@ -602,7 +618,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
         indices, weights = vision_interpolation(
             grid, self.config.num_grid_per_side, merge, device,
         )
+        num_patches = sum(t * h * w for t, h, w in grid)
         return NodeInputs(
+            # what the engine leases the captured block loop's bucket by
+            input_seq_len=num_patches,
             tensor_inputs={
                 "pixel_values": torch.cat(inputs["pixel_values"], dim=0),
                 "indices": indices,
@@ -613,7 +632,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
                 # resource to plan, and `forward_batched` cuts the output at
                 # the patch count.
                 "seq_lengths": vision_seq_lengths(grid),
-                "num_patches": sum(t * h * w for t, h, w in grid),
+                "num_patches": num_patches,
             },
         )
 
@@ -622,8 +641,13 @@ class VisionEncoderSubmodule(NodeSubmodule):
         graph_walk: str,
         request_ids: list[str],
         inputs: list[NodeInputs],
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
-    ) -> SubmoduleStep:
+    ) -> SubmoduleStep | None:
+        # The captured block loop declares and plans its own attention per
+        # replay; leased, there is nothing left for this step to do.
+        if (piecewise_leases or {}).get(VISION_BLOCK_LOOP):
+            return None
         # One segment per frame: a frame attends to itself alone, so a request
         # carrying several images contributes several. This is the whole
         # layout — there is no cache to read it off next step.
@@ -641,6 +665,94 @@ class VisionEncoderSubmodule(NodeSubmodule):
         self, batch: ExecutingBatch, model_inputs: list[NodeInputs],
     ) -> bool:
         return True
+
+    def max_batch_size(self, graph_walk: str) -> int | None:
+        # one request a step, so it can take the captured block loop
+        return 1
+
+    def get_piecewise_cuda_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype,
+        tp_world_size: int = 1, **kwargs,
+    ) -> dict[str, PiecewiseCudaGraphConfig]:
+        """The block loop, one image per replay, by patch-count bucket.
+
+        Patch embed, the position resample and rope stay eager before it, and
+        the merger after: the merger quarters the row count, which a region's
+        real-length output view cannot express. Batch size 1 only -- one
+        image's patches attend to each other alone, so a replay is one
+        segment, and the eager path covers anything else.
+        """
+        hidden, head_dim = self.config.hidden_size, self.config.head_dim
+
+        def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
+            n = shape.total_tokens
+            return {
+                "hidden": torch.zeros(n, hidden, dtype=autocast_dtype, device=device),
+                "cos": torch.zeros(n, head_dim, dtype=autocast_dtype, device=device),
+                "sin": torch.zeros(n, head_dim, dtype=autocast_dtype, device=device),
+            }
+
+        def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
+            return SubmoduleStep(
+                segments=[
+                    Segment(request_id=rid, label="main", span=n)
+                    for rid, n in zip(request_ids, seq_lens, strict=True)
+                ],
+                steps={VISION_ATTN: AttentionStep(causal=False)},
+            )
+
+        return {
+            VISION_BLOCK_LOOP: PiecewisePackedConfig(
+                capture_fn=self._capture_block_loop,
+                make_static_inputs=make_static_inputs,
+                declare_step=declare_step,
+                lease_before_step=True,
+                total_tokens=self.BLOCK_LOOP_PATCH_BUCKETS,
+                capture_batch_sizes=[1],
+            )
+        }
+
+    def _capture_block_loop(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        """The captured region: reads the runner's buffers, never rebinds."""
+        s = inp.static_inputs
+        return {"hidden": self.model.encode(s["hidden"], s["cos"], s["sin"])}
+
+    @torch.compiler.disable
+    def _replay_block_loop(
+        self,
+        engine_inputs: ModelInputsFromEngine,
+        hidden: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        seq_lengths: tuple[int, ...],
+    ) -> torch.Tensor | None:
+        """The block loop through its captured graph, one replay per image, or
+        None when the step was not leased one and runs it eagerly.
+
+        Decided the way the engine leased: on the batch size and the total
+        patch count. Leased, each image fits a bucket too, since it is at most
+        the total.
+        """
+        runner = engine_inputs.piecewise_runners.get(VISION_BLOCK_LOOP)
+        if runner is None or not runner.can_run(
+            len(engine_inputs.request_ids), int(hidden.shape[0]),
+        ):
+            return None
+        rid = engine_inputs.request_ids[0]
+        outs, start = [], 0
+        for n in seq_lengths:
+            end = start + n
+            out = runner.run(
+                static_inputs={
+                    "hidden": hidden[start:end], "cos": cos[start:end], "sin": sin[start:end],
+                },
+                request_ids=[rid],
+                seq_lens=[n],
+            ).get_view("hidden")
+            # the next replay overwrites the buffer behind this view
+            outs.append(out if len(seq_lengths) == 1 else out.clone())
+            start = end
+        return outs[0] if len(outs) == 1 else torch.cat(outs)
 
     def preprocess(
         self,
@@ -666,6 +778,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
             "num_patches": tuple(
                 inp.tensor_inputs["num_patches"] for inp in inputs
             ),
+            "seq_lengths": tuple(
+                n for inp in inputs for n in inp.tensor_inputs["seq_lengths"]
+            ),
         }
 
     def forward(
@@ -686,13 +801,18 @@ class VisionEncoderSubmodule(NodeSubmodule):
         weights: torch.Tensor,
         position_ids: torch.Tensor,
         num_patches: tuple[int, ...],
+        seq_lengths: tuple[int, ...] = (),
         **kwargs,
     ) -> dict[str, NameToTensorList]:
         # One call for every image of every request in the batch.
         # `declare_step` planned a segment per frame, so the ragged kernel is
         # what keeps them from seeing each other; the tower never learns where
         # any of the boundaries are.
-        embeds = self.model(pixel_values, indices, weights, position_ids)
+        hidden, cos, sin = self.model.embed(pixel_values, indices, weights, position_ids)
+        encoded = self._replay_block_loop(engine_inputs, hidden, cos, sin, seq_lengths)
+        if encoded is None:
+            encoded = self.model.encode(hidden, cos, sin)
+        embeds = self.model.merger(encoded)
         if len(num_patches) == 1:
             return {engine_inputs.request_ids[0]: {"vision_embeds": [embeds]}}
         # the merger already folded each `merge_unit` block of patches into one
