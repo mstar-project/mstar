@@ -204,6 +204,11 @@ it. It then walks the teardown: delete the session, wait for the id to be
 released (which happens only once the worker has confirmed its state is gone),
 and check that resuming it is a 404.
 
+``budget_probe.py`` beside it proves the same accumulation without reading a
+single generated token: it sends long turns into one session until the held state
+passes the configured ``max_state``, and the turn after that has to come back
+with the budget error.
+
 Limits in this version
 ----------------------
 
