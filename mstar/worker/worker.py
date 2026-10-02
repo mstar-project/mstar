@@ -1231,10 +1231,11 @@ class Worker:
         # edges: a rid with nothing ready still needs an entry, because
         # per_request_info is keyed off these and the engine indexes it by rid.
         # skip_missing: a backstop, not a fix. A live rid holding a freed uuid
-        # is a bug (``_unend_stream`` was one), but resolving the batch in one
-        # call means one such rid would otherwise fail every other request in
-        # the step -- 64 duplex sessions for one bad chunk. Take out just that
-        # rid and report it, so the failure is attributed and loud.
+        # is a bug (an abandoned speculation handing back a still-ingested
+        # chunk is one), but resolving the batch in one call means one such rid
+        # would otherwise fail every other request in the step -- 64 duplex
+        # sessions for one bad chunk. Take out just that rid and report it, so
+        # the failure is attributed and loud.
         per_request_inputs, final_edges, unresolved = (
             batch.input_edges.to_input_tensors(
                 self.tensor_manager.get_tensor, batch.request_to_worker_graph,
