@@ -2331,6 +2331,31 @@ window.runMermaid = runMermaid;</script>
             <span class="n">outputs</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">rid</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">rid_out</span><span class="p">)</span>
 
 
+<div class="viewcode-block" id="Engine.capture_group">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine.capture_group">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">capture_group</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">request_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The capture bucket this one request would replay, by</span>
+<span class="sd">        ``cg_key_info``; None when the walk has no capture or the submodule</span>
+<span class="sd">        does not split by it.</span>
+
+<span class="sd">        A batch spanning two groups matches no capture and runs eager, so the</span>
+<span class="sd">        scheduler batches each group on its own when the submodule opts in</span>
+<span class="sd">        (``split_batches_by_capture_key``).</span>
+<span class="sd">        """</span>
+        <span class="n">submodule_mgmt</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_submodules</span><span class="p">[</span><span class="n">node_name</span><span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">submodule_mgmt</span><span class="o">.</span><span class="n">submodule</span><span class="o">.</span><span class="n">split_batches_by_capture_key</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">cg_runner</span> <span class="o">=</span> <span class="n">submodule_mgmt</span><span class="o">.</span><span class="n">cuda_graph_runner</span>
+        <span class="k">if</span> <span class="n">cg_runner</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">cg_runner</span><span class="o">.</span><span class="n">captures_walk</span><span class="p">(</span><span class="n">graph_walk</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="n">submodule_mgmt</span><span class="o">.</span><span class="n">submodule</span><span class="o">.</span><span class="n">cg_key_info</span><span class="p">(</span>
+            <span class="n">graph_walk</span><span class="p">,</span> <span class="p">{</span><span class="n">request_id</span><span class="p">:</span> <span class="n">request_info</span><span class="p">},</span>
+        <span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="Engine.get_max_batch_size">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.engine.html#mstar.engine.engine.Engine.get_max_batch_size">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_max_batch_size</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>

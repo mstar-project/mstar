@@ -1738,6 +1738,16 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">best</span></div>
 
 
+<div class="viewcode-block" id="CudaGraphRunner.captures_walk">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.captures_walk">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">captures_walk</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether any capture replays this walk."""</span>
+        <span class="k">return</span> <span class="nb">any</span><span class="p">(</span>
+            <span class="n">graph_walk</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">replay_graph_walks</span>
+            <span class="k">for</span> <span class="n">config</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_capture_configs</span>
+        <span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="CudaGraphRunner.max_batch_size_for">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.cuda_graph_runner.html#mstar.engine.cuda_graph_runner.CudaGraphRunner.max_batch_size_for">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">max_batch_size_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>

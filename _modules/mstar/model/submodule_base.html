@@ -1301,6 +1301,19 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
+<div class="viewcode-block" id="NodeSubmodule.split_batches_by_capture_key">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.split_batches_by_capture_key">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">split_batches_by_capture_key</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether the scheduler batches each ``cg_key_info`` group apart.</span>
+
+<span class="sd">        A batch spanning two groups matches no capture. Opt in when that batch</span>
+<span class="sd">        runs worse than two captured ones, e.g. per-request eager; leave it off</span>
+<span class="sd">        when a batched eager forward handles the mix well.</span>
+<span class="sd">        """</span>
+        <span class="k">del</span> <span class="n">graph_walk</span>
+        <span class="k">return</span> <span class="kc">False</span></div>
+
+
 <div class="viewcode-block" id="NodeSubmodule.request_state">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.request_state">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">request_state</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PerRequestState</span><span class="p">:</span>
