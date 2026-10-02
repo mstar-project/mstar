@@ -1359,7 +1359,6 @@ window.runMermaid = runMermaid;</script>
 
 
 
-
 <div class="viewcode-block" id="OmniVoiceAdapter">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OmniVoiceAdapter">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">OmniVoiceAdapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
@@ -1415,6 +1414,67 @@ window.runMermaid = runMermaid;</script>
             <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">input</span><span class="p">,</span>
             <span class="n">file_paths</span><span class="o">=</span><span class="n">file_paths</span><span class="p">,</span>
             <span class="n">input_modalities</span><span class="o">=</span><span class="n">input_modalities</span><span class="p">,</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"audio"</span><span class="p">],</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="Qwen3TTSAdapter">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3TTSAdapter">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">Qwen3TTSAdapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Qwen3-TTS (CustomVoice / VoiceDesign / Base): text-to-speech, audio only.</span>
+
+<span class="sd">    ``voice`` selects a built-in speaker (CustomVoice). ``instructions`` (the</span>
+<span class="sd">    OpenAI field; ``instruct`` also accepted) carries the style or voice</span>
+<span class="sd">    description. Non-standard knobs travel through ``extra_body``:</span>
+<span class="sd">    ``language``, ``non_streaming_mode``, ``top_k``, ``repetition_penalty``,</span>
+<span class="sd">    the residual-group ``subtalker_*`` sampling, ``max_new_tokens``.</span>
+<span class="sd">    ``temperature`` / ``top_p`` / ``seed`` map onto the Talker sampler.</span>
+
+<span class="sd">    Inputs of 600+ characters are synthesized as ordered sentence chunks</span>
+<span class="sd">    (``serving_speech``): each Talker request stays near the lengths the</span>
+<span class="sd">    model was trained on and the chunks batch like independent requests.</span>
+<span class="sd">    Benchmark sentences (5-40 words) never reach the threshold.</span>
+<span class="sd">    """</span>
+
+    <span class="n">supports_speech</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="n">speech_chunk_min_chars</span> <span class="o">=</span> <span class="mi">600</span>
+    <span class="n">speech_chunk_max_chars</span> <span class="o">=</span> <span class="mi">400</span>
+
+<div class="viewcode-block" id="Qwen3TTSAdapter.speech_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3TTSAdapter.speech_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">speech_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">SpeechRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
+        <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"voice"</span><span class="p">,</span> <span class="kc">None</span><span class="p">):</span>
+            <span class="n">mk</span><span class="p">[</span><span class="s2">"voice"</span><span class="p">]</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">voice</span>
+        <span class="c1"># OpenAI's field is ``instructions``; the model reads ``instruct``.</span>
+        <span class="n">instructions</span> <span class="o">=</span> <span class="n">mk</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"instructions"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">instructions</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"instruct"</span><span class="p">,</span> <span class="n">instructions</span><span class="p">)</span>
+        <span class="n">_apply_sampling</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">mk</span><span class="p">,</span> <span class="n">temperature_key</span><span class="o">=</span><span class="s2">"temperature"</span><span class="p">,</span> <span class="n">top_p_key</span><span class="o">=</span><span class="s2">"top_p"</span><span class="p">,</span> <span class="n">max_tokens_key</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+        <span class="c1"># Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL, a</span>
+        <span class="c1"># local path or bare base64 (vLLM-Omni's field). It becomes the</span>
+        <span class="c1"># request's audio input for one request; ``ref_text`` and</span>
+        <span class="c1"># ``x_vector_only_mode`` ride along as model kwargs. Named, persisted</span>
+        <span class="c1"># voices come with the shared voice registry (engine/voice-registry).</span>
+        <span class="n">ref_audio</span> <span class="o">=</span> <span class="n">mk</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"ref_audio"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">ref_audio</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">ref_audio</span><span class="o">.</span><span class="n">startswith</span><span class="p">((</span><span class="s2">"data:"</span><span class="p">,</span> <span class="s2">"http://"</span><span class="p">,</span> <span class="s2">"https://"</span><span class="p">))</span> <span class="ow">or</span> <span class="n">Path</span><span class="p">(</span><span class="n">ref_audio</span><span class="p">)</span><span class="o">.</span><span class="n">suffix</span><span class="p">:</span>
+                <span class="n">_</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">resolve_media_ref</span><span class="p">(</span><span class="n">ref_audio</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">_</span><span class="p">,</span> <span class="n">path</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">save_base64</span><span class="p">(</span><span class="n">ref_audio</span><span class="p">,</span> <span class="s2">"wav"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+                <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">input</span><span class="p">,</span>
+                <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">"audio"</span><span class="p">:</span> <span class="p">[</span><span class="n">path</span><span class="p">]},</span>
+                <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"audio"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">],</span>
+                <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"audio"</span><span class="p">],</span>
+                <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">input</span><span class="p">,</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
             <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"audio"</span><span class="p">],</span>
             <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
         <span class="p">)</span></div>
@@ -1880,6 +1940,10 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"qwen3_omni"</span><span class="p">:</span> <span class="n">Qwen3OmniAdapter</span><span class="p">(),</span>
     <span class="s2">"omnivoice"</span><span class="p">:</span> <span class="n">OmniVoiceAdapter</span><span class="p">(),</span>
     <span class="s2">"orpheus"</span><span class="p">:</span> <span class="n">OrpheusAdapter</span><span class="p">(),</span>
+    <span class="s2">"qwen3_tts"</span><span class="p">:</span> <span class="n">Qwen3TTSAdapter</span><span class="p">(),</span>
+    <span class="s2">"qwen3_tts_1p7b"</span><span class="p">:</span> <span class="n">Qwen3TTSAdapter</span><span class="p">(),</span>
+    <span class="s2">"qwen3_tts_voicedesign"</span><span class="p">:</span> <span class="n">Qwen3TTSAdapter</span><span class="p">(),</span>
+    <span class="s2">"qwen3_tts_base"</span><span class="p">:</span> <span class="n">Qwen3TTSAdapter</span><span class="p">(),</span>
     <span class="s2">"kokoro"</span><span class="p">:</span> <span class="n">KokoroAdapter</span><span class="p">(),</span>
     <span class="s2">"cosmos3"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
     <span class="s2">"cosmos3_droid"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>

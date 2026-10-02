@@ -700,23 +700,35 @@ backbone + audio codec. Clones a voice from a reference clip.</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice</span></code></p></td>
 <td><p>Streaming text-to-speech with built-in speakers: Talker + 12 Hz speech codec.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_1p7b</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice</span></code></p></td>
+<td><p>1.7B CustomVoice: built-in speakers plus style/emotion <code class="docutils literal notranslate"><span class="pre">instruct</span></code> control.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_voicedesign</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign</span></code></p></td>
+<td><p>1.7B VoiceDesign: the voice is described by the request’s <code class="docutils literal notranslate"><span class="pre">instruct</span></code> text.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">qwen3_tts_base</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-TTS-12Hz-1.7B-Base</span></code></p></td>
+<td><p>1.7B Base: zero-shot voice clone from one reference clip (x-vector, optional in-context transcript).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">facebook/vjepa2-vitl-fpc64-256</span></code></p></td>
 <td><p>V-JEPA 2 video encoder + masked predictor.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vjepa2_ac</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">vjepa2-ac-vitg</span></code></p></td>
 <td><p>V-JEPA 2-AC encoder + action-conditioned predictor.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code> <em>(Beta)</em></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3</span></code></p></td>
 <td><p>Encoder-decoder ASR (audio in, transcript out). Beta / un-optimized.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code> <em>(Beta)</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bosonai/higgs-audio-v3-stt</span></code></p></td>
 <td><p>Audio-tower + Qwen3 LLM speech-to-text. Beta / un-optimized.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">wan22</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code></p></td>
 <td><p>Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.</p></td>
 </tr>
@@ -800,25 +812,68 @@ voices for a picker: the bundled voices whose G2P extra is installed on the serv
 <h2>Qwen3-TTS notes<a class="headerlink" href="#qwen3-tts-notes" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p>Install the model-specific dependencies with <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">'.[qwen3_tts]'</span></code>
-and launch the default single-GPU deployment with
-<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">qwen3_tts</span> <span class="pre">--gpus</span> <span class="pre">0</span></code>.</p></li>
-<li><p>The first integration supports the CustomVoice checkpoint and text-to-audio
-requests. <code class="docutils literal notranslate"><span class="pre">voice</span></code> selects one of the checkpoint’s built-in speakers and
-<code class="docutils literal notranslate"><span class="pre">language</span></code> defaults to automatic detection.</p></li>
-<li><p>Codec CUDA graphs are captured through batch size 8. The upstream decoder’s
-batch-16 capture can exhaust an H100 after Talker weights and CodePredictor
-graphs are resident; larger Codec batches therefore use the scheduler’s safe
-ceiling.</p></li>
-<li><p>Talker prefill remains eager because it runs once with variable sequence
-lengths. Decode always uses the whole-walk CUDA Graph, with the 15-step
+and launch a single-GPU deployment with <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">&lt;key&gt;</span> <span class="pre">--gpus</span> <span class="pre">0</span></code> where
+<code class="docutils literal notranslate"><span class="pre">&lt;key&gt;</span></code> is one of <code class="docutils literal notranslate"><span class="pre">qwen3_tts</span></code> (0.6B CustomVoice), <code class="docutils literal notranslate"><span class="pre">qwen3_tts_1p7b</span></code>,
+<code class="docutils literal notranslate"><span class="pre">qwen3_tts_voicedesign</span></code> or <code class="docutils literal notranslate"><span class="pre">qwen3_tts_base</span></code>. One model class serves every
+12 Hz checkpoint; the variant (speakers, instruction support, reference
+audio) is read from the checkpoint’s <code class="docutils literal notranslate"><span class="pre">config.json</span></code>.</p></li>
+<li><p>Requests: <code class="docutils literal notranslate"><span class="pre">voice</span></code> selects a built-in speaker (CustomVoice), <code class="docutils literal notranslate"><span class="pre">language</span></code>
+defaults to automatic detection, <code class="docutils literal notranslate"><span class="pre">instruct</span></code> (OpenAI: <code class="docutils literal notranslate"><span class="pre">instructions</span></code>)
+carries a style instruction (1.7B CustomVoice) or the voice description
+(VoiceDesign, required). Base clones a voice from one reference clip: on
+<code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> pass <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> (data URL, URL, path or base64) plus
+<code class="docutils literal notranslate"><span class="pre">ref_text</span></code> (its transcript) or <code class="docutils literal notranslate"><span class="pre">x_vector_only_mode:</span> <span class="pre">true</span></code>; with the SDK,
+<code class="docutils literal notranslate"><span class="pre">client.tts(text,</span> <span class="pre">reference_audio=&quot;ref.wav&quot;,</span> <span class="pre">ref_text=&quot;...&quot;)</span></code>. The clip’s
+conditioning (x-vector and codec frames) is memoised by content, so a voice
+reused across requests, or by the sentence chunks of one long request, is
+encoded once; named, persisted voices arrive with the shared voice registry.</p></li>
+<li><p>Text layout follows the reference defaults: CustomVoice and VoiceDesign put
+the whole text in the prefill; Base feeds it one token per frame. Override
+per request with <code class="docutils literal notranslate"><span class="pre">non_streaming_mode</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> inputs of 600 or more characters are synthesized as
+ordered sentence chunks of about 400 characters (one Talker request each,
+two kept in flight while the current one streams); set
+<code class="docutils literal notranslate"><span class="pre">sentence_chunking:</span> <span class="pre">false</span></code> (or <code class="docutils literal notranslate"><span class="pre">true</span></code> for shorter texts) per request.</p></li>
+<li><p>Audio streams in a ramp of codec chunks: the first frame is decoded on its
+own (first audio one Talker step after prefill), the next windows add 3, 8
+and 16 frames, then 25 new frames behind up to 72 frames of already decoded
+left context, the decoder transformer’s sliding window (as vLLM-Omni). The
+transformer stacks 8 such layers, so a window still differs slightly from a
+whole-utterance decode once an utterance outgrows the context; 25 frames of
+context differed far more. Each window size is a CUDA-graph bucket captured
+for batch sizes 1 to 32; the stream buffer reports how many leading frames of
+a window are repeated context, and the codec trims their audio. A voice
+clone’s reference tail (its last 72 frames) is the first window’s context.</p></li>
+<li><p>The codec runs its transformer over the whole window but its conv stack (all
+but a few percent of the codec’s time) only over the new frames plus the
+stack’s causal receptive field, derived from the decoder’s modules at load
+(10 frames for the 12 Hz decoder; the new frames’ audio equals the
+whole-window decode). It also fuses the SnakeBeta activations into one kernel.</p></li>
+<li><p>Talker prefill replays a packed CUDA Graph for the smallest token bucket
+(32 to 1024 tokens) that holds the batch; only the clone prefill, which also
+pushes the reference clip’s frames into the codec stream, runs eager. Decode
+always uses the whole-walk CUDA Graph, with the 15-step
 CodePredictor loop captured inside it; request-local EOS suppression is
 carried as a graph tensor input so replay does not consult capture-slot dummy
 request state. Residual <code class="docutils literal notranslate"><span class="pre">subtalker_*</span></code> sampling is per-request through the
 <code class="docutils literal notranslate"><span class="pre">code_predictor</span></code> aux sampler, so custom values neither block batching nor
-fall off the graph.</p></li>
-<li><p>The 12 Hz decoder does not require the system SoX executable. M* imports only
-the exact upstream decoder modules, avoiding qwen-tts’s unrelated 25 Hz SoX
-probe during worker startup.</p></li>
+fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
+Talker-width inputs through <code class="docutils literal notranslate"><span class="pre">small_to_mtp_projection</span></code> before its depth loop.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">configs/qwen3tts_1p7b_split.yaml</span></code> runs the Codec on a second worker that
+shares GPU 0 (<code class="docutils literal notranslate"><span class="pre">rank_devices</span></code>) and caps the Talker KV pool so both fit.
+On its own it lowers first-audio latency at high concurrency; with a
+user-level CUDA MPS daemon (<code class="docutils literal notranslate"><span class="pre">nvidia-cuda-mps-control</span> <span class="pre">-d</span></code> before
+<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code>) the two workers’ kernels also overlap, which raised c=32
+throughput by about a fifth on an H100.</p></li>
+<li><p>The codec decoder runs in float32 by default, reproducing the reference
+decoder bit for bit. <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{codec_dtype:</span> <span class="pre">bfloat16}</span></code> in the
+deployment YAML halves its GPU time when throughput matters more than
+bit-exactness (the Talker is bf16 either way).</p></li>
+<li><p>Weight loading checks coverage in both directions: a parameter the checkpoint
+does not fill, or a checkpoint tensor the port does not load, fails startup.</p></li>
+<li><p>The 12 Hz codec does not require the system SoX executable. M* imports only
+the exact upstream speech-tokenizer modules, avoiding qwen-tts’s unrelated
+25 Hz SoX probe during worker startup.</p></li>
 </ul>
 <p>For throughput/latency validation, run the native serving benchmark with the
 Qwen3-TTS model metadata rather than the Orpheus compatibility entry:</p>
@@ -840,6 +895,15 @@ Qwen3-TTS model metadata rather than the Orpheus compatibility entry:</p>
 fixed-length decode throughput rather than end-user latency.
 The first process-local request can include eager FlashInfer kernel JIT, so
 keep the warmup requests enabled when reporting steady-state latency.</p>
+<p>For cross-engine comparisons (M*, vLLM-Omni, SGLang-Omni) use the shared
+streaming <code class="docutils literal notranslate"><span class="pre">/v1/audio/speech</span></code> client, which measures time-to-first-audio, RTF
+and audio-seconds per second with the same request for every engine, and score
+the saved WAVs with <code class="docutils literal notranslate"><span class="pre">benchmark/tts_speech_wer.py</span></code>:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="o">-</span><span class="n">m</span> <span class="n">benchmark</span><span class="o">.</span><span class="n">tts_speech_bench</span> <span class="o">--</span><span class="n">engine</span> <span class="n">mstar</span> <span class="o">--</span><span class="n">url</span> <span class="n">http</span><span class="p">:</span><span class="o">//</span><span class="mf">127.0.0.1</span><span class="p">:</span><span class="mi">8000</span> \
+    <span class="o">--</span><span class="n">model</span> <span class="n">qwen3_tts_1p7b</span> <span class="o">--</span><span class="n">sentences</span> <span class="n">sentences_200</span><span class="o">.</span><span class="n">txt</span> <span class="o">--</span><span class="n">voice</span> <span class="n">vivian</span> \
+    <span class="o">--</span><span class="n">language</span> <span class="n">English</span> <span class="o">--</span><span class="n">concurrency</span> <span class="mi">8</span> <span class="o">--</span><span class="n">repeats</span> <span class="mi">3</span> <span class="o">--</span><span class="n">out</span> <span class="n">results</span><span class="o">/</span><span class="n">mstar_c8</span><span class="o">.</span><span class="n">json</span>
+</pre></div>
+</div>
 </section>
 <section id="cosmos3-environment-requirements">
 <h2>Cosmos3 environment requirements<a class="headerlink" href="#cosmos3-environment-requirements" title="Link to this heading">#</a></h2>

@@ -606,6 +606,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.pop_chunk"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.pop_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.pop_waiting_edge"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.pop_waiting_edge()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.pre_read_register"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.pre_read_register()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.prime_context"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.prime_context()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.producer_done"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.producer_done</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.put"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.put()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.request_id"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.request_id</span></code></a></li>
@@ -756,6 +757,22 @@ start_offset is the global position of the first item in the chunk.</p>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>tensor_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.streaming.stream_buffer.StreamBuffer.prime_context">
+<span class="sig-name descname"><span class="pre">prime_context</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">context_items</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/stream_buffer.html#StreamBuffer.prime_context"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.stream_buffer.StreamBuffer.prime_context" title="Link to this definition">#</a></dt>
+<dd><p>The first <code class="docutils literal notranslate"><span class="pre">context_items</span></code> items the producer sends are context only
+(e.g. a voice clone’s reference frames): the first chunk carries them
+ahead of its new items, reported as <code class="docutils literal notranslate"><span class="pre">context_items</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>context_items</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -990,6 +1007,7 @@ start_offset is the global position of the first item in the chunk.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.pop_chunk"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.pop_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.pop_waiting_edge"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.pop_waiting_edge()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.pre_read_register"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.pre_read_register()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.prime_context"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.prime_context()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.producer_done"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.producer_done</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.put"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.put()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.stream_buffer.StreamBuffer.request_id"><code class="docutils literal notranslate"><span class="pre">StreamBuffer.request_id</span></code></a></li>

@@ -1170,7 +1170,9 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="Cosmos3DiTSubmodule.cg_key_info">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.submodules.html#mstar.model.cosmos3.submodules.Cosmos3DiTSubmodule.cg_key_info">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">cg_key_info</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">per_request_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">object</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">cg_key_info</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">per_request_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">per_request_input_metadata</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">object</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Which of this walk's capture buckets the batch belongs to, or None</span>
 <span class="sd">        for "run eager".</span>
 
@@ -1204,6 +1206,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        here instead would make the key step-dependent, which is exactly what</span>
 <span class="sd">        the pre-plan path cannot support.</span>
 <span class="sd">        """</span>
+        <span class="k">del</span> <span class="n">per_request_input_metadata</span><span class="p">,</span> <span class="n">kwargs</span>
         <span class="n">rids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">per_request_info</span><span class="p">)</span>
         <span class="n">states</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">request_states</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">]</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">states</span> <span class="ow">or</span> <span class="nb">any</span><span class="p">(</span>

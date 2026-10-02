@@ -850,6 +850,8 @@ the answer off the step; it asks here instead.</p>
 bucket, and the <code class="docutils literal notranslate"><span class="pre">cg_key_info</span></code> this batch’s <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> puts on
 its step. Disagreeing is not an error anywhere — it just misses the
 capture and runs eager — so derive both from one place.</p>
+<p><code class="docutils literal notranslate"><span class="pre">per_request_input_metadata</span></code> is the batch’s per-step input facts (as
+on <code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine</span></code>), e.g. for a bucket that follows a stream chunk.</p>
 <p>None (the default) means the walk has a single capture.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>

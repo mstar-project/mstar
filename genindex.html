@@ -4520,6 +4520,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerMessageType.INPUT_SIGNALS">INPUT_SIGNALS (mstar.utils.ipc_format.WorkerMessageType attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.InputMetadata">InputMetadata (class in mstar.model.submodule_base)</a>
+</li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.DataWorkerProfile.inputs">inputs (mstar.api_server.request_types.DataWorkerProfile attribute)</a>
 
       <ul>
@@ -8239,16 +8241,16 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine.per_request_info">(mstar.model.submodule_base.ModelInputsFromEngine attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch.per_request_input_metadata">per_request_input_metadata (mstar.engine.engine.ExecutingBatch attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine.per_request_input_metadata">(mstar.model.submodule_base.ModelInputsFromEngine attribute)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch.per_request_input_tensors">per_request_input_tensors (mstar.engine.engine.ExecutingBatch attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine.per_request_states">per_request_states (mstar.model.submodule_base.ModelInputsFromEngine attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch.per_request_stream_chunks">per_request_stream_chunks (mstar.engine.engine.ExecutingBatch attribute)</a>
-
-      <ul>
-        <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ModelInputsFromEngine.per_request_stream_chunks">(mstar.model.submodule_base.ModelInputsFromEngine attribute)</a>
-</li>
-      </ul></li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.PerRequestState">PerRequestState (class in mstar.model.submodule_base)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.ReferenceInfo.persist">persist (mstar.communication.tensor_store.ReferenceInfo attribute)</a>
@@ -8431,14 +8433,14 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.PositionManager">PositionManager (class in mstar.engine.resources.position.manager)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PositionSpec">PositionSpec (class in mstar.engine.resources)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.position.config.html#mstar.engine.resources.position.config.PositionSpec">(class in mstar.engine.resources.position.config)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PositionStep">PositionStep (class in mstar.engine.resources)</a>
 
       <ul>
@@ -8725,6 +8727,14 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.PreprocessInput">PreprocessInput (class in mstar.api_server.request_types)</a>
 </li>
+      <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.prime">prime() (mstar.streaming.chunk_policy.ChunkPolicy method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.prime">(mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy method)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.prime_context">prime_context() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
+</li>
       <li><a href="_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.StreamingConnectionState.producer_done">producer_done (mstar.conductor.request_info.StreamingConnectionState attribute)</a>
 
       <ul>
@@ -8903,14 +8913,14 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.kv.plan.html#mstar.engine.resources.kv.plan.PagedIndptrs.qo_indptr">(mstar.engine.resources.kv.plan.PagedIndptrs attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.attn.flashinfer.html#mstar.engine.resources.attn.flashinfer.FlashInferManager.qo_indptr_buf">qo_indptr_buf() (mstar.engine.resources.attn.flashinfer.FlashInferManager method)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.attn.xpu.html#mstar.engine.resources.attn.xpu.XPUPagedAttentionManager.qo_indptr_buf">(mstar.engine.resources.attn.xpu.XPUPagedAttentionManager method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.attn.config.CrossAttentionConfig.query_kv_cache">query_kv_cache (mstar.engine.resources.attn.config.CrossAttentionConfig attribute)</a>
 
       <ul>
@@ -8936,6 +8946,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3OmniAdapter">Qwen3OmniAdapter (class in mstar.api_server.openai.adapters)</a>
 </li>
       <li><a href="_autosummary/mstar.model.components.diffusion.text_encoder.html#mstar.model.components.diffusion.text_encoder.Qwen3RMSNorm">Qwen3RMSNorm (class in mstar.model.components.diffusion.text_encoder)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3TTSAdapter">Qwen3TTSAdapter (class in mstar.api_server.openai.adapters)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -10337,14 +10349,14 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_audio_slice_start">snac_audio_slice_start (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_model_id">snac_model_id (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_stride_tokens">snac_stride_tokens (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_window_tokens">snac_window_tokens (mstar.model.orpheus.config.OrpheusModelConfig attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.kokoro.components.decoder.html#mstar.model.kokoro.components.decoder.snake">snake() (in module mstar.model.kokoro.components.decoder)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.Snake1d">Snake1d (class in mstar.model.cosmos3.components.sound_tokenizer)</a>
@@ -10472,11 +10484,19 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_lookahead">speech_chunk_lookahead (mstar.api_server.openai.adapters.OpenAIAdapter attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_chars">speech_chunk_max_chars (mstar.api_server.openai.adapters.OpenAIAdapter attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3TTSAdapter.speech_chunk_max_chars">(mstar.api_server.openai.adapters.Qwen3TTSAdapter attribute)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_max_pieces">speech_chunk_max_pieces (mstar.api_server.openai.adapters.OpenAIAdapter attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.speech_chunk_min_chars">speech_chunk_min_chars (mstar.api_server.openai.adapters.OpenAIAdapter attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3TTSAdapter.speech_chunk_min_chars">(mstar.api_server.openai.adapters.Qwen3TTSAdapter attribute)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.KokoroAdapter.speech_to_request">speech_to_request() (mstar.api_server.openai.adapters.KokoroAdapter method)</a>
 
       <ul>
@@ -10487,6 +10507,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OrpheusAdapter.speech_to_request">(mstar.api_server.openai.adapters.OrpheusAdapter method)</a>
 </li>
         <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3OmniAdapter.speech_to_request">(mstar.api_server.openai.adapters.Qwen3OmniAdapter method)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3TTSAdapter.speech_to_request">(mstar.api_server.openai.adapters.Qwen3TTSAdapter method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest">SpeechRequest (class in mstar.api_server.openai.protocol)</a>
@@ -10679,6 +10701,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.TranscriptionRequest.stream">(mstar.api_server.openai.protocol.TranscriptionRequest attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.InputMetadata.stream_chunks">stream_chunks (mstar.model.submodule_base.InputMetadata attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo.stream_lead_items">stream_lead_items (mstar.conductor.request_info.CurrentForwardPassInfo attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.engine.html#mstar.engine.engine.ExecutingBatch.stream_partition_done_rids">stream_partition_done_rids (mstar.engine.engine.ExecutingBatch attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.stream_text">stream_text() (mstar.api_server.openai.adapters.OpenAIAdapter method)</a>
@@ -10799,6 +10825,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OrpheusAdapter.supports_speech">(mstar.api_server.openai.adapters.OrpheusAdapter attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3OmniAdapter.supports_speech">(mstar.api_server.openai.adapters.Qwen3OmniAdapter attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Qwen3TTSAdapter.supports_speech">(mstar.api_server.openai.adapters.Qwen3TTSAdapter attribute)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.HiggsAudioAdapter.supports_transcriptions">supports_transcriptions (mstar.api_server.openai.adapters.HiggsAudioAdapter attribute)</a>

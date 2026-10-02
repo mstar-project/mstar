@@ -601,6 +601,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.continue_after_producer_done"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.continue_after_producer_done()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.is_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.next_chunk_size()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.prime"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.prime()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.register_chunk"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.register_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.window_size"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.window_size()</span></code></a></li>
 </ul>
@@ -629,6 +630,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy.is_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy.next_chunk_size()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.prime"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy.prime()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.register_chunk"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy.register_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.window_size"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy.window_size()</span></code></a></li>
 </ul>
@@ -727,6 +729,23 @@ For sliding-window policies this is the stride, not the window.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.streaming.chunk_policy.ChunkPolicy.prime">
+<span class="sig-name descname"><span class="pre">prime</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">context_items</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#ChunkPolicy.prime"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.ChunkPolicy.prime" title="Link to this definition">#</a></dt>
+<dd><p>The stream starts with <code class="docutils literal notranslate"><span class="pre">context_items</span></code> items that count as already
+delivered: they reach the consumer only as context of the first chunk.</p>
+<p>Called before the first chunk. Only policies with a notion of context
+support it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>context_items</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1030,7 +1049,7 @@ context: the context is whatever has been delivered so far, capped.</p>
 items and the first audio leaves after four frames instead of 300.</p>
 <p>The consumer learns how many leading items of a window are context from
 <code class="docutils literal notranslate"><span class="pre">StreamChunk.context_items</span></code> (the worker passes it along as
-<code class="docutils literal notranslate"><span class="pre">step_metadata[&quot;stream_chunks&quot;][edge][&quot;context_items&quot;]</span></code>), so it can trim
+<code class="docutils literal notranslate"><span class="pre">input_metadata.stream_chunks[edge].context_items</span></code>), so it can trim
 the duplicated output without re-deriving this schedule.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1067,6 +1086,23 @@ For sliding-window policies this is the stride, not the window.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.prime">
+<span class="sig-name descname"><span class="pre">prime</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">context_items</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/streaming/chunk_policy.html#ScheduledLeftContextChunkPolicy.prime"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.prime" title="Link to this definition">#</a></dt>
+<dd><p>The stream starts with <code class="docutils literal notranslate"><span class="pre">context_items</span></code> items that count as already
+delivered: they reach the consumer only as context of the first chunk.</p>
+<p>Called before the first chunk. Only policies with a notion of context
+support it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>context_items</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1212,6 +1248,7 @@ the buffer retains older items so the chunk contains the full window.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.continue_after_producer_done"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.continue_after_producer_done()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.is_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.next_chunk_size()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.prime"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.prime()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.register_chunk"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.register_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ChunkPolicy.window_size"><code class="docutils literal notranslate"><span class="pre">ChunkPolicy.window_size()</span></code></a></li>
 </ul>
@@ -1240,6 +1277,7 @@ the buffer retains older items so the chunk contains the full window.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.is_ready"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy.is_ready()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.next_chunk_size"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy.next_chunk_size()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.prime"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy.prime()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.register_chunk"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy.register_chunk()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.window_size"><code class="docutils literal notranslate"><span class="pre">ScheduledLeftContextChunkPolicy.window_size()</span></code></a></li>
 </ul>

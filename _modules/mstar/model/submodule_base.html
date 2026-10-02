@@ -895,7 +895,8 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span><span class="p">,</span> <span class="n">fields</span><span class="p">,</span> <span class="n">replace</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">types</span><span class="w"> </span><span class="kn">import</span> <span class="n">MappingProxyType</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
@@ -908,6 +909,24 @@ window.runMermaid = runMermaid;</script>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.cuda_graph_runner</span><span class="w"> </span><span class="kn">import</span> <span class="n">PiecewiseCudaGraphRunner</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.engine</span><span class="w"> </span><span class="kn">import</span> <span class="n">ExecutingBatch</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.stream_buffer</span><span class="w"> </span><span class="kn">import</span> <span class="n">StreamChunkInfo</span>
+
+
+<div class="viewcode-block" id="InputMetadata">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.InputMetadata">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">InputMetadata</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""What the worker knows about one request's inputs to this step.</span>
+
+<span class="sd">    Per step, unlike the per-request ``CurrentForwardPassInfo``. Build it with</span>
+<span class="sd">    keywords: fields get added here rather than as new hook arguments.</span>
+<span class="sd">    """</span>
+    <span class="c1"># input_name -&gt; where that streamed input's chunk sits in its stream</span>
+    <span class="n">stream_chunks</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">StreamChunkInfo</span><span class="p">]</span> <span class="o">=</span> <span class="n">MappingProxyType</span><span class="p">({})</span></div>
+
+    <span class="c1"># TODO: fold in prepare_inputs' is_final_stream_chunk kwarg once the Chatterbox work settles.</span>
+    <span class="c1"># TODO: move step_metadata and dynamic_loop_iter_counts here off CurrentForwardPassInfo (move, don't copy).</span>
+
+
+<span class="n">EMPTY_INPUT_METADATA</span> <span class="o">=</span> <span class="n">InputMetadata</span><span class="p">()</span>
 
 
 <div class="viewcode-block" id="NodeInputs">
@@ -1204,10 +1223,8 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># ``capture_forward_method``, so most submodules never need this.</span>
     <span class="n">captured</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
-    <span class="c1"># rid -&gt; {input_name: StreamChunkInfo}; only rids consuming a streamed input</span>
-    <span class="n">per_request_stream_chunks</span><span class="p">:</span> <span class="s2">"Mapping[str, Mapping[str, StreamChunkInfo]]"</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
-        <span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span>
-    <span class="p">)</span>
+    <span class="c1"># rid -&gt; this step's InputMetadata; rids without any are absent</span>
+    <span class="n">per_request_input_metadata</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">InputMetadata</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
@@ -1284,6 +1301,8 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">cg_key_info</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
         <span class="n">per_request_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
+        <span class="n">per_request_input_metadata</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">InputMetadata</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Which of this walk's capture buckets a batch belongs to.</span>
 
@@ -1298,9 +1317,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        its step. Disagreeing is not an error anywhere — it just misses the</span>
 <span class="sd">        capture and runs eager — so derive both from one place.</span>
 
+<span class="sd">        ``per_request_input_metadata`` is the batch's per-step input facts (as</span>
+<span class="sd">        on ``ModelInputsFromEngine``), e.g. for a bucket that follows a stream chunk.</span>
+
 <span class="sd">        None (the default) means the walk has a single capture.</span>
 <span class="sd">        """</span>
-        <span class="k">del</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">per_request_info</span>
+        <span class="k">del</span> <span class="n">graph_walk</span><span class="p">,</span> <span class="n">per_request_info</span><span class="p">,</span> <span class="n">per_request_input_metadata</span><span class="p">,</span> <span class="n">kwargs</span>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 

@@ -1669,11 +1669,13 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.waypoint.submodules.html#mstar.model.waypoint.submodules.WaypointVaeEncoderSubmodule.cg_key_info">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">cg_key_info</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">per_request_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">CurrentForwardPassInfo</span><span class="p">],</span>
+        <span class="n">per_request_input_metadata</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""The captured (H, W) bucket for this batch's seed, or None for eager.</span>
 
 <span class="sd">        The seed shape isn't on ``model_inputs`` at lease time, so it is read</span>
 <span class="sd">        off ``step_metadata["seed_hw"]``, set by ``get_initial_forward_pass_args``."""</span>
+        <span class="k">del</span> <span class="n">per_request_input_metadata</span><span class="p">,</span> <span class="n">kwargs</span>
         <span class="k">if</span> <span class="n">graph_walk</span> <span class="o">!=</span> <span class="n">PRIME_WALK</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
         <span class="n">sizes</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>

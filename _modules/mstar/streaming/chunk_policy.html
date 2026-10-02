@@ -907,6 +907,19 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">items_consumed</span> <span class="o">+=</span> <span class="n">chunk_size</span></div>
 
 
+<div class="viewcode-block" id="ChunkPolicy.prime">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.prime">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prime</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context_items</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The stream starts with ``context_items`` items that count as already</span>
+<span class="sd">        delivered: they reach the consumer only as context of the first chunk.</span>
+
+<span class="sd">        Called before the first chunk. Only policies with a notion of context</span>
+<span class="sd">        support it.</span>
+<span class="sd">        """</span>
+        <span class="k">if</span> <span class="n">context_items</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> has no leading context"</span><span class="p">)</span></div>
+
+
 <div class="viewcode-block" id="ChunkPolicy.is_ready">
 <a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ChunkPolicy.is_ready">[docs]</a>
     <span class="nd">@abstractmethod</span>
@@ -1198,7 +1211,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    The consumer learns how many leading items of a window are context from</span>
 <span class="sd">    ``StreamChunk.context_items`` (the worker passes it along as</span>
-<span class="sd">    ``step_metadata["stream_chunks"][edge]["context_items"]``), so it can trim</span>
+<span class="sd">    ``input_metadata.stream_chunks[edge].context_items``), so it can trim</span>
 <span class="sd">    the duplicated output without re-deriving this schedule.</span>
 <span class="sd">    """</span>
 
@@ -1211,6 +1224,17 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_left_context</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">left_context</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_delivered</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># new items handed to the consumer so far</span>
+
+<div class="viewcode-block" id="ScheduledLeftContextChunkPolicy.prime">
+<a class="viewcode-back" href="../../../_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.ScheduledLeftContextChunkPolicy.prime">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prime</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">context_items</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="n">context_items</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_left_context</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"can prime 0..</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">_left_context</span><span class="si">}</span><span class="s2"> context items before the first chunk, "</span>
+                <span class="sa">f</span><span class="s2">"got </span><span class="si">{</span><span class="n">context_items</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_delivered</span> <span class="o">=</span> <span class="n">context_items</span></div>
+
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_new_items</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chunks_popped</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_schedule</span><span class="p">):</span>

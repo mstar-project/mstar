@@ -19,6 +19,7 @@ mstar.model.submodule\_base
    
       ARNodeInputs
       ARNodeSubmodule
+      InputMetadata
       LazyRequestStates
       ModelInputsFromEngine
       NodeInputs
