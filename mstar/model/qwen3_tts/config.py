@@ -19,6 +19,7 @@ The dataclasses below preserve that ownership while exposing one
 """
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -250,12 +251,24 @@ class Qwen3TTSCodecConfig:
     # frame alone, so first audio leaves one Talker step after prefill; the
     # decoder is causal, so a frame's audio does not depend on how it was
     # chunked), then ``chunk_frames`` new frames per call, each preceded by up
-    # to ``left_context_frames`` already decoded frames so the causal decoder
-    # warms up (the reference's own ``chunked_decode`` uses 25 frames of left
-    # context).
+    # to ``left_context_frames`` already decoded frames. That context defaults
+    # to the decoder transformer's ``sliding_window``: with less, the streamed
+    # audio drifts from a whole decode (25 frames gave 25-39 dB SNR).
     chunk_schedule: tuple[int, ...] = (1, 3, 8, 16)
     chunk_frames: int = 25
-    left_context_frames: int = 25
+    left_context_frames: int | None = None
+    # Context the conv stack after the transformer sees. It is causal, so the
+    # transformer runs over the whole window and the (dominant) conv stack only
+    # over the new frames plus this much context. None: the stack's exact
+    # receptive field, derived from the decoder (10 frames for the 12 Hz one).
+    conv_context_frames: int | None = None
+    # Decode the conv stack over the new frames only (see conv_context_frames);
+    # off decodes whole windows.
+    split_decode: bool = True
+
+    def __post_init__(self) -> None:
+        if self.left_context_frames is None:
+            self.left_context_frames = self.sliding_window
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Qwen3TTSCodecConfig":
@@ -279,18 +292,28 @@ class Qwen3TTSCodecConfig:
         })
         return cls(**values)
 
-    def codec_windows(self) -> list[int]:
+    def codec_windows(self, lead_frames: Sequence[int] = (0,)) -> list[int]:
         """Distinct window sizes (context + new frames) the chunk schedule produces.
 
-        These are the shapes the codec captures CUDA graphs for; a terminal
-        flush shorter than a window is padded up to the next one.
+        One pass per entry of ``lead_frames``: a stream that starts with that
+        many context-only frames (a voice clone's reference tail). These are
+        the shapes the codec captures CUDA graphs for; any other window (a
+        terminal flush, a shorter reference tail) pads up to the next one.
         """
+        left = self.left_context_frames
         windows = set()
-        delivered = 0
-        for size in (*self.chunk_schedule, self.chunk_frames):
-            windows.add(min(self.left_context_frames, delivered) + size)
-            delivered += size
+        for lead in lead_frames:
+            delivered = lead
+            for size in self.chunk_schedule:
+                windows.add(min(left, delivered) + size)
+                delivered += size
+            while True:
+                windows.add(min(left, delivered) + self.chunk_frames)
+                if delivered >= left:
+                    break
+                delivered += self.chunk_frames
         return sorted(windows)
+
 
     def frames_for_samples(self, num_samples: int) -> int:
         """Codec frames the encoder emits for ``num_samples`` of input audio."""
@@ -308,6 +331,8 @@ class Qwen3TTSCodecConfig:
             "chunk_schedule",
             "chunk_frames",
             "left_context_frames",
+            "conv_context_frames",
+            "split_decode",
         }
         return {
             name: getattr(self, name)

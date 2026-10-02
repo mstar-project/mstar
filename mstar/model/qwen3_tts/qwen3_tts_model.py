@@ -16,19 +16,21 @@ Architecture (two asynchronous partitions):
     Codec      - stateless speech-tokenizer decoder producing PCM chunks
 
 Streaming topology:
-    Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((1, 3, 8, 16), 25, 25)]--> Codec
+    Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((1, 3, 8, 16), 25, 72)]--> Codec
 
 Request state machine:
     Talker: talker_prefill | talker_prefill_clone -> talker_decode loop -> done on EOS/token limit
-    Codec:  waits for streamed frames -> codec_chunk | codec_chunk_clone -> emits audio -> waits
+    Codec:  waits for streamed frames -> codec_chunk -> emits audio -> waits
 
 This class runs in the API/conductor side. It owns request validation, graph
 and partition declarations, state-machine transitions, sampling defaults, and
 lazy worker-side construction. Heavy weights are not loaded in ``__init__``.
 """
 
+import contextlib
 import importlib.metadata
 import importlib.util
+import inspect
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -64,7 +66,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
@@ -111,6 +113,62 @@ def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
             "speech_tokenizer/config.json",
         ],
     )
+
+
+@contextlib.contextmanager
+def _transformers_v4_decorators():
+    """Let qwen-tts' ``@check_model_inputs()`` (transformers 4.x) apply under 5.x.
+
+    5.x takes the function directly; patched only while the module executes.
+    """
+    from transformers.utils import generic
+
+    original = generic.check_model_inputs
+    if "func" not in inspect.signature(original).parameters:
+        yield
+        return
+
+    def check_model_inputs(func=None):
+        return original(func) if func is not None else original
+
+    generic.check_model_inputs = check_model_inputs
+    try:
+        yield
+    finally:
+        generic.check_model_inputs = original
+
+
+def _adapt_tokenizer_module(module) -> None:
+    """Fill in what transformers 5.x removed, on the private module only.
+
+    The decoder config asks for the ``default`` RoPE (dropped from
+    ``ROPE_INIT_FUNCTIONS``), and the mask builders renamed ``input_embeds``
+    to ``inputs_embeds`` and dropped ``cache_position``.
+    """
+    rope = module.ROPE_INIT_FUNCTIONS
+    if "default" not in rope:
+        def default_rope(config, device=None, seq_len=None, layer_type=None):
+            del seq_len, layer_type
+            head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+            exponent = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim
+            return 1.0 / (config.rope_theta ** exponent), 1.0
+
+        module.ROPE_INIT_FUNCTIONS = {**rope, "default": default_rope}
+
+    for name in ("create_causal_mask", "create_sliding_window_causal_mask"):
+        builder = getattr(module, name)
+        params = inspect.signature(builder).parameters
+        if "input_embeds" in params:
+            continue
+
+        def adapted(*args, _builder=builder, _params=params, **kwargs):
+            if "input_embeds" in kwargs:
+                kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+            if "cache_position" not in _params:
+                kwargs.pop("cache_position", None)
+            return _builder(*args, **kwargs)
+
+        setattr(module, name, adapted)
 
 
 @lru_cache(maxsize=1)
@@ -169,10 +227,12 @@ def _load_qwen3_tts_codec_classes() -> tuple[type, type, type]:
             config_name,
             source_root / "configuration_qwen3_tts_tokenizer_v2.py",
         )
-        model_module = load_private_module(
-            model_name,
-            source_root / "modeling_qwen3_tts_tokenizer_v2.py",
-        )
+        with _transformers_v4_decorators():
+            model_module = load_private_module(
+                model_name,
+                source_root / "modeling_qwen3_tts_tokenizer_v2.py",
+            )
+        _adapt_tokenizer_module(model_module)
     except Exception:
         for name in loaded_names:
             sys.modules.pop(name, None)
@@ -485,7 +545,6 @@ class Qwen3TTSModel(Model):
                 ref_encoder,
                 talker_prefill_node([*self.PREFILL_INPUTS, "speaker_embed", "ref_codes"]),
             ])
-            walks["codec_chunk_clone"] = codec_node(["codec_tokens", "ref_frames"])
         return walks
 
     # -----------------------------------------------------------------------
@@ -498,7 +557,6 @@ class Qwen3TTSModel(Model):
         codec_walks = {"codec_chunk"}
         if self.config.supports_reference_audio:
             talker_walks.add("talker_prefill_clone")
-            codec_walks.add("codec_chunk_clone")
         return [
             PartitionDefinition(
                 name="Talker",
@@ -693,6 +751,9 @@ class Qwen3TTSModel(Model):
             raise ValueError("Qwen3-TTS reference clip is empty")
         return ref_text, frames
 
+    # model_kwargs key: reference frames leading an in-context clone's codec stream
+    CODEC_STREAM_LEAD_KEY = "codec_stream_lead_frames"
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -700,7 +761,7 @@ class Qwen3TTSModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs: Any,
-    ) -> NameToTensorList:
+    ) -> NameToTensorList | ProcessPromptOutput:
         """Validate a request against the checkpoint variant and tokenize it.
 
         Produces the ``PREFILL_INPUTS`` tensors. ``text_inputs`` is the
@@ -710,8 +771,9 @@ class Qwen3TTSModel(Model):
         ref_text_len, ref_frames]``. ``stream_text`` follows the reference
         default per variant (whole text in the prefill for CustomVoice and
         VoiceDesign, one token per frame for Base) unless the request sets
-        ``non_streaming_mode``. Base requests also get ``ref_frames`` as its
-        own tensor for the codec's trimming.
+        ``non_streaming_mode``. An in-context clone also reports, as
+        ``CODEC_STREAM_LEAD_KEY`` metadata, how many reference frames lead the
+        codec stream (context only; see ``get_initial_forward_pass_args``).
         """
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
@@ -763,8 +825,9 @@ class Qwen3TTSModel(Model):
             "speaker_id": [torch.tensor([speaker_id], dtype=torch.long)],
             "language_id": [torch.tensor([language_id], dtype=torch.long)],
         }
-        if self.config.supports_reference_audio:
-            outputs["ref_frames"] = [torch.tensor([ref_frames], dtype=torch.long)]
+        lead = min(ref_frames, self.config.codec.left_context_frames)
+        if lead:
+            return ProcessPromptOutput(outputs, {self.CODEC_STREAM_LEAD_KEY: lead})
         return outputs
 
     # -----------------------------------------------------------------------
@@ -821,27 +884,20 @@ class Qwen3TTSModel(Model):
             metadata = CurrentForwardConductorMetadata(
                 input_modalities=input_modalities,
                 output_modalities=output_modalities,
-                graph_walk="codec_chunk_clone" if clone else "codec_chunk",
+                graph_walk="codec_chunk",
                 is_prefill=False,
             )
+            # An in-context clone's stream leads with reference frames: they
+            # are the first window's context, never audio of their own.
+            lead = int((model_kwargs or {}).get(self.CODEC_STREAM_LEAD_KEY, 0))
             return ForwardPassArgs(
                 full_metadata=metadata,
-                # The clone walk needs the reference frame count next to the
-                # stream from its very first chunk; the API tensor stays
-                # persisted so every later re-arm can read it again.
-                inputs=self._codec_ref_frames_edges(input_signals) if clone else [],
+                inputs=[],
                 unpersist_tensors=[],
                 request_done="audio" not in output_modalities,
+                stream_lead_items={"codec_tokens": lead} if lead else {},
             )
         raise ValueError(f"Unknown Qwen3-TTS partition: {partition_name!r}")
-
-    @staticmethod
-    def _codec_ref_frames_edges(
-        signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[GraphEdge]:
-        edge = GraphEdge(next_node="Codec", name="ref_frames")
-        edge.tensor_info = signals.get("ref_frames", [])
-        return [edge]
 
     def get_partition_forward_pass_args(
         self,
@@ -883,16 +939,10 @@ class Qwen3TTSModel(Model):
             )
 
         if partition_name == "Codec":
-            inputs = []
-            if partition_metadata.graph_walk == "codec_chunk_clone":
-                # The reference frame count is an API tensor; every codec
-                # invocation of a clone request re-reads it (cheap, one int).
-                inputs = self._codec_ref_frames_edges(persist_signals)
-            else:
-                partition_metadata.graph_walk = "codec_chunk"
+            partition_metadata.graph_walk = "codec_chunk"
             return ForwardPassArgs(
                 full_metadata=partition_metadata,
-                inputs=inputs,
+                inputs=[],
                 unpersist_tensors=[],
                 step_metadata={
                     "codec_chunk_frames": self.config.codec.chunk_frames,

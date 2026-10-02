@@ -16,4 +16,4 @@ node_groups:
     graph_walks: [talker_prefill, talker_prefill_clone, talker_decode]
   - node_names: [Codec]
     ranks: [0]
-    graph_walks: [codec_chunk, codec_chunk_clone]
+    graph_walks: [codec_chunk]

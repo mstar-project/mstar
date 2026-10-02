@@ -537,18 +537,26 @@ class Worker:
             request_id, self._graph_runtime.get_sharding_config(request_id),
         )
 
-        # Create StreamBuffers for consumer connections on this worker
+        # Create StreamBuffers for consumer connections on this worker. A request
+        # with several partitions here arrives once per partition: keep the
+        # buffer the first arrival made (it may already hold items).
+        req_info = self.request_state.per_request_info[request_id]
         for conn in self._my_consumer_connections:
-            req_info = self.request_state.per_request_info[request_id]
-            sbuf = StreamBuffer(
-                request_id=request_id,
-                edge_name=conn.edge_name,
-                from_partition=conn.from_partition,
-                policy=conn.chunk_policy_factory(),
-            )
-            req_info.stream_buffers[conn.edge_name] = sbuf
-            consumer = self._consumer_node_cache.get(conn.edge_name, "")
-            req_info.stream_buffers_by_consumer.setdefault(consumer, {})[conn.edge_name] = sbuf
+            sbuf = req_info.stream_buffers.get(conn.edge_name)
+            if sbuf is None:
+                sbuf = StreamBuffer(
+                    request_id=request_id,
+                    edge_name=conn.edge_name,
+                    from_partition=conn.from_partition,
+                    policy=conn.chunk_policy_factory(),
+                )
+                req_info.stream_buffers[conn.edge_name] = sbuf
+                consumer = self._consumer_node_cache.get(conn.edge_name, "")
+                req_info.stream_buffers_by_consumer.setdefault(consumer, {})[conn.edge_name] = sbuf
+            if conn.to_partition == body.request_info.partition_name:
+                lead = body.request_info.stream_lead_items.get(conn.edge_name)
+                if lead:
+                    sbuf.prime_context(lead)
 
         # Start RDMA reads for tensors that have tensor_info
         futures = self.tensor_manager.start_read_tensors(

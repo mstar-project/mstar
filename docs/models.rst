@@ -186,11 +186,19 @@ Qwen3-TTS notes
   ``sentence_chunking: false`` (or ``true`` for shorter texts) per request.
 - Audio streams in a ramp of codec chunks: the first frame is decoded on its
   own (first audio one Talker step after prefill), the next windows add 3, 8
-  and 16 frames, then 25 new frames behind 25 frames of already decoded left
-  context (the reference's own ``chunked_decode`` context; the decoder is
-  causal, so chunking does not change the audio). Each window size is a CUDA-graph bucket
-  captured for batch sizes 1 to 32; the stream buffer reports how many leading
-  frames of a window are repeated context, and the codec trims their audio.
+  and 16 frames, then 25 new frames behind up to 72 frames of already decoded
+  left context, the decoder transformer's sliding window (as vLLM-Omni). The
+  transformer stacks 8 such layers, so a window still differs slightly from a
+  whole-utterance decode once an utterance outgrows the context; 25 frames of
+  context differed far more. Each window size is a CUDA-graph bucket captured
+  for batch sizes 1 to 32; the stream buffer reports how many leading frames of
+  a window are repeated context, and the codec trims their audio. A voice
+  clone's reference tail (its last 72 frames) is the first window's context.
+- The codec runs its transformer over the whole window but its conv stack (all
+  but a few percent of the codec's time) only over the new frames plus the
+  stack's causal receptive field, derived from the decoder's modules at load
+  (10 frames for the 12 Hz decoder; the new frames' audio equals the
+  whole-window decode). It also fuses the SnakeBeta activations into one kernel.
 - Talker prefill replays a packed CUDA Graph for the smallest token bucket
   (32 to 1024 tokens) that holds the batch; only the clone prefill, which also
   pushes the reference clip's frames into the codec stream, runs eager. Decode

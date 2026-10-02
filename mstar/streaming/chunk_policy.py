@@ -12,6 +12,16 @@ class ChunkPolicy(ABC):
         self.first_chunk_read = True
         self.items_consumed += chunk_size
 
+    def prime(self, context_items: int) -> None:
+        """The stream starts with ``context_items`` items that count as already
+        delivered: they reach the consumer only as context of the first chunk.
+
+        Called before the first chunk. Only policies with a notion of context
+        support it.
+        """
+        if context_items:
+            raise NotImplementedError(f"{type(self).__name__} has no leading context")
+
     @abstractmethod
     def is_ready(self, buffer_len: int) -> bool:
         """Return True if the buffer has enough items for a chunk."""
@@ -244,6 +254,14 @@ class ScheduledLeftContextChunkPolicy(ChunkPolicy):
         self._left_context = int(left_context)
         self._chunks_popped = 0
         self._delivered = 0  # new items handed to the consumer so far
+
+    def prime(self, context_items: int) -> None:
+        if not 0 <= context_items <= self._left_context or self._chunks_popped:
+            raise ValueError(
+                f"can prime 0..{self._left_context} context items before the first chunk, "
+                f"got {context_items}"
+            )
+        self._delivered = context_items
 
     def _new_items(self) -> int:
         if self._chunks_popped < len(self._schedule):
