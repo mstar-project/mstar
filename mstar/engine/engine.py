@@ -1332,12 +1332,16 @@ class Engine:
         request_info: CurrentForwardPassInfo,
     ) -> Any | None:
         """The capture bucket this one request would replay, by
-        ``cg_key_info``; None when the walk has no capture.
+        ``cg_key_info``; None when the walk has no capture or the submodule
+        does not split by it.
 
         A batch spanning two groups matches no capture and runs eager, so the
-        scheduler batches each group on its own.
+        scheduler batches each group on its own when the submodule opts in
+        (``split_batches_by_capture_key``).
         """
         submodule_mgmt = self._submodules[node_name]
+        if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
+            return None
         cg_runner = submodule_mgmt.cuda_graph_runner
         if cg_runner is None or not cg_runner.captures_walk(graph_walk):
             return None

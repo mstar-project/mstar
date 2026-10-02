@@ -719,3 +719,43 @@ def test_clearing_a_rid_forgets_its_undelivered_admit_error():
 
     assert sched.take_admit_errors() == {}
     assert sched.failed_rids == set()
+
+
+# ── engine capture-group gate ───────────────────────────────────────────
+
+
+class _Submodule:
+    def __init__(self, split):
+        self._split = split
+
+    def split_batches_by_capture_key(self, graph_walk):
+        del graph_walk
+        return self._split
+
+    def cg_key_info(self, graph_walk, per_request_info):
+        del graph_walk
+        (info,) = per_request_info.values()
+        return info.guided
+
+
+def _capture_group(split=True, captured=(WALK,)):
+    from mstar.engine.engine import Engine
+
+    runner = SimpleNamespace(captures_walk=lambda walk: walk in captured)
+    engine = SimpleNamespace(_submodules={
+        NODE: SimpleNamespace(submodule=_Submodule(split), cuda_graph_runner=runner),
+    })
+    return Engine.capture_group(engine, NODE, WALK, 0, SimpleNamespace(guided=True))
+
+
+def test_an_opted_in_submodule_groups_by_its_capture_key():
+    assert _capture_group() is True
+
+
+def test_a_submodule_that_does_not_opt_in_is_never_split():
+    """The default: a mixed batch keeps whatever path it ran before."""
+    assert _capture_group(split=False) is None
+
+
+def test_a_walk_without_a_capture_is_never_split():
+    assert _capture_group(captured=()) is None
