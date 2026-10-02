@@ -215,7 +215,9 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_transcriptions.html">mstar.api_server.openai.serving_transcriptions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
@@ -854,6 +856,18 @@ semantics. Point any OpenAI client at <code class="docutils literal notranslate"
 <td><p>speech models that publish a voice list through their speech adapter (<code class="docutils literal notranslate"><span class="pre">kokoro</span></code>, <code class="docutils literal notranslate"><span class="pre">orpheus</span></code>; 404 otherwise)</p></td>
 <td><p>The <code class="docutils literal notranslate"><span class="pre">voice</span></code> ids the served model accepts, plus its default.</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/audio/transcriptions</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code>, <code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code></p></td>
+<td><p>Speech-to-text (multipart upload; <code class="docutils literal notranslate"><span class="pre">json</span></code> / <code class="docutils literal notranslate"><span class="pre">text</span></code> / <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> /
+<code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code>; streaming via <code class="docutils literal notranslate"><span class="pre">transcript.text.delta</span></code> events).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">WS</span> <span class="pre">/v1/realtime?intent=transcription</span></code></p></td>
+<td><p>models whose adapter can continue a hypothesis</p></td>
+<td><p>Streaming speech-to-text: <code class="docutils literal notranslate"><span class="pre">input_audio_buffer.append</span></code> PCM16 chunks in,
+<code class="docutils literal notranslate"><span class="pre">conversation.item.input_audio_transcription.delta</span></code> (append-only) and
+<code class="docutils literal notranslate"><span class="pre">mstar.transcription.partial</span></code> (whole current hypothesis) out; <code class="docutils literal notranslate"><span class="pre">commit</span></code>
+finishes the utterance.</p></td>
+</tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/generations</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code></p></td>
 <td><p>Text-to-image.</p></td>
@@ -877,6 +891,10 @@ Waypoint emits live RGB frame chunks and is not routed through the encoded-video
 <span class="c1"># (mstar extension) the voices the served model accepts</span>
 <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"http://localhost:8000/v1/audio/voices"</span><span class="p">)</span><span class="o">.</span><span class="n">json</span><span class="p">()[</span><span class="s2">"voices"</span><span class="p">]</span>
 
+<span class="c1"># speech-to-text</span>
+<span class="n">client</span><span class="o">.</span><span class="n">audio</span><span class="o">.</span><span class="n">transcriptions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"whisper_large"</span><span class="p">,</span> <span class="n">file</span><span class="o">=</span><span class="nb">open</span><span class="p">(</span><span class="s2">"speech.wav"</span><span class="p">,</span> <span class="s2">"rb"</span><span class="p">),</span>
+                                   <span class="n">language</span><span class="o">=</span><span class="s2">"en"</span><span class="p">)</span>
+
 <span class="c1"># image generation</span>
 <span class="n">client</span><span class="o">.</span><span class="n">images</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"bagel"</span><span class="p">,</span> <span class="n">prompt</span><span class="o">=</span><span class="s2">"a cat in a hat"</span><span class="p">)</span>
 </pre></div>
@@ -890,6 +908,31 @@ residual codec groups use <code class="docutils literal notranslate"><span class
 <code class="docutils literal notranslate"><span class="pre">Ethan</span></code>) and request audio output by including <code class="docutils literal notranslate"><span class="pre">&quot;audio&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">modalities</span></code>.
 Non-OpenAI knobs (e.g. <code class="docutils literal notranslate"><span class="pre">talker_top_k</span></code>, <code class="docutils literal notranslate"><span class="pre">code_predictor_top_p</span></code>) go through
 <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.</p></li>
+<li><p><strong>Whisper / Higgs-Audio</strong> — <code class="docutils literal notranslate"><span class="pre">language</span></code> (ISO-639-1) skips language detection,
+<code class="docutils literal notranslate"><span class="pre">prompt</span></code> conditions the decoder on prior text (it reaches the model as
+<code class="docutils literal notranslate"><span class="pre">initial_prompt</span></code>), and <code class="docutils literal notranslate"><span class="pre">response_format</span></code>
+<code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> / <code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code> (or <code class="docutils literal notranslate"><span class="pre">timestamp_granularities[]</span></code>) asks the
+model for timestamps. Whisper’s language and timestamp tokens travel in the
+text stream and are lifted into <code class="docutils literal notranslate"><span class="pre">language</span></code> / <code class="docutils literal notranslate"><span class="pre">segments</span></code> by the server; a
+streaming client receives only the spoken words. Uploads longer than the
+model’s clip (30 s for Whisper) are served as consecutive windows. By default
+they run in order, openai-whisper style: each window gets the transcript so
+far as <code class="docutils literal notranslate"><span class="pre">initial_prompt</span></code> and the first window’s detected language, is decoded
+with timestamps so the next window can start where its last closed segment
+ended (no word is split by a boundary), and is decoded again when its text is
+a repetition loop (gzip compression ratio above 2.4): first without the
+conditioning text, then at rising temperatures — after which the transcript
+so far stops conditioning later windows.
+Leave <code class="docutils literal notranslate"><span class="pre">temperature</span></code> at 0 to get that fallback; a pinned temperature is used
+as is. <code class="docutils literal notranslate"><span class="pre">long_form=&quot;parallel&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">extra_body</span></code> submits fixed windows all at
+once, each cut at the quietest moment before its boundary. Segment timestamps
+are offset to the whole file.</p></li>
+<li><p><strong>Realtime transcription</strong> — every <code class="docutils literal notranslate"><span class="pre">chunk_seconds</span></code> (default 2 s) of new audio the
+session re-transcribes everything heard so far as one engine request whose assistant
+turn is prefilled with the previous hypothesis minus its last <code class="docutils literal notranslate"><span class="pre">unfixed_tokens</span></code>
+tokens (the Qwen3-ASR SDK’s streaming algorithm), so only the tail is ever revised.
+Tune <code class="docutils literal notranslate"><span class="pre">chunk_seconds</span></code> / <code class="docutils literal notranslate"><span class="pre">unfixed_chunks</span></code> / <code class="docutils literal notranslate"><span class="pre">unfixed_tokens</span></code> under <code class="docutils literal notranslate"><span class="pre">session.mstar</span></code>
+in <code class="docutils literal notranslate"><span class="pre">transcription_session.update</span></code>.</p></li>
 <li><p><strong>Kokoro</strong> — <code class="docutils literal notranslate"><span class="pre">voice</span></code> is one of the 54 bundled voices (default <code class="docutils literal notranslate"><span class="pre">af_heart</span></code>) or a
 blend such as <code class="docutils literal notranslate"><span class="pre">af_bella+af_sky</span></code> or <code class="docutils literal notranslate"><span class="pre">af_bella(2)+af_sky(1)</span></code>; <code class="docutils literal notranslate"><span class="pre">speed</span></code> scales the
 speaking rate (0.25-4.0). <code class="docutils literal notranslate"><span class="pre">lang_code</span></code> and <code class="docutils literal notranslate"><span class="pre">phonemes</span></code> go through <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>.

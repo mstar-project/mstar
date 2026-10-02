@@ -568,7 +568,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_transcriptions.html">mstar.api_server.openai.serving_transcriptions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
@@ -896,13 +898,15 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">APIRouter</span><span class="p">,</span> <span class="n">Request</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">APIRouter</span><span class="p">,</span> <span class="n">Request</span><span class="p">,</span> <span class="n">WebSocket</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">fastapi.responses</span><span class="w"> </span><span class="kn">import</span> <span class="n">JSONResponse</span><span class="p">,</span> <span class="n">StreamingResponse</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">serving_chat</span><span class="p">,</span>
     <span class="n">serving_images</span><span class="p">,</span>
+    <span class="n">serving_realtime</span><span class="p">,</span>
     <span class="n">serving_speech</span><span class="p">,</span>
+    <span class="n">serving_transcriptions</span><span class="p">,</span>
     <span class="n">serving_videos</span><span class="p">,</span>
 <span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">now</span>
@@ -913,6 +917,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">ModelCard</span><span class="p">,</span>
     <span class="n">ModelList</span><span class="p">,</span>
     <span class="n">SpeechRequest</span><span class="p">,</span>
+    <span class="n">TranscriptionRequest</span><span class="p">,</span>
     <span class="n">VideoGenerationRequest</span><span class="p">,</span>
 <span class="p">)</span>
 
@@ -1001,6 +1006,73 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="k">await</span> <span class="n">serving_speech</span><span class="o">.</span><span class="n">create_speech</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">raw_request</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
         <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="mi">500</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="audio_transcriptions">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.audio_transcriptions">[docs]</a>
+<span class="nd">@router</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">"/v1/audio/transcriptions"</span><span class="p">)</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">audio_transcriptions</span><span class="p">(</span><span class="n">request</span><span class="p">:</span> <span class="n">Request</span><span class="p">):</span>
+    <span class="c1"># Multipart (audio file + the OpenAI fields), parsed manually like</span>
+    <span class="c1"># images/edits so unknown fields flow through as model_kwargs.</span>
+    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_transcriptions"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">err</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">form</span> <span class="o">=</span> <span class="k">await</span> <span class="n">request</span><span class="o">.</span><span class="n">form</span><span class="p">()</span>
+        <span class="n">upload</span> <span class="o">=</span> <span class="n">form</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"file"</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">upload</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">upload</span><span class="p">,</span> <span class="s2">"read"</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="s2">"audio/transcriptions requires a 'file' upload"</span><span class="p">)</span>
+        <span class="n">limit</span> <span class="o">=</span> <span class="n">serving_transcriptions</span><span class="o">.</span><span class="n">MAX_UPLOAD_BYTES</span>
+        <span class="k">if</span> <span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">upload</span><span class="p">,</span> <span class="s2">"size"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">or</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">limit</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">413</span><span class="p">,</span> <span class="sa">f</span><span class="s2">"audio/transcriptions accepts files up to </span><span class="si">{</span><span class="n">limit</span><span class="w"> </span><span class="o">//</span><span class="w"> </span><span class="mi">2</span><span class="o">**</span><span class="mi">20</span><span class="si">}</span><span class="s2"> MiB"</span><span class="p">)</span>
+        <span class="n">audio_bytes</span> <span class="o">=</span> <span class="k">await</span> <span class="n">upload</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">audio_bytes</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="s2">"audio/transcriptions received an empty 'file'"</span><span class="p">)</span>
+        <span class="n">fields</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">form</span><span class="o">.</span><span class="n">multi_items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="s2">"filename"</span><span class="p">):</span>
+                <span class="k">continue</span>
+            <span class="c1"># OpenAI clients send list fields as repeated ``name[]`` keys.</span>
+            <span class="k">if</span> <span class="n">key</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s2">"[]"</span><span class="p">):</span>
+                <span class="n">fields</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">key</span><span class="p">[:</span><span class="o">-</span><span class="mi">2</span><span class="p">],</span> <span class="p">[])</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+                <span class="k">continue</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">fields</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+            <span class="k">except</span> <span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">JSONDecodeError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">):</span>
+                <span class="n">fields</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">req</span> <span class="o">=</span> <span class="n">TranscriptionRequest</span><span class="p">(</span><span class="o">**</span><span class="n">fields</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — pydantic validation</span>
+            <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">))</span>
+        <span class="k">return</span> <span class="k">await</span> <span class="n">serving_transcriptions</span><span class="o">.</span><span class="n">create_transcription</span><span class="p">(</span>
+            <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">audio_bytes</span><span class="p">,</span>
+            <span class="nb">getattr</span><span class="p">(</span><span class="n">upload</span><span class="p">,</span> <span class="s2">"filename"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span> <span class="n">raw_request</span><span class="o">=</span><span class="n">request</span><span class="p">,</span>
+        <span class="p">)</span>
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>  <span class="c1"># noqa: BLE001</span>
+        <span class="n">default_status</span> <span class="o">=</span> <span class="mi">400</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="p">(</span><span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">))</span> <span class="k">else</span> <span class="mi">500</span>
+        <span class="k">return</span> <span class="n">_error</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"status_code"</span><span class="p">,</span> <span class="n">default_status</span><span class="p">),</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">e</span><span class="p">,</span> <span class="s2">"detail"</span><span class="p">,</span> <span class="n">e</span><span class="p">)),</span> <span class="s2">"server_error"</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="realtime">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.router.html#mstar.api_server.openai.router.realtime">[docs]</a>
+<span class="nd">@router</span><span class="o">.</span><span class="n">websocket</span><span class="p">(</span><span class="s2">"/v1/realtime"</span><span class="p">)</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">realtime</span><span class="p">(</span><span class="n">websocket</span><span class="p">:</span> <span class="n">WebSocket</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""OpenAI Realtime API, transcription intent (``?intent=transcription``):</span>
+<span class="sd">    streaming speech-to-text with partial results. See ``serving_realtime``."""</span>
+    <span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">err</span> <span class="o">=</span> <span class="n">_resolve</span><span class="p">(</span><span class="s2">"supports_realtime_transcription"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">err</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 1008 is policy violation, the served model has no such endpoint</span>
+        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">accept</span><span class="p">()</span>
+        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">close</span><span class="p">(</span><span class="n">code</span><span class="o">=</span><span class="mi">1008</span><span class="p">,</span> <span class="n">reason</span><span class="o">=</span><span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="nb">bytes</span><span class="p">(</span><span class="n">err</span><span class="o">.</span><span class="n">body</span><span class="p">))[</span><span class="s2">"error"</span><span class="p">][</span><span class="s2">"message"</span><span class="p">])</span>
+        <span class="k">return</span>
+    <span class="n">intent</span> <span class="o">=</span> <span class="n">websocket</span><span class="o">.</span><span class="n">query_params</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"intent"</span><span class="p">,</span> <span class="s2">"transcription"</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">intent</span> <span class="o">!=</span> <span class="s2">"transcription"</span><span class="p">:</span>
+        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">accept</span><span class="p">()</span>
+        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">close</span><span class="p">(</span><span class="n">code</span><span class="o">=</span><span class="mi">1008</span><span class="p">,</span> <span class="n">reason</span><span class="o">=</span><span class="sa">f</span><span class="s2">"unsupported intent </span><span class="si">{</span><span class="n">intent</span><span class="si">!r}</span><span class="s2">; use intent=transcription"</span><span class="p">)</span>
+        <span class="k">return</span>
+    <span class="k">await</span> <span class="n">serving_realtime</span><span class="o">.</span><span class="n">RealtimeTranscription</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">websocket</span><span class="p">)</span><span class="o">.</span><span class="n">run</span><span class="p">()</span></div>
 
 
 

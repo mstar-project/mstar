@@ -14,11 +14,13 @@ mstar.api\_server.openai.router
    .. autosummary::
    
       audio_speech
+      audio_transcriptions
       audio_voices
       chat_completions
       images_edits
       images_generations
       list_models
+      realtime
       videos_generations
    
    

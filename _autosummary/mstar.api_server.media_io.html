@@ -215,7 +215,9 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_transcriptions.html">mstar.api_server.openai.serving_transcriptions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
@@ -594,6 +596,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.decode_audio"><code class="docutils literal notranslate"><span class="pre">decode_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.modality_from_mime"><code class="docutils literal notranslate"><span class="pre">modality_from_mime()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.mux_mp4_with_pcm16"><code class="docutils literal notranslate"><span class="pre">mux_mp4_with_pcm16()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.pcm16_to_container"><code class="docutils literal notranslate"><span class="pre">pcm16_to_container()</span></code></a></li>
@@ -603,7 +606,9 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_base64"><code class="docutils literal notranslate"><span class="pre">save_base64()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_data_url"><code class="docutils literal notranslate"><span class="pre">save_data_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_remote_url"><code class="docutils literal notranslate"><span class="pre">save_remote_url()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.split_windows"><code class="docutils literal notranslate"><span class="pre">split_windows()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.wav_stream_header"><code class="docutils literal notranslate"><span class="pre">wav_stream_header()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.write_wav"><code class="docutils literal notranslate"><span class="pre">write_wav()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -635,39 +640,64 @@ the base install stays slim.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.modality_from_mime" title="mstar.api_server.media_io.modality_from_mime"><code class="xref py py-obj docutils literal notranslate"><span class="pre">modality_from_mime</span></code></a>(mime)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.decode_audio" title="mstar.api_server.media_io.decode_audio"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_audio</span></code></a>(path[, sample_rate])</p></td>
+<td><p>Decode an audio file to a float32 mono numpy waveform at <code class="docutils literal notranslate"><span class="pre">sample_rate</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.modality_from_mime" title="mstar.api_server.media_io.modality_from_mime"><code class="xref py py-obj docutils literal notranslate"><span class="pre">modality_from_mime</span></code></a>(mime)</p></td>
 <td><p>Map a MIME type to one of our modality strings (image/audio/video).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.mux_mp4_with_pcm16" title="mstar.api_server.media_io.mux_mp4_with_pcm16"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mux_mp4_with_pcm16</span></code></a>(video_mp4, pcm, sample_rate)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.mux_mp4_with_pcm16" title="mstar.api_server.media_io.mux_mp4_with_pcm16"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mux_mp4_with_pcm16</span></code></a>(video_mp4, pcm, sample_rate)</p></td>
 <td><p>Mux an H.264 mp4 and raw interleaved 16-bit PCM into one mp4 with an AAC audio track (stream-copies the video).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.pcm16_to_container" title="mstar.api_server.media_io.pcm16_to_container"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pcm16_to_container</span></code></a>(pcm, sample_rate[, fmt])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.pcm16_to_container" title="mstar.api_server.media_io.pcm16_to_container"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pcm16_to_container</span></code></a>(pcm, sample_rate[, fmt])</p></td>
 <td><p>Encode raw 16-bit PCM into <code class="docutils literal notranslate"><span class="pre">fmt</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.pcm16_to_wav_bytes" title="mstar.api_server.media_io.pcm16_to_wav_bytes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pcm16_to_wav_bytes</span></code></a>(pcm, sample_rate[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.pcm16_to_wav_bytes" title="mstar.api_server.media_io.pcm16_to_wav_bytes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">pcm16_to_wav_bytes</span></code></a>(pcm, sample_rate[, ...])</p></td>
 <td><p>Wrap raw little-endian 16-bit PCM (the model's audio output) into a WAV blob.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.png_to_data_url" title="mstar.api_server.media_io.png_to_data_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">png_to_data_url</span></code></a>(png_bytes)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.png_to_data_url" title="mstar.api_server.media_io.png_to_data_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">png_to_data_url</span></code></a>(png_bytes)</p></td>
 <td><p>Encode PNG image bytes (the model's image output) as a data URL.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.resolve_media_ref" title="mstar.api_server.media_io.resolve_media_ref"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_media_ref</span></code></a>(ref, upload_dir, *[, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.resolve_media_ref" title="mstar.api_server.media_io.resolve_media_ref"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_media_ref</span></code></a>(ref, upload_dir, *[, ...])</p></td>
 <td><p>Resolve a media reference (data URL, http(s) URL, or local path).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_base64" title="mstar.api_server.media_io.save_base64"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_base64</span></code></a>(b64, fmt, modality_hint, upload_dir)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_base64" title="mstar.api_server.media_io.save_base64"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_base64</span></code></a>(b64, fmt, modality_hint, upload_dir)</p></td>
 <td><p>Persist a bare base64 blob with a known <code class="docutils literal notranslate"><span class="pre">fmt</span></code> (e.g. <code class="docutils literal notranslate"><span class="pre">&quot;wav&quot;</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_data_url" title="mstar.api_server.media_io.save_data_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_data_url</span></code></a>(data_url, upload_dir)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_data_url" title="mstar.api_server.media_io.save_data_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_data_url</span></code></a>(data_url, upload_dir)</p></td>
 <td><p>Persist a <code class="docutils literal notranslate"><span class="pre">data:&lt;mime&gt;;base64,&lt;payload&gt;</span></code> URL.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_remote_url" title="mstar.api_server.media_io.save_remote_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_remote_url</span></code></a>(url, upload_dir[, timeout])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.save_remote_url" title="mstar.api_server.media_io.save_remote_url"><code class="xref py py-obj docutils literal notranslate"><span class="pre">save_remote_url</span></code></a>(url, upload_dir[, timeout])</p></td>
 <td><p>Download an <code class="docutils literal notranslate"><span class="pre">http(s)</span></code> URL into <code class="docutils literal notranslate"><span class="pre">upload_dir</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.split_windows" title="mstar.api_server.media_io.split_windows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_windows</span></code></a>(audio, window_seconds[, ...])</p></td>
+<td><p>Cut a waveform into consecutive windows of at most <code class="docutils literal notranslate"><span class="pre">window_seconds</span></code>; concatenating them gives the input back sample for sample.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.wav_stream_header" title="mstar.api_server.media_io.wav_stream_header"><code class="xref py py-obj docutils literal notranslate"><span class="pre">wav_stream_header</span></code></a>(sample_rate[, ...])</p></td>
 <td><p>A 44-byte WAV header with streaming (unknown-length) size fields.</p></td>
 </tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.write_wav" title="mstar.api_server.media_io.write_wav"><code class="xref py py-obj docutils literal notranslate"><span class="pre">write_wav</span></code></a>(audio, path[, sample_rate])</p></td>
+<td><p>Float waveform -&gt; 16-bit PCM WAV file at <code class="docutils literal notranslate"><span class="pre">path</span></code>.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.decode_audio">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">decode_audio</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16000</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#decode_audio"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.decode_audio" title="Link to this definition">#</a></dt>
+<dd><p>Decode an audio file to a float32 mono numpy waveform at <code class="docutils literal notranslate"><span class="pre">sample_rate</span></code>.</p>
+<p>libsndfile (<code class="docutils literal notranslate"><span class="pre">soundfile</span></code>) first — no FFmpeg needed for wav/flac/ogg/mp3 —
+then torchcodec for the rest (m4a, webm, …).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>sample_rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.media_io.modality_from_mime">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">modality_from_mime</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mime</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#modality_from_mime"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.modality_from_mime" title="Link to this definition">#</a></dt>
@@ -837,6 +867,30 @@ publicly should allowlist hosts or disable remote fetch (data-URL only).</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.split_windows">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">split_windows</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">audio</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">window_seconds</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16000</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">search_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">frame_seconds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.02</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#split_windows"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.split_windows" title="Link to this definition">#</a></dt>
+<dd><p>Cut a waveform into consecutive windows of at most <code class="docutils literal notranslate"><span class="pre">window_seconds</span></code>;
+concatenating them gives the input back sample for sample.</p>
+<p>With <code class="docutils literal notranslate"><span class="pre">search_seconds</span></code> a cut is moved back from its nominal boundary to
+the end of the quietest <code class="docutils literal notranslate"><span class="pre">frame_seconds</span></code> frame within that span (the
+last such frame on a tie, so silence cuts at the boundary): the cut lands
+in a pause rather than on a word when there is one to find.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>window_seconds</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>sample_rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>search_seconds</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+<li><p><strong>frame_seconds</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.media_io.wav_stream_header">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">wav_stream_header</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_channels</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bits</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#wav_stream_header"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.wav_stream_header" title="Link to this definition">#</a></dt>
 <dd><p>A 44-byte WAV header with streaming (unknown-length) size fields.</p>
@@ -854,6 +908,23 @@ open-ended stream, which players and the OpenAI client’s
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.write_wav">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">write_wav</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">audio</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">16000</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#write_wav"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.write_wav" title="Link to this definition">#</a></dt>
+<dd><p>Float waveform -&gt; 16-bit PCM WAV file at <code class="docutils literal notranslate"><span class="pre">path</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>sample_rate</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -907,6 +978,7 @@ open-ended stream, which players and the OpenAI client’s
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.decode_audio"><code class="docutils literal notranslate"><span class="pre">decode_audio()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.modality_from_mime"><code class="docutils literal notranslate"><span class="pre">modality_from_mime()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.mux_mp4_with_pcm16"><code class="docutils literal notranslate"><span class="pre">mux_mp4_with_pcm16()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.pcm16_to_container"><code class="docutils literal notranslate"><span class="pre">pcm16_to_container()</span></code></a></li>
@@ -916,7 +988,9 @@ open-ended stream, which players and the OpenAI client’s
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_base64"><code class="docutils literal notranslate"><span class="pre">save_base64()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_data_url"><code class="docutils literal notranslate"><span class="pre">save_data_url()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.save_remote_url"><code class="docutils literal notranslate"><span class="pre">save_remote_url()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.split_windows"><code class="docutils literal notranslate"><span class="pre">split_windows()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.wav_stream_header"><code class="docutils literal notranslate"><span class="pre">wav_stream_header()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.write_wav"><code class="docutils literal notranslate"><span class="pre">write_wav()</span></code></a></li>
 </ul>
   </nav></div>
 

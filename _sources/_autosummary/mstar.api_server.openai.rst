@@ -32,7 +32,9 @@ mstar.api\_server.openai
    router
    serving_chat
    serving_images
+   serving_realtime
    serving_speech
+   serving_transcriptions
    serving_videos
    speech_chunking
 

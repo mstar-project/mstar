@@ -215,7 +215,9 @@
 <li class="toctree-l4 current active"><a class="current reference internal" href="#">mstar.api_server.openai.router</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_transcriptions.html">mstar.api_server.openai.serving_transcriptions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
@@ -595,11 +597,13 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.audio_speech"><code class="docutils literal notranslate"><span class="pre">audio_speech()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.audio_transcriptions"><code class="docutils literal notranslate"><span class="pre">audio_transcriptions()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.audio_voices"><code class="docutils literal notranslate"><span class="pre">audio_voices()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.chat_completions"><code class="docutils literal notranslate"><span class="pre">chat_completions()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.images_edits"><code class="docutils literal notranslate"><span class="pre">images_edits()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.images_generations"><code class="docutils literal notranslate"><span class="pre">images_generations()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.list_models"><code class="docutils literal notranslate"><span class="pre">list_models()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.realtime"><code class="docutils literal notranslate"><span class="pre">realtime()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.videos_generations"><code class="docutils literal notranslate"><span class="pre">videos_generations()</span></code></a></li>
 </ul>
             </nav>
@@ -624,20 +628,26 @@ the surface is supported, and delegates to a serving handler. The native
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.audio_speech" title="mstar.api_server.openai.router.audio_speech"><code class="xref py py-obj docutils literal notranslate"><span class="pre">audio_speech</span></code></a>(request, raw_request)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.audio_voices" title="mstar.api_server.openai.router.audio_voices"><code class="xref py py-obj docutils literal notranslate"><span class="pre">audio_voices</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.audio_transcriptions" title="mstar.api_server.openai.router.audio_transcriptions"><code class="xref py py-obj docutils literal notranslate"><span class="pre">audio_transcriptions</span></code></a>(request)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.chat_completions" title="mstar.api_server.openai.router.chat_completions"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chat_completions</span></code></a>(request, raw_request)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.audio_voices" title="mstar.api_server.openai.router.audio_voices"><code class="xref py py-obj docutils literal notranslate"><span class="pre">audio_voices</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.images_edits" title="mstar.api_server.openai.router.images_edits"><code class="xref py py-obj docutils literal notranslate"><span class="pre">images_edits</span></code></a>(request)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.chat_completions" title="mstar.api_server.openai.router.chat_completions"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chat_completions</span></code></a>(request, raw_request)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.images_generations" title="mstar.api_server.openai.router.images_generations"><code class="xref py py-obj docutils literal notranslate"><span class="pre">images_generations</span></code></a>(request, raw_request)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.images_edits" title="mstar.api_server.openai.router.images_edits"><code class="xref py py-obj docutils literal notranslate"><span class="pre">images_edits</span></code></a>(request)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.list_models" title="mstar.api_server.openai.router.list_models"><code class="xref py py-obj docutils literal notranslate"><span class="pre">list_models</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.images_generations" title="mstar.api_server.openai.router.images_generations"><code class="xref py py-obj docutils literal notranslate"><span class="pre">images_generations</span></code></a>(request, raw_request)</p></td>
 <td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.list_models" title="mstar.api_server.openai.router.list_models"><code class="xref py py-obj docutils literal notranslate"><span class="pre">list_models</span></code></a>()</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.realtime" title="mstar.api_server.openai.router.realtime"><code class="xref py py-obj docutils literal notranslate"><span class="pre">realtime</span></code></a>(websocket)</p></td>
+<td><p>OpenAI Realtime API, transcription intent (<code class="docutils literal notranslate"><span class="pre">?intent=transcription</span></code>): streaming speech-to-text with partial results.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.router.videos_generations" title="mstar.api_server.openai.router.videos_generations"><code class="xref py py-obj docutils literal notranslate"><span class="pre">videos_generations</span></code></a>(request, raw_request)</p></td>
 <td><p></p></td>
@@ -654,6 +664,16 @@ the surface is supported, and delegates to a serving handler. The native
 <li><p><strong>request</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest" title="mstar.api_server.openai.protocol.SpeechRequest"><em>SpeechRequest</em></a>)</p></li>
 <li><p><strong>raw_request</strong> (<em>Request</em>)</p></li>
 </ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.router.audio_transcriptions">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.router.</span></span><span class="sig-name descname"><span class="pre">audio_transcriptions</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/router.html#audio_transcriptions"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.router.audio_transcriptions" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>request</strong> (<em>Request</em>)</p>
 </dd>
 </dl>
 </dd></dl>
@@ -703,6 +723,18 @@ the surface is supported, and delegates to a serving handler. The native
 <dt class="sig sig-object py" id="mstar.api_server.openai.router.list_models">
 <span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.router.</span></span><span class="sig-name descname"><span class="pre">list_models</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/router.html#list_models"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.router.list_models" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.openai.router.realtime">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.router.</span></span><span class="sig-name descname"><span class="pre">realtime</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">websocket</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/router.html#realtime"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.router.realtime" title="Link to this definition">#</a></dt>
+<dd><p>OpenAI Realtime API, transcription intent (<code class="docutils literal notranslate"><span class="pre">?intent=transcription</span></code>):
+streaming speech-to-text with partial results. See <code class="docutils literal notranslate"><span class="pre">serving_realtime</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>websocket</strong> (<em>WebSocket</em>)</p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.openai.router.videos_generations">
@@ -767,11 +799,13 @@ the surface is supported, and delegates to a serving handler. The native
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.audio_speech"><code class="docutils literal notranslate"><span class="pre">audio_speech()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.audio_transcriptions"><code class="docutils literal notranslate"><span class="pre">audio_transcriptions()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.audio_voices"><code class="docutils literal notranslate"><span class="pre">audio_voices()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.chat_completions"><code class="docutils literal notranslate"><span class="pre">chat_completions()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.images_edits"><code class="docutils literal notranslate"><span class="pre">images_edits()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.images_generations"><code class="docutils literal notranslate"><span class="pre">images_generations()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.list_models"><code class="docutils literal notranslate"><span class="pre">list_models()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.realtime"><code class="docutils literal notranslate"><span class="pre">realtime()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.router.videos_generations"><code class="docutils literal notranslate"><span class="pre">videos_generations()</span></code></a></li>
 </ul>
   </nav></div>

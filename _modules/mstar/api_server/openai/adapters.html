@@ -568,7 +568,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.router.html">mstar.api_server.openai.router</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_transcriptions.html">mstar.api_server.openai.serving_transcriptions</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
 </ul>
@@ -911,6 +913,8 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span>
@@ -923,6 +927,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">ChatCompletionRequest</span><span class="p">,</span>
         <span class="n">ImageGenerationRequest</span><span class="p">,</span>
         <span class="n">SpeechRequest</span><span class="p">,</span>
+        <span class="n">TranscriptionRequest</span><span class="p">,</span>
         <span class="n">VideoGenerationRequest</span><span class="p">,</span>
     <span class="p">)</span>
 
@@ -939,6 +944,28 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Ordered text/attachment sequence. None from entrypoints with no ordering</span>
     <span class="c1"># to preserve, which keep the legacy attachments-then-text layout.</span>
     <span class="n">prompt_parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">PromptPart</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+
+
+
+<div class="viewcode-block" id="Transcript">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.Transcript">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Transcript</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A finished transcription as the serving layer reports it.</span>
+
+<span class="sd">    ``text`` is the clean transcript. ``language`` is an ISO-639-1 code when the</span>
+<span class="sd">    model reported one (detected or forced). ``segments`` / ``words`` carry</span>
+<span class="sd">    ``{"start", "end", "text"}`` / ``{"start", "end", "word"}`` in seconds when</span>
+<span class="sd">    the model emitted timestamps; empty otherwise. ``unfinished`` says the</span>
+<span class="sd">    output stopped inside a segment (a start timestamp with no end): the text</span>
+<span class="sd">    after the last closed segment is provisional, and a long-form driver</span>
+<span class="sd">    re-decodes that audio from the last segment end.</span>
+<span class="sd">    """</span>
+    <span class="n">text</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">language</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">segments</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">words</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">unfinished</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span></div>
 
 
 
@@ -1079,6 +1106,27 @@ window.runMermaid = runMermaid;</script>
     <span class="n">supports_images</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># POST /v1/images/generations and /v1/images/edits</span>
     <span class="n">supports_videos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>   <span class="c1"># POST /v1/videos/generations</span>
     <span class="n">supports_realtime</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>  <span class="c1"># /v1/realtime (bidirectional speech WebSocket)</span>
+    <span class="n">supports_transcriptions</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>  <span class="c1"># POST /v1/audio/transcriptions</span>
+    <span class="c1"># Longest clip the model transcribes in one request. Longer uploads are cut</span>
+    <span class="c1"># into windows of this length by the transcription route (None means unlimited).</span>
+    <span class="n">max_audio_seconds</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># How the windows of a long upload run: "sequential" feeds each window the</span>
+    <span class="c1"># previous transcript as ``initial_prompt`` (openai-whisper's carry-over),</span>
+    <span class="c1"># "parallel" submits them all at once. A request can override with</span>
+    <span class="c1"># ``long_form`` in extra_body.</span>
+    <span class="n">long_form</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"sequential"</span>
+    <span class="c1"># Sequential long form: decode every window with timestamps and start the</span>
+    <span class="c1"># next one where the last closed segment ended, instead of at a fixed</span>
+    <span class="c1"># boundary (openai-whisper's seek). Needs ``parse_transcript`` to report</span>
+    <span class="c1"># segments and ``unfinished``.</span>
+    <span class="n">seeks_by_timestamps</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Sequential long form: a window whose text compresses better than this</span>
+    <span class="c1"># (gzip bytes ratio) is a repetition loop and is decoded again at rising</span>
+    <span class="c1"># temperatures (openai-whisper's fallback). None disables the check.</span>
+    <span class="n">compression_ratio_threshold</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="mf">2.4</span>
+    <span class="c1"># Streaming transcription over /v1/realtime: the model must be able to</span>
+    <span class="c1"># continue a hypothesis it is handed (see ``realtime_step_request``).</span>
+    <span class="n">supports_realtime_transcription</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
     <span class="c1"># ``/v1/audio/speech`` sentence chunking (``serving_speech``): inputs of at</span>
     <span class="c1"># least ``speech_chunk_min_chars`` characters are split into sentence</span>
@@ -1122,6 +1170,41 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.image_edit_to_request">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">image_edit_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">image_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">extra_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
         <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">"image editing is not supported by this model"</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="OpenAIAdapter.transcription_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.transcription_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">transcription_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">TranscriptionRequest</span><span class="p">,</span> <span class="n">audio_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">"audio/transcriptions is not supported by this model"</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="OpenAIAdapter.parse_transcript">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.parse_transcript">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">parse_transcript</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">TranscriptionRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Transcript</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
+<span class="w">        </span><span class="sd">"""Structured view of a model's raw text stream. The default is plain</span>
+<span class="sd">        text; a model whose stream carries control tokens (Whisper's language</span>
+<span class="sd">        and timestamp tokens, an LLM decoder's tags) parses them here."""</span>
+        <span class="k">return</span> <span class="n">Transcript</span><span class="p">(</span><span class="n">text</span><span class="o">=</span><span class="n">text</span><span class="o">.</span><span class="n">strip</span><span class="p">())</span></div>
+
+
+<div class="viewcode-block" id="OpenAIAdapter.stream_text">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.stream_text">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">stream_text</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">raw</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The client-facing text of the raw stream so far. It must only</span>
+<span class="sd">        grow as ``raw`` does, so a model with control tokens strips them and</span>
+<span class="sd">        holds back a tail that may still turn out to be one. The default</span>
+<span class="sd">        passes the text through."""</span>
+        <span class="k">return</span> <span class="n">raw</span></div>
+
+
+<div class="viewcode-block" id="OpenAIAdapter.realtime_step_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.OpenAIAdapter.realtime_step_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">realtime_step_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">TranscriptionRequest</span><span class="p">,</span> <span class="n">audio_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">prefix</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
+<span class="w">        </span><span class="sd">"""One streaming step: transcribe ``audio_path`` (everything heard so</span>
+<span class="sd">        far) continuing from ``prefix``, the stable part of the previous raw</span>
+<span class="sd">        hypothesis. Models that cannot continue a hypothesis leave this</span>
+<span class="sd">        unimplemented and stay off ``/v1/realtime``."""</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">"realtime transcription is not supported by this model"</span><span class="p">)</span></div>
 </div>
 
 
@@ -1550,6 +1633,189 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="c1"># Whisper-style control tokens: ``&lt;|en|&gt;`` (language), ``&lt;|12.34|&gt;`` (timestamp),</span>
+<span class="c1"># and the task/format markers. ASR models render the ones that carry</span>
+<span class="c1"># information (language, timestamps) into their text stream so the adapter can</span>
+<span class="c1"># lift them out here. Everything else is dropped.</span>
+<span class="n">_CONTROL_TOKEN</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">"&lt;\|([^|&lt;&gt;]*)\|&gt;"</span><span class="p">)</span>
+<span class="c1"># a control token cut off by the end of the stream so far</span>
+<span class="n">_PARTIAL_CONTROL_TOKEN</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">"&lt;(\|[^|&lt;&gt;]*\|?)?$"</span><span class="p">)</span>
+<span class="n">_TIMESTAMP</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">"^\d+\.\d</span><span class="si">{2}</span><span class="s2">$"</span><span class="p">)</span>
+<span class="n">_LANGUAGE</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">"^[a-z]{2,3}$"</span><span class="p">)</span>
+<span class="c1"># Whisper's word timings follow the transcript after this marker, one</span>
+<span class="c1"># ``&lt;|start|&gt; word &lt;|end|&gt;`` per word in the same timestamp vocabulary</span>
+<span class="n">_WORDS_MARKER</span> <span class="o">=</span> <span class="s2">"&lt;|startoflm|&gt;"</span>
+
+
+<span class="c1"># sampling knobs the engine reads as numbers; a string there fails every</span>
+<span class="c1"># request batched with it, so they are checked before submission</span>
+<span class="n">_NUMERIC_KWARGS</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">"temperature"</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="s2">"top_p"</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="s2">"min_p"</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span> <span class="s2">"repetition_penalty"</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
+    <span class="s2">"top_k"</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="s2">"max_output_tokens"</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="s2">"seed"</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+<span class="p">}</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_check_numeric_kwargs</span><span class="p">(</span><span class="n">mk</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Coerce the known numeric ``model_kwargs`` to numbers, or raise ValueError."""</span>
+    <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">kind</span> <span class="ow">in</span> <span class="n">_NUMERIC_KWARGS</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">value</span> <span class="o">=</span> <span class="n">mk</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="p">(</span><span class="n">kind</span> <span class="ow">is</span> <span class="nb">int</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)):</span>
+            <span class="k">continue</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">number</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+        <span class="k">except</span> <span class="p">(</span><span class="ne">TypeError</span><span class="p">,</span> <span class="ne">ValueError</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> must be a number; got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">math</span><span class="o">.</span><span class="n">isfinite</span><span class="p">(</span><span class="n">number</span><span class="p">)</span> <span class="ow">or</span> <span class="p">(</span><span class="n">kind</span> <span class="ow">is</span> <span class="nb">int</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">number</span><span class="o">.</span><span class="n">is_integer</span><span class="p">()):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> must be a finite </span><span class="si">{</span><span class="n">kind</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">; got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span>
+        <span class="n">mk</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">kind</span><span class="p">(</span><span class="n">number</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">mk</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_transcription_kwargs</span><span class="p">(</span><span class="n">req</span><span class="p">:</span> <span class="n">TranscriptionRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Map the OpenAI transcription fields shared by every ASR model onto</span>
+<span class="sd">    ``model_kwargs``. ``language`` / ``temperature`` / ``seed`` pass through</span>
+<span class="sd">    under their own names; ``prompt`` becomes ``initial_prompt`` (the</span>
+<span class="sd">    conditioning text, named as faster-whisper does — ``prompt`` itself is</span>
+<span class="sd">    the request's text argument); a timestamped ``response_format`` or an</span>
+<span class="sd">    explicit granularity asks the model for timestamps."""</span>
+    <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">req</span><span class="o">.</span><span class="n">language</span><span class="p">:</span>
+        <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"language"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">language</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">:</span>
+        <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"initial_prompt"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">req</span><span class="o">.</span><span class="n">temperature</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"temperature"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">temperature</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
+    <span class="n">granularities</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">timestamp_granularities</span> <span class="ow">or</span> <span class="p">())</span>
+    <span class="k">if</span> <span class="s2">"word"</span> <span class="ow">in</span> <span class="n">granularities</span><span class="p">:</span>
+        <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"timestamps"</span><span class="p">,</span> <span class="s2">"word"</span><span class="p">)</span>
+    <span class="k">elif</span> <span class="n">granularities</span> <span class="ow">or</span> <span class="n">req</span><span class="o">.</span><span class="n">response_format</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"verbose_json"</span><span class="p">,</span> <span class="s2">"srt"</span><span class="p">,</span> <span class="s2">"vtt"</span><span class="p">):</span>
+        <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"timestamps"</span><span class="p">,</span> <span class="s2">"segment"</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">_check_numeric_kwargs</span><span class="p">(</span><span class="n">mk</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="WhisperAdapter">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.WhisperAdapter">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">WhisperAdapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Whisper (large-v3, large-v3-turbo): speech-to-text.</span>
+
+<span class="sd">    The transcript stream is Whisper's own token stream rendered as text:</span>
+<span class="sd">    a leading ``&lt;|xx|&gt;`` language token when the language was detected or</span>
+<span class="sd">    forced, and ``&lt;|s.ss|&gt;`` timestamp tokens around each segment when</span>
+<span class="sd">    timestamps were requested. ``parse_transcript`` lifts those into</span>
+<span class="sd">    :class:`Transcript`; ``stream_text`` hides them from streaming clients.</span>
+<span class="sd">    """</span>
+
+    <span class="n">supports_transcriptions</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># Whisper hears one 30 s window. The route cuts longer uploads into them,</span>
+    <span class="c1"># each starting where the previous window's last segment closed.</span>
+    <span class="n">max_audio_seconds</span> <span class="o">=</span> <span class="mf">30.0</span>
+    <span class="n">seeks_by_timestamps</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="WhisperAdapter.transcription_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.WhisperAdapter.transcription_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">transcription_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">TranscriptionRequest</span><span class="p">,</span> <span class="n">audio_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+            <span class="c1"># Whisper is conditioned by its forced token prompt, not free text, so</span>
+            <span class="c1"># ``prompt`` reaches the model as the ``initial_prompt`` kwarg</span>
+            <span class="c1"># (``&lt;|startofprev|&gt;`` context).</span>
+            <span class="n">text</span><span class="o">=</span><span class="s2">""</span><span class="p">,</span>
+            <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">"audio"</span><span class="p">:</span> <span class="p">[</span><span class="n">audio_path</span><span class="p">]},</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"audio"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">_transcription_kwargs</span><span class="p">(</span><span class="n">req</span><span class="p">),</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="WhisperAdapter.stream_text">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.WhisperAdapter.stream_text">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">stream_text</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">raw</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+        <span class="n">raw</span> <span class="o">=</span> <span class="n">raw</span><span class="o">.</span><span class="n">partition</span><span class="p">(</span><span class="n">_WORDS_MARKER</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>  <span class="c1"># word timings follow the transcript</span>
+        <span class="k">return</span> <span class="n">_CONTROL_TOKEN</span><span class="o">.</span><span class="n">sub</span><span class="p">(</span><span class="s2">""</span><span class="p">,</span> <span class="n">_PARTIAL_CONTROL_TOKEN</span><span class="o">.</span><span class="n">sub</span><span class="p">(</span><span class="s2">""</span><span class="p">,</span> <span class="n">raw</span><span class="p">))</span></div>
+
+
+<div class="viewcode-block" id="WhisperAdapter.parse_transcript">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.WhisperAdapter.parse_transcript">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">parse_transcript</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">TranscriptionRequest</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Transcript</span><span class="p">:</span>
+        <span class="n">text</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">timed_words</span> <span class="o">=</span> <span class="n">text</span><span class="o">.</span><span class="n">partition</span><span class="p">(</span><span class="n">_WORDS_MARKER</span><span class="p">)</span>
+        <span class="n">language</span><span class="p">,</span> <span class="n">segments</span><span class="p">,</span> <span class="n">parts</span><span class="p">,</span> <span class="n">unfinished</span> <span class="o">=</span> <span class="n">_parse_timestamped</span><span class="p">(</span><span class="n">text</span><span class="p">)</span>
+        <span class="n">clean</span> <span class="o">=</span> <span class="s2">" "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">parts</span> <span class="k">if</span> <span class="n">p</span><span class="o">.</span><span class="n">strip</span><span class="p">())</span>
+        <span class="k">for</span> <span class="n">idx</span><span class="p">,</span> <span class="n">seg</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">segments</span><span class="p">):</span>
+            <span class="n">seg</span><span class="p">[</span><span class="s2">"id"</span><span class="p">]</span> <span class="o">=</span> <span class="n">idx</span>
+        <span class="n">words</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="p">{</span><span class="s2">"word"</span><span class="p">:</span> <span class="n">seg</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span> <span class="s2">"start"</span><span class="p">:</span> <span class="n">seg</span><span class="p">[</span><span class="s2">"start"</span><span class="p">],</span> <span class="s2">"end"</span><span class="p">:</span> <span class="n">seg</span><span class="p">[</span><span class="s2">"end"</span><span class="p">]}</span>
+            <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">_parse_timestamped</span><span class="p">(</span><span class="n">timed_words</span><span class="p">)[</span><span class="mi">1</span><span class="p">]</span>
+        <span class="p">]</span> <span class="k">if</span> <span class="n">timed_words</span> <span class="k">else</span> <span class="p">[]</span>
+        <span class="k">return</span> <span class="n">Transcript</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">clean</span><span class="p">,</span> <span class="n">language</span><span class="o">=</span><span class="n">language</span> <span class="ow">or</span> <span class="n">req</span><span class="o">.</span><span class="n">language</span><span class="p">,</span> <span class="n">segments</span><span class="o">=</span><span class="n">segments</span><span class="p">,</span> <span class="n">words</span><span class="o">=</span><span class="n">words</span><span class="p">,</span>
+            <span class="n">unfinished</span><span class="o">=</span><span class="n">unfinished</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_parse_timestamped</span><span class="p">(</span><span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">bool</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""Walk Whisper's rendered stream: ``(language, closed segments, text</span>
+<span class="sd">    pieces in order, whether a segment was left open)``. A segment is the</span>
+<span class="sd">    text between a start and an end timestamp; text outside timestamps is</span>
+<span class="sd">    kept as is."""</span>
+    <span class="n">language</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">segments</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">dict</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">start</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">buffer</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">cursor</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="k">for</span> <span class="n">match</span> <span class="ow">in</span> <span class="n">_CONTROL_TOKEN</span><span class="o">.</span><span class="n">finditer</span><span class="p">(</span><span class="n">text</span><span class="p">):</span>
+        <span class="n">span</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="n">cursor</span><span class="p">:</span><span class="n">match</span><span class="o">.</span><span class="n">start</span><span class="p">()]</span>
+        <span class="n">cursor</span> <span class="o">=</span> <span class="n">match</span><span class="o">.</span><span class="n">end</span><span class="p">()</span>
+        <span class="p">(</span><span class="n">buffer</span> <span class="k">if</span> <span class="n">start</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">parts</span><span class="p">)</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">span</span><span class="p">)</span>
+        <span class="n">token</span> <span class="o">=</span> <span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">_TIMESTAMP</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="n">token</span><span class="p">):</span>
+            <span class="n">stamp</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">token</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">start</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">start</span> <span class="o">=</span> <span class="n">stamp</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="n">segment_text</span> <span class="o">=</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">buffer</span><span class="p">)</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+                <span class="k">if</span> <span class="n">segment_text</span><span class="p">:</span>
+                    <span class="n">segments</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">"start"</span><span class="p">:</span> <span class="n">start</span><span class="p">,</span> <span class="s2">"end"</span><span class="p">:</span> <span class="n">stamp</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">:</span> <span class="n">segment_text</span><span class="p">})</span>
+                    <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">segment_text</span><span class="p">)</span>
+                <span class="n">buffer</span> <span class="o">=</span> <span class="p">[]</span>
+                <span class="n">start</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="k">elif</span> <span class="n">language</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">_LANGUAGE</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="n">token</span><span class="p">):</span>
+            <span class="n">language</span> <span class="o">=</span> <span class="n">token</span>
+    <span class="n">tail</span> <span class="o">=</span> <span class="n">text</span><span class="p">[</span><span class="n">cursor</span><span class="p">:]</span>
+    <span class="p">(</span><span class="n">buffer</span> <span class="k">if</span> <span class="n">start</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">parts</span><span class="p">)</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">tail</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">start</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">buffer</span><span class="p">)</span><span class="o">.</span><span class="n">strip</span><span class="p">():</span>
+        <span class="c1"># an open segment at the end of the stream: keep its text, no end</span>
+        <span class="n">parts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">buffer</span><span class="p">)</span><span class="o">.</span><span class="n">strip</span><span class="p">())</span>
+    <span class="k">return</span> <span class="n">language</span><span class="p">,</span> <span class="n">segments</span><span class="p">,</span> <span class="n">parts</span><span class="p">,</span> <span class="n">start</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
+
+<div class="viewcode-block" id="HiggsAudioAdapter">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.HiggsAudioAdapter">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">HiggsAudioAdapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Higgs-Audio v3 STT: an instruction-following LLM decoder, so the OpenAI</span>
+<span class="sd">    ``prompt`` is the transcription instruction (the model has a default)."""</span>
+
+    <span class="n">supports_transcriptions</span> <span class="o">=</span> <span class="kc">True</span>
+
+<div class="viewcode-block" id="HiggsAudioAdapter.transcription_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.HiggsAudioAdapter.transcription_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">transcription_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">TranscriptionRequest</span><span class="p">,</span> <span class="n">audio_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
+        <span class="n">mk</span> <span class="o">=</span> <span class="n">_transcription_kwargs</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+        <span class="n">mk</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"initial_prompt"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span> <span class="ow">or</span> <span class="s2">""</span><span class="p">,</span>
+            <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">"audio"</span><span class="p">:</span> <span class="p">[</span><span class="n">audio_path</span><span class="p">]},</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"audio"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
+
+
+
 <span class="c1"># Only models with an OpenAI-standard surface are registered. Action/world-model</span>
 <span class="c1"># models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.</span>
 <span class="n">ADAPTER_REGISTRY</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">OpenAIAdapter</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
@@ -1566,6 +1832,8 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"cosmos3_super_i2v_4step"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
     <span class="s2">"cosmos3_super_t2i_4step"</span><span class="p">:</span> <span class="n">Cosmos3Adapter</span><span class="p">(),</span>
     <span class="s2">"wan22"</span><span class="p">:</span> <span class="n">Wan22Adapter</span><span class="p">(),</span>
+    <span class="s2">"whisper_large"</span><span class="p">:</span> <span class="n">WhisperAdapter</span><span class="p">(),</span>
+    <span class="s2">"higgs_audio"</span><span class="p">:</span> <span class="n">HiggsAudioAdapter</span><span class="p">(),</span>
 <span class="p">}</span>
 
 

@@ -13,6 +13,7 @@ mstar.api\_server.media\_io
 
    .. autosummary::
    
+      decode_audio
       modality_from_mime
       mux_mp4_with_pcm16
       pcm16_to_container
@@ -22,7 +23,9 @@ mstar.api\_server.media\_io
       save_base64
       save_data_url
       save_remote_url
+      split_windows
       wav_stream_header
+      write_wav
    
    
 
