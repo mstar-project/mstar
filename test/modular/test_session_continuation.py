@@ -20,13 +20,12 @@ import torch
 
 from mstar.engine.engine import Engine
 from mstar.engine.resources import (
-    KVConfig,
     PositionConfig,
     StepContext,
     StepRunner,
 )
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVStep
+from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.position.manager import RopeManager
@@ -46,11 +45,20 @@ PAGE_SIZE = 16
 
 
 class _StubTransfer:
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    """No engine, no bytes moved."""
 
-    def get_kv_transfer_info(self):
-        return None
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
+
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del kwargs
+        return transfer_info == self.get_kv_transfer_info()
+
+    def remove_request(self, request_id):
+        del request_id
 
     def start_async_retrieve(self, **kwargs):
         del kwargs
@@ -71,7 +79,7 @@ class _Node:
     def __init__(self, max_state: int | None = None, policy=None):
         device = torch.device("cpu")
         self.kv = KVManager(
-            cfg=KVConfig(
+            cfg=PagedKVConfig(
                 num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
                 max_num_pages=64, page_size=PAGE_SIZE,
             ),

@@ -130,10 +130,13 @@ def test_a_request_whose_session_is_free_is_never_held():
 
 
 def test_the_second_new_request_for_one_rid_is_not_held_by_the_first():
+    # the worker hands over the handle it already minted for this rid
     manager, _ = _manager(leaving={"r0"})
     manager.bind("r0", "s")
 
-    assert manager.hold_if_not_ready(_new_request("r0", "s")) is False
+    assert manager.hold_if_not_ready(_new_request("r0", "s"), "r0") is False
+    # without it the rid would read as one of its own session's stragglers
+    assert manager.hold_if_not_ready(_new_request("r0", "s")) is True
 
 
 def test_a_held_request_that_is_still_not_ready_holds_itself_again():

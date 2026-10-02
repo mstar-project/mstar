@@ -271,9 +271,12 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     w.request_state = SimpleNamespace(
         per_request_info={}, add_request=_state_add,
     )
+    w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
     w.engine_manager = SimpleNamespace(
         evictable_nodes=lambda: ["n"],
-        add_request=lambda rid, cfgs: seen.setdefault("engine", rid),
+        add_request=lambda rid, cfgs, session_id=None: seen.setdefault(
+            "engine", rid,
+        ),
     )
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, cfg: seen.setdefault("tensors", rid),
@@ -284,6 +287,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={},
+        session_id=None,
     ))
 
     handle = w._graph_runtime.get_rid_handle("X")

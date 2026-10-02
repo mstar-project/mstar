@@ -42,29 +42,49 @@ def _worker(known_rids=("X",), sessions=None, in_flight=(), is_follower=False):
     w._draining_rids = set()
     w._reads_done_sent = set()
     w._pending_removes = set()
+    w._last_active = {}
+    w._unprocessed_messages = {}
+    w._my_consumer_connections = []
+    w.streaming_buffers = {}
+    w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    w.scheduler = SimpleNamespace(
+        clear_rid=lambda rid, wire_rid=None: None,
+        clear_wire_rid=lambda wire_rid: None,
+        fail_rids=lambda rids: None,
+        pending_tp_follow_count={},
+    )
+    # Identity interning, as main's worker tests do: the rid string is its own
+    # handle, so the string/handle split is exercised without a real runtime.
+    interned = set(known_rids)
+    w.request_state = SimpleNamespace(
+        per_request_info={
+            rid: SimpleNamespace(sharding_config=None, stream_buffers={})
+            for rid in known_rids
+        },
+        remove_request=lambda rid: w.request_state.per_request_info.pop(rid, None),
+        add_request=lambda rid, info: w.request_state.per_request_info.setdefault(
+            rid, SimpleNamespace(sharding_config=None, stream_buffers={}),
+        ),
+    )
+
+    def _add(request_id, **kwargs):
+        interned.add(request_id)
+        return request_id
+
+    w._graph_runtime = SimpleNamespace(
+        add_request=_add,
+        get_rid_handle=lambda r: r if r in interned else None,
+        get_rid_string=lambda h: h,
+        remove_request=lambda h: None,
+        get_sharding_config=lambda h: SimpleNamespace(groups=[]),
+        ingest_inputs_batch=lambda edges, can_buffer=False: None,
+    )
     # the real bookkeeping, asking this worker what is still leaving
     w._sessions = WorkerSessionManager(is_leaving=w._rid_is_leaving)
     for session_id, rids in (sessions or {}).items():
         for rid in rids:
+            interned.add(rid)
             w._sessions.bind(rid, session_id)
-    w._last_active = {}
-    w._unprocessed_messages = {}
-    w.streaming_buffers = {}
-    w.scheduler = SimpleNamespace(
-        clear_rid=lambda rid: None,
-        fail_rids=lambda rids: None,
-        pending_tp_follow_count={},
-    )
-    w.worker_graphs_manager = SimpleNamespace(
-        per_request_info={
-            rid: SimpleNamespace(sharding_config=SimpleNamespace(groups=[]))
-            for rid in known_rids
-        },
-        remove_request=lambda rid: w.worker_graphs_manager.per_request_info.pop(
-            rid, None
-        ),
-        add_request=lambda **kwargs: None,
-    )
     w.engine_manager = SimpleNamespace(
         remove_request=lambda rid, end_session=False: w.removed.append(
             (rid, end_session)
@@ -152,11 +172,9 @@ def test_a_deferred_removal_keeps_its_end_session_flag():
 
 def test_the_tp_leader_forwards_end_session_to_its_followers():
     w = _worker(sessions={"s": {"X"}})
-    w.worker_graphs_manager.per_request_info["X"] = SimpleNamespace(
-        sharding_config=SimpleNamespace(groups=[
-            SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["w0", "w1"]),
-        ])
-    )
+    w._graph_runtime.get_sharding_config = lambda h: SimpleNamespace(groups=[
+        SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["w0", "w1"]),
+    ])
 
     Worker._remove_request(w, RemoveRequest(request_id="X", end_session=True))
 
@@ -227,22 +245,16 @@ def _new_request(rid="Y", session_id=None):
         partition_worker_graph_ids=[],
         worker_graph_to_workers={},
         initial_inputs=[],
-        request_info=SimpleNamespace(resource_configs={}, graph_walk="prefill"),
+        request_info=SimpleNamespace(
+            resource_configs={}, graph_walk="prefill", partition_name="default",
+            rid_handle=-1,
+        ),
         session_id=session_id,
-    )
-
-
-def _prepare_for_ingest(w):
-    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
-    w._my_consumer_connections = []
-    w.worker_graphs_manager.per_request_info["Y"] = SimpleNamespace(
-        sharding_config=SimpleNamespace(groups=[]), stream_buffers={},
     )
 
 
 def test_ingest_binds_the_request_to_its_session():
     w = _worker(known_rids=())
-    _prepare_for_ingest(w)
 
     Worker._add_new_request(w, _new_request(session_id="s"))
 
@@ -252,7 +264,6 @@ def test_ingest_binds_the_request_to_its_session():
 
 def test_ingest_fails_a_request_whose_session_overflowed_under_the_error_policy():
     w = _worker(known_rids=())
-    _prepare_for_ingest(w)
     w.session_errors["s"] = "session s exceeded its state budget"
     failed = {}
     w._fail_requests = failed.update
@@ -267,7 +278,6 @@ def test_a_resumed_ingest_waits_for_the_previous_request_to_hand_state_over():
     # which can outrun the previous request's REMOVE_REQUEST; ingesting then
     # would adopt an empty stream instead of the session's context
     w = _worker(known_rids=("X",), sessions={"s": {"X"}})
-    _prepare_for_ingest(w)
 
     Worker._add_new_request(w, _new_request(session_id="s"))
 
@@ -289,7 +299,6 @@ def test_the_second_new_request_for_one_rid_is_not_held_by_the_first():
     # the conductor sends a NEW_REQUEST per partition, so a worker serving two
     # of them ingests the same rid twice
     w = _worker(known_rids=())
-    _prepare_for_ingest(w)
 
     Worker._add_new_request(w, _new_request(session_id="s"))
     Worker._add_new_request(w, _new_request(session_id="s"))
@@ -300,7 +309,6 @@ def test_the_second_new_request_for_one_rid_is_not_held_by_the_first():
 
 def test_ingest_without_a_session_touches_no_session_state():
     w = _worker(known_rids=())
-    _prepare_for_ingest(w)
 
     Worker._add_new_request(w, _new_request())
 
