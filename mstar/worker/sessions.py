@@ -88,8 +88,9 @@ class WorkerSessionManager:
         True when the request was held; the worker must then leave it alone
         until ``take_held_ingests`` gives it back.
         """
-        if body.session_id is None or not self.requests_still_leaving(
-            body.session_id, except_rid=own_handle,
+        session = body.request_info.session
+        if session is None or not self.requests_still_leaving(
+            session.session_id, except_rid=own_handle,
         ):
             return False
         # ingesting now would adopt nothing
@@ -99,7 +100,7 @@ class WorkerSessionManager:
         ):
             logger.info(
                 "Holding request %s: session %s is still releasing its "
-                "previous request", body.request_id, body.session_id,
+                "previous request", body.request_id, session.session_id,
             )
         self._pending_session_ingests.append(body)
         return True

@@ -44,6 +44,7 @@ from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPoi
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, PrefixStream
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
+from mstar.model.sessions import RequestSession
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import SlidingWindowChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -315,6 +316,7 @@ class OrpheusModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        session: RequestSession | None = None,
     ) -> ForwardPassArgs:
         if partition_name == "LLM":
             full_metadata = CurrentForwardConductorMetadata(

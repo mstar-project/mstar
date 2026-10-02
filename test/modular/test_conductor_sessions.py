@@ -15,6 +15,13 @@ from collections import deque
 sys.path.insert(0, ".")
 
 from mstar.conductor.conductor import Conductor, RequestData, SessionData
+from mstar.conductor.request_info import (
+    DEFAULT_PARTITION,
+    CurrentForwardConductorMetadata,
+    PartitionDefinition,
+)
+from mstar.model.base import ForwardPassArgs
+from mstar.model.sessions import RequestSession
 from mstar.utils.ipc_format import (
     NewRequestConductor,
     ReadsDone,
@@ -150,6 +157,97 @@ def test_end_session_on_any_request_marks_the_session_ending():
     c._register_session_request("s", "r1", {"wg": ["worker_0"]}, end_session=True)
 
     assert c.sessions["s"].ending is True
+
+
+# ── what the model and its submodules are handed ────────────────────────────
+
+def _ingestable(c, model_session=None):
+    """Enough conductor to run a real ingest, capturing what the model got."""
+    walks = {"prefill"}
+    wg = _wg(ranks=[0])
+    wg.graph_walks = walks
+    wg.section = types.SimpleNamespace(get_nodes=lambda: {"LLM"})
+    c.worker_graphs = {1: wg}
+    c._all_worker_graph_ids_to_graph_walks = {1: walks}
+    c.max_concurrent_requests = None
+    c.enable_nvtx = False
+    c.model_config = {}
+    c.streaming_consumers = set()
+    c.default_sharding_config = types.SimpleNamespace(
+        clone_empty=lambda: types.SimpleNamespace(
+            groups=[], setup=lambda m: None,
+            assert_stream_consumer_compatibility=lambda s: None,
+        ),
+    )
+    partition = PartitionDefinition(
+        name=DEFAULT_PARTITION, graph_walks=walks, initial_walk=None,
+        producer_partitions=[],
+    )
+    fwd = ForwardPassArgs(
+        full_metadata=CurrentForwardConductorMetadata(
+            graph_walk="prefill", is_prefill=True,
+        ),
+        inputs=[],
+        unpersist_tensors=[],
+        step_metadata={},
+    )
+
+    def _initial(**kwargs):
+        model_session["seen"] = kwargs.get("session")
+        return fwd
+
+    c.model = types.SimpleNamespace(
+        get_initial_forward_pass_args=_initial,
+        get_max_output_tokens=lambda **kw: 8,
+        get_partitions=lambda: [partition],
+        get_partition_topology=lambda: types.SimpleNamespace(connections=[]),
+        get_request_resource_configs=lambda **kw: {},
+        prefix_key_streams=lambda: {},
+    )
+    return c
+
+
+def _new_requests_sent(c):
+    return [
+        m.body for e, m in c.sent
+        if m.message_type == WorkerMessageType.NEW_REQUEST
+    ]
+
+
+def test_the_model_is_handed_the_request_s_session():
+    # first-class, not riding on the client's model_kwargs
+    seen = {}
+    c = _ingestable(_conductor(), seen)
+
+    body = _new_request("r0", session_id="s")
+    body.resumed = True
+    body.end_session = True
+    c._do_ingest_request(body)
+
+    assert seen["seen"] == RequestSession("s", resumed=True, end_session=True)
+
+
+def test_a_sessionless_request_hands_the_model_no_session():
+    seen = {}
+    c = _ingestable(_conductor(), seen)
+
+    c._do_ingest_request(_new_request("r0"))
+
+    assert seen["seen"] is None
+
+
+def test_the_forward_pass_the_worker_gets_carries_the_session():
+    # a submodule reads it off the step, not off a kwarg
+    seen = {}
+    c = _ingestable(_conductor(), seen)
+    body = _new_request("r0", session_id="s")
+    body.resumed = True
+
+    c._do_ingest_request(body)
+
+    [sent] = _new_requests_sent(c)
+    assert sent.request_info.session == RequestSession("s", resumed=True)
+    assert not hasattr(sent, "session_id"), "one carrier, not two"
 
 
 # ── standalone teardown (DELETE, TTL, a failed request) ─────────────────────

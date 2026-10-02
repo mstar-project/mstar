@@ -259,12 +259,12 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     w._unprocessed_messages = {}
     info = SimpleNamespace(
         rid_handle=-1, resource_configs={}, graph_walk="decode",
-        partition_name="p",
+        partition_name="p", session=None,
     )
     body = SimpleNamespace(
         request_id="wire-1", request_info=info,
         partition_worker_graph_ids={}, worker_graph_to_workers={},
-        initial_inputs=[], session_id=None,
+        initial_inputs=[],
     )
     w.request_state.per_request_info = {0: cfg}
 

@@ -31,11 +31,39 @@ class SessionOverflowPolicy(Enum):
     ERROR = "error"
 
 
+class SessionParkedPolicy(Enum):
+    """What happens to a session's parked state when the deployment is full."""
+
+    # Nothing: it lives until the client ends the session or its TTL expires,
+    # and a new session past the cap is refused.
+    KEEP = "keep"
+    # The least recently used idle session is torn down to make room. A session
+    # with a request in flight is never evicted, so a full deployment of
+    # in-flight sessions still refuses a new one.
+    EVICT = "evict"
+
+
 class SessionTTLMode(Enum):
     # Expire a session ``timeout_s`` after its last request finished.
     IDLE = "idle"
     # Expire it ``timeout_s`` after it was started, however busy it is.
     ABSOLUTE = "absolute"
+
+
+@dataclass
+class RequestSession:
+    """The session one request belongs to, as the server validated it.
+
+    Handed to the model with the request's initial forward-pass args and
+    carried on every forward pass after it, so a model and its submodules read
+    the session from the request rather than from the client's knobs.
+    """
+
+    session_id: str
+    # Continuing a session that already holds state, rather than opening one.
+    resumed: bool = False
+    # The session ends when this request finishes.
+    end_session: bool = False
 
 
 @dataclass
@@ -67,6 +95,8 @@ class SessionsConfig:
     default_timeout_s: float = 300.0
     max_timeout_s: float = 3600.0
     ttl_mode: SessionTTLMode = SessionTTLMode.IDLE
+    # What a full deployment does with parked state; see SessionParkedPolicy.
+    parked_policy: SessionParkedPolicy = SessionParkedPolicy.KEEP
     # Whether a resume may land on a session that already has a request in
     # flight (bidirectional streaming). False refuses it with a 409.
     interruptible: bool = False
@@ -77,6 +107,8 @@ class SessionsConfig:
     def __post_init__(self):
         if isinstance(self.ttl_mode, str):
             self.ttl_mode = SessionTTLMode(self.ttl_mode)
+        if isinstance(self.parked_policy, str):
+            self.parked_policy = SessionParkedPolicy(self.parked_policy)
         self.resources = {
             key: (
                 cfg if isinstance(cfg, SessionResourceConfig)
@@ -154,7 +186,7 @@ def apply_sessions_yaml_overrides(
     resources = overrides.pop("resources", None)
     known = {
         "max_concurrent_sessions", "default_timeout_s", "max_timeout_s",
-        "ttl_mode", "interruptible",
+        "ttl_mode", "parked_policy", "interruptible",
     }
     unknown = sorted(overrides.keys() - known)
     if unknown:
@@ -173,6 +205,7 @@ def apply_sessions_yaml_overrides(
         ),
         max_timeout_s=overrides.get("max_timeout_s", config.max_timeout_s),
         ttl_mode=overrides.get("ttl_mode", config.ttl_mode),
+        parked_policy=overrides.get("parked_policy", config.parked_policy),
         interruptible=overrides.get("interruptible", config.interruptible),
     )
     for key, kwargs in (resources or {}).items():

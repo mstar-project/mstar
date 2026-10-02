@@ -283,11 +283,12 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         start_read_tensors=lambda rid, inputs, graph_walk: [],
     )
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
+    info = SimpleNamespace(
+        resource_configs={}, graph_walk="g", partition_name="p", session=None,
+    )
     Worker._add_new_request(w, SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={},
-        session_id=None,
     ))
 
     handle = w._graph_runtime.get_rid_handle("X")

@@ -27,7 +27,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.model.multimodal import PromptPart
-from mstar.model.sessions import SessionsConfig
+from mstar.model.sessions import RequestSession, SessionsConfig
 
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
@@ -496,6 +496,7 @@ class Model(ABC):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        session: RequestSession | None = None,
     ) -> ForwardPassArgs:
         pass
 

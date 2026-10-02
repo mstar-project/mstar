@@ -49,9 +49,6 @@ class NewRequest(MessageBody):
     worker_graph_to_workers: dict[int, list[str]]
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
-    # The persistent session this request continues, if any: the worker's
-    # session resources hand it the state that session holds.
-    session_id: str | None = None
 
 
 class MessageSource(IntEnum):
@@ -160,9 +157,11 @@ class NewRequestConductor(MessageBody):
     initial_output_modalities: list[str]
     input_metadata: dict[str, list[dict]]
     model_kwargs: dict
-    # The session this request belongs to, and whether it is the last one in
-    # it. The API server has already validated both.
+    # The session this request belongs to, as the API server validated it:
+    # which one, whether it continues state that is already there, and whether
+    # it is the last request in it.
     session_id: str | None = None
+    resumed: bool = False
     end_session: bool = False
 
 

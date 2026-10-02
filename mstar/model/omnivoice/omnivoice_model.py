@@ -58,6 +58,7 @@ from mstar.model.omnivoice.submodules import (
     OmniVoiceCode2WavSubmodule,
     OmniVoiceRefEncoderSubmodule,
 )
+from mstar.model.sessions import RequestSession
 from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -461,6 +462,7 @@ class OmniVoiceModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list],
         model_kwargs: dict | None = None,
+        session: RequestSession | None = None,
     ) -> ForwardPassArgs:
         model_kwargs = model_kwargs or {}
         # Backstops. process_prompt already rejected each of these on the data

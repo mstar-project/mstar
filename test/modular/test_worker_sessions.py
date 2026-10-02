@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+from mstar.model.sessions import RequestSession
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     MessageSource,
@@ -248,8 +249,8 @@ def _new_request(rid="Y", session_id=None):
         request_info=SimpleNamespace(
             resource_configs={}, graph_walk="prefill", partition_name="default",
             rid_handle=-1,
+            session=None if session_id is None else RequestSession(session_id),
         ),
-        session_id=session_id,
     )
 
 

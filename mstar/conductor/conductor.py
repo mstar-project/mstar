@@ -35,6 +35,7 @@ from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.model.sessions import RequestSession
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.exitcode import describe_exitcode
@@ -214,6 +215,8 @@ class RequestData:
     random_seed: int
     # resource label -> the config this request's resources were opened with
     resource_configs: dict[str, ResourceReqConfig]
+    # the session this request belongs to, stamped on every forward pass
+    session: RequestSession | None = None
     sharding_config: ShardingConfig | None = None
 
     # Partition state (always populated — single-partition models use a "default" partition)
@@ -887,9 +890,15 @@ class Conductor:
         worker_graph_to_workers = self._assign_worker_graphs_to_workers(
             body.session_id
         )
+        session = None
         if body.session_id is not None:
             self._register_session_request(
                 body.session_id, body.request_id, worker_graph_to_workers,
+                end_session=body.end_session,
+            )
+            session = RequestSession(
+                session_id=body.session_id,
+                resumed=body.resumed,
                 end_session=body.end_session,
             )
 
@@ -946,6 +955,7 @@ class Conductor:
             partition_definitions=partition_definitions,
             streaming_connections=streaming_connections,
             resource_configs={},
+            session=session,
             sharding_config=self._build_request_sharding_config(worker_graph_to_workers),
             conductor_ingest_time=ingest_time,
         )
@@ -960,6 +970,7 @@ class Conductor:
                 output_modalities=body.initial_output_modalities,
                 input_signals=body.initial_signals,
                 model_kwargs=body.model_kwargs,
+                session=session,
             )
             pstate = partition_states[p.name]
             # if a partition is not active at all in the request, register that here
@@ -1016,7 +1027,6 @@ class Conductor:
                     partition_worker_graph_ids=partition_wg_ids,
                     worker_graph_to_workers=worker_graph_to_workers,
                     initial_inputs=inputs_per_worker.get(worker_id, []),
-                    session_id=body.session_id,
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
@@ -1025,7 +1035,8 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        resource_configs=request_data.resource_configs
+                        resource_configs=request_data.resource_configs,
+                        session=request_data.session,
                     ),
                 )
                 self.communicator.send(
@@ -1675,6 +1686,7 @@ class Conductor:
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
                         resource_configs=request_data.resource_configs,
+                        session=request_data.session,
                     ),
                     partition_name=partition_name
                 ),
@@ -1710,7 +1722,8 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         partition_name=consumer_partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        resource_configs=request_data.resource_configs
+                        resource_configs=request_data.resource_configs,
+                        session=request_data.session,
                     ),
                     partition_name=consumer_partition_name,
                     producer_done=set([producer_partition]),

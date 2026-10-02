@@ -534,6 +534,7 @@ class PreprocessWorkerThread:
                 input_metadata=input_metadata,
                 model_kwargs=model_kwargs,
                 session_id=input.session_id,
+                resumed=input.resumed,
                 end_session=input.end_session,
             ),
         )

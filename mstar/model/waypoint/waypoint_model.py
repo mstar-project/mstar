@@ -60,6 +60,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.sessions import RequestSession
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.waypoint.config import (
     WAYPOINT_VARIANT_360P,
@@ -547,6 +548,7 @@ class WaypointModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        session: RequestSession | None = None,
     ) -> ForwardPassArgs:
         del partition_name, input_modalities
         if output_modalities != ["video_frame"]:

@@ -13,6 +13,8 @@ import sys
 
 sys.path.insert(0, ".")
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.model.sessions import RequestSession
 from mstar.utils.ipc_format import NewRequest
 from mstar.worker.sessions import WorkerSessionManager
 
@@ -25,13 +27,16 @@ def _manager(leaving=()):
 
 
 def _new_request(rid: str, session_id: str | None = None) -> NewRequest:
+    session = None if session_id is None else RequestSession(session_id)
     return NewRequest(
         request_id=rid,
         partition_worker_graph_ids=[],
         worker_graph_to_workers={},
         initial_inputs=[],
-        request_info=None,
-        session_id=session_id,
+        request_info=CurrentForwardPassInfo(
+            request_id=rid, graph_walk="w", fwd_index=0, random_seed=0,
+            max_tokens=1, session=session,
+        ),
     )
 
 

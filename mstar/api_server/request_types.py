@@ -99,6 +99,8 @@ class PreprocessInput:
     # Ordered text/attachment sequence, when the entrypoint preserved it.
     prompt_parts: list[PromptPart] | None = None
 
-    # The validated session this request belongs to, and whether it ends it.
+    # The validated session this request belongs to: which one, whether it
+    # continues state already there, and whether it ends the session.
     session_id: str | None = None
+    resumed: bool = False
     end_session: bool = False

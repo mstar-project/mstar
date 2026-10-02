@@ -485,9 +485,10 @@ class APIServer:
             file_paths=file_paths,
             input_modalities=input_modalities,
             output_modalities=output_modalities,
-            model_kwargs=self._session_model_kwargs(model_kwargs, session),
+            model_kwargs=model_kwargs,
             prompt_parts=prompt_parts,
             session_id=session.session_id if session else None,
+            resumed=bool(session and session.resumed),
             end_session=bool(session and session.end_session),
         ))
         if session is not None and session.end_session and session.session_id:
@@ -500,31 +501,6 @@ class APIServer:
             request_id, input_modalities, output_modalities,
         )
         return request_id
-
-    # The names a model reads the request's session under. Only the server may
-    # set them: a client naming another session would be served its state.
-    SESSION_KWARGS = ("session_id", "resume_session", "end_session")
-
-    @classmethod
-    def _session_model_kwargs(
-        cls, model_kwargs: dict | None, session: SessionRequest | None,
-    ) -> dict | None:
-        """``model_kwargs`` with the validated session in it, if there is one.
-
-        A model reads its session the way it reads a keyed prefix — off
-        ``model_kwargs``, filled in by the server — so a model written against
-        the session fields needs no new signature.
-        """
-        if model_kwargs is None and (session is None or session.session_id is None):
-            return None
-        resolved = dict(model_kwargs or {})
-        for name in cls.SESSION_KWARGS:
-            resolved.pop(name, None)
-        if session is not None and session.session_id is not None:
-            resolved["session_id"] = session.session_id
-            resolved["resume_session"] = session.resumed
-            resolved["end_session"] = session.end_session
-        return resolved
 
     # ----------------------------------------------------------
     # Result collection (background thread)
@@ -1261,20 +1237,50 @@ def _ws_input_layout(
     return [p.modality for p in parts], parts
 
 
+def _ws_session(server, message: dict, request_id: str) -> SessionRequest:
+    """Resolve a WebSocket message's session the way ``/generate`` does.
+
+    The control loop is the surface that most wants sessions: a step continues
+    from the state the previous one left. The fields are the form's, so a client
+    moves between the two without changing what it sends.
+    """
+    flags = {
+        name: bool(message.get(name, False))
+        for name in ("start_session", "resume_session", "end_session")
+    }
+    session_id = message.get("session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        raise ValueError("session_id must be a string")
+    timeout = message.get("session_timeout_s")
+    if timeout is not None and not isinstance(timeout, (int, float)):
+        raise ValueError("session_timeout_s must be a number")
+    if not any(flags.values()) and session_id is None:
+        return SessionRequest()
+    return server.sessions.resolve(
+        session_id=session_id,
+        session_timeout_s=None if timeout is None else float(timeout),
+        request_id=request_id,
+        **flags,
+    )
+
+
 @app.websocket("/generate/ws")
 async def generate_ws(websocket: WebSocket):
     """``/generate`` over one persistent WebSocket, for control loops.
 
     Each incoming message is one request with the ``/generate`` fields —
     ``text``, ``files`` (``[{"name", "data"}]``), ``input_modalities``,
-    ``output_modalities``, ``model_kwargs``, ``request_id`` — either a JSON
-    text frame (``data`` base64) or a msgpack binary frame (``data`` raw
-    bytes). Every result chunk comes back as a frame of the same encoding,
+    ``output_modalities``, ``model_kwargs``, ``request_id``, and the session
+    fields (``start_session``, ``resume_session``, ``end_session``,
+    ``session_id``, ``session_timeout_s``) — either a JSON text frame (``data``
+    base64) or a msgpack binary frame (``data`` raw bytes). Every result chunk
+    comes back as a frame of the same encoding,
     ``{"request_id", "modality", "data", "metadata"}``, followed by
     ``{"request_id", "finish": true}``. A rejected message answers
     ``{"request_id", "error": ...}``, and so does a request that fails after
     it was accepted (with the HTTP ``status`` it would have had); no finish
-    follows an error. Messages may be pipelined: a client can
+    follows an error. A refused session names the status it would have had on
+    the form route, so a control loop can tell a 409 from a 404. Messages may be pipelined: a client can
     send the next observation before the previous action chunk has returned,
     and the ``request_id`` tells the replies apart. Closing the socket aborts
     whatever is still in flight.
@@ -1299,6 +1305,7 @@ async def generate_ws(websocket: WebSocket):
     async def serve_one(message: dict, binary: bool) -> None:
         request_id = message.get("request_id")
         file_paths: dict[str, list[str]] | None = None
+        session = SessionRequest()
         try:
             if request_id is not None and not isinstance(request_id, str):
                 raise ValueError("request_id must be a string")
@@ -1319,6 +1326,19 @@ async def generate_ws(websocket: WebSocket):
                 model_kwargs = json.loads(model_kwargs)
             if model_kwargs is not None and not isinstance(model_kwargs, dict):
                 raise ValueError("model_kwargs must be a JSON object")
+            if request_id is None:
+                request_id = str(uuid.uuid4())
+            session = _ws_session(api_server, message, request_id)
+            if session.session_id is not None:
+                await send({
+                    "request_id": request_id, "modality": "session",
+                    "data": session.session_id.encode("utf-8"),
+                    "metadata": {
+                        "session_id": session.session_id,
+                        "created": session.created,
+                        "end_session": session.end_session,
+                    },
+                }, binary)
             request_id = api_server.submit_request(
                 text=text,
                 file_paths=file_paths or None,
@@ -1328,6 +1348,7 @@ async def generate_ws(websocket: WebSocket):
                 prompt_parts=parts or None,
                 streaming=True,
                 request_id=request_id,
+                session=session,
             )
             # Cancelling this task (socket closed mid-stream) tears the
             # iterator down, and its ``finally`` aborts the engine request.
@@ -1354,8 +1375,18 @@ async def generate_ws(websocket: WebSocket):
             raise
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
             logger.exception("generate/ws request failed")
+            if session.session_id is not None:
+                # Release the session this message claimed: it never reached the
+                # engine, so nothing else would let go of it.
+                api_server.sessions.finish_request(
+                    request_id, failed=True, error=str(exc),
+                )
+            status = exc.status if isinstance(exc, SessionError) else None
+            reply = {"request_id": request_id, "error": str(exc)}
+            if status is not None:
+                reply["status"] = status
             try:
-                await send({"request_id": request_id, "error": str(exc)}, binary)
+                await send(reply, binary)
             except Exception:  # noqa: BLE001
                 pass
         finally:

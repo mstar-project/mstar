@@ -123,12 +123,13 @@ def test_the_flags_reach_the_data_worker():
         start_session=True, resume_session=False, end_session=False,
         session_id="s", session_timeout_s=None, request_id="r0",
     )
-    session = SessionRequest(session_id="s", end_session=True)
+    session = SessionRequest(session_id="s", resumed=True, end_session=True)
 
     _submit(s, session)
 
     [preprocess_input] = s.preprocessed
     assert preprocess_input.session_id == "s"
+    assert preprocess_input.resumed is True
     assert preprocess_input.end_session is True
     # end_session holds the tombstone from submit, not from completion
     assert s.sessions.snapshot()[0]["closing"] is True
@@ -141,78 +142,6 @@ def test_a_sessionless_request_emits_no_session_chunk():
 
     assert s.pending_requests["r0"].chunks == []
     assert s.preprocessed[0].session_id is None
-
-
-# ── the session a model reads ───────────────────────────────────────────────
-#
-# A model takes its session off model_kwargs, the way it takes a keyed prefix:
-# the server fills the names in, so a model written against the session fields
-# needs no new signature. Only the server may set them.
-
-def test_a_model_reads_the_validated_session_off_model_kwargs():
-    s = _server(_config())
-    session = s.sessions.resolve(
-        start_session=True, resume_session=False, end_session=False,
-        session_id="s", session_timeout_s=None, request_id="r0",
-    )
-
-    s.submit_request(
-        text="hi", input_modalities=["text"], output_modalities=["text"],
-        request_id="r0", model_kwargs={"voice": "tara"}, session=session,
-    )
-
-    [sent] = s.preprocessed
-    assert sent.model_kwargs == {
-        "voice": "tara", "session_id": "s",
-        "resume_session": False, "end_session": False,
-    }
-
-
-def test_a_resumed_request_says_so_to_the_model():
-    s = _server(_config())
-    s.sessions.resolve(
-        start_session=True, resume_session=False, end_session=False,
-        session_id="s", session_timeout_s=None, request_id="r0",
-    )
-    s.sessions.finish_request("r0")
-    session = s.sessions.resolve(
-        start_session=False, resume_session=True, end_session=True,
-        session_id="s", session_timeout_s=None, request_id="r1",
-    )
-
-    s.submit_request(
-        text="hi", input_modalities=["text"], output_modalities=["text"],
-        request_id="r1", session=session,
-    )
-
-    [sent] = s.preprocessed
-    assert sent.model_kwargs["resume_session"] is True
-    assert sent.model_kwargs["end_session"] is True
-
-
-def test_a_client_cannot_name_a_session_through_model_kwargs():
-    # it would otherwise be served another session's state
-    s = _server(_config())
-
-    s.submit_request(
-        text="hi", input_modalities=["text"], output_modalities=["text"],
-        request_id="r0", session=None,
-        model_kwargs={"session_id": "someone-elses", "resume_session": True},
-    )
-
-    [sent] = s.preprocessed
-    assert sent.model_kwargs == {}
-
-
-def test_a_sessionless_request_keeps_its_kwargs_untouched():
-    s = _server(_config())
-
-    s.submit_request(
-        text="hi", input_modalities=["text"], output_modalities=["text"],
-        request_id="r0", model_kwargs={"voice": "tara"}, session=None,
-    )
-
-    assert s.preprocessed[0].model_kwargs == {"voice": "tara"}
 
 
 # ── the result loop ─────────────────────────────────────────────────────────

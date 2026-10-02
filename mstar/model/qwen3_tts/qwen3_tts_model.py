@@ -67,6 +67,7 @@ from mstar.model.qwen3_tts.config import (
     TALKER_SAMPLER,
     Qwen3TTSModelConfig,
 )
+from mstar.model.sessions import RequestSession
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.streaming.chunk_policy import LeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -481,6 +482,7 @@ class Qwen3TTSModel(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict | None = None,
+        session: RequestSession | None = None,
     ) -> ForwardPassArgs:
         """Create each partition's initial state.
 

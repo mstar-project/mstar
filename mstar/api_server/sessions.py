@@ -17,7 +17,11 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from mstar.model.sessions import SessionsConfig, SessionTTLMode
+from mstar.model.sessions import (
+    SessionParkedPolicy,
+    SessionsConfig,
+    SessionTTLMode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +69,7 @@ class SessionRequest:
     # Set when the server minted the id, so it is reported back to the client.
     created: bool = False
     end_session: bool = False
-    # Continuing a session that already exists, rather than opening one. A
-    # model reads this to know the state it is resuming from.
+    # Continuing a session that already exists, rather than opening one.
     resumed: bool = False
 
 
@@ -150,9 +153,10 @@ class SessionRegistry:
             raise SessionError(400, str(e)) from e
 
         now = self._clock()
+        evicted = None
         with self._lock:
             if start_session:
-                resolved = self._start_locked(session_id, timeout_s, now)
+                resolved, evicted = self._start_locked(session_id, timeout_s, now)
                 created = session_id is None
             else:
                 resolved = self._resume_locked(session_id)
@@ -161,6 +165,11 @@ class SessionRegistry:
             record.active_request_ids.add(request_id)
             record.last_activity = now
             self._request_to_session[request_id] = resolved
+        if evicted is not None:
+            logger.info(
+                "Evicted idle session %s to make room for %s", evicted, resolved,
+            )
+            self._teardown(evicted)
         logger.info(
             "Request %s %s session %s", request_id,
             "started" if start_session else "resumed", resolved,
@@ -172,7 +181,8 @@ class SessionRegistry:
 
     def _start_locked(
         self, session_id: str | None, timeout_s: float, now: float,
-    ) -> str:
+    ) -> tuple[str, str | None]:
+        """Open a session, returning it and whatever was evicted for it."""
         config = self.config
         if session_id is not None:
             existing = self._sessions.get(session_id)
@@ -182,13 +192,22 @@ class SessionRegistry:
                     f"session {session_id!r} already exists"
                     + (" and is being torn down" if existing.closing else ""),
                 )
+        evicted = None
         live = sum(1 for r in self._sessions.values() if not r.closing)
         if live >= config.max_concurrent_sessions:
-            raise SessionError(
-                429,
-                f"this deployment holds {config.max_concurrent_sessions} "
-                "concurrent sessions at most; end one first",
+            victim = (
+                self._lru_idle_locked()
+                if config.parked_policy is SessionParkedPolicy.EVICT else None
             )
+            if victim is None:
+                raise SessionError(
+                    429,
+                    f"this deployment holds {config.max_concurrent_sessions} "
+                    "concurrent sessions at most; end one first",
+                )
+            self._mark_closing_locked(victim, "evicted to make room")
+            victim.teardown_asked = True
+            evicted = victim.session_id
         resolved = session_id or str(uuid.uuid4())
         self._sessions[resolved] = SessionRecord(
             session_id=resolved,
@@ -196,7 +215,17 @@ class SessionRegistry:
             created_at=now,
             last_activity=now,
         )
-        return resolved
+        return resolved, evicted
+
+    def _lru_idle_locked(self) -> SessionRecord | None:
+        """The least recently used session that may be evicted: idle, and not
+        already closing. A session with a request in flight is writing its state
+        right now, so it is never a candidate however old it is."""
+        idle = [
+            record for record in self._sessions.values()
+            if not record.closing and not record.active_request_ids
+        ]
+        return min(idle, key=lambda r: r.last_activity, default=None)
 
     def _resume_locked(self, session_id: str) -> str:
         record = self._sessions.get(session_id)

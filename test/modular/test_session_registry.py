@@ -177,6 +177,81 @@ def test_a_closing_session_does_not_count_against_the_cap():
     _start(reg, request_id="r1", session_id="b")  # no raise
 
 
+# ── a full deployment: keep the parked state, or evict it ───────────────────
+
+def test_keep_is_the_default_and_refuses_rather_than_evicting():
+    reg, _, torn_down = _registry(max_concurrent_sessions=1)
+    _start(reg, request_id="r0", session_id="a")
+    reg.finish_request("r0")  # idle, but KEEP holds it until close or TTL
+
+    with pytest.raises(SessionError) as e:
+        _start(reg, request_id="r1", session_id="b")
+
+    assert e.value.status == 429
+    assert torn_down == []
+
+
+def test_evict_makes_room_by_tearing_down_the_idle_session():
+    reg, _, torn_down = _registry(
+        max_concurrent_sessions=1, parked_policy="evict",
+    )
+    _start(reg, request_id="r0", session_id="a")
+    reg.finish_request("r0")
+
+    assert _start(reg, request_id="r1", session_id="b").session_id == "b"
+
+    assert torn_down == ["a"]
+    # the evicted id is held until its teardown is confirmed
+    with pytest.raises(SessionError, match="evicted to make room"):
+        _resume(reg, "a", "r2")
+
+
+def test_evict_takes_the_least_recently_used_idle_session():
+    reg, clock, torn_down = _registry(
+        max_concurrent_sessions=2, parked_policy="evict",
+    )
+    _start(reg, request_id="r0", session_id="old")
+    reg.finish_request("r0")
+    clock.advance(10.0)
+    _start(reg, request_id="r1", session_id="new")
+    reg.finish_request("r1")
+
+    _start(reg, request_id="r2", session_id="third")
+
+    assert torn_down == ["old"]
+
+
+def test_a_session_with_a_request_in_flight_is_never_evicted():
+    # it is writing its state right now
+    reg, clock, torn_down = _registry(
+        max_concurrent_sessions=1, parked_policy="evict",
+    )
+    _start(reg, request_id="r0", session_id="busy")
+    clock.advance(1000.0)
+
+    with pytest.raises(SessionError) as e:
+        _start(reg, request_id="r1", session_id="b")
+
+    assert e.value.status == 429
+    assert torn_down == []
+
+
+def test_evict_skips_a_session_that_is_already_closing():
+    reg, _, torn_down = _registry(
+        max_concurrent_sessions=2, parked_policy="evict",
+    )
+    _start(reg, request_id="r0", session_id="a")
+    reg.finish_request("r0")
+    reg.delete("a")  # closing: it no longer counts, and is not a victim
+    _start(reg, request_id="r1", session_id="b")
+    reg.finish_request("r1")
+
+    # one live session against a cap of 2: room without evicting
+    _start(reg, request_id="r2", session_id="c")
+
+    assert torn_down == ["a"]
+
+
 # ── resume ──────────────────────────────────────────────────────────────────
 
 def test_resume_of_an_unknown_session_is_a_404():

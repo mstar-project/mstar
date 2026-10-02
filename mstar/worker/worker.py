@@ -539,6 +539,8 @@ class Worker:
             return
         if self._sessions.hold_if_not_ready(body, self._rid(body.request_id)):
             return
+        session = body.request_info.session
+        session_id = None if session is None else session.session_id
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         # The one place a handle is minted; a request with several partitions
         # on this worker gets the same one for each. Everything below keys on it.
@@ -556,16 +558,16 @@ class Worker:
             self._last_active[(request_id, node_name)] = now
 
         self.request_state.add_request(request_id, body.request_info)
-        self._sessions.bind(request_id, body.session_id)
+        self._sessions.bind(request_id, session_id)
         self.engine_manager.add_request(
             request_id, body.request_info.resource_configs,
-            session_id=body.session_id,
+            session_id=session_id,
         )
-        if body.session_id is not None:
+        if session_id is not None:
             # An ERROR-policy overflow the session owes this request: it was
             # cleared rather than truncated, so say so instead of continuing
             # from a context that is no longer what the client built.
-            error = self.engine_manager.take_session_error(body.session_id)
+            error = self.engine_manager.take_session_error(session_id)
             if error is not None:
                 self._fail_requests({request_id: error})
         self.tensor_manager.register_request(

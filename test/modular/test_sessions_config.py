@@ -15,6 +15,7 @@ import pytest
 
 from mstar.model.sessions import (
     SessionOverflowPolicy,
+    SessionParkedPolicy,
     SessionResourceConfig,
     SessionsConfig,
     SessionTTLMode,
@@ -45,6 +46,11 @@ def test_string_enums_are_coerced():
 def test_interruptible_is_declared_but_refused_for_now():
     with pytest.raises(ValueError, match="not implemented"):
         _config(interruptible=True)
+
+
+def test_the_parked_policy_defaults_to_keeping_state():
+    assert _config().parked_policy is SessionParkedPolicy.KEEP
+    assert _config(parked_policy="evict").parked_policy is SessionParkedPolicy.EVICT
 
 
 def test_refuses_nonsense_caps():
@@ -85,11 +91,13 @@ def test_block_can_disable_sessions_outright():
 def test_block_tunes_caps_and_budgets():
     merged = apply_sessions_yaml_overrides(_config(), {"sessions": {
         "max_concurrent_sessions": 32,
+        "parked_policy": "evict",
         "default_timeout_s": 60.0,
         "resources": {"kv_cache": {"max_state": 256, "overflow_policy": "error"}},
     }})
 
     assert merged.max_concurrent_sessions == 32
+    assert merged.parked_policy is SessionParkedPolicy.EVICT
     assert merged.default_timeout_s == 60.0
     assert merged.resources["kv_cache"].max_state == 256
     assert (

@@ -72,11 +72,12 @@ budget:
 What a request's model sees
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-A model reads the session off ``model_kwargs``, the way it reads a keyed prefix:
-the server fills in ``session_id``, ``resume_session`` and ``end_session`` from
-the validated request, so a model written against those names needs no new
-signature. They are stripped from whatever the client sent first — naming a
-session there would otherwise be a way to be served someone else's state.
+A :class:`~mstar.model.sessions.RequestSession` — the id, whether it continues
+state already there, and whether it ends the session — reaches the model with
+the request's initial forward-pass args, and rides on every
+``CurrentForwardPassInfo`` after it, so a submodule reads it off the step. It is
+server-validated state, not a client knob: nothing a client puts in
+``model_kwargs`` can name a session.
 
 Submodule state
 ^^^^^^^^^^^^^^^
@@ -111,6 +112,13 @@ does not hold across a session.
 finished; ``absolute`` expires it that long after it was started, however busy
 it is. A session with a request in flight is never collected.
 
+``parked_policy`` decides what a full deployment does with the state sessions
+have parked. ``keep`` (the default) holds every session until its client ends it
+or its TTL expires, and refuses a new one past the cap with a 429. ``evict``
+instead tears down the least recently used **idle** session to make room. A
+session with a request in flight is never evicted — it is writing its state
+right now — so a deployment whose sessions are all in flight still refuses.
+
 The HTTP API
 ------------
 
@@ -141,6 +149,10 @@ streaming (modality ``"session"``, with ``session_id`` in its metadata), and as
 
 ``DELETE /sessions/{id}`` ends a session without a request, and
 ``GET /sessions`` lists what the server holds.
+
+``/generate/ws`` takes the same five fields on each message, and answers a
+refused session in-band with the status the form route would have given, so a
+control loop can tell a 409 from a 404 without dropping its socket.
 
 Refusals
 ^^^^^^^^
@@ -232,11 +244,8 @@ Limits in this version
   ``max_concurrent_requests`` allows, or a full pool will start refusing
   admission. (A session's state does follow its request through an offload
   while that request is running.)
-- Sessions are reachable through the ``POST /generate`` form and the SDK. The
-  other entry points carry no session fields: the ``/generate/ws`` control-loop
-  socket, the OpenAI-compatible routes, and the optional Rust frontend
-  (``--rust-frontend``). The WebSocket route is the one that most wants them —
-  it is how a Cosmos3-edge client drives a control loop, and continuing from the
-  state the previous step left is the same need sessions serve.
+- Sessions are reachable through the ``POST /generate`` form, the
+  ``/generate/ws`` control-loop socket, and the SDK. The OpenAI-compatible routes
+  and the optional Rust frontend (``--rust-frontend``) carry no session fields.
 - Only ``test_text_session`` declares session support. Any other deployment
   refuses sessions until its model opts in.
