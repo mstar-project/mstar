@@ -114,6 +114,29 @@ def test_a_dependency_on_a_plain_resource_marks_nothing():
     assert resources["pos"].session_config is not None
 
 
+def test_a_dependent_without_the_session_hooks_is_left_alone():
+    # the attention resource plans per step and holds nothing across requests;
+    # marking it would skip its ordinary per-request teardown
+    class _Plain(Resource):
+        def __init__(self, deps):
+            self._deps = set(deps)
+
+        @classmethod
+        def build(cls, spec, info):
+            raise NotImplementedError
+
+        def depends_on(self):
+            return set(self._deps)
+
+    resources = {"kv": _Res(), "attn": _Plain(("kv",)), "rope": _Res(deps=("kv",))}
+    engine = _engine(resources)
+
+    engine._open_session_state(_specs("kv", "attn", "rope"), _config("kv"))
+
+    assert resources["attn"].session_config is None
+    assert resources["rope"].session_config is not None
+
+
 def test_a_resource_without_the_session_hooks_is_refused():
     # it would inherit the base no-ops and hold nothing, silently
     class _Plain(Resource):

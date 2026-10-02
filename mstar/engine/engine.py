@@ -609,6 +609,10 @@ class Engine:
         for key, resource in self._resources.items():
             if resource.session_config is not None:
                 continue
+            if type(resource).retain_session_state is Resource.retain_session_state:
+                # nothing durable to hold (attention plans per step), so it
+                # keeps its ordinary per-request teardown
+                continue
             if any(
                 self._resources.get(dep) is not None
                 and self._resources[dep].session_config is not None
