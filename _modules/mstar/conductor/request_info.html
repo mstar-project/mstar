@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 01, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 02, 2026"/>
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -1022,8 +1022,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">wg_rank_completions</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
     <span class="n">num_output_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">curr_forward_outputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
-    <span class="c1"># resource label -&gt; PublishedInfo, accumulated from the rank-0 worker's</span>
-    <span class="c1"># reports and handed back out on the next forward</span>
+    <span class="c1"># resource label -&gt; PublishedInfo, accumulated across all TP ranks and</span>
+    <span class="c1"># handed back out on the next forward</span>
     <span class="n">resource_publish_info</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">PublishedInfo</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span></div>
 
 </pre></div>
@@ -1073,7 +1073,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 01, 2026.
+  Last updated on Oct 02, 2026.
   <br/>
 </p>
   </div>

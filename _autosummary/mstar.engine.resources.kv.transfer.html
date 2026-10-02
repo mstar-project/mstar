@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 01, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 02, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -593,6 +593,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine"><code class="docutils literal notranslate"><span class="pre">CudaIpcKVTransferEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.get_kv_transfer_info"><code class="docutils literal notranslate"><span class="pre">CudaIpcKVTransferEngine.get_kv_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.owns_transfer_info"><code class="docutils literal notranslate"><span class="pre">CudaIpcKVTransferEngine.owns_transfer_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.read_batched_async"><code class="docutils literal notranslate"><span class="pre">CudaIpcKVTransferEngine.read_batched_async()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.shutdown"><code class="docutils literal notranslate"><span class="pre">CudaIpcKVTransferEngine.shutdown()</span></code></a></li>
 </ul>
@@ -617,13 +618,17 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.get_kv_transfer_info"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine.get_kv_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.owns_transfer_info"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine.owns_transfer_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.read_batched_async"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine.read_batched_async()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.remove_request"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.shutdown"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine.shutdown()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager"><code class="docutils literal notranslate"><span class="pre">KVTransferManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.cleanup"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.get_kv_transfer_info"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.get_kv_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.owns_transfer_info"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.owns_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.remove_request"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.start_async_retrieve"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.start_async_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.sync_retrieve"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.sync_retrieve()</span></code></a></li>
 </ul>
@@ -636,6 +641,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.get_kv_transfer_info"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferEngine.get_kv_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.owns_transfer_info"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferEngine.owns_transfer_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.read_batched_async"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferEngine.read_batched_async()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.shutdown"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferEngine.shutdown()</span></code></a></li>
 </ul>
@@ -647,12 +653,38 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.session_id"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferInfo.session_id</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk"><code class="docutils literal notranslate"><span class="pre">ShmKVSnapshotChunk</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.end_len"><code class="docutils literal notranslate"><span class="pre">ShmKVSnapshotChunk.end_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.page_indices"><code class="docutils literal notranslate"><span class="pre">ShmKVSnapshotChunk.page_indices</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.path"><code class="docutils literal notranslate"><span class="pre">ShmKVSnapshotChunk.path</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.start_len"><code class="docutils literal notranslate"><span class="pre">ShmKVSnapshotChunk.start_len</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.get_kv_transfer_info"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine.get_kv_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.owns_transfer_info"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine.owns_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.read_batched_async"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine.read_batched_async()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.remove_request"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine.remove_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.shutdown"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine.shutdown()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.chunks"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferInfo.chunks</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.layout"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferInfo.layout</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.page_indices"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferInfo.page_indices</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.path"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferInfo.path</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.get_shm_dir"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.get_shm_dir()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.my_entity_id"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.my_entity_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.my_session_id"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.my_session_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.shm_dir"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.shm_dir</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.shm_dir_factory"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.shm_dir_factory</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.transfer_engine"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.transfer_engine</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.make_deployment_kv_shm_dir"><code class="docutils literal notranslate"><span class="pre">make_deployment_kv_shm_dir()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -673,6 +705,15 @@ dispatch and the Mooncake read). It pulls in the conductor and the
 sampling kernels behind it, and this module is otherwise free of both —
 keeping the import deferred is what lets the KV layer be built and tested
 without a GPU toolchain present.</p>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.make_deployment_kv_shm_dir" title="mstar.engine.resources.kv.transfer.make_deployment_kv_shm_dir"><code class="xref py py-obj docutils literal notranslate"><span class="pre">make_deployment_kv_shm_dir</span></code></a>(...[, owner_pid])</p></td>
+<td><p>Create a private SHM directory for one local deployment.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -692,7 +733,7 @@ without a GPU toolchain present.</p>
 <td><p></p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.LocalOnlyKVTransferEngine" title="mstar.engine.resources.kv.transfer.LocalOnlyKVTransferEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LocalOnlyKVTransferEngine</span></code></a>()</p></td>
-<td><p>KV cache that remains local to its worker.</p></td>
+<td><p>KV cache that never leaves its worker instance.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine" title="mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MooncakeKVTransferEngine</span></code></a>(kv_cache, ...)</p></td>
 <td><p></p></td>
@@ -700,7 +741,16 @@ without a GPU toolchain present.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo" title="mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MooncakeKVTransferInfo</span></code></a>(entity_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo" title="mstar.engine.resources.kv.transfer.TransferEngineInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TransferEngineInfo</span></code></a>(my_entity_id, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk" title="mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ShmKVSnapshotChunk</span></code></a>(path, start_len, end_len, ...)</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine" title="mstar.engine.resources.kv.transfer.ShmKVTransferEngine"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ShmKVTransferEngine</span></code></a>(kv_cache, entity_id, shm_dir)</p></td>
+<td><p>Host-staged KV transfer through a shared-memory filesystem.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo" title="mstar.engine.resources.kv.transfer.ShmKVTransferInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ShmKVTransferInfo</span></code></a>(path, page_indices, layout)</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo" title="mstar.engine.resources.kv.transfer.TransferEngineInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TransferEngineInfo</span></code></a>(my_entity_id, ...[, ...])</p></td>
 <td><p></p></td>
 </tr>
 </tbody>
@@ -717,10 +767,36 @@ without a GPU toolchain present.</p>
 </dl>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.get_kv_transfer_info">
-<span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#CudaIpcKVTransferEngine.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.get_kv_transfer_info" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_indices</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reset_generation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#CudaIpcKVTransferEngine.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.get_kv_transfer_info" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo" title="mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo"><em>CudaIpcKVTransferInfo</em></a></p>
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>page_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>reset_generation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo" title="mstar.engine.resources.kv.transfer.CudaIpcKVTransferInfo"><em>CudaIpcKVTransferInfo</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.owns_transfer_info">
+<span class="sig-name descname"><span class="pre">owns_transfer_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">transfer_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#CudaIpcKVTransferEngine.owns_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.owns_transfer_info" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>transfer_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -847,10 +923,36 @@ without a GPU toolchain present.</p>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/abc.html#abc.ABC" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ABC</span></code></a></p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVTransferEngine.get_kv_transfer_info">
-<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferEngine.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.get_kv_transfer_info" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_indices</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reset_generation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferEngine.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.get_kv_transfer_info" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a></p>
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>page_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>reset_generation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVTransferEngine.owns_transfer_info">
+<span class="sig-name descname"><span class="pre">owns_transfer_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">transfer_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferEngine.owns_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.owns_transfer_info" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>transfer_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -869,6 +971,20 @@ without a GPU toolchain present.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVTransferEngine.remove_request">
+<span class="sig-name descname"><span class="pre">remove_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferEngine.remove_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.remove_request" title="Link to this definition">#</a></dt>
+<dd><p>Release request-scoped transfer resources, if any.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVTransferEngine.shutdown">
 <span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">shutdown</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferEngine.shutdown"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.shutdown" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -877,13 +993,15 @@ without a GPU toolchain present.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVTransferManager">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">KVTransferManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">transfer_engine_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferManager" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">KVTransferManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">transfer_engine_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kv_cache</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resource_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'kv'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">needs_remote_transfer</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferManager" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>transfer_engine_info</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo" title="mstar.engine.resources.kv.transfer.TransferEngineInfo"><em>TransferEngineInfo</em></a>)</p></li>
 <li><p><strong>kv_cache</strong> (<a class="reference internal" href="mstar.engine.resources.kv.cache.html#mstar.engine.resources.kv.cache.KVCache" title="mstar.engine.resources.kv.cache.KVCache"><em>KVCache</em></a>)</p></li>
+<li><p><strong>resource_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>needs_remote_transfer</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -894,9 +1012,50 @@ without a GPU toolchain present.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVTransferManager.get_kv_transfer_info">
-<span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferManager.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferManager.get_kv_transfer_info" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_indices</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reset_generation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferManager.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferManager.get_kv_transfer_info" title="Link to this definition">#</a></dt>
 <dd><p>Descriptor another process needs to read this cache remotely.
 <code class="docutils literal notranslate"><span class="pre">KVCachePool.publish</span></code> stamps it onto every <code class="docutils literal notranslate"><span class="pre">SequenceInfo</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>page_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>reset_generation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVTransferManager.owns_transfer_info">
+<span class="sig-name descname"><span class="pre">owns_transfer_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">transfer_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferManager.owns_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferManager.owns_transfer_info" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>transfer_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.KVTransferManager.remove_request">
+<span class="sig-name descname"><span class="pre">remove_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#KVTransferManager.remove_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.KVTransferManager.remove_request" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
@@ -929,13 +1088,22 @@ without a GPU toolchain present.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.LocalOnlyKVTransferEngine">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">LocalOnlyKVTransferEngine</span></span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#LocalOnlyKVTransferEngine"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.LocalOnlyKVTransferEngine" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.engine.resources.kv.transfer.KVTransferEngine" title="mstar.engine.resources.kv.transfer.KVTransferEngine"><code class="xref py py-class docutils literal notranslate"><span class="pre">KVTransferEngine</span></code></a></p>
-<p>KV cache that remains local to its worker.</p>
+<p>KV cache that never leaves its worker instance.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.LocalOnlyKVTransferEngine.get_kv_transfer_info">
-<span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#LocalOnlyKVTransferEngine.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.LocalOnlyKVTransferEngine.get_kv_transfer_info" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_indices</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reset_generation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#LocalOnlyKVTransferEngine.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.LocalOnlyKVTransferEngine.get_kv_transfer_info" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>page_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>reset_generation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -975,10 +1143,36 @@ without a GPU toolchain present.</p>
 </dl>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.get_kv_transfer_info">
-<span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#MooncakeKVTransferEngine.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.get_kv_transfer_info" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_indices</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reset_generation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#MooncakeKVTransferEngine.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.get_kv_transfer_info" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo" title="mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo"><em>MooncakeKVTransferInfo</em></a></p>
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>page_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>reset_generation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo" title="mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo"><em>MooncakeKVTransferInfo</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.owns_transfer_info">
+<span class="sig-name descname"><span class="pre">owns_transfer_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">transfer_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#MooncakeKVTransferEngine.owns_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.owns_transfer_info" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>transfer_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1043,8 +1237,171 @@ without a GPU toolchain present.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">ShmKVSnapshotChunk</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start_len</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">end_len</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'int'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_indices</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'tuple[int,</span> <span class="pre">...]'</span></span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#ShmKVSnapshotChunk"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>start_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>end_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>page_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.end_len">
+<span class="sig-name descname"><span class="pre">end_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.end_len" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.page_indices">
+<span class="sig-name descname"><span class="pre">page_indices</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.page_indices" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.path">
+<span class="sig-name descname"><span class="pre">path</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.path" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.start_len">
+<span class="sig-name descname"><span class="pre">start_len</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.start_len" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVTransferEngine">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">ShmKVTransferEngine</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv_cache</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">entity_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shm_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">resource_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'kv'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#ShmKVTransferEngine"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.engine.resources.kv.transfer.KVTransferEngine" title="mstar.engine.resources.kv.transfer.KVTransferEngine"><code class="xref py py-class docutils literal notranslate"><span class="pre">KVTransferEngine</span></code></a></p>
+<p>Host-staged KV transfer through a shared-memory filesystem.</p>
+<p>Appends save only the changed tail pages. Descriptors retain immutable
+chunks for earlier tokens, so a delayed reader can still use an older
+descriptor without keeping a full copy of every growing snapshot.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>kv_cache</strong> (<a class="reference internal" href="mstar.engine.resources.kv.cache.html#mstar.engine.resources.kv.cache.KVCache" title="mstar.engine.resources.kv.cache.KVCache"><em>KVCache</em></a>)</p></li>
+<li><p><strong>entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>shm_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>resource_key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVTransferEngine.get_kv_transfer_info">
+<span class="sig-name descname"><span class="pre">get_kv_transfer_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_indices</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">seq_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reset_generation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#ShmKVTransferEngine.get_kv_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.get_kv_transfer_info" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>page_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>reset_generation</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo" title="mstar.engine.resources.kv.transfer.ShmKVTransferInfo"><em>ShmKVTransferInfo</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVTransferEngine.owns_transfer_info">
+<span class="sig-name descname"><span class="pre">owns_transfer_info</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">transfer_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#ShmKVTransferEngine.owns_transfer_info"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.owns_transfer_info" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>transfer_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>)</p></li>
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVTransferEngine.read_batched_async">
+<span class="sig-name descname"><span class="pre">read_batched_async</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">remote_kv_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">read_info</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#ShmKVTransferEngine.read_batched_async"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.read_batched_async" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>remote_kv_info</strong> (<a class="reference internal" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo" title="mstar.engine.resources.kv.transfer.ShmKVTransferInfo"><em>ShmKVTransferInfo</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>read_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.transfer.KVReadInfo" title="mstar.engine.resources.kv.transfer.KVReadInfo"><em>KVReadInfo</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><em>Future</em> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVTransferEngine.remove_request">
+<span class="sig-name descname"><span class="pre">remove_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#ShmKVTransferEngine.remove_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.remove_request" title="Link to this definition">#</a></dt>
+<dd><p>Release request-scoped transfer resources, if any.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVTransferEngine.shutdown">
+<span class="sig-name descname"><span class="pre">shutdown</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#ShmKVTransferEngine.shutdown"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.shutdown" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVTransferInfo">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">ShmKVTransferInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">page_indices</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'tuple[int,</span> <span class="pre">...]'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'KVLayout'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunks</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'tuple[ShmKVSnapshotChunk,</span> <span class="pre">...]</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#ShmKVTransferInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>page_indices</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><em>...</em><em>]</em>)</p></li>
+<li><p><strong>layout</strong> (<a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVLayout" title="mstar.engine.resources.kv.config.KVLayout"><em>KVLayout</em></a>)</p></li>
+<li><p><strong>chunks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference internal" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk" title="mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk"><em>ShmKVSnapshotChunk</em></a><em>, </em><em>...</em><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVTransferInfo.chunks">
+<span class="sig-name descname"><span class="pre">chunks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk" title="mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk"><span class="pre">ShmKVSnapshotChunk</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.chunks" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVTransferInfo.layout">
+<span class="sig-name descname"><span class="pre">layout</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVLayout" title="mstar.engine.resources.kv.config.KVLayout"><span class="pre">KVLayout</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.layout" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVTransferInfo.page_indices">
+<span class="sig-name descname"><span class="pre">page_indices</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.page_indices" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.ShmKVTransferInfo.path">
+<span class="sig-name descname"><span class="pre">path</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.path" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.TransferEngineInfo">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">TransferEngineInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">my_entity_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">my_session_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">transfer_engine</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'TensorTransferEngine'</span></span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#TransferEngineInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">TransferEngineInfo</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">my_entity_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">my_session_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">transfer_engine</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'TensorTransferEngine'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shm_dir</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'str</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shm_dir_factory</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'Callable[[],</span> <span class="pre">str]</span> <span class="pre">|</span> <span class="pre">None'</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#TransferEngineInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1052,9 +1409,22 @@ without a GPU toolchain present.</p>
 <li><p><strong>my_entity_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>my_session_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>transfer_engine</strong> (<a class="reference internal" href="mstar.communication.tensors.html#mstar.communication.tensors.TensorTransferEngine" title="mstar.communication.tensors.TensorTransferEngine"><em>TensorTransferEngine</em></a>)</p></li>
+<li><p><strong>shm_dir</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>shm_dir_factory</strong> (<em>Callable</em><em>[</em><em>[</em><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.TransferEngineInfo.get_shm_dir">
+<span class="sig-name descname"><span class="pre">get_shm_dir</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#TransferEngineInfo.get_shm_dir"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.get_shm_dir" title="Link to this definition">#</a></dt>
+<dd><p>Resolve the deployment SHM directory only for a cache that needs it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.TransferEngineInfo.my_entity_id">
 <span class="sig-name descname"><span class="pre">my_entity_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.my_entity_id" title="Link to this definition">#</a></dt>
@@ -1066,10 +1436,42 @@ without a GPU toolchain present.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.TransferEngineInfo.shm_dir">
+<span class="sig-name descname"><span class="pre">shm_dir</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.shm_dir" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.TransferEngineInfo.shm_dir_factory">
+<span class="sig-name descname"><span class="pre">shm_dir_factory</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Callable</span><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.shm_dir_factory" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.TransferEngineInfo.transfer_engine">
 <span class="sig-name descname"><span class="pre">transfer_engine</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.communication.tensors.html#mstar.communication.tensors.TensorTransferEngine" title="mstar.communication.tensors.TensorTransferEngine"><span class="pre">TensorTransferEngine</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.transfer_engine" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.transfer.make_deployment_kv_shm_dir">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.transfer.</span></span><span class="sig-name descname"><span class="pre">make_deployment_kv_shm_dir</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">socket_path_prefix</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dist_init_method</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">owner_pid</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/transfer.html#make_deployment_kv_shm_dir"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.transfer.make_deployment_kv_shm_dir" title="Link to this definition">#</a></dt>
+<dd><p>Create a private SHM directory for one local deployment.</p>
+<p>The conductor PID plus its unique distributed-init endpoint separates
+concurrent servers, even when both use the default worker ids and request
+ids. On startup, directories owned by this uid whose conductor no longer
+exists are swept so killed deployments do not leak tmpfs indefinitely.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>socket_path_prefix</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>dist_init_method</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>owner_pid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
 </dd></dl>
 
 </section>
@@ -1123,6 +1525,7 @@ without a GPU toolchain present.</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine"><code class="docutils literal notranslate"><span class="pre">CudaIpcKVTransferEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.get_kv_transfer_info"><code class="docutils literal notranslate"><span class="pre">CudaIpcKVTransferEngine.get_kv_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.owns_transfer_info"><code class="docutils literal notranslate"><span class="pre">CudaIpcKVTransferEngine.owns_transfer_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.read_batched_async"><code class="docutils literal notranslate"><span class="pre">CudaIpcKVTransferEngine.read_batched_async()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.CudaIpcKVTransferEngine.shutdown"><code class="docutils literal notranslate"><span class="pre">CudaIpcKVTransferEngine.shutdown()</span></code></a></li>
 </ul>
@@ -1147,13 +1550,17 @@ without a GPU toolchain present.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.get_kv_transfer_info"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine.get_kv_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.owns_transfer_info"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine.owns_transfer_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.read_batched_async"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine.read_batched_async()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.remove_request"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferEngine.shutdown"><code class="docutils literal notranslate"><span class="pre">KVTransferEngine.shutdown()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager"><code class="docutils literal notranslate"><span class="pre">KVTransferManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.cleanup"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.cleanup()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.get_kv_transfer_info"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.get_kv_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.owns_transfer_info"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.owns_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.remove_request"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.start_async_retrieve"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.start_async_retrieve()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.KVTransferManager.sync_retrieve"><code class="docutils literal notranslate"><span class="pre">KVTransferManager.sync_retrieve()</span></code></a></li>
 </ul>
@@ -1166,6 +1573,7 @@ without a GPU toolchain present.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.get_kv_transfer_info"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferEngine.get_kv_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.owns_transfer_info"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferEngine.owns_transfer_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.read_batched_async"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferEngine.read_batched_async()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferEngine.shutdown"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferEngine.shutdown()</span></code></a></li>
 </ul>
@@ -1177,12 +1585,38 @@ without a GPU toolchain present.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.MooncakeKVTransferInfo.session_id"><code class="docutils literal notranslate"><span class="pre">MooncakeKVTransferInfo.session_id</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk"><code class="docutils literal notranslate"><span class="pre">ShmKVSnapshotChunk</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.end_len"><code class="docutils literal notranslate"><span class="pre">ShmKVSnapshotChunk.end_len</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.page_indices"><code class="docutils literal notranslate"><span class="pre">ShmKVSnapshotChunk.page_indices</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.path"><code class="docutils literal notranslate"><span class="pre">ShmKVSnapshotChunk.path</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVSnapshotChunk.start_len"><code class="docutils literal notranslate"><span class="pre">ShmKVSnapshotChunk.start_len</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.get_kv_transfer_info"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine.get_kv_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.owns_transfer_info"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine.owns_transfer_info()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.read_batched_async"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine.read_batched_async()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.remove_request"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine.remove_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferEngine.shutdown"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferEngine.shutdown()</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.chunks"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferInfo.chunks</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.layout"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferInfo.layout</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.page_indices"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferInfo.page_indices</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.ShmKVTransferInfo.path"><code class="docutils literal notranslate"><span class="pre">ShmKVTransferInfo.path</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.get_shm_dir"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.get_shm_dir()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.my_entity_id"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.my_entity_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.my_session_id"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.my_session_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.shm_dir"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.shm_dir</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.shm_dir_factory"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.shm_dir_factory</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.TransferEngineInfo.transfer_engine"><code class="docutils literal notranslate"><span class="pre">TransferEngineInfo.transfer_engine</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.transfer.make_deployment_kv_shm_dir"><code class="docutils literal notranslate"><span class="pre">make_deployment_kv_shm_dir()</span></code></a></li>
 </ul>
   </nav></div>
 
@@ -1216,7 +1650,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 01, 2026.
+  Last updated on Oct 02, 2026.
   <br/>
 </p>
   </div>

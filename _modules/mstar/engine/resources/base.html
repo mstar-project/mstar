@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 01, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 02, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -952,6 +952,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">joint_comm_group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">transfer_engine_info</span><span class="p">:</span> <span class="s2">"TransferEngineInfo | None"</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">kv_dtype</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span>
+    <span class="c1"># Whether this logical resource has consumers in another worker instance.</span>
+    <span class="n">needs_remote_transfer</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># the specs this one named in `depends_on`, by resource key</span>
     <span class="n">dependencies</span><span class="p">:</span> <span class="s2">"Mapping[str, NodeResourceSpec]"</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
         <span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span>
@@ -1114,6 +1116,36 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Resource.publish">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.publish">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">publish</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PublishedInfo | None"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
+<div class="viewcode-block" id="Resource.publish_for_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.publish_for_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">publish_for_step</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PublishedInfo | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Publish after one node step, with context for selective exporters.</span>
+
+<span class="sd">        Existing resources remain compatible through ``publish``; resources</span>
+<span class="sd">        that need node/walk context can override this method.</span>
+<span class="sd">        """</span>
+        <span class="k">del</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">publish</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="Resource.publish_after_stop">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.publish_after_stop">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">publish_after_stop</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+        <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PublishedInfo | None"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Publish state that is useful only when a dynamic loop stops."""</span>
+        <span class="k">del</span> <span class="n">request_id</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
@@ -1302,6 +1334,14 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@abstractmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">update</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">other</span><span class="p">:</span> <span class="s2">"PublishedInfo"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="o">...</span></div>
+
+
+<div class="viewcode-block" id="PublishedInfo.clone">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.PublishedInfo.clone">[docs]</a>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">clone</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PublishedInfo"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Return independent publication metadata for deferred sending."""</span>
+        <span class="o">...</span></div>
 </div>
 
 
@@ -1358,7 +1398,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 01, 2026.
+  Last updated on Oct 02, 2026.
   <br/>
 </p>
   </div>

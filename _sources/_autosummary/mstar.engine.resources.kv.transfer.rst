@@ -9,6 +9,12 @@ mstar.engine.resources.kv.transfer
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      make_deployment_kv_shm_dir
+   
    
 
    
@@ -25,6 +31,9 @@ mstar.engine.resources.kv.transfer
       LocalOnlyKVTransferEngine
       MooncakeKVTransferEngine
       MooncakeKVTransferInfo
+      ShmKVSnapshotChunk
+      ShmKVTransferEngine
+      ShmKVTransferInfo
       TransferEngineInfo
    
    

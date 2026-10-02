@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 01, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 02, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -919,6 +919,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">position</span> <span class="ow">in</span> <span class="n">other</span><span class="o">.</span><span class="n">counters</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">if</span> <span class="n">position</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">counters</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">,</span> <span class="mi">0</span><span class="p">):</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">counters</span><span class="p">[</span><span class="n">label</span><span class="p">]</span> <span class="o">=</span> <span class="n">position</span></div>
+
+
+<div class="viewcode-block" id="PublishedPositionInfo.clone">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.position.manager.html#mstar.engine.resources.position.manager.PublishedPositionInfo.clone">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">clone</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PublishedPositionInfo"</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">PublishedPositionInfo</span><span class="p">(</span><span class="n">counters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">counters</span><span class="o">.</span><span class="n">copy</span><span class="p">())</span></div>
 </div>
 
 
@@ -1469,7 +1475,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 01, 2026.
+  Last updated on Oct 02, 2026.
   <br/>
 </p>
   </div>

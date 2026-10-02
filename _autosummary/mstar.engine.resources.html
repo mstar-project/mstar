@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Oct 01, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 02, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -686,7 +686,9 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig"><code class="docutils literal notranslate"><span class="pre">KVReqConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.apply_conductor_config"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.apply_conductor_config()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.final_publish_labels_per_node_walk"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.final_publish_labels_per_node_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.get_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.get_labels()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.get_publish_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.get_publish_labels()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.needed_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.needed_labels</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.needed_labels_per_node"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.needed_labels_per_node</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.needed_labels_per_node_walk"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.needed_labels_per_node_walk</span></code></a></li>
@@ -694,6 +696,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.prefix_decode"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_decode</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.prefix_keys"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_keys</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.prefix_tail"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_tail</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.publish_labels_per_node_walk"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.publish_labels_per_node_walk</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec"><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -766,6 +769,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PublishedInfo"><code class="docutils literal notranslate"><span class="pre">PublishedInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PublishedInfo.clone"><code class="docutils literal notranslate"><span class="pre">PublishedInfo.clone()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PublishedInfo.update"><code class="docutils literal notranslate"><span class="pre">PublishedInfo.update()</span></code></a></li>
 </ul>
 </li>
@@ -816,6 +820,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.post_warmup_validate"><code class="docutils literal notranslate"><span class="pre">Resource.post_warmup_validate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">Resource.prefix_skip_safe</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.publish"><code class="docutils literal notranslate"><span class="pre">Resource.publish()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.publish_after_stop"><code class="docutils literal notranslate"><span class="pre">Resource.publish_after_stop()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.publish_for_step"><code class="docutils literal notranslate"><span class="pre">Resource.publish_for_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.reclaimable"><code class="docutils literal notranslate"><span class="pre">Resource.reclaimable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.reload"><code class="docutils literal notranslate"><span class="pre">Resource.reload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.remove_request"><code class="docutils literal notranslate"><span class="pre">Resource.remove_request()</span></code></a></li>
@@ -913,6 +919,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.pre_admit"><code class="docutils literal notranslate"><span class="pre">StepRunner.pre_admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.pre_plan"><code class="docutils literal notranslate"><span class="pre">StepRunner.pre_plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.publish"><code class="docutils literal notranslate"><span class="pre">StepRunner.publish()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.publish_after_stop"><code class="docutils literal notranslate"><span class="pre">StepRunner.publish_after_stop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.remove_request"><code class="docutils literal notranslate"><span class="pre">StepRunner.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.resolve_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.resources"><code class="docutils literal notranslate"><span class="pre">StepRunner.resources</span></code></a></li>
@@ -1505,7 +1512,7 @@ all-to-alls heads, so attention runs at head-degree tp*sp.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.resources.KVReqConfig">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">KVReqConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">needed_labels:</span> <span class="pre">list[str]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">needed_labels_per_node:</span> <span class="pre">dict[str,</span> <span class="pre">list[str]]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">needed_labels_per_node_walk:</span> <span class="pre">dict[tuple[str,</span> <span class="pre">str],</span> <span class="pre">list[str]]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">prefix_keys:</span> <span class="pre">dict[str,</span> <span class="pre">list[bytes]]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">prefix_tail:</span> <span class="pre">dict[str,</span> <span class="pre">list[int]]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">prefix_decode:</span> <span class="pre">dict[str,</span> <span class="pre">str]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">prefix_cache:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVReqConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.KVReqConfig" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">KVReqConfig</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="pre">needed_labels:</span> <span class="pre">list[str]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">needed_labels_per_node:</span> <span class="pre">dict[str,</span> <span class="pre">list[str]]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">needed_labels_per_node_walk:</span> <span class="pre">dict[tuple[str,</span> <span class="pre">str],</span> <span class="pre">list[str]]</span> <span class="pre">=</span> <span class="pre">&lt;factory&gt;,</span> <span class="pre">publish_labels_per_node_walk:</span> <span class="pre">dict[tuple[str,</span> <span class="pre">str],</span> <span class="pre">list[str]]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">final_publish_labels_per_node_walk:</span> <span class="pre">dict[tuple[str,</span> <span class="pre">str],</span> <span class="pre">list[str]]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">prefix_keys:</span> <span class="pre">dict[str,</span> <span class="pre">list[bytes]]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">prefix_tail:</span> <span class="pre">dict[str,</span> <span class="pre">list[int]]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">prefix_decode:</span> <span class="pre">dict[str,</span> <span class="pre">str]</span> <span class="pre">|</span> <span class="pre">None</span> <span class="pre">=</span> <span class="pre">None,</span> <span class="pre">prefix_cache:</span> <span class="pre">bool</span> <span class="pre">=</span> <span class="pre">True</span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVReqConfig"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.KVReqConfig" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.ResourceReqConfig" title="mstar.engine.resources.spec.ResourceReqConfig"><code class="xref py py-class docutils literal notranslate"><span class="pre">ResourceReqConfig</span></code></a></p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
@@ -1513,6 +1520,8 @@ all-to-alls heads, so attention runs at head-degree tp*sp.</p>
 <li><p><strong>needed_labels</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>needed_labels_per_node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>]</em>)</p></li>
 <li><p><strong>needed_labels_per_node_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>]</em>)</p></li>
+<li><p><strong>publish_labels_per_node_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>final_publish_labels_per_node_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>prefix_keys</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)"><em>bytes</em></a><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>prefix_tail</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>prefix_decode</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
@@ -1535,6 +1544,11 @@ all-to-alls heads, so attention runs at head-degree tp*sp.</p>
 </dl>
 </dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.KVReqConfig.final_publish_labels_per_node_walk">
+<span class="sig-name descname"><span class="pre">final_publish_labels_per_node_walk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.KVReqConfig.final_publish_labels_per_node_walk" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.KVReqConfig.get_labels">
 <span class="sig-name descname"><span class="pre">get_labels</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVReqConfig.get_labels"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.KVReqConfig.get_labels" title="Link to this definition">#</a></dt>
@@ -1544,6 +1558,24 @@ all-to-alls heads, so attention runs at head-degree tp*sp.</p>
 <li><p><strong>node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 </ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.KVReqConfig.get_publish_labels">
+<span class="sig-name descname"><span class="pre">get_publish_labels</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">available</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">final</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVReqConfig.get_publish_labels"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.KVReqConfig.get_publish_labels" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>available</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>final</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1581,6 +1613,11 @@ all-to-alls heads, so attention runs at head-degree tp*sp.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.KVReqConfig.prefix_tail">
 <span class="sig-name descname"><span class="pre">prefix_tail</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.KVReqConfig.prefix_tail" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.KVReqConfig.publish_labels_per_node_walk">
+<span class="sig-name descname"><span class="pre">publish_labels_per_node_walk</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.KVReqConfig.publish_labels_per_node_walk" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1990,6 +2027,17 @@ resource stays free of the manager and its kernels.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.PublishedInfo">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.</span></span><span class="sig-name descname"><span class="pre">PublishedInfo</span></span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#PublishedInfo"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.PublishedInfo" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/abc.html#abc.ABC" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ABC</span></code></a></p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.PublishedInfo.clone">
+<span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">clone</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#PublishedInfo.clone"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.PublishedInfo.clone" title="Link to this definition">#</a></dt>
+<dd><p>Return independent publication metadata for deferred sending.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.PublishedInfo" title="mstar.engine.resources.base.PublishedInfo"><em>PublishedInfo</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.PublishedInfo.update">
 <span class="property"><span class="k"><span class="pre">abstractmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">update</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">other</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#PublishedInfo.update"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.PublishedInfo.update" title="Link to this definition">#</a></dt>
@@ -2489,6 +2537,44 @@ across TP ranks after cuda graph capture.</p>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.PublishedInfo" title="mstar.engine.resources.base.PublishedInfo"><em>PublishedInfo</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.Resource.publish_after_stop">
+<span class="sig-name descname"><span class="pre">publish_after_stop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.publish_after_stop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.Resource.publish_after_stop" title="Link to this definition">#</a></dt>
+<dd><p>Publish state that is useful only when a dynamic loop stops.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.PublishedInfo" title="mstar.engine.resources.base.PublishedInfo"><em>PublishedInfo</em></a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.Resource.publish_for_step">
+<span class="sig-name descname"><span class="pre">publish_for_step</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.publish_for_step"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.Resource.publish_for_step" title="Link to this definition">#</a></dt>
+<dd><p>Publish after one node step, with context for selective exporters.</p>
+<p>Existing resources remain compatible through <code class="docutils literal notranslate"><span class="pre">publish</span></code>; resources
+that need node/walk context can override this method.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.PublishedInfo" title="mstar.engine.resources.base.PublishedInfo"><em>PublishedInfo</em></a> | None</p>
@@ -3217,7 +3303,7 @@ in <cite>ctx.plan_results</cite> for the dependents in this same subset.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.StepRunner.publish">
-<span class="sig-name descname"><span class="pre">publish</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.publish"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.StepRunner.publish" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">publish</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.publish"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.StepRunner.publish" title="Link to this definition">#</a></dt>
 <dd><p>durable state outward publish</p>
 <p>non-publish resources noop; pairs with <cite>admit_retrieve</cite></p>
 <p>Scoped to the node whose step just ran; no other node’s state moved,
@@ -3227,6 +3313,25 @@ and <cite>merge_publish_info</cite> keeps the entry it already published.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
 <li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference internal" href="mstar.engine.resources.base.html#mstar.engine.resources.base.PublishedInfo" title="mstar.engine.resources.base.PublishedInfo"><em>PublishedInfo</em></a>]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.StepRunner.publish_after_stop">
+<span class="sig-name descname"><span class="pre">publish_after_stop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/runner.html#StepRunner.publish_after_stop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.StepRunner.publish_after_stop" title="Link to this definition">#</a></dt>
+<dd><p>Publish resources configured for the end of a dynamic loop.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>request_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -3574,7 +3679,9 @@ would otherwise be a silently ineffective setting.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig"><code class="docutils literal notranslate"><span class="pre">KVReqConfig</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.apply_conductor_config"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.apply_conductor_config()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.final_publish_labels_per_node_walk"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.final_publish_labels_per_node_walk</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.get_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.get_labels()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.get_publish_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.get_publish_labels()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.needed_labels"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.needed_labels</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.needed_labels_per_node"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.needed_labels_per_node</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.needed_labels_per_node_walk"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.needed_labels_per_node_walk</span></code></a></li>
@@ -3582,6 +3689,7 @@ would otherwise be a silently ineffective setting.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.prefix_decode"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_decode</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.prefix_keys"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_keys</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.prefix_tail"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.prefix_tail</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVReqConfig.publish_labels_per_node_walk"><code class="docutils literal notranslate"><span class="pre">KVReqConfig.publish_labels_per_node_walk</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec"><code class="docutils literal notranslate"><span class="pre">KVSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -3654,6 +3762,7 @@ would otherwise be a silently ineffective setting.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PublishedInfo"><code class="docutils literal notranslate"><span class="pre">PublishedInfo</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PublishedInfo.clone"><code class="docutils literal notranslate"><span class="pre">PublishedInfo.clone()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PublishedInfo.update"><code class="docutils literal notranslate"><span class="pre">PublishedInfo.update()</span></code></a></li>
 </ul>
 </li>
@@ -3704,6 +3813,8 @@ would otherwise be a silently ineffective setting.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.post_warmup_validate"><code class="docutils literal notranslate"><span class="pre">Resource.post_warmup_validate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.prefix_skip_safe"><code class="docutils literal notranslate"><span class="pre">Resource.prefix_skip_safe</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.publish"><code class="docutils literal notranslate"><span class="pre">Resource.publish()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.publish_after_stop"><code class="docutils literal notranslate"><span class="pre">Resource.publish_after_stop()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.publish_for_step"><code class="docutils literal notranslate"><span class="pre">Resource.publish_for_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.reclaimable"><code class="docutils literal notranslate"><span class="pre">Resource.reclaimable()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.reload"><code class="docutils literal notranslate"><span class="pre">Resource.reload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.remove_request"><code class="docutils literal notranslate"><span class="pre">Resource.remove_request()</span></code></a></li>
@@ -3801,6 +3912,7 @@ would otherwise be a silently ineffective setting.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.pre_admit"><code class="docutils literal notranslate"><span class="pre">StepRunner.pre_admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.pre_plan"><code class="docutils literal notranslate"><span class="pre">StepRunner.pre_plan()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.publish"><code class="docutils literal notranslate"><span class="pre">StepRunner.publish()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.publish_after_stop"><code class="docutils literal notranslate"><span class="pre">StepRunner.publish_after_stop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.remove_request"><code class="docutils literal notranslate"><span class="pre">StepRunner.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">StepRunner.resolve_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.StepRunner.resources"><code class="docutils literal notranslate"><span class="pre">StepRunner.resources</span></code></a></li>
@@ -3853,7 +3965,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 01, 2026.
+  Last updated on Oct 02, 2026.
   <br/>
 </p>
   </div>
