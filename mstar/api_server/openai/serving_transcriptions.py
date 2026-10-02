@@ -28,8 +28,13 @@ Long uploads
     (openai-whisper's log-probability and no-speech thresholds need
     per-token probabilities the engine does not report; they are not applied.)
 
-    ``parallel`` submits fixed windows all at once, each cut at the quietest
-    moment shortly before its nominal boundary, with no conditioning.
+    ``parallel`` cuts fixed windows, each at the quietest moment shortly
+    before its nominal boundary, with no conditioning, and keeps up to
+    :data:`PARALLEL_INFLIGHT` of them on the engine at once.
+
+    Uploads longer than :data:`MAX_DURATION_SECONDS` are rejected. Every
+    window still on the engine when the request ends (error, disconnect) is
+    released, and the upload and window files are deleted.
 
 Response formats
     ``json`` (text only), ``verbose_json`` (language, duration, segments,
@@ -72,6 +77,11 @@ PROMPT_RESET_TEMPERATURE = 0.5
 MIN_SEEK_SECONDS = 1.0
 # parallel mode: how far before a fixed boundary to look for the quietest cut
 CUT_SEARCH_SECONDS = 2.0
+# parallel mode: windows on the engine at once for one upload
+PARALLEL_INFLIGHT = 8
+# longest upload the route accepts, in seconds and in bytes
+MAX_DURATION_SECONDS = 30 * 60
+MAX_UPLOAD_BYTES = 512 * 2**20
 
 
 def save_upload(audio_bytes: bytes, filename: str | None, upload_dir: Path) -> str:
@@ -147,6 +157,7 @@ class WindowPlanner:
         self.max_seconds = max_seconds
         self.upload_dir = Path(upload_dir)
         self.duration = audio_duration_seconds(audio_path)
+        self.files = [audio_path]
         self._audio = None
         self._count = 0
 
@@ -189,8 +200,14 @@ class WindowPlanner:
     def _write(self, piece, offset: float) -> Window:
         stem = Path(self.audio_path).stem
         path = media_io.write_wav(piece, str(self.upload_dir / f"{stem}_w{self._count:04d}.wav"), SAMPLE_RATE)
+        self.files.append(path)
         self._count += 1
         return Window(path=path, offset=offset, duration=len(piece) / SAMPLE_RATE)
+
+    def cleanup(self) -> None:
+        for path in self.files:
+            Path(path).unlink(missing_ok=True)
+        self.files = []
 
 
 def plan_windows(audio_path: str, max_seconds: float | None, upload_dir: Path) -> list[Window]:
@@ -239,7 +256,7 @@ def _attempts(req, carry_over: str | None) -> list[tuple[float, str | None]]:
     return ladder
 
 
-def _submit(api, adapter, req, window: Window, streaming: bool) -> str:
+def _submit(api, adapter, req, window: Window, streaming: bool, inflight: set[str]) -> str:
     args = adapter.transcription_to_request(req, window.path)
     args.model_kwargs.pop("long_form", None)
     request_id = rid("transcr")
@@ -253,8 +270,28 @@ def _submit(api, adapter, req, window: Window, streaming: bool) -> str:
         streaming=streaming,
         request_id=request_id,
     )
+    inflight.add(request_id)
     window.request_id = request_id
     return request_id
+
+
+async def _collect(api, window: Window, inflight: set[str], raw_request=None) -> str:
+    """The window's raw text; collect_results releases the request on every
+    path but cancellation, which the caller's ``_release`` covers."""
+    try:
+        chunks = await api.collect_results(window.request_id, raw_request)
+    except HTTPException:
+        inflight.discard(window.request_id)
+        raise
+    inflight.discard(window.request_id)
+    return _text_of(chunks)
+
+
+def _release(api, inflight: set[str]) -> None:
+    """Abort every window still on the engine (the request ended early)."""
+    for request_id in inflight:
+        api.release_request(request_id)
+    inflight.clear()
 
 
 def _text_of(chunks) -> str:
@@ -287,7 +324,7 @@ def _closed(t: Transcript) -> Transcript:
     )
 
 
-async def _sequential(api, adapter, req, planner: WindowPlanner, raw_request=None):
+async def _sequential(api, adapter, req, planner: WindowPlanner, inflight: set[str], raw_request=None):
     """openai-whisper's loop over the upload; yields each window once its
     transcript is accepted (see the module docstring)."""
     language = req.language
@@ -302,8 +339,8 @@ async def _sequential(api, adapter, req, planner: WindowPlanner, raw_request=Non
             attempt = _window_request(req, language, prompt, timestamps=seeks)
             if temperature != (req.temperature or 0.0):
                 attempt = attempt.model_copy(update={"temperature": temperature})
-            _submit(api, adapter, attempt, window, streaming=False)
-            window.raw_text = _text_of(await api.collect_results(window.request_id, raw_request))
+            _submit(api, adapter, attempt, window, streaming=False, inflight=inflight)
+            window.raw_text = await _collect(api, window, inflight, raw_request)
             parsed = adapter.parse_transcript(window.raw_text, attempt)
             window.temperature = temperature
             window.compression_ratio = compression_ratio(parsed.text)
@@ -364,27 +401,42 @@ async def create_transcription(
             detail=f"response_format must be one of {list(RESPONSE_FORMATS)}; got {fmt!r}",
         )
     mode = _long_form_mode(adapter, req)
+    try:
+        # the adapter checks the fields; before a stream commits to a 200
+        adapter.transcription_to_request(req, "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
     audio_path = save_upload(audio_bytes, filename, api.upload_dir)
     planner = WindowPlanner(audio_path, adapter.max_audio_seconds, api.upload_dir)
+    if planner.duration is not None and planner.duration > MAX_DURATION_SECONDS:
+        planner.cleanup()
+        raise HTTPException(
+            status_code=413,
+            detail=f"audio is {planner.duration:.0f} s; the limit is {MAX_DURATION_SECONDS} s",
+        )
 
     if req.stream:
+        # the stream owns the files and windows from here
         return StreamingResponse(
-            _stream(api, adapter, req, planner, mode, audio_path, raw_request),
+            _stream(api, adapter, req, planner, mode, raw_request),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
 
-    if mode == "parallel" or planner.single:
-        windows = planner.fixed()
-        for window in windows:
-            _submit(api, adapter, req, window, streaming=False)
-        for window in windows:
-            window.raw_text = _text_of(await api.collect_results(window.request_id, raw_request))
-    else:
-        windows = [window async for window in _sequential(api, adapter, req, planner, raw_request)]
+    inflight: set[str] = set()
+    try:
+        if mode == "parallel" or planner.single:
+            windows = planner.fixed()
+            async for _ in _parallel(api, adapter, req, windows, inflight, raw_request):
+                pass
+        else:
+            windows = [w async for w in _sequential(api, adapter, req, planner, inflight, raw_request)]
+        duration = planner.duration
+    finally:
+        _release(api, inflight)
+        planner.cleanup()
 
     transcript = merge_windows(windows, adapter, req)
-    duration = audio_duration_seconds(audio_path)
     if fmt == "text":
         return PlainTextResponse(transcript.text)
     if fmt == "json":
@@ -463,6 +515,18 @@ def render_vtt(segments: list[dict]) -> str:
     return "\n".join(lines)
 
 
+async def _parallel(api, adapter, req, windows: list[Window], inflight: set[str], raw_request=None):
+    """Collect ``windows`` in order with up to :data:`PARALLEL_INFLIGHT` on
+    the engine, yielding each once its raw text is in."""
+    submitted = 0
+    for index, window in enumerate(windows):
+        while submitted < min(len(windows), index + PARALLEL_INFLIGHT):
+            _submit(api, adapter, req, windows[submitted], streaming=False, inflight=inflight)
+            submitted += 1
+        window.raw_text = await _collect(api, window, inflight, raw_request)
+        yield window
+
+
 def _error_event(message: str, status: int | None) -> str:
     return sse({
         "type": "error",
@@ -470,51 +534,66 @@ def _error_event(message: str, status: int | None) -> str:
     })
 
 
-async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, audio_path: str, raw_request=None):
+async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_request=None):
     """Deltas as they come for one window or parallel windows (in window
     order); sequential long form emits each window's text once the window
     is accepted, since only then is it known to stand."""
     windows: list[Window] = []
-    if mode == "parallel" or planner.single:
-        windows = planner.fixed()
-        for window in windows:
-            _submit(api, adapter, req, window, streaming=True)
-        for i, window in enumerate(windows):
-            raw_parts: list[str] = []
-            async for c in api.iter_result_chunks(window.request_id):
-                if c.modality == "error":
-                    yield _error_event(c.data.decode("utf-8", "replace"), (c.metadata or {}).get("status"))
-                    yield SSE_DONE
-                    return
-                if c.modality != "text" or not c.data:
-                    continue
-                text = c.data.decode("utf-8", "replace")
-                raw_parts.append(text)
-                delta = adapter.stream_delta(text)
-                if delta:
-                    yield sse({"type": "transcript.text.delta", "delta": delta})
-            window.raw_text = "".join(raw_parts)
-            if i + 1 < len(windows):
-                # windows are joined by a space in the final text, say so mid-stream
-                yield sse({"type": "transcript.text.delta", "delta": " "})
-            await asyncio.sleep(0)
-    else:
-        try:
-            async for window in _sequential(api, adapter, req, planner, raw_request):
-                if windows:
+    inflight: set[str] = set()
+    try:
+        if mode == "parallel" or planner.single:
+            windows = planner.fixed()
+            submitted = 0
+            for i, window in enumerate(windows):
+                while submitted < min(len(windows), i + PARALLEL_INFLIGHT):
+                    _submit(api, adapter, req, windows[submitted], streaming=True, inflight=inflight)
+                    submitted += 1
+                raw, emitted = "", ""
+                async for c in api.iter_result_chunks(window.request_id):
+                    if c.modality == "error":
+                        yield _error_event(c.data.decode("utf-8", "replace"), (c.metadata or {}).get("status"))
+                        yield SSE_DONE
+                        return
+                    if c.modality != "text" or not c.data:
+                        continue
+                    raw += c.data.decode("utf-8", "replace")
+                    delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
+                    if delta:
+                        yield sse({"type": "transcript.text.delta", "delta": delta})
+                inflight.discard(window.request_id)
+                window.raw_text = raw
+                if i + 1 < len(windows):
+                    # windows are joined by a space in the final text, say so mid-stream
                     yield sse({"type": "transcript.text.delta", "delta": " "})
-                windows.append(window)
-                if window.transcript.text:
-                    yield sse({"type": "transcript.text.delta", "delta": window.transcript.text})
                 await asyncio.sleep(0)
-        except HTTPException as exc:
-            yield _error_event(str(exc.detail), exc.status_code)
-            yield SSE_DONE
-            return
-    transcript = merge_windows(windows, adapter, req)
-    yield sse({
-        "type": "transcript.text.done",
-        "text": transcript.text,
-        "usage": _usage(audio_duration_seconds(audio_path)),
-    })
-    yield SSE_DONE
+        else:
+            try:
+                async for window in _sequential(api, adapter, req, planner, inflight, raw_request):
+                    if windows:
+                        yield sse({"type": "transcript.text.delta", "delta": " "})
+                    windows.append(window)
+                    if window.transcript.text:
+                        yield sse({"type": "transcript.text.delta", "delta": window.transcript.text})
+                    await asyncio.sleep(0)
+            except HTTPException as exc:
+                yield _error_event(str(exc.detail), exc.status_code)
+                yield SSE_DONE
+                return
+        transcript = merge_windows(windows, adapter, req)
+        yield sse({
+            "type": "transcript.text.done",
+            "text": transcript.text,
+            "usage": _usage(planner.duration),
+        })
+        yield SSE_DONE
+    finally:
+        _release(api, inflight)
+        planner.cleanup()
+
+
+def _stream_delta(text: str, emitted: str) -> tuple[str, str]:
+    """The part of the clean text so far not sent yet. Deltas are
+    append-only, so a revision of sent text is not resent."""
+    if text.startswith(emitted):
+        return text[len(emitted):], text
+    return "", emitted

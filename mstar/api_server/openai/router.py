@@ -123,6 +123,9 @@ async def audio_transcriptions(request: Request):
         upload = form.get("file")
         if upload is None or not hasattr(upload, "read"):
             return _error(400, "audio/transcriptions requires a 'file' upload")
+        limit = serving_transcriptions.MAX_UPLOAD_BYTES
+        if (getattr(upload, "size", None) or 0) > limit:
+            return _error(413, f"audio/transcriptions accepts files up to {limit // 2**20} MiB")
         audio_bytes = await upload.read()
         if not audio_bytes:
             return _error(400, "audio/transcriptions received an empty 'file'")

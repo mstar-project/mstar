@@ -24,6 +24,7 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -265,10 +266,12 @@ class OpenAIAdapter:
         and timestamp tokens, an LLM decoder's tags) parses them here."""
         return Transcript(text=text.strip())
 
-    def stream_delta(self, text: str) -> str:
-        """The client-facing part of one streamed text chunk. The default
-        passes it through; a model with control tokens strips them."""
-        return text
+    def stream_text(self, raw: str) -> str:
+        """The client-facing text of the raw stream so far. It must only
+        grow as ``raw`` does, so a model with control tokens strips them and
+        holds back a tail that may still turn out to be one. The default
+        passes the text through."""
+        return raw
 
     def realtime_step_request(self, req: TranscriptionRequest, audio_path: str, prefix: str) -> SubmitArgs:  # noqa: ARG002
         """One streaming step: transcribe ``audio_path`` (everything heard so
@@ -647,11 +650,37 @@ class Wan22Adapter(OpenAIAdapter):
 # information (language, timestamps) into their text stream so the adapter can
 # lift them out here. Everything else is dropped.
 _CONTROL_TOKEN = re.compile(r"<\|([^|<>]*)\|>")
+# a control token cut off by the end of the stream so far
+_PARTIAL_CONTROL_TOKEN = re.compile(r"<(\|[^|<>]*\|?)?$")
 _TIMESTAMP = re.compile(r"^\d+\.\d{2}$")
 _LANGUAGE = re.compile(r"^[a-z]{2,3}$")
 # Whisper's word timings follow the transcript after this marker, one
 # ``<|start|> word <|end|>`` per word in the same timestamp vocabulary
 _WORDS_MARKER = "<|startoflm|>"
+
+
+# sampling knobs the engine reads as numbers; a string there fails every
+# request batched with it, so they are checked before submission
+_NUMERIC_KWARGS = {
+    "temperature": float, "top_p": float, "min_p": float, "repetition_penalty": float,
+    "top_k": int, "max_output_tokens": int, "seed": int,
+}
+
+
+def _check_numeric_kwargs(mk: dict) -> dict:
+    """Coerce the known numeric ``model_kwargs`` to numbers, or raise ValueError."""
+    for key, kind in _NUMERIC_KWARGS.items():
+        value = mk.get(key)
+        if value is None or (kind is int and isinstance(value, int) and not isinstance(value, bool)):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be a number; got {value!r}") from None
+        if not math.isfinite(number) or (kind is int and not number.is_integer()):
+            raise ValueError(f"{key} must be a finite {kind.__name__}; got {value!r}")
+        mk[key] = kind(number)
+    return mk
 
 
 def _transcription_kwargs(req: TranscriptionRequest) -> dict:
@@ -675,7 +704,7 @@ def _transcription_kwargs(req: TranscriptionRequest) -> dict:
         mk.setdefault("timestamps", "word")
     elif granularities or req.response_format in ("verbose_json", "srt", "vtt"):
         mk.setdefault("timestamps", "segment")
-    return mk
+    return _check_numeric_kwargs(mk)
 
 
 class WhisperAdapter(OpenAIAdapter):
@@ -685,7 +714,7 @@ class WhisperAdapter(OpenAIAdapter):
     a leading ``<|xx|>`` language token when the language was detected or
     forced, and ``<|s.ss|>`` timestamp tokens around each segment when
     timestamps were requested. ``parse_transcript`` lifts those into
-    :class:`Transcript`; ``stream_delta`` hides them from streaming clients.
+    :class:`Transcript`; ``stream_text`` hides them from streaming clients.
     """
 
     supports_transcriptions = True
@@ -706,10 +735,9 @@ class WhisperAdapter(OpenAIAdapter):
             model_kwargs=_transcription_kwargs(req),
         )
 
-    def stream_delta(self, text: str) -> str:
-        if _WORDS_MARKER in text:
-            return ""  # the word timings arrive as one chunk after the transcript
-        return _CONTROL_TOKEN.sub("", text)
+    def stream_text(self, raw: str) -> str:
+        raw = raw.partition(_WORDS_MARKER)[0]  # word timings follow the transcript
+        return _CONTROL_TOKEN.sub("", _PARTIAL_CONTROL_TOKEN.sub("", raw))
 
     def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
         text, _, timed_words = text.partition(_WORDS_MARKER)

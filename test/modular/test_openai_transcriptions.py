@@ -5,6 +5,7 @@ The router is mounted on a FastAPI app with a stubbed APIServer, like
 """
 
 import json
+import re
 import sys
 import tempfile
 import types
@@ -41,10 +42,16 @@ class _StubAPI:
         self.next_chunks: list = []
         # per-submission chunk lists, consumed in order (long-form windows)
         self.queued_chunks: list = []
+        self.released: list = []
+        self.wav_seconds: list = []
 
     def submit_request(self, **kw):
         self.last_submit = kw
         self.submits.append(kw)
+        # window files are deleted once the request is done
+        path = Path(kw["file_paths"]["audio"][0])
+        if re.search(r"_w\d{4}$", path.stem):
+            self.wav_seconds.append(_wav_seconds(str(path)))
         chunks = self.queued_chunks.pop(0) if self.queued_chunks else list(self.next_chunks)
         self._chunks[kw["request_id"]] = chunks
         return kw["request_id"]
@@ -55,6 +62,9 @@ class _StubAPI:
     async def iter_result_chunks(self, request_id):
         for c in self._chunks.get(request_id, []):
             yield c
+
+    def release_request(self, request_id):
+        self.released.append(request_id)
 
 
 @pytest.fixture
@@ -160,11 +170,19 @@ def test_whisper_parse_keeps_text_of_an_unterminated_segment():
     assert t.text == "cut off" and t.segments == []
 
 
-def test_whisper_stream_delta_hides_control_tokens():
+def test_whisper_stream_text_hides_control_tokens():
     ad = adapters.WhisperAdapter()
-    assert ad.stream_delta("<|en|>") == ""
-    assert ad.stream_delta("<|0.00|> Hello") == " Hello"
-    assert ad.stream_delta(" world") == " world"
+    assert ad.stream_text("<|en|>") == ""
+    assert ad.stream_text("<|en|><|0.00|> Hello") == " Hello"
+    assert ad.stream_text("<|en|><|0.00|> Hello world") == " Hello world"
+
+
+def test_whisper_stream_text_holds_back_a_split_control_token():
+    ad = adapters.WhisperAdapter()
+    assert ad.stream_text("<|e") == ""
+    assert ad.stream_text("<|en|><|0.00|> Hi<") == " Hi"
+    assert ad.stream_text("<|en|><|0.00|> Hi<|1.0") == " Hi"
+    assert ad.stream_text("<|en|><|0.00|> Hi<|1.00|>") == " Hi"
 
 
 def test_higgs_request_uses_prompt_as_instruction():
@@ -211,7 +229,8 @@ def test_transcription_json(client_and_stub):
     assert submit["model_kwargs"]["temperature"] == 0
     assert submit["streaming"] is False
     (saved,) = submit["file_paths"]["audio"]
-    assert Path(saved).read_bytes() == b"RIFFfake" and saved.endswith("_speech.wav")
+    # deleted once the request is done
+    assert saved.endswith("_speech.wav") and not Path(saved).exists()
 
 
 def test_transcription_text_format(client_and_stub):
@@ -317,9 +336,8 @@ def test_whisper_words_follow_the_transcript_after_the_marker():
         {"word": "there.", "start": 0.6, "end": 1.18},
     ]
     assert not t.unfinished
-    # streaming clients never see the timing chunk
-    assert ad.stream_delta("<|startoflm|><|0.02|>Hello<|0.60|>") == ""
-    assert ad.stream_delta("<|0.00|> Hello") == " Hello"
+    # streaming clients never see the timings
+    assert ad.stream_text(raw) == " Hello there."
 
 
 # --------------------------------------------------------------------------
@@ -451,7 +469,7 @@ def test_sequential_seeks_to_the_last_closed_segment(client_and_stub):
     assert stub.submits[1]["model_kwargs"]["initial_prompt"] == "First."
     assert stub.submits[2]["model_kwargs"]["initial_prompt"] == "First. Second."
     # window 2 starts at 20 s and is a full window, window 3 starts where it ended (50 s)
-    assert [round(_wav_seconds(s["file_paths"]["audio"][0]), 2) for s in stub.submits] == [30.0, 30.0, 15.0]
+    assert [round(t, 2) for t in stub.wav_seconds] == [30.0, 30.0, 15.0]
 
 
 def test_sequential_json_decodes_windows_with_timestamps(client_and_stub):
@@ -471,7 +489,7 @@ def test_short_seek_or_no_closed_segment_takes_the_whole_window(client_and_stub)
     ]
     r = _post(client, {"model": "whisper_large"}, filename="long.wav", content=_wav_bytes(65))
     assert r.json() == {"text": "open ended a tail last"}
-    assert [round(_wav_seconds(s["file_paths"]["audio"][0]), 2) for s in stub.submits] == [30.0, 30.0, 5.0]
+    assert [round(t, 2) for t in stub.wav_seconds] == [30.0, 30.0, 5.0]
 
 
 def test_repetitive_window_first_drops_the_prompt_then_warms_up(client_and_stub):
@@ -532,3 +550,105 @@ def test_split_windows_cuts_at_the_quietest_point():
     assert sum(len(p) for p in pieces) == len(audio)
     fixed = media_io.split_windows(audio, 30.0, 16_000)
     assert [len(p) / 16_000 for p in fixed] == [30.0, 30.0, 15.0]
+
+
+# --------------------------------------------------------------------------
+# hardening
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field,value", [("top_p", "abc"), ("max_output_tokens", "abc"), ("top_k", "1.5")])
+def test_non_numeric_sampling_kwargs_are_rejected_before_submission(client_and_stub, field, value):
+    client, stub = client_and_stub
+    r = _post(client, {"model": "whisper_large", field: value}, filename="a.wav", content=_wav_bytes(1))
+    assert r.status_code == 400 and field in r.json()["error"]["message"]
+    assert not stub.submits
+
+
+def test_non_numeric_sampling_kwargs_are_rejected_before_a_stream_opens(client_and_stub):
+    client, stub = client_and_stub
+    r = _post(client, {"model": "whisper_large", "stream": "true", "top_p": "abc"},
+              filename="a.wav", content=_wav_bytes(1))
+    assert r.status_code == 400 and not stub.submits
+
+
+def test_numeric_strings_are_coerced():
+    req = TranscriptionRequest(top_p="0.9", max_output_tokens="100")
+    mk = adapters.WhisperAdapter().transcription_to_request(req, "/tmp/a.wav").model_kwargs
+    assert mk["top_p"] == 0.9 and mk["max_output_tokens"] == 100
+
+
+def test_upload_and_window_files_are_deleted(client_and_stub):
+    client, stub = client_and_stub
+    stub.queued_chunks = [_text(" one"), _text(" two"), _text(" three")]
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel"},
+              filename="long.wav", content=_wav_bytes(61))
+    assert r.status_code == 200
+    assert not list(stub.upload_dir.iterdir())
+
+
+def test_streamed_upload_files_are_deleted(client_and_stub):
+    client, stub = client_and_stub
+    stub.queued_chunks = [_text(" one"), _text(" two")]
+    with client.stream(
+        "POST", "/v1/audio/transcriptions",
+        data={"model": "whisper_large", "stream": "true"},
+        files={"file": ("long.wav", _wav_bytes(45), "audio/wav")},
+    ) as r:
+        list(r.iter_lines())
+    assert not list(stub.upload_dir.iterdir())
+
+
+def test_parallel_bounds_windows_in_flight(client_and_stub, monkeypatch):
+    client, stub = client_and_stub
+    monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 2)
+    seen = []
+    collect = stub.collect_results
+
+    async def watching(request_id, raw_request=None):
+        seen.append(len(stub.submits))
+        return await collect(request_id, raw_request)
+
+    stub.collect_results = watching
+    stub.queued_chunks = [_text(f" w{i}") for i in range(5)]
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel"},
+              filename="long.wav", content=_wav_bytes(140))
+    assert r.json() == {"text": "w0 w1 w2 w3 w4"}
+    assert seen == [2, 3, 4, 5, 5]
+
+
+def test_parallel_failure_releases_the_other_windows(client_and_stub):
+    client, stub = client_and_stub
+    stub.queued_chunks = [[_Chunk("error", b"bad language", {"status": 400})], _text(" two"), _text(" three")]
+
+    async def collect(request_id, raw_request=None):
+        return serving_transcriptions._text_of(stub._chunks[request_id]) and []
+
+    stub.collect_results = collect
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel"},
+              filename="long.wav", content=_wav_bytes(61))
+    assert r.status_code == 400
+    assert sorted(stub.released) == sorted(s["request_id"] for s in stub.submits[1:])
+    assert not list(stub.upload_dir.iterdir())
+
+
+def test_streaming_parallel_error_releases_the_other_windows(client_and_stub):
+    client, stub = client_and_stub
+    stub.queued_chunks = [[_Chunk("error", b"bad language", {"status": 400})], _text(" two"), _text(" three")]
+    with client.stream(
+        "POST", "/v1/audio/transcriptions",
+        data={"model": "whisper_large", "stream": "true", "long_form": "parallel"},
+        files={"file": ("long.wav", _wav_bytes(61), "audio/wav")},
+    ) as r:
+        lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
+    assert json.loads(lines[0][len("data: "):])["type"] == "error"
+    # the failed window is released too: its iterator was left mid-stream
+    assert sorted(stub.released) == sorted(s["request_id"] for s in stub.submits)
+
+
+def test_upload_longer_than_the_cap_is_rejected(client_and_stub, monkeypatch):
+    client, stub = client_and_stub
+    monkeypatch.setattr(serving_transcriptions, "MAX_DURATION_SECONDS", 60)
+    r = _post(client, {"model": "whisper_large"}, filename="long.wav", content=_wav_bytes(61))
+    assert r.status_code == 413 and not stub.submits
+    assert not list(stub.upload_dir.iterdir())

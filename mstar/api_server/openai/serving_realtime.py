@@ -30,6 +30,7 @@ batch on the engine like any other traffic.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -41,7 +42,7 @@ import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
 from mstar.api_server import media_io
-from mstar.api_server.openai._util import now
+from mstar.api_server.openai._util import now, rid
 from mstar.api_server.openai.protocol import TranscriptionRequest
 
 logger = logging.getLogger(__name__)
@@ -136,23 +137,31 @@ def _common_prefix_len(a: str, b: str) -> int:
 async def _run_step(api, adapter, session: RealtimeSession, prefix: str) -> str:
     """Transcribe the audio heard so far, continuing from ``prefix``; return
     the model's raw output (prefix included)."""
+    # a fresh id per step: a failed step does not advance chunk_id, and its
+    # id is still draining when the next step goes out
+    request_id = rid(f"rt-{session.session_id}")
     path = media_io.write_wav(
-        session.audio_so_far(), str(Path(api.upload_dir) / f"rt_{session.session_id}_{session.chunk_id:05d}.wav"),
-        SAMPLE_RATE,
+        session.audio_so_far(), str(Path(api.upload_dir) / f"{request_id}.wav"), SAMPLE_RATE,
     )
-    args = adapter.realtime_step_request(session.request, path, prefix)
-    request_id = f"rt-{session.session_id}-{session.chunk_id}"
-    api.submit_request(
-        text=args.text,
-        file_paths=args.file_paths,
-        input_modalities=args.input_modalities,
-        output_modalities=args.output_modalities,
-        model_kwargs=args.model_kwargs,
-        prompt_parts=args.prompt_parts,
-        streaming=False,
-        request_id=request_id,
-    )
-    chunks = await api.collect_results(request_id)
+    try:
+        args = adapter.realtime_step_request(session.request, path, prefix)
+        api.submit_request(
+            text=args.text,
+            file_paths=args.file_paths,
+            input_modalities=args.input_modalities,
+            output_modalities=args.output_modalities,
+            model_kwargs=args.model_kwargs,
+            prompt_parts=args.prompt_parts,
+            streaming=False,
+            request_id=request_id,
+        )
+        try:
+            chunks = await api.collect_results(request_id)
+        except asyncio.CancelledError:
+            api.release_request(request_id)
+            raise
+    finally:
+        Path(path).unlink(missing_ok=True)
     text = "".join(c.data.decode("utf-8", "replace") for c in chunks if c.modality == "text")
     errors = [c for c in chunks if c.modality == "error"]
     if errors:
@@ -221,7 +230,11 @@ class RealtimeTranscription:
     async def handle(self, event: dict) -> None:
         kind = event.get("type")
         if kind == "transcription_session.update":
-            self.update(event.get("session") or {})
+            try:
+                self.update(event.get("session") or {})
+            except (TypeError, ValueError) as exc:
+                await self.send(_error(str(exc)))
+                return
             await self.send(_event("transcription_session.updated", session=self._session_view()))
         elif kind == "input_audio_buffer.append":
             try:
@@ -252,21 +265,20 @@ class RealtimeTranscription:
             await self.send(_error(f"unknown event {kind!r}"))
 
     def update(self, session: dict) -> None:
+        """Apply a session update, all or nothing."""
         s = self.session
+        fmt = session.get("input_audio_format")
+        if fmt not in (None, "pcm16"):
+            raise ValueError(f"only pcm16 input is supported; got {fmt!r}")
+        knobs = session.get("mstar") or {}
+        chunk_seconds = max(float(knobs.get("chunk_seconds", s.chunk_seconds)), 0.1)
+        unfixed_chunks = int(knobs.get("unfixed_chunks", s.unfixed_chunks))
+        unfixed_tokens = int(knobs.get("unfixed_tokens", s.unfixed_tokens))
         transcription = session.get("input_audio_transcription") or {}
         fields = {k: v for k, v in transcription.items() if k in ("language", "prompt")}
         if fields:
             s.request = s.request.model_copy(update=fields)
-        knobs = session.get("mstar") or {}
-        if "chunk_seconds" in knobs:
-            s.chunk_seconds = max(float(knobs["chunk_seconds"]), 0.1)
-        if "unfixed_chunks" in knobs:
-            s.unfixed_chunks = int(knobs["unfixed_chunks"])
-        if "unfixed_tokens" in knobs:
-            s.unfixed_tokens = int(knobs["unfixed_tokens"])
-        fmt = session.get("input_audio_format")
-        if fmt not in (None, "pcm16"):
-            raise ValueError(f"only pcm16 input is supported; got {fmt!r}")
+        s.chunk_seconds, s.unfixed_chunks, s.unfixed_tokens = chunk_seconds, unfixed_chunks, unfixed_tokens
 
     def current_text(self) -> str:
         return self.adapter.parse_transcript(self.session.raw_hypothesis, self.session.request).text
