@@ -5,6 +5,10 @@ decision that state drives: which requests belong to a session, whether a
 resumed request may be ingested yet, which deferred removal also ends its
 session, and which held teardown is free to run.
 
+Requests are the worker's rid *handles*, like the rest of its per-request state;
+a held NEW_REQUEST is the one exception, since its handle is minted only once the
+worker admits it.
+
 Nothing here talks to the engine or the communicator — the worker does that. The
 one thing it cannot answer for itself is whether a request is still on its way
 out of the worker, so that predicate is injected.
@@ -23,14 +27,15 @@ logger = logging.getLogger(__name__)
 class WorkerSessionManager:
     """The persistent sessions one worker holds state for."""
 
-    # rid -> is it still on its way out of this worker (held by an in-flight
-    # step, a deferred removal, or still registered)? Only the worker knows.
-    is_leaving: Callable[[str], bool]
+    # rid handle -> is it still on its way out of this worker (held by an
+    # in-flight step, a deferred removal, or still registered)? Only the worker
+    # knows.
+    is_leaving: Callable[[int], bool]
 
-    _session_rids: dict[str, set[str]] = field(default_factory=dict)
-    _rid_session: dict[str, str] = field(default_factory=dict)
+    _session_rids: dict[str, set[int]] = field(default_factory=dict)
+    _rid_session: dict[int, str] = field(default_factory=dict)
     # deferred removes that also end their session
-    _pending_remove_end_session: set[str] = field(default_factory=set)
+    _pending_remove_end_session: set[int] = field(default_factory=set)
     # TEARDOWN_SESSIONs waiting on their requests to finish leaving
     _pending_session_teardowns: set[str] = field(default_factory=set)
     # NEW_REQUESTs held until their session's previous request has finished
@@ -42,14 +47,14 @@ class WorkerSessionManager:
     # What the worker holds
     # ------------------------------------------------------------------
 
-    def get_rids(self, session_id: str) -> set[str]:
+    def get_rids(self, session_id: str) -> set[int]:
         return self._session_rids.get(session_id, set())
 
-    def session_of(self, request_id: str) -> str | None:
+    def session_of(self, request_id: int) -> str | None:
         return self._rid_session.get(request_id)
 
     def requests_still_leaving(
-        self, session_id: str, except_rid: str | None = None,
+        self, session_id: str, except_rid: int | None = None,
     ) -> bool:
         """Whether any of the session's requests is still on its way out.
 
@@ -73,14 +78,18 @@ class WorkerSessionManager:
     # Ingest
     # ------------------------------------------------------------------
 
-    def hold_if_not_ready(self, body: NewRequest) -> bool:
+    def hold_if_not_ready(
+        self, body: NewRequest, own_handle: int | None = None,
+    ) -> bool:
         """Hold a resumed request whose session has not handed its state over.
 
+        ``own_handle`` is the handle this request already has here, if the
+        worker has seen another of its partitions — it is not a request leaving.
         True when the request was held; the worker must then leave it alone
         until ``take_held_ingests`` gives it back.
         """
         if body.session_id is None or not self.requests_still_leaving(
-            body.session_id, except_rid=body.request_id,
+            body.session_id, except_rid=own_handle,
         ):
             return False
         # ingesting now would adopt nothing
@@ -101,7 +110,7 @@ class WorkerSessionManager:
         held, self._pending_session_ingests = self._pending_session_ingests, []
         return held
 
-    def bind(self, request_id: str, session_id: str | None) -> None:
+    def bind(self, request_id: int, session_id: str | None) -> None:
         """Record which session a request belongs to; a no-op without one."""
         if session_id is None:
             return
@@ -112,15 +121,15 @@ class WorkerSessionManager:
     # Removal
     # ------------------------------------------------------------------
 
-    def defer_end_session(self, request_id: str) -> None:
+    def defer_end_session(self, request_id: int) -> None:
         """Remember that a removal deferred behind a GPU step ends its session,
         so the flag survives being reconstructed later."""
         self._pending_remove_end_session.add(request_id)
 
-    def ends_session(self, request_id: str) -> bool:
+    def ends_session(self, request_id: int) -> bool:
         return request_id in self._pending_remove_end_session
 
-    def release(self, request_id: str) -> str | None:
+    def release(self, request_id: int) -> str | None:
         """Drop the request, returning the session it belonged to.
 
         The session itself stays — it keeps what the request built — unless the

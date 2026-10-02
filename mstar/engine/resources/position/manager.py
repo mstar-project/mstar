@@ -32,6 +32,9 @@ class PublishedPositionInfo(PublishedInfo):
             if position > self.counters.get(label, 0):
                 self.counters[label] = position
 
+    def clone(self) -> "PublishedPositionInfo":
+        return PublishedPositionInfo(counters=self.counters.copy())
+
 
 class PositionManager(Resource):
     # only under a sequential scheme, which the load check enforces

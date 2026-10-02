@@ -105,6 +105,9 @@ class StepRunner:
         # capture-time buffer allocation, likewise scoped: a node's runner has
         # no business sizing a resource it never plans against
         self._node_order = self._per_node(node_resources, list(self._order))
+        # the step whose pre-plan is staged across the pre-planning resources,
+        # as `_step_key` describes it; None when nothing is staged
+        self._staged: tuple | None = None
 
     def resolve_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str,
@@ -337,8 +340,63 @@ class StepRunner:
 
 
 
+    # ── Pre-plan bookkeeping ─────────────────────────────────────────────
+    #
+    # A pre-plan is staged across every pre-planning resource for one step,
+    # and each resource promotes its share when that step's full `plan`
+    # arrives. Only the runner sees the whole step, so it is the one that
+    # decides whether the step reaching `admit`/`plan` is the staged one. Any
+    # other step — a new request's prefill dispatched while a decode step sits
+    # pre-planned, or the same rows re-declared without their lease — drops
+    # the stage on every resource first. Otherwise a resource that promotes
+    # blindly (the attention wrappers, positions) would run against the KV
+    # layout its dependency just discarded and planned afresh.
+
+    def _step_key(self, step: SubmoduleStep):
+        """What identifies the step a pre-plan was staged for: its walk, the
+        rows it runs (padding included), the replay slot it was leased on,
+        its capture key, and every resource's segments."""
+        ctx = step.ctx
+        lease = ctx.slot_lease
+        return (
+            ctx.graph_walk,
+            tuple(ctx.padded_request_ids),
+            None if lease is None else lease.slot,
+            step.cg_key_info,
+            tuple(
+                (key, tuple(step.get(key).segments or ()))
+                for key in self._keys_for(step)
+            ),
+        )
+
+    def _drop_stale_preplan(self, step: SubmoduleStep) -> None:
+        if self._staged is None or step.ctx.is_preplan:
+            return
+        key = self._step_key(step)
+        if self._staged != key:
+            # Not the normal path: the worker meant to run the staged step
+            # next. Name both steps so the source can be traced.
+            logger.warning(
+                "dropping the staged pre-plan (walk %s, %d rows) for a different "
+                "step (walk %s, %d rows) that reached the GPU thread first",
+                self._staged[0], len(self._staged[1]), key[0], len(key[1]),
+            )
+            self.clear_preplan()
+
+    @property
+    def staged(self) -> bool:
+        """A pre-plan is staged and not yet promoted."""
+        return self._staged is not None
+
+    def clear_preplan(self) -> None:
+        """Drop the staged pre-plan on every resource, and the record of it."""
+        self._staged = None
+        for key in self._order:
+            self._resources[key].clear_preplan()
+
     def admit(self, step: SubmoduleStep) -> FullAdmitOutcome:
         """reserve capacity for step"""
+        self._drop_stale_preplan(step)
         ready = True
         for key in self._keys_for(step):
             if self._nvtx:
@@ -362,6 +420,11 @@ class StepRunner:
 
         place plan in `step.ctx.plan_results` before next plan runs
         again could possibly move that into `plan` itself"""
+        self._drop_stale_preplan(step)
+        if not step.ctx.is_preplan:
+            # the resources promote their staged share below (or plan afresh
+            # if nothing was staged): either way nothing stays staged
+            self._staged = None
         results = step.ctx.plan_results
         results.clear()
         for key in self._keys_for(step):
@@ -412,6 +475,7 @@ class StepRunner:
             finally:
                 if self._nvtx:
                     range_pop()
+        self._staged = self._step_key(step)
         return results
 
     def commit(self, step: SubmoduleStep) -> None:
@@ -426,7 +490,10 @@ class StepRunner:
                     range_pop()
 
     def publish(
-        self, request_ids: list[str], node_name: str | None = None,
+        self,
+        request_ids: list[str],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
     ) -> dict[str, dict[str, PublishedInfo]]:
         """durable state outward publish
 
@@ -442,13 +509,36 @@ class StepRunner:
         for rid in request_ids:
             per_key: dict[str, PublishedInfo] = {}
             for key, resource in publishers:
-                info = resource.publish(rid)
+                info = resource.publish_for_step(
+                    rid, node_name=node_name, graph_walk=graph_walk,
+                )
                 if info is not None:
                     per_key[key] = info
             out[rid] = per_key
         return out
 
-
+    def publish_after_stop(
+        self,
+        request_ids: list[str],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+    ) -> dict[str, dict[str, PublishedInfo]]:
+        """Publish resources configured for the end of a dynamic loop."""
+        order = self._sweep(self._node_publish_order, self._publish_order, node_name)
+        if not order:
+            return {rid: {} for rid in request_ids}
+        publishers = [(key, self._resources[key]) for key in order]
+        out: dict[str, dict[str, PublishedInfo]] = {}
+        for rid in request_ids:
+            per_key: dict[str, PublishedInfo] = {}
+            for key, resource in publishers:
+                info = resource.publish_after_stop(
+                    rid, node_name=node_name, graph_walk=graph_walk,
+                )
+                if info is not None:
+                    per_key[key] = info
+            out[rid] = per_key
+        return out
 
     def build_cuda_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,

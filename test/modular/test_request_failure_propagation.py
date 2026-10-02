@@ -40,6 +40,25 @@ from mstar.worker.worker import PendingBatch, Worker
 # ── worker ─────────────────────────────────────────────────────────────────
 
 
+class _Runtime:
+    """Interning plus the speculative flag, which the runtime owns now."""
+
+    def __init__(self, known_rids):
+        self._known = set(known_rids)
+        self.cleared: list[tuple[str, list]] = []
+
+    def get_rid_handle(self, r):
+        return r if r in self._known else None
+
+    def get_rid_string(self, h):
+        return h
+
+    def set_speculatively_scheduled(self, node, wg_id, rids, value):
+        del wg_id
+        if not value:
+            self.cleared.append((node, list(rids)))
+
+
 def _worker(known_rids=("r1", "r2")):
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
@@ -47,9 +66,11 @@ def _worker(known_rids=("r1", "r2")):
     w.communicator = SimpleNamespace(
         send=lambda entity_id, msg: w.sent.append((entity_id, msg))
     )
-    w.worker_graphs_manager = SimpleNamespace(
+    w.request_state = SimpleNamespace(
         per_request_info={rid: object() for rid in known_rids}
     )
+    # Identity interning: the rid string doubles as its own handle here.
+    w._graph_runtime = _Runtime(known_rids)
     w.scheduler = MicroScheduler.__new__(MicroScheduler)
     w.scheduler.failed_rids = set()
     w.scheduler.held_until = {}
@@ -83,9 +104,6 @@ def _pending_batch(rids, future=None):
     return PendingBatch(
         batch=ScheduledBatch(
             node_name="node", graph_walk="walk",
-            node_objects={
-                rid: SimpleNamespace(_speculatively_scheduled=True) for rid in rids
-            },
             request_to_worker_graph={rid: "wg" for rid in rids},
         ),
         # _handle_main_loop_error works off the ScheduledBatch alone; the
@@ -113,11 +131,8 @@ def test_crashed_forward_fails_the_whole_batch():
         assert set(errors) == {"r1"}
         assert "ZeroDivisionError" in errors["r1"]
         # The node must not stay flagged as speculatively scheduled, or it can
-        # never be re-queued.
-        assert all(
-            not n._speculatively_scheduled
-            for n in pending.batch.node_objects.values()
-        )
+        # never be re-queued. The runtime owns that flag now.
+        assert w._graph_runtime.cleared == [("node", ["r1"])]
     finally:
         executor.shutdown(wait=True)
 
@@ -154,7 +169,6 @@ def test_error_handler_also_fails_the_batch_built_this_iteration():
     w._in_flight_rids = {"r1"}
     scheduled = ScheduledBatch(
         node_name="node", graph_walk="walk",
-        node_objects={"r2": SimpleNamespace(_speculatively_scheduled=True)},
         request_to_worker_graph={"r2": "wg"},
     )
     w._handle_main_loop_error(RuntimeError("boom"), (None, None), scheduled)
@@ -251,7 +265,7 @@ def test_engine_failure_does_not_clobber_an_earlier_error():
 
 
 def _preprocess_thread(model):
-    from mstar.api_server.data_worker import PreprocessWorkerThread
+    from mstar.api_server.data_worker import PreprocessWorkerThread, RequestOutputState
 
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
     wt.out_queue = queue.Queue()
@@ -259,6 +273,10 @@ def _preprocess_thread(model):
     wt.request_model_kwargs = {}
     wt.tensor_uuid_to_metadata_per_request = {"r1": {"u1": {}}}
     wt.enable_prof = False
+    wt.enable_nvtx = False
+    wt.request_output_state = {
+        "r1": RequestOutputState(order={"u1": (0, None)}, next_sequence=1),
+    }
     return wt
 
 
@@ -277,8 +295,8 @@ def test_output_postprocess_failure_becomes_an_error_chunk():
     )
     wt.tensor_manager = SimpleNamespace(
         get_ready_tensors=lambda: {"r1": [edge]},
-        get_tensor=lambda request_id, uuid: object(),
-        dereference=lambda request_id, uuid: dereferenced.append(uuid),
+        get_tensor=lambda uuid: object(),
+        dereference=dereferenced.append,
     )
 
     assert wt._process_read_tensors() is True
@@ -289,6 +307,37 @@ def test_output_postprocess_failure_becomes_an_error_chunk():
     assert chunk.metadata["status"] == 500
     # The tensor is still released even though postprocessing died.
     assert dereferenced == ["u1"]
+
+
+def test_a_failed_output_releases_the_outputs_held_behind_it():
+    """Sequence 1 finished first and waits in the reorder buffer for 0. When 0
+    fails, its error chunk must take slot 0 so 1 is released in order; emitted
+    around the buffer, 1 would sit in ``pending`` until the API server's TTL."""
+
+    class _BadModel:
+        def postprocess(self, tensor, modality, request_kwargs=None):
+            raise RuntimeError("decode failed")
+
+    wt = _preprocess_thread(_BadModel())
+    held = ResultChunk(request_id="r1", modality="text", data=b"later", metadata={})
+    wt.request_output_state["r1"].pending[1] = held
+    wt.request_output_state["r1"].next_sequence = 2
+    edge = SimpleNamespace(
+        name="text_output", tensor_info=[SimpleNamespace(uuid="u1")],
+    )
+    wt.tensor_manager = SimpleNamespace(
+        get_ready_tensors=lambda: {"r1": [edge]},
+        get_tensor=lambda uuid: object(),
+        dereference=lambda uuid: None,
+    )
+
+    assert wt._process_read_tensors() is True
+    chunks = [wt.out_queue.get_nowait(), wt.out_queue.get_nowait()]
+    assert [c.modality for c in chunks] == ["error", "text"]
+    assert chunks[1] is held
+    assert wt.out_queue.empty()
+    assert wt.request_output_state["r1"].pending == {}
+    assert wt.request_output_state["r1"].next_emit == 2
 
 
 def test_result_transfer_failure_answers_for_every_queued_tensor():

@@ -21,6 +21,32 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+# The head dims FlashInfer instantiates its paged prefill/decode kernels (and
+# the split-KV merge, DISPATCH_HEAD_DIM) for. Other sizes raise inside
+# FlashInfer (32, 48), crash with an illegal memory access (80, 96, 112) or --
+# worst -- run and return wrong values: head_dim 72 gives max |diff| 2.25
+# against a torch reference where 128 gives 0.004 (FlashInfer 0.6.18, H100,
+# 2026-09-20; 192 computes exactly but has no merge kernel). Refuse them up front.
+FLASHINFER_HEAD_DIMS = frozenset({64, 128, 256})
+
+
+def check_flashinfer_head_dim(head_dim: int, device: torch.device | None = None) -> None:
+    """Raise unless FlashInfer's paged attention computes ``head_dim`` exactly.
+    Only CUDA runs FlashInfer, so a non-CUDA ``device`` (CPU tests driving the
+    wrappers with a stand-in module and toy head dims) is not checked."""
+    if device is not None and device.type != "cuda":
+        return
+    if head_dim not in FLASHINFER_HEAD_DIMS:
+        raise ValueError(
+            f"FlashInfer paged attention: head_dim {head_dim} is not one of "
+            f"{sorted(FLASHINFER_HEAD_DIMS)}. FlashInfer builds its paged prefill/decode and "
+            "split-KV merge kernels for these sizes only; other head dims fail inside FlashInfer "
+            "or run and return wrong values (72 does). Zero-pad the model's q/k/v to the next "
+            "supported size (exact: the padded dims add nothing to the scores, the padded output "
+            "dims are zeros to drop) and declare that size as the KV cache's head_dim."
+        )
+
+
 class FlashInferPrefillWrapper:
     """Batched prefill attention with paged KV cache.
 
@@ -55,6 +81,7 @@ class FlashInferPrefillWrapper:
         enable_nvtx: bool = False,
         backend: str = "auto",
     ):
+        check_flashinfer_head_dim(head_dim, device)
         self.device = device
         self.use_cuda_graph = use_cuda_graph
         self.enable_nvtx = enable_nvtx
@@ -207,6 +234,7 @@ class FlashInferDecodeWrapper:
         enable_nvtx: bool = False,
         backend: str = "auto",
     ):
+        check_flashinfer_head_dim(head_dim, device)
         self.device = device
         self.use_cuda_graph = use_cuda_graph
         self.enable_nvtx = enable_nvtx

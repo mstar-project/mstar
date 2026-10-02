@@ -844,7 +844,7 @@ class LLMSubmodule(ARNodeSubmodule):
             labels = ["main", "cfg_text", "cfg_img"] # just return all labels since it is cheap
 
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
-                labels, fwd_info.request_id, device, seq_len
+                labels, fwd_info.rid_handle, device, seq_len
             )
 
         if graph_walk == "prefill_vae":
@@ -879,7 +879,7 @@ class LLMSubmodule(ARNodeSubmodule):
             seq_len = tensor_inputs["empty_combined_emb"].shape[0]
             node_inputs.input_seq_len = seq_len
             node_inputs.custom_pos_ids = self._get_image_pos_ids(
-                labels, fwd_info.request_id, device, seq_len
+                labels, fwd_info.rid_handle, device, seq_len
             )
             node_inputs.tensor_inputs = {
                 **tensor_inputs,
@@ -1278,7 +1278,7 @@ class LLMSubmodule(ARNodeSubmodule):
             + pos_embed
 
         empty_combined_emb[1:-1] = latents_
-        logger.debug(f"packed_seq = {empty_combined_emb}")
+        logger.debug("packed_seq = %s", empty_combined_emb)  # tensor repr: keep lazy
 
         if requires_cfg:
             cfg_text_scale = kwargs.pop("cfg_text_scale", self.config.cfg_text_scale)
@@ -1638,7 +1638,7 @@ class VAEDecoderSubmodule(NodeSubmodule):
     ) -> NameToTensorList:
         logger.debug(
             "Running BAGEL VAE dec with latents shape %s, h %d, w %d",
-            str(latents.shape), image_h, image_w
+            latents.shape, image_h, image_w
         )
         H = image_h
         W = image_w
@@ -1661,22 +1661,16 @@ class VAEDecoderSubmodule(NodeSubmodule):
 class CombineCFGSubmodule(NodeSubmodule):
     """Lightweight node: applies CFG formula + Euler step.
 
-    Receives 3 velocity tensors (v_main, v_cfg_text, v_cfg_img) plus
-    latents and time_index from the parallel LLM branches. Projects
-    velocities to VAE space, applies the 2-node CFG formula with
-    renormalization, then performs an Euler step.
+    Receives 3 VAE-space velocity tensors (v_main, v_cfg_text, v_cfg_img)
+    plus latents and time_index from the parallel LLM branches. Applies the
+    2-node CFG formula with renormalization, then performs an Euler step.
 
     Used in the image_gen_cfg graph walk (parallel CFG architecture).
     Runs on the same GPU as the main LLM branch (enc_dec engine, no KV cache).
     """
 
-    def __init__(
-        self,
-        llm2vae: nn.Linear,
-        config: "BagelModelConfig",
-    ):
+    def __init__(self, config: "BagelModelConfig"):
         super().__init__()
-        self.llm2vae = llm2vae
         self.config = config
 
     @staticmethod
@@ -1690,7 +1684,9 @@ class CombineCFGSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs
     ) -> NodeInputs:
-        device = self.get_device()
+        # The join has no parameters; incoming branch output identifies the
+        # worker device without loading an otherwise-unused model component.
+        device = inputs["v_main"][0].device
 
         result = {
             "v_main": inputs["v_main"][0],
@@ -1761,13 +1757,7 @@ class CombineCFGSubmodule(NodeSubmodule):
         timestep_next = self._apply_timestep_shift(t=t_uniform_next, shift=shift)
         dt = (timestep - timestep_next)[0]
 
-        # Project to VAE space, strip BOI/EOI
-        # v_m = self.llm2vae(v_main[1:-1])
-        # v_ct = self.llm2vae(v_cfg_text[1:-1])
-        # v_ci = self.llm2vae(v_cfg_img[1:-1])
-        # Branches now project to VAE space themselves in
-        # _forward_image_gen_single_branch (avoids re-projecting the same
-        # hidden state on every CFG combine).
+        # Branches project to VAE space before routing to this join.
         v_m = v_main
         v_ct = v_cfg_text
         v_ci = v_cfg_img

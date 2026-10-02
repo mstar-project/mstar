@@ -117,14 +117,24 @@ def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> Non
     )
 
 
+def worker_device(device_type: str, rank: int, rank_devices: dict[int, int] | None = None) -> str:
+    """The device string a worker rank runs on: its own number unless the
+    deployment's ``rank_devices`` maps it elsewhere (several ranks may share a
+    GPU); CPU deployments ignore the mapping."""
+    if device_type == "cpu":
+        return "cpu"
+    index = (rank_devices or {}).get(rank, rank)
+    return f"{device_type}:{index}"
+
+
 def _worker_process_target(
     worker_id: str,
     worker_ids: list[str],
     my_worker_graphs: list[WorkerGraph],
     model_config: dict,
-    all_worker_graph_ids_to_graph_walks: dict[str, set[str]],
-    all_worker_graph_ids_to_nodes: dict[str, set[str]],
-    all_worker_graph_ids_to_dyn_loops: dict[str, set[str]],
+    all_worker_graph_ids_to_graph_walks: dict[int, set[str]],
+    all_worker_graph_ids_to_nodes: dict[int, set[str]],
+    all_worker_graph_ids_to_dyn_loops: dict[int, set[str]],
     sharding_config: ShardingConfig,
     parallel_groups: WorkerParallelGroups,
     hostname: str,
@@ -197,9 +207,9 @@ def _worker_process_target(
 class RequestData:
     # Request-level shared state
     persist_signals: dict[str, list[TensorPointerInfo]]  # signals passed back to conductor
-    persist_signal_ref_cnt: dict[str, int]  # uuid -> number of times it was passed to workers
-    worker_graph_to_workers: dict[str, list[str]]
-    all_worker_graph_ids: set[str]
+    persist_signal_ref_cnt: dict[int, int]  # uuid -> number of times it was passed to workers
+    worker_graph_to_workers: dict[int, list[str]]
+    all_worker_graph_ids: set[int]
     max_output_tokens: int
     random_seed: int
     # resource label -> the config this request's resources were opened with
@@ -229,7 +239,7 @@ class RequestData:
     rx_info: dict[tuple[str, str, str], RxInfo] = field(default_factory=dict)
     tx_info: dict[tuple[str, str], TxInfo] = field(default_factory=dict)
 
-    def remove_persist_signal_uuids(self, uuids: list[str]):
+    def remove_persist_signal_uuids(self, uuids: list[int]):
         uuids = set(uuids)
         for name in self.persist_signals:
             self.persist_signals[name] = [
@@ -269,7 +279,7 @@ class SessionData:
     pick would send the request to workers holding nothing.
     """
     session_id: str
-    worker_graph_to_workers: dict[str, list[str]]
+    worker_graph_to_workers: dict[int, list[str]]
     request_ids: set[str] = field(default_factory=set)
     # A request carrying end_session has been ingested; the session goes when
     # that request's teardown completes.
@@ -362,11 +372,26 @@ class Conductor:
         )
         assert "max_seq_len" in self.model_config
         assert "node_groups" in self.model_config
+        # Optional ``rank_devices: {rank: device_index}`` places a worker rank
+        # on a device other than the one its number implies, e.g. two workers
+        # sharing one GPU so a light node's steps stop interleaving with a
+        # heavy node's on the same worker loop.
+        self.rank_devices = {
+            int(rank): int(index)
+            for rank, index in (self.model_config.get("rank_devices") or {}).items()
+        }
+        model.validate_config_yaml(self.model_config, model_config_file)
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
+        # The conductor is the only process that sees every worker graph, so it
+        # owns the numbering. Workers receive their graphs (and these ids) at
+        # spawn, so everyone agrees without the ids having to be negotiated.
+        worker_graphs = model.get_worker_graphs(model_config_file)
+        for index, worker_graph in enumerate(worker_graphs):
+            worker_graph.worker_graph_id = index
         self.worker_graphs = {
             worker_graph.worker_graph_id: worker_graph
-            for worker_graph in model.get_worker_graphs(model_config_file)
+            for worker_graph in worker_graphs
         }
 
         # (1) Set up worker graph TP ranks
@@ -389,7 +414,7 @@ class Conductor:
 
         # v1: one sharding group per worker graph. Track which group "owns"
         # each wg so we can assert single-group-per-wg.
-        wg_to_owning_group: dict[str, str] = {}
+        wg_to_owning_group: dict[int, str] = {}
 
         for group in self.default_sharding_config.groups:
             if group.graph_walks is not None and any([
@@ -493,14 +518,14 @@ class Conductor:
             self._per_worker_graphs[worker_id] = worker_graphs
 
         # Global maps needed by all workers
-        self._all_worker_graph_ids_to_graph_walks: dict[str, set[str]] = {
+        self._all_worker_graph_ids_to_graph_walks: dict[int, set[str]] = {
             worker_graph_id: worker_graph.graph_walks for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
-        self._all_worker_graph_ids_to_nodes: dict[str, set[str]] = {
+        self._all_worker_graph_ids_to_nodes: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_nodes())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
-        self._all_worker_graph_ids_to_dyn_loops: dict[str, set[str]] = {
+        self._all_worker_graph_ids_to_dyn_loops: dict[int, set[str]] = {
             worker_graph_id: set(worker_graph.section.get_loops())
             for worker_graph_id, worker_graph in self.worker_graphs.items()
         }
@@ -542,10 +567,7 @@ class Conductor:
                     "model": self.model,
                     "enable_nvtx": self.enable_nvtx,
                     "enable_prof": self.enable_prof,
-                    "device": (
-                        f"{self.device_type}:{rank}"
-                        if self.device_type != "cpu" else "cpu"
-                    ),
+                    "device": worker_device(self.device_type, rank, self.rank_devices),
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device
@@ -655,7 +677,7 @@ class Conductor:
 
     def _assign_worker_graphs_to_workers(
         self, session_id: str | None = None,
-    ) -> dict[str, list[str]]:
+    ) -> dict[int, list[str]]:
         """
         For a request, assign worker graphs to workers. DP picks are
         coordinated by ``_group_id`` so all wgs derived from the same
@@ -698,7 +720,7 @@ class Conductor:
         return result
 
     def _build_request_sharding_config(
-        self, worker_graph_to_workers: dict[str, list[str]],
+        self, worker_graph_to_workers: dict[int, list[str]],
     ) -> ShardingConfig:
         """Per-request ShardingConfig: clone default + setup with this
         request's worker assignments.
@@ -908,7 +930,7 @@ class Conductor:
             )
 
         # Collect all worker_graph_ids per worker for the NewRequest
-        worker_to_worker_graph_ids: dict[str, list[str]] = defaultdict(list)
+        worker_to_worker_graph_ids: dict[str, list[int]] = defaultdict(list)
         for wg_id, worker_ids in worker_graph_to_workers.items():
             for worker_id in worker_ids:
                 worker_to_worker_graph_ids[worker_id].append(wg_id)
@@ -1014,9 +1036,9 @@ class Conductor:
                 )
 
     def _resolve_worker_partition(
-        self, worker_graph_ids: list[str],
+        self, worker_graph_ids: list[int],
         partitions: list[PartitionDefinition],
-    ) -> dict[str, set[str]]:
+    ) -> dict[str, set[int]]:
         """Find which partition(s) a set of worker graphs belongs to."""
         partition_wg_ids = {}
         for wg_id in worker_graph_ids:
@@ -1080,7 +1102,7 @@ class Conductor:
 
     def _register_session_request(
         self, session_id: str, request_id: str,
-        worker_graph_to_workers: dict[str, list[str]],
+        worker_graph_to_workers: dict[int, list[str]],
         end_session: bool = False,
     ) -> None:
         """Bind a request to its session, opening the session on the first one.
@@ -1506,13 +1528,16 @@ class Conductor:
             for name, infos in body.persist_signals.items():
                 request_data.persist_signals.setdefault(name, []).extend(infos)
 
+        # Resource publish info is rank-sharded. Every TP rank contributes its
+        # own KV pages and transfer descriptor, and PublishedKVInfo.update()
+        # folds those entries by rank.
+        merge_publish_info(
+            pstate.resource_publish_info, body.resource_publish_info
+        )
+
         # Absorb-only fields are replicated across TP ranks; only the rank-0
         # message contributes.
         if body.is_first_tp_rank:
-            merge_publish_info(
-                pstate.resource_publish_info, body.resource_publish_info
-            )
-
             if body.new_token_counts:
                 for name, count in body.new_token_counts.items():
                     pstate.num_output_tokens += count
@@ -1529,9 +1554,7 @@ class Conductor:
 
             request_data.final_outputs.update(body.output_loop_indices)
 
-            pstate.curr_forward_outputs += body.output_signal_names if isinstance(
-                body.output_signal_names, list
-            ) else []
+            pstate.curr_forward_outputs += body.output_signal_names
 
         # Each wg is only marked complete when all its TP ranks have reported.
         for wg_id in body.worker_graph_ids:

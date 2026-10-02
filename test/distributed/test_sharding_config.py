@@ -7,9 +7,10 @@ Covers:
   TP sizes, with and without producer/consumer colocation
 """
 import pytest
+import torch
 
 from mstar.distributed.base import ShardDestination, ShardingConfig, ShardingGroup
-from mstar.graph.base import NodeAndGraphWalk
+from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 
 # ---------------------------------------------------------------------------
 # ShardingGroup
@@ -500,3 +501,82 @@ class TestCrossGraphWalkAndAllFanouts:
             ShardDestination(worker="w4", tp_rank=0, full_tensor=False, start_idxs=[2], end_idxs=[4])
         ]
 
+
+
+class TestFanoutOffsetIsLocalToTheSourceShard:
+    """``start_idxs`` are rows of the LOGICAL tensor, but ``offset`` is a read
+    into the rank's OWN shard: the reader slices ``canonical_tensor[offset //
+    row : ...]`` and the transports do ``address + offset`` / ``seek(offset)``.
+
+    Rank 0's slab starts at 0, so the two agree there and nothing caught this.
+    Above rank 0 an unrebased offset indexes past the end of the local tensor,
+    and a Python out-of-range slice is EMPTY rather than an error -- the
+    receiver gets nothing, silently.
+    """
+
+    @staticmethod
+    def _cfg():
+        return _make_config(
+            groups={
+                (("A",), 2, ("decode",)): ["w0", "w1"],
+                (("B",), 4, ("decode",)): ["w2", "w3", "w4", "w5"],
+            },
+            node_to_worker={
+                NodeAndGraphWalk("A", "decode"): ["w0", "w1"],
+                NodeAndGraphWalk("B", "decode"): ["w2", "w3", "w4", "w5"],
+            },
+            shard_dim={"x": 0},
+        )
+
+    @staticmethod
+    def _edge():
+        # 4 local rows of 2 float32s: 8 B per row, 32 B in this rank's shard.
+        info = TensorPointerInfo(
+            dims=(4, 2), dtype=torch.float32, nbytes=32, address=0x1000,
+            stride=(2, 1), uuid=1, source_session_id="h:1",
+            source_entity="w0",
+        )
+        return GraphEdge(name="x", next_node="B", tensor_info=[info])
+
+    @pytest.mark.parametrize("src_rank", [0, 1])
+    def test_every_offset_stays_inside_the_local_shard(self, src_rank):
+        edge = self._edge()
+        local_nbytes = edge.tensor_info[0].nbytes
+        out = self._cfg().fanout_graph_edges(
+            edge, source_node="A", source_graph_walk="decode",
+            dest_graph_walk="decode", source_tp_rank=src_rank,
+        )
+        assert out, "expected a fanout"
+        for worker, new_edge in out.items():
+            for info in new_edge.tensor_info:
+                assert info.offset >= 0, (worker, info.offset)
+                assert info.offset + info.nbytes <= local_nbytes, (
+                    f"{worker}: reads [{info.offset}, "
+                    f"{info.offset + info.nbytes}) of a {local_nbytes} B shard"
+                )
+
+    def test_rank_one_sends_its_two_halves_not_two_empty_slices(self):
+        """src tp=2 -> dest tp=4: rank 1 owns global rows [4,8), which are
+        local rows [0,4). Those go to dest ranks 2 and 3 as [0,2) and [2,4)."""
+        out = self._cfg().fanout_graph_edges(
+            self._edge(), source_node="A", source_graph_walk="decode",
+            dest_graph_walk="decode", source_tp_rank=1,
+        )
+        # 8 B per row, 2 rows each.
+        assert {w: (i.offset, i.nbytes, i.dims)
+                for w, e in out.items() for i in e.tensor_info} == {
+            "w4": (0, 16, (2, 2)),
+            "w5": (16, 16, (2, 2)),
+        }
+
+    def test_rank_zero_is_unchanged(self):
+        """The case every deployment actually runs: global == local."""
+        out = self._cfg().fanout_graph_edges(
+            self._edge(), source_node="A", source_graph_walk="decode",
+            dest_graph_walk="decode", source_tp_rank=0,
+        )
+        assert {w: (i.offset, i.nbytes)
+                for w, e in out.items() for i in e.tensor_info} == {
+            "w2": (0, 16),
+            "w3": (16, 16),
+        }
