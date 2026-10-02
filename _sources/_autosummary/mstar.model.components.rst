@@ -28,10 +28,13 @@ mstar.model.components
    :recursive:
 
    attention
+   audio_features
+   aut_encoder
    decoder_layer
    distributed
    linear
    mlp
    moe
    norm
+   qwen3_lm
 
