@@ -54,6 +54,7 @@ from mstar.utils.profiler import PHASE_PERIOD, mark, phase_record, range_pop, ra
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
+    from mstar.streaming.stream_buffer import StreamChunkInfo
 
 logger = logging.getLogger(__name__)
 
@@ -209,9 +210,17 @@ class ExecutingBatch:
     per_request_input_tensors: Mapping[str, NameToTensorList] = field(
         default_factory=dict
     )
-    # rids whose consumed streaming input was the final chunk — this step
-    # reports the partition done
+    # rids for which this step ends every finite stream into the node; the
+    # consumer flushes what it held back
     final_stream_rids: set[str] = field(default_factory=set)
+    # rid -> {input_name: chunk info} for rids consuming a streamed input
+    per_request_stream_chunks: Mapping[str, Mapping[str, "StreamChunkInfo"]] = field(
+        default_factory=dict
+    )
+
+    # rids for which this step ends every finite stream into the partition;
+    # this step reports the partition done
+    stream_partition_done_rids: set[str] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -512,6 +521,14 @@ class Engine:
             submodule_mgmt.joint_comm_group.world_size,
         )
         runners: dict[str, PiecewiseCudaGraphRunner] = {}
+        # One graph memory pool for all of the node's regions (see
+        # ``PiecewiseCudaGraphRunner``): its captured-memory footprint becomes
+        # the largest region's rather than the sum over regions.
+        memory_pool = (
+            torch.cuda.graphs.graph_pool_handle()
+            if configs and getattr(self._device, "type", None) == "cuda" and torch.cuda.is_available()
+            else None
+        )
         for label, config in configs.items():
             runner = PiecewiseCudaGraphRunner(
                 label=f"{node_name}_{label}",
@@ -523,6 +540,7 @@ class Engine:
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
                 node_name=node_name,
+                memory_pool=memory_pool,
             )
             runners[label] = runner
         return runners
@@ -580,8 +598,10 @@ class Engine:
                 logger.warning(
                     "KV %s: prefix cache on with cpu_offload_pages 0: a decode "
                     "step that finds nothing to evict holds its requests until "
-                    "they time out. max_concurrent_requests caps how many run "
-                    "at once, and cpu_offload_pages gives the worker a victim",
+                    "they time out. Set max_concurrent_requests to the pool's "
+                    "pages over the pages one request needs. cpu_offload_pages "
+                    "gives the worker a victim, but one that shares most of its "
+                    "prompt frees little",
                     key,
                 )
 
@@ -610,6 +630,10 @@ class Engine:
                     fwd_info=batch.per_request_info[rid],
                     inputs=batch.per_request_input_tensors.get(rid, {}),
                     resources=self._submodules[batch.node_name].resources,
+                    # the step that ends the last of the node's streams: it must
+                    # flush whatever it held back (a vocoder's crossfade tail, the
+                    # look-ahead frames a token encoder withholds)
+                    is_final_stream_chunk=rid in batch.final_stream_rids,
                 )
                 if req_inputs is not None:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
@@ -1065,6 +1089,7 @@ class Engine:
             per_request_states=LazyRequestStates(submodule, rids),
             captured=lease is not None,
             step=step,
+            per_request_stream_chunks=batch.per_request_stream_chunks,
         )
         if nvtx:
             range_push("engine.preprocess")

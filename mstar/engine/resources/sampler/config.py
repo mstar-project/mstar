@@ -26,6 +26,11 @@ class SamplerSpec(NodeResourceSpec):
     # actually runs on a given step is settled per step from the resident
     # requests' `repetition_penalty` — see `SamplerResource.admit`.
     enable_repetion_penalty: bool = True
+    # Same kind of capability for min-p: whether the node's sampler (eager and
+    # graph-captured) carries the filter. It costs two passes over ``[B, V]``
+    # per step, so nodes that never ask for it pay nothing; a request that
+    # sets ``min_p`` on a node without it is refused at ingest.
+    enable_min_p: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -41,6 +46,10 @@ class SamplingReqConfig(ResourceReqConfig):
     top_p: float = 1
     ignore_eos: bool = False # used for benchmark parity
     repetition_penalty: float = 1
+    # Min-p (HF ``MinPLogitsWarper`` / vLLM ``min_p``): drop every token whose
+    # probability is below ``min_p`` times the most likely token's, after the
+    # penalty and temperature and before top-k/top-p. 0 disables.
+    min_p: float = 0.0
     _seed: int = 0 # set by the conductor
 
     def apply_conductor_config(

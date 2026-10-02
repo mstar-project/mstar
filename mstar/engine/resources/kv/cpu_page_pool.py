@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.resources.kv.cache import KVCache, KVConfig, PageAllocator
+from mstar.engine.resources.kv.cache import KVCache, PageAllocator, PagedKVConfig
 from mstar.utils.streams import KV_OFFLOAD, get_stream
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,7 @@ class OffloadedStream:
     stored_len: int
     position: int
     released: int = 0
+    protected_prefix: int = 0
 
 
 class CPUPagePool:
@@ -33,7 +34,7 @@ class CPUPagePool:
 
     def __init__(
         self,
-        config: KVConfig,
+        config: PagedKVConfig,
         kv_cache: KVCache,
         max_cpu_pages: int,
     ):
@@ -79,6 +80,7 @@ class CPUPagePool:
         stored_len: int,
         position: int,
         released: int = 0,
+        protected_prefix: int = 0,
     ) -> bool:
         """Copy device pages to the host. False when the host pool is full,
         in which case nothing moved and the caller keeps its device pages."""
@@ -95,6 +97,10 @@ class CPUPagePool:
             return False
 
         stream = self._get_stream()
+        # The compute stream may still be running the step that last touched
+        # these pages (a commit hands pages on right after the launch). Queue
+        # the copies behind it, or they could read a page mid-write.
+        stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for gpu_idx, cpu_idx in zip(gpu_page_indices, cpu_pages, strict=True):
                 # every layer of the page at once: cpu[:, cpu] = gpu[:, gpu]
@@ -107,6 +113,7 @@ class CPUPagePool:
             stored_len=stored_len,
             position=position,
             released=released,
+            protected_prefix=protected_prefix,
         )
         return True
 
@@ -127,6 +134,9 @@ class CPUPagePool:
             del self.offloaded[rid]
 
         stream = self._get_stream()
+        # Same ordering as the offload: the device pages we write may have
+        # been released by a commit whose kernels are still reading them.
+        stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for cpu_idx, gpu_idx in zip(
                 state.cpu_page_indices, gpu_page_indices, strict=True

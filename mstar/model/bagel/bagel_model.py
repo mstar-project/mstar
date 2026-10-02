@@ -44,10 +44,10 @@ from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConduc
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
-    KVConfig,
     KVReqConfig,
     KVSpec,
     NodeResourceSpec,
+    PagedKVConfig,
     PositionConfig,
     PositionSpec,
     RaggedAttentionConfig,
@@ -726,8 +726,8 @@ class BagelModel(Model):
     # on absent, ungrouped nodes.
     _LLM_NODES = frozenset({"LLM", "LLM_cfg_text", "LLM_cfg_img"})
 
-    def _kv_config(self) -> KVConfig:
-        return KVConfig(
+    def _kv_config(self) -> PagedKVConfig:
+        return PagedKVConfig(
             num_layers=self.config.num_hidden_layers,
             num_kv_heads=self.config.num_key_value_heads,
             head_dim=self.config.hidden_size // self.config.num_attention_heads,
@@ -736,14 +736,14 @@ class BagelModel(Model):
         )
 
     def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
-        """The text walk's prompt is its token ids, and so is every step it takes.
+        """The text walk's prompt is its token ids.
 
         The image walks write into this stream too, and an edit's picture lands
         at the positions its keyed text would have; only the text walk is named.
+        Generated pages are not keyed: the chat API sends a reply back inside
+        the next user turn, so their keys never match.
         """
-        return {"kv": {"main": PrefixStream(
-            "text_inputs", "ids", "prefill_text", "decode",
-        )}}
+        return {"kv": {"main": PrefixStream("text_inputs", "ids", "prefill_text")}}
 
     def checkpoint_path(self) -> str:
         return snapshot_download(

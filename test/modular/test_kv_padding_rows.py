@@ -16,7 +16,7 @@ import torch
 
 from mstar.engine.resources import Segment, StepContext
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVStep
+from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
 
@@ -47,7 +47,7 @@ def _stub_transfer(monkeypatch):
 
 
 def _make_manager(max_num_pages: int) -> KVManager:
-    cfg = KVConfig(
+    cfg = PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=4,
         max_seq_len=max_num_pages * PAGE_SIZE, max_num_pages=max_num_pages,
         page_size=PAGE_SIZE, cpu_offload_pages=0,

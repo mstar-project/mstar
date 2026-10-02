@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from mstar.engine.cuda_graph_config import CudaGraphConfig, PiecewiseCudaGraphConfig
     from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
     from mstar.engine.engine import ExecutingBatch
+    from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
 @dataclass
@@ -433,6 +434,11 @@ class ModelInputsFromEngine:
     # dim) reads it here. The forward method itself is chosen by the config's
     # ``capture_forward_method``, so most submodules never need this.
     captured: bool = False
+
+    # rid -> {input_name: StreamChunkInfo}; only rids consuming a streamed input
+    per_request_stream_chunks: "Mapping[str, Mapping[str, StreamChunkInfo]]" = field(
+        default_factory=dict
+    )
 
     @property
     @torch.compiler.disable

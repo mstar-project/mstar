@@ -22,7 +22,7 @@ import torch
 
 from mstar.engine.resources import Segment, StepContext
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVStep
+from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 
 requires_cuda = pytest.mark.skipif(
@@ -60,7 +60,7 @@ def _ctx(*rids: str, is_preplan: bool = False) -> StepContext:
 
 
 def _make_manager() -> KVManager:
-    cfg = KVConfig(
+    cfg = PagedKVConfig(
         num_layers=2,
         num_kv_heads=1,
         head_dim=4,

@@ -186,6 +186,18 @@ class OpenAIAdapter:
     supports_videos: bool = False   # POST /v1/videos/generations
     supports_realtime: bool = False  # /v1/realtime (bidirectional speech WebSocket)
 
+    # ``/v1/audio/speech`` sentence chunking (``serving_speech``): inputs of at
+    # least ``speech_chunk_min_chars`` characters are split into sentence
+    # groups of about ``speech_chunk_max_chars`` and synthesized as ordered
+    # sub-requests. ``None`` keeps the whole text in one request unless the
+    # client sends ``sentence_chunking: true``.
+    speech_chunk_min_chars: int | None = None
+    speech_chunk_max_chars: int = 400
+    # sub-requests kept in flight ahead of the one being streamed
+    speech_chunk_lookahead: int = 2
+    # most sub-requests one input may split into; longer inputs get a 400
+    speech_chunk_max_pieces: int = 32
+
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
         # emits text, whereas BAGEL chat is text-only.
@@ -416,6 +428,35 @@ class OmniVoiceAdapter(OpenAIAdapter):
         )
 
 
+class KokoroAdapter(OpenAIAdapter):
+    """Kokoro-82M: text-to-speech, audio out only.
+
+    ``voice`` is a bundled voice or a blend (``af_bella+af_sky``,
+    ``af_bella(2)+af_sky(1)``) and ``speed`` scales the predicted durations;
+    both are real model knobs and are forwarded. Kokoro does not sample, so
+    ``temperature`` / ``top_p`` are ignored. ``lang_code`` (a G2P language
+    override; the default follows the voice's prefix) and ``phonemes`` (skip
+    G2P) arrive through ``extra_body``.
+    """
+
+    supports_speech = True
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        mk = _passthrough(req)
+        if getattr(req, "voice", None):
+            mk.setdefault("voice", req.voice)
+        if getattr(req, "speed", None) is not None:
+            mk.setdefault("speed", req.speed)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+        return SubmitArgs(
+            text=req.input,
+            input_modalities=["text"],
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
 class Cosmos3Adapter(OpenAIAdapter):
     """NVIDIA Cosmos3: text-to-image and text/image-to-video generation.
 
@@ -487,6 +528,38 @@ class Cosmos3Adapter(OpenAIAdapter):
         )
 
 
+class Cosmos3EdgeAdapter(Cosmos3Adapter):
+    """Cosmos3-Edge: the generator surfaces of :class:`Cosmos3Adapter` plus
+    chat (the reasoner: the understanding tower served as a VLM).
+
+    Chat requests take the OpenAI ``messages`` layout with image / video
+    attachments in order; ``temperature`` / ``top_p`` / ``max_tokens`` map to
+    the reasoner's sampler, and ``extra_body`` knobs (``enable_thinking``,
+    ``top_k``, ``repetition_penalty``, ``video_fps`` / ``video_num_frames``)
+    pass through.
+    """
+
+    supports_chat = True
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
+        mk = _passthrough(req)
+        _apply_sampling(req, mk)
+        # ``chat_template_kwargs`` is how the vLLM recipe toggles thinking;
+        # accept it alongside a flat ``enable_thinking``.
+        template_kwargs = mk.pop("chat_template_kwargs", None) or {}
+        if "enable_thinking" in template_kwargs:
+            mk.setdefault("enable_thinking", bool(template_kwargs["enable_thinking"]))
+        return SubmitArgs(
+            text=text,
+            file_paths=file_paths or None,
+            input_modalities=in_mods,
+            output_modalities=["text"],
+            model_kwargs=mk,
+            prompt_parts=parts,
+        )
+
+
 class Wan22Adapter(OpenAIAdapter):
     """Wan2.2-TI2V-5B: text/image-to-video generation (video only).
 
@@ -547,9 +620,14 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),
+    "kokoro": KokoroAdapter(),
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),
+    "cosmos3_edge": Cosmos3EdgeAdapter(),
+    "cosmos3_edge_droid": Cosmos3EdgeAdapter(),
     "cosmos3_super": Cosmos3Adapter(),
+    "cosmos3_super_i2v_4step": Cosmos3Adapter(),
+    "cosmos3_super_t2i_4step": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
 }
 

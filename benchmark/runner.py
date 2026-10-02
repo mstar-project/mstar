@@ -255,7 +255,14 @@ class Benchmark:
                 "jct_ms": (m.e2e_latency or 0.0) * 1000.0,
                 "type": m.type.value if hasattr(m.type, "value") else str(m.type),
                 "output_bytes": dict(m.output_bytes),
+                # per-modality time to first chunk, seconds (TTFT / time to first audio)
+                "ttft_s": dict(m.ttft),
             })
+
+        def _stats(stats):
+            if stats is None:
+                return None
+            return {"mean": stats.mean, "p50": stats.p50, "p95": stats.p95, "p99": stats.p99}
 
         payload = {
             "system": "ours",
@@ -273,6 +280,16 @@ class Benchmark:
             "jct_p95_ms": _pct(jcts_ms, 95),
             "jct_p99_ms": _pct(jcts_ms, 99),
             "request_throughput": (agg.request_throughput or 0.0),
+            # the streaming/audio aggregates the protocol tables are built from
+            "aggregate": {
+                "max_concurrency": agg.max_concurrency,
+                "ttft_s": {modality: _stats(stats) for modality, stats in agg.ttft.items()},
+                "e2e_latency_s": _stats(agg.e2e_latency),
+                "rtf": _stats(agg.rtf),
+                "audio_seconds_throughput": agg.audio_seconds_throughput,
+                "audio_duration_mean_s": agg.audio_duration_mean_s,
+                "total_output_bytes": dict(agg.total_output_bytes),
+            },
             "per_request": per_request,
         }
 

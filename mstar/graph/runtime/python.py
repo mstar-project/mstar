@@ -885,7 +885,17 @@ class PythonGraphRuntime(GraphRuntime):
             self._undo_spec_ingest(node, into_signals, into_next_iter)
             return None
 
-        slots = node.ready_next_iter if same_node else node.ready_signals
+        inputs = dict(
+            node.ready_next_iter.ready_inputs if same_node
+            else node.ready_signals.ready_inputs
+        )
+        if same_node:
+            # Carry over loop-external inputs sitting in ready_signals (see
+            # GraphNode.is_ready_for_speculation): they are re-injected
+            # unchanged every iteration and never land in ready_next_iter.
+            for name, edge in node.ready_signals.ready_inputs.items():
+                if edge._persist_for_loop and name not in inputs:
+                    inputs[name] = edge
         return _SpecRidPrep(
             rid=rid,
             node=node,
@@ -895,7 +905,7 @@ class PythonGraphRuntime(GraphRuntime):
                     name,
                     [info.uuid for info in edge.tensor_info],
                     edge._final_stream_chunk,
-                ) for name, edge in slots.ready_inputs.items()
+                ) for name, edge in inputs.items()
             ],
             into_signals=into_signals,
             into_next_iter=into_next_iter,

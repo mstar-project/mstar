@@ -371,15 +371,27 @@ impl RequestState {
         if next_iter { st.next.has(slot) } else { st.cur.has(slot) }
     }
 
+    /// The node's inputs for a run: the current slot, or for a same-node
+    /// next-iteration speculation the next-iter slot plus the held inputs
+    /// still sitting in the current slot -- Python's `_prep_spec_rid` carries
+    /// those over because an enclosing loop re-injects them unchanged every
+    /// iteration and they never land in `ready_next_iter`.
     pub fn input_tensors(
         &self, node: NodeId, next_iter: bool,
     ) -> Vec<(Sym, Vec<TensorRef>, bool)> {
         let spec = self.graph.node(node);
         let st = &self.nodes[node as usize];
         let slot = if next_iter { &st.next } else { &st.cur };
+        let carried = if next_iter { spec.held_mask & st.cur.mask & !st.next.mask } else { 0 };
         spec.inputs.iter().enumerate()
-            .filter_map(|(i, &n)| slot.tensors[i].as_ref().map(
-                |t| (n, t.clone(), slot.is_final_chunk(i as u8))))
+            .filter_map(|(i, &n)| {
+                if carried >> i & 1 == 1 {
+                    return st.cur.tensors[i].as_ref().map(
+                        |t| (n, t.clone(), st.cur.is_final_chunk(i as u8)));
+                }
+                slot.tensors[i].as_ref().map(
+                    |t| (n, t.clone(), slot.is_final_chunk(i as u8)))
+            })
             .collect()
     }
 
@@ -799,7 +811,14 @@ impl RequestState {
             needed &= !spec.streaming_mask;
         }
         let st = &self.nodes[node as usize];
-        let have = if check_next_iter { st.next.mask } else { st.cur.mask } | st.spec.mask;
+        let mut have = if check_next_iter { st.next.mask } else { st.cur.mask } | st.spec.mask;
+        if check_next_iter {
+            // Held (loop-external) inputs are re-injected into the current
+            // slot every iteration and never reach the next-iter slot, so a
+            // same-node speculation must not wait on them (Python's
+            // `is_ready_for_speculation` counts `_persist_for_loop` edges).
+            have |= st.cur.mask & spec.held_mask;
+        }
         needed & !have == 0
     }
 
@@ -1098,5 +1117,59 @@ mod tests {
         assert!(!st.has_input(dec, 0, false));
         assert_eq!(st.loop_indices(), vec![0]);
         assert!(!st.is_done);
+    }
+
+    /// `dec`'s external input `h` is held in the current slot and never
+    /// promoted to next-iter, so a same-node speculation onto the next
+    /// iteration must count it as present and hand it over with the inputs
+    /// (mirrors test_speculation_external_inputs.py).
+    #[test]
+    fn a_held_external_input_satisfies_next_iter_speculation() {
+        let (it, g) = decode_loop();
+        let dec = 1;
+        let (h, tok) = (it.get("h").unwrap(), it.get("tok").unwrap());
+        let mut st = RequestState::new(g.clone());
+        st.ingest(&g, dec, 0, &[t(2)], true, false);
+        st.ingest(&g, dec, 1, &[t(3)], true, false);
+
+        let spec_edges: Vec<RoutedEdge> = g.node(dec).outputs.iter()
+            .map(|e| routed(e, vec![t(30)])).collect();
+        let ready = st.ingest_for_speculation(&g, dec, &spec_edges);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].node, dec);
+        assert!(ready[0].is_new_loop_iter);
+        st.clear_speculative_inputs();
+
+        // The loop-back `tok` goes into the next-iter slot; `h` stays put.
+        assert!(st.ingest(&g, dec, 1, &[t(30)], true, false));
+        assert!(st.ready_for_speculation(dec, true, false));
+        let mut inputs: Vec<(Sym, Vec<u64>)> = st.input_tensors(dec, true)
+            .into_iter().map(|(n, ts, _)| (n, ts.iter().map(|x| x.uuid).collect()))
+            .collect();
+        inputs.sort();
+        let mut expected = vec![(h, vec![2]), (tok, vec![30])];
+        expected.sort();
+        assert_eq!(inputs, expected);
+        // The current slot is untouched: `h` was read, not moved.
+        assert!(st.has_input(dec, 0, false));
+        assert!(!st.has_input(dec, 0, true));
+    }
+
+    /// Outside any loop nothing is held, so an external input in the current
+    /// slot does not make the next iteration ready.
+    #[test]
+    fn a_top_level_external_input_is_not_carried_into_next_iter() {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("top", &["a", "b"], &[], vec![edge("b", "top")]),
+        ];
+        let g = compile_one(&mut it, &nodes, &[]).unwrap();
+        let top = 0;
+        let mut st = RequestState::new(g.clone());
+        st.ingest(&g, top, 0, &[t(1)], true, false);
+        st.ingest(&g, top, 1, &[t(2)], true, false);
+        assert!(st.ingest(&g, top, 1, &[t(3)], true, false));
+        assert!(!st.ready_for_speculation(top, true, false));
+        assert_eq!(st.input_tensors(top, true).len(), 1);
     }
 }

@@ -17,7 +17,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
 )
-from mstar.engine.resources.kv.config import KVConfig, KVSpec
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
     LinearAttnSpec,
@@ -202,7 +202,7 @@ class Qwen3_5DenseModel(Model):
         return [
             KVSpec(
                 resource_key=KV_CACHE, nodes={"LLM"},
-                config=KVConfig(
+                config=PagedKVConfig(
                     num_layers=num_kv_layers,
                     num_kv_heads=self.config.num_key_value_heads,
                     head_dim=self.config.head_dim,
