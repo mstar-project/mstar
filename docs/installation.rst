@@ -5,8 +5,9 @@ Requirements
 ------------
 
 - **Python 3.12+**.
-- **Linux with an NVIDIA GPU** and a recent **CUDA** toolkit for the GPU model
-  families. A CPU-only machine can exercise the graph/worker plumbing in *dummy mode*
+- **Linux with an NVIDIA GPU** and a recent **CUDA** toolkit, or an **Intel XPU**
+  for BAGEL with the XPU dependencies described below.
+  A CPU-only machine can exercise the graph/worker plumbing in *dummy mode*
   (submodules return ``None``) for development and the modular tests, but not real model
   inference.
 - Enough GPU memory for the model you intend to serve — several families (e.g.
@@ -32,7 +33,8 @@ Python 3.12 environment:
 The extras are the same as for a source install (see `Optional dependencies`_), so
 ``mstar-ai[bagel]`` or ``mstar-ai[qwen3_omni,audio]`` work the same way. The default
 deployment configs ship inside the package, so ``mstar serve <model>`` works without a
-checkout. Keep ``--torch-backend=auto`` on every install, see the note below.
+checkout. Use ``--torch-backend=auto`` for CUDA installs. Intel XPU installs use
+``--torch-backend=xpu`` and the ``bagel_xpu`` extra; see `Intel XPU (BAGEL)`_.
 
 Install from source
 -------------------
@@ -55,8 +57,9 @@ console scripts, ``mstar`` and ``mstar-serve``.
 
 .. important::
 
-   **Always pass** ``--torch-backend=auto``. ``mstar`` floors PyTorch at 2.9
-   (``torch>=2.9.1`` / ``torchvision>=0.24.1`` / ``torchaudio>=2.9.1``). The flag tells 
+   **For CUDA installs, pass** ``--torch-backend=auto``. The CUDA extras require
+   ``torch>=2.9.1,<2.13.0``, ``torchvision>=0.24.1`` and ``torchaudio>=2.9.1``.
+   The flag tells
    ``uv`` to detect your driver's CUDA version and fetch the **matching** torch build
    — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
    compiled extensions (``flash-attn``) and the JIT-built MoE kernel for Qwen3-Omni
@@ -64,6 +67,34 @@ console scripts, ``mstar`` and ``mstar-serve``.
    Without the flag ``uv`` installs PyPI's default (cu128) build. You can set it once
    with ``export UV_TORCH_BACKEND=auto`` instead of repeating the flag. See `Matching your
    CUDA toolkit`_ for details and the manual fallback.
+
+Intel XPU (BAGEL)
+----------------
+
+Package metadata cannot detect the GPU or select a PyTorch wheel index.
+Select the XPU backend explicitly, in a fresh Python 3.12 environment:
+
+.. code-block:: bash
+
+   uv pip install --torch-backend=xpu -e ".[bagel_xpu]"
+   mstar-serve --config configs/bagel_xpu_tp2.yaml
+
+The ``bagel_xpu`` extra selects ``xpu``, which pins the tested
+``torch==2.13.0+xpu``, ``torchvision==0.28.0+xpu`` and
+``vllm-xpu-kernels==0.1.15.4`` wheels. PyTorch supplies ``triton-xpu``.
+This install provides the image and text dependencies BAGEL uses.
+
+With pip, select PyTorch's XPU index explicitly:
+
+.. code-block:: bash
+
+   python -m pip install --extra-index-url https://download.pytorch.org/whl/xpu \
+       -e ".[bagel_xpu]"
+
+The same extras are forwarded by ``mstar-project`` and ``mstar-serve``.
+Existing model extras such as ``bagel`` and ``all`` select the CUDA constraints.
+Use ``bagel_xpu`` for the supported XPU model; adding ``xpu`` to a CUDA model
+extra does not port that model's kernels.
 
 Optional dependencies
 ---------------------
@@ -76,14 +107,18 @@ Model families and some output formats need extra packages, exposed as pip *extr
 
    * - Extra
      - Installs / use for
+   * - ``.[cuda]``
+     - The existing PyTorch version range and torchvision/torchaudio dependencies.
+       Selected by the CUDA model extras.
+   * - ``.[xpu]``
+     - Tested Intel PyTorch/torchvision builds and ``vllm-xpu-kernels==0.1.15.4``.
+       Selected by ``bagel_xpu``.
    * - ``.[bagel]``
      - BAGEL runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``Pillow``, ``torchvision`` / ``torchaudio`` / ``torchcodec``,
        ``huggingface-hub``, ``regex``, and ``mooncake-transfer-engine`` (RDMA transport).
    * - ``.[bagel_xpu]``
-     - BAGEL runtime for Intel XPU. Pins ``vllm-xpu-kernels==0.1.15.4`` for
-       batched token sampling with per-request RNG state on the device.
-       Install the matching XPU build of PyTorch.
+     - BAGEL image/text runtime plus ``xpu``. See `Intel XPU (BAGEL)`_.
    * - ``.[qwen3_omni]``
      - Qwen3-Omni runtime: the BAGEL set plus ``qwen-omni-utils``, ``datasets``, and
        ``ninja`` (speeds up the JIT build of the vendored MoE align kernel).
@@ -93,7 +128,7 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
    * - ``.[omnivoice]``
-     - OmniVoice TTS. The extra is empty on purpose: the runtime is the
+     - OmniVoice TTS plus the CUDA constraints. The runtime is the
        ``omnivoice`` package, installed separately from git —
        see `omnivoice (OmniVoice)`_.
    * - ``.[pi05]``
@@ -120,7 +155,7 @@ Model families and some output formats need extra packages, exposed as pip *extr
        install than a single family's extra. It excludes the separately installed
        TAEHV and ``flash-attn`` packages; see below and `flash-attn (Qwen3-Omni)`_.
 
-Combine extras as needed (keep ``--torch-backend=auto`` on every install):
+Combine CUDA extras as needed (keep ``--torch-backend=auto``):
 
 .. code-block:: bash
 
@@ -150,8 +185,8 @@ Or, in an existing Python 3.12 environment:
 
 .. tip::
 
-   If you're just getting started or have the disk/time to spare, ``.[all]`` installs all
-   index-hosted model dependencies in one shot. Waypoint still needs the pinned TAEHV
+   For CUDA, ``.[all]`` installs the index-hosted model dependencies in one shot.
+   Waypoint still needs the pinned TAEHV
    command above, and Qwen3-Omni still needs ``flash-attn``:
 
    .. code-block:: bash
@@ -160,13 +195,14 @@ Or, in an existing Python 3.12 environment:
 
 .. note::
 
-   ``torch``, ``torchvision``, and ``torchaudio`` are already in the base install; each
-   model extra adds that family's remaining runtime — FlashInfer for the autoregressive
-   backbones, Transformers, safetensors, any codec/media libraries, and the Mooncake RDMA
-   transport for disaggregated deployments.
+   The base install requires PyTorch. Backend extras select its tested version
+   range and media libraries; model extras add kernels, Transformers, safetensors
+   and the Mooncake RDMA transport for disaggregated deployments.
 
 GPU libraries
 -------------
+
+The libraries in this section apply to the CUDA model extras.
 
 The GPU model families depend on:
 

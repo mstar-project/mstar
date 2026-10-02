@@ -16,6 +16,9 @@ dependencies = ["mstar-ai"]
 # forward to the real package instead of silently installing the bare engine.
 # Keep in sync with mstar-ai's [project.optional-dependencies].
 [project.optional-dependencies]
+cuda = ["mstar-ai[cuda]"]
+xpu = ["mstar-ai[xpu]"]
+bagel_xpu = ["mstar-ai[bagel_xpu]"]
 dev = ["mstar-ai[dev]"]
 audio = ["mstar-ai[audio]"]
 dynamo = ["mstar-ai[dynamo]"]

@@ -69,7 +69,12 @@ mstar serve bagel          # one command — launch a server (default: http://lo
 The PyPI package is `mstar-ai` (`mstar-project` and `mstar-serve` install the same thing); the import package
 and the CLI are `mstar`. Working from a checkout instead: `uv pip install --torch-backend=auto -e .[all]`.
 
-To enable flash-attn support (required for Qwen3-Omni, recommended for BAGEL),
+For BAGEL on Intel XPU, install from a checkout with
+`uv pip install --torch-backend=xpu -e ".[bagel_xpu]"`, then use
+`mstar-serve --config configs/bagel_xpu_tp2.yaml`.
+See the [installation guide](docs/installation.rst#intel-xpu-bagel) for backend dependencies.
+
+To enable CUDA flash-attn support (required for Qwen3-Omni, recommended for BAGEL),
 ```bash
 # torch built for CUDA 12.x (cu12)
 uv pip install \
