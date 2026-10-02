@@ -51,6 +51,9 @@ class GDNWrapper(ABC):
     # chunked kernel takes one and ignores it, returning NaN once a sequence is
     # long enough to matter, so the prefill path is normalised by the caller.
     qk_l2norm_in_kernel: bool = False
+    # Whether the kernel reads strided `v`/`a`/`b` (column views of the fused
+    # projection and conv output) as they are, sparing the caller a copy each.
+    takes_strided_inputs: bool = False
 
     @abstractmethod
     def plan(self, *args, **kwargs):
@@ -439,6 +442,8 @@ class GDNDecodeWrapper(GDNWrapper):
     # The cutlass decode kernel really does normalise in-kernel, which saves
     # the caller a norm + divide + two casts per q and k, per layer, per step.
     qk_l2norm_in_kernel: bool = True
+    # it marks q/k/v/a/b layout-dynamic, so the views go in as they are
+    takes_strided_inputs: bool = True
 
     def plan(
         self, spans: list[int], slots: torch.Tensor
@@ -469,6 +474,16 @@ class GDNDecodeWrapper(GDNWrapper):
     def run(self, q, k, v, g, beta, state, a_log, dt_bias):
         from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 
+        # Uninitialized output: the kernel writes every row, except one whose
+        # slot is -1 (only with the sink off), which it would leave as found.
+        # Its own default is a fresh `torch.zeros`, a fill per layer per step.
+        output = (
+            torch.empty(
+                (q.shape[0], 1, v.shape[1], v.shape[2]),
+                dtype=torch.bfloat16, device=q.device,
+            )
+            if self._null_slot_id >= 0 and q.dtype == torch.bfloat16 else None
+        )
         # row i is token i, so the token axis is just unsqueezed
         out, _ = gated_delta_rule_decode_pretranspose(
             q=q.unsqueeze(1), k=k.unsqueeze(1), v=v.unsqueeze(1),
@@ -478,6 +493,7 @@ class GDNDecodeWrapper(GDNWrapper):
             dt_bias=dt_bias,
             b=beta.unsqueeze(1),
             scale=self._sm_scale,
+            output=output,
             initial_state=state,
             initial_state_indices=self._plan_state.slots,
             use_qk_l2norm=self._qk_l2norm,

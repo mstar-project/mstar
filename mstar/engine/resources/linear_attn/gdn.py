@@ -272,10 +272,12 @@ class GDNManager(LinearAttnManager):
         if self.config.qk_l2norm and not plan.qk_l2norm_in_kernel:
             q = torch.nn.functional.normalize(q.float(), dim=-1).to(q.dtype)
             k = torch.nn.functional.normalize(k.float(), dim=-1).to(k.dtype)
-        # both kernels demand contiguous inputs; a split projection gives views
-        v = v.contiguous()
-        a = a.contiguous()
-        b = b.contiguous()
+        # a split projection gives column views; copy only for a kernel that
+        # needs them contiguous
+        if not plan.takes_strided_inputs:
+            v = v.contiguous()
+            a = a.contiguous()
+            b = b.contiguous()
 
         return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias)
 
