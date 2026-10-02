@@ -977,6 +977,29 @@ async def shutdown_event():
 # CLI entry point
 # ------------------------------------------------------------------
 
+def _apply_config_env(config: dict, config_path: str) -> None:
+    """Export the yaml's optional ``env:`` section before anything is spawned.
+
+    The conductor and workers are spawned (fresh interpreters), so a variable
+    set here reaches every process that reads it at import or startup. One
+    already set in the environment wins: a config default, not an override.
+    """
+    env = config.get("env") or {}
+    applied, kept = {}, {}
+    for key, value in env.items():
+        value = str(value)
+        if key in os.environ:
+            kept[key] = os.environ[key]
+        else:
+            os.environ[key] = value
+            applied[key] = value
+    log = logging.getLogger(__name__)
+    if applied:
+        log.info("yaml env from %s: %s", config_path, applied)
+    if kept:
+        log.info("yaml env from %s: kept from the environment: %s", config_path, kept)
+
+
 def main(argv: list[str] | None = None):
     import argparse
 
@@ -1059,6 +1082,7 @@ def main(argv: list[str] | None = None):
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
+    _apply_config_env(config, args.config)
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight

@@ -8,6 +8,14 @@ dist_timeout_s: 7200
 #   mstar-serve --config configs/kimi_k2_7_code_tp8.yaml \
 #               --model-path /path/to/Kimi-K2.7-Code
 # Omit --model-path to pull moonshotai/Kimi-K2.7-Code from HuggingFace.
+# Decode-path defaults, measured on the pruned-96 checkpoint at TP4 on 4x H200
+# (8k in / 1k out, TPOT p50 at N=1 / N=8): 14.4 / 24.0 ms with none of these,
+# 9.5 / 15.0 ms with all four. Set any of them in the environment to override.
+env:
+  MSTAR_ALLREDUCE_BACKEND: flashinfer            # one-shot all-reduce fused with add+RMSNorm
+  MSTAR_TP_ASYNC_SCHED: "1"                      # build/plan step N+1 during forward N
+  TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS: ATEN # cuBLAS for small-M decode GEMMs
+  MSTAR_KIMI_SHARED_STREAM: "1"                  # shared expert beside the routed experts
 model_kwargs:
   config_variant: k27_code
   tokenizer_mode: hf

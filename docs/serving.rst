@@ -201,6 +201,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``dist_timeout_s``
      - *(optional)* Timeout in seconds for the NCCL world group and its parallel
        subgroups. Unset keeps PyTorch's default.
+   * - ``env``
+     - *(optional)* Environment variables exported before the conductor and workers
+       are spawned, e.g. the decode-path switches in :doc:`environment_variables`. A
+       variable already set in the launching environment wins over the config.
 
 Node names are model-specific — they are the node names appearing in the model's graph
 walks (e.g. BAGEL's ``vit_encoder`` / ``vae_encoder`` / ``LLM``, Orpheus's ``LLM`` /
