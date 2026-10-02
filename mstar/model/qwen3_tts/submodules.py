@@ -708,7 +708,12 @@ class TalkerSubmodule(ARNodeSubmodule):
                 },
             ),
             capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            compile=True,
+            # Capture the eager kernels. A torch.compile'd capture picks its
+            # kernels by benchmarking in each process, and sixty sampling
+            # steps turn the resulting rounding differences into a different
+            # token sequence per server instance for the same seed. The eager
+            # kernels are the same everywhere, and the capture is faster.
+            compile=False,
         )]
 
     def get_piecewise_cuda_graph_configs(

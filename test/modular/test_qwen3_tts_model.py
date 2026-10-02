@@ -702,6 +702,10 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     graph_config = submodule.get_cuda_graph_configs(torch.device("cpu"))[0]
     assert graph_config.capture_graph_walk == "talker_decode"
     assert graph_config.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
+    # The decode graph captures the eager kernels: a compiled capture picks
+    # kernels by benchmarking per process, and the same seed then gives a
+    # different token sequence on every server instance.
+    assert graph_config.compile is False
     assert graph_config.single_request_inputs.tensor_inputs[
         "suppress_eos"
     ].item() is True
