@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 
 from mstar.communication.tensors import TensorCommunicationManager
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import (
     GraphEdge,
@@ -183,6 +183,11 @@ class WorkerGraphQueues:
 @dataclass
 class PerPartitionInfo:
     current_fwd_info: CurrentForwardPassInfo
+    # Publication produced by this worker since its last completion message.
+    # Kept separate from current_fwd_info, which also contains peer state.
+    pending_resource_publish_info: dict[str, PublishedInfo] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -250,10 +255,43 @@ class RequestStateManager:
         if resource_publish_info is not None:
             part_info.current_fwd_info.update_publish_info(resource_publish_info)
 
+    def buffer_publish_info(
+        self,
+        request_id: int,
+        partition_name: str,
+        published: dict[str, PublishedInfo],
+    ) -> None:
+        pending = self.per_request_info[request_id].per_partition_info[
+            partition_name
+        ].pending_resource_publish_info
+        # finalize_batch also merges these objects into current_fwd_info.
+        # Detach the pending delta so a later peer update to that aggregate
+        # cannot leak another rank into this worker's completion message.
+        merge_publish_info(
+            pending, {name: info.clone() for name, info in published.items()}
+        )
+
+    def flush_publish_info(
+        self, request_id: int, partition_name: str,
+    ) -> dict[str, PublishedInfo]:
+        part_info = self.per_request_info[request_id].per_partition_info[
+            partition_name
+        ]
+        published = part_info.pending_resource_publish_info
+        part_info.pending_resource_publish_info = {}
+        return published
+
     def get_fwd_info(self, request_id: int, partition_name: str):
         return self.per_request_info[request_id].per_partition_info[
             partition_name
         ].current_fwd_info
+
+    def get_pending_publish_info(
+        self, request_id: int, partition_name: str,
+    ) -> dict[str, PublishedInfo]:
+        return self.per_request_info[request_id].per_partition_info[
+            partition_name
+        ].pending_resource_publish_info
 
     def get_partition_for_node(self, node_name: str) -> str | None:
         return self.node_to_partition.get(node_name)

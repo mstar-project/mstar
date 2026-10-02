@@ -289,7 +289,7 @@ pub struct GraphRuntime {
         is_first_tp_rank: bool,
         partition_name: &str,
         stream_tokens_consumed: &[(String, i64)],
-        request_info_encoded: Option<&[u8]>,
+        publication_encoded: Option<&[u8]>,
         profiling_encoded: Option<&[u8]>,
         speculative: bool,
     ) -> PyResult<Vec<u8>> {
@@ -326,9 +326,7 @@ pub struct GraphRuntime {
             partition_done,
             stream_tokens_consumed,
             output_loop_indices: loop_indices,
-            resource_publish_info: frames::spliced_field(
-                request_info_encoded, "resource_publish_info",
-            ),
+            resource_publish_info: frames::spliced_value(publication_encoded),
             profiling: frames::split_profiling(profiling_encoded),
         };
         let bk = self.bookkeeping.lock().unwrap();
@@ -2627,11 +2625,8 @@ impl GraphRuntime {
         Ok(out)
     }
 
-    /// Stop loops, record the pending stops, and report who to tell.
-    ///
-    /// Returns (worker, loop names) per rid for the caller to send. The frames
-    /// are still built in Python: a Rust encoder has to reproduce the typed
-    /// msgpack wire.py emits byte for byte, which is its own piece of work.
+    /// Stop loops, record the pending stops, notify peers, and return the rids
+    /// whose loops were actually stopped.
     #[allow(clippy::type_complexity)]
     fn stop_loops_batched(
         &mut self,
@@ -2641,17 +2636,18 @@ impl GraphRuntime {
         last_node_run: &str,
         rids: Vec<u32>,
         loop_names: Vec<Vec<String>>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Vec<u32>> {
         // One release for the whole batch; see send_outputs.
-        py.allow_threads(move || -> PyResult<()> {
+        py.allow_threads(move || -> PyResult<Vec<u32>> {
             if rids.len() != loop_names.len() {
                 return Err(PyValueError::new_err(
                     "stop_loops_batched: rids and loop_names must be the same length",
                 ));
             }
             let Some(walk) = self.interner.get(graph_walk) else {
-                return Ok(());
+                return Ok(Vec::new());
             };
+            let mut stopped_rids = Vec::new();
             for (rid, names) in rids.into_iter().zip(loop_names) {
                 let wanted: Vec<String> = names
                     .into_iter()
@@ -2693,8 +2689,9 @@ impl GraphRuntime {
                     .encode(&self.interner);
                     self.dispatch(self.interner.name(worker), &bytes)?;
                 }
+                stopped_rids.push(rid);
             }
-            Ok(())
+            Ok(stopped_rids)
         })
     }
 
@@ -2766,6 +2763,7 @@ impl GraphRuntime {
         completion_id, info_rids, request_infos,
         ntc_rids, new_token_counts,
         consumed_rids, stream_tokens_consumed, prof_rids, profiling,
+        publish_rids, publications,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn send_outputs(
@@ -2782,7 +2780,9 @@ impl GraphRuntime {
         stream_tokens_consumed: Vec<FxHashMap<String, i64>>,
         prof_rids: Vec<u32>,
         profiling: Vec<Option<Vec<u8>>>,
-    ) -> PyResult<()> {
+        publish_rids: Vec<u32>,
+        publications: Vec<Option<Vec<u8>>>,
+    ) -> PyResult<Vec<u32>> {
         // Released for the whole frame phase rather than around each send.
         // Nothing below touches Python: the arguments arrive already
         // extracted, the frames are msgpack built from the interner and the
@@ -2799,7 +2799,7 @@ impl GraphRuntime {
         // Python thread may call into this runtime while a send is in
         // flight: it would get `Already mutably borrowed` rather than block.
         // Only the worker's main loop does today.
-        py.allow_threads(move || -> PyResult<()> {
+        py.allow_threads(move || -> PyResult<Vec<u32>> {
             let request_infos: Vec<(u32, Option<Vec<u8>>)> =
                 info_rids.into_iter().zip(request_infos).collect();
             let new_token_counts: Vec<(u32, Vec<(String, i64)>)> = ntc_rids
@@ -2827,6 +2827,9 @@ impl GraphRuntime {
                 profiling.into_iter().collect();
             let consumed: FxHashMap<u32, Vec<(String, i64)>> =
                 stream_tokens_consumed.into_iter().collect();
+            let publications: FxHashMap<u32, Option<Vec<u8>>> =
+                publish_rids.into_iter().zip(publications).collect();
+            let mut sent_rids = Vec::new();
             let nested = std::mem::take(&mut plan.nested);
 
             // One frame per (request, worker): the plan is per edge, and a worker
@@ -2927,13 +2930,14 @@ impl GraphRuntime {
                 let bytes = self.worker_graphs_done_frame(
                     rid, &wg_ids, is_first_tp_rank, &partition,
                     consumed.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]),
-                    encoded.get(&rid).and_then(|b| b.as_deref()),
+                    publications.get(&rid).and_then(|b| b.as_deref()),
                     profiling.get(&rid).and_then(|b| b.as_deref()),
                     spec_flags.get(&rid).copied().unwrap_or(false),
                 )?;
                 self.dispatch("conductor", &bytes)?;
+                sent_rids.push(rid);
             }
-            Ok(())
+            Ok(sent_rids)
         })
     }
 

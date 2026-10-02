@@ -11,6 +11,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import partial
 from time import sleep
 
 import torch
@@ -18,14 +19,21 @@ import torch
 from mstar.communication.codec import WireCodec
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.event import EventWakeup
-from mstar.communication.tensors import NameToTensorList, create_tensor_communication_manager
+from mstar.communication.tensors import (
+    LocalTransferEngine,
+    NameToTensorList,
+    create_tensor_communication_manager,
+)
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_torch_config
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AllocationFailed, StepContext
-from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.kv.transfer import (
+    TransferEngineInfo,
+    make_deployment_kv_shm_dir,
+)
 from mstar.graph.base import GraphEdge
 from mstar.graph.graph_io import format_graph_edge_list
 from mstar.graph.runtime.base import (
@@ -275,6 +283,18 @@ class Worker:
             tcp_transfer_device=tcp_transfer_device,
             enable_prof=enable_prof
         )
+        kv_shm_dir_factory = None
+        if (
+            isinstance(
+                self.tensor_manager.transfer_engine, LocalTransferEngine,
+            )
+            and self.device.type != "cuda"
+        ):
+            kv_shm_dir_factory = partial(
+                make_deployment_kv_shm_dir,
+                socket_path_prefix=socket_path_prefix,
+                dist_init_method=dist_init_method,
+            )
 
         node_names = set()
         for wg in my_worker_graphs:
@@ -288,7 +308,8 @@ class Worker:
             transfer_engine_info=TransferEngineInfo(
                 my_entity_id=worker_id,
                 my_session_id=self.tensor_manager.my_session_id,
-                transfer_engine=self.tensor_manager.transfer_engine
+                transfer_engine=self.tensor_manager.transfer_engine,
+                shm_dir_factory=kv_shm_dir_factory,
             ),
             model=model,
             enable_nvtx=self.enable_nvtx,
@@ -1404,6 +1425,8 @@ class Worker:
         )
 
 
+
+
     # ------------------------------------------------------------------
     # Main loop — async scheduling
     #
@@ -1596,7 +1619,10 @@ class Worker:
             # the next iter's prep and the conductor see it. Runs regardless
             # of success, allocation failure, or an uncaught raise —
             # finalize_batch reads whatever state the engine actually reached.
-            engine.finalize_batch(node_batch)
+            publish_rids = self._publishable_request_ids(node_batch)
+            node_batch.resource_publish_info = engine.finalize_batch(
+                node_batch, publish_request_ids=publish_rids,
+            )
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
@@ -1685,6 +1711,21 @@ class Worker:
     # ------------------------------------------------------------------
     # Speculation
     # ------------------------------------------------------------------
+
+    def _publishable_request_ids(self, batch: ExecutingBatch) -> list[int]:
+        """Do not create a late KV snapshot for an aborting request.
+
+        REMOVE_REQUEST is deferred while a GPU step is in flight. The
+        publication on that step's completion must still exclude the rid.
+        """
+        return [
+            rid for rid in batch.request_ids
+            if (info := batch.per_request_info.get(rid)) is not None
+            if rid not in self._pending_removes
+            and rid not in self.scheduler.failed_rids
+            and info.request_id not in self._pending_drains
+            and info.request_id not in self._draining_rids
+        ]
 
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
         if not self._graph_runtime.is_async_schedulable(
@@ -2414,20 +2455,37 @@ class Worker:
             range_pop(synchronize=False)
             range_push("worker.postprocess.stop_loops", synchronize=False)
 
+
         # Stop loops, if applicable. The runtime filters rids whose walk does
         # not contain the loop, snapshots the stop times, records the pending
         # stops and fans out to peers.
         # Main loop only: the runtime holds `&mut self` across its GIL
         # release, so a concurrent caller gets "Already mutably
         # borrowed" rather than blocking.
+        stopped_rids = []
         if stops:
-            self._graph_runtime.stop_loops_batched(
+            stopped_rids = self._graph_runtime.stop_loops_batched(
                 partition=batch_N.partition,
                 graph_walk=batch_N.graph_walk,
                 last_node_run=batch_N.node_name,
                 loop_names=ParallelList(
                     list(stops), [list(v) for v in stops.values()],
                 ),
+            )
+
+        # Ordinary publication precedes stop detection on the GPU thread.
+        # Export final-only state now, after the last iteration committed and
+        # before routing reports the completed loop to the conductor.
+        if stopped_rids:
+            engine.finalize_stopped_requests(batch_N.node_batch, stopped_rids)
+
+        # CurrentForwardPassInfo also contains publication inherited from peer
+        # ranks. Buffer only what this worker produced for the conductor.
+        for rid in batch_N.node_batch.request_ids:
+            self.request_state.buffer_publish_info(
+                rid,
+                batch_N.partition,
+                batch_N.node_batch.resource_publish_info.get(rid, {}),
             )
 
         if self.enable_nvtx:
@@ -2568,6 +2626,15 @@ class Worker:
             ),
             profiling=self._profiling_payloads(send_rids) if self.enable_prof
             else None,
+            resource_publish_info=ParallelList(
+                info_rids,
+                [
+                    self.request_state.get_pending_publish_info(
+                        rid, batch_N.partition,
+                    )
+                    for rid in info_rids
+                ],
+            ),
         )
         _t_send = _time.perf_counter() if self._phase_period else 0.0
         if self._phase_period:
@@ -2575,7 +2642,9 @@ class Worker:
         # Main loop only: the runtime holds `&mut self` across its GIL
         # release, so a concurrent caller gets "Already mutably
         # borrowed" rather than blocking.
-        self._graph_runtime.send_outputs(send_input)
+        completed_rids = self._graph_runtime.send_outputs(send_input)
+        for rid in completed_rids:
+            self.request_state.flush_publish_info(rid, batch_N.partition)
         if self._phase_period:
             self._phase_record(
                 "worker.postprocess.send", _time.perf_counter() - _t_send,

@@ -5,6 +5,7 @@ from typing import NamedTuple
 from mstar.communication.tensors import NameToTensorList, TensorStore
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources import PublishedInfo
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
@@ -451,6 +452,8 @@ class SendInput(NamedTuple):
     # rid -> (rx_info, tx_info, graph_timings). All three are populated only
     # under enable_prof, so this is None in production.
     profiling: ParallelList[int, Profiling] | None = None
+    # Only metadata produced by this worker since its last completion.
+    resource_publish_info: ParallelList[int, dict[str, PublishedInfo]] | None = None
 
 
 class GraphRuntime(ABC):
@@ -766,7 +769,7 @@ class GraphRuntime(ABC):
         graph_walk: str,
         last_node_run: str,
         loop_names: ParallelList[int, list[str]]
-    ):
+    ) -> list[int]:
         """
         (1) Stop loops in the graph
         (2) Updates pending_loop_stops list
@@ -775,6 +778,7 @@ class GraphRuntime(ABC):
         Rids whose current walk does not contain a named loop are filtered out
         here (that is a model bug, logged and dropped), so callers pass whatever
         check_stop produced.
+        Returns the rids whose loops were stopped.
         """
         pass
 
@@ -833,7 +837,7 @@ class GraphRuntime(ABC):
     def send_outputs(
         self,
         input: SendInput,
-    ):
+    ) -> list[int]:
         """
         (1) Send outputs to other workers
         (2) Buffer persist signals (the buffered signals will be internal to
@@ -842,5 +846,6 @@ class GraphRuntime(ABC):
         (4) Output signals -> api server
         (5) Remote streaming tensors
         (6) WG done messages to the conductor
+        Returns rids for which a WORKER_GRAPHS_DONE message was sent.
         """
         pass

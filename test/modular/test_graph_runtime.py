@@ -19,6 +19,7 @@ from mstar.conductor.request_info import (
     CurrentForwardPassInfo,
 )
 from mstar.distributed.base import ShardingConfig
+from mstar.engine.resources.kv.manager import KVSequenceInfo, PublishedKVInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.graph.runtime.base import (
@@ -180,6 +181,30 @@ def _make_manager(wg_id=0, graph_walk="decode", worker_id="worker0"):
 
 
 # --- tests -------------------------------------------------------------------
+
+def test_publication_buffer_keeps_only_local_metadata():
+    mgr, _, _, _, rid = _make_manager()
+    inherited = PublishedKVInfo.build_for_rank(
+        rank=0, world_size=2,
+        seq_info={"main": KVSequenceInfo(10, "peer", [0])},
+    )
+    mgr.update_request_info(
+        rid, "default", resource_publish_info={"kv": inherited},
+    )
+    produced = PublishedKVInfo.build_for_rank(
+        rank=1, world_size=2,
+        seq_info={"main": KVSequenceInfo(9, "local", [1])},
+    )
+    mgr.buffer_publish_info(rid, "default", {"kv": produced})
+    produced.update(inherited)
+    produced.get(1)["main"].page_indices.append(2)
+
+    pending = mgr.get_pending_publish_info(rid, "default")["kv"]
+    assert set(pending.info) == {1}
+    assert pending.get(1)["main"].page_indices == [1]
+    assert set(mgr.get_fwd_info(rid, "default").resource_publish_info["kv"].info) == {0}
+    assert set(mgr.flush_publish_info(rid, "default")["kv"].info) == {1}
+    assert mgr.get_pending_publish_info(rid, "default") == {}
 
 def test_inverted_index_populated_at_init():
     mgr, wg_id, walk, runtime, rid = _make_manager()
@@ -397,10 +422,11 @@ def test_pending_loop_stops_are_recorded_and_live_one_iteration():
     _ingest(runtime, rid, [GraphEdge(name="prompt", next_node="prefill")])
     runtime._mark_node_complete(rid, wg_id, "prefill")
 
-    runtime.stop_loops_batched(
+    stopped_rids = runtime.stop_loops_batched(
         partition="default", graph_walk=walk, last_node_run="ar_decode",
         loop_names=ParallelList([rid], [["ar_loop"]]),
     )
+    assert stopped_rids == [rid]
     assert runtime.has_pending_loop_stop(rid, walk, "ar_loop")
     assert runtime.pending_loop_stop_rids(walk, "ar_loop") == {rid}
     # A different walk must not match.
@@ -414,10 +440,11 @@ def test_stop_for_a_loop_not_in_the_walk_is_dropped():
     """check_dyn_loop filtering: a stop naming a loop this walk does not have
     is a model bug, logged and dropped rather than raised."""
     _mgr, _wg_id, walk, runtime, rid = _make_manager()
-    runtime.stop_loops_batched(
+    stopped_rids = runtime.stop_loops_batched(
         partition="default", graph_walk=walk, last_node_run="ar_decode",
         loop_names=ParallelList([rid], [["not_a_real_loop"]]),
     )
+    assert stopped_rids == []
     assert runtime.pending_loop_stop_rids(walk, "not_a_real_loop") == set()
 
 

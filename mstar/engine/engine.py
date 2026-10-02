@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
 from mstar.engine.cuda_graph_runner import (
     CudaGraphRunner,
@@ -23,6 +23,7 @@ from mstar.engine.resources import (
     AdmitFailedReason,
     FullAdmitOutcome,
     NodeResourceSpec,
+    PublishedInfo,
     Resource,
     ResourceReqConfig,
     SlotLease,
@@ -236,6 +237,12 @@ class ExecutingBatch:
     # submitted — the tensors exist then, even though their values land later.
     outputs: dict[str, NameToTensorList] = field(default_factory=dict)
 
+    # Durable resource state produced by this worker in this batch. This is
+    # deliberately narrower than per_request_info's inherited aggregate.
+    resource_publish_info: dict[str, dict[str, PublishedInfo]] = field(
+        default_factory=dict
+    )
+
     # The next step reads N's outputs, and plans against N's committed state.
     # Two separate dependencies, so two events: whoever prepares N+1 can start
     # threading N's outputs while N is still committing.
@@ -352,9 +359,22 @@ class Engine:
             if len(relevant_nodes) == 0:
                 continue # resource not needed
 
-            if not parallel_groups.all_in_same_group(spec.nodes):
+            if not parallel_groups.all_have_compatible_parallel_shape(
+                spec.nodes
+            ):
                 raise ValueError(
                     f"Resource spec {spec.resource_key} nodes {spec.nodes} "
+                    "must use the same TP x SP shape across replicas"
+                )
+
+            # A spec is a logical resource identity and may span replicas on
+            # different workers (for example BAGEL's three CFG branches).
+            # This Engine constructs only the local instance, so require only
+            # the locally hosted consumers to share one parallel group.
+            if not parallel_groups.all_in_same_group(relevant_nodes):
+                raise ValueError(
+                    f"Resource spec {spec.resource_key} local nodes "
+                    f"{relevant_nodes} "
                     f"must all be in the same parallel (tp x sp) group"
                 )
             joint_comm_group = parallel_groups.get_joint_group_for_node(
@@ -367,6 +387,11 @@ class Engine:
                     joint_comm_group=joint_comm_group,
                     transfer_engine_info=transfer_engine_info,
                     kv_dtype=kv_cache_type,
+                    needs_remote_transfer=(
+                        parallel_groups.resource_needs_remote_transfer(
+                            spec.nodes, relevant_nodes
+                        )
+                    ),
                     dependencies={
                         key: specs_by_key[key] for key in spec.depends_on()
                     },
@@ -1226,22 +1251,46 @@ class Engine:
         return stops
 
     def finalize_batch(
-        self, batch: ExecutingBatch
-    ):
+        self, batch: ExecutingBatch,
+        publish_request_ids: list[int] | None = None,
+    ) -> dict[str, dict[str, PublishedInfo]]:
         if self._enable_nvtx:
             range_push("engine.finalize_batch")
         try:
             # Returns rid -> {resource label -> published info}
             published = self._runner.publish(
-                batch.request_ids, node_name=batch.node_name,
+                batch.request_ids if publish_request_ids is None
+                else publish_request_ids,
+                node_name=batch.node_name,
+                graph_walk=batch.step_context.graph_walk,
             )
             for rid, info in batch.per_request_info.items():
                 if rid not in published:
                     continue
                 info.update_publish_info(published[rid])
+            return published
         finally:
             if self._enable_nvtx:
                 range_pop()
+
+    def finalize_stopped_requests(
+        self,
+        batch: ExecutingBatch,
+        request_ids: list[int],
+    ) -> None:
+        """Publish state that must include the last iteration of a stopped loop."""
+        published = self._runner.publish_after_stop(
+            request_ids,
+            node_name=batch.node_name,
+            graph_walk=batch.step_context.graph_walk,
+        )
+        for rid in request_ids:
+            rid_published = published.get(rid, {})
+            batch.per_request_info[rid].update_publish_info(rid_published)
+            merge_publish_info(
+                batch.resource_publish_info.setdefault(rid, {}),
+                rid_published,
+            )
 
     def _collect_outputs(
         self,

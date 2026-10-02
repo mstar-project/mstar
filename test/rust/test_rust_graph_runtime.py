@@ -810,10 +810,11 @@ def test_routing_settles_the_safety_hold(runtime):
 def test_a_stop_records_a_pending_stop(runtime):
     rid = _admit(runtime)
     assert not runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
-    runtime.stop_loops_batched(
+    stopped_rids = runtime.stop_loops_batched(
         partition="default", graph_walk=WALK, last_node_run="ar_decode",
         loop_names=ParallelList([rid], [["ar_loop"]]),
     )
+    assert stopped_rids == [rid]
     assert runtime.has_pending_loop_stop(rid, WALK, "ar_loop")
     assert runtime.pending_loop_stop_rids(WALK, "ar_loop") == {rid}
     runtime.clear_pending_loop_stops()
@@ -823,10 +824,11 @@ def test_a_stop_records_a_pending_stop(runtime):
 def test_a_stop_for_a_loop_not_in_the_walk_is_dropped(runtime):
     # A model bug rather than a protocol one: logged and dropped, not raised.
     rid = _admit(runtime)
-    runtime.stop_loops_batched(
+    stopped_rids = runtime.stop_loops_batched(
         partition="default", graph_walk=WALK, last_node_run="ar_decode",
         loop_names=ParallelList([rid], [["not_a_loop"]]),
     )
+    assert stopped_rids == []
     assert runtime.pending_loop_stop_rids(WALK, "not_a_loop") == set()
 
 
