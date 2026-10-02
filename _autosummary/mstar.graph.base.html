@@ -276,6 +276,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.audio_features.html">mstar.model.components.audio_features</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.aut_encoder.html">mstar.model.components.aut_encoder</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear.html">mstar.model.components.linear</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
@@ -620,6 +621,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.is_ready_for_speculation"><code class="docutils literal notranslate"><span class="pre">GraphNode.is_ready_for_speculation()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.name"><code class="docutils literal notranslate"><span class="pre">GraphNode.name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.outputs"><code class="docutils literal notranslate"><span class="pre">GraphNode.outputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.persisted_input_names"><code class="docutils literal notranslate"><span class="pre">GraphNode.persisted_input_names()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.register_communication_info"><code class="docutils literal notranslate"><span class="pre">GraphNode.register_communication_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.reset_for_outer_iter"><code class="docutils literal notranslate"><span class="pre">GraphNode.reset_for_outer_iter()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.reset_outputs"><code class="docutils literal notranslate"><span class="pre">GraphNode.reset_outputs()</span></code></a></li>
@@ -977,6 +979,20 @@ is a streaming edge that we are not redy for and needs to get re-queued</p>
 <dt class="sig sig-object py" id="mstar.graph.base.GraphNode.outputs">
 <span class="sig-name descname"><span class="pre">outputs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.graph.base.GraphEdge" title="mstar.graph.base.GraphEdge"><span class="pre">GraphEdge</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.graph.base.GraphNode.outputs" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.graph.base.GraphNode.persisted_input_names">
+<span class="sig-name descname"><span class="pre">persisted_input_names</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/graph/base.html#GraphNode.persisted_input_names"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.graph.base.GraphNode.persisted_input_names" title="Link to this definition">#</a></dt>
+<dd><p>Inputs the enclosing loop re-injects unchanged into <code class="docutils literal notranslate"><span class="pre">ready_signals</span></code>
+every iteration (<code class="docutils literal notranslate"><span class="pre">Loop.ingest_external_input</span></code> / <code class="docutils literal notranslate"><span class="pre">complete_iter</span></code>): a
+denoise step’s text conditioning, say. They never land in
+<code class="docutils literal notranslate"><span class="pre">ready_next_iter</span></code>, but they are as good as ready for the next one.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)">set</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.graph.base.GraphNode.register_communication_info">
@@ -1793,6 +1809,7 @@ cleared: in the set only if its inputs are ALL streaming.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.is_ready_for_speculation"><code class="docutils literal notranslate"><span class="pre">GraphNode.is_ready_for_speculation()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.name"><code class="docutils literal notranslate"><span class="pre">GraphNode.name</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.outputs"><code class="docutils literal notranslate"><span class="pre">GraphNode.outputs</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.persisted_input_names"><code class="docutils literal notranslate"><span class="pre">GraphNode.persisted_input_names()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.register_communication_info"><code class="docutils literal notranslate"><span class="pre">GraphNode.register_communication_info()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.reset_for_outer_iter"><code class="docutils literal notranslate"><span class="pre">GraphNode.reset_for_outer_iter()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.graph.base.GraphNode.reset_outputs"><code class="docutils literal notranslate"><span class="pre">GraphNode.reset_outputs()</span></code></a></li>

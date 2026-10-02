@@ -629,6 +629,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.audio_features.html">mstar.model.components.audio_features</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.aut_encoder.html">mstar.model.components.aut_encoder</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.linear.html">mstar.model.components.linear</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
@@ -890,6 +891,7 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionManager</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.ragged.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">RaggedAttnManager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVManager</span>
 
 
@@ -909,6 +911,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    That sharing is why the label is one cursor for the whole stack. No model</span>
 <span class="sd">    varies its label per layer today; one that needs to should thread the label</span>
 <span class="sd">    explicitly rather than use this.</span>
+
+<span class="sd">    For a cacheless attention, see :class:`RaggedAttentionCallable`.</span>
 <span class="sd">    """</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kv</span><span class="p">:</span> <span class="n">KVManager</span><span class="p">,</span> <span class="n">attn</span><span class="p">:</span> <span class="n">AttentionManager</span> <span class="o">|</span> <span class="kc">None</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
@@ -953,6 +957,38 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="o">.</span><span class="n">requires_kv_write</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">kv</span><span class="o">.</span><span class="n">write_kv</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">kv_cache_layer</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv</span><span class="o">.</span><span class="n">layer_view</span><span class="p">(),</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="RaggedAttentionCallable">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.convenience.html#mstar.engine.resources.convenience.RaggedAttentionCallable">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">RaggedAttentionCallable</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""`AttentionCallable` for a cacheless attention: ``(q, k, v) -&gt; out`` over</span>
+<span class="sd">    one declared span of a `RaggedAttnManager`.</span>
+
+<span class="sd">    No ``kv`` and no layer cursor, because there is neither to carry: a ragged</span>
+<span class="sd">    plan is keyed by the segment label, and the wrapper behind it is per</span>
+<span class="sd">    (bucket, slot, label) rather than per layer. The label is therefore bound</span>
+<span class="sd">    here at construction instead of being a cursor on the resource -- which is</span>
+<span class="sd">    what lets one stack attend over several spans at once (a refiner over the</span>
+<span class="sd">    image tokens next to a pass over all of them), the case `AttentionCallable`</span>
+<span class="sd">    says to thread explicitly.</span>
+
+<span class="sd">    One instance per label, held for the life of the resource binding: a</span>
+<span class="sd">    compiled transformer region guards on the identity of the callables it is</span>
+<span class="sd">    handed, so handing it a fresh one per step retraces that frame every step</span>
+<span class="sd">    until Dynamo gives up.</span>
+<span class="sd">    """</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">attn</span><span class="p">:</span> <span class="n">RaggedAttnManager</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">attn</span> <span class="o">=</span> <span class="n">attn</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">label</span> <span class="o">=</span> <span class="n">label</span>
+
+    <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">label</span><span class="p">)</span></div>
 
 </pre></div>
 

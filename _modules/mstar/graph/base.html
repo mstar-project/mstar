@@ -629,6 +629,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.audio_features.html">mstar.model.components.audio_features</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.aut_encoder.html">mstar.model.components.aut_encoder</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.linear.html">mstar.model.components.linear</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../_autosummary/mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
@@ -1275,6 +1276,19 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="GraphNode.persisted_input_names">
+<a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.persisted_input_names">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">persisted_input_names</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""Inputs the enclosing loop re-injects unchanged into ``ready_signals``</span>
+<span class="sd">        every iteration (``Loop.ingest_external_input`` / ``complete_iter``): a</span>
+<span class="sd">        denoise step's text conditioning, say. They never land in</span>
+<span class="sd">        ``ready_next_iter``, but they are as good as ready for the next one."""</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="n">name</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">edge</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">ready_signals</span><span class="o">.</span><span class="n">ready_inputs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">edge</span><span class="o">.</span><span class="n">_persist_for_loop</span>
+        <span class="p">}</span></div>
+
+
 <div class="viewcode-block" id="GraphNode.is_ready_for_speculation">
 <a class="viewcode-back" href="../../../_autosummary/mstar.graph.base.html#mstar.graph.base.GraphNode.is_ready_for_speculation">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_ready_for_speculation</span><span class="p">(</span>
@@ -1285,19 +1299,12 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">allow_streaming</span><span class="p">:</span>
             <span class="n">needed_inputs</span> <span class="o">=</span> <span class="n">needed_inputs</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">_streaming_inputs</span>
         <span class="k">if</span> <span class="n">check_next_iter</span><span class="p">:</span>
-            <span class="c1"># Loop-external inputs are re-injected unchanged into ready_signals</span>
-            <span class="c1"># every iteration (Loop.ingest_external_input / complete_iter) and</span>
-            <span class="c1"># never routed through ready_next_iter. Count them here so a</span>
-            <span class="c1"># same-node next-iteration speculation isn't blocked on inputs</span>
-            <span class="c1"># that are guaranteed to reappear.</span>
-            <span class="n">carried_names</span> <span class="o">=</span> <span class="p">{</span>
-                <span class="n">name</span> <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">edge</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">ready_signals</span><span class="o">.</span><span class="n">ready_inputs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
-                <span class="k">if</span> <span class="n">edge</span><span class="o">.</span><span class="n">_persist_for_loop</span>
-            <span class="p">}</span>
+            <span class="c1"># Count the persisted inputs here so a same-node next-iteration</span>
+            <span class="c1"># speculation isn't blocked on inputs guaranteed to reappear.</span>
             <span class="k">return</span> <span class="n">needed_inputs</span><span class="o">.</span><span class="n">issubset</span><span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">ready_next_iter</span><span class="o">.</span><span class="n">ready_names</span>
                 <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_signals</span><span class="o">.</span><span class="n">ready_names</span>
-                <span class="o">|</span> <span class="n">carried_names</span>
+                <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">persisted_input_names</span><span class="p">()</span>
             <span class="p">)</span>
         <span class="k">return</span> <span class="n">needed_inputs</span><span class="o">.</span><span class="n">issubset</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">ready_signals</span><span class="o">.</span><span class="n">ready_names</span> <span class="o">|</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_signals</span><span class="o">.</span><span class="n">ready_names</span>

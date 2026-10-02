@@ -276,6 +276,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.audio_features.html">mstar.model.components.audio_features</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.aut_encoder.html">mstar.model.components.aut_encoder</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.linear.html">mstar.model.components.linear</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
@@ -773,16 +774,20 @@ when <code class="docutils literal notranslate"><span class="pre">stream=False</
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">generate_image(prompt,</span> <span class="pre">**kw)</span></code></p></td>
 <td><p>PNG <code class="docutils literal notranslate"><span class="pre">bytes</span></code> (e.g. BAGEL text-to-image).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tts(text,</span> <span class="pre">*,</span> <span class="pre">voice=None,</span> <span class="pre">**kw)</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">edit_image(prompt,</span> <span class="pre">image,</span> <span class="pre">**kw)</span></code></p></td>
+<td><p>PNG <code class="docutils literal notranslate"><span class="pre">bytes</span></code> for an edit of <code class="docutils literal notranslate"><span class="pre">image</span></code> (a path, bytes, or a list of them for
+multi-reference models).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tts(text,</span> <span class="pre">*,</span> <span class="pre">voice=None,</span> <span class="pre">**kw)</span></code></p></td>
 <td><p>An <code class="docutils literal notranslate"><span class="pre">AudioBuffer</span></code> (<code class="docutils literal notranslate"><span class="pre">.to_wav(path)</span></code>, <code class="docutils literal notranslate"><span class="pre">.to_numpy()</span></code>, <code class="docutils literal notranslate"><span class="pre">len(...)</span></code> samples).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">voices()</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">voices()</span></code></p></td>
 <td><p>The <code class="docutils literal notranslate"><span class="pre">voice</span></code> ids the served speech model accepts (<code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/audio/voices</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">stream(**kw)</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">stream(**kw)</span></code></p></td>
 <td><p>Sugar for <code class="docutils literal notranslate"><span class="pre">generate(stream=True,</span> <span class="pre">...)</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">health()</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">health()</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">True</span></code> if the server is healthy.</p></td>
 </tr>
 </tbody>

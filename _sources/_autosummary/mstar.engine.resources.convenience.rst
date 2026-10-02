@@ -18,6 +18,7 @@ mstar.engine.resources.convenience
    .. autosummary::
    
       AttentionCallable
+      RaggedAttentionCallable
    
    
 

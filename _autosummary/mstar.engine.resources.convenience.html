@@ -276,6 +276,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.audio_features.html">mstar.model.components.audio_features</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.aut_encoder.html">mstar.model.components.aut_encoder</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear.html">mstar.model.components.linear</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
@@ -602,6 +603,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.AttentionCallable.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">AttentionCallable.set_layer_idx()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.RaggedAttentionCallable"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionCallable</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -621,6 +623,9 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.convenience.AttentionCallable" title="mstar.engine.resources.convenience.AttentionCallable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">AttentionCallable</span></code></a>(kv[, attn])</p></td>
 <td><p>A convenience wrapper around kv and attn that wraps the KV write and attention call in one pure-tensor function, with helper methods for setting layer and label information.</p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.convenience.RaggedAttentionCallable" title="mstar.engine.resources.convenience.RaggedAttentionCallable"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RaggedAttentionCallable</span></code></a>(attn, label)</p></td>
+<td><p><cite>AttentionCallable</cite> for a cacheless attention: <code class="docutils literal notranslate"><span class="pre">(q,</span> <span class="pre">k,</span> <span class="pre">v)</span> <span class="pre">-&gt;</span> <span class="pre">out</span></code> over one declared span of a <cite>RaggedAttnManager</cite>.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -639,6 +644,7 @@ per layer and blows the recompile limit.</p>
 <p>That sharing is why the label is one cursor for the whole stack. No model
 varies its label per layer today; one that needs to should thread the label
 explicitly rather than use this.</p>
+<p>For a cacheless attention, see <a class="reference internal" href="#mstar.engine.resources.convenience.RaggedAttentionCallable" title="mstar.engine.resources.convenience.RaggedAttentionCallable"><code class="xref py py-class docutils literal notranslate"><span class="pre">RaggedAttentionCallable</span></code></a>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -685,6 +691,33 @@ layer that no longer takes a label as an argument can still reach it
 </dl>
 </dd></dl>
 
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.resources.convenience.RaggedAttentionCallable">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.convenience.</span></span><span class="sig-name descname"><span class="pre">RaggedAttentionCallable</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">attn</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/convenience.html#RaggedAttentionCallable"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.convenience.RaggedAttentionCallable" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p><cite>AttentionCallable</cite> for a cacheless attention: <code class="docutils literal notranslate"><span class="pre">(q,</span> <span class="pre">k,</span> <span class="pre">v)</span> <span class="pre">-&gt;</span> <span class="pre">out</span></code> over
+one declared span of a <cite>RaggedAttnManager</cite>.</p>
+<p>No <code class="docutils literal notranslate"><span class="pre">kv</span></code> and no layer cursor, because there is neither to carry: a ragged
+plan is keyed by the segment label, and the wrapper behind it is per
+(bucket, slot, label) rather than per layer. The label is therefore bound
+here at construction instead of being a cursor on the resource – which is
+what lets one stack attend over several spans at once (a refiner over the
+image tokens next to a pass over all of them), the case <cite>AttentionCallable</cite>
+says to thread explicitly.</p>
+<p>One instance per label, held for the life of the resource binding: a
+compiled transformer region guards on the identity of the callables it is
+handed, so handing it a fresh one per step retraces that frame every step
+until Dynamo gives up.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>attn</strong> (<a class="reference internal" href="mstar.engine.resources.attn.ragged.base.html#mstar.engine.resources.attn.ragged.base.RaggedAttnManager" title="mstar.engine.resources.attn.ragged.base.RaggedAttnManager"><em>RaggedAttnManager</em></a>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
 </dd></dl>
 
 </section>
@@ -742,6 +775,7 @@ layer that no longer takes a label as an argument can still reach it
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.AttentionCallable.set_layer_idx"><code class="docutils literal notranslate"><span class="pre">AttentionCallable.set_layer_idx()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.convenience.RaggedAttentionCallable"><code class="docutils literal notranslate"><span class="pre">RaggedAttentionCallable</span></code></a></li>
 </ul>
   </nav></div>
 

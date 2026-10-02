@@ -276,6 +276,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.audio_features.html">mstar.model.components.audio_features</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.aut_encoder.html">mstar.model.components.aut_encoder</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear.html">mstar.model.components.linear</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
@@ -616,6 +617,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3EdgeAdapter.supports_chat"><code class="docutils literal notranslate"><span class="pre">Cosmos3EdgeAdapter.supports_chat</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter"><code class="docutils literal notranslate"><span class="pre">DiffusionImageAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter.image_edit_to_request"><code class="docutils literal notranslate"><span class="pre">DiffusionImageAdapter.image_edit_to_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter.image_to_request"><code class="docutils literal notranslate"><span class="pre">DiffusionImageAdapter.image_to_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter.supports_images"><code class="docutils literal notranslate"><span class="pre">DiffusionImageAdapter.supports_images</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.HiggsAudioAdapter"><code class="docutils literal notranslate"><span class="pre">HiggsAudioAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.HiggsAudioAdapter.supports_transcriptions"><code class="docutils literal notranslate"><span class="pre">HiggsAudioAdapter.supports_transcriptions</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.HiggsAudioAdapter.transcription_to_request"><code class="docutils literal notranslate"><span class="pre">HiggsAudioAdapter.transcription_to_request()</span></code></a></li>
@@ -760,34 +767,37 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Cosmos3EdgeAdapter" title="mstar.api_server.openai.adapters.Cosmos3EdgeAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Cosmos3EdgeAdapter</span></code></a>()</p></td>
 <td><p>Cosmos3-Edge: the generator surfaces of <a class="reference internal" href="#mstar.api_server.openai.adapters.Cosmos3Adapter" title="mstar.api_server.openai.adapters.Cosmos3Adapter"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cosmos3Adapter</span></code></a> plus chat (the reasoner: the understanding tower served as a VLM).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.HiggsAudioAdapter" title="mstar.api_server.openai.adapters.HiggsAudioAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HiggsAudioAdapter</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter" title="mstar.api_server.openai.adapters.DiffusionImageAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DiffusionImageAdapter</span></code></a>()</p></td>
+<td><p>Generic adapter for the DiT-scaffold image models (FLUX.2 klein, Z-Image, ...): text-to-image and reference-image editing.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.HiggsAudioAdapter" title="mstar.api_server.openai.adapters.HiggsAudioAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">HiggsAudioAdapter</span></code></a>()</p></td>
 <td><p>Higgs-Audio v3 STT: an instruction-following LLM decoder, so the OpenAI <code class="docutils literal notranslate"><span class="pre">prompt</span></code> is the transcription instruction (the model has a default).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.KokoroAdapter" title="mstar.api_server.openai.adapters.KokoroAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KokoroAdapter</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.KokoroAdapter" title="mstar.api_server.openai.adapters.KokoroAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">KokoroAdapter</span></code></a>()</p></td>
 <td><p>Kokoro-82M: text-to-speech, audio out only.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter" title="mstar.api_server.openai.adapters.OmniVoiceAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OmniVoiceAdapter</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OmniVoiceAdapter" title="mstar.api_server.openai.adapters.OmniVoiceAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OmniVoiceAdapter</span></code></a>()</p></td>
 <td><p>OmniVoice: zero-shot TTS in three modes over one endpoint.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OpenAIAdapter" title="mstar.api_server.openai.adapters.OpenAIAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OpenAIAdapter" title="mstar.api_server.openai.adapters.OpenAIAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a>()</p></td>
 <td><p>Base adapter.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OrpheusAdapter" title="mstar.api_server.openai.adapters.OrpheusAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OrpheusAdapter</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.OrpheusAdapter" title="mstar.api_server.openai.adapters.OrpheusAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">OrpheusAdapter</span></code></a>()</p></td>
 <td><p>Orpheus: text-to-speech (audio out only).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter" title="mstar.api_server.openai.adapters.Qwen3OmniAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Qwen3OmniAdapter</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Qwen3OmniAdapter" title="mstar.api_server.openai.adapters.Qwen3OmniAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Qwen3OmniAdapter</span></code></a>()</p></td>
 <td><p>Qwen3-Omni: multimodal chat (text, optionally + speech) and TTS.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SubmitArgs</span></code></a>(text, file_paths, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SubmitArgs</span></code></a>(text, file_paths, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Transcript" title="mstar.api_server.openai.adapters.Transcript"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Transcript</span></code></a>(text[, language, segments, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Transcript" title="mstar.api_server.openai.adapters.Transcript"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Transcript</span></code></a>(text[, language, segments, ...])</p></td>
 <td><p>A finished transcription as the serving layer reports it.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Wan22Adapter" title="mstar.api_server.openai.adapters.Wan22Adapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Wan22Adapter</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.Wan22Adapter" title="mstar.api_server.openai.adapters.Wan22Adapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Wan22Adapter</span></code></a>()</p></td>
 <td><p>Wan2.2-TI2V-5B: text/image-to-video generation (video only).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.WhisperAdapter" title="mstar.api_server.openai.adapters.WhisperAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WhisperAdapter</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.openai.adapters.WhisperAdapter" title="mstar.api_server.openai.adapters.WhisperAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WhisperAdapter</span></code></a>()</p></td>
 <td><p>Whisper (large-v3, large-v3-turbo): speech-to-text.</p></td>
 </tr>
 </tbody>
@@ -944,6 +954,57 @@ pass through.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.api_server.openai.adapters.Cosmos3EdgeAdapter.supports_chat">
 <span class="sig-name descname"><span class="pre">supports_chat</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.Cosmos3EdgeAdapter.supports_chat" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.DiffusionImageAdapter">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.openai.adapters.</span></span><span class="sig-name descname"><span class="pre">DiffusionImageAdapter</span></span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#DiffusionImageAdapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.api_server.openai.adapters.OpenAIAdapter" title="mstar.api_server.openai.adapters.OpenAIAdapter"><code class="xref py py-class docutils literal notranslate"><span class="pre">OpenAIAdapter</span></code></a></p>
+<p>Generic adapter for the DiT-scaffold image models (FLUX.2 klein, Z-Image, …):
+text-to-image and reference-image editing.</p>
+<p><code class="docutils literal notranslate"><span class="pre">size</span></code> (“WxH”) maps to the models’ <code class="docutils literal notranslate"><span class="pre">width</span></code> / <code class="docutils literal notranslate"><span class="pre">height</span></code> kwargs; <code class="docutils literal notranslate"><span class="pre">seed</span></code> is
+honoured by the conductor; every other knob (<code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code>,
+<code class="docutils literal notranslate"><span class="pre">guidance_scale</span></code> on models that take it, <code class="docutils literal notranslate"><span class="pre">negative_prompt</span></code>) passes through
+<code class="docutils literal notranslate"><span class="pre">extra_body</span></code>. <code class="docutils literal notranslate"><span class="pre">n</span></code> is served as <code class="docutils literal notranslate"><span class="pre">n</span></code> concurrent requests by the images handler,
+which the equal-shape batching then runs together.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.DiffusionImageAdapter.image_edit_to_request">
+<span class="sig-name descname"><span class="pre">image_edit_to_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">prompt</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">image_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">extra_kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#DiffusionImageAdapter.image_edit_to_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter.image_edit_to_request" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>prompt</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>image_path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>extra_kwargs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs"><em>SubmitArgs</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.DiffusionImageAdapter.image_to_request">
+<span class="sig-name descname"><span class="pre">image_to_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">req</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/openai/adapters.html#DiffusionImageAdapter.image_to_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter.image_to_request" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>req</strong> (<a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest" title="mstar.api_server.openai.protocol.ImageGenerationRequest"><em>ImageGenerationRequest</em></a>)</p></li>
+<li><p><strong>upload_dir</strong> (<em>Path</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.api_server.openai.adapters.SubmitArgs" title="mstar.api_server.openai.adapters.SubmitArgs">SubmitArgs</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.openai.adapters.DiffusionImageAdapter.supports_images">
+<span class="sig-name descname"><span class="pre">supports_images</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter.supports_images" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1696,6 +1757,12 @@ apply their own prompt formatting in <code class="docutils literal notranslate">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3EdgeAdapter"><code class="docutils literal notranslate"><span class="pre">Cosmos3EdgeAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3EdgeAdapter.chat_to_request"><code class="docutils literal notranslate"><span class="pre">Cosmos3EdgeAdapter.chat_to_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.Cosmos3EdgeAdapter.supports_chat"><code class="docutils literal notranslate"><span class="pre">Cosmos3EdgeAdapter.supports_chat</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter"><code class="docutils literal notranslate"><span class="pre">DiffusionImageAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter.image_edit_to_request"><code class="docutils literal notranslate"><span class="pre">DiffusionImageAdapter.image_edit_to_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter.image_to_request"><code class="docutils literal notranslate"><span class="pre">DiffusionImageAdapter.image_to_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.DiffusionImageAdapter.supports_images"><code class="docutils literal notranslate"><span class="pre">DiffusionImageAdapter.supports_images</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.openai.adapters.HiggsAudioAdapter"><code class="docutils literal notranslate"><span class="pre">HiggsAudioAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

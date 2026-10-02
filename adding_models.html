@@ -275,6 +275,7 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.audio_features.html">mstar.model.components.audio_features</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.aut_encoder.html">mstar.model.components.aut_encoder</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.linear.html">mstar.model.components.linear</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
@@ -628,6 +629,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-orpheus">Worked example: Orpheus</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-bagel">Worked example: BAGEL</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-whisper">Worked example: Whisper</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-an-image-dit-on-the-diffusion-scaffold">Worked example: an image DiT on the diffusion scaffold</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-async-partitions-and-streaming">Advanced: async partitions and streaming</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checklist">Checklist</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing">Testing</a></li>
@@ -2191,6 +2193,65 @@ context segments have a non-zero span in the prefill step that writes them, and 
 0 in every later step. The <code class="docutils literal notranslate"><span class="pre">commit</span></code> in the prefill step converts the reservation into
 resident pages that the later steps read.</p>
 </section>
+<section id="worked-example-an-image-dit-on-the-diffusion-scaffold">
+<h2>Worked example: an image DiT on the diffusion scaffold<a class="headerlink" href="#worked-example-an-image-dit-on-the-diffusion-scaffold" title="Link to this heading">#</a></h2>
+<p>Flow-matching image and video transformers (FLUX-family DiTs, Z-Image, Wan-style
+video) share one graph shape, so M* ships it as a scaffold in
+<code class="docutils literal notranslate"><span class="pre">mstar/model/components/diffusion/</span></code>; a model adds only its exact component
+ports, its checkpoint remap and a few hooks.</p>
+<p>Graph and Walks:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>text_encoder ──text_embeds──▶ Loop("denoise_loop", dit) ──latents──▶ vae_decoder ──▶ EMIT image
+vae_encoder  ──ref_latents──▶ (image_edit only)
+
+encode_text  : text_inputs  -&gt; text_embeds  (persist)
+encode_image : image_inputs -&gt; ref_latents  (persist)
+image_gen    : Sequential[Loop(dit) -&gt; vae_decoder]
+image_edit   : image_gen with ref_latents as an extra Loop input
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">latents</span></code> is the loop-back edge; every other input is re-injected each
+iteration. The step index is the engine’s loop counter
+(<code class="docutils literal notranslate"><span class="pre">fwd_info.dynamic_loop_iter_counts</span></code>), so there is no host sync per step.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">dit</span></code> node subclasses <code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule</span></code> (<code class="docutils literal notranslate"><span class="pre">denoise_loop.py</span></code>), which owns
+the engine contract — seeded initial noise, per-request schedules, equal-key request
+batching (<code class="docutils literal notranslate"><span class="pre">can_batch</span></code>), stacked <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code>, <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> at the request’s own
+step count, the ragged-attention <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> and one CUDA-graph bucket per
+<code class="docutils literal notranslate"><span class="pre">bucket_key</span></code> with the Euler update inside the graph — and asks the model for:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">MyDenoise</span><span class="p">(</span><span class="n">DenoiseLoopSubmodule</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">bucket_key_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">):</span> <span class="o">...</span>       <span class="c1"># hashable: latent grid, text length, ...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">schedule_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span> <span class="o">...</span>    <span class="c1"># FlowMatchSchedule (flow_match.py)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">seed_latents</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">gen</span><span class="p">):</span> <span class="o">...</span>  <span class="c1"># [L, C] initial noise, seeded</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">request_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span> <span class="o">...</span>  <span class="c1"># per-row conditioning tensors</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">num_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span> <span class="o">...</span>                <span class="c1"># image tokens for the attention step</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">capture_request_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">device</span><span class="p">):</span> <span class="o">...</span>   <span class="c1"># dummy rows for graph capture</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">denoise</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">engine_inputs</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">latents</span><span class="p">,</span> <span class="n">timestep</span><span class="p">,</span> <span class="n">sigma</span><span class="p">,</span> <span class="n">sigma_next</span><span class="p">,</span> <span class="o">**</span><span class="n">cond</span><span class="p">):</span> <span class="o">...</span>
+    <span class="c1"># optional: extra attention spans (a refiner over the image tokens alone, ...)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">attention_segments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span> <span class="k">return</span> <span class="p">((</span><span class="s2">"main"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">(</span><span class="n">key</span><span class="p">)),)</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">bucket_key</span></code> is whatever has to match for two rows to share a forward, and it is also
+the CUDA-graph bucket key — shape, but equally a knob like whether CFG is on.</p>
+<p>A multi-step scheduler that carries solver state between iterations (wan22’s UniPC, with
+<code class="docutils literal notranslate"><span class="pre">unipc_model_outputs</span></code> and <code class="docutils literal notranslate"><span class="pre">unipc_last_sample</span></code>) names it in <code class="docutils literal notranslate"><span class="pre">SOLVER_STATE</span></code>; those
+become loop-back edges alongside <code class="docutils literal notranslate"><span class="pre">latents</span></code>, seeded by <code class="docutils literal notranslate"><span class="pre">seed_loop_back</span></code> and returned
+from <code class="docutils literal notranslate"><span class="pre">denoise</span></code> as a <code class="docutils literal notranslate"><span class="pre">{name:</span> <span class="pre">tensor}</span></code> mapping. A scheduler needing another per-step
+scalar adds a <code class="docutils literal notranslate"><span class="pre">STEP_SCALARS</span></code> entry naming the attribute of its <code class="docutils literal notranslate"><span class="pre">FlowMatchSchedule</span></code>
+to slice it from — the base stages that tensor on the device and slices it per step, so
+nothing in the batching path has to change.</p>
+<p>Every span a layer attends over must be declared with its own label (default: one
+<code class="docutils literal notranslate"><span class="pre">&quot;main&quot;</span></code> segment per request); <code class="docutils literal notranslate"><span class="pre">ragged_for(label)</span></code> hands that span’s kernel to the
+layers, which fall back to SDPA when no ragged resource is bound.</p>
+<p>Shared pieces to build the components from: <code class="docutils literal notranslate"><span class="pre">flow_match.py</span></code> (shift schedules and the
+exact Euler step), <code class="docutils literal notranslate"><span class="pre">rope.py</span></code> (multi-axis rotary embeddings), <code class="docutils literal notranslate"><span class="pre">attention.py</span></code> (joint
+attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under graphs),
+<code class="docutils literal notranslate"><span class="pre">text_encoder.py</span></code> (native Qwen3 hidden-state taps), <code class="docutils literal notranslate"><span class="pre">autoencoder_kl.py</span></code> (the KL VAE
+family), <code class="docutils literal notranslate"><span class="pre">image_io.py</span></code> (latent packing, PNG) and <code class="docutils literal notranslate"><span class="pre">lora.py</span></code> (static LoRA merge at load,
+also into fused <code class="docutils literal notranslate"><span class="pre">q</span></code>/<code class="docutils literal notranslate"><span class="pre">k</span></code>/<code class="docutils literal notranslate"><span class="pre">v</span></code> shards via <code class="docutils literal notranslate"><span class="pre">FusedColumnLinear.shard_slice</span></code>).</p>
+<p>On the API side <code class="docutils literal notranslate"><span class="pre">DiffusionImageAdapter</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/api_server/openai/adapters.py</span></code>) serves
+<code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/images/edits</span></code> for any such model (<code class="docutils literal notranslate"><span class="pre">size</span></code> becomes
+<code class="docutils literal notranslate"><span class="pre">width</span></code>/<code class="docutils literal notranslate"><span class="pre">height</span></code>, <code class="docutils literal notranslate"><span class="pre">seed</span></code> and other knobs pass through); register it under the
+model’s registry key. The SDK exposes <code class="docutils literal notranslate"><span class="pre">generate_image</span></code> and <code class="docutils literal notranslate"><span class="pre">edit_image</span></code>.</p>
+</section>
 <section id="advanced-async-partitions-and-streaming">
 <h2>Advanced: async partitions and streaming<a class="headerlink" href="#advanced-async-partitions-and-streaming" title="Link to this heading">#</a></h2>
 <p>Models with a single partition can skip this section. The defaults in <code class="docutils literal notranslate"><span class="pre">Model</span></code> provide
@@ -2360,6 +2421,7 @@ for a full omni-modal model.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-orpheus">Worked example: Orpheus</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-bagel">Worked example: BAGEL</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-whisper">Worked example: Whisper</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worked-example-an-image-dit-on-the-diffusion-scaffold">Worked example: an image DiT on the diffusion scaffold</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#advanced-async-partitions-and-streaming">Advanced: async partitions and streaming</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#checklist">Checklist</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#testing">Testing</a></li>

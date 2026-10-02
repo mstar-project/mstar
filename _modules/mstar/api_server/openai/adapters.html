@@ -629,6 +629,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.audio_features.html">mstar.model.components.audio_features</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.aut_encoder.html">mstar.model.components.aut_encoder</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.linear.html">mstar.model.components.linear</a></li>
 <li class="toctree-l4"><a class="reference internal" href="../../../../_autosummary/mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
@@ -1631,6 +1632,62 @@ window.runMermaid = runMermaid;</script>
         <span class="p">)</span></div>
 </div>
 
+
+
+<div class="viewcode-block" id="DiffusionImageAdapter">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.DiffusionImageAdapter">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">DiffusionImageAdapter</span><span class="p">(</span><span class="n">OpenAIAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Generic adapter for the DiT-scaffold image models (FLUX.2 klein, Z-Image, ...):</span>
+<span class="sd">    text-to-image and reference-image editing.</span>
+
+<span class="sd">    ``size`` ("WxH") maps to the models' ``width`` / ``height`` kwargs; ``seed`` is</span>
+<span class="sd">    honoured by the conductor; every other knob (``num_inference_steps``,</span>
+<span class="sd">    ``guidance_scale`` on models that take it, ``negative_prompt``) passes through</span>
+<span class="sd">    ``extra_body``. ``n`` is served as ``n`` concurrent requests by the images handler,</span>
+<span class="sd">    which the equal-shape batching then runs together.</span>
+<span class="sd">    """</span>
+
+    <span class="n">supports_images</span> <span class="o">=</span> <span class="kc">True</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_size_kwargs</span><span class="p">(</span><span class="n">size</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">mk</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">size</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">width</span><span class="p">,</span> <span class="n">height</span> <span class="o">=</span> <span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">size</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">"x"</span><span class="p">))</span>
+        <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"size must be 'WxH' (e.g. '1024x1024'); got </span><span class="si">{</span><span class="n">size</span><span class="si">!r}</span><span class="s2">"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
+        <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"width"</span><span class="p">,</span> <span class="n">width</span><span class="p">)</span>
+        <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"height"</span><span class="p">,</span> <span class="n">height</span><span class="p">)</span>
+
+<div class="viewcode-block" id="DiffusionImageAdapter.image_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.DiffusionImageAdapter.image_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">image_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">ImageGenerationRequest</span><span class="p">,</span> <span class="n">upload_dir</span><span class="p">:</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>  <span class="c1"># noqa: ARG002</span>
+        <span class="n">mk</span> <span class="o">=</span> <span class="n">_passthrough</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_size_kwargs</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"size"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span> <span class="n">mk</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="s2">"seed"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">mk</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"seed"</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">seed</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">prompt</span><span class="p">,</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">],</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="DiffusionImageAdapter.image_edit_to_request">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.adapters.html#mstar.api_server.openai.adapters.DiffusionImageAdapter.image_edit_to_request">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">image_edit_to_request</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">image_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">extra_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">SubmitArgs</span><span class="p">:</span>
+        <span class="n">mk</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">extra_kwargs</span> <span class="ow">or</span> <span class="p">{})</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_size_kwargs</span><span class="p">(</span><span class="n">mk</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"size"</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span> <span class="n">mk</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">SubmitArgs</span><span class="p">(</span>
+            <span class="n">text</span><span class="o">=</span><span class="n">prompt</span><span class="p">,</span>
+            <span class="n">file_paths</span><span class="o">=</span><span class="p">{</span><span class="s2">"image"</span><span class="p">:</span> <span class="p">[</span><span class="n">image_path</span><span class="p">]},</span>
+            <span class="n">input_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">,</span> <span class="s2">"text"</span><span class="p">],</span>
+            <span class="n">output_modalities</span><span class="o">=</span><span class="p">[</span><span class="s2">"image"</span><span class="p">],</span>
+            <span class="n">model_kwargs</span><span class="o">=</span><span class="n">mk</span><span class="p">,</span>
+        <span class="p">)</span></div>
+</div>
 
 
 <span class="c1"># Whisper-style control tokens: ``&lt;|en|&gt;`` (language), ``&lt;|12.34|&gt;`` (timestamp),</span>

@@ -276,6 +276,7 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.audio_features.html">mstar.model.components.audio_features</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.aut_encoder.html">mstar.model.components.aut_encoder</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.decoder_layer.html">mstar.model.components.decoder_layer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.components.diffusion.html">mstar.model.components.diffusion</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.distributed.html">mstar.model.components.distributed</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.linear.html">mstar.model.components.linear</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.components.mlp.html">mstar.model.components.mlp</a></li>
@@ -620,6 +621,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.FusedColumnLinear"><code class="docutils literal notranslate"><span class="pre">FusedColumnLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.FusedColumnLinear.forward"><code class="docutils literal notranslate"><span class="pre">FusedColumnLinear.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.FusedColumnLinear.shard_slice"><code class="docutils literal notranslate"><span class="pre">FusedColumnLinear.shard_slice()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.FusedColumnLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">FusedColumnLinear.weight_loader()</span></code></a></li>
 </ul>
 </li>
@@ -1000,6 +1002,21 @@ registered hooks while the latter silently ignores them.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.14)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.model.components.FusedColumnLinear.shard_slice">
+<span class="sig-name descname"><span class="pre">shard_slice</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">shard_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/components/linear.html#FusedColumnLinear.shard_slice"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.components.FusedColumnLinear.shard_slice" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">(offset,</span> <span class="pre">size)</span></code> of one shard’s rows in the fused parameter, for callers that
+update a shard in place (e.g. merging a LoRA delta into <code class="docutils literal notranslate"><span class="pre">q</span></code> only).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>shard_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1555,22 +1572,25 @@ expert.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.decoder_layer.html#module-mstar.model.components.decoder_layer" title="mstar.model.components.decoder_layer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decoder_layer</span></code></a></p></td>
 <td><p>Pre-norm transformer decoder layers.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.distributed.html#module-mstar.model.components.distributed" title="mstar.model.components.distributed"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distributed</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.diffusion.html#module-mstar.model.components.diffusion" title="mstar.model.components.diffusion"><code class="xref py py-obj docutils literal notranslate"><span class="pre">diffusion</span></code></a></p></td>
+<td><p>The DiT scaffold: shared pieces of a text -&gt; flow-transformer loop -&gt; VAE model.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.distributed.html#module-mstar.model.components.distributed" title="mstar.model.components.distributed"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distributed</span></code></a></p></td>
 <td><p>Tensor-parallel building blocks.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.linear.html#module-mstar.model.components.linear" title="mstar.model.components.linear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">linear</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.linear.html#module-mstar.model.components.linear" title="mstar.model.components.linear"><code class="xref py py-obj docutils literal notranslate"><span class="pre">linear</span></code></a></p></td>
 <td><p>Non-distributed fused linear projections.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.mlp.html#module-mstar.model.components.mlp" title="mstar.model.components.mlp"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mlp</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.mlp.html#module-mstar.model.components.mlp" title="mstar.model.components.mlp"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mlp</span></code></a></p></td>
 <td><p>MLP and SwiGLU-style GatedMLP.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.moe.html#module-mstar.model.components.moe" title="mstar.model.components.moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">moe</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.moe.html#module-mstar.model.components.moe" title="mstar.model.components.moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">moe</span></code></a></p></td>
 <td><p>Mixture-of-Experts blocks.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.norm.html#module-mstar.model.components.norm" title="mstar.model.components.norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">norm</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.norm.html#module-mstar.model.components.norm" title="mstar.model.components.norm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">norm</span></code></a></p></td>
 <td><p>RMSNorm and AdaRMSNorm.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.model.components.qwen3_lm.html#module-mstar.model.components.qwen3_lm" title="mstar.model.components.qwen3_lm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">qwen3_lm</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.model.components.qwen3_lm.html#module-mstar.model.components.qwen3_lm" title="mstar.model.components.qwen3_lm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">qwen3_lm</span></code></a></p></td>
 <td><p>Dense Qwen3 causal language model from the shared components.</p></td>
 </tr>
 </tbody>
@@ -1649,6 +1669,7 @@ expert.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.FusedColumnLinear"><code class="docutils literal notranslate"><span class="pre">FusedColumnLinear</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.FusedColumnLinear.forward"><code class="docutils literal notranslate"><span class="pre">FusedColumnLinear.forward()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.FusedColumnLinear.shard_slice"><code class="docutils literal notranslate"><span class="pre">FusedColumnLinear.shard_slice()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.components.FusedColumnLinear.weight_loader"><code class="docutils literal notranslate"><span class="pre">FusedColumnLinear.weight_loader()</span></code></a></li>
 </ul>
 </li>

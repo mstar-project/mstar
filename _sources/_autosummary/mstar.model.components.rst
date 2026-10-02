@@ -31,6 +31,7 @@ mstar.model.components
    audio_features
    aut_encoder
    decoder_layer
+   diffusion
    distributed
    linear
    mlp
