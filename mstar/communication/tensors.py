@@ -41,7 +41,6 @@ from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
-from mstar.utils.streams import RECV, SEND, TRANSFER_READ, get_stream
 
 logger = logging.getLogger(__name__)
 
@@ -139,10 +138,7 @@ class AsyncMooncakeReader:
         self._pending: list[Future] = []
         # none on the host: host buffers have no GPU work to wait for, and a stream or event would
         # create a CUDA context on a GPU that other processes may have filled
-        self._copy_stream = (
-            get_stream(TRANSFER_READ, device)
-            if torch.device(device).type == "cuda" else None
-        )
+        self._copy_stream = torch.cuda.Stream(device=device) if torch.device(device).type == "cuda" else None
 
     def submit(self, read_info: list[TransferReadInfo]) -> Future:
         """Non-blocking: enqueue a batch of READs.
@@ -363,14 +359,9 @@ class TensorCommunicationManager(ABC):
 
     @property
     def needs_cpu_tensor(self) -> bool:
-        """Whether this transport sends from host memory.
-
-        If so, the store methods keep a host copy the producer already has
-        (``cpu_tensors``) next to each device tensor, and sending reads that
-        instead of copying the device tensor down again. A transport that
-        reads device memory directly (TCP / RDMA) has no use for one, so they
-        are not stored.
-        """
+        """Whether this transport sends from host memory, so the store keeps
+        the producer's host copies (``cpu_tensors``) for the send to reuse.
+        False for transports that read device memory (TCP / RDMA)."""
         return False
 
     # ---- shared: store ----
@@ -379,12 +370,10 @@ class TensorCommunicationManager(ABC):
         tensors: NameToTensorList, cpu_tensors: NameToTensorList | None,
     ) -> dict[int, torch.Tensor]:
         """One request's host copies, keyed by ``id`` of the device tensor
-        each mirrors -- matched by name and position in the producer's output.
+        each mirrors (matched by name and position in the producer's output).
 
-        Keyed by the tensor rather than the name because outputs get renamed
-        on the way to their signal (Qwen3.5 stores ``new_token`` as
-        ``text_inputs``): the rename aliases the same tensor, so its copy
-        follows it.
+        Keyed by tensor, not name, because outputs get renamed on the way to
+        their signal (Qwen3.5 stores ``new_token`` as ``text_inputs``).
         """
         if not cpu_tensors:
             return {}
@@ -401,12 +390,9 @@ class TensorCommunicationManager(ABC):
         self, by_tensor: dict[int, torch.Tensor], tensor: torch.Tensor,
         canonical: torch.Tensor, shard_dim: int | None,
     ) -> torch.Tensor | None:
-        """The producer's host copy of ``tensor``, if it gave a usable one.
-
-        Anything that is not a host tensor of the same shape and dtype is
-        dropped rather than trusted: the copy then comes from the device
-        tensor at send time, as it would with no host copy at all.
-        """
+        """The producer's host copy of ``tensor``, if it gave a usable one: a
+        host tensor of the same shape and dtype, else None (the send then
+        copies from the device tensor)."""
         cpu = by_tensor.get(id(tensor))
         if not torch.is_tensor(cpu) or cpu.device.type != "cpu":
             return None
@@ -588,10 +574,8 @@ class TensorCommunicationManager(ABC):
         freed when its request is torn down.
 
         ``cpu_tensors`` mirrors ``outputs`` with host copies the caller already
-        made (the stop check's, say), matched to the device tensors by name
-        and position before any signal lookup (see
-        ``_host_copies_by_tensor``); they are kept only if
-        ``needs_cpu_tensor``.
+        made (e.g. the stop check's), matched as in ``_host_copies_by_tensor``;
+        kept only if ``needs_cpu_tensor``.
         """
         if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
@@ -1483,8 +1467,8 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         self._d2h_stream: torch.cuda.Stream | None = None
         self._h2d_stream: torch.cuda.Stream | None = None
         if torch.cuda.is_available() and str(device) != "cpu":
-            self._d2h_stream = get_stream(SEND, device)
-            self._h2d_stream = get_stream(RECV, device)
+            self._d2h_stream = torch.cuda.Stream(device=device)
+            self._h2d_stream = torch.cuda.Stream(device=device)
 
     @property
     def needs_cpu_tensor(self) -> bool:

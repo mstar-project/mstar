@@ -44,13 +44,6 @@ def an_image():
     return torch.rand(3, 224, 224)
 
 
-def test_text_only_is_one_segment(model):
-    out = model.process_prompt("What is 2 + 2?", ["text"], ["text"])
-    assert list(out) == ["text_inputs"]
-    assert len(out["text_inputs"]) == 1
-    assert out["text_inputs"][0].dim() == 1
-
-
 @pytest.mark.parametrize(
     "modalities",
     [

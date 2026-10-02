@@ -189,14 +189,10 @@ def _fused_sampling_prep_kernel(
 # ---------------------------------------------------------------------------
 # Split-V variant of the above.
 #
-# The single-kernel form runs one threadblock per row, so a decode batch of 16
-# occupies 16 SMs of 132 and the vocab is walked serially three times. Splitting
-# the vocab across blocks fixes both: occupancy scales with B x NSPLIT, and pass
-# one keeps a running max/sum (online softmax) so the logits are read twice
-# rather than three times.
-#
-# Three kernels instead of one, but each saturates; measured well under the
-# single-kernel version for Qwen3.5's 248k vocab.
+# The single-kernel form runs one block per row (16 of 132 SMs at bs=16) and
+# reads the vocab three times. Splitting the vocab across blocks scales
+# occupancy with B x NSPLIT, and an online softmax reads the logits twice.
+# Measured well under the single kernel for Qwen3.5's 248k vocab.
 # ---------------------------------------------------------------------------
 
 
@@ -254,12 +250,9 @@ def _split_partials_kernel(
                 is_new, v_start + tl.argmax(scaled, axis=0).to(tl.int32), arg,
             )
         new_max = tl.maximum(run_max, block_max)
-        # rescale what we had, then fold this block in. Both terms need care
-        # while no finite logit has been seen yet: `-inf - -inf` is NaN, so a
-        # chunk whose leading block is all -inf (a masked-out vocab region)
-        # would otherwise carry a NaN sum out of here, which the combine step
-        # turns into a 1e30 scale on the whole row. Until the running max is
-        # finite the sum is exactly zero, and a -inf logit contributes nothing.
+        # rescale what we had, then fold this block in. Guard both terms while
+        # no finite logit has been seen: `-inf - -inf` is NaN, and an all -inf
+        # leading block would carry a NaN sum into the combine step.
         rescale = tl.where(run_max == -float("inf"), 0.0, tl.exp(run_max - new_max))
         terms = tl.where(
             mask & (scaled > -float("inf")), tl.exp(scaled - new_max), 0.0
@@ -349,11 +342,9 @@ def _split_write_kernel(
         )
 
 
-# A fixed chunk, rather than one derived from the batch: the block count then
-# scales with B on its own, and every launch has the same iteration count, so
-# there is no batch size at which the split quietly turns into a long serial
-# walk. 16k over a 248k vocab is 16 chunks, i.e. 256 blocks at a decode batch
-# of 16 — enough to fill an H100 twice over.
+# A fixed chunk, not one derived from the batch, so the block count scales with
+# B and no batch size turns the split into a long serial walk. 248k vocab is 16
+# chunks: 256 blocks at bs=16.
 _SPLIT_CHUNK = 16384
 _SPLIT_MAX_BLOCK = 8192
 
@@ -361,13 +352,9 @@ _SPLIT_MAX_BLOCK = 8192
 def _split_count(batch: int, vocab: int, device: torch.device) -> int:
     """How many chunks to cut the vocab into.
 
-    Note that this is the vocabulary's call alone: any vocab wider than one
-    chunk takes the split path, whatever the batch, so for every real LLM
-    vocabulary the fused kernel above is only reached from tests. The batch
-    is accepted so a future rule can use it (at a few hundred rows the fused
-    kernel already fills the machine and reads the logits three times where
-    the split reads them twice, so which wins there is a measurement, not a
-    given).
+    The vocab's call alone: any vocab wider than one chunk splits, so for real
+    LLM vocabularies the fused kernel is only reached from tests. ``batch`` is
+    accepted for a future rule.
     """
     del batch, device
     return max(1, -(-vocab // _SPLIT_CHUNK))
@@ -380,8 +367,7 @@ def _split_v_softmax(
     """The three-kernel path; see the kernels above for why."""
     B, V = logits.shape
     chunk = -(-V // nsplit)
-    # Sized to the chunk: a fixed small block turns a long chunk into many
-    # serial iterations, which cost more than the occupancy the split bought.
+    # sized to the chunk: a small block makes a long chunk many serial iterations
     block = min(_SPLIT_MAX_BLOCK, triton.next_power_of_2(chunk))
     opts = dict(
         BLOCK_SIZE=block,
@@ -1189,10 +1175,8 @@ class HostBuffer:
       (its address must stay stable across replays).
     - ``master`` ``[capacity]`` slot-indexed HOST array, one row per request.
 
-    The master lives on the host because the gather runs in the pre-plan,
-    beside the previous step's graph: from here the per-step row is one H2D
-    copy, where a device-side master would need an ``index_select`` (and its
-    row writes a ``fill_``) on the plan stream -- see ``mstar.utils.h2d``.
+    The master is on the host because the gather runs in the pre-plan beside a
+    live graph, so it must be one H2D copy with no device ops (``mstar.utils.h2d``).
     """
     buf: torch.Tensor
     master: np.ndarray
@@ -1350,10 +1334,9 @@ class SamplerBuffers:
     # Slots awaiting init, consumed by the next gather so the rows are written
     # on the gathering thread rather than racing it from the main one.
     _pending_init: set[int] = field(default_factory=set, repr=False)
-    # Slots whose RNG offset must be zeroed before it is next gathered. The
-    # zeroing is a device write, so it waits for ``gather_dynamic`` on the
-    # default stream rather than running on the plan stream from the pre-plan.
-    # Filled by the plan thread, drained by the GPU thread.
+    # Slots whose RNG offset must be zeroed before it is next gathered: a
+    # device write, so the plan thread queues it and ``gather_dynamic`` (GPU
+    # thread, default stream) drains it.
     _pending_offset_reset: set[int] = field(default_factory=set, repr=False)
     _offset_reset_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Last-known config per rid — change-detect for ``update_request_config``
@@ -1363,8 +1346,7 @@ class SamplerBuffers:
     # a config change apart from a batch it already gathered.
     _config_version: int = field(default=0, repr=False)
     # cg slot -> (rids, padded_bs, _config_version) of the last
-    # ``gather_static``: a steady decode batch matches it every step, and then
-    # its per-step buffers already hold exactly these rows.
+    # ``gather_static``, so a steady batch can skip it.
     _static_key: dict[int, tuple[tuple[str, ...], int, int]] = field(
         default_factory=dict, repr=False
     )
@@ -1575,11 +1557,9 @@ class SamplerBuffers:
             torch._foreach_copy_(dsts, srcs)
 
     def _init_slot(self, slot: int, rid: str) -> None:
-        """Init for a newly registered slot. Runs on the thread that gathers,
-        so the rows are written before the gather that reads them
-        (``register_request`` runs on the main thread). No device work: this
-        runs in the pre-plan, so the offset reset is queued for
-        ``gather_dynamic`` on the default stream."""
+        """Init for a newly registered slot, on the gathering thread so rows are
+        written before the gather reads them. No device work (pre-plan): the
+        offset reset is queued for ``gather_dynamic``."""
         with self._offset_reset_lock:
             self._pending_offset_reset.add(slot)
         self._write_master_row(slot, self._cached_config[rid])
@@ -1638,11 +1618,9 @@ class SamplerBuffers:
         into ``cg_slot``. Safe to pre-plan: these change only on a config
         update, never step to step.
 
-        Skipped when ``cg_slot`` last gathered this same batch and no master
-        row has been written since: its buffers (written only here) already
-        hold these rows. Not with a slot awaiting init, whose rows the staging
-        below writes -- that is also what catches a request id re-registered
-        onto a new slot."""
+        Skipped when ``cg_slot`` last gathered this same batch and no master row
+        changed since. Never skipped with a slot awaiting init, which also
+        catches a request id re-registered onto a new slot."""
         rids = tuple(request_ids)
         if (
             not self._pending_init
@@ -1652,8 +1630,8 @@ class SamplerBuffers:
             self._last_real_bs[cg_slot] = len(request_ids)
             return
         self._stage_slot_idx(request_ids, padded_bs, cg_slot)
-        # H2D copies only -- this runs in the pre-plan (see HostBuffer). The
-        # device-side index row is uploaded by gather_dynamic.
+        # H2D copies only (pre-plan, see HostBuffer); gather_dynamic uploads
+        # the device-side index row
         rows = self._slot_idx_np[cg_slot, :padded_bs]
         for buf in self._scalar_buffers():
             buf.gather(rows, padded_bs, cg_slot)

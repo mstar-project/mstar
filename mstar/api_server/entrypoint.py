@@ -1452,13 +1452,11 @@ async def shutdown_event():
 # ------------------------------------------------------------------
 
 def _set_preprocess_threads(model, config: dict) -> None:
-    """Size torch's intra-op pool for this process's preprocessing.
+    """Size torch's intra-op pool for this process's media preprocessing.
 
-    The API server's torch work is the data worker's per-request media
-    preprocessing (``load_image``, ``process_prompt``). ``config.yaml``'s
-    ``preprocess_torch_threads`` wins, else the model's
-    ``PREPROCESS_TORCH_THREADS``; None leaves torch's default (one thread per
-    core). Only this process: the conductor and workers are spawned fresh.
+    ``config.yaml``'s ``preprocess_torch_threads`` wins, else the model's
+    ``PREPROCESS_TORCH_THREADS``; None keeps torch's default. Affects only this
+    process: the conductor and workers are spawned fresh.
     """
     threads = config.get("preprocess_torch_threads", model.PREPROCESS_TORCH_THREADS)
     if threads is None:

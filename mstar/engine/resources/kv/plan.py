@@ -75,8 +75,8 @@ class PagedIndptrs(NamedTuple):
     paged_kv_indptr: torch.Tensor
     paged_kv_indices: torch.Tensor
     paged_kv_last_page_len: torch.Tensor
-    # Each row's KV length, host-only: what FlashInfer's decode plan would
-    # otherwise rebuild from the two above with torch ops on every plan.
+    # Each row's KV length, host-only, so FlashInfer's decode plan need not
+    # rebuild it with torch ops.
     kv_lens: torch.Tensor | None = None
 
     def to_device(self, device: torch.device):

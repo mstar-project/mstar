@@ -1,18 +1,10 @@
 """Loading a Qwen3.5 checkpoint into this stack.
 
-Mostly a rename: the checkpoint nests the text stack under ``language_model``
-and names the gated-delta-net mixer ``linear_attn`` where ours calls both
-mixers ``self_attn``. The 297 vision tensors need only their ``model.visual.``
-prefix stripped.
-
-What is not a rename is fusion. We hold the MLP's gate/up as one GEMM and the
-delta net's four input projections as another, so six checkpoint tensors per
-layer-pair land in two parameters; ``_STACKED_PARAMS`` routes each by shard id
-to the fused parameter's ``weight_loader``.
-
-The two towers load separately because they are separate nodes: a worker
-holding only ``LLM`` never builds the ViT, and vice versa. The MTP head
-(``mtp.*``) is skipped; it isn't built.
+Mostly a rename: the text stack sits under ``language_model`` and the delta
+net mixer is ``linear_attn`` (ours: ``self_attn``); vision tensors lose their
+``model.visual.`` prefix. ``_STACKED_PARAMS`` routes the separate gate/up and
+delta net input projections by shard id into their fused parameters. The two
+towers load separately, as separate nodes. The MTP head (``mtp.*``) is skipped.
 """
 from __future__ import annotations
 
@@ -24,9 +16,8 @@ from torch import nn
 from mstar.model.loader.base import StackedParamRule, load_weights_into
 from mstar.model.loader.iterators import iter_safetensors_shards
 
-# The shard ids are the fused parameters' own: ints index
-# `MergedColumnParallelLinear.output_sizes`, the delta net's names key
-# `SPLIT_SHARD_BLOCKS`.
+# ints index `MergedColumnParallelLinear.output_sizes`; names key
+# `SPLIT_SHARD_BLOCKS`
 _STACKED_PARAMS: list[StackedParamRule] = [
     StackedParamRule(".gate_up_proj", ".gate_proj", 0),
     StackedParamRule(".gate_up_proj", ".up_proj", 1),
@@ -38,8 +29,7 @@ _STACKED_PARAMS: list[StackedParamRule] = [
 
 _TEXT_PREFIX = "model.language_model."
 _VISION_PREFIX = "model.visual."
-# Sits at the checkpoint's root rather than under the text prefix, and only
-# exists at all when the embeddings are untied — 9B and 27B, not 0.8B/2B/4B.
+# at the checkpoint's root, and only when untied (9B and 27B)
 _LM_HEAD = "lm_head.weight"
 
 
@@ -71,13 +61,9 @@ def _load(
 ) -> set[str]:
     """Fill ``expected`` from the shards each selector picks out, or raise.
 
-    A selector is ``prefix=`` or ``keys=`` for ``iter_safetensors_shards``, and
-    only narrows *which shards get opened* — ``remapper`` is what decides what
-    loads. More than one because a tower's tensors are not always under a
-    single prefix: an untied ``lm_head`` sits at the checkpoint's root.
-
-    A silently half-loaded tower produces plausible-looking garbage rather
-    than an error, so an unfilled parameter has to be fatal.
+    A selector (``prefix=`` or ``keys=``) only narrows which shards open;
+    ``remapper`` decides what loads. An unfilled parameter is fatal, since a
+    half-loaded tower produces plausible garbage.
     """
     loaded: set[str] = set()
     for selector in selectors:
@@ -104,15 +90,13 @@ def load_qwen3_5_weights(
     tied = model.config.tie_word_embeddings
     selectors = [{"prefix": _TEXT_PREFIX}]
     if not tied:
-        # 9B and 27B untie the head, and then the checkpoint carries it at the
-        # root — outside the text prefix, so it needs a pass of its own.
+        # an untied head sits at the root, outside the text prefix
         selectors.append({"keys": {_LM_HEAD}})
     return _load(
         model, path, device, qwen3_5_name_remapper, selectors,
         expected={
             n for n, _ in model.named_parameters()
-            # tied to embed_tokens, so the checkpoint carries no tensor for it
-            # (and `named_parameters` dedupes it away besides)
+            # tied: the checkpoint carries no tensor for it
             if not (tied and n == _LM_HEAD)
         },
         stacked=_STACKED_PARAMS,

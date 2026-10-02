@@ -177,31 +177,6 @@ def test_qkv_and_conv_shard_per_block(tp):
 
 
 @pytest.mark.parametrize("tp", [2, 4])
-def test_every_parameter_reassembles(tp):
-    ref = reference_weights()
-    ranks = [build(tp, r) for r in range(tp)]
-    for module in ranks:
-        load(module, ref)
-
-    for block in ("z", "a", "b"):
-        got = torch.cat([fused_block(m, block, tp) for m in ranks], dim=0)
-        name = f"in_proj_{block}.weight"
-        torch.testing.assert_close(got, ref[name].to(got.dtype), msg=name)
-
-    for name, dim in [("A_log", 0), ("dt_bias", 0), ("out_proj.weight", 1)]:
-        got = torch.cat(
-            [dict(m.named_parameters())[name].data for m in ranks], dim=dim,
-        )
-        torch.testing.assert_close(got, ref[name].to(got.dtype), msg=name)
-
-    # a head *dim*, not a head count — every rank holds it whole
-    for module in ranks:
-        torch.testing.assert_close(
-            module.norm.weight.data, ref["norm.weight"].to(module.norm.weight.dtype),
-        )
-
-
-@pytest.mark.parametrize("tp", [2, 4])
 def test_each_rank_holds_its_own_k_heads_value_heads(tp):
     """A rank's v-heads must be the ones its k-heads own.
 

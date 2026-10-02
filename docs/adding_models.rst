@@ -1328,12 +1328,12 @@ example, ``configs/qwen3tts.yaml`` selects FA2 under ``talker_attn``,
 Preprocessing threads
 ~~~~~~~~~~~~~~~~~~~~~
 
-The API server runs ``load_image`` / ``process_prompt`` on its data worker thread, with
-torch's intra-op pool, which defaults to one thread per core. For a few small ops per
-request that pool can be slower than a small one. On a shared node an op waits on
-whichever of its threads another process has descheduled. A model sets its own size with
-``PREPROCESS_TORCH_THREADS`` on the class (Qwen3.5 uses 4). A deployment overrides it at the
-top level of its config, and ``null`` keeps torch's default:
+The API server runs ``load_image`` / ``process_prompt`` with torch's intra-op pool, which
+defaults to one thread per core. For a few small ops per request a small pool is faster,
+especially on a shared node, where an op waits on any of its threads another process has
+descheduled. A model sets its size with ``PREPROCESS_TORCH_THREADS`` on the class (Qwen3.5
+uses 4). A deployment overrides it at the top level of its config; ``null`` keeps torch's
+default:
 
 .. code-block:: yaml
 

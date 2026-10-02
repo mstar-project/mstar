@@ -108,10 +108,8 @@ class FlashInferPrefillWrapper:
             self._paged_kv_indptr_buf = torch.zeros(
                 batch_size + 1, dtype=torch.int32, device=device
             )
-            # one index per resident page, plus one SINK_PAGE per padding row:
-            # a replay's padding rows hold no pages of their own and each
-            # names the sink, so a full arena under a wide bucket needs the
-            # extra `batch_size` entries
+            # one index per resident page, plus one SINK_PAGE per padding row
+            # (a full arena under a wide bucket needs the extra `batch_size`)
             self._paged_kv_indices_buf = torch.zeros(
                 max_num_pages + batch_size, dtype=torch.int32, device=device
             )
@@ -258,10 +256,8 @@ class FlashInferDecodeWrapper:
             self._paged_kv_indptr_buf = torch.zeros(
                 batch_size + 1, dtype=torch.int32, device=device
             )
-            # one index per resident page, plus one SINK_PAGE per padding row:
-            # a replay's padding rows hold no pages of their own and each
-            # names the sink, so a full arena under a wide bucket needs the
-            # extra `batch_size` entries
+            # one index per resident page, plus one SINK_PAGE per padding row
+            # (a full arena under a wide bucket needs the extra `batch_size`)
             self._paged_kv_indices_buf = torch.zeros(
                 max_num_pages + batch_size, dtype=torch.int32, device=device
             )

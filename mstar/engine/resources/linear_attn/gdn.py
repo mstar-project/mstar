@@ -1,14 +1,10 @@
 """Gated delta rule through FlashInfer's GDN kernels.
 
-Two kernels, one plan picking one for the whole batch: all-one-token rows take
-the recurrent decode path, anything else the chunked path, which handles span-1
-and zero-span padding alongside long rows. So a mixed batch goes through whole
-and neither kernel re-packs tokens.
+One kernel per batch: all-one-token rows take the recurrent decode path,
+anything else the chunked path, which also handles span-1 and zero-span padding.
 
-The pool is never reached as an object: its plan result arrives through
-``ctx.plan_results`` (named in ``depends_on``) and its per-layer block as a
-plain tensor argument to ``run``, as ``AttentionCallable`` hands
-``kv.layer_view()`` to ``attn.run``.
+The pool's plan result arrives through ``ctx.plan_results`` and its per-layer
+block as a plain tensor argument to ``run``.
 """
 
 from __future__ import annotations
@@ -68,10 +64,8 @@ class GDNManager(LinearAttnManager):
             if device.type == "cuda" else 9
         )
         allowed = _PREFILL_STATE_DTYPES.get(major, (torch.float32,))
-        # Cast only where the arch cannot read the pool as it stands. A bf16
-        # pool on SM90 round-trips through fp32 for prefill and is read
-        # directly by decode, so the scatter casts back — see
-        # `GDNPrefillWrapper.run`.
+        # Cast only where the arch cannot read the pool as is: a bf16 pool on
+        # SM90 round-trips through fp32 for prefill (`GDNPrefillWrapper.run`).
         self._prefill_dtype = (
             state_dtype if state_dtype in allowed else torch.float32
         )
@@ -86,9 +80,8 @@ class GDNManager(LinearAttnManager):
 
         self._current: dict[str, GDNWrapper] = {}
 
-        # Pre-planning. Nothing here mutates live state — the wrappers are
-        # built once and their plans are per-step descriptors — so staging is
-        # just caching the result. Follows the pool, which it depends on.
+        # Pre-planning mutates no live state, so staging is just caching the
+        # result.
         self._preplanned = False
         self._cached_plan_output: dict[str, GDNWrapper] | None = None
 
@@ -117,9 +110,8 @@ class GDNManager(LinearAttnManager):
                 "which this build does not have; declare an fp32 pool instead."
             )
         if not has_sink:
-            # That kernel reads a -1 index as slot 0 and writes there anyway.
-            # With no sink, slot 0 belongs to a request and a padding row would
-            # land on top of it.
+            # That kernel writes a -1 index to slot 0, which without a sink
+            # belongs to a request.
             raise ValueError(
                 "a bf16 gdn state needs the pool's sink slot: its decode "
                 "kernel writes padding rows to slot 0 rather than skipping "
@@ -127,8 +119,7 @@ class GDNManager(LinearAttnManager):
             )
 
     def depends_on(self) -> set[str]:
-        # so the pool plans first and its addressing reaches us through
-        # `ctx.plan_results`; see `StepRunner.topo_sort`
+        # the pool plans first; its addressing arrives via `ctx.plan_results`
         return {self._pool_key}
 
     # Step lifecycle
@@ -179,13 +170,10 @@ class GDNManager(LinearAttnManager):
         """The wrapper this (label, walk) plans into, built once and reused.
 
         Under capture it is keyed per (bucket, slot, label) and sized to the
-        bucket: the captured graph holds the addresses of the wrapper's
-        buffers, so one that reallocated on a later, larger layout would leave
-        the replay reading freed memory.
+        bucket, since the graph holds its buffers' addresses.
         """
         if lease is None:
-            # Both walks can run eagerly under one label, and they hold
-            # different wrapper types — so `is_decode` has to be in the key.
+            # both walks can run eagerly under one label
             key, store = (label, is_decode), self._eager_wrappers
             bs, tok = None, None
         else:
@@ -195,8 +183,6 @@ class GDNManager(LinearAttnManager):
             tok = lease.bucket.num_tokens
 
         if key not in store:
-            # what the pool hands to rows that stand for no request; the conv
-            # kernels skip rows carrying it
             null_slot_id = SINK_SLOT if self._has_sink else NO_SLOT
             if is_decode:
                 store[key] = GDNDecodeWrapper(
@@ -232,14 +218,11 @@ class GDNManager(LinearAttnManager):
     ) -> GDNWrapper:
         spans = [seg.span for seg in segments]
         num_rows = len(spans)
-        # Both walks address every row, so slots are a narrow of the pool's
-        # addressing — no gather, and padding rows keep pointing at the sink.
+        # a narrow, not a gather: padding rows keep pointing at the sink
         slots = addressing.slot_indices[:num_rows]
 
-        # Without chunked prefill a batch is either all single-token rows or
-        # not, so one walk owns the whole step. Splitting a mixed batch — the
-        # faster decode kernel over its single-token rows — would be a change
-        # here and not to callers.
+        # One walk owns the whole step; splitting a mixed batch would be a
+        # change here, not to callers.
         is_decode = bool(spans) and all(s == 1 for s in spans)
         wrapper = self._get_wrapper(label, is_decode, ctx.slot_lease)
         if is_decode:
@@ -282,26 +265,18 @@ class GDNManager(LinearAttnManager):
         layer's ``[max_slots, HV, V, K]`` view of the pool, updated in place.
 
         ``a``/``b`` are the raw gate projections, not the decay and learning
-        rate: the decode kernel forms those itself, the chunked one wants them
-        made, so they are marshalled apart below.
-
-        q and k are L2-normalized only where the kernel will not do it. Both
-        take a flag but only decode honours it — SM90's chunked kernel ignores
-        its own and returns NaN on any sequence long enough to matter.
+        rate. q and k are L2-normalized here only where the kernel will not do
+        it (see `GDNWrapper.qk_l2norm_in_kernel`).
         """
         plan = self.current_plan(label)
         if self.config.qk_l2norm and not plan.qk_l2norm_in_kernel:
             q = torch.nn.functional.normalize(q.float(), dim=-1).to(q.dtype)
             k = torch.nn.functional.normalize(k.float(), dim=-1).to(k.dtype)
-        # both kernels demand contiguous inputs, and a caller that split one
-        # projection into q/k/v hands over views that are not. A no-op when
-        # they already are.
+        # both kernels demand contiguous inputs; a split projection gives views
         v = v.contiguous()
         a = a.contiguous()
         b = b.contiguous()
 
-        # Both wrappers take the gates raw: prefill forms the decay and the
-        # learning rate itself, decode hands them to a kernel that does.
         return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias)
 
     @torch.compiler.disable
@@ -319,9 +294,8 @@ class GDNManager(LinearAttnManager):
         ``x`` is ``[total_tokens, conv_dim]``, ``weight``
         ``[conv_dim, kernel_size]``, and ``conv_layer`` this layer's
         ``[max_slots, conv_dim, width]`` view of the pool's conv block, updated
-        in place. Splits like ``run``, on the same plan. Padding rows need
-        nothing special: they carry the pool's pad index (the sink, or -1 with
-        the sink off), and both conv kernels skip rows whose slot is that id.
+        in place. Padding rows carry the pool's null slot, which both conv
+        kernels skip.
         """
         return self.current_plan(label).run_conv(
             x=x, conv_layer=conv_layer, weight=weight, bias=bias,
@@ -334,10 +308,8 @@ class GDNManager(LinearAttnManager):
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len
-        # A floor under every capture wrapper's row count, applied when one is
-        # built. The engine announces the widest batch it will capture before
-        # any bucket plans, and a wrapper that sized itself to its own bucket
-        # alone would reallocate if a wider layout ever reached it.
+        # A floor under every capture wrapper's row count, so none reallocates
+        # if a wider layout reaches it; announced before any bucket plans.
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
 
     def cleanup(self):

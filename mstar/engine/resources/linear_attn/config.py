@@ -1,13 +1,8 @@
-"""What a model declares about linear attention: its variant, its backend,
-its spec, its step.
+"""What a model declares about linear attention: variant, backend, spec, step.
 
-Kept free of the managers and their kernels so a submodule can declare a step
-without pulling FlashInfer in behind it.
-
-The wrapper half of the split `kv/` and `attn/` already use: the state lives in
-a ``RecurrentStatePool``, and this resource plans and runs kernels against it.
-Head geometry is not declared here — ``LinearAttnManager.build`` reads it off
-the pool's blocks, so a model names its shapes once.
+Kept free of the managers so declaring a step does not import FlashInfer. The
+state lives in a ``RecurrentStatePool`` (as `kv/` is to `attn/`), and head
+geometry is read off its blocks rather than declared here.
 """
 
 from dataclasses import dataclass
@@ -46,10 +41,9 @@ class LinearAttnConfig:
     # formula in the KDA kernel. None keeps the softplus one.
     gate_lower_bound: float | None = None
 
-    # L2-normalise q and k inside the delta-rule kernel. Qwen3.5 wants this —
-    # both HF (`modeling_qwen3_5.py`, chunked and recurrent paths) and vLLM
-    # pass it — and skipping it is a silent numerical divergence rather than an
-    # error, so the default is on.
+    # L2-normalise q and k for the delta rule: in the kernel where it can, by
+    # `GDNManager.run` where it cannot (the SM90 chunked prefill). Qwen3.5 needs
+    # it (HF and vLLM both pass it) and skipping it diverges silently.
     qk_l2norm: bool = True
 
 
@@ -58,8 +52,6 @@ class LinearAttnSpec(NodeResourceSpec):
     config: LinearAttnConfig
 
     def depends_on(self) -> set[str]:
-        # the kernels run against the pool's slots, and the geometry they
-        # marshal for is read off that pool's blocks
         return {self.config.recurrent_state}
 
     @property
@@ -71,11 +63,7 @@ class LinearAttnSpec(NodeResourceSpec):
     def apply_yaml_overrides(
         self, backend: str | LinearAttnBackend | None = None,
     ):
-        """Which kernel to run is the deployment's call as much as the model's.
-
-        Slot capacity is not repeated here: it belongs to the pool this spec
-        depends on, and is tuned under that resource's own block.
-        """
+        """Let the deployment pick the backend; slot capacity is tuned on the pool."""
         if backend is not None:
             self.config.backend = LinearAttnBackend(backend)
 
@@ -84,8 +72,7 @@ class LinearAttnSpec(NodeResourceSpec):
 class LinearAttnStep(ResourceStep):
     """One step's work for a linear-attention layer stack.
 
-    Carries no state semantics: the segments say which rows run and how long
-    each is, and the pool's own step says what becomes of the slots. Which rows
-    take the recurrent path and which the chunked one is derived from the
-    spans, not declared.
+    Carries no state semantics: the segments give the rows and spans, and the
+    pool's own step says what becomes of the slots. The walk is derived from
+    the spans.
     """

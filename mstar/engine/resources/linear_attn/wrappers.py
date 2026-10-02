@@ -1,13 +1,9 @@
 """Per-(bucket, slot, label) state for the two GDN walks.
 
-A wrapper owns the buffers its kernels launch against and is reused across
-steps. Under CUDA-graph capture that ownership is the point: the captured
-graph holds the *addresses* of these buffers, so they are sized to the bucket
-on first plan and never reallocated afterwards. Any `torch.zeros` that can
-fire on a later, larger layout is a replay reading freed memory.
-
-Both wrappers take the gates raw and expose the same `plan`/`run`/`run_conv`
-surface, so `GDNManager` dispatches on neither.
+A wrapper owns the buffers its kernels launch against. A captured graph holds
+their addresses, so they are sized to the bucket on first plan and never
+reallocated: a `torch.zeros` firing on a later, larger layout means a replay
+reads freed memory.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -39,10 +35,9 @@ class GDNWrapper(ABC):
                 f"bs to size static buffers; got {num_tokens} and {bs}"
             )
         self._pad_slot_id = pad_slot_id
-        # The slot the pool hands to rows that stand for no request (its sink,
-        # or -1 with the sink off). The conv kernels skip rows whose slot is
-        # this id; left at their default of 0 they would skip whichever real
-        # request holds slot 0 when the sink is off.
+        # The pool's slot for rows with no request (its sink, or -1 with the
+        # sink off). The conv kernels skip rows with this slot; their default
+        # of 0 would skip a real request in slot 0 when the sink is off.
         self._null_slot_id = null_slot_id
         self._max_num_tokens = num_tokens
         self._bs = bs
@@ -94,11 +89,10 @@ class GDNPrefillPlan:
 
 @dataclass(frozen=True)
 class ConvMetadata:
-    """Precomputed launch geometry for the varlen conv kernel.
+    """Launch geometry for the varlen conv kernel, precomputed at plan time.
 
-    Left to itself, the kernel derives this inside its grid lambda, which
-    requires a non-cuda-graph-compatible D2H and H2D. We derive the metadata
-    at plan time instead.
+    The kernel otherwise derives it in its grid lambda with a D2H and H2D,
+    which capture forbids.
     """
 
     nums_dict: dict
@@ -333,12 +327,10 @@ class GDNPrefillWrapper(GDNWrapper):
 
         slots = self._plan_state.slots.to(torch.int64)
 
-        # _has_sink_state is a static property of the corresponding recurrent
-        # state resource, making this if statement cuda graph-compatible
+        # static per pool, so safe to branch on under capture
         if not self._has_sink_state:
-            # With the pool's sink slot off, a padding row carries -1, which
-            # index_select and index_copy_ cannot take. Point those rows at a live
-            # row's slot instead; the gather is masked off below.
+            # Without a sink a padding row carries -1, which index_select and
+            # index_copy_ cannot take; point it at a live row's slot and mask.
             live = slots >= 0
             any_live = live.any()
             ref = torch.argmax(live.to(torch.uint8)).view(1)
@@ -349,9 +341,8 @@ class GDNPrefillWrapper(GDNWrapper):
             addr = slots
             carried = self._plan_state.has_state
 
-        # SM90 takes packed, sequence-ordered state — `state_indices` is
-        # SM100/SM103 only — so gather here and scatter back. Once per prefill
-        # step rather than per token, and prefill stays eager-cheap.
+        # SM90 takes packed, sequence-ordered state (`state_indices` is
+        # SM100/SM103 only), so gather here and scatter back.
         initial = torch.index_select(state, 0, addr).to(self._prefill_dtype)
 
         # zero the rows that start fresh, by select rather than boolean mask:
@@ -375,8 +366,7 @@ class GDNPrefillWrapper(GDNWrapper):
                 _with_room(t, rows) for t in (q, k, v, g, beta)
             )
 
-        # Neutralise the bucket's padded tail before it reaches the kernel,
-        # so inf values in the tail can't poison the result
+        # zero the padded tail so inf there can't poison the result
         keep = self._plan_state.token_mask[: q.shape[0], None, None].bool()
         def blank(t, shape):
             return torch.where(
@@ -402,9 +392,8 @@ class GDNPrefillWrapper(GDNWrapper):
         )
 
         if not self._has_sink_state:
-            # What the padding rows write to `ref_slot`: the live row's own result,
-            # or — with no live row in the batch — whatever is already there, so
-            # the write cannot disturb slot 0.
+            # Padding rows write to `ref_slot` the live row's own result, or with
+            # no live row what is already there, so slot 0 is not disturbed.
             padded = torch.where(
                 any_live,
                 torch.index_select(final, 0, ref),

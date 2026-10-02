@@ -322,13 +322,9 @@ class Qwen3OmniAdapter(OpenAIAdapter):
 class Qwen3_5Adapter(OpenAIAdapter):
     """Qwen3.5: text-and-image chat, text out.
 
-    Chat only — the model has no image, speech or video output, so the other
-    ``/v1/*`` surfaces stay 404.
-
-    Sampling keys are the plain ones: ``temperature``, ``top_p`` and
-    ``max_output_tokens`` (see ``Qwen3_5DenseModel.get_request_resource_configs``),
-    plus ``seed``, which the conductor honors. Two more the model reads are not
-    OpenAI fields, so they go through ``extra_body``:
+    Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
+    ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus two
+    non-OpenAI fields via ``extra_body``:
 
     * ``repetition_penalty`` — the sampler applies it over the prompt's tokens
       as well as the generated ones.
@@ -631,8 +627,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "wan22": Wan22Adapter(),
 }
 
-# One registry key per size, as the model registry declares them; every size is
-# the same dense architecture and takes the same adapter.
+# One key per size; every size takes the same adapter.
 ADAPTER_REGISTRY.update({
     f"qwen3_5_{size}b": Qwen3_5Adapter() for size in QWEN_3_5_DENSE_SIZES
 })

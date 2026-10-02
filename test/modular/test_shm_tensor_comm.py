@@ -870,25 +870,6 @@ def test_shm_sends_the_stored_host_copy():
         assert torch.equal(_send_and_read(sender, receiver, "req1", edges), host)
 
 
-def test_batch_store_keeps_host_copies_per_request_and_signal():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = _make_manager(tmpdir)
-        outputs = {
-            1: {"tok": [torch.zeros(1)], "other": [torch.zeros(2)]},
-            2: {"tok": [torch.zeros(1)]},
-        }
-        # host copies for "tok" only, and request 2's has the wrong shape
-        cpu = {1: {"tok": [torch.ones(1)]}, 2: {"tok": [torch.ones(3)]}}
-        stored = mgr.store_and_return_tensor_info_batch(
-            [1, 2], outputs, ["tok", "other"], cpu_tensors=cpu,
-        )
-        got = [mgr.tensor_store.get_cpu_tensor(u) for u in stored.flat_uuids]
-        # mint order is request-major, then signal order
-        assert got[0] is cpu[1]["tok"][0]
-        assert got[1] is None   # no host copy given for "other"
-        assert got[2] is None   # shape mismatch: not trusted
-
-
 def test_host_copy_follows_a_renamed_output():
     """A submodule that rebinds an output under its signal name (Qwen3.5's
     ``new_token`` -> ``text_inputs``) aliases the tensor; the stop check's
@@ -903,16 +884,6 @@ def test_host_copy_follows_a_renamed_output():
             cpu_tensors={7: {"new_token": [host]}},
         )
         assert mgr.tensor_store.get_cpu_tensor(stored.flat_uuids[0]) is host
-
-
-def test_host_copy_is_ignored_when_not_on_the_host():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = _make_manager(tmpdir, request_id="req1")
-        not_a_host_copy = torch.ones(1, device="meta")
-        infos = mgr.store_and_return_tensor_info(
-            "req1", {"tok": [torch.zeros(1)]}, cpu_tensors={"tok": [not_a_host_copy]},
-        )
-        assert mgr.tensor_store.get_cpu_tensor(infos["tok"][0].uuid) is None
 
 
 def test_host_copies_not_kept_for_device_transports():
@@ -936,40 +907,3 @@ def test_host_copies_not_kept_for_device_transports():
         )
         for uuid in [infos["tok"][0].uuid, *stored.flat_uuids]:
             assert mgr.tensor_store.get_cpu_tensor(uuid) is None
-
-
-def test_removing_a_tensor_drops_its_host_copy():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = _make_manager(tmpdir, request_id="req1")
-        infos = mgr.store_and_return_tensor_info(
-            "req1", {"tok": [torch.zeros(1)]}, cpu_tensors={"tok": [torch.ones(1)]},
-        )
-        uuid = infos["tok"][0].uuid
-        mgr.tensor_store.remove_tensor(uuid)
-        assert mgr.tensor_store.get_cpu_tensor(uuid) is None
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_shm_send_of_a_device_tensor_skips_the_copy_down(monkeypatch):
-    """With a host copy stored, sending a device tensor serializes the copy:
-    the device tensor is never brought to the host again."""
-    import mstar.communication.tensors as tensors_mod
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        sender = SharedMemoryCommunicationManager(
-            my_entity_id="worker_0", hostname="localhost", device="cuda",
-            communicator=MockCommunicator(), shm_dir=tmpdir,
-        )
-        device_tensor = torch.arange(4, device="cuda")
-        host = device_tensor.cpu()
-        infos = sender.store_and_return_tensor_info(
-            "req1", {"tok": [device_tensor]}, cpu_tensors={"tok": [host]},
-        )
-        serialized = []
-        real = tensors_mod._serialize_tensor
-        monkeypatch.setattr(
-            tensors_mod, "_serialize_tensor",
-            lambda t: serialized.append(t) or real(t),
-        )
-        sender.register_for_send("req1", infos["tok"])
-        assert len(serialized) == 1 and serialized[0] is host

@@ -1,8 +1,6 @@
 """The linear-attention resource's spec-time factory.
 
-The variants themselves live beside this — `gdn`, and `kda` when it lands —
-and ``LinearAttnManager.build`` reaches them by deferred import, so naming one
-in a spec does not load the others.
+``LinearAttnManager.build`` picks the manager for the configured variant.
 """
 
 import logging
@@ -19,21 +17,17 @@ logger = logging.getLogger(__name__)
 
 
 class LinearAttnManager(AttentionResource):
-    # Remains abstract except for build; will build based on the variant.
-
-    # Label / layer cursors come from `AttentionResource`; `run` resolves them.
+    # Abstract except for `build`, which dispatches on the variant.
 
     @classmethod
     def build(cls, spec: LinearAttnSpec, info: EngineResourceInfo):
-        # the pool's own config, not a copy; per-rank shapes, and `shard` is
-        # idempotent so both builders can call it
+        # the pool's own config, not a copy; `shard` is idempotent so both
+        # builders can call it
         pool_config = info.dependency(spec.config.recurrent_state).config
         if info.joint_comm_group is not None:
             pool_config.shard(info.joint_comm_group.world_size)
 
-        # Reading geometry off the pool is also the check that the two were
-        # built for the same model: `from_blocks` raises on shapes that are not
-        # this family's.
+        # also checks the pool's shapes: `from_blocks` raises on another family's
         geometry = DeltaNetGeometry.from_blocks(pool_config.blocks)
 
         backend = spec.config.backend

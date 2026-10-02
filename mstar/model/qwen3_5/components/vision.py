@@ -1,17 +1,12 @@
 """Qwen3.5's vision tower: a ViT over packed image patches.
 
 Ported from transformers' ``modeling_qwen3_5.py`` and ``vision_utils.py``
-(Apache-2.0). The grid helpers are ported rather than imported: they are pure
-tensor maths with no model state, and ``transformers.vision_utils`` is an
-internal module whose shape can change between releases.
-
-Simplifications against upstream, all of them things Qwen3.5 does not use:
-bilinear-only position resampling (no bicubic), no temporal rotary axis, and
-no deepstack, so the tower returns merged embeddings and nothing else.
+(Apache-2.0); the grid helpers are copied because ``transformers.vision_utils``
+is internal. Dropped, as Qwen3.5 does not use them: bicubic resampling, the
+temporal rotary axis, and deepstack.
 
 Images arrive packed: ``pixel_values`` is ``[total_patches, patch_numel]`` and
-``grid_thw`` gives each image's ``(t, h, w)`` patch grid. Attention is per
-image, which is what the per-frame segment lengths mark off.
+``grid_thw`` gives each image's ``(t, h, w)`` patch grid.
 """
 from __future__ import annotations
 
@@ -27,13 +22,8 @@ from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
 
 
 def vision_seq_lengths(grid: list[tuple[int, int, int]]) -> tuple[int, ...]:
-    """One attending segment per frame, on the host.
-
-    Each frame attends to itself alone, so a ``t``-frame entry contributes
-    ``t`` segments of ``h * w``. The submodule turns these into the step's
-    ``Segment`` list and the ragged attention resource plans them; nothing in
-    the tower reads them.
-    """
+    """One attending segment per frame, on the host: ``t`` segments of
+    ``h * w`` per entry, planned by the ragged attention resource."""
     return tuple(h * w for t, h, w in grid for _ in range(t))
 
 
@@ -44,9 +34,7 @@ def vision_position_ids(
 ) -> torch.Tensor:
     """``[total_patches, 2]`` (h, w) indices in spatial-merge-block order.
 
-    The merger later folds each ``m x m`` block into one token, so patches are
-    emitted block-major here and the rotary sees the same order the merger
-    will consume.
+    Block-major, so the rotary sees the order the merger will fold.
     """
     out = []
     for t, h, w in grid:
@@ -103,9 +91,8 @@ def vision_interpolation(
     starts = torch.repeat_interleave(
         F.pad(counts.cumsum(0)[:-1], (1, 0)), counts,
     )
-    # position within one frame's flat patch run, repeating across frames.
-    # The total comes off the host grid rather than `counts.sum()`, which
-    # would be a device read this function has no other reason to make.
+    # position within one frame's flat patch run, repeating across frames;
+    # the total comes off the host grid to avoid a device read
     total_patches = sum(t * h * w for t, h, w in grid)
     within = (
         torch.arange(total_patches, device=device) - starts
@@ -225,17 +212,10 @@ class VisionMLP(nn.Module):
 class VisionAttention(nn.Module):
     """Full attention within each frame, over packed patches.
 
-    The engine's ragged attention resource does the isolating: the submodule
-    declares one segment per frame and the manager plans a varlen layout, so
-    this hands it the whole packed run and never sees the boundaries.
-
-    The layout being in the plan rather than in this forward is what lets the
-    tower compile. Splitting the packed run per frame here put each frame's
-    patch count into the graph as its own symint, which made the token
-    dimension a sum like ``s45 + s63 + 1792``; inductor then would not prove
-    ``hidden_size * n`` divisible by ``n`` when it fused a block's residual add
-    into the next block's norm, and refused to codegen any packed run of three
-    or more images (``CantSplit``).
+    The ragged attention resource plans the per-frame layout, so this forward
+    never sees the boundaries. That is what lets the tower compile: splitting
+    per frame here gave each frame its own symint, and inductor then refused
+    (``CantSplit``) to codegen packed runs of three or more images.
     """
 
     def __init__(self, config: Qwen3_5VisionConfig):
@@ -264,8 +244,7 @@ class VisionAttention(nn.Module):
                 "vision_encoder node"
             )
         seq_len = hidden_states.shape[0]
-        # [tokens, heads, head_dim] throughout — the layout the ragged kernel
-        # takes, so nothing transposes on the way in or out
+        # [tokens, heads, head_dim]: the ragged kernel's layout, no transposes
         q, k, v = (
             self.qkv(hidden_states)
             .reshape(seq_len, 3, self.num_heads, -1)
@@ -333,17 +312,10 @@ class Qwen3_5VisionModel(nn.Module):
         """``[total_patches, patch_numel]`` in, ``[merged_tokens, out_hidden]``
         out — one token per ``spatial_merge_size ** 2`` block of patches.
 
-        Everything the grid decides is built by the caller (see
-        ``vision_grid_inputs``) and handed over ready-made. The grid must not
-        be read here: ``grid_thw.tolist()`` breaks the graph, and the h and w
-        it yields come back as unbacked symints, which makes the token
-        dimension a polynomial like ``s11*s50 + 768``. Inductor then cannot
-        prove ``hidden_size * n`` divisible by ``n`` and refuses to codegen
-        (``CantSplit``) for any packed multi-image run.
-
-        Which patches attend together is not an argument here either: the
-        submodule declares one segment per frame and the ragged attention
-        resource plans the layout, outside the graph.
+        Grid-derived inputs are built by the caller
+        (``VisionEncoderSubmodule.prepare_inputs``): ``grid_thw.tolist()`` here
+        would break the graph and make h, w unbacked symints, and inductor then
+        refuses (``CantSplit``) to codegen packed multi-image runs.
         """
         hidden, cos, sin = self.embed(pixel_values, indices, weights, position_ids)
         return self.merger(self.encode(hidden, cos, sin))
@@ -358,8 +330,7 @@ class Qwen3_5VisionModel(nn.Module):
         """Patch embed plus the resampled position table, and the rope for
         the blocks: everything before the block loop, per patch."""
         n = pixel_values.shape[0]
-        # Same grid, separate inputs: without this each leading dim gets its
-        # own symbol and nothing downstream lines up.
+        # one symbol for every leading dim, not one each
         torch._check(indices.shape[0] == n)
         torch._check(weights.shape[0] == n)
         torch._check(position_ids.shape[0] == n)

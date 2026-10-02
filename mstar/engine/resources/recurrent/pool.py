@@ -1,11 +1,8 @@
 """A pool of fixed-size recurrent state slots.
 
-Storage only. The pool hands out slots, keeps the per-layer tensors those slots
-index into, and says which slot each row of a step addresses; what a backend
-writes there, and with which kernel, is the backend's business.
-
-The split mirrors ``kv/`` and ``attn/``: this is the cache, and a linear-
-attention resource is the wrapper planned against it.
+Storage only: the pool hands out slots, keeps the per-layer tensors they index,
+and says which slot each row of a step addresses. As ``kv/`` is to ``attn/``,
+a linear-attention resource is the wrapper planned against it.
 """
 
 from __future__ import annotations
@@ -35,9 +32,9 @@ from mstar.utils.h2d import H2DMirror, PinnedStager
 logger = logging.getLogger(__name__)
 
 # Where a padding tail or zero-span row points. SINK_SLOT is held out of
-# circulation like the KV cache's SINK_PAGE and absorbs writes nothing reads —
-# the one place slot ids are not unique. NO_SLOT asks the backend to skip the
-# row, which only some kernels honour.
+# circulation like SINK_PAGE and absorbs writes nothing reads (the one place
+# slot ids are not unique). NO_SLOT asks the backend to skip the row, which
+# only some kernels honour.
 SINK_SLOT = 0
 NO_SLOT = -1
 
@@ -45,24 +42,21 @@ NO_SLOT = -1
 @dataclass
 class SlotState:
     index: int
-    # Whether the slot holds state a later step should resume from. False for a
-    # freshly allocated slot, which reads as zeros.
+    # whether a later step resumes from the slot; a fresh slot reads as zeros
     has_state: bool = False
-    # Bumped on fork, like `CacheStream.generation`: lets a stale plan be
-    # spotted rather than silently attended through.
+    # Counts forks into this slot, like `CacheStream.generation`; nothing in
+    # the engine reads it yet (the pre-plan tests use it to see a fork land).
     generation: int = 0
 
 
 @dataclass(frozen=True)
 class RecurrentAddressing:
-    """Where one label's rows live this step.
+    """Where one label's rows live this step: the pool's whole plan output.
 
-    The pool's whole plan output. Token layout (cu_seqlens, chunk metadata) is
-    the backend's to build from the same segments — it is about tokens, not
-    slots.
+    Token layout (cu_seqlens, chunk metadata) is the backend's to build.
     """
 
-    slot_indices: torch.Tensor  # [rows] int32, NO_SLOT where nothing is addressed
+    slot_indices: torch.Tensor  # [rows] int32, `pad_index` where nothing is addressed
     has_state: torch.Tensor     # [rows] bool, False where the slot reads as zeros
     num_rows: int               # real rows, before a capture bucket's padding
 
@@ -100,8 +94,7 @@ class RecurrentStatePool(Resource):
         if not config.disable_sink_slot:
             sink = self._free.pop()
             assert sink == SINK_SLOT, f"expected slot {SINK_SLOT} first, got {sink}"
-        # guards `_slots`/`_free` against a concurrent admit/plan/commit or
-        # reset/remove on another thread; see `KVManager._lock`
+        # guards `_slots`/`_free` across threads; see `KVManager._lock`
         self._lock = threading.RLock()
 
         self._cg_max_bs = 0
@@ -116,9 +109,8 @@ class RecurrentStatePool(Resource):
         # label -> this step's addressing, for the backend to read
         self._current: dict[str, RecurrentAddressing] = {}
 
-        # Pre-planning. The addressing is host bookkeeping plus two H2D copies,
-        # so staging it off the critical path is most of what this resource
-        # costs a step. Forks are not staged; see `_pending_fork_state`.
+        # Pre-planning stages the addressing (host bookkeeping plus two H2D
+        # copies). Forks are not staged; see `_pending_fork_state`.
         self._preplanned = False
         self._cached_plan_output: dict[str, RecurrentAddressing] | None = None
 
@@ -134,11 +126,7 @@ class RecurrentStatePool(Resource):
     # Storage access
 
     def block(self, name: str, layer_idx: int) -> torch.Tensor:
-        """One layer's slot-major view of a block: ``[max_slots, *shape]``.
-
-        Contiguous, so a backend can hand it straight to a kernel that indexes
-        the pool itself rather than gathering rows out of it.
-        """
+        """One layer's contiguous slot-major view of a block: ``[max_slots, *shape]``."""
         return self._blocks[name][layer_idx]
 
     @property
@@ -167,8 +155,8 @@ class RecurrentStatePool(Resource):
     def reset_request(self, rid: str, free: bool = False):
         """Drop a request's slots. ``free`` hands them back to the pool.
 
-        Both paths zero what they release: a slot is handed out as zeros, and
-        the alternative is a backend resuming on another request's state.
+        Both paths zero what they release, or a backend could resume on another
+        request's state.
         """
         with self._lock:
             labels = self._slots.get(rid)
@@ -196,10 +184,9 @@ class RecurrentStatePool(Resource):
                 return slot
             if not self._free:
                 return None
-            # Slot ids must be unique across the batch: an indexed scatter with
-            # two rows naming one slot leaves it nondeterministic, and the
-            # kernels take that as a caller precondition rather than checking
-            # it (which would cost a host sync). A free list gives it for free.
+            # Slot ids must be unique across the batch: kernels assume it rather
+            # than check, and a scatter with two rows on one slot is
+            # nondeterministic. The free list guarantees it.
             slot = labels[label] = SlotState(index=self._free.pop())
             return slot
 
@@ -208,12 +195,9 @@ class RecurrentStatePool(Resource):
     def admit(self, step: RecurrentStep, ctx: StepContext) -> AdmitOutcome:
         """Reserve a slot per addressed (rid, label), plus fork targets.
 
-        Capture rows and a replay's padding rows reserve nothing: they stand
-        for no request and address the sink instead (see `_build_addressing`).
-        A slot handed to a padding row would otherwise have to be given back
-        after every step, or the runner's dummy names (two capture slots times
-        the widest bucket of them) would drain a pool sized for the real
-        concurrency.
+        Capture rows and a replay's padding rows reserve nothing and address the
+        sink instead; otherwise the runner's dummy names would drain a pool
+        sized for the real concurrency.
         """
         if ctx.capture:
             return ADMIT_OK
@@ -267,10 +251,9 @@ class RecurrentStatePool(Resource):
     def _pending_fork_state(self, step: RecurrentStep) -> dict[tuple[str, str], bool]:
         """``has_state`` each pre-fork will hand its target, without applying it.
 
-        Staging cannot apply the fork — the copy would race the default stream
-        — but the addressing it stages has to be the one the step will run
-        with, and a fork target inherits its source's ``has_state``. So the
-        flag is read ahead and the copy still happens at promotion.
+        Staging cannot apply the fork (the copy would race the default stream),
+        but a fork target inherits its source's ``has_state``, so the flag is
+        read ahead and the copy happens at promotion.
         """
         pending: dict[tuple[str, str], bool] = {}
         for rid in self._fork_rids(step):
@@ -286,17 +269,15 @@ class RecurrentStatePool(Resource):
             "planning a different step ahead"
         )
         if self._preplanned:
-            # Promotion. The staged addressing already reads as though the
-            # fork had happened; this is the copy itself, which staging left
-            # undone. `_pending_fork_state` says why.
+            # Promotion: apply the fork copies staging left undone; see
+            # `_pending_fork_state`.
             self._current = self._cached_plan_output
             self._maybe_apply_forks(step, ctx)
             self.clear_preplan()
             return self._current
 
-        # Both run ahead of the addressing, which records each slot's
-        # `has_state`. Staging only reads the flag the fork will land; running
-        # for real applies it.
+        # Forks run ahead of the addressing, which records `has_state`; staging
+        # only reads the flag the fork will land.
         if ctx.is_preplan:
             pending = self._pending_fork_state(step)
         else:
@@ -314,12 +295,7 @@ class RecurrentStatePool(Resource):
         return self._current
 
     def clear_preplan(self):
-        """Drop the staged plan.
-
-        Nothing to rewind: staging builds addressing and touches no live state
-        — forks apply at promotion, not here — so an abandoned stage leaves the
-        pool as it found it.
-        """
+        """Drop the staged plan; staging touched no live state, so nothing to rewind."""
         self._preplanned = False
         self._cached_plan_output = None
 
@@ -332,8 +308,7 @@ class RecurrentStatePool(Resource):
                     continue
                 slot = self._slots.get(segment.request_id, {}).get(segment.label)
                 if slot is not None:
-                    # the backend has already written the pool; this only says a
-                    # later step resumes rather than starting from zeros
+                    # the backend already wrote the pool; a later step resumes
                     slot.has_state = True
 
         for rid in self._fork_rids(step):
@@ -347,9 +322,8 @@ class RecurrentStatePool(Resource):
     ) -> None:
         """Copy one slot onto its fork target.
 
-        A real copy, not the KV cache's page aliasing: the state is mutated in
-        place, so two labels cannot share it. Fixed-size, which is why this
-        needs none of ``KVManager._apply_fork``'s length arithmetic.
+        A real copy, not page aliasing: the state is mutated in place, so two
+        labels cannot share it.
         """
         with self._lock:
             labels = self._slots.get(rid)
@@ -401,14 +375,10 @@ class RecurrentStatePool(Resource):
 
         num_rows = len(indices)
         target, mirrors = self._addressing_buffers(label, ctx, num_rows)
-        # Built on the host and copied in: the values come from Python
-        # bookkeeping, so building them on device would sync. The tail is
-        # cleared too rather than left at last step's values -- attention keeps
-        # a replay off its padding with the plan's indptrs, but a recurrent
-        # kernel has no such thing and reads every row of the batch, so a stale
-        # index here is a write to a slot whose request is not in this step.
-        # The clear rides the same copy (padding written on the host): this
-        # runs in the pre-plan, beside a live graph, so no device-side fill.
+        # Built on the host and copied in. The tail is cleared too: a recurrent
+        # kernel reads every row, so a stale index would write a slot whose
+        # request is not in this step. The clear rides the same H2D copy since
+        # this runs in the pre-plan beside a live graph: no device-side fill.
         self._index_stager.copy_(
             target.slot_indices, indices, pad_value=pad, mirror=mirrors[0],
         )
@@ -424,13 +394,10 @@ class RecurrentStatePool(Resource):
     def _addressing_buffers(
         self, label: str, ctx: StepContext, num_rows: int,
     ) -> tuple[RecurrentAddressing, tuple[H2DMirror | None, H2DMirror | None]]:
-        """The buffers this step fills, and their mirrors (captured buffers
-        only: the eager ones are reallocated as they grow).
+        """The buffers this step fills, and their mirrors (captured buffers only).
 
-        Under capture they are static and per (bucket, slot, label), built on
-        the first plan for that key and sized to the largest batch any runner
-        asked for — a bucket replays at several row counts, so this must not be
-        sized off the first plan's.
+        Under capture they are static per (bucket, slot, label) and sized to the
+        largest batch any runner asked for, not the first plan's row count.
         """
         lease = ctx.slot_lease
         if lease is None:
@@ -477,9 +444,8 @@ class RecurrentStatePool(Resource):
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len
-        # The per-key buffers are built on first plan (which labels a walk
-        # plans under is the step's to declare). Every runner capturing against
-        # this node calls in, so keep the largest.
+        # per-key buffers are built on first plan; every runner calls in, so
+        # keep the largest
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
 
     def cleanup(self):

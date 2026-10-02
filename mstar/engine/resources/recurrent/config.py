@@ -1,17 +1,8 @@
 """What a model declares about a pool of recurrent state.
 
-Kept free of the manager and its kernels so a submodule can declare a step
-without pulling a backend in behind it.
-
-The pool is deliberately ignorant of what the state means. A slot is a fixed
-number of bytes per layer, held for as long as a request needs it; whether
-those bytes are a delta-net [HV, V, K] matrix, a Mamba SSM block, or something
-else is the calling resource's business. Contrast the KV cache, whose geometry
-(pages, tokens, heads) is baked into its own contract.
-
-The consequence that shapes everything here: this state does not grow with the
-sequence. Capacity is a slot count, not a byte budget that scales with length,
-and a fork is a fixed-size copy rather than a page-count-dependent one.
+Kept free of the manager so declaring a step does not import a backend. The
+pool is ignorant of what the state means: a slot is a fixed number of bytes per
+layer, so capacity is a slot count and a fork is a fixed-size copy.
 """
 
 from abc import ABC, abstractmethod
@@ -33,8 +24,7 @@ class RecurrentBlockConfig:
     """One per-slot, per-layer tensor block.
 
     ``shape`` is opaque to the pool. ``shard_dims`` names the axes divided
-    across ranks — shape arithmetic, not semantics: the pool never learns that
-    axis 0 happens to be a head count.
+    across ranks.
     """
 
     shape: tuple[int, ...]
@@ -80,13 +70,9 @@ class DeltaNetGeometry(RecurrentGeometry):
     """Head geometry of the delta-net family: gated delta rule (Qwen3.5,
     Qwen3-Next) and Kimi delta attention (Kimi Linear, GLM-5.3).
 
-    Both carry the same two blocks: a K-last [HV, V, K] state matrix — the
-    layout FlashInfer's pool paths want, and what lets one pool serve either —
-    and a short conv window holding every tap but the current token's.
-
-    ``to_blocks`` and ``from_blocks`` are inverses, so a backend reads its
-    geometry off the pool it was pointed at rather than the model declaring it
-    twice and the two drifting.
+    Both carry a K-last [HV, V, K] state matrix (FlashInfer's pool layout) and a
+    conv window holding every tap but the current token's. ``to_blocks`` and
+    ``from_blocks`` are inverses, so a backend reads its geometry off the pool.
     """
 
     num_k_heads: int
@@ -108,11 +94,7 @@ class DeltaNetGeometry(RecurrentGeometry):
         state_dtype: torch.dtype = torch.float32,
         conv_dtype: torch.dtype = torch.bfloat16,
     ) -> dict[str, RecurrentBlockConfig]:
-        """Pool blocks for this geometry.
-
-        Head counts are pre-sharding; ``shard_dims`` narrows them at build, as
-        a ``KVConfig``'s head counts are.
-        """
+        """Pool blocks for this geometry; head counts are pre-sharding."""
         return {
             "state": RecurrentBlockConfig(
                 shape=(self.num_v_heads, self.head_v_dim, self.head_k_dim),
@@ -130,11 +112,9 @@ class DeltaNetGeometry(RecurrentGeometry):
     def from_blocks(
         cls, blocks: dict[str, RecurrentBlockConfig],
     ) -> "DeltaNetGeometry":
-        """Recover head counts from block shapes. Works on sharded shapes,
-        since every axis involved shards.
+        """Recover head counts from (possibly sharded) block shapes.
 
-        Raises if the shapes are not a delta-net's — the check that a pool and
-        the resource planning against it were built for the same model.
+        Raises if the shapes are not a delta-net's.
         """
         for name in ("state", "conv"):
             if name not in blocks:
@@ -175,26 +155,18 @@ class DeltaNetGeometry(RecurrentGeometry):
 class RecurrentStateConfig:
     # The total number of recurrent layers, not total transformer layers
     num_layers: int
-    # Named blocks, e.g. what `DeltaNetGeometry.to_blocks` returns. A backend declares
-    # what it needs; the pool allocates one tensor per block and hands back
-    # per-layer views.
+    # Named blocks, e.g. what `DeltaNetGeometry.to_blocks` returns; the pool
+    # allocates one tensor per block and hands back per-layer views.
     blocks: dict[str, RecurrentBlockConfig] = field(default_factory=dict)
 
-    # Slots the pool can hand out at once. A request holds one per label, so
-    # this bounds concurrent requests times their labels, not requests alone.
-    # The sink, when there is one, comes out of this the way SINK_PAGE comes
-    # out of a KV cache's `max_num_pages`.
+    # Slots in the pool, including the sink if any. A request holds one per
+    # label, so this bounds concurrent requests times labels.
     max_slots: int = 256
 
-    # Whether padding rows address a real sink slot or a negative sentinel.
-    #
-    # Not the model author's call: it turns on what the backend's kernels do
-    # with an unaddressed row, and they disagree. FlashInfer's fp32 GDN decode
-    # skips a -1 row entirely; its bf16 fast path redirects -1 onto slot 0 and
-    # writes there anyway; SM90 prefill has no say at all, since it gathers the
-    # state in torch rather than addressing the pool, and masks the sentinel
-    # itself (`GDNPrefillWrapper.run`). A sink is correct under all three, so
-    # it is the default.
+    # Whether padding rows address a real sink slot or a -1 sentinel. Kernels
+    # disagree on -1: FlashInfer's fp32 GDN decode skips it, its bf16 path
+    # writes slot 0, and SM90 prefill masks it itself (`GDNPrefillWrapper.run`).
+    # A sink is correct under all three, so it is the default.
     #
     # TODO: derive this from (backend, dtype, ...) automatically.
     disable_sink_slot: bool = False
@@ -214,11 +186,8 @@ class RecurrentStateConfig:
         return self.max_slots - (0 if self.disable_sink_slot else 1)
 
     def shard(self, num_shards: int) -> None:
-        """Narrow every block's sharded axes; see ``KVConfig.shard``.
-
-        Idempotent, so one config shared by the pool and the resource planning
-        against it can be sharded by both on construction.
-        """
+        """Narrow every block's sharded axes. Idempotent, so the pool and its
+        resource can both shard the shared config."""
         for block in self.blocks.values():
             block.shard(num_shards)
 
@@ -244,14 +213,11 @@ class RecurrentStateSpec(NodeResourceSpec):
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
     ):
-        """How many slots this deployment gets, and how precise they are.
+        """How many slots this deployment gets, and the state's dtype.
 
-        Block *shapes* are not tunable: they are the model's, and a pool sized
-        for shapes the backend does not produce is a crash, not a slow run.
-        The state's dtype is a deployment call — it trades precision that
-        accumulates over a whole generation against half the bandwidth on a
-        tensor read and written every step, and it decides which kernels the
-        backend can reach. The model's default stands unless this is set.
+        Block shapes are the model's and not tunable. The dtype trades
+        accumulated precision against bandwidth and decides which kernels the
+        backend can reach.
         """
         if max_slots is not None:
             self.config.max_slots = max_slots
@@ -277,10 +243,8 @@ class RecurrentStateSpec(NodeResourceSpec):
 class RecurrentStep(ResourceStep):
     """One step's work against the pool.
 
-    There is no ``commit`` flag, unlike ``KVStep``. A backend writes the pool
-    in place, so by the time commit ran the bytes would already be gone.
-    A consumer that needs it would have to have two labels: reading one label
-    and writing an other.
+    No ``commit`` flag, unlike ``KVStep``: a backend writes the pool in place,
+    so a non-committing reader needs two labels, reading one and writing another.
 
     Forks mirror ``KVStep``'s: ``(from_label, to_label)`` pairs, reserved at
     admit and copied at plan (pre) or commit (post).

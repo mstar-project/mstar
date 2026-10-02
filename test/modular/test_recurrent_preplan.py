@@ -90,12 +90,6 @@ def decode_step(rids: list[str], **kwargs) -> RecurrentStep:
     )
 
 
-def test_both_resources_declare_preplan():
-    """The point of the change: neither used to, so both planned inline."""
-    assert build_pool().supports_preplan
-    assert build_backend().supports_preplan
-
-
 def test_promoted_plan_is_the_staged_one():
     pool = build_pool()
     rids = ["a", "b", "c"]

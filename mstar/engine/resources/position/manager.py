@@ -115,9 +115,8 @@ class RopeManager(PositionManager):
         self._preplan_pos_ids: dict[str, torch.Tensor] = {}
         self._preplanned = False
         # (rid, to_label, counter) for each pre-fork applied, so
-        # `clear_preplan` can put the targets back. These forks *are* staged,
-        # unlike KV's and the state pool's: a counter is host bookkeeping, so
-        # copying it early races nothing on the default stream.
+        # `clear_preplan` can put the targets back. Unlike KV's, these forks are
+        # staged: a counter is host-only, so copying it early races nothing.
         self._preplan_fork_undo: list[tuple[str, str, int | None]] = []
 
     def depends_on(self):
@@ -220,9 +219,8 @@ class RopeManager(PositionManager):
 
     @property
     def force_double_buffer(self):
-        # `_pinned_pos_ids_buffer` refills one pinned host buffer per slot and
-        # `_place` copies out of it non-blocking, so a slot must not be reused
-        # while that copy may still be queued. See `Resource.force_double_buffer`.
+        # a slot's pinned host buffer must not be refilled while `_place`'s
+        # non-blocking copy out of it may still be queued
         return True
 
     def clear_preplan(self):
@@ -346,12 +344,10 @@ class RopeManager(PositionManager):
     def _pinned_pos_ids_buffer(
         self, key: CGSlotKey, num_tokens: int,
     ) -> torch.Tensor:
-        """Host staging for one (bucket, slot, label)'s positions.
+        """Pinned host staging for one (bucket, slot, label)'s positions.
 
-        Keyed like `_static_pos_ids`, which is what makes reuse safe: the
-        upload out of here is asynchronous, and the runner does not re-lease a
-        slot whose step is still in flight, so a buffer is refilled only once
-        its own copy has run. Sized to the bucket, so it never grows.
+        Reuse is safe because the runner does not re-lease a slot whose step is
+        in flight, so a buffer is refilled only after its async copy ran.
         """
         buffer = self._pinned_pos_ids.get(key)
         if buffer is None:
@@ -365,12 +361,9 @@ class RopeManager(PositionManager):
     ) -> torch.Tensor:
         """step positions in KV plan order from stream counters
 
-        Under a lease these are written into pinned memory, so that `_place`'s
-        `non_blocking` copy is actually asynchronous. Out of PAGEABLE memory
-        it is not: the driver stages it through a bounce buffer of its own and
-        the host waits for that, inside the plan the plan stream was there to
-        overlap. The eager path keeps the plain allocation — it has no slot to
-        key a reusable buffer by, and is not the step-after-step path.
+        Under a lease these go into pinned memory so `_place`'s `non_blocking`
+        copy is really asynchronous; from pageable memory the host waits. The
+        eager path has no slot to key a buffer by, so allocates plainly.
         """
         block = self._config.scheme == PosScheme.BLOCK
         pos_ids: list[int] = []
@@ -391,8 +384,7 @@ class RopeManager(PositionManager):
             f"plan label {plan_label!r} carries {num_tokens} tokens but its "
             f"captured bucket holds {buffer.shape[0]}"
         )
-        # one slice assignment through the numpy view, rather than building a
-        # tensor that would allocate again
+        # through the numpy view, to avoid allocating a tensor
         buffer.numpy()[:num_tokens] = pos_ids
         return buffer[:num_tokens]
 

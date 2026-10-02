@@ -553,11 +553,9 @@ class TensorStore:
     def __init__(self, bookkeeping: TensorBookkeeping | None = None):
         # {UUID -> tensor}
         self._tensors: dict[int, torch.Tensor] = {}
-        # {UUID -> host copy of that tensor}, for a transport that sends from
-        # host memory (``TensorCommunicationManager.needs_cpu_tensor``) and so
-        # can reuse a copy the producer already made instead of making its
-        # own. Optional per tensor; never the only copy. The producer may
-        # reuse its memory after the send, so nothing but the send reads it.
+        # {UUID -> producer's host copy}, for a ``needs_cpu_tensor`` transport
+        # to send from. Optional and never the only copy; the producer reuses
+        # its memory after the send, so nothing but the send may read it.
         self._tensors_cpu: dict[int, torch.Tensor] = {}
         # Only for teardown: which uuids a request is responsible for, and the
         # reverse so a single removal does not scan every request. A sliced

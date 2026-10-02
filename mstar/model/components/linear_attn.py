@@ -1,28 +1,17 @@
 """Gated delta-net mixer — the linear-attention counterpart to ``Attention``.
 
-Holds the projections, the depthwise conv weight, the decay parameters and the
-gated output norm; the recurrent state and the kernels behind it belong to the
-engine, reached through ``LinearAttnCallable``.
+Holds the weights; the recurrent state and kernels belong to the engine,
+reached through ``LinearAttnCallable``.
 
-Two checkpoint layouts, because the family disagrees:
+Two checkpoint layouts. ``SPLIT`` (Qwen3.5) has separate ``in_proj_qkv`` /
+``in_proj_z`` / ``in_proj_a`` / ``in_proj_b``, held here as one
+``in_proj_fused`` GEMM (see ``SPLIT_SHARD_BLOCKS``). ``FUSED`` (Qwen3-Next)
+packs ``in_proj_qkvz`` and ``in_proj_ba`` **head-interleaved** by k-head, which
+``_project_fused`` undoes and which needs its own loader under TP. Everything
+after the flat ``[q|k|v]`` is shared.
 
-``SPLIT`` (Qwen3.5) keeps ``in_proj_qkv`` / ``in_proj_z`` / ``in_proj_a`` /
-``in_proj_b`` apart, and ``in_proj_qkv`` is already the flat ``[q|k|v]`` the
-conv wants. We hold them as one ``in_proj_fused`` GEMM anyway and let the
-loaders place each at its offset — see ``SPLIT_SHARD_BLOCKS``.
-
-``FUSED`` (Qwen3-Next) packs one ``in_proj_qkvz`` and one ``in_proj_ba``, and
-they are **head-interleaved** rather than block-concatenated: the rows group by
-k-head, each group holding that head's q, k, and its share of v and z. Undoing
-that is what ``_project_fused`` does, and it is also why the fused layout needs
-a weight loader of its own under tensor parallelism.
-
-Everything downstream of the flat ``[q|k|v]`` is shared between the two.
-
-Head counts here are whatever the caller passes. ``ParallelGatedDeltaNet`` in
-``components/distributed`` passes one rank's share and swaps the projections,
-so this module stays free of any distributed import — the same direction the
-rest of ``components`` runs in.
+Head counts are whatever the caller passes; ``ParallelGatedDeltaNet`` passes
+one rank's share, so this module has no distributed import.
 """
 from __future__ import annotations
 
@@ -40,32 +29,24 @@ class GDNProjLayout(Enum):
     FUSED = "fused"
 
 
-# bf16 elements in the 32 bytes FlashInfer's bf16 GDN decode kernel wants a
-# tensor to start on (its fp32 kernel is happy with 16, but the bf16 one is
-# the default whenever K = V = 128, and it checks on every call).
+# bf16 elements in the 32-byte alignment FlashInfer's bf16 GDN decode kernel
+# checks on every call (the default kernel when K = V = 128).
 _ALIGN = 16
 
 
 def gate_pad(num_v_heads: int) -> int:
     """Padding between the ``a`` and ``b`` blocks, in elements.
 
-    The decode kernel takes ``a`` and ``b`` as raw slices of the fused
-    projection, and the kernel checks each one's data pointer for 32-byte
-    alignment. ``a`` is fine — every block before it is a whole number of
-    128-wide heads — but ``b`` starts one v-head count later, so it lands
-    mid-word whenever that count is not a multiple of 16. This block is what
-    pushes it back onto one; it is never loaded and never read. Under tensor
-    parallelism the count is the rank's share, which is why the pad is sized
-    per rank (16 v-heads at TP2 leaves 8, and 8 x 2 bytes is only half a
-    32-byte line).
+    The decode kernel takes ``b`` as a raw slice of the fused projection and
+    checks it for 32-byte alignment; ``b`` starts ``num_v_heads`` after ``a``,
+    so this pad realigns it. Never loaded or read. Sized per rank under TP
+    (16 v-heads at TP2 leaves 8, only half a 32-byte line).
     """
     return -num_v_heads % _ALIGN
 
 
-# The blocks of the fused SPLIT projection, in order: [q|k|v|z|a|pad|b]. Each
-# checkpoint tensor maps to the blocks it covers — ``in_proj_qkv`` arrives as
-# one flat [q|k|v], the other three are a block each. Shared with the
-# tensor-parallel subclass, which shards block by block.
+# Blocks of the fused SPLIT projection, [q|k|v|z|a|pad|b], per checkpoint
+# tensor. Shared with the TP subclass, which shards block by block.
 SPLIT_SHARD_BLOCKS: dict[str, tuple[int, ...]] = {
     "qkv": (0, 1, 2),
     "z": (3,),
@@ -117,9 +98,8 @@ class GatedDeltaNet(nn.Module):
             num_v_heads, gate_pad(num_v_heads), num_v_heads,
         ]
         if layout is GDNProjLayout.SPLIT:
-            # One GEMM rather than four. At decode the two gate projections are
-            # 2560x32 each — a single threadblock apiece, ~19 GB/s — and
-            # absorbing them into a wide GEMM costs 0.3% more bytes.
+            # One GEMM rather than four: the 2560x32 gate projections run at
+            # ~19 GB/s alone at decode; absorbed, they cost 0.3% more bytes.
             self.in_proj_fused = nn.Linear(
                 hidden_size, sum(self.in_proj_blocks), bias=proj_bias,
             )
@@ -142,8 +122,7 @@ class GatedDeltaNet(nn.Module):
             torch.zeros(self.num_v_heads, dtype=torch.float32)
         )
 
-        # per head: the checkpoint's weight is [head_v_dim], so it is the one
-        # thing here that does not shard — a head dim, not a head count
+        # weight is [head_v_dim], a head dim, so it does not shard
         self.norm = RMSNormGated(head_v_dim, eps=rms_norm_eps)
         self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=proj_bias)
         self._attach_weight_loaders()
@@ -153,12 +132,10 @@ class GatedDeltaNet(nn.Module):
     # ------------------------------------------------------------------
 
     def _attach_weight_loaders(self) -> None:
-        """Bind the loaders that are not a parameter's own.
+        """Bind the fused projection's loader (needed even unsharded).
 
-        The fused projection is four checkpoint tensors in one, so it needs a
-        loader even unsharded. ``_apply`` re-runs this because ``.to(...)``
-        re-allocates Parameters and drops attribute attachments, and that
-        happens before weights load.
+        ``_apply`` re-runs this because ``.to(...)`` re-allocates Parameters and
+        drops attached attributes, and that happens before weights load.
         """
         proj = getattr(self, "in_proj_fused", None)
         if proj is not None:
@@ -166,9 +143,8 @@ class GatedDeltaNet(nn.Module):
         self._zero_gate_pad()
 
     def _zero_gate_pad(self) -> None:
-        """The pad block is never loaded, so give it zeros rather than whatever
-        ``torch.empty`` left there: its output column is discarded, but NaNs
-        in a weight trip any finiteness check or quantization pass."""
+        """Zero the never-loaded pad block: its output is discarded, but NaNs
+        in a weight trip finiteness checks and quantization passes."""
         proj = getattr(self, "in_proj_fused", None)
         pad = self.in_proj_blocks[5]
         if proj is None or pad == 0:
@@ -180,11 +156,9 @@ class GatedDeltaNet(nn.Module):
     def _apply(self, fn, recurse: bool = True):
         """Keep the fp32 parameters fp32 through any ``.to(dtype)``.
 
-        FlashInfer's GDN kernels assert on these three, and the checkpoint
-        stores them fp32. A whole-module cast to bf16 — which the engine does
-        once at load, after the model is built — would otherwise silently
-        downcast them and fail at the first decode. Owning the invariant here
-        means it survives whoever calls ``.to``.
+        FlashInfer's GDN kernels assert on these three; the engine's bf16
+        module cast at load would otherwise downcast them and fail at the first
+        decode.
         """
         out = super()._apply(fn, recurse)
         for param in (
@@ -206,11 +180,10 @@ class GatedDeltaNet(nn.Module):
         self.mix = LinearAttnCallable(pool=self.pool, attn=self.attn)
 
     def _project_split(self, x: torch.Tensor):
-        """Qwen3.5: one GEMM over [q|k|v|z|a|b], then split.
+        """Qwen3.5: one GEMM over [q|k|v|z|a|pad|b], then split.
 
-        The splits are column views, so they are strided rather than
-        contiguous. Both conv kernels take explicit strides and ``z``'s
-        reshape only splits a unit-stride dim, so nothing here copies.
+        The splits are strided column views; the conv kernels take explicit
+        strides and ``z``'s reshape splits a unit-stride dim, so nothing copies.
         """
         num_tokens = x.shape[0]
         qkv, z, a, _pad, b = torch.split(
@@ -235,9 +208,7 @@ class GatedDeltaNet(nn.Module):
     def _project_fused(self, x: torch.Tensor):
         """Qwen3-Next: one projection each, head-interleaved.
 
-        The rows group by k-head; within a group come that head's q, its k, and
-        the ``v_per_k`` heads' worth of v and z that belong to it. Reshaping to
-        ``[tokens, num_k_heads, group]`` and splitting the last dim undoes it.
+        Rows group by k-head as [q, k, v_per_k v heads, v_per_k z heads].
         """
         num_tokens = x.shape[0]
         group_qkvz = (

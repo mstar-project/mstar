@@ -1,22 +1,16 @@
 """The gated delta-net mixer, sharded across tensor-parallel ranks.
 
-Sharding is by head: k-heads for q and k, v-heads for v, z, the gates, the
-decay parameters and the recurrent state. Head *dims* — ``head_k_dim``,
-``head_v_dim``, and so the gated norm's weight — do not shard.
+Sharding is by head (k-heads for q/k, v-heads for v, z, gates, decay and
+state); head dims, and so the gated norm's weight, do not shard.
 
-The trap is ``[q|k|v]``. It is a single checkpoint tensor over ``conv_dim``, so
-slicing it by rank means slicing each of the three blocks: the obvious
-``chunk(conv_dim, tp)`` hands rank 0 the whole of q plus half of k, at every
-shape check's blessing. ``_shard_blocks`` is that slice, and it is why the conv
-weight and ``in_proj_qkv`` carry loaders of their own.
+``[q|k|v]`` is one checkpoint tensor, so each of its three blocks must be
+sliced separately: a plain ``chunk(conv_dim, tp)`` would give rank 0 all of q
+plus half of k and still pass shape checks. ``_shard_blocks`` does this, hence
+the own loaders on the conv weight and ``in_proj_qkv``.
 
-The engine shards to match without being told: ``DeltaNetGeometry.to_blocks``
-marks both pool blocks ``shard_dims=(0,)`` and the pool divides them at build,
-so a model declares its geometry whole and the rank arithmetic happens once.
-
-Only ``__init__`` differs from the base — the forward is written against
-``self.num_k_heads`` / ``self.key_dim`` and friends, which are this rank's
-share, so it is inherited rather than repeated.
+The state pool shards to match via ``DeltaNetGeometry.to_blocks``
+(``shard_dims=(0,)``). The forward is inherited: it reads the rank-local
+``self.num_k_heads`` / ``self.key_dim`` etc.
 """
 from __future__ import annotations
 
@@ -40,11 +34,8 @@ from mstar.model.components.linear_attn import (
 def _shard_blocks(
     tensor: torch.Tensor, block_sizes: list[int], rank: int, world: int,
 ) -> torch.Tensor:
-    """One rank's slice of a tensor whose dim 0 is ``[block0|block1|...]``.
-
-    Each block is divided separately and the pieces re-joined, so the result
-    is this rank's ``[q|k|v]`` rather than a contiguous cut across the three.
-    """
+    """One rank's slice of a tensor whose dim 0 is ``[block0|block1|...]``,
+    divided block by block and re-joined."""
     parts, offset = [], 0
     for size in block_sizes:
         per = divide(size, world)
@@ -56,10 +47,8 @@ def _shard_blocks(
 class _FusedBlockColumnParallelLinear(MergedColumnParallelLinear):
     """A merged column-parallel linear whose checkpoint tensors span blocks.
 
-    The parent wants one call per block; the delta-net checkpoint stores
-    ``[q|k|v]`` as a single tensor and z/a/b as one each. ``shard_map`` says
-    which blocks a given checkpoint tensor covers, so the loader's names stay
-    one-to-one with the checkpoint's.
+    ``shard_map`` names the blocks each checkpoint tensor covers (``[q|k|v]``
+    is one tensor), so loader names match the checkpoint's.
     """
 
     def __init__(self, *, shard_map: dict[str, tuple[int, ...]], **kwargs):
@@ -90,9 +79,7 @@ class _FusedBlockColumnParallelLinear(MergedColumnParallelLinear):
 class ParallelGatedDeltaNet(GatedDeltaNet):
     """``GatedDeltaNet`` over one rank's heads.
 
-    Takes the checkpoint's head counts, not the rank's — the division happens
-    here, so callers declare the model once and the same arguments serve any
-    degree, ``CommGroup.trivial()`` included.
+    Takes the checkpoint's (total) head counts and divides them here.
     """
 
     def __init__(
@@ -116,18 +103,14 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
             comm_group = CommGroup.trivial()
         tp = comm_group.world_size
         if layout is GDNProjLayout.FUSED and tp > 1:
-            # The fused projection is head-interleaved, so a rank's slice is a
-            # gather of per-k-head groups rather than a narrow. Nothing ships
-            # this layout yet, so it is unwritten rather than wrong.
             raise NotImplementedError(
                 "the fused delta-net layout has no tensor-parallel weight "
                 "loader yet; it is head-interleaved, so sharding it is a "
                 "gather per k-head, not a narrow"
             )
 
-        # The base builds this rank's share, so every view in its forward is
-        # already local; only the projections need replacing below, and they
-        # are replaced at the same local width.
+        # The base builds this rank's share; only the projections are
+        # replaced below, at the same local width.
         super().__init__(
             hidden_size=hidden_size,
             num_k_heads=divide(num_k_heads, tp),
@@ -143,7 +126,7 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
             state_key=state_key,
         )
         self.comm_group = comm_group
-        # Totals describe the checkpoint, which is what the loaders slice.
+        # Totals describe the checkpoint, which the loaders slice.
         self.total_num_k_heads = num_k_heads
         self.total_num_v_heads = num_v_heads
         self.total_key_dim = num_k_heads * head_k_dim
@@ -151,13 +134,10 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
         self._qkv_blocks = [
             self.total_key_dim, self.total_key_dim, self.total_value_dim,
         ]
-        # the fused layout keeps the base's plain projections; it refuses tp>1
-        # above, so there is nothing to shard
+        # the fused layout keeps the base's projections (tp>1 refused above)
         if layout is GDNProjLayout.SPLIT:
-            # Every block shards on dim 0 by head count, so one merged linear
-            # covers them all — the base's forward splits the result. Widths
-            # here are the checkpoint's; the pad is sized from the *local* head
-            # count and scaled up, since alignment is a per-rank property.
+            # Widths are the checkpoint's; the pad is sized from the *local*
+            # head count and scaled up, since alignment is per rank.
             self.in_proj_fused = _FusedBlockColumnParallelLinear(
                 comm_group=comm_group, input_size=hidden_size,
                 output_sizes=[
@@ -203,9 +183,8 @@ class ParallelGatedDeltaNet(GatedDeltaNet):
     def _attach_weight_loaders(self) -> None:
         """Bind the loaders that are not a parallel linear's own.
 
-        Re-run from the base's ``_apply``: ``.to(device)`` re-allocates
-        Parameters and drops attribute attachments, and it happens before
-        weights load. Same reason ``ColumnParallelLinear`` re-attaches.
+        Re-run from the base's ``_apply``, since ``.to(device)`` drops attached
+        attributes before weights load.
         """
         conv = getattr(self, "conv1d", None)
         if conv is not None:

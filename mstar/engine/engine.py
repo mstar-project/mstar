@@ -235,7 +235,7 @@ class ExecutingBatch:
     # the resource that ran out, so an eviction can be scoped to it
     failed_resource: str | None = None
 
-    # This step's per-rid outputs, published as soon as the forward has been
+    # This step's outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
     outputs: BatchedModelOutput = field(default_factory=BatchedModelOutput)
 
@@ -1247,10 +1247,9 @@ class Engine:
         check for the rest of the batch and leave their loops running past
         their stop condition.
 
-        With ``host_rows`` (the step's row-addressed outputs on the host), a
-        submodule implementing ``check_stop_batched`` checks the batch in one
-        call; if it raises, the per-request path runs instead, so a failure
-        still lands on its own request.
+        With ``host_rows``, ``check_stop_batched`` checks the batch in one call;
+        if it raises, the per-request path runs so a failure lands on its own
+        request.
         """
         submodule = self._submodules[batch.node_name].submodule
         if host_rows is not None:
@@ -1338,9 +1337,8 @@ class Engine:
         return BatchedModelOutput(
             per_rid_outputs=outputs,
             check_stop_buffers=raw_outputs.clone_check_stop_buffers(),
-            # row i of those buffers is request_ids[i] *as the forward ran
-            # them*; the worker maps rows through this rather than through
-            # its own, later-rewritten request list
+            # row i is request_ids[i] as the forward ran them, not the
+            # worker's later-rewritten request list
             row_request_ids=tuple(request_ids),
         )
 
@@ -1355,23 +1353,16 @@ class Engine:
     ) -> None:
         """Fold the forward's per-rid entries into ``outputs``.
 
-        Row-addressed outputs (``row_outputs``) are copied out of the graph's
-        buffers once for the whole batch and handed to each request as a view
-        of that one clone. Per-rid entries are still cloned individually —
-        nothing says they are rows of a single tensor. A name present in both
-        is the per-rid one: that is the more specific claim.
-
-        The clone still happens after ``filter_batched_output``, so a key the
-        submodule drops for this request is never copied. Taking a view is
-        free, so the row entries can be offered to the filter up front.
+        ``row_outputs`` are cloned once for the batch and handed out as row
+        views; per-rid entries are cloned individually after
+        ``filter_batched_output``. A name in both resolves to the per-rid one.
         """
         row_clones = raw_outputs.clone_row_outputs(len(request_ids))
         for i, (rid, out_id) in enumerate(
             zip(request_ids, out_ids, strict=False)
         ):
             rid_out = raw_outputs.get(out_id)
-            # names served by a view of the batch clone — already copied out,
-            # so they must not be cloned again below
+            # names served by a view of the batch clone: don't clone again
             from_rows: set[str] = set()
             candidates: dict[str, Any] = {}
             for name, tensor in row_clones.items():

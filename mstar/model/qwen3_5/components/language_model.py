@@ -1,25 +1,16 @@
 """Qwen3.5's hybrid text stack: 3 gated-delta-net layers to 1 full-attention.
 
-The two layer types index *different* resources — the recurrent pool is sized
-by the linear layers and the KV cache by the full ones — so each layer is given
-its position among its own kind, not its position in the stack. See
-``Qwen3_5Config.resource_layer_index``.
+Each layer indexes its own resource (recurrent pool or KV cache) by its
+position among its own kind; see ``Qwen3_5Config.resource_layer_index``.
 
-Tensor parallelism shards by head throughout — q-heads for attention, k/v-heads
-for the delta net — and the engine shards the KV cache and the recurrent pool to
-match without being told, so ``get_node_resources`` stays unsharded. The
-checkpoint keeps ``gate/up`` and the delta net's four projections apart; we
-fuse each group into one GEMM and route the checkpoint's tensors in by shard
-id, because at decode width those GEMMs are latency-bound rather than
-bandwidth-bound. ``q/k/v`` stay apart — see ``Qwen3_5Attention``.
-
-Two head counts are not the q-heads: ``num_key_value_heads`` is 4 or 2, so past
-that degree the K/V heads replicate (see ``KVColumnParallelLinear``), and the
-delta net's are its own (see ``GatedDeltaNet``).
+TP shards by head (q-heads for attention, k/v-heads for the delta net), and the
+engine shards the KV cache and recurrent pool to match, so
+``get_node_resources`` stays unsharded. ``gate/up`` and the delta net's four
+projections are each fused into one GEMM, since at decode width they are
+latency-bound; ``q/k/v`` stay apart. ``num_key_value_heads`` is 4 or 2, so past
+that TP degree the K/V heads replicate (see ``KVColumnParallelLinear``).
 """
 from __future__ import annotations
-
-import os
 
 import torch
 from torch import nn
@@ -55,9 +46,8 @@ from mstar.model.qwen3_5.config import (
 class RopeCache:
     """This step's cos/sin, shared by every full-attention layer.
 
-    A cursor like the label and the layer index: the stack sets it once
-    per step rather than threading cos/sin through every layer's forward,
-    which would mean a decoder layer of our own.
+    Set once per step, like the label cursor, so cos/sin need not be threaded
+    through ``DecoderLayer.forward``.
     """
 
     def __init__(self):
@@ -71,10 +61,8 @@ class RopeCache:
 class Qwen3_5Attention(Attention):
     """Full attention with Qwen3.5's output gate.
 
-    ``q_proj`` carries the query and the gate **interleaved per head** — each
-    head's block is ``[q(head_dim) | gate(head_dim)]``, not all queries then
-    all gates — so it is chunked after the per-head view, never before. The
-    gate multiplies the attention output before ``o_proj``.
+    ``q_proj`` interleaves query and gate **per head** (``[q | gate]`` per
+    head block), so it is chunked after the per-head view, never before.
     """
 
     def __init__(
@@ -90,8 +78,7 @@ class Qwen3_5Attention(Attention):
         self.comm_group = comm_group
         tp = comm_group.world_size
         if self.q_norm is not None:
-            # the parent builds Llama-style; Qwen3.5's are Gemma-style too.
-            # `head_dim` is a head *dim*, so it does not shard.
+            # Gemma-style, not the parent's Llama-style; head_dim does not shard
             eps = self.q_norm.variance_epsilon
             self.q_norm = RMSNorm(self.head_dim, eps=eps, gemma_mode=True)
             self.k_norm = RMSNorm(self.head_dim, eps=eps, gemma_mode=True)
@@ -101,9 +88,7 @@ class Qwen3_5Attention(Attention):
         self.total_num_heads = self.num_heads
         self.num_heads = divide(self.num_heads, tp)
 
-        # The gate rides inside each head's block — `[q(head_dim) | gate]` per
-        # head — so sharding *across* heads leaves it intact and this is an
-        # ordinary column shard at double width.
+        # the gate is inside each head's block, so a head shard keeps it intact
         self.q_proj = ColumnParallelLinear(
             comm_group=comm_group, input_size=self.input_hidden_size,
             output_size=self.total_num_heads * self.head_dim * (2 if output_gate else 1),
@@ -129,11 +114,8 @@ class Qwen3_5Attention(Attention):
         )
 
     def _apply_rope(self, q, k, label):
-        """Interleaved 3D MRoPE over the partial rotary dim.
-
-        Falls back to the position resource's 1D RoPE when no cos/sin was
-        set, which is what a text-only bring-up harness does.
-        """
+        """Interleaved 3D MRoPE over the partial rotary dim; 1D RoPE when no
+        cos/sin was set (a text-only bring-up harness)."""
         if self.rope_cache is None or self.rope_cache.cos is None:
             return super()._apply_rope(q, k, label)
         return apply_partial_mrope(q, k, self.rope_cache.cos, self.rope_cache.sin)
@@ -169,16 +151,12 @@ class Qwen3_5Attention(Attention):
 
 
 def _norm(config: Qwen3_5Config) -> RMSNorm:
-    """Qwen3.5's plain RMSNorm is Gemma-style: the checkpoint stores
-    ``weight - 1`` and the norm scales by ``1 + weight``. Its *gated* norm
-    is not — see ``RMSNormGated``.
-    """
+    """Gemma-style RMSNorm (scales by ``1 + weight``); the gated norm is not."""
     return RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma_mode=True)
 
 
 def _build_mlp(config: Qwen3_5Config, comm_group: CommGroup) -> nn.Module:
-    # Fused gate/up: one GEMM per layer instead of two. The checkpoint's
-    # separate tensors route in by shard id — see `_STACKED_PARAMS`.
+    # fused gate/up; see `weight_loader._STACKED_PARAMS`
     return ParallelGatedMLP(
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
@@ -261,8 +239,7 @@ class Qwen3_5LanguageModel(nn.Module):
         )
         self.norm = _norm(config)
 
-        # Precomputed so the forward does no bookkeeping: which cursor each
-        # layer advances, and the index it advances to.
+        # precomputed: which cursor each layer advances, and to what index
         self._cursor_attr = [
             "mix" if kind == LINEAR_ATTENTION else "attend"
             for kind in config.layer_types
@@ -270,24 +247,19 @@ class Qwen3_5LanguageModel(nn.Module):
         self._resource_idx = [
             config.resource_layer_index(i) for i in range(config.num_hidden_layers)
         ]
-        # one layer of each kind to bind the label through; the cursors live on
-        # the shared resources, so binding once per kind covers the stack
+        # the cursors are on shared resources, so bind once per kind
         self._bind_through = {
             attr: self._cursor_attr.index(attr) for attr in set(self._cursor_attr)
         }
 
-        # Carry the residual stream beside the hidden states instead of adding
-        # it at the end of each block, so every add lands in the norm that
-        # follows it: one fused add+norm per block (and, under TP, one fused
-        # all-reduce+add+norm kernel in place of NCCL + add + norm). The
-        # row-parallel outputs therefore hand back partial sums.
-        self._fused_residual = os.getenv("MSTAR_QWEN35_FUSED_ADD_NORM", "1") != "0"
-        if self._fused_residual:
-            for layer in self.layers:
-                mixer = layer.self_attn
-                out = mixer.o_proj if hasattr(mixer, "o_proj") else mixer.out_proj
-                out.reduce_results = False
-                layer.mlp.down_proj.reduce_results = False
+        # Defer each residual add into the next norm: one fused add+norm (under
+        # TP, all-reduce+add+norm) per block, so row-parallel outputs return
+        # partial sums.
+        for layer in self.layers:
+            mixer = layer.self_attn
+            out = mixer.o_proj if hasattr(mixer, "o_proj") else mixer.out_proj
+            out.reduce_results = False
+            layer.mlp.down_proj.reduce_results = False
 
     def build_cos_sin(
         self, position_ids_3d: torch.Tensor, dtype: torch.dtype,
@@ -302,25 +274,15 @@ class Qwen3_5LanguageModel(nn.Module):
         self, query_sequence: torch.Tensor, *, label: str,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        # cos/sin are the same for every layer, so they ride a cursor too
         self.rope_cache.set(*(cos_sin or (None, None)))
-        # The label and layer index are cursors on the shared resources: bind
-        # the label once per resource kind, advance the index per layer.
+        # bind the label once per resource kind, advance the index per layer
         for attr, idx in self._bind_through.items():
             getattr(self.layers[idx].self_attn, attr).bind_step(label)
-        if self._fused_residual:
-            return self._forward_fused_residual(query_sequence)
-        for i, layer in enumerate(self.layers):
-            getattr(layer.self_attn, self._cursor_attr[i]).set_layer_idx(
-                self._resource_idx[i]
-            )
-            query_sequence = layer(hidden_states=query_sequence)
-        return self.norm(query_sequence)
+        return self._forward_fused_residual(query_sequence)
 
     def _forward_fused_residual(self, hidden: torch.Tensor) -> torch.Tensor:
-        """``DecoderLayer.forward`` with each residual add deferred into the
-        next norm. ``hidden`` coming out of a mixer or MLP is a partial sum
-        under TP; the norm's ``comm_group`` reduces it."""
+        """``DecoderLayer.forward`` with residual adds deferred into the next
+        norm, which also reduces the TP partial sums."""
         cg = self.comm_group if self.comm_group.world_size > 1 else None
         residual = None
         for i, layer in enumerate(self.layers):
@@ -350,10 +312,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.model = Qwen3_5LanguageModel(config, comm_group)
-        # All-gathers the vocab before returning, so the sampler stays
-        # vocab-oblivious. Its shard is `[vocab/tp, hidden]`, the same shape
-        # the vocab-parallel embedding holds — which is what lets the tie
-        # below keep working per rank.
+        # Gathers the vocab so the sampler is TP-oblivious. Its `[vocab/tp,
+        # hidden]` shard matches the embedding's, so the tie works per rank.
         self.lm_head = ColumnParallelLinear(
             comm_group=self.model.comm_group,
             input_size=config.hidden_size,

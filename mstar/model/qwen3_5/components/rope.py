@@ -1,12 +1,9 @@
 """Qwen3.5's interleaved 3D MRoPE, over a partial rotary dim.
 
-Two differences from the 1D RoPE the position resource serves, which is why
-this is model-side (``position/manager.py`` still has 3D positions as a TODO):
-
-* the three position grids are woven into the frequency dims in a
-  ``[T,H,W,T,H,W,...]`` pattern rather than chunked, and
-* only ``head_dim * partial_rotary_factor`` of each head is rotated — 64 of
-  256 for every released size — with the remainder passed through untouched.
+Model-side because the position resource serves only 1D RoPE. The three grids
+are interleaved ``[T,H,W,T,H,W,...]`` over the frequency dims, and only
+``head_dim * partial_rotary_factor`` of each head is rotated (64 of 256 for
+every released size).
 
 TODO: this duplicates ``qwen3_omni/components/rope.py`` apart from the partial
 rotation. Both belong in ``model/components/rope.py``.
@@ -34,9 +31,8 @@ def _recompose_frequencies(
 ) -> torch.Tensor:
     """Weave the three grids together, T as the base and H/W overwriting.
 
-    ``freqs`` is ``[3, seq_len, rotary_dim // 2]``. With section ``[11,11,10]``
-    T keeps dims 0,3,6..., H takes 1,4,7... and W takes 2,5,8..., which is the
-    ``mrope_interleaved`` layout.
+    ``freqs`` is ``[3, seq_len, rotary_dim // 2]``; T keeps dims 0,3,6..., H
+    takes 1,4,7..., W 2,5,8... (the ``mrope_interleaved`` layout).
     """
     out = freqs[0].clone()
     for dim, offset in enumerate((1, 2), start=1):  # H, W
@@ -111,10 +107,9 @@ def vision_position_ids(
 ) -> torch.Tensor:
     """``[3, t * h' * w']`` for one image, where ``h' = h // merge``.
 
-    The three grids stop moving together here: T is constant across a frame
-    while H and W sweep the merged patch grid, all three based at
-    ``start_pos``. Order is row-major over ``(t, h', w')``, which is the order
-    the merger emits tokens in.
+    T is constant across a frame while H and W sweep the merged patch grid,
+    all based at ``start_pos``; row-major over ``(t, h', w')``, the merger's
+    token order.
     """
     t, h, w = (int(v) for v in grid_thw.tolist())
     h //= spatial_merge_size
@@ -131,10 +126,8 @@ def vision_position_advance(
 ) -> int:
     """How far one image moves the position cursor.
 
-    Not its token count: the grids run in parallel rather than in sequence, so
-    an image spans ``max(h', w')`` positions while occupying ``t * h' * w'``
-    tokens. Feeding the token count here would leave a gap the size of the
-    image before the text that follows it.
+    ``max(h', w')`` positions, not its ``t * h' * w'`` tokens: the grids run
+    in parallel.
     """
     _, h, w = (int(v) for v in grid_thw.tolist())
     return max(h, w) // spatial_merge_size

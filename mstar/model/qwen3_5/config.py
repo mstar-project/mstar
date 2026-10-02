@@ -1,7 +1,6 @@
-"""Qwen3.5's text-stack config, read off the HF ``config.json``.
+"""Qwen3.5's text and vision configs, read off the HF ``config.json``.
 
-Text tower only; the vision config is a follow-up. Field names mirror HF's so
-``from_hf`` can splat the checkpoint's own dict and a reader can diff the two.
+Field names mirror HF's so ``from_hf`` can splat the checkpoint's own dict.
 """
 from __future__ import annotations
 
@@ -40,10 +39,8 @@ class Qwen3_5VisionConfig:
 
     hidden_act: str = "gelu_pytorch_tanh"
     rope_theta: float = 10_000.0
-    # Dead config surface, kept only so a checkpoint that revives it fails
-    # loudly: `[]` on all ten released sizes, and transformers' own
-    # `modeling_qwen3_5` never reads the field. Qwen3-VL is where it is live
-    # (default `[8, 16, 24]`), feeding intermediate blocks back into the LLM.
+    # Kept only so a checkpoint that sets it fails loudly: `[]` on every
+    # released size and unread by transformers' Qwen3.5 (live in Qwen3-VL).
     deepstack_visual_indexes: tuple[int, ...] = ()
 
     @property
@@ -107,8 +104,7 @@ class Qwen3_5Config:
     attn_output_gate: bool = False
     tie_word_embeddings: bool = False
     eos_token_id: int | list[int] | None = None
-    # Multimodal sentinels. These sit at the *root* of `config.json`, not under
-    # `text_config`, because they are what joins the two towers.
+    # multimodal sentinels, at the root of `config.json`, not `text_config`
     vision_start_token_id: int | None = None
     vision_end_token_id: int | None = None
     image_token_id: int | None = None
@@ -129,8 +125,7 @@ class Qwen3_5Config:
             path = path / "config.json"
         raw = json.loads(path.read_text())
         tc = raw.get("text_config", raw)
-        # Root first so `text_config` wins any name they share, and rope from
-        # one level down so its names line up.
+        # root first so `text_config` wins shared names; rope one level down
         merged = {**raw, **tc, **tc.get("rope_parameters", {})}
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in merged.items() if k in known})
@@ -150,11 +145,9 @@ class Qwen3_5Config:
     def stop_token_ids(self) -> frozenset[int]:
         """Every id that ends generation — wider than ``eos_token_ids``.
 
-        The released checkpoints are chat models whose assistant turns end on
-        ``<|im_end|>``, but ``config.json`` names only ``<|endoftext|>``.
-        Stopping on the config's alone runs every reply to the token budget.
-        The model fills ``extra_stop_token_ids`` from the tokenizer, which
-        knows the real one.
+        Chat turns end on ``<|im_end|>``, but ``config.json`` names only
+        ``<|endoftext|>``, so the model adds the tokenizer's eos via
+        ``extra_stop_token_ids``; without it every reply runs to the budget.
         """
         return self.eos_token_ids | frozenset(self.extra_stop_token_ids)
 
@@ -174,9 +167,8 @@ class Qwen3_5Config:
     def resource_layer_index(self, layer_idx: int) -> int:
         """Where a stack layer sits among *its own* resource's layers.
 
-        The KV cache is sized by the full-attention layers and the recurrent
-        pool by the linear ones, so neither is indexed by stack position.
-        Handing either the stack index reads another layer's state.
+        The KV cache holds only full-attention layers and the recurrent pool
+        only linear ones; a stack index would read another layer's state.
         """
         same = (
             self.linear_layer_indices

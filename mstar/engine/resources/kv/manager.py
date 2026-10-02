@@ -847,10 +847,8 @@ class KVManager(AttentionResource):
 
             for segment in step.segments:
                 # A replay's padding rows reserve nothing: they run against
-                # SINK_PAGE (see `_sequence_views`). Handing them pages meant
-                # either keeping those resident per dummy name or, freed after
-                # each step, re-allocating them every padded step — and on a
-                # near-full arena that allocation failed and held the batch.
+                # SINK_PAGE (see `_sequence_views`). Pages for them would fail
+                # to allocate on a near-full arena and hold the batch.
                 if segment.span == 0 or ctx.is_padding_row(segment.request_id):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
@@ -898,10 +896,8 @@ class KVManager(AttentionResource):
         pending_forks = pending_forks or {}
         for s in segments:
             if ctx is not None and ctx.is_padding_row(s.request_id):
-                # A padding row stands for no request. Its tokens read and
-                # write SINK_PAGE, which is held out of circulation for exactly
-                # this, so the row needs no pages of its own and its output is
-                # discarded by the engine.
+                # A padding row reads and writes SINK_PAGE; the engine
+                # discards its output.
                 views.append(SequenceView(
                     request_id=s.request_id, label=s.label,
                     page_idxs=[SINK_PAGE] if s.span > 0 else [],
@@ -1011,8 +1007,8 @@ class KVManager(AttentionResource):
         self, views: list[SequenceView], static_state: KVPlanState,
         capture_len: int,
     ) -> KVPlanState:
-        """``_decode_plan_state`` + ``KVPlanState.copy_`` without the device
-        staging tensor: rows past the real tokens get SINK_PAGE / 0, as there."""
+        """``_decode_plan_state`` + ``KVPlanState.copy_`` with no device staging
+        tensor; rows past the real tokens get SINK_PAGE / 0."""
         pages, offsets = self._decode_locations(views)
         self._plan_stager.copy_(
             static_state.token_to_page[:capture_len], pages, pad_value=SINK_PAGE,
@@ -1029,10 +1025,9 @@ class KVManager(AttentionResource):
     ):
         for label, indptrs in plan_output.items():
             if indptrs.is_decode and lease is not None:
-                # Straight into the captured buffers, padding and all, in one
-                # H2D per buffer: this runs in the pre-plan beside a live graph,
-                # where a device-side staging copy + fill would share the GPU
-                # with it (see mstar.utils.h2d).
+                # Straight into the captured buffers in one H2D per buffer:
+                # this runs in the pre-plan beside a live graph, where a
+                # device-side copy + fill would slow it (see mstar.utils.h2d).
                 plan_state = self._stage_decode_plan_state(
                     indptrs.views, self._static_plan_state(lease.slot, label),
                     lease.bucket.num_tokens,
@@ -1078,10 +1073,9 @@ class KVManager(AttentionResource):
     ) -> dict[tuple[str, str], tuple[int, int]]:
         """``(stored_len, generation)`` each pre-fork will hand its target.
 
-        Staging cannot run the fork — `copy_pages` would race the default
-        stream — but the addressing it stages has to be the one the step runs
-        with. A target takes its source's length and bumps its own generation,
-        so both are read ahead here and the copy still happens at promotion.
+        Staging cannot run the fork (`copy_pages` would race the default
+        stream), so the target's length and bumped generation are read ahead
+        and the copy happens at promotion.
         """
         pending: dict[tuple[str, str], tuple[int, int]] = {}
         with self._lock:
@@ -1113,9 +1107,8 @@ class KVManager(AttentionResource):
                 self._current_plan_states = self._preplan_states
                 res = self._cached_plan_output
 
-                # Promotion. The staged addressing already reads as though the
-                # fork had happened; this is the copy itself, which staging left
-                # undone. `_pending_fork_state` says why.
+                # Promotion: apply the fork copies staging left undone; see
+                # `_pending_fork_state`.
                 self._maybe_apply_forks(step, ctx)
 
                 self._preplan_new_labels = []
@@ -1128,9 +1121,8 @@ class KVManager(AttentionResource):
             # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
 
-        # Both run ahead of the views, which record each stream's length and
-        # generation. Staging only reads what the fork will land; running for
-        # real applies it.
+        # Forks run ahead of the views, which record length and generation;
+        # staging only reads what the fork will land.
         if ctx.is_preplan:
             pending = self._pending_fork_state(step, ctx)
         else:

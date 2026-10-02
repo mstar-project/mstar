@@ -3,22 +3,19 @@
 Vendored from vLLM's ``model_executor/layers/mamba/ops/causal_conv1d.py``
 (Apache-2.0), itself adapted from Tri Dao's causal-conv1d. Kept intact apart
 from the vLLM couplings: ``current_platform`` becomes a local capability check,
-``vllm.triton_utils`` becomes triton directly, and the CPU-implementation swap
-at the bottom is dropped since the GDN path is CUDA-only.
+``vllm.triton_utils`` becomes triton directly, the CPU swap at the bottom is
+dropped (the GDN path is CUDA-only), and ``causal_conv1d_fn`` takes an optional
+``seqlens_cpu``: host lengths that replace its device-to-host read, a sync that
+is illegal under CUDA-graph capture.
 
-What mstar uses is the state-pool shape of the API, which lines up with a
-``RecurrentStatePool`` block as it stands: ``conv_states`` is
-``[slots, dim, width - 1]``, ``cache_indices`` is a slot per row,
-``query_start_loc`` is cu_seqlens, and ``has_initial_state`` says which rows
-resume. ``causal_conv1d_fn`` takes the chunked path and
-``causal_conv1d_update`` the single-token one, matching the split in
-``linear_attn/gdn.py``.
+The state-pool API matches a ``RecurrentStatePool`` block: ``conv_states`` is
+``[slots, dim, width - 1]``, ``cache_indices`` a slot per row,
+``query_start_loc`` cu_seqlens, ``has_initial_state`` which rows resume.
 
 The block-indexed arguments (``block_idx_*``, ``initial_state_idx``,
-``num_computed_tokens``, ``block_size_to_align``, ``null_block_id``) drive
-vLLM's prefix caching for conv state. mstar has none, so they stay at their
-defaults and those branches compile out; they are left in place rather than cut
-so this file can be diffed against upstream.
+``num_computed_tokens``, ``block_size_to_align``, ``null_block_id``) are vLLM's
+conv-state prefix caching; mstar leaves them at defaults (branches compile out)
+but keeps them so this file diffs cleanly against upstream.
 """
 
 # Copyright (c) 2024, Tri Dao.
@@ -596,10 +593,9 @@ def causal_conv1d_fn(
         batch_ptr = metadata.batch_ptr
         token_chunk_offset_ptr = metadata.token_chunk_offset_ptr
     else:
-        # mstar: `query_start_loc.diff().to("cpu")` is a device sync, so it
-        # cannot run under CUDA-graph capture. The caller already knows the
-        # spans on the host at plan time and passes them here; falling back
-        # to the readback keeps upstream's behaviour for other callers.
+        # mstar: `query_start_loc.diff().to("cpu")` is a device sync, illegal
+        # under CUDA-graph capture, so the caller passes host spans from plan
+        # time; the readback fallback keeps upstream's behaviour.
         seqlens = (
             seqlens_cpu
             if seqlens_cpu is not None

@@ -93,35 +93,6 @@ Notes
   ``process_prompt`` for the inputs it expects.
 - To add a new family, see :doc:`adding_models`.
 
-<<<<<<< HEAD
-Qwen3.5 (``qwen3_5_*``)
------------------------
-
-Text-and-image chat on the Qwen3.5 dense family; five sizes, one architecture.
-MoE variants are not supported yet. Served on both ``POST /generate`` and
-``/v1/chat/completions`` (image parts included). Images may be interleaved with
-text anywhere in the prompt, and prefill follows the order they were written::
-
-    mstar serve qwen3_5_4b --gpus 0
-
-Most layers are gated DeltaNet rather than full attention, so a request holds a
-recurrent-state slot as well as a KV allocation. The slot pool is sized
-explicitly in ``configs/qwen3_5_*.yaml`` (``gdn_state.max_slots``): one slot per
-concurrent request plus the sink, so set it to the concurrency you want to
-serve. A slot is ~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half
-that with a bf16 state), which is why the 256-slot default is not used.
-CUDA-graph capture and padded replays address the sink and take no slots, so
-the capture batch sizes do not enter into it. The recurrent state takes the
-checkpoint's ``mamba_ssm_dtype`` (fp32 for the released checkpoints, as in
-vLLM). ``gdn_state.state_dtype: bfloat16`` halves the state traffic, a tensor
-read and written every step, at some precision; it needs FlashInfer's fused
-bf16 decode kernel (K = V = 128).
-
-``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
-``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
-a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
-via ``extra_body``.
-=======
 OmniVoice notes
 ~~~~~~~~~~~~~~~
 
@@ -137,7 +108,31 @@ OmniVoice notes
 - The backbone is not autoregressive: it fills a fixed canvas of eight codebook
   rows over a few unmasking steps, so there is no KV cache and no per-token
   sampling loop. Serve it with ``mstar serve omnivoice --gpus 0``.
->>>>>>> main
+
+Qwen3.5 (``qwen3_5_*``)
+-----------------------
+
+Text-and-image chat on the Qwen3.5 dense family (five sizes; MoE variants are
+not supported yet; video is refused). Served on both ``POST /generate`` and
+``/v1/chat/completions`` (image parts included). Images may be interleaved with
+text anywhere in the prompt, and prefill follows the order they were written::
+
+    mstar serve qwen3_5_4b --gpus 0
+
+Most layers are gated DeltaNet, so a request holds a recurrent-state slot as
+well as a KV allocation. Set ``gdn_state.max_slots`` in
+``configs/qwen3_5_*.yaml`` to the concurrency you want plus one for the sink;
+CUDA-graph capture and padded replays use the sink, not slots. A slot is
+~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half that in bf16), hence
+not the 256-slot default. The state defaults to the checkpoint's
+``mamba_ssm_dtype`` (fp32 for the released checkpoints, as in vLLM);
+``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
+needs FlashInfer's fused bf16 decode kernel (K = V = 128).
+
+``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
+``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
+a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
+via ``extra_body``.
 
 Kokoro notes
 ------------

@@ -80,10 +80,8 @@ class CommGroup:
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
     ) -> bool:
         """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
-        hidden]`` inputs. Collective over this group, so every member calls it
-        at the same point (model construction). Larger inputs -- long
-        prefills -- keep the NCCL path, where the kernel's advantage is gone
-        anyway. Returns whether the fused kernel is available."""
+        hidden]`` inputs; larger inputs keep the NCCL path. Collective: every
+        member calls it at the same point. Returns whether it is available."""
         if self.world_size == 1 or self._ar_fusion_ws is not None:
             return self._ar_fusion_ws is not None
         from mstar.distributed.ar_fusion import create_workspace

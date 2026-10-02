@@ -67,10 +67,8 @@ logger = logging.getLogger(__name__)
 def _resolve_model_metadata(repo_id: str, cache_dir: str | None) -> str:
     """Resolve only the files needed to construct config and tokenize input.
 
-    The API and conductor processes do not need model tensors. Downloading a
-    metadata-only snapshot here keeps them from allocating or transferring the
-    multi-gigabyte checkpoint. Workers fetch the complete snapshot lazily from
-    ``get_submodule``.
+    The API and conductor processes never download the checkpoint; workers
+    fetch the full snapshot lazily from ``get_submodule``.
     """
     local_path = Path(repo_id)
     if local_path.is_dir():
@@ -97,14 +95,13 @@ def _as_hwc_uint8(image: torch.Tensor):
     """What the HF image processor expects, from what the data worker sends.
 
     Images arrive ``(C, H, W)`` float32 in [0, 1] on the GPU. The processor
-    defaults to ``do_rescale=True``, so handing it floats rescales a second
-    time and the model sees a near-black image rather than an error.
+    defaults to ``do_rescale=True``, so floats would be rescaled twice and the
+    model would silently see a near-black image.
     """
     if image.dtype.is_floating_point:
         image = (image * 255.0).clamp(0, 255).to(torch.uint8)
     if image.dim() == 3 and image.shape[0] == 4:
-        # a PNG with an alpha channel: the processor cannot infer the channel
-        # dim of a 4-channel tensor and refuses it, so drop alpha here
+        # the processor refuses a 4-channel (RGBA) tensor, so drop alpha
         image = image[:3]
     if image.dim() == 3 and image.shape[0] in (1, 3):
         image = image.permute(1, 2, 0)
@@ -121,28 +118,22 @@ class WalkInput:
 # nth tensor of that kind.
 TEXT_PART, IMAGE_PART = 0, 1
 
-# Ragged attention sizes a CUDA-graph bucket off this, and the ViT is not
-# captured, so it only has to be generous enough for a plausible prompt.
-MAX_VISION_SEGMENTS = 16
-
 
 @dataclass(frozen=True)
 class PrefillStep:
     walk: str
-    # One list per name: a merged `prefill_vision` step carries every text
-    # span and every image of the prompt.
+    # one list per name: a `prefill_vision` step carries every span and image
     input_tensors: dict[str, list[TensorPointerInfo]]
     order: tuple[int, ...] = ()
 
 
 # TODO: implement MoE variants
 class Qwen3_5DenseModel(Model):
-    # Image preprocessing is a few small ops per request (decode, the HF fast
-    # image processor), and a pool of one thread per core only slows them:
-    # each op waits on whichever of its threads a co-tenant descheduled. At
-    # 64 threads, 1 in ~8 4B image preprocesses took 35-130 ms instead of
-    # ~5 ms, and c=1 TTFT p95 was 152 ms; at 4, preprocessing held at 7-10 ms
-    # and p95 at 49 ms. One thread is steadier but slower (13 ms).
+    # Image preprocessing is a few small ops per request, and a thread per
+    # core only slows them: each op waits on whichever thread a co-tenant
+    # descheduled. At 64 threads c=1 TTFT p95 was 152 ms (some preprocesses
+    # 35-130 ms); at 4, preprocessing held at 7-10 ms and p95 at 49 ms. One
+    # thread is steadier but slower (13 ms).
     PREPROCESS_TORCH_THREADS = 4
 
     def __init__(
@@ -156,8 +147,8 @@ class Qwen3_5DenseModel(Model):
 
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
-        # None on a text-only checkpoint; `_create_submodule` raises rather
-        # than silently serving a deployment whose config asked for the node.
+        # None on a text-only checkpoint (`_create_submodule` then refuses a
+        # vision_encoder node)
         self.vision_config = Qwen3_5VisionConfig.from_hf_or_none(self.local_dir)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -169,8 +160,7 @@ class Qwen3_5DenseModel(Model):
         if self.tokenizer.eos_token_id is not None:
             self.config.extra_stop_token_ids = (self.tokenizer.eos_token_id,)
 
-        # Each worker asks only for nodes assigned to it. Cache the resulting
-        # wrappers so weights are materialized at most once.
+        # so weights are materialized at most once per node
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
         self._image_processor = None
 
@@ -183,9 +173,8 @@ class Qwen3_5DenseModel(Model):
         as vLLM does; fp32 wherever the pool's decode kernels cannot take it.
 
         ``gdn_state.state_dtype: bfloat16`` in the yaml overrides this. bf16
-        halves the state traffic -- the state is read and written every step --
-        but only FlashInfer's fused bf16 decode kernel takes it, and that is
-        K=V=128 only.
+        halves state traffic, but only FlashInfer's fused bf16 decode kernel
+        takes it, and that is K=V=128 only.
         """
         dtype = getattr(torch, self.config.mamba_ssm_dtype, None)
         head_dims_ok = (
@@ -247,11 +236,7 @@ class Qwen3_5DenseModel(Model):
         ]
 
     def _vision_resources(self) -> list[NodeResourceSpec]:
-        """The ViT tower's attention. Nothing else: the tower caches nothing
-        and carries nothing between steps.
-
-        Absent on a text-only checkpoint, where the node is never built.
-        """
+        """The ViT tower's attention, its only resource; none when text-only."""
         if self.vision_config is None:
             return []
         vision = self.vision_config
@@ -262,9 +247,8 @@ class Qwen3_5DenseModel(Model):
                     num_qo_heads=vision.num_heads,
                     num_kv_heads=vision.num_heads,
                     head_dim=vision.head_dim,
-                    # a frame, not a request: a prompt's images each add one,
-                    # and a multi-frame entry adds one per frame
-                    max_segments_per_request=MAX_VISION_SEGMENTS,
+                    # one segment per captured replay: the block loop takes one
+                    # image at a time, so the default of one per request fits
                 ),
             ),
         ]
@@ -308,16 +292,13 @@ class Qwen3_5DenseModel(Model):
             outputs=[],
         )
 
-        # One walk for a whole multimodal prompt: the encoder turns every
-        # image into LLM-width embeddings, then the LLM node prefills the text
-        # spans and those embeddings as one row, spliced in prompt order off
-        # `prefill_order`. The KV stream is append-only, so one ordered
-        # concatenation reproduces the interleaving that a walk per span did.
+        # One walk for a whole multimodal prompt: the encoder embeds every
+        # image, then the LLM prefills text spans and embeddings as one row,
+        # spliced in prompt order off `prefill_order`.
         prefill_vision = Sequential([
             GraphNode(
                 name="vision_encoder",
-                # image_grid_thw carries each image's (t, h, w) patch grid,
-                # which sets both the token count and the 3D position ids.
+                # each image's (t, h, w) patch grid: token count and 3D ids
                 input_names=["pixel_values", "image_grid_thw"],
                 outputs=[
                     GraphEdge(next_node="LLM", name="vision_embeds"),
@@ -346,9 +327,8 @@ class Qwen3_5DenseModel(Model):
     # ------------------------------------------------------------------
     # Model ABC: I/O
     # ------------------------------------------------------------------
-    # The chat template writes each image as this triple, one pad rather than
-    # one per token: the interior is dropped anyway, and `prefill_vision`
-    # re-emits the two sentinels around the encoder output.
+    # The chat template writes each image as this triple with one pad; the
+    # interior is dropped and `prefill_vision` re-emits the sentinels.
     _PLACEHOLDER_TOKENS: dict[str, tuple[str, str, str]] = {
         "image": ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>"),
     }
@@ -356,10 +336,8 @@ class Qwen3_5DenseModel(Model):
     def _placeholder_specs(self) -> dict[str, tuple[int, int, int]]:
         """``(start, pad, end)`` sentinel ids, read off the tokenizer.
 
-        The tokenizer rendered the prompt, so it decides these ids. Qwen3.5's
-        `config.json` happens to agree, but Qwen3-Omni's does not, and the
-        failure is silent: scanning with the config's ids finds no spans and
-        the whole prompt comes back as one text segment.
+        Not off `config.json`: Qwen3-Omni's disagrees with its tokenizer, and
+        wrong ids silently find no spans.
         """
         specs: dict[str, tuple[int, int, int]] = {}
         for modality, tokens in self._PLACEHOLDER_TOKENS.items():
@@ -392,19 +370,13 @@ class Qwen3_5DenseModel(Model):
         """Render the request once, tokenize once, split at the attachments.
 
         ``text_inputs`` comes back as one span per text step of the prefill
-        plan, not as a single prompt: the image belongs *inside* the user turn,
-        and the KV stream is append-only, so the walks replay the layout by
-        prefilling the spans and the images in the order they were written.
-        `_prefill_schedule` walks the same plan, so the nth span is the nth
-        text step by construction.
+        plan, since images sit inside the user turn. `_prefill_schedule` walks
+        the same plan, so the nth span is the nth text step.
         """
         if prompt is None:
-            # An image-only chat message arrives with no text at all. That is a
-            # legitimate prompt (the template still frames the image inside a
-            # user turn), so render it with an empty text span. A request with
-            # neither text nor attachments has nothing to prefill, and saying so
-            # here reaches the client as a 400 rather than a swallowed error in
-            # the conductor and a request that never answers.
+            # An image-only message renders with an empty text span. With no
+            # attachments either, fail here, where it reaches the client as a
+            # 400, not in the conductor, where the request would hang.
             if not any(m != TEXT for m in input_modalities):
                 raise ValueError(
                     "Qwen3.5 got a request with no text and no attachments; "
@@ -419,25 +391,19 @@ class Qwen3_5DenseModel(Model):
         )
         unsupported = {p.modality for p in parts} - {TEXT, "image"}
         if unsupported:
-            # Video needs per-frame timestamp tokens and a `video_second_per_grid`
-            # position scale that images do not; the tower would run, the
-            # positions would be wrong. A ValueError so the server answers 400.
+            # Video needs timestamp tokens and a `video_second_per_grid` position
+            # scale; without them positions would be silently wrong. 400s.
             raise ValueError(
                 f"Qwen3.5 here has no {', '.join(sorted(unsupported))} path; "
                 "text and image attachments only"
             )
         raw_images = (tensors or {}).get("image_inputs", [])
-        # always: a request naming an image it did not send would otherwise
-        # have the image quietly dropped from the schedule
+        # always, or a named but unsent image is quietly dropped
         check_attachments(parts, {"image": len(raw_images)})
 
-        # The released Qwen3.5 checkpoints are chat/reasoning models — the base
-        # ones carry a `-Base` suffix — so the raw completion form is wrong
-        # here: it skips the `<|im_start|>` framing the model was trained on.
-        #
-        # The template also opens a `<think>` block by default. `enable_thinking
-        # =False` does not remove it; it emits an empty, pre-closed one, which
-        # is how Qwen turns reasoning off.
+        # The released checkpoints are chat models (base ones say `-Base`), so
+        # always use the chat template. `enable_thinking=False` emits an empty,
+        # pre-closed `<think>` block, which is how Qwen turns reasoning off.
         content = [
             {"type": TEXT, "text": part.text or ""} if part.modality == TEXT
             else {"type": part.modality, part.modality: ""}
@@ -485,10 +451,8 @@ class Qwen3_5DenseModel(Model):
     # Model ABC: forward pass args
     # ------------------------------------------------------------------
 
-    # Which node reads which of a walk's signals. A name can appear twice:
-    # both halves of `prefill_vision` need the grid — the encoder to lay out
-    # its patches, the LLM to place the 3D positions — and it reaches a node
-    # only if an edge names it. The conductor dedupes the unpersist.
+    # Which node reads which of a walk's signals. Both `prefill_vision` nodes
+    # need the grid, so it appears twice; the conductor dedupes the unpersist.
     _WALK_INPUTS: dict[str, list[WalkInput]] = {
         "prefill_text": [WalkInput("LLM", ("text_inputs",))],
         "prefill_vision": [
@@ -504,12 +468,9 @@ class Qwen3_5DenseModel(Model):
     ) -> list[PrefillStep]:
         """The prefill walks a request runs.
 
-        One walk per prompt: `prefill_vision` carries the whole interleaving
-        when the request has images, `prefill_text` when it does not. The
-        layout travels as `order` rather than as a walk per span, so an image
-        prompt costs one step instead of one per span plus one per image.
-        `process_prompt` split `text_inputs` against the same plan, so the nth
-        span is the nth text tensor.
+        With images, one `prefill_vision` walk carries the whole interleaving
+        as `order`; without, one `prefill_text` walk per span. `process_prompt`
+        split `text_inputs` against the same plan.
         """
         pools = {
             TEXT: signals.get("text_inputs", []),
@@ -523,16 +484,14 @@ class Qwen3_5DenseModel(Model):
         }
         for step in prefill_plan(parts_from_modalities(input_modalities)):
             pool = pools.get(step.modality, [])
-            # An image needs its grid too, and the two are built together in
-            # `process_prompt` — so a short `grids` means the same breakage.
+            # an image needs its grid too
             short = step.index >= len(pool) or (
                 step.modality != TEXT and step.index >= len(grids)
             )
             if short:
-                # `check_plan` already failed a mismatch at intake, where a 400
-                # can still be returned. This runs in the conductor, whose loop
-                # only logs — raising here orphans the request and hangs the
-                # client instead. Same choice as Qwen3-Omni and BAGEL.
+                # `check_plan` already 400s a mismatch at intake. This runs in
+                # the conductor, where raising orphans the request and hangs the
+                # client. Same choice as Qwen3-Omni and BAGEL.
                 logger.warning(
                     "Qwen3.5 prefill plan wants a %s span at index %d but the "
                     "prompt produced %d; skipping it",
@@ -550,8 +509,7 @@ class Qwen3_5DenseModel(Model):
         if not order:
             return []
         if not picked["pixel_values"]:
-            # No encoder to run, so this is the plain text walk — and it stays
-            # one step per span, exactly as before.
+            # no encoder to run: the text walk, one step per span
             return [
                 PrefillStep("prefill_text", {"text_inputs": [t]}, (TEXT_PART,))
                 for t in picked["text_inputs"]
@@ -571,9 +529,7 @@ class Qwen3_5DenseModel(Model):
     ) -> ForwardPassArgs:
         schedule = self._prefill_schedule(input_modalities, input_signals)
         if not schedule:
-            # Every step was skipped for want of a tensor, so there is nothing
-            # to prefill and decode would run on an empty stream. Naming the
-            # cause beats the IndexError the next line would raise.
+            # every step was skipped for want of a tensor
             raise ValueError(
                 f"Qwen3.5 has nothing to prefill for modalities "
                 f"{input_modalities}: the request carries no "
@@ -633,9 +589,8 @@ class Qwen3_5DenseModel(Model):
 
         order: tuple[int, ...] = ()
         if metadata.is_prefill and remaining:
-            # Every prefill step carries its own tensors, so a text span in the
-            # middle of the prompt reads its own segment. Only decode reads
-            # back what the previous step emitted.
+            # each prefill step carries its own tensors; only decode reads
+            # back what the previous step emitted
             step = remaining.pop(0)
             metadata.graph_walk = step.walk
             inputs = self._walk_inputs(step)
@@ -749,8 +704,7 @@ class Qwen3_5DenseModel(Model):
         )
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
-        if (tp_group is not None and tp_group.world_size > 1
-                and model.model._fused_residual):
+        if tp_group is not None and tp_group.world_size > 1:
             # collective over the TP group; every rank builds the LLM here
             tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
@@ -758,9 +712,8 @@ class Qwen3_5DenseModel(Model):
 
     @staticmethod
     def _build(make, dtype: torch.dtype, device: str) -> torch.nn.Module:
-        """Construct under `dtype` so no fp32 copy of the weights is ever
-        allocated. Parameters that must stay fp32 restore themselves in
-        `_apply`; see `components/linear_attn.py`."""
+        """Construct under `dtype` so no fp32 copy of the weights is
+        allocated. fp32-only parameters restore themselves in `_apply`."""
         torch.set_default_dtype(dtype)
         try:
             return make().to(device)
@@ -768,8 +721,7 @@ class Qwen3_5DenseModel(Model):
             torch.set_default_dtype(torch.float32)
 
     def _resolve_weights(self) -> str:
-        """The full snapshot. Only workers call this; the API and conductor
-        processes stay on the metadata-only copy from ``__init__``."""
+        """The full snapshot; only workers call this."""
         local_path = Path(self.model_path_hf)
         if local_path.is_dir():
             return str(local_path)

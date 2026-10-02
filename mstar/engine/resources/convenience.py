@@ -61,15 +61,12 @@ class AttentionCallable:
 
 
 class LinearAttnCallable:
-    """A convenience wrapper around a recurrent state pool and the resource
-    running kernels against it, mirroring :class:`AttentionCallable`.
+    """A recurrent state pool plus the resource running kernels against it,
+    mirroring :class:`AttentionCallable`.
 
-    The layer body calls ``conv`` and then the instance itself; this reads the
-    pool's per-layer blocks and hands them over as plain tensors, so neither
-    the layer nor the manager holds the pool.
-
-    The layer cursor lives here as well as on the resource: the resource uses
-    it for its own bookkeeping, and this needs it to pick the block.
+    The layer calls ``conv`` then the instance; this hands the pool's per-layer
+    blocks over as plain tensors, so neither the layer nor the manager holds
+    the pool.
     """
 
     def __init__(self, pool: RecurrentStatePool, attn: LinearAttnManager | None = None):
@@ -92,11 +89,7 @@ class LinearAttnCallable:
 
     @torch.compiler.disable
     def set_layer_idx(self, layer_idx: int) -> None:
-        """The layer's index among the *recurrent* layers, not the stack's.
-
-        A hybrid model interleaves these with full-attention layers, and the
-        pool is sized by its own count; see the model's ``get_node_resources``.
-        """
+        """The layer's index among the *recurrent* layers, not the stack's."""
         self._layer_idx = layer_idx
         self.attn.set_default_layer_idx(layer_idx)
 

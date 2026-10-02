@@ -1,19 +1,11 @@
 """Copy-only host-to-device staging, for work that runs beside a live CUDA graph.
 
-Pre-planning builds step N+1's small index and parameter tensors on the plan
-stream while step N's graph replays on the default stream. Anything it puts on
-the GPU besides H2D or D2H copies, which also runs on the SMs, executes
-concurrently with the graph and slows down the in-graph gap between kernels.
-H2D copies (the copy engine) and event waits leave it alone.
-
-So values that come from host bookkeeping go host -> device in ONE copy, with
-any padding written on the host as part of the same buffer rather than by a
-``fill_`` on the device, and never through a device-side staging tensor.
-``PinnedStager`` owns the pinned memory that takes, reused across steps.
-
-Much of it does not change step to step -- a steady decode batch addresses the
-same requests every step -- so a destination can carry an ``H2DMirror`` of what
-was last copied into it, and a copy of the same values is skipped.
+Pre-planning builds step N+1's small tensors on the plan stream while step N's
+graph replays. Any SM work it issues (a kernel, a ``fill_``, a D2D copy) slows
+the graph; H2D copies and event waits do not. So host values go to the device
+in ONE copy from pinned memory (``PinnedStager``), padding written on the host,
+never via a device-side staging tensor. An ``H2DMirror`` skips re-copying
+values a destination already holds, as in a steady decode batch.
 """
 from __future__ import annotations
 
@@ -29,9 +21,8 @@ class H2DMirror:
 
     Lets ``PinnedStager.copy_`` skip a copy whose values the destination
     already holds. Only sound for a destination nothing but that stager writes,
-    and that lives as long as its mirror: the owner keeps the two together,
-    which is why this is an object rather than a cache keyed by address (the
-    caching allocator hands a freed address to the next tensor).
+    and that lives as long as its mirror -- hence an object the owner keeps
+    with it, not a cache keyed by address (the allocator reuses addresses).
     """
 
     __slots__ = ("_key", "_values")

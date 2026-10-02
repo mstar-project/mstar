@@ -40,21 +40,15 @@ class BatchedModelOutput:
     batch tensors a captured graph emitted under a ``__name__`` key, which a
     submodule's ``unpack_packed_outputs`` cuts per request.
 
-    ``check_stop_buffers`` is what the stop check reads. It defaults to the
-    per-rid outputs, which costs a device-to-host copy per tensor per request;
-    a submodule that can hand over one batch tensor instead — row i belonging
-    to request i, as everywhere else here — turns that into one copy.
+    ``check_stop_buffers`` is what the stop check reads (default: the per-rid
+    outputs, one device-to-host copy per tensor per request); a batch tensor
+    with row i for request i makes it one copy.
 
-    ``row_outputs`` is the same idea for the outputs themselves. The rows have
-    to be copied out of a captured graph's buffers before the next replay
-    overwrites them; slicing per request first makes that one clone per
-    request, which at a decode batch is one tiny launch per row per step.
-    Handing over the batch tensor lets the engine take a single clone and give
-    each request a view of it. Only ``Engine._collect_outputs`` reads this —
-    it materialises the per-rid views, so nothing downstream ever sees it.
+    ``row_outputs`` does the same for the outputs: the engine clones each batch
+    tensor once, not once per request, and hands out row views. Only
+    ``Engine._collect_outputs`` reads it.
 
-    Both dicts are always dicts: a ``None`` here would have every reader guard
-    before touching them, and the readers are on the step's critical path.
+    The two dicts are never None, so readers on the critical path need no guard.
     """
 
     per_rid_outputs: dict[str, NameToTensorList] = field(default_factory=dict)
@@ -63,13 +57,10 @@ class BatchedModelOutput:
     check_stop_buffers: dict[str, torch.Tensor | NameToTensorList] | None = None
     # name -> [bs, ...] tensor, row i belonging to request i
     row_outputs: dict[str, torch.Tensor] | None = None
-    # The request each row of ``check_stop_buffers`` belongs to, in the order
-    # the forward ran them. Stamped by the engine, which is the only place that
-    # order is known for sure: the worker rewrites its own copy of the batch's
-    # request list between the forward and the stop check (dropping requests
-    # whose loops already stopped, and not necessarily in place), so slicing
-    # the rows by position against that list hands one request another's
-    # token. None when there are no row-addressed stop buffers.
+    # The request each row of ``check_stop_buffers`` belongs to, in forward
+    # order. Stamped by the engine: the worker rewrites its request list before
+    # the stop check, and slicing rows against that list would hand one
+    # request another's token. None when there are no row-addressed buffers.
     row_request_ids: tuple[str, ...] | None = None
 
     @classmethod
@@ -96,18 +87,13 @@ class BatchedModelOutput:
         return self.packed_outputs.get(key, default)
 
     def pop(self, request_id: str, default=None):
-        """Drop one request's outputs, e.g. when it stopped or failed.
-
-        Only the per-rid side: a packed, row or check-stop batch tensor is
-        addressed by row, and the caller takes the request out of the batch
-        instead.
-        """
+        """Drop one request's per-rid outputs; row-addressed tensors are left
+        alone, and the caller takes the request out of the batch instead."""
         return self.per_rid_outputs.pop(request_id, default)
 
     def clone_check_stop_buffers(self):
-        """A detached copy, since a captured graph's buffers are overwritten by
-        the next replay and the stop check reads them after that has started.
-        """
+        """A detached copy: the next replay overwrites a captured graph's
+        buffers before the stop check reads them."""
         if self.check_stop_buffers is None:
             return None
 
@@ -120,27 +106,20 @@ class BatchedModelOutput:
                 ]
             if isinstance(value, dict):
                 return {k: _clone(v) for k, v in value.items()}
-            # anything else is not ours to copy — pass it through rather than
-            # dropping it, which would silently lose a stop signal
+            # pass anything else through: dropping it could lose a stop signal
             return value
 
         return {k: _clone(v) for k, v in self.check_stop_buffers.items()}
 
     def clone_row_outputs(self, num_rows: int) -> dict[str, torch.Tensor]:
-        """One clone per row-addressed batch tensor, narrowed to the real rows.
-
-        Same reason ``clone_check_stop_buffers`` copies: a captured graph's
-        static output buffer is overwritten by the next replay, and the rows
-        are read after that has started. Narrowing first means a padded
-        replay's dummy rows are never copied.
-        """
+        """One clone per row-addressed batch tensor, narrowed to the real rows
+        so padding rows are never copied (see ``clone_check_stop_buffers``)."""
         if not self.row_outputs:
             return {}
         cloned: dict[str, torch.Tensor] = {}
         for name, tensor in self.row_outputs.items():
             if not isinstance(tensor, torch.Tensor) or tensor.dim() == 0:
-                # not row-addressable; a submodule that puts one here means
-                # something else, so pass it through rather than dropping it
+                # not row-addressable: pass through rather than drop
                 cloned[name] = tensor
                 continue
             rows = min(num_rows, tensor.shape[0])
@@ -153,16 +132,13 @@ class BatchedModelOutput:
         return self.per_rid_outputs
 
     def update(self, other: BatchedModelOutput | dict[str, Any]):
-        # coerced, because a caller holding the old dict contract is still a
-        # valid producer — that is what `coerce` is for everywhere else here
+        # coerced: a plain dict is still a valid producer
         other = self.coerce(other)
         self.per_rid_outputs.update(other.per_rid_outputs)
         self.packed_outputs.update(other.packed_outputs)
-        # Row-addressed buffers describe one forward. Merging two of them
-        # would leave rows from different forwards under one name, so the
-        # merged output keeps them only when exactly one side had any; the
-        # stop check then falls back to the per-rid outputs, which are always
-        # there.
+        # Row-addressed buffers describe one forward, so keep them only when
+        # exactly one side had any; otherwise the stop check falls back to the
+        # per-rid outputs.
         if other.check_stop_buffers is not None:
             if self.check_stop_buffers is None:
                 self.check_stop_buffers = dict(other.check_stop_buffers)
@@ -630,9 +606,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         **kwargs, # coming from preprocess output
-    )  -> dict[str, NameToTensorList] | BatchedModelOutput: # request_id to tensors
-        """Batched form of ``forward``: maps a multi-request batch to
-        per-request outputs. Override when ``can_batch`` returns True."""
+    )  -> dict[str, NameToTensorList] | BatchedModelOutput:
+        """Batched form of ``forward``: a multi-request batch's outputs, per
+        request or as a ``BatchedModelOutput``. Override when ``can_batch``
+        returns True."""
         raise NotImplementedError(
             f"Batching not implemented for submodule {self.__class__.__name__}"
             " - override forward_batched to implement, or ensure can_batch returns False"
@@ -824,11 +801,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """``check_stop`` for the whole batch at once, off the host rows.
 
         Optional. Returns rid -> loops to stop (rids with none left out), and
-        must agree with ``check_stop`` for every rid; None means "use the
-        per-request path". It runs once per step instead of once per request,
-        which is the point for an AR submodule whose stop test is one token.
-        A raise falls back to the per-request path, which then attributes the
-        failure to the request it belongs to.
+        must agree with ``check_stop`` for every rid. None, or a raise, falls
+        back to the per-request path.
         """
         return None
 

@@ -1,13 +1,9 @@
 """Qwen3.5's node submodules: the hybrid LLM and the vision encoder.
 
-The LLM node serves every walk. ``prefill_text`` and ``decode`` hand it token
-ids; ``prefill_vision`` hands it embeddings the encoder already produced, which
-is why it declares its step off ``input_seq_len`` rather than off the ids.
-
-Positions are the one thing that does not ride a resource cursor. The rotation
-is Qwen3.5's own interleaved 3D MRoPE (see ``components/rope.py``), so the
-position resource is used purely as a per-request counter and the 3D ids are
-built here and threaded in as cos/sin.
+``prefill_vision`` hands the LLM encoder embeddings rather than ids, so steps
+are declared off ``input_seq_len``. The rotation is Qwen3.5's interleaved 3D
+MRoPE (``components/rope.py``): the position resource is only a per-request
+counter, and the 3D ids are built here and passed in as cos/sin.
 """
 
 import logging
@@ -85,17 +81,14 @@ class LLMSubmodule(ARNodeSubmodule):
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 
-    # A merged walk holds a whole prompt, so these count text as well as image
-    # tokens. They stop at 4096 rather than the processor's 16384 ceiling
-    # because the interned static buffers are sized by the largest bucket in
-    # the config; a longer prompt falls back to the eager path.
+    # Text plus image tokens of a whole prompt. Capped at 4096, not the
+    # processor's 16384, because static buffers are sized by the largest
+    # bucket; a longer prompt runs eagerly.
     PREFILL_VISION_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
     # Requests per `prefill_vision` step, so a packed step stays inside the
-    # 4096-token top bucket: Food101-sized images (<=512 px) are ~300 tokens a
-    # request, so 14 already overflow it; 4 fit up to ~1000 tokens a request
-    # (about a 1000 px square image with its text). Past the top bucket the
-    # step drops to the eager path, where every new packed length recompiles.
-    # Chunked prefill replaces this cap.
+    # 4096-token top bucket: 4 fit ~1000 tokens a request (a ~1000 px square
+    # image plus text). Past the top bucket the step runs eagerly and every
+    # new packed length recompiles. Chunked prefill replaces this cap.
     PREFILL_VISION_MAX_BATCH_SIZE = 4
     PREFILL_VISION_CAPTURE_BATCH_SIZES = [1, 2, 4]
 
@@ -118,12 +111,7 @@ class LLMSubmodule(ARNodeSubmodule):
     def get_cuda_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[CudaGraphConfig]:
-        """Decode, text prefill and vision prefill all capture.
-
-        Nothing here is model-specific beyond the bucket sizes: the recurrent
-        pool and the GDN resource size their plan buffers per (bucket, slot),
-        so a captured walk replays without re-planning.
-        """
+        """Decode, text prefill and vision prefill all capture."""
         def dummy(n: int) -> ARNodeInputs:
             return ARNodeInputs(
                 input_ids=torch.zeros(n, dtype=torch.long, device=device),
@@ -131,7 +119,6 @@ class LLMSubmodule(ARNodeSubmodule):
             )
 
         def vision_dummy(n: int) -> ARNodeInputs:
-            # Embeds, not ids, from the encoder's output
             return ARNodeInputs(
                 input_seq_len=n,
                 input_embeds=torch.zeros(
@@ -141,8 +128,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 custom_pos_ids=torch.zeros(
                     (3, n), dtype=torch.float, device=device,
                 ),
-                # `declare_step` reads these; capture only needs admit and
-                # plan to succeed on them, and replay restages the real values.
+                # read by `declare_step`; replay restages the real values
                 tensor_inputs={
                     "mrope_advance": max(n - 2, 0),
                     "text_token_ids": torch.zeros(
@@ -176,10 +162,10 @@ class LLMSubmodule(ARNodeSubmodule):
     # ------------------------------------------------------------------
 
     def _sentinel_embeds(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """``<|vision_start|>`` / ``<|vision_end|>`` as embeddings, cached.
+        """``<|vision_start|>`` / ``<|vision_end|>`` embeddings, cached.
 
-        The media span is sentinel-inclusive, so `split_around_spans` dropped
-        these two along with the pad interior. This walk owns them.
+        `split_around_spans` drops them with the pad interior, so this walk
+        re-adds them.
         """
         if self._vision_sentinels is None:
             ids = torch.tensor(
@@ -196,17 +182,12 @@ class LLMSubmodule(ARNodeSubmodule):
         """A whole multimodal prompt as one row, spliced in prompt order.
 
         `prefill_order` tags each part text (0) or image (1); the nth tag of a
-        kind takes the nth tensor of that kind. Text spans embed as usual;
-        each image contributes its sentinels and the encoder's slice of the
-        packed embeds.
+        kind takes the nth tensor of that kind.
 
-        Positions are why the two kinds cannot simply concatenate. The three
-        MRoPE grids stop moving together across an image: T is flat while H
-        and W sweep the merged patch grid, so an image spans ``max(h', w')``
-        positions but ``t * h' * w'`` tokens. The cursor advances by the real
-        amount here, and `declare_step` hands the total to the position
-        resource — left to its own rule it would advance by the token count
-        and put everything after the first image in the wrong place.
+        An image spans ``max(h', w')`` MRoPE positions but ``t * h' * w'``
+        tokens, so the cursor advances by the real amount and `declare_step`
+        hands the total to the position resource; its default (the token
+        count) would misplace everything after the first image.
         """
         if self.vision_config is None:
             raise ValueError(
@@ -285,31 +266,15 @@ class LLMSubmodule(ARNodeSubmodule):
             return self._vision_inputs(fwd_info, inputs)
 
         input_ids = inputs["text_inputs"][0]
-        seq_len = input_ids.shape[0]
-        # The counter the position resource keeps for this stream, advanced by
-        # the PositionStep below. The rotation is ours, but the bookkeeping is
-        # not worth duplicating.
-        start_pos = self.node_resources[ROPE].position(
-            rid=fwd_info.request_id, label="main",
-        )
-        return ARNodeInputs(
-            input_seq_len=seq_len,
-            input_ids=input_ids,
-        )
+        return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """``[3, total_tokens]`` for the step, in packed request order.
 
-        The position resource already built this step's 1D positions on the
-        device as part of its own plan — the same counters, the same KV plan
-        order — and `plan` runs before `preprocess`. A pure-text step is that
-        vector broadcast across the three MRoPE grids, which advance together
-        over text: a view, so no host work and no copy of its own.
-
-        An image's grids do NOT advance together (T is flat while H and W
-        sweep the patch grid), so a request carrying `custom_pos_ids` supplies
-        its own and the step concatenates instead, taking the resource's slice
-        for any text span beside it.
+        A pure-text step is the position resource's planned 1D positions
+        broadcast across the three grids (a view, no copy). An image's grids
+        do not advance together, so a request with `custom_pos_ids` supplies
+        its own and the step concatenates, using the resource's slice for text.
         """
         total_tokens = sum(inp.input_seq_len for inp in inputs)
         pos_ids = self.node_resources[ROPE].pos_ids("main")
@@ -370,16 +335,14 @@ class LLMSubmodule(ARNodeSubmodule):
                 for rid, inp in zip(request_ids, inputs, strict=True)
             }
         elif graph_walk == "prefill_vision":
-            # The merged walk carries the prompt's text too, so its ids still
-            # have to reach the repetition penalty.
+            # the prompt's text ids still feed the repetition penalty
             prefill_tokens = {
                 rid: inp.tensor_inputs["text_token_ids"]
                 for rid, inp in zip(request_ids, inputs, strict=True)
             }
 
-        # `advance=None` means the resource's own rule, which is the span. That
-        # is right for a pure-text walk and wrong for one holding an image,
-        # whose 3D grid covers fewer positions than it does tokens.
+        # `advance=None` advances by the span, which is wrong for an image:
+        # its 3D grid covers fewer positions than tokens.
         advance = None
         if graph_walk == "prefill_vision":
             advance = tuple(
@@ -478,13 +441,8 @@ class LLMSubmodule(ARNodeSubmodule):
             graph_walk, engine_inputs, cos_3d, sin_3d,
             input_ids=input_ids, input_embeds=input_embeds,
         )
-        # Row i is request i on both sides, so the whole step is described by
-        # the one tensor the forward already produced:
-        #
-        # * ``row_outputs`` — the engine takes ONE clone out of the graph's
-        #   buffer and gives each request a view, instead of a clone per row.
-        # * ``check_stop_buffers`` — one device-to-host copy a step instead of
-        #   one per request.
+        # Row i is request i: one clone and one D2H copy per step instead of
+        # one per request.
         return BatchedModelOutput(
             row_outputs={"new_token": new_tokens},
             check_stop_buffers={"new_token": new_tokens},
@@ -505,9 +463,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 not request_info.step_metadata.get("last_prefill", False):
             outputs.pop("new_token", None)
             return
-        # Metadata only: the decode loop routes on `text_inputs`, so rebind the
-        # name rather than copying. The EOS test is in `check_stop` so the GPU
-        # thread never syncs on `.item()` here.
+        # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is
+        # tested in `check_stop` so the GPU thread never syncs on `.item()`.
         if "new_token" not in outputs:
             return
         outputs["text_inputs"] = outputs["new_token"]
@@ -535,9 +492,7 @@ class LLMSubmodule(ARNodeSubmodule):
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
     ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request, off one ``tolist`` of the token
-        row rather than an ``.item()`` (and a stop-id set rebuilt) per request.
-        """
+        """``check_stop`` for every request off one ``tolist``."""
         tokens = host_rows.buffers.get("new_token")
         if not torch.is_tensor(tokens) or tokens.dim() == 0:
             return None
@@ -570,22 +525,17 @@ VISION_BLOCK_LOOP = "vision_block_loop"
 class VisionEncoderSubmodule(NodeSubmodule):
     """Qwen3.5's ViT, which turns pixel patches into LLM-width embeddings.
 
-    A prompt's images go through packed, in one call. The grid maths runs in
-    `prepare_inputs` rather than the compiled forward, and which patches attend
-    together is declared as this step's segments rather than split for inside
-    it — both so that the tower's only symbolic shape is its token count.
+    A prompt's images go through packed, in one call. Grid maths runs in
+    `prepare_inputs` and attention boundaries are declared as step segments,
+    so the compiled tower's only symbolic shape is its token count.
 
-    Several requests can go through together: `preprocess` concatenates their
-    patch runs and `forward_batched` cuts the embeddings back apart. But the
-    block loop is captured as a CUDA graph (see `get_piecewise_cuda_graph_configs`)
-    one image at a time, which beats batching: eager, the tower is launch-bound
-    -- ~500 kernels for ~4 ms of GPU work in a ~20 ms forward on 9B -- so the
-    encoder takes one request a step.
+    The block loop is captured one image per replay, which beats batching:
+    eager, the tower is launch-bound (~500 kernels, ~4 ms of GPU work in a
+    ~20 ms forward on 9B). So the encoder takes one request a step.
     """
 
-    # Patch-count buckets of the captured block loop, one image per replay.
-    # Merged tokens are a quarter of these: 16384 patches is the LLM's 4096
-    # `prefill_vision` bucket. A larger image runs the loop eagerly.
+    # Patch-count buckets, one image per replay. 16384 patches merge to the
+    # LLM's 4096 `prefill_vision` bucket; a larger image runs eagerly.
     BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
 
     def __init__(
@@ -602,8 +552,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> NodeInputs:
-        # (num_images, 3). One image arrives as a bare [t, h, w], which the
-        # per-image loops in `vision.py` would read as three images.
+        # (num_images, 3): a bare [t, h, w] would read as three images
         device = self.get_device()
         merge = self.config.spatial_merge_size
         grid = [
@@ -611,10 +560,8 @@ class VisionEncoderSubmodule(NodeSubmodule):
             for g in inputs["image_grid_thw"]
             for t, h, w in g.reshape(-1, 3).tolist()
         ]
-        # Everything the grid decides is built here, not in the forward: the
-        # tower is compiled, and a `.tolist()` inside it breaks the graph and
-        # turns h and w into symints that inductor cannot codegen a packed run
-        # from. See `Qwen3_5VisionModel.forward`.
+        # Built here, not in the compiled forward: a `.tolist()` there breaks
+        # the graph and makes h, w symints inductor cannot codegen from.
         indices, weights = vision_interpolation(
             grid, self.config.num_grid_per_side, merge, device,
         )
@@ -627,12 +574,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
                 "indices": indices,
                 "weights": weights,
                 "position_ids": vision_grid_position_ids(grid, merge, device),
-                # neither of these is a forward arg. `declare_step` turns the
-                # segment lengths into the step's segments for the ragged
-                # resource to plan, and `forward_batched` cuts the output at
-                # the patch count.
+                # not forward args: `declare_step` makes segments of the
+                # lengths, `forward_batched` cuts the output at the count
                 "seq_lengths": vision_seq_lengths(grid),
-                "num_patches": num_patches,
             },
         )
 
@@ -644,13 +588,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep | None:
-        # The captured block loop declares and plans its own attention per
-        # replay; leased, there is nothing left for this step to do.
+        # leased, the captured block loop plans its own attention per replay
         if (piecewise_leases or {}).get(VISION_BLOCK_LOOP):
             return None
-        # One segment per frame: a frame attends to itself alone, so a request
-        # carrying several images contributes several. This is the whole
-        # layout — there is no cache to read it off next step.
+        # one segment per frame: a frame attends to itself alone
         segments = [
             Segment(request_id=rid, label="main", span=span)
             for rid, inp in zip(request_ids, inputs, strict=True)
@@ -676,11 +617,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
     ) -> dict[str, PiecewiseCudaGraphConfig]:
         """The block loop, one image per replay, by patch-count bucket.
 
-        Patch embed, the position resample and rope stay eager before it, and
-        the merger after: the merger quarters the row count, which a region's
-        real-length output view cannot express. Batch size 1 only -- one
-        image's patches attend to each other alone, so a replay is one
-        segment, and the eager path covers anything else.
+        Patch embed, position resample and rope run eagerly before it, the
+        merger after (it quarters the row count, which a region's output view
+        cannot express). Batch size 1: one replay is one image's segment.
         """
         hidden, head_dim = self.config.hidden_size, self.config.head_dim
 
@@ -726,12 +665,10 @@ class VisionEncoderSubmodule(NodeSubmodule):
         sin: torch.Tensor,
         seq_lengths: tuple[int, ...],
     ) -> torch.Tensor | None:
-        """The block loop through its captured graph, one replay per image, or
-        None when the step was not leased one and runs it eagerly.
+        """The block loop replayed once per image, or None if not leased.
 
-        Decided the way the engine leased: on the batch size and the total
-        patch count. Leased, each image fits a bucket too, since it is at most
-        the total.
+        Decided as the engine leased, on batch size and total patch count;
+        each image then fits a bucket, being at most the total.
         """
         runner = engine_inputs.piecewise_runners.get(VISION_BLOCK_LOOP)
         if runner is None or not runner.can_run(
@@ -760,27 +697,17 @@ class VisionEncoderSubmodule(NodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[NodeInputs],
     ) -> dict[str, Any]:
-        """One packed run for the whole batch.
-
-        Every per-token input concatenates the same way, in the order
-        `declare_step` laid the segments out, so the plan and the tensors agree
-        without either knowing about the other.
-        """
+        """The batch's one request (see `max_batch_size`), its images packed
+        in `declare_step`'s segment order."""
+        (inp,) = inputs
         device = self.get_device()
-        cat = lambda name: torch.cat(  # noqa: E731
-            [inp.tensor_inputs[name].to(device) for inp in inputs], dim=0,
-        )
+        tensors = inp.tensor_inputs
         return {
-            "pixel_values": cat("pixel_values"),
-            "indices": cat("indices"),
-            "weights": cat("weights"),
-            "position_ids": cat("position_ids"),
-            "num_patches": tuple(
-                inp.tensor_inputs["num_patches"] for inp in inputs
-            ),
-            "seq_lengths": tuple(
-                n for inp in inputs for n in inp.tensor_inputs["seq_lengths"]
-            ),
+            "pixel_values": tensors["pixel_values"].to(device),
+            "indices": tensors["indices"].to(device),
+            "weights": tensors["weights"].to(device),
+            "position_ids": tensors["position_ids"].to(device),
+            "seq_lengths": tuple(tensors["seq_lengths"]),
         }
 
     def forward(
@@ -800,27 +727,14 @@ class VisionEncoderSubmodule(NodeSubmodule):
         indices: torch.Tensor,
         weights: torch.Tensor,
         position_ids: torch.Tensor,
-        num_patches: tuple[int, ...],
         seq_lengths: tuple[int, ...] = (),
         **kwargs,
     ) -> dict[str, NameToTensorList]:
-        # One call for every image of every request in the batch.
-        # `declare_step` planned a segment per frame, so the ragged kernel is
-        # what keeps them from seeing each other; the tower never learns where
-        # any of the boundaries are.
+        # One call for every image; the ragged kernel's per-frame segments
+        # keep them apart.
         hidden, cos, sin = self.model.embed(pixel_values, indices, weights, position_ids)
         encoded = self._replay_block_loop(engine_inputs, hidden, cos, sin, seq_lengths)
         if encoded is None:
             encoded = self.model.encode(hidden, cos, sin)
         embeds = self.model.merger(encoded)
-        if len(num_patches) == 1:
-            return {engine_inputs.request_ids[0]: {"vision_embeds": [embeds]}}
-        # the merger already folded each `merge_unit` block of patches into one
-        # token, so a request's share of the output is its share scaled down
-        merge_unit = self.config.merge_unit
-        out, start = {}, 0
-        for rid, patches in zip(engine_inputs.request_ids, num_patches, strict=True):
-            end = start + patches // merge_unit
-            out[rid] = {"vision_embeds": [embeds[start:end]]}
-            start = end
-        return out
+        return {engine_inputs.request_ids[0]: {"vision_embeds": [embeds]}}

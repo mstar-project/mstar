@@ -1,16 +1,10 @@
 """Fused tensor-parallel all-reduce + residual add + RMSNorm.
 
-A row-parallel projection's output is a per-rank partial sum. The layer then
-adds it to the residual stream and normalises the result for the next block.
-Done separately that is an NCCL all-reduce, an add and a norm kernel per
-projection -- three launches and three trips through HBM for a tensor that
-is only ``[tokens, hidden]``. FlashInfer's ``allreduce_fusion`` does all of
-it in one kernel over a peer-mapped workspace, which at decode shapes is
-~4-6us against ~11us for the unfused sequence.
-
-The kernel runs behind a ``torch.library`` op so dynamo and the CUDA-graph
-capture see one opaque node; the workspace, which is a Python object, is
-reached through a small registry keyed by an int.
+Replaces the NCCL all-reduce, add and norm after a row-parallel projection
+with FlashInfer's one-kernel ``allreduce_fusion`` (~4-6us vs ~11us unfused at
+decode shapes). It runs behind a ``torch.library`` op so dynamo and CUDA-graph
+capture see one opaque node; the workspace is reached through an int-keyed
+registry.
 """
 from __future__ import annotations
 
@@ -28,10 +22,9 @@ def create_workspace(
     rank: int, world_size: int, cpu_group, max_tokens: int, hidden: int,
     dtype: torch.dtype,
 ) -> int | None:
-    """Collective over the TP group: every member must call it, in the same
-    order. Returns the id to pass to ``allreduce_add_rmsnorm``, or None if
-    FlashInfer cannot build a workspace on this topology (the caller then
-    keeps the unfused path)."""
+    """Collective over the TP group: every member calls it, in the same order.
+    Returns the id for ``allreduce_add_rmsnorm``, or None if FlashInfer cannot
+    build a workspace here (caller keeps the unfused path)."""
     try:
         import flashinfer.comm as fc
         from flashinfer.comm.comm_backend import TorchDistBackend

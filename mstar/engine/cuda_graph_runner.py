@@ -19,7 +19,6 @@ from mstar.engine.cuda_graph_config import (
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils import profiler
-from mstar.utils.streams import PLAN, get_stream
 
 logger = logging.getLogger(__name__)
 
@@ -634,10 +633,8 @@ class CudaGraphRunner:
                 config_idx=spec.config_idx,
             )
         finally:
-            # Capture ran the dummy rows as real requests, so hand their
-            # storage back now rather than carry it through the rest of the
-            # pass: a replay's padding rows address the sink (page and slot)
-            # and need none of it.
+            # Capture ran the dummy rows as real requests; free their storage
+            # now, since replay's padding rows address the sink page and slot.
             self._dummy_rows.reset(dummy_rids, free=True)
 
     def _forward_for(self, spec: CGSlotSpec):
@@ -965,12 +962,9 @@ class CudaGraphRunner:
     def release(self, lease: SlotLease, real_bs: int) -> None:
         """Return the padding rows to their at-rest state after a step.
 
-        Padding rows are flagged on the step context (`is_padding_row`) and
-        the resources give them nothing: the KV cache runs them against
-        SINK_PAGE, the recurrent pool against its sink slot. So there is
-        nothing to keep resident here, and nothing that could fail to be
-        re-acquired on the next padded step either — a step's padding must
-        never compete with real requests for storage.
+        Padding rows (`is_padding_row`) run against SINK_PAGE and the recurrent
+        pool's sink slot, so nothing stays resident: padding must never compete
+        with real requests for storage.
         """
         dummy_rids = self.slot_for(lease).dummy_rids
         self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs], free=True)
@@ -987,7 +981,7 @@ class CudaGraphRunner:
         if not torch.cuda.is_available():
             return None
         if self._plan_stream is None:
-            self._plan_stream = get_stream(PLAN, self._device)
+            self._plan_stream = torch.cuda.Stream(device=self._device)
         return self._plan_stream
 
 
