@@ -7,8 +7,8 @@ module selects the next token.
 Supports per-request sampling parameters (different temperature/top_k/top_p
 for each request in a batch) via tensor parameters.
 
-CUDA graph compatible: no Python control flow branches — uses masking
-to handle greedy vs sampled requests in the same batch.
+With explicit seed and offset tensors, XPU sampling keeps parameters and RNG
+state on device and uses masking for mixed greedy and sampled requests.
 
 Usage:
     from mstar.engine.resources.sampler.utils import sample_tokens
@@ -520,11 +520,16 @@ def _sample_xpu(
     seen_token_mask: torch.Tensor | None,
     run_greedy: bool,
     any_top_k_zero: bool | None,
+    all_top_k_zero: bool | None,
     seed: torch.Tensor | None,
     rand_offset: torch.Tensor | None,
     min_p: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Sample normalized XPU inputs with vllm-xpu-kernels."""
+    """Sample a whole batch with vllm-xpu-kernels >= 0.1.15.
+
+    The kernel reads one device-side [seed, offset] pair per row. Explicit
+    RNG tensors never round-trip through the CPU, including under XPUGraph.
+    """
     import vllm_xpu_kernels._xpu_C  # noqa: F401
 
     batch_size = logits.shape[0]
@@ -548,75 +553,45 @@ def _sample_xpu(
         threshold = probs.amax(dim=-1, keepdim=True) * min_p[:, None]
         scores = scores.masked_fill(probs < threshold, float("-inf")).contiguous()
 
-    # The XPU kernel accepts one CPU [seed, offset] pair per invocation.
-    # Invoke it per row to preserve independent request RNG streams.
-    #
-    # TODO: batch this when the kernel accepts per-row RNG state. The
-    # current loop and scalar .item() checks synchronize once per row and
-    # are intended for the XPU deployment's current batch-size-one path.
-    #
-    # TODO: These device-to-host copies synchronize the asynchronous worker
-    # loop even if batched. The long-term fix is for the Sampler resource to
-    # pass the CPU seed/offset copies already maintained by SamplerBuffers.
-    #
     # Raw callers may omit seed and/or offset. Match CUDA's behavior by filling
     # missing values from the default XPU generator. When offset is omitted,
     # reserve one Philox region per logit and advance the generator state.
-    sampled_rows = []
-    seeds_cpu = seed.detach().cpu() if seed is not None else None
-    offsets_cpu = (
-        rand_offset.detach().cpu() if rand_offset is not None else None
-    )
-    if seeds_cpu is None or offsets_cpu is None:
+    # This fallback runs eagerly; graph callers supply explicit RNG tensors.
+    if seed is None or rand_offset is None:
         device_index = logits.device.index
         if device_index is None:
             device_index = torch.xpu.current_device()
         generator = torch.xpu.default_generators[device_index]
         default_seed, default_offset = _xpu_generator_seed_offset(
             generator,
-            logits.numel() if offsets_cpu is None else 0,
+            logits.numel() if rand_offset is None else 0,
         )
-        if seeds_cpu is None:
-            seeds_cpu = torch.full(
-                (batch_size,), default_seed, dtype=torch.int64,
+        if seed is None:
+            seed = torch.full(
+                (batch_size,), default_seed, dtype=torch.int64, device=logits.device,
             )
-        if offsets_cpu is None:
-            offsets_cpu = (
-                torch.arange(batch_size, dtype=torch.int64)
+        if rand_offset is None:
+            rand_offset = (
+                torch.arange(batch_size, dtype=torch.int64, device=logits.device)
                 * logits.shape[1]
                 + default_offset
             )
 
-    assert seeds_cpu is not None and offsets_cpu is not None
-    for row in range(batch_size):
-        sampled = torch.empty(
-            1, dtype=torch.int64, device=logits.device,
-        )
-        seed_offset = torch.tensor(
-            [int(seeds_cpu[row]), int(offsets_cpu[row])],
-            dtype=torch.int64,
-        )
-
-        row_k = top_k[row:row + 1].to(torch.int64)
-        if any_top_k_zero is not False and int(row_k.item()) == 0:
-            row_k = None
-        row_p = top_p[row:row + 1]
-        if float(row_p.item()) >= 1.0:
-            row_p = None
-
-        torch.ops._xpu_C.topk_topp_sampler(
-            sampled,
-            None,
-            scores[row:row + 1],
-            row_k,
-            row_p,
-            "raw_logits",
-            seed_offset,
-            1.0,
-        )
-        sampled_rows.append(sampled[0])
-
-    sampled = torch.stack(sampled_rows)
+    seed_offsets = torch.stack(
+        (seed.to(device=logits.device, dtype=torch.int64),
+         rand_offset.to(device=logits.device, dtype=torch.int64)),
+        dim=1,
+    ).contiguous()
+    kernel_top_k = None
+    if all_top_k_zero is not True:
+        kernel_top_k = top_k.to(torch.int64)
+        if any_top_k_zero is not False:
+            kernel_top_k = torch.where(kernel_top_k == 0, logits.shape[1], kernel_top_k)
+    sampled = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
+    torch.ops._xpu_C.topk_topp_sampler(
+        sampled, None, scores, kernel_top_k, top_p,
+        "raw_logits", seed_offsets, 1.0,
+    )
     if greedy_tokens is not None:
         sampled = torch.where(greedy, greedy_tokens, sampled)
     return sampled
@@ -650,6 +625,12 @@ def sample_tokens(
             branch entirely. None = unknown → run the full path.
         any_top_k_zero: CPU-side hint. When False, skips the `top_k == 0 → vocab`
             masked_fill. None = unknown → run the full path.
+        all_top_k_zero: CPU-side hint. When True, disables top-k filtering for
+            the entire batch without reading device parameters.
+        seed: Optional per-request int64 tensor [batch_size].
+        rand_offset: Optional per-request int64 tensor [batch_size]. On XPU,
+            omit seed/offset to use the default generator eagerly; provide both
+            on device to capture sampling in an XPUGraph.
         min_p: Scalar or per-request tensor [batch_size]; None/0 = disabled.
             Applied to the temperature-scaled, penalised distribution before
             top-k/top-p (the HF processor order).
@@ -695,6 +676,7 @@ def sample_tokens(
             seen_token_mask,
             run_greedy,
             any_top_k_zero,
+            all_top_k_zero,
             seed,
             rand_offset,
             min_p=min_p,
