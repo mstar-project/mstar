@@ -55,6 +55,9 @@ class InputTensors(NamedTuple):
     # Per rid, the edges that carried a stream's final chunk. The CONSUMING
     # pass reports the partition done, which is why this rides with the inputs.
     final_stream_edges: dict[int, set[str]]
+    # Rids with an edge whose tensor the store no longer has, under
+    # ``skip_missing``. Empty otherwise, because the lookup raises instead.
+    unresolved_rids: frozenset[int] = frozenset()
 
 
 @dataclass
@@ -172,6 +175,7 @@ class ColumnarEdgeSpecs:
 
     def to_input_tensors(
         self, get_tensor, rids: list[int] | None = None,
+        skip_missing: bool = False,
     ) -> InputTensors:
         """One walk for both things a batch build needs: each rid's inputs as
         ``{signal: [tensor]}``, and per rid the edges that carried a stream's
@@ -180,11 +184,20 @@ class ColumnarEdgeSpecs:
         ``rids`` seeds the result so a rid with no ready edges still gets an
         empty mapping -- what slicing a zero-length run used to give. Left
         None, only the rids that actually have edges appear.
+
+        ``skip_missing`` makes a uuid the store has forgotten take only its own
+        rid out, reported in ``unresolved_rids``, instead of raising out of the
+        whole walk. That a live rid reaches here holding a freed uuid is always
+        a bug, but this resolves the batch, so without the per-rid skip one such
+        rid fails every other request in the step with it. Off by default: the
+        speculative preps roll back and retry serially, so for them raising is
+        the better answer.
         """
         by_rid: dict[int, NameToTensorList] = (
             {} if rids is None else {rid: {} for rid in rids}
         )
         final_edges: dict[int, set[str]] = {}
+        unresolved: set[int] = set()
         names = self.signal_names
         uuids = self.uuids
         at = 0
@@ -194,11 +207,22 @@ class ColumnarEdgeSpecs:
             if slot is None:
                 slot = by_rid[rid] = {}
             name = names[self.signal_name_idxs[i]]
-            slot[name] = [get_tensor(uuids[j]) for j in range(at, end)]
+            try:
+                tensors = [get_tensor(uuids[j]) for j in range(at, end)]
+            except KeyError:
+                if not skip_missing:
+                    raise
+                # Leave the signal absent rather than half-filled: the caller
+                # drops the rid, and a partial input dict would otherwise
+                # surface as a missing-signal error further down.
+                unresolved.add(rid)
+                at = end
+                continue
+            slot[name] = tensors
             if self.is_final_streaming_chunk[i]:
                 final_edges.setdefault(rid, set()).add(name)
             at = end
-        return InputTensors(by_rid, final_edges)
+        return InputTensors(by_rid, final_edges, frozenset(unresolved))
 
     def edge_tuples(self) -> list[EdgeTuple]:
         """One ``EdgeTuple`` per edge.

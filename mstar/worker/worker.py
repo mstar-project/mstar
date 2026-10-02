@@ -1090,8 +1090,10 @@ class Worker:
     ) -> None:
         """
         Remember the chunk the graph accepted, for the batch that consumes it.
-        NOTE: it works to store a single ingested_chunk field because
-        streaming edges are always ingested with can_buffer=False.
+        NOTE: a single ingested_chunk field works because streaming edges are
+        ingested with can_buffer=False -- except when speculating a loop-back,
+        where the current value is already in-flight in the forward, so the
+        buffered chunk is the only one a later build can still be describing.
         """
         req_info = self.request_state.per_request_info.get(request_id)
         if req_info is None:
@@ -1251,11 +1253,22 @@ class Worker:
         # Seeded with the batch's rids rather than just the ones that have
         # edges: a rid with nothing ready still needs an entry, because
         # per_request_info is keyed off these and the engine indexes it by rid.
-        per_request_inputs, final_edges = (
+        # skip_missing: a backstop, not a fix. A live rid holding a freed uuid
+        # is a bug (``_unend_stream`` was one), but resolving the batch in one
+        # call means one such rid would otherwise fail every other request in
+        # the step -- 64 duplex sessions for one bad chunk. Take out just that
+        # rid and report it, so the failure is attributed and loud.
+        per_request_inputs, final_edges, unresolved = (
             batch.input_edges.to_input_tensors(
                 self.tensor_manager.get_tensor, batch.request_to_worker_graph,
+                skip_missing=True,
             )
         )
+        for rid in unresolved:
+            # Before the get_fwd_info loop below, so a rid that is going to be
+            # failed anyway is not asked for forward-pass state as well.
+            per_request_inputs.pop(rid, None)
+            final_edges.pop(rid, None)
         per_request_stream_chunks: dict[int, dict[str, StreamChunkInfo]] = {}
         for request_id, inputs in per_request_inputs.items():
             per_request_info[request_id] = self.request_state.get_fwd_info(
@@ -1264,15 +1277,31 @@ class Worker:
             if chunks := self._stream_chunks_for(request_id, batch.node_name, inputs):
                 per_request_stream_chunks[request_id] = chunks
 
-        return self._make_executing_batch(
+        node_batch = self._make_executing_batch(
             node_name=batch.node_name,
             graph_walk=batch.graph_walk,
-            request_ids=list(batch.request_to_worker_graph),
+            request_ids=[
+                rid for rid in batch.request_to_worker_graph
+                if rid not in unresolved
+            ],
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
             final_edges=final_edges,
             per_request_stream_chunks=per_request_stream_chunks,
         )
+        for rid in unresolved:
+            # Reported the way a per-rid stage reports: left in
+            # ``failed_requests`` for the run loop to drop and fail, so the
+            # client gets an error instead of a session that silently stops.
+            logger.error(
+                "Worker %s: request %s has an input tensor the store no longer "
+                "holds; failing it and running %s without it",
+                self.worker_id, rid, batch.node_name,
+            )
+            node_batch.register_failure(
+                rid, KeyError(f"input tensor missing for {batch.node_name}"),
+            )
+        return node_batch
 
     def _settle_final_streams(
         self, node_name: str, final_edges: dict[int, set[str]],
@@ -2683,6 +2712,15 @@ class Worker:
                 batch_N.node_batch.exec_timings,
             )
 
+        # Before the local-streaming dereference below: numel() needs the
+        # tensors, and a new_token whose only other destination is a local
+        # stream holds a single reference, which that dereference drops to zero
+        # -- collecting the tensor this count is about to read.
+        new_token_counts = self._count_new_tokens(
+            route_output.new_token_output_idxs,
+            flat_rids, flat_uuids, signals, signal_idxs,
+        )
+
         # Local streaming stays here: a StreamBuffer holds real tensors, so it
         # cannot move behind the runtime's contract.
         streamed: list[int] = []
@@ -2699,11 +2737,6 @@ class Worker:
         self.tensor_manager.dereference_batch_uniform(streamed)
 
         send_rids = list(rids)
-        # numel() needs the tensors, so the counting stays on this side.
-        new_token_counts = self._count_new_tokens(
-            route_output.new_token_output_idxs,
-            flat_rids, flat_uuids, signals, signal_idxs,
-        )
         # Timed apart from the send: these comprehensions are per rid, and
         # building them is the worker's cost, not the runtime's.
         _t_prep = _time.perf_counter() if self._phase_period else 0.0
