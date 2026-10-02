@@ -162,15 +162,24 @@ class _Manager:
 
 
 class _Engine:
-    def __init__(self, max_bs=None, not_ready=frozenset(), unservable=frozenset()):
+    def __init__(
+        self, max_bs=None, not_ready=frozenset(), unservable=frozenset(),
+        groups=None,
+    ):
         self._max_bs = max_bs
         self.not_ready = set(not_ready)
         # rids a resource rejects outright, as opposed to "not yet"
         self.unservable = set(unservable)
+        # rid -> capture group; a rid not named here has none
+        self.groups = dict(groups or {})
 
     def get_max_batch_size(self, node_name, graph_walk):
         del node_name, graph_walk
         return self._max_bs
+
+    def capture_group(self, node_name, graph_walk, rid, fwd_info):
+        del node_name, graph_walk, fwd_info
+        return self.groups.get(rid)
 
     def check_ready(self, node_name, rid, fwd_info):
         del node_name, fwd_info
@@ -527,6 +536,110 @@ def test_the_peek_ignores_a_backlog_of_failed_rids():
     assert _has_ready(sched, _Manager([]), (NODE, WALK)) is False
 
 
+# ── capture groups ──────────────────────────────────────────────────────
+
+# chatterbox T3: guided (cfg_weight > 0) and unguided requests replay
+# different decode captures, so a batch of both runs eager
+_MIXED = {"g0": True, "u0": False, "g1": True, "u1": False}
+
+
+def test_a_mixed_ready_set_schedules_one_capture_group():
+    """The regression: a mixed batch ran T3 eager one request at a time."""
+    sched = _scheduler(_Engine(max_bs=16, groups=_MIXED))
+
+    batch = _next_batch(sched, _Manager(list(_MIXED)))
+
+    assert list(batch.request_to_worker_graph) == ["g0", "g1"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["u0", "u1"]
+
+
+def test_the_other_group_runs_next_from_the_backlog():
+    sched = _scheduler(_Engine(max_bs=16, groups=_MIXED))
+    _next_batch(sched, _Manager(list(_MIXED)))
+
+    batch = _next_batch(sched, _Manager([]))
+
+    assert list(batch.request_to_worker_graph) == ["u0", "u1"]
+    assert sched.backlog == {}
+
+
+def test_a_mixed_backlog_is_split_too():
+    sched = _scheduler(_Engine(max_bs=16, groups=_MIXED))
+    sched.backlog[(NODE, WALK)] = _batch(["u0", "g0", "u1", "g1"])
+
+    batch = _next_batch(sched, _Manager([]))
+
+    assert list(batch.request_to_worker_graph) == ["u0", "u1"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["g0", "g1"]
+
+
+def test_an_unready_head_does_not_set_the_group():
+    """The group comes from the first rid that can run, not one that waits."""
+    sched = _scheduler(_Engine(max_bs=16, groups=_MIXED, not_ready={"u0"}))
+    sched.backlog[(NODE, WALK)] = _batch(["u0", "g0", "u1", "g1"])
+
+    batch = _next_batch(sched, _Manager([]))
+
+    assert list(batch.request_to_worker_graph) == ["g0", "g1"]
+
+
+def test_without_capture_groups_nothing_is_split():
+    sched = _scheduler(_Engine(max_bs=16))
+
+    batch = _next_batch(sched, _Manager(list(_MIXED)))
+
+    assert len(batch) == 4
+    assert sched.backlog == {}
+
+
+def test_the_speculation_merge_takes_only_the_chains_group():
+    """Fresh rids merged into a guided chain must be guided; the rest wait."""
+    sched = _scheduler(_Engine(max_bs=16, groups={**_MIXED, "c0": True}))
+
+    batch = _next_batch(sched,
+        _Manager(["u0", "g0", "u1", "g1"]), target=(NODE, WALK),
+        pre_existing_batch_size=1, capture_group_of="c0",
+    )
+
+    assert list(batch.request_to_worker_graph) == ["g0", "g1"]
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["u0", "u1"]
+
+
+def test_a_merge_with_nothing_in_its_group_backlogs_the_rest():
+    sched = _scheduler(_Engine(max_bs=16, groups={**_MIXED, "c0": True}))
+
+    batch = _next_batch(sched,
+        _Manager(["u0", "u1"]), target=(NODE, WALK),
+        pre_existing_batch_size=1, capture_group_of="c0",
+    )
+
+    assert batch is None
+    assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["u0", "u1"]
+
+
+def test_a_chain_yields_to_another_groups_backlog():
+    """The merge never takes those rids, so without a yield they starve."""
+    sched = _scheduler(_Engine(max_bs=16, groups={**_MIXED, "c0": True}))
+    sched.backlog[(NODE, WALK)] = _batch(["u0", "g0"])
+
+    assert sched.backlog_splits_from(_Manager([]), (NODE, WALK), "c0") is True
+
+
+def test_a_chain_keeps_going_over_its_own_groups_backlog():
+    sched = _scheduler(_Engine(max_bs=16, groups={**_MIXED, "c0": True}))
+    sched.backlog[(NODE, WALK)] = _batch(["g0", "g1"])
+
+    assert sched.backlog_splits_from(_Manager([]), (NODE, WALK), "c0") is False
+
+
+def test_a_chain_does_not_yield_to_a_failed_rid():
+    sched = _scheduler(_Engine(max_bs=16, groups={**_MIXED, "c0": True}))
+    sched.backlog[(NODE, WALK)] = _batch(["u0"])
+    sched.fail_rids({"u0"})
+
+    assert sched.backlog_splits_from(_Manager([]), (NODE, WALK), "c0") is False
+
+
 # ── round robin ─────────────────────────────────────────────────────────
 
 
@@ -606,3 +719,43 @@ def test_clearing_a_rid_forgets_its_undelivered_admit_error():
 
     assert sched.take_admit_errors() == {}
     assert sched.failed_rids == set()
+
+
+# ── engine capture-group gate ───────────────────────────────────────────
+
+
+class _Submodule:
+    def __init__(self, split):
+        self._split = split
+
+    def split_batches_by_capture_key(self, graph_walk):
+        del graph_walk
+        return self._split
+
+    def cg_key_info(self, graph_walk, per_request_info):
+        del graph_walk
+        (info,) = per_request_info.values()
+        return info.guided
+
+
+def _capture_group(split=True, captured=(WALK,)):
+    from mstar.engine.engine import Engine
+
+    runner = SimpleNamespace(captures_walk=lambda walk: walk in captured)
+    engine = SimpleNamespace(_submodules={
+        NODE: SimpleNamespace(submodule=_Submodule(split), cuda_graph_runner=runner),
+    })
+    return Engine.capture_group(engine, NODE, WALK, 0, SimpleNamespace(guided=True))
+
+
+def test_an_opted_in_submodule_groups_by_its_capture_key():
+    assert _capture_group() is True
+
+
+def test_a_submodule_that_does_not_opt_in_is_never_split():
+    """The default: a mixed batch keeps whatever path it ran before."""
+    assert _capture_group(split=False) is None
+
+
+def test_a_walk_without_a_capture_is_never_split():
+    assert _capture_group(captured=()) is None

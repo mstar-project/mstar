@@ -1468,8 +1468,10 @@ impl GraphRuntime {
                 }
             }
             let me = self.shard.me;
-            info.has_remote_nodes =
-                info.node_to_workers.values().flatten().any(|&w| w != me);
+            info.has_remote_workers = info
+                .node_to_workers
+                .values()
+                .any(|ws| ws.iter().any(|&w| w != me));
             // clone_empty() + setup(node_to_workers), per Python.
             info.shard = Some(
                 self.shard
@@ -2160,7 +2162,7 @@ impl GraphRuntime {
             // Before complete(), which clears the flag.
             let was_speculative = state.is_spec_scheduled(node);
             let completed = state.complete(&g, node, &out_tensors);
-            let pre_shard_edges = completed.edges;
+            let mut pre_shard_edges = completed.edges;
             let freed_inputs = completed.freed;
             // A loop that cached this node's outputs holds a reference on
             // each, as `Loop.maybe_cache_output` takes one. Applied before
@@ -2203,6 +2205,13 @@ impl GraphRuntime {
                     );
                 }
             }
+            // A loop-back the node never reads only feeds the loop's accumulated
+            // outputs. Dropped after persist_pre and the new-token count read it.
+            pre_shard_edges.retain(|e| {
+                !(matches!(e.dest, Dest::Local(d) if d == node)
+                    && !e.streaming
+                    && g.node(node).slot_of(e.name).is_none())
+            });
             let me_sym = self.shard.me;
             let mut edges = if let Some(info) = &self.requests[rid as usize] {
                 if let Some(sharding) = &info.shard {
@@ -2415,23 +2424,15 @@ impl GraphRuntime {
                 }
             }
 
-            // Whether a persisted output has a reader besides this worker. It
-            // goes back to the conductor, which feeds it to a later walk of
-            // this request; when every node of the request runs here, that walk
-            // reads the tensor where it already is and staging it is pure cost
-            let stage_persist =
-                self.info(rid).map_or(false, |i| i.has_remote_nodes);
-
             // Staged before the routed edges, so a persist signal is
             // registered for a remote read whether or not the fanout kept an
-            // edge for it -- Python stages `routing.persist` the same way.
-            if stage_persist {
-                for (_name, tensors) in &persist_pre {
-                    for t in tensors {
-                        if staged.insert(t.uuid) {
-                            out.register_uuids.push(t.uuid);
-                            out.register_rids.push(rid);
-                        }
+            // edge for it. Skipped with no remote worker, as in Python.
+            let has_remote = self.info(rid).is_none_or(|i| i.has_remote_workers);
+            for (_name, tensors) in persist_pre.iter().filter(|_| has_remote) {
+                for t in tensors {
+                    if staged.insert(t.uuid) {
+                        out.register_uuids.push(t.uuid);
+                        out.register_rids.push(rid);
                     }
                 }
             }
@@ -2467,7 +2468,7 @@ impl GraphRuntime {
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
-                let remote = (e.persist && stage_persist)
+                let remote = (e.persist && has_remote)
                     || e.declined_local
                     || (!is_local
                         && matches!(e.dest, Dest::External(_) | Dest::EmitToClient));
@@ -2477,6 +2478,17 @@ impl GraphRuntime {
                             out.register_uuids.push(t.uuid);
                             out.register_rids.push(rid);
                         }
+                    }
+                }
+            }
+
+            // Every persisted tensor, including earlier iterations' on an accumulated
+            // output: the client's read releases them before a later walk reads them.
+            if !persist_pre.is_empty() {
+                let mut bk = self.bookkeeping.lock().unwrap();
+                for (_, tensors) in &persist_pre {
+                    for t in tensors {
+                        bk.set_persist(t.uuid, true);
                     }
                 }
             }
@@ -2559,12 +2571,6 @@ impl GraphRuntime {
                     *contributed.entry(t.uuid).or_insert(0) += refs;
                 }
             }
-            // Same for the persist marker: a set, built once.
-            let persisted: FxHashSet<u64> = persist_pre
-                .iter()
-                .flat_map(|(_, ts)| ts.iter().map(|t| t.uuid))
-                .collect();
-
             // Settle from the safety hold of 1 to the real fanout. persist is
             // excluded from the COUNT: those are held by the marker, and
             // counting them would double-count a signal whose destination is
@@ -2575,10 +2581,7 @@ impl GraphRuntime {
                     let count = contributed.get(&uuid).copied().unwrap_or(0);
                     // Pre-fanout: a rank whose persist edge the fanout
                     // dropped still holds the tensor for the conductor, and
-                    // an unmarked one is dereferenced to zero right here.
-                    if persisted.contains(&uuid) {
-                        bk.set_persist(uuid, true);
-                    }
+                    // an unmarked one would be dereferenced to zero right here.
                     let delta = count - 1;
                     if delta > 0 {
                         bk.increment_ref(uuid, delta)?;
@@ -2929,7 +2932,7 @@ impl GraphRuntime {
             for (rid, signal, uuids) in plan.persist {
                 let sig = self.interner.intern(&signal);
                 if let Some(info) = self.requests[rid as usize].as_mut() {
-                    info.pending.persist.push((sig, uuids));
+                    info.pending.add_persist(sig, uuids);
                 }
             }
             for (rid, counts) in &new_token_counts {

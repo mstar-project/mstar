@@ -1954,6 +1954,10 @@ class Worker:
         # have already waited a step, and the chain only ever continues its own
         # rids, so at the cap they would never be reached. None => uncapped.
         spec_target = (spec_node_name, batch_N.graph_walk)
+        # The merge below takes only this chain's capture group; another
+        # group's backlog runs only once the chain yields to it.
+        if self.scheduler.backlog_splits_from(self.request_state, spec_target, rid):
+            return None
         max_continuing = self.scheduler.room_for_continuing(spec_target)
 
         # Removes, aborts and failures are filtered here; prep_spec_rids
@@ -2015,7 +2019,8 @@ class Worker:
         fresh_batch = self.scheduler.get_next_batch(
             self.request_state,
             target=spec_target,
-            pre_existing_batch_size=len(continuing)
+            pre_existing_batch_size=len(continuing),
+            capture_group_of=prep.ready_rids[0],
         )
 
         if fresh_batch is not None:
