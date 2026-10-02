@@ -1,6 +1,6 @@
 import logging
+import pickle
 from collections.abc import Callable
-from copy import deepcopy
 from dataclasses import dataclass, field
 
 from mstar.communication.tensors import TensorCommunicationManager
@@ -70,6 +70,10 @@ class WorkerGraphQueues:
     def __post_init__(self):
         self.nodes = set(self.worker_graph.section.get_nodes().keys())
         self.loops = set(self.worker_graph.section.get_loops().keys())
+        # Copied per request by unpickling, several times cheaper than deepcopy.
+        self._section_blob = pickle.dumps(
+            self.worker_graph.section, protocol=pickle.HIGHEST_PROTOCOL
+        )
 
     def process_new_inputs(
         self, request_id: int, inputs: list[GraphEdge],
@@ -102,7 +106,7 @@ class WorkerGraphQueues:
         """
         Initialize queues for a new request
         """
-        section_copy = deepcopy(self.worker_graph.section)
+        section_copy = pickle.loads(self._section_blob)
         queue = WorkerGraphIO(section_copy, wg_id=self.worker_graph_id)
         queue.register_communication_info(
             self.tensor_manager, request_id
