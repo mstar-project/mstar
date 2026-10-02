@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import time
 
 import torch
 import triton
@@ -85,21 +86,30 @@ def _cuda_op_available() -> bool:
     """
     if not torch.cuda.is_available():
         return False
-    try:
-        from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import load
 
-        _clear_stale_build_lock("_mstar_moe_C")
-        load(name="_mstar_moe_C", sources=[_CSRC], is_python_module=False, verbose=False)
-        # Touch the op so a registration failure surfaces here, not at call time.
-        _ = torch.ops._mstar_moe_C.moe_align_block_size
-        return True
-    except Exception as e:  # pragma: no cover -- depends on the build toolchain
-        logger.warning(
-            "fused MoE: could not build the CUDA moe_align_block_size op (%s); "
-            "using the slower torch fallback.",
-            e,
-        )
-        return False
+    # Retried: TP workers load concurrently, and FileBaton.release() closes the
+    # lock's fd before removing the file. A peer that scans in that window sees
+    # an unheld lock, removes it as abandoned, and the owner's own remove then
+    # raises ENOENT out of load(). The build is done by then, so a retry loads.
+    attempts = 3
+    for attempt in range(attempts):
+        try:
+            _clear_stale_build_lock("_mstar_moe_C")
+            load(name="_mstar_moe_C", sources=[_CSRC], is_python_module=False, verbose=False)
+            # Touch the op so a registration failure surfaces here, not at call time.
+            _ = torch.ops._mstar_moe_C.moe_align_block_size
+            return True
+        except Exception as e:  # pragma: no cover -- depends on the build toolchain
+            if attempt + 1 < attempts:
+                time.sleep(1.0)
+                continue
+            logger.warning(
+                "fused MoE: could not build the CUDA moe_align_block_size op (%s); "
+                "using the slower torch fallback.",
+                e,
+            )
+    return False
 
 
 def moe_align_block_size(
