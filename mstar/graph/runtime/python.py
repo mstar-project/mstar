@@ -95,6 +95,12 @@ class GraphRuntimeRequestInfo:
     node_to_workers: dict[NodeAndGraphWalk, list[str]]
     dyn_loop_to_workers: dict[NodeAndGraphWalk, list[str]]
     sharding_config: ShardingConfig
+    # True when some node of THIS request runs on another worker, i.e. when a
+    # later walk of it can land elsewhere. That is what decides whether a
+    # persisted output has to be staged for a send (complete_and_route_batch).
+    # Per request, not per deployment: a data-parallel replica has peer workers,
+    # but none of them run this request.
+    has_remote_nodes: bool = False
     # Per-loop stop indices. Worker-only, so it lives here rather than riding
     # on CurrentForwardPassInfo across the wire.
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
@@ -231,7 +237,12 @@ class PythonGraphRuntime(GraphRuntime):
                 worker_graph_ids=[],
                 node_to_workers=node_to_workers,
                 dyn_loop_to_workers=dyn_loop_to_workers,
-                sharding_config=sharding_config
+                sharding_config=sharding_config,
+                has_remote_nodes=any(
+                    worker != self._my_worker_id
+                    for workers in node_to_workers.values()
+                    for worker in workers
+                ),
             )
 
         for graph_id in partition_worker_graph_ids:
@@ -1267,8 +1278,20 @@ class PythonGraphRuntime(GraphRuntime):
             # edge carries tensors from earlier iterations, and those need
             # staging just as much. Deduped by uuid, so a re-emitted edge does
             # not stage twice.
+            #
+            # A persisted output is the exception: it goes back to the conductor,
+            # which feeds it to a later walk of this request, so it only has a
+            # remote reader if some node of the request runs elsewhere. When none
+            # does, the later walk runs here, where the tensor already is, and
+            # staging it is pure cost -- the SHM transport serializes it to a
+            # file, 13 ms for the 7.5 MiB text embedding of every image request,
+            # which nobody then reads.
+            persist = (
+                routing.persist
+                if self._request_info[rid].has_remote_nodes else []
+            )
             for edge in (
-                routing.persist + routing.emit_to_client
+                persist + routing.emit_to_client
                 + sum(routing.to_workers.values(), start=[])
                 + sum(routing.streaming_to_workers.values(), start=[])
             ):
