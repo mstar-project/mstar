@@ -19,13 +19,14 @@ ABSOLUTE_MAX_TIMEOUT_S = 24 * 3600
 
 
 class SessionOverflowPolicy(Enum):
-    """What happens when a session's held state exceeds its budget."""
+    """What happens when a session's held state exceeds its budget.
+
+    A backstop, not a way to trim: a bounded rolling context is the resource's
+    own business (a KV stream's ``RetentionPolicy``), not this budget's.
+    """
 
     # Drop everything the session holds; the next request starts from scratch.
     CLEAR = "clear"
-    # Keep the most recent state that fits. A resource that cannot trim
-    # soundly (KV, whose stored keys are already rotated) falls back to CLEAR.
-    WINDOW = "window"
     # Drop everything and fail the session's next request, so a client is told
     # rather than silently served from a truncated context.
     ERROR = "error"

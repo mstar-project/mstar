@@ -63,11 +63,17 @@ budget:
 
 - ``CLEAR`` (the default) drops everything the session holds. The next request
   in it starts from scratch.
-- ``WINDOW`` keeps the most recent state that fits. A resource that cannot
-  window soundly — the KV cache, whose stored keys are already rotated — falls
-  back to ``CLEAR``.
 - ``ERROR`` drops the state *and* fails the session's next request, so a client
   is told rather than silently served from a context it did not build.
+
+The budget is a backstop against a session outgrowing what the deployment will
+hold, not a way to trim one. **A bounded, rolling context is a different thing
+and belongs to the resource**: a KV stream declares a
+:class:`~mstar.engine.resources.kv.config.RetentionPolicy` on its step, and
+``commit`` releases its oldest whole pages behind ``protected_prefix`` as the
+stream grows — which is how windowed generation holds a fixed context. A
+deployment that wants a session to keep generating indefinitely wants that, not a
+budget it periodically trips.
 
 What a request's model sees
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -76,8 +82,13 @@ A :class:`~mstar.model.sessions.RequestSession` — the id, whether it continues
 state already there, and whether it ends the session — reaches the model with
 the request's initial forward-pass args, and rides on every
 ``CurrentForwardPassInfo`` after it, so a submodule reads it off the step. It is
-server-validated state, not a client knob: nothing a client puts in
-``model_kwargs`` can name a session.
+what the server validated, and it arrives as a property of the request rather
+than among the client's ``model_kwargs``.
+
+A model that instead reads a session id out of ``model_kwargs`` (cosmos3 does
+today, with a session store of its own) is not going through any of this: no
+registry, no TTL, no teardown barrier. Porting such a model means reading the
+``RequestSession`` above.
 
 Submodule state
 ^^^^^^^^^^^^^^^

@@ -179,14 +179,6 @@ class Resource(ABC):
         """Drop the session's state but keep the session itself alive."""
         self.remove_session(session_id)
 
-    def trim_session_state(self, session_id: str, max_state: int) -> bool:
-        """Bring the session's state within ``max_state``, keeping the tail.
-
-        False (the default) means this resource cannot window soundly, and the
-        runner falls back to a full clear.
-        """
-        return False
-
     def admit_retrieve(
         self, rid: str,
         node_name: str,

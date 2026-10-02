@@ -259,8 +259,7 @@ class StepRunner:
         A clear is the whole session's, not one resource's: what the others
         hold addresses the state being dropped (the position counters over a
         KV cache), so clearing one alone would leave the next request placing
-        its tokens past a context that is no longer there. A window is local —
-        the tail it keeps sits at the positions it was written at.
+        its tokens past a context that is no longer there.
         """
         for key in self.session_resource_keys():
             resource = self._resources[key]
@@ -275,10 +274,6 @@ class StepRunner:
                 "Session %s holds %d of resource %s, over its budget of %d; "
                 "applying %s", session_id, held, key, cfg.max_state, policy.value,
             )
-            if policy is SessionOverflowPolicy.WINDOW and resource.trim_session_state(
-                session_id, cfg.max_state
-            ):
-                continue
             self._clear_session(session_id)
             if policy is SessionOverflowPolicy.ERROR:
                 self._session_errors[session_id] = (

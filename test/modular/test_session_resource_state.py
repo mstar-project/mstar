@@ -28,7 +28,6 @@ class _Stub(Resource):
         self.calls: list[str] = []
         self.requests: dict[str, int] = {}
         self.sessions: dict[str, int] = {}
-        self.can_trim = False
 
     @classmethod
     def build(cls, spec, info):
@@ -63,13 +62,6 @@ class _Stub(Resource):
 
     def session_state_size(self, session_id):
         return self.sessions.get(session_id, 0)
-
-    def trim_session_state(self, session_id, max_state):
-        self.calls.append(f"trim:{session_id}:{max_state}")
-        if not self.can_trim:
-            return False
-        self.sessions[session_id] = max_state
-        return True
 
 
 def _runner(session_keys=(), max_state=None, policy=None, derived=()):
@@ -186,35 +178,6 @@ def test_the_clear_policy_drops_the_whole_session_state():
     assert runner.take_session_error("s") is None
 
 
-def test_the_window_policy_trims_when_the_resource_can():
-    runner, res = _runner(
-        session_keys=("kv",), max_state=10,
-        policy=SessionOverflowPolicy.WINDOW,
-    )
-    res["kv"].can_trim = True
-    runner.ingest_request("r0", session_id="s")
-    res["kv"].requests["r0"] = 25
-
-    runner.remove_request("r0", session_id="s")
-
-    assert res["kv"].sessions == {"s": 10}
-    assert "trim:s:10" in res["kv"].calls
-
-
-def test_the_window_policy_falls_back_to_a_clear_when_it_cannot():
-    runner, res = _runner(
-        session_keys=("kv",), max_state=10,
-        policy=SessionOverflowPolicy.WINDOW,
-    )
-    res["kv"].can_trim = False
-    runner.ingest_request("r0", session_id="s")
-    res["kv"].requests["r0"] = 25
-
-    runner.remove_request("r0", session_id="s")
-
-    assert res["kv"].sessions == {}
-
-
 def test_the_error_policy_clears_and_owes_the_next_request_an_error():
     runner, res = _runner(
         session_keys=("kv",), max_state=10,
@@ -261,27 +224,9 @@ def test_a_breach_on_one_resource_clears_every_session_resource():
     assert res["pos"].sessions == {}
 
 
-def test_a_window_on_one_resource_leaves_the_others_alone():
-    # a kept tail sits at the positions it was written at, so nothing else moves
-    runner, res = _runner(
-        session_keys=("kv",), derived=("pos",), max_state=10,
-        policy=SessionOverflowPolicy.WINDOW,
-    )
-    res["kv"].can_trim = True
-    runner.ingest_request("r0", session_id="s")
-    res["kv"].requests["r0"] = 40
-    res["pos"].requests["r0"] = 40
-
-    runner.remove_request("r0", session_id="s")
-
-    assert res["kv"].sessions == {"s": 10}
-    assert res["pos"].sessions == {"s": 40}
-
-
 @pytest.mark.parametrize("policy", list(SessionOverflowPolicy))
 def test_every_policy_leaves_the_session_usable_or_told(policy):
     runner, res = _runner(session_keys=("kv",), max_state=4, policy=policy)
-    res["kv"].can_trim = True
     runner.ingest_request("r0", session_id="s")
     res["kv"].requests["r0"] = 99
     runner.remove_request("r0", session_id="s")

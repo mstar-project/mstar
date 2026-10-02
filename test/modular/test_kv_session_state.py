@@ -316,17 +316,6 @@ def test_session_state_size_counts_the_pages_it_holds():
     assert kv.session_state_size("other") == 0
 
 
-def test_kv_declines_to_window_its_state():
-    kv = _manager()
-    kv.ingest_request("r0", KVReqConfig())
-    _grow(kv, "r0", 100)
-    kv.retain_session_state("r0", "s")
-
-    # the stored keys are already rotated, so keeping a suffix is not sound
-    assert kv.trim_session_state("s", 1) is False
-    assert kv.session_state_size("s") > 1
-
-
 # ── positions over the session's pages ──────────────────────────────────────
 
 def _position_manager():
