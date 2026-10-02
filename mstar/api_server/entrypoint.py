@@ -1374,7 +1374,12 @@ async def generate_ws(websocket: WebSocket):
         except (WebSocketDisconnect, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — reported in-band, the socket stays up
-            logger.exception("generate/ws request failed")
+            if isinstance(exc, SessionError):
+                # A client error (unknown session, one already in use): the
+                # reply carries it, so a stack trace would just be noise.
+                logger.warning("generate/ws refused a session: %s", exc.detail)
+            else:
+                logger.exception("generate/ws request failed")
             if session.session_id is not None:
                 # Release the session this message claimed: it never reached the
                 # engine, so nothing else would let go of it.
