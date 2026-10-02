@@ -652,3 +652,36 @@ def test_upload_longer_than_the_cap_is_rejected(client_and_stub, monkeypatch):
     r = _post(client, {"model": "whisper_large"}, filename="long.wav", content=_wav_bytes(61))
     assert r.status_code == 413 and not stub.submits
     assert not list(stub.upload_dir.iterdir())
+
+
+@pytest.mark.parametrize(
+    "mode, submitted", [("parallel", 1 + serving_transcriptions.PARALLEL_INFLIGHT), ("sequential", 2)],
+)
+def test_client_gone_mid_long_form_stops_submitting(client_and_stub, monkeypatch, mode, submitted):
+    # collect_results aborts and returns [] once the client is gone; the
+    # remaining windows must not be submitted after that
+    from starlette.requests import Request
+
+    client, stub = client_and_stub
+    gone = False
+    collect = stub.collect_results
+
+    async def collect_until_gone(request_id, raw_request=None):
+        nonlocal gone
+        if len(stub.submits) > 1 and stub.submits[1]["request_id"] == request_id:
+            gone = True
+            return []
+        return await collect(request_id, raw_request)
+
+    async def is_disconnected(self):
+        return gone
+
+    stub.collect_results = collect_until_gone
+    monkeypatch.setattr(Request, "is_disconnected", is_disconnected)
+    stub.queued_chunks = [_text(f" w{i}") for i in range(20)]
+    r = _post(client, {"model": "whisper_large", "long_form": mode},
+              filename="long.wav", content=_wav_bytes(10 * 60))
+    assert r.status_code == 200, r.text
+    assert len(stub.submits) == submitted
+    assert set(stub.released) == {s["request_id"] for s in stub.submits[2:]}
+    assert not list(stub.upload_dir.iterdir())
