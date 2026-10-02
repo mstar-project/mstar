@@ -1033,6 +1033,11 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="n">edge</span><span class="o">.</span><span class="n">next_node</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">:</span>
                 <span class="k">continue</span> <span class="c1"># TODO: cross-worker-graph speculation</span>
             <span class="n">node</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">nodes</span><span class="p">[</span><span class="n">edge</span><span class="o">.</span><span class="n">next_node</span><span class="p">]</span>
+            <span class="k">if</span> <span class="n">edge</span><span class="o">.</span><span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">node</span><span class="o">.</span><span class="n">input_names</span><span class="p">:</span>
+                <span class="c1"># A loop-back the node never reads. It only feeds the loop's</span>
+                <span class="c1"># accumulated outputs, and GraphNode.ingest_input declines it</span>
+                <span class="c1"># the same way on the regular path.</span>
+                <span class="k">continue</span>
             <span class="n">node</span><span class="o">.</span><span class="n">speculative_signals</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">edge</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_nodes_with_speculative_inputs</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
             <span class="n">dest_nodes</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
