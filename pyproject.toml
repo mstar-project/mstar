@@ -21,7 +21,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Operating System :: POSIX :: Linux",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "Environment :: GPU",
     "Environment :: GPU :: NVIDIA CUDA",
 ]
 dependencies = [
@@ -32,9 +31,9 @@ dependencies = [
     "msgpack",
     "python-multipart",
     "requests",
-    # Device builds, ABI constraints and media libraries belong to the backend
-    # extras. pip cannot select an accelerator from the installed hardware.
-    "torch>=2.9.1",
+    "torch>=2.9.1,<2.13.0",
+    "torchvision>=0.24.1",
+    "torchaudio>=2.9.1",
     "uvicorn",
     # uvicorn serves WebSockets (/v1/realtime) only with a ws library installed
     "websockets",
@@ -52,24 +51,6 @@ mstar = "mstar.cli.main:main"
 mstar-serve = "mstar.api_server.entrypoint:main"
 
 [project.optional-dependencies]
-# Keep the existing CUDA model extras working by sharing their original
-# PyTorch constraints here. Select the wheel index with --torch-backend=auto
-# (uv) or install the matching CUDA/CPU builds explicitly (pip).
-cuda = [
-    "torch>=2.9.1,<2.13.0",
-    "torchvision>=0.24.1",
-    "torchaudio>=2.9.1",
-]
-
-# These are the XPU builds tested with the published native kernel wheel.
-# --torch-backend=xpu (uv) or PyTorch's XPU index (pip) supplies the wheels.
-# torch's XPU wheel brings triton-xpu; do not install CUDA's triton alongside it.
-xpu = [
-    "torch==2.13.0+xpu",
-    "torchvision==0.28.0+xpu",
-    "vllm-xpu-kernels==0.1.15.4",
-]
-
 # OmniVoice reuses the reference package for weight loading, the rule-based
 # duration estimator, language/instruct validation and the pydub silence
 # trim; mstar owns the graph.
@@ -79,7 +60,7 @@ xpu = [
 # calls, so it has to come from git. A direct URL in requires_dist would make
 # PyPI reject the mstar upload, so it is an install step instead — see
 # docs/installation.rst, same as flash-attn.
-omnivoice = ["mstar-ai[cuda]"]
+omnivoice = []
 
 dev = [
     "ruff<=0.16",
@@ -101,7 +82,6 @@ dynamo = [
 ]
 
 bagel = [
-    "mstar-ai[cuda]",
     "einops",
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
@@ -116,7 +96,6 @@ bagel = [
 ]
 
 bagel_xpu = [
-    "mstar-ai[xpu]",
     "einops",
     "huggingface-hub",
     "mooncake-transfer-engine",
@@ -124,11 +103,13 @@ bagel_xpu = [
     "regex",
     "safetensors",
     "torchvision",
+    "torchaudio",
+    "torchcodec",
     "transformers",
+    "vllm-xpu-kernels==0.1.15.4",
 ]
 
 cosmos3 = [
-    "mstar-ai[cuda]",
     # PyAV backs torchvision's write_video, the video-container fallback used
     # when torchcodec is too old to ship VideoEncoder (< 0.9).
     "av",
@@ -150,7 +131,6 @@ cosmos3 = [
 ]
 
 qwen3_omni = [
-    "mstar-ai[cuda]",
     # NOTE: flash-attn is required by Qwen3-Omni but is NOT listed here — its
     # prebuilt wheels aren't on PyPI, so a plain install compiles from source
     # (and fails on CUDA 13). Install it separately; see docs/installation.rst.
@@ -171,7 +151,6 @@ qwen3_omni = [
 ]
 
 qwen3_tts = [
-    "mstar-ai[cuda]",
     "einops",
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
@@ -182,7 +161,6 @@ qwen3_tts = [
 ]
 
 kokoro = [
-    "mstar-ai[cuda]",
     # misaki is the G2P (lexicon + spaCy tagger); `misaki[en]` additionally
     # bundles espeak-ng (GPL) for out-of-dictionary words and is optional.
     # The spaCy model is fetched on first use: `python -m spacy download en_core_web_sm`.
@@ -194,7 +172,6 @@ kokoro = [
 ]
 
 orpheus = [
-    "mstar-ai[cuda]",
     "einops",
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
@@ -204,7 +181,6 @@ orpheus = [
 ]
 
 pi05 = [
-    "mstar-ai[cuda]",
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "mooncake-transfer-engine",
@@ -214,7 +190,6 @@ pi05 = [
 ]
 
 vjepa2 = [
-    "mstar-ai[cuda]",
     "huggingface-hub",
     "mooncake-transfer-engine",
     "safetensors",
@@ -222,7 +197,6 @@ vjepa2 = [
 ]
 
 wan22 = [
-    "mstar-ai[cuda]",
     # 0.39 is the diffusers release the Wan2.2 golden-reference oracle ran on;
     # the wrapped AutoencoderKLWan/UMT5 components are equivalence-tested
     # against it (floor only — an upper cap would block installs without
@@ -238,7 +212,6 @@ wan22 = [
 ]
 
 waypoint = [
-    "mstar-ai[cuda]",
     # mp4 encode for benchmark_streaming.py --save-videos.
     "av",
     "huggingface-hub",
@@ -254,7 +227,6 @@ waypoint = [
 ]
 
 vjepa2_ac = [
-    "mstar-ai[cuda]",
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
     "mooncake-transfer-engine",
@@ -264,7 +236,6 @@ vjepa2_ac = [
 
 # ASR models: Whisper-large-v3, Higgs Audio
 asr = [
-    "mstar-ai[cuda]",
     "einops",
     "flashinfer-python>=0.6.4",
     "huggingface-hub",
@@ -277,7 +248,6 @@ asr = [
 ]
 
 all = [
-    "mstar-ai[cuda]",
     "ruff",
     "pytest>=8.2",
     "soundfile",

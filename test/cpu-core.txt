@@ -33,6 +33,5 @@ test/modular/test_kv_publish_retrieve.py
 test/modular/test_parallel_groups.py
 test/modular/test_preplan_error_paths.py
 test/modular/test_xpu_sampler.py
-test/modular/test_accelerator_packaging.py
 test/sampling_test/test_xpu_sampler_rng.py
 test/sampling_test/test_xpu_sampler_batched.py
