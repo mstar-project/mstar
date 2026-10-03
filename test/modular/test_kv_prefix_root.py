@@ -87,6 +87,9 @@ class _Model:
     def prefix_key_streams(self):
         return {}
 
+    def get_max_output_tokens(self):
+        return 64
+
 
 class _Declaring(_Model):
     """Keys ``main`` on the KV resource from its text walk."""
@@ -273,25 +276,22 @@ def test_a_keyed_node_with_host_pages_says_what_opened_and_no_more(caplog):
         caplog, _kv(prefix_cache_salt="deployment", cpu_offload_pages=4), _Declaring(),
     )
 
-    assert len(info) == 1 and "main" in info[0] and "LLM" in info[0], (
+    assert len(info) == 2 and "main" in info[0] and "LLM" in info[0], (
         "the cache opened without saying which label it keys on which node"
     )
     assert warnings == [], "a cache with host pages to offload to was warned it had none"
 
 
-def test_a_keyed_node_without_host_pages_is_warned_its_decode_can_hold(caplog):
+def test_a_keyed_node_says_what_one_request_reserves(caplog):
     info, warnings = _said_at_load(caplog, _kv(prefix_cache_salt="deployment"), _Declaring())
 
-    assert len(info) == 1 and "main" in info[0] and "LLM" in info[0], (
+    assert len(info) == 2 and "main" in info[0] and "LLM" in info[0], (
         "the cache opened without saying which label it keys on which node"
     )
-    assert len(warnings) == 1 and "cpu_offload_pages" in warnings[0], (
-        "a cache with nothing to offload opened without saying a full pool "
-        "holds its decode until the requests time out"
+    assert "16 pages" in info[1] and "up to 4 pages of decode" in info[1] and "max_tokens 64" in info[1], (
+        "the load log left out the pool's pages or what a request reserves at the default max_tokens"
     )
-    assert "max_concurrent_requests" in warnings[0], (
-        "the warning names one way out of a full pool and not the other"
-    )
+    assert warnings == [], "a pool that admits by reservation was warned its decode can hold"
 
 
 @pytest.mark.parametrize("overrides, model", [

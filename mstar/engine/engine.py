@@ -614,18 +614,17 @@ class Engine:
             nodes = ", ".join(sorted(specs_by_key[key].nodes))
             for label in declared[key]:
                 logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
-            if not resource.supports_eviction:
-                # a hit allocates only the prompt's tail, so admission no longer
-                # bounds how many requests decode at once
-                logger.warning(
-                    "KV %s: prefix cache on with cpu_offload_pages 0: a decode "
-                    "step that finds nothing to evict holds its requests until "
-                    "they time out. Set max_concurrent_requests to the pool's "
-                    "pages over the pages one request needs. cpu_offload_pages "
-                    "gives the worker a victim, but one that shares most of its "
-                    "prompt frees little",
-                    key,
-                )
+            # a hit allocates only the prompt's tail, so the pool admits a request by
+            # what it can still take, not by what its prompt takes
+            config = specs_by_key[key].config
+            max_tokens = model.get_max_output_tokens()
+            logger.info(
+                "KV %s: admits by reservation from %d pages: a request reserves its "
+                "uncached prompt and up to %d pages of decode at the default "
+                "max_tokens %d",
+                key, config.max_num_pages,
+                -(-min(max_tokens, config.max_seq_len) // config.page_size), max_tokens,
+            )
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.
