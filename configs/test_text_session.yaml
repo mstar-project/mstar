@@ -1,0 +1,22 @@
+# BAGEL's LLM, text only, with its KV held across a persistent session.
+# See docs/sessions.rst.
+model: "test_text_session"
+max_seq_len: 32768
+max_concurrent_requests: 8
+
+sessions:
+  max_concurrent_sessions: 4
+  default_timeout_s: 300.0
+  max_timeout_s: 1800.0
+  ttl_mode: idle
+  resources:
+    kv:
+      # pages (128 tokens each), so ~8k tokens of conversation per session
+      max_state: 64
+      overflow_policy: error
+
+node_groups:
+  - node_names:
+      - LLM
+    ranks:
+      - 0

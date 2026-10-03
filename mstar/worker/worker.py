@@ -6,10 +6,10 @@ import threading
 import time
 import time as _time
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Container, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import partial
 from time import sleep
@@ -49,6 +49,7 @@ from mstar.graph.runtime.base import (
 from mstar.graph.runtime.python import PythonGraphRuntime
 from mstar.graph.runtime.utils import GraphRuntimeType, resolve_graph_runtime_type
 from mstar.model.base import Model, WorkerGraph
+from mstar.model.submodule_base import InputMetadata
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo, StreamingEdge
 from mstar.utils.containers import ParallelList, RecentSet
@@ -622,18 +623,26 @@ class Worker:
             request_id, self._graph_runtime.get_sharding_config(request_id),
         )
 
-        # Create StreamBuffers for consumer connections on this worker
+        # Create StreamBuffers for consumer connections on this worker. A request
+        # with several partitions here arrives once per partition: keep the
+        # buffer the first arrival made (it may already hold items).
+        req_info = self.request_state.per_request_info[request_id]
         for conn in self._my_consumer_connections:
-            req_info = self.request_state.per_request_info[request_id]
-            sbuf = StreamBuffer(
-                request_id=request_id,
-                edge_name=conn.edge_name,
-                from_partition=conn.from_partition,
-                policy=conn.chunk_policy_factory(),
-            )
-            req_info.stream_buffers[conn.edge_name] = sbuf
-            consumer = self._consumer_node_cache.get(conn.edge_name, "")
-            req_info.stream_buffers_by_consumer.setdefault(consumer, {})[conn.edge_name] = sbuf
+            sbuf = req_info.stream_buffers.get(conn.edge_name)
+            if sbuf is None:
+                sbuf = StreamBuffer(
+                    request_id=request_id,
+                    edge_name=conn.edge_name,
+                    from_partition=conn.from_partition,
+                    policy=conn.chunk_policy_factory(),
+                )
+                req_info.stream_buffers[conn.edge_name] = sbuf
+                consumer = self._consumer_node_cache.get(conn.edge_name, "")
+                req_info.stream_buffers_by_consumer.setdefault(consumer, {})[conn.edge_name] = sbuf
+            if conn.to_partition == body.request_info.partition_name:
+                lead = body.request_info.stream_lead_items.get(conn.edge_name)
+                if lead:
+                    sbuf.prime_context(lead)
 
         # Start RDMA reads for tensors that have tensor_info
         futures = self.tensor_manager.start_read_tensors(
@@ -1252,13 +1261,13 @@ class Worker:
             # failed anyway is not asked for forward-pass state as well.
             per_request_inputs.pop(rid, None)
             final_edges.pop(rid, None)
-        per_request_stream_chunks: dict[int, dict[str, StreamChunkInfo]] = {}
+        per_request_input_metadata: dict[int, InputMetadata] = {}
         for request_id, inputs in per_request_inputs.items():
             per_request_info[request_id] = self.request_state.get_fwd_info(
                 request_id, batch_partition
             )
             if chunks := self._stream_chunks_for(request_id, batch.node_name, inputs):
-                per_request_stream_chunks[request_id] = chunks
+                per_request_input_metadata[request_id] = InputMetadata(stream_chunks=chunks)
 
         node_batch = self._make_executing_batch(
             node_name=batch.node_name,
@@ -1270,7 +1279,7 @@ class Worker:
             per_request_input_tensors=per_request_inputs,
             per_request_info=per_request_info,
             final_edges=final_edges,
-            per_request_stream_chunks=per_request_stream_chunks,
+            per_request_input_metadata=per_request_input_metadata,
         )
         for rid in unresolved:
             # Reported the way a per-rid stage reports: left in
@@ -1328,7 +1337,7 @@ class Worker:
         per_request_input_tensors: dict[int, NameToTensorList],
         per_request_info: dict[int, CurrentForwardPassInfo],
         final_edges: dict[int, set[str]] | None = None,
-        per_request_stream_chunks: dict[int, dict[str, StreamChunkInfo]] | None = None,
+        per_request_input_metadata: dict[int, InputMetadata] | None = None,
     ) -> ExecutingBatch:
         """One step's batch, with the step context the engine drives it through.
 
@@ -1345,7 +1354,7 @@ class Worker:
             per_request_input_tensors=per_request_input_tensors,
             final_stream_rids=final_stream_rids,
             stream_partition_done_rids=stream_partition_done_rids,
-            per_request_stream_chunks=per_request_stream_chunks or {},
+            per_request_input_metadata=per_request_input_metadata or {},
             step_context=StepContext(
                 request_ids=tuple(request_ids),
                 graph_walk=graph_walk,
@@ -1518,8 +1527,6 @@ class Worker:
             ParallelList(list(per_rid), list(per_rid.values())),
             skip_cuda_sync=True,
         )
-
-
 
 
     # ------------------------------------------------------------------
@@ -1892,6 +1899,40 @@ class Worker:
             )
         )
 
+    def _speculative_fwd_info(
+        self,
+        request_ids: list[int],
+        partition: str,
+        spec_target: SpeculationOutput,
+        continuing: Container[int],
+    ) -> dict[int, CurrentForwardPassInfo]:
+        """The step context a speculative batch runs each rid under.
+
+        A request's shared info is refreshed as each batch is built, so while
+        iteration k of a loop is in flight it reads k, and stays there until the
+        step lands. A speculative next iteration that ran under it would take k
+        again: a denoise step would run the same sigma twice, and the overshoot
+        past the last step would never be vetoed. So the speculative batch gets a
+        view of its own, with the counters it will run at: one past the in-flight
+        iteration for a continuing rid on a new iteration of its loop, and the
+        loops' current indices otherwise (a fresh rid's loop already advanced when
+        its last step routed). The mutable per-request tables are shared, so what
+        an engine records on the view is seen by later steps; the in-flight batch
+        keeps the shared info, so its stop check still reads k.
+        """
+        per_request_info = {}
+        for rid, new_iters in self._graph_runtime.get_dynamic_loop_iters(
+            request_ids, partition=partition,
+        ):
+            info = self.request_state.get_fwd_info(rid, partition)
+            counts = dict(info.dynamic_loop_iter_counts)
+            counts.update(new_iters)
+            if spec_target.is_new_loop_iter and rid in continuing:
+                loop = spec_target.loop_name
+                counts[loop] = counts.get(loop, 0) + 1
+            per_request_info[rid] = replace(info, dynamic_loop_iter_counts=counts)
+        return per_request_info
+
     def _assemble_speculation(
         self,
         pending: PendingBatch,
@@ -1909,8 +1950,8 @@ class Worker:
         loop runs. Leader and follower differ only in how they pick the rids."""
         spec_node = spec_target.node_name
         request_ids = list(request_to_worker_graph)
-        per_request_stream_chunks = {
-            rid: chunks for rid in request_ids
+        per_request_input_metadata = {
+            rid: InputMetadata(stream_chunks=chunks) for rid in request_ids
             if (chunks := self._stream_chunks_for(rid, spec_node, per_request_inputs[rid]))
         }
         spec_batch = ScheduledBatch(
@@ -1928,16 +1969,15 @@ class Worker:
             graph_walk=pending.graph_walk,
             request_ids=request_ids,
             per_request_input_tensors=per_request_inputs,
-            per_request_info={
-                rid: self.request_state.get_fwd_info(rid, pending.partition)
-                for rid in request_ids
-            },
+            per_request_info=self._speculative_fwd_info(
+                request_ids, pending.partition, spec_target, set(continuing),
+            ),
             final_edges={
                 rid: {se.edge.name for se in edges if se.chunk.is_final}
                 for rid, edges in consumed_streaming_edges.items()
                 if any(se.chunk.is_final for se in edges)
             },
-            per_request_stream_chunks=per_request_stream_chunks,
+            per_request_input_metadata=per_request_input_metadata,
         )
         return Speculation(
             scheduled_batch=spec_batch,
@@ -2214,7 +2254,7 @@ class Worker:
                 speculation.node_batch.per_request_input_tensors.pop(r, None)
                 speculation.node_batch.per_request_info.pop(r, None)
                 speculation.scheduled_batch.request_to_worker_graph.pop(r, None)
-                speculation.node_batch.per_request_stream_chunks.pop(r, None)
+                speculation.node_batch.per_request_input_metadata.pop(r, None)
                 # Its final chunks go back below; it must not flush or report done.
                 speculation.node_batch.final_stream_rids.discard(r)
                 speculation.node_batch.stream_partition_done_rids.discard(r)

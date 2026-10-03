@@ -39,7 +39,7 @@ def _speculation(rids: list[str]) -> Speculation:
             request_ids=list(rids),
             per_request_input_tensors={r: {} for r in rids},
             per_request_info={r: object() for r in rids},
-            per_request_stream_chunks={r: {f"audio_{r}": None} for r in rids},
+            per_request_input_metadata={r: None for r in rids},
             final_stream_rids=set(rids),
             stream_partition_done_rids=set(rids),
         ),
@@ -84,7 +84,7 @@ def test_dropped_rid_gets_its_own_edges_back():
     for table in (
         spec.node_batch.per_request_input_tensors,
         spec.node_batch.per_request_info,
-        spec.node_batch.per_request_stream_chunks,
+        spec.node_batch.per_request_input_metadata,
         spec.scheduled_batch.request_to_worker_graph,
     ):
         assert set(table) == {"keep"}

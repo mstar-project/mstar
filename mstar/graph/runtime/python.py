@@ -951,12 +951,10 @@ class PythonGraphRuntime(GraphRuntime):
             else node.ready_signals.ready_inputs
         )
         if same_node:
-            # Carry over loop-external inputs sitting in ready_signals (see
-            # GraphNode.is_ready_for_speculation): they are re-injected
-            # unchanged every iteration and never land in ready_next_iter.
-            for name, edge in node.ready_signals.ready_inputs.items():
-                if edge._persist_for_loop and name not in inputs:
-                    inputs[name] = edge
+            # Carry over the loop-external inputs sitting in ready_signals —
+            # the same set `is_ready_for_speculation` just counted as ready.
+            for name in node.persisted_input_names():
+                inputs.setdefault(name, node.ready_signals.ready_inputs[name])
         return _SpecRidPrep(
             rid=rid,
             node=node,

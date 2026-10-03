@@ -267,7 +267,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             te.float()
         return self
 
-    def cg_key_info(self, graph_walk: str, per_request_info: dict) -> object | None:
+    def cg_key_info(
+        self, graph_walk: str, per_request_info: dict, per_request_input_metadata=None, **kwargs,
+    ) -> object | None:
         """Which of this walk's capture buckets the batch belongs to, or None
         for "run eager".
 
@@ -301,6 +303,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         here instead would make the key step-dependent, which is exactly what
         the pre-plan path cannot support.
         """
+        del per_request_input_metadata, kwargs
         rids = list(per_request_info)
         states = [self.request_states.get(rid) for rid in rids]
         if not states or any(
