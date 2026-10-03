@@ -19,9 +19,23 @@ model_kwargs:
   compile_exact_ops: false
   cuda_graph: true
   capture_sizes: [[1024, 1024]]
-  # captions are padded to multiples of 32 tokens; graphs are captured for these lengths
-  capture_caption_lengths: [32, 64]
-  capture_batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8]
+  # Captions pad to multiples of 32 up to max_seq_len, so cap_len has 16 possible
+  # values -- and it is an INPUT, not a shape: the DiT substitutes a learned
+  # cap_pad_token at every padded position and attends over it, so a prompt cannot
+  # be padded up into a wider bucket without changing the image. A cap_len with no
+  # captured graph falls back to the eager batched path.
+  #
+  # The capture budget is len(capture_caption_lengths) x len(capture_batch_sizes),
+  # so all 16 lengths would be 128 graphs. Spend the budget on caption lengths
+  # instead of batch sizes: a captured bucket already serves SHORTER batches by
+  # padding them with dummy rows (CudaGraphRunner.DummyRowPool), so 1/2/4/8 covers
+  # every batch up to 8, where extra cap_lens cover nothing but themselves.
+  # 4 x 4 = 16 graphs, the same count as the [32, 64] x [1..8] this replaced, with
+  # twice the caption coverage. Widen if the measured startup and VRAM allow.
+  capture_caption_lengths: [32, 64, 96, 128]
+  # The scaffold default; 3/5/6/7 replay the next captured size with dummy rows.
+  # Costs some padded compute at those sizes, buys half the graphs.
+  capture_batch_sizes: [1, 2, 4, 8]
   max_batch_size: 8
   # compiled VAE decode (max-autotune): 3x faster at 1024^2, ~56 dB from the eager decode; the autotuner may pick
   # other conv kernels in another server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
