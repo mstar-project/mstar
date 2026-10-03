@@ -161,10 +161,10 @@ def encode_mp4_pyav(frames: torch.Tensor, fps: float, crf: int = 18, preset: str
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
-    # Text prompt with optional image/video conditioning; emits an image or a
-    # video (video_sound_gen adds audio) and actions for the world-model walks.
+    # Text prompt with optional image/video conditioning; emits an image, a video
+    # (the sound walk adds audio), actions, or text where the reasoner is served
     SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image", "video"})
-    SUPPORTED_OUTPUT_MODALITIES = frozenset({"image", "video", "audio", "action"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"image", "video", "audio", "action", "text"})
     DEFAULT_OUTPUT_MODALITIES = ("image",)
 
     PREFILL_WALK = constants.PREFILL_WALK

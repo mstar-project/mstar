@@ -162,6 +162,14 @@ ACCEPTED = [
     ("cosmos3", ["image", "text"], ["video"]),
     ("cosmos3", ["video", "text"], ["video"]),
     ("cosmos3_droid", ["image", "text"], ["action"]),
+    # Edge's reasoner answers chat in text; its WS clients ask for video/action
+    ("cosmos3_edge", ["image", "text"], ["text"]),
+    ("cosmos3_edge", ["video", "text"], ["text"]),
+    ("cosmos3_edge", ["image", "text"], ["video"]),
+    ("cosmos3_edge_droid", ["image", "text"], ["action"]),
+    ("kokoro", ["text"], ["audio"]),
+    # benchmark/waypoint/benchmark_streaming.py
+    ("waypoint", ["image"], ["video_frame"]),
     ("wan22", ["text"], ["video"]),
     ("wan22", ["image", "text"], ["video"]),
     ("vjepa2", ["video"], ["video"]),
@@ -201,6 +209,11 @@ REJECTED = [
     ("pi05", ["image", "text"], ["text"]),
     ("qwen3_omni", ["text"], ["video"]),
     ("cosmos3", ["audio"], ["video"]),
+    ("kokoro", ["text", "audio"], ["audio"]),
+    ("kokoro", ["text"], ["text"]),
+    # raw frames only, never an encoded video; and no prompt conditioning
+    ("waypoint", ["image"], ["video"]),
+    ("waypoint", ["image", "text"], ["video_frame"]),
 ]
 
 
