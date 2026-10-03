@@ -273,7 +273,7 @@ def test_a_follower_takes_what_rank_zero_would_hold_back():
     )
 
 
-def _cfg_parallel_cache(node: str) -> KVManager:
+def _cfg_parallel_cache(node: str, rank: int = 0, world_size: int = 1) -> KVManager:
     """One worker's cache under CFG parallel, which runs ``node`` of the three."""
     spec = KVSpec(
         resource_key="kv", nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"},
@@ -283,8 +283,10 @@ def _cfg_parallel_cache(node: str) -> KVManager:
         ),
         leader="LLM",
     )
+    group = SimpleNamespace(rank=rank, world_size=world_size) if world_size > 1 else None
     return KVManager.build(spec, EngineResourceInfo(
-        device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({node}),
+        device=torch.device("cpu"), joint_comm_group=group, kv_dtype=torch.float32,
+        nodes=frozenset({node}),
     ))
 
 
@@ -296,6 +298,18 @@ def test_under_cfg_parallel_the_leaders_cache_decides_for_the_guidance_caches():
     assert not _ready(leader, "b").ready, "the leader's cache admitted past its room"
     assert _ready(guidance, "b").ready and _step(guidance, "b", 100).ok, (
         "a guidance cache refused a request on its own count"
+    )
+
+
+def test_under_cfg_parallel_and_tp_only_the_leaders_rank_zero_holds_a_request_back():
+    held_back = {
+        (node, rank)
+        for node in ("LLM", "LLM_cfg_text") for rank in (0, 1)
+        if not _ready(_two_admitted(_cfg_parallel_cache(node, rank, world_size=2)), "b").ready
+    }
+
+    assert held_back == {("LLM", 0)}, (
+        "a pool other than the leader's rank 0 admitted a request by its own count"
     )
 
 
