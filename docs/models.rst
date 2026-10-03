@@ -267,7 +267,7 @@ Zonos2 environment requirements
   (``<= 0`` is greedy), ``topk``, ``top_p``, ``min_p``, ``repetition_penalty``,
   ``repetition_window`` (at most ``max_repetition_window``, 256), ``repetition_codebooks``,
   ``ignore_eos`` and ``seed``. ``max_output_tokens`` (or ``max_tokens``) is the frame budget
-  and must be at least 9. ``speed``, ``speaking_rate`` and ``speaking_rate_bucket`` take
+  and must be at least 1. ``speed``, ``speaking_rate`` and ``speaking_rate_bucket`` take
   effect only with ``speaking_rate_enabled: true``, as in the reference.
 - **Text length.** The model's context is 6144 frames: one per UTF-8 byte of (normalized)
   text, plus the generated audio (~86 frames/s). Generation stops when the context is full:
@@ -281,3 +281,9 @@ Zonos2 environment requirements
   the checkpoint download, and the checkpoint loads with ``torch.load(weights_only=True)``.
 - **Single GPU only.** Tensor parallelism is disabled until expert parallelism lands; a
   config with ``tp_size > 1`` is rejected at load.
+- **Audio length.** As in the reference, audio ends at the frame where end-of-audio was
+  sampled (unless ``ignore_eos``), and a request stopped by its budget decodes every
+  frame: ``max_output_tokens=N`` gives N frames of 512 samples.
+- **Warm-up.** The first prefill of each walk compiles after READY (up to ~2 min cold).
+  ``test/zonos2/launch_server_zonos2.sh`` sends text and clone warm-up requests before
+  announcing it is serving; ``ZONOS2_WARMUP=0`` skips them.

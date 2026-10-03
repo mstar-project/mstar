@@ -82,7 +82,11 @@ class StreamingDacDecoder:
 
     The decoder collects the frames of a request. Each call decodes the frames
     that now have enough future context for ``shear_up``. Output frame ``i``
-    needs the input frames ``i`` to ``i + n_codebooks - 1``.
+    needs the input frames ``i`` to ``i + n_codebooks - 1``. The final call
+    decodes every remaining frame, padding the missing shear context.
+
+    As in the reference, the first frame with an ``eoa_id`` code caps the audio
+    at its aligned end frame, unless the request sets ``ignore_eos``.
 
     Each chunk that is not the last withholds its final ``overlap_frames *
     hop_length`` samples, and the final flush emits them. The crossfade runs in
@@ -104,8 +108,10 @@ class StreamingDacDecoder:
         overlap_frames: int = 4,
         hop_length: int = 512,
         min_decode_chunk: int = 1,
+        eoa_id: int | None = None,
     ):
         self.n_codebooks = n_codebooks
+        self.eoa_id = eoa_id
         self.audio_pad_id = audio_pad_id
         self.codebook_size = codebook_size
         self.sample_rate = sample_rate
@@ -122,6 +128,8 @@ class StreamingDacDecoder:
         # overlap region of the previous chunk, which the decoder did not emit.
         # The code crossfades it into the head of the next chunk.
         self._overlap_tails: dict[str, torch.Tensor] = {}
+        # The aligned end-of-audio frame of each request that has emitted eoa.
+        self._eos_frames: dict[str, int] = {}
         # Raised-cosine fade-in windows, keyed by (length, device).
         self._window_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
 
@@ -130,10 +138,27 @@ class StreamingDacDecoder:
             self._frames.clear()
             self._decoded.clear()
             self._overlap_tails.clear()
+            self._eos_frames.clear()
         else:
             self._frames.pop(request_id, None)
             self._decoded.pop(request_id, None)
             self._overlap_tails.pop(request_id, None)
+            self._eos_frames.pop(request_id, None)
+
+    def _detect_eos(self, request_id: str, start: int, frames: torch.Tensor) -> None:
+        """Record the aligned end frame at the first eoa, as the reference does.
+
+        ``frames`` start at stream index ``start``. One host sync per call.
+        """
+        if self.eoa_id is None or request_id in self._eos_frames:
+            return
+        hits = frames[:, : self.n_codebooks] == self.eoa_id
+        rows = hits.any(dim=1).nonzero()
+        if rows.numel() == 0:
+            return
+        row = int(rows[0, 0])
+        last_col = int(hits[row].nonzero()[-1, 0])
+        self._eos_frames[request_id] = max(0, start + row - last_col)
 
     def _fade_in(self, length: int, device: torch.device) -> torch.Tensor:
         """Return a cached raised-cosine fade-in of ``length`` samples: 0 to 1."""
@@ -158,7 +183,8 @@ class StreamingDacDecoder:
         return audio.detach().float()
 
     def _prep_window(
-        self, request_id: str, frames: torch.Tensor, is_final: bool
+        self, request_id: str, frames: torch.Tensor, is_final: bool,
+        ignore_eos: bool = False,
     ) -> tuple[str, Any]:
         """Add ``frames`` and find the decode window of this request.
 
@@ -172,6 +198,8 @@ class StreamingDacDecoder:
         buf = self._frames.get(request_id)
         if frames.numel():
             add = frames.to(dtype=torch.int64)
+            if not ignore_eos:
+                self._detect_eos(request_id, 0 if buf is None else buf.shape[0], add)
             buf = add if buf is None else torch.cat([buf, add], dim=0)
             self._frames[request_id] = buf
         if buf is None:
@@ -183,10 +211,12 @@ class StreamingDacDecoder:
 
         total = buf.shape[0]
         decoded = self._decoded[request_id]
-        # Output only the frames that have full shear context: all frames
-        # except the last (n_codebooks - 1). Those last frames de-shear earlier
-        # frames. They are not audio of their own.
-        target = max(total - (self.n_codebooks - 1), 0)
+        # Mid-stream, decode only frames with full shear context; the last
+        # (n_codebooks - 1) wait on later codebooks. The final call takes all.
+        target = total if is_final else max(total - (self.n_codebooks - 1), 0)
+        eos_frame = self._eos_frames.get(request_id)
+        if eos_frame is not None:
+            target = min(target, eos_frame)
         new_decodable = target - decoded
 
         if is_final:
@@ -229,9 +259,7 @@ class StreamingDacDecoder:
     ) -> torch.Tensor:
         """Crossfade, withhold or emit the overlap tail, and encode to int16.
 
-        ``audio`` is the raw ``(out_count * hop,)`` decode of this request. The
-        single path and the batched path both call this method, so their output
-        agrees exactly.
+        ``audio`` is the raw ``(out_count * hop,)`` decode of this request.
         """
         # Crossfade the overlap region with the withheld tail of the previous
         # chunk. The code stays functional (cat, not in-place), so it is safe
@@ -264,12 +292,15 @@ class StreamingDacDecoder:
             self.reset(request_id)
         return pcm
 
-    def add_frames(self, request_id: str, frames: torch.Tensor, is_final: bool) -> torch.Tensor:
+    def add_frames(
+        self, request_id: str, frames: torch.Tensor, is_final: bool,
+        ignore_eos: bool = False,
+    ) -> torch.Tensor:
         """Add the frames ``(num, n_codebooks)`` and decode what is ready.
 
         The result is an int16 PCM tensor ``(num_samples,)``. It can be empty.
         """
-        kind, plan = self._prep_window(request_id, frames, is_final)
+        kind, plan = self._prep_window(request_id, frames, is_final, ignore_eos)
         if kind == "done":
             return plan
         audio = self._decode_codes(plan["codes"].unsqueeze(0))[0]  # (out_count * hop,)
@@ -282,16 +313,21 @@ class StreamingDacDecoder:
         request_ids: list[str],
         frames_list: list[torch.Tensor],
         finals: list[bool],
+        ignore_eos: list[bool] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Run :meth:`add_frames` for several requests in one call.
 
         The method prepares the window of each request separately. It then
         stacks the windows of the same length into one DAC call.
         """
+        if ignore_eos is None:
+            ignore_eos = [False] * len(request_ids)
         results: dict[str, torch.Tensor] = {}
         groups: dict[int, list[tuple[str, dict]]] = {}
-        for rid, frames, is_final in zip(request_ids, frames_list, finals, strict=True):
-            kind, plan = self._prep_window(rid, frames, is_final)
+        for rid, frames, is_final, ign in zip(
+            request_ids, frames_list, finals, ignore_eos, strict=True,
+        ):
+            kind, plan = self._prep_window(rid, frames, is_final, ign)
             if kind == "done":
                 results[rid] = plan
             else:

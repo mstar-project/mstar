@@ -39,4 +39,36 @@ CUDA_VISIBLE_DEVICES=$DEVICES python mstar/api_server/entrypoint.py \
     --upload-dir /tmp/mstar_uploads_$WHO/ \
     --port $PORT \
     --tensor-comm-protocol $TENSOR_PROTOCOL \
-    --tcp-transfer-device ${TCP_DEVICE:-0.0.0.0.0}
+    --tcp-transfer-device ${TCP_DEVICE:-0.0.0.0.0} &
+SERVER_PID=$!
+trap 'kill $SERVER_PID 2>/dev/null' EXIT INT TERM
+
+# Warm up: a cold first prefill compiles for up to ~2 min. Two prompt lengths
+# per walk reach the dynamic-shape graph. ZONOS2_WARMUP=0 skips this.
+if [[ "${ZONOS2_WARMUP:-1}" == 1 ]]; then
+    until curl -sf "http://127.0.0.1:$PORT/health" >/dev/null; do
+        kill -0 $SERVER_PID 2>/dev/null || exit 1
+        sleep 5
+    done
+    WARM_DIR=$(mktemp -d)
+    URL="http://127.0.0.1:$PORT/generate"
+    ok=1
+    python test/zonos2/tts_request.py --url "$URL" --output "$WARM_DIR/a.wav" \
+        --text "Warming up." || ok=0
+    python test/zonos2/tts_request.py --url "$URL" --output "$WARM_DIR/b.wav" \
+        --text "The quick brown fox jumps over the lazy dog, twice." || ok=0
+    if [[ $ok == 1 ]]; then
+        python test/zonos2/tts_request.py --url "$URL" --ref-audio "$WARM_DIR/b.wav" \
+            --output "$WARM_DIR/c.wav" --text "Warming up." || ok=0
+        python test/zonos2/tts_request.py --url "$URL" --ref-audio "$WARM_DIR/b.wav" \
+            --output "$WARM_DIR/d.wav" \
+            --text "The quick brown fox jumps over the lazy dog, twice." || ok=0
+    fi
+    rm -rf "$WARM_DIR"
+    if [[ $ok == 1 ]]; then
+        echo "Zonos2 warm-up done; serving on port $PORT"
+    else
+        echo "Zonos2 warm-up FAILED; see the server log above" >&2
+    fi
+fi
+wait $SERVER_PID

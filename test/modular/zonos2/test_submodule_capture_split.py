@@ -188,10 +188,13 @@ def test_capture_style_padding_matches_unpadded_reals():
 
     # Master offset for the two reals must equal the step count (10), proving
     # padding rows (slot 0) were never synced over them.
-    for rid in reals:
-        slot = sub._sampler_buffers._rid_to_slot[rid]
-        # 9 syncs have landed (the 10th is still deferred), plus the pending one.
-        assert sub._sampler_buffers.offset_master[slot].item() in (9, 10)
+    bufs = sub._sampler_buffers
+    slots = [bufs._rid_to_slot[rid] for rid in reals]
+    # 9 syncs have landed; the 10th waits for the next preprocess.
+    assert sub._pending_sync_rids == reals
+    assert [bufs.offset_master[s].item() for s in slots] == [9, 9]
+    bufs.sync_after_step(sub._pending_sync_rids)
+    assert [bufs.offset_master[s].item() for s in slots] == [10, 10]
 
 
 def test_sync_before_register_no_clobber_on_slot_reuse():

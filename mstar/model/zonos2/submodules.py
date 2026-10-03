@@ -467,6 +467,9 @@ class Zonos2LLMSubmodule(ARNodeSubmodule):
                 request_id, self.max_positions, prompt_len,
             )
             finished = True
+        # Prefill has no loop to stop; the conductor's max-tokens cap ends it.
+        if getattr(request_info, "graph_walk", None) in ("prefill", "prefill_clone"):
+            return set()
         return {"decode_loop"} if finished else set()
 
     def cleanup_request(self, request_id: str):
@@ -481,9 +484,8 @@ class Zonos2DACSubmodule(NodeSubmodule):
 
     The node takes the streamed frames of a request and emits int16 PCM chunks.
     It decodes incrementally through :class:`StreamingDacDecoder`. On the final
-    chunk (``request_id in engine_inputs.final_stream_rids``) it flushes the
-    withheld crossfade tail. It drops the last ``n_codebooks - 1``
-    shear-alignment frames, because they hold no audio of their own.
+    chunk (``request_id in engine_inputs.final_stream_rids``) it decodes the
+    remaining frames and flushes the withheld crossfade tail.
     """
 
     # fp32, uncompiled: what ``get_stateless_flavor`` returning "audio_codec"
@@ -517,8 +519,7 @@ class Zonos2DACSubmodule(NodeSubmodule):
 
     def can_batch(self, batch, model_inputs) -> bool:
         # The decoder groups the windows of the same length into one DAC call.
-        # The result agrees exactly with per-request decoding, so any
-        # co-scheduled set is safe.
+        # Requests stay independent; on CUDA only float rounding can differ.
         return True
 
     def preprocess(
@@ -542,7 +543,10 @@ class Zonos2DACSubmodule(NodeSubmodule):
         rid = engine_inputs.request_ids[0]
         audio_codes = frames_list[0][:, : self.n_codebooks]
         is_final = rid in engine_inputs.final_stream_rids
-        pcm = self.decoder.add_frames(rid, audio_codes, is_final=is_final)
+        pcm = self.decoder.add_frames(
+            rid, audio_codes, is_final=is_final,
+            ignore_eos=self._ignore_eos(engine_inputs, rid),
+        )
         return {"audio_chunk": [pcm]}
 
     def forward_batched(
@@ -555,8 +559,16 @@ class Zonos2DACSubmodule(NodeSubmodule):
         rids = engine_inputs.request_ids
         finals = [rid in engine_inputs.final_stream_rids for rid in rids]
         codes = [f[:, : self.n_codebooks] for f in frames_list]
-        out = self.decoder.add_frames_batched(rids, codes, finals)
+        ignore = [self._ignore_eos(engine_inputs, rid) for rid in rids]
+        out = self.decoder.add_frames_batched(rids, codes, finals, ignore)
         return {rid: {"audio_chunk": [out[rid]]} for rid in rids}
+
+    @staticmethod
+    def _ignore_eos(engine_inputs: ModelInputsFromEngine, rid: str) -> bool:
+        """The request's ``ignore_eos``; the LLM node reads the same knob."""
+        info = (engine_inputs.per_request_info or {}).get(rid)
+        params = (getattr(info, "resource_configs", None) or {}).get(SAMPLING)
+        return bool(getattr(params, "ignore_eos", False))
 
     def cleanup_request(self, request_id: str):
         self.decoder.reset(request_id)

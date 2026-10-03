@@ -100,3 +100,12 @@ def test_no_cap_without_a_recorded_prompt():
     sub = _capped_sub(50, 30)
     sub._prompt_lens.clear()
     assert _first_stop_step(sub, {}) is None
+
+
+def test_prefill_never_signals_the_decode_loop():
+    # The prefill walk has no decode_loop; the conductor's cap ends a 1-frame request.
+    sub = _sub()
+    ri = SimpleNamespace(dynamic_loop_iter_counts={}, max_tokens=1, graph_walk="prefill")
+    assert sub.check_stop("r", ri, {"new_token": [_frame([])]}) == set()
+    ri.graph_walk = "decode"
+    assert sub.check_stop("r", ri, {"new_token": [_frame([])]}) == {"decode_loop"}

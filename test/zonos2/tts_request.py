@@ -74,6 +74,7 @@ def main() -> int:
 
     pcm = b""
     chunks = 0
+    error = None
     with requests.post(args.url, data=data, files=files, stream=True) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines():
@@ -83,6 +84,11 @@ def main() -> int:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if msg.get("modality") == "error":
+                # A failure after the 200 travels in-band as the last chunk.
+                status = (msg.get("metadata") or {}).get("status", 500)
+                error = f"{status}: {base64.b64decode(msg.get('data', '')).decode(errors='replace')}"
+                continue
             if msg.get("modality") != "audio":
                 continue
             data = msg.get("data", "")
@@ -90,6 +96,9 @@ def main() -> int:
                 pcm += base64.b64decode(data)
                 chunks += 1
 
+    if error is not None:
+        print(f"Server error {error}", file=sys.stderr)
+        return 1
     if not pcm:
         print("No audio received.", file=sys.stderr)
         return 1

@@ -254,3 +254,73 @@ def test_for_request_applies_kwargs_over_defaults_and_normalizes():
 def test_for_request_rejects_bad_values(kwargs, match):
     with pytest.raises(ValueError, match=match):
         TTSSamplingParams().for_request(kwargs, max_window=64)
+
+
+# -- parity with Zyphra's sampler (opt-in, see _reference.py) -----------------
+@pytest.fixture
+def ref_sampler(monkeypatch):
+    from _reference import load_reference  # pytest puts this dir on sys.path
+
+    (mod,) = load_reference(monkeypatch, "tts/sampler.py")
+    return mod
+
+
+def _ref_frames(ref, logits, p, rep_ids=None):
+    B = logits.shape[0]
+
+    def full(v):
+        return torch.full((B,), v)
+
+    out = ref.sample_tts(
+        logits, full(float(p.temperature)), full(p.topk), full(p.top_p), full(p.min_p),
+        repetition_token_ids=rep_ids, repetition_penalties=full(p.repetition_penalty),
+        text_vocab=99,
+    )
+    return torch.tensor(out)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_greedy_matches_reference(ref_sampler, seed):
+    g = torch.Generator().manual_seed(seed)
+    B, Cb, Vb, W = 4, 9, 1026, 16
+    logits = torch.randn(B, Cb, Vb, generator=g) * 3
+    rep = torch.randint(-1, Vb, (B, Cb, W), generator=g)
+    p = TTSSamplingParams(temperature=0.0, repetition_penalty=1.5)
+    ours = sample_frame(logits, p, repetition_token_ids=rep, text_placeholder=99, seed=0)
+    assert torch.equal(ours, _ref_frames(ref_sampler, logits, p, rep))
+
+
+@pytest.mark.parametrize("knobs", [
+    {"temperature": 1.0, "topk": 0, "top_p": 0.0, "min_p": 0.0},
+    {"temperature": 0.7, "topk": 4, "top_p": 0.0, "min_p": 0.0},
+    {"temperature": 1.0, "topk": 0, "top_p": 0.8, "min_p": 0.0},
+    {"temperature": 1.0, "topk": 0, "top_p": 0.0, "min_p": 0.2},
+    {},  # the shipped defaults
+])
+def test_sampled_distribution_matches_reference(ref_sampler, knobs):
+    """The draws differ by RNG, so compare frequencies over many independent draws."""
+    g = torch.Generator().manual_seed(0)
+    Vb, N = 12, 20_000
+    logits = (torch.randn(1, 2, Vb, generator=g) * 2).expand(N, -1, -1).contiguous()
+    rep = torch.full((N, 2, 4), -1, dtype=torch.long)
+    rep[:, :, 0] = logits[0].argmax(-1)  # penalize each codebook's top token
+    p = TTSSamplingParams(**knobs)
+    ours = sample_frame(logits, p, repetition_token_ids=rep, seed=7, steps=torch.arange(N))
+    torch.manual_seed(0)
+    theirs = _ref_frames(ref_sampler, logits, p, rep)
+    for c in range(2):
+        f_ours = torch.bincount(ours[:, c], minlength=Vb) / N
+        f_ref = torch.bincount(theirs[:, c], minlength=Vb) / N
+        assert 0.5 * (f_ours - f_ref).abs().sum() < 0.03, (c, f_ours, f_ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton codegen needs a GPU")
+def test_seeded_sampling_compiles_for_cuda():
+    # The hash constants once exceeded int32, which Triton rejects beside an index.
+    logits = torch.randn(4, 9, 1026, device="cuda")
+    steps = torch.arange(4, device="cuda")
+    seeds = torch.arange(4, device="cuda") * 7919
+    p = TTSSamplingParams()
+    compiled = torch.compile(sample_frame, fullgraph=False)
+    got = compiled(logits, p, seed=seeds, steps=steps)
+    assert torch.equal(got, sample_frame(logits, p, seed=seeds, steps=steps))

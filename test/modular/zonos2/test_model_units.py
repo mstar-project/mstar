@@ -500,8 +500,8 @@ def test_prompt_that_leaves_no_room_to_speak_is_rejected():
         return model.process_prompt("a" * n, ["text"], ["audio"])["text_inputs"][0]
 
     overhead = frames(1).shape[0] - 1
-    fits = 100 - (model.config.n_codebooks + 1) - overhead
-    assert frames(fits).shape[0] + model.config.n_codebooks + 1 == 100
+    fits = 100 - 2 - overhead
+    assert frames(fits).shape[0] + 2 == 100
     with pytest.raises(ValueError, match=f"at most {fits} bytes fit") as exc:
         frames(fits + 1)
     assert "100-position context" in str(exc.value)
@@ -514,9 +514,8 @@ def _prompt(model, **kwargs):
 
 @pytest.mark.parametrize("kwargs, match", [
     ({"temperature": "hot"}, "must be a number"),
-    ({"max_output_tokens": 8}, "at least 9 frames"),
-    ({"max_output_tokens": 0}, "at least 9 frames"),
-    ({"max_tokens": -1}, "at least 9 frames"),
+    ({"max_output_tokens": 0}, "at least 1"),
+    ({"max_tokens": -1}, "at least 1"),
     ({"max_output_tokens": 12.0}, "must be an integer"),
     ({"speaking_rate_enabled": "yes"}, "must be true or false"),
 ])
@@ -530,7 +529,7 @@ def test_frame_budget_reads_max_tokens_as_an_alias():
     assert model.get_max_output_tokens() == model.sampling_params.max_tokens
     assert model.get_max_output_tokens(max_tokens=50) == 50
     assert model.get_max_output_tokens(max_tokens=50, max_output_tokens=70) == 70
-    _prompt(model, max_output_tokens=model.config.n_codebooks)  # the smallest accepted
+    _prompt(model, max_output_tokens=1)  # the smallest accepted
 
 
 def test_request_knobs_reach_the_resource_config():

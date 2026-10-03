@@ -203,6 +203,14 @@ def apply_repetition_penalty(
 _M32 = 0xFFFFFFFF
 
 
+def _i32(k: int) -> int:
+    """``k`` as a signed int32; Triton rejects a larger literal times an index.
+
+    The low 32 bits of ``x * k`` are unchanged, so the hash after ``& _M32`` is too.
+    """
+    return k - (1 << 32) if k >= 1 << 31 else k
+
+
 def _fmix32(h: torch.Tensor) -> torch.Tensor:
     """Apply the MurmurHash3 ``fmix32`` finalizer to uint32 values in int64.
 
@@ -242,9 +250,9 @@ def _deterministic_uniform(
     else:
         base = int(seed) & _M32
     # The chained fmix32 rounds mix every field into the result.
-    h = (v * 0x27D4EB2F) & _M32
-    h = _fmix32(h ^ (c * 0x85EBCA77))
-    h = _fmix32(h ^ (s * 0xC2B2AE3D))
+    h = (v * _i32(0x27D4EB2F)) & _M32
+    h = _fmix32(h ^ ((c * _i32(0x85EBCA77)) & _M32))
+    h = _fmix32(h ^ ((s * _i32(0xC2B2AE3D)) & _M32))
     h = _fmix32(h ^ base)
     return (h.to(torch.float64) / 4294967296.0).to(dtype)
 

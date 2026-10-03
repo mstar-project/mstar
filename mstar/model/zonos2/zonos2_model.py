@@ -545,33 +545,23 @@ class Zonos2Model(Model):
         return flags
 
     def _check_max_output_tokens(self, kwargs: dict) -> None:
-        """Reject a frame budget too small to produce audio.
-
-        The DAC holds back the last ``n_codebooks - 1`` frames, so the budget
-        must be at least ``n_codebooks``. The reference rejects only ``<= 0``,
-        which would leave 1-8 returning 200 with no audio.
-        """
+        """Reject a non-integer or non-positive frame budget, as the reference does."""
         for key in ("max_output_tokens", "max_tokens"):
             value = kwargs.get(key)
             if value is None:
                 continue
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError(f"{key} must be an integer, got {value!r}.")
-            minimum = self.config.n_codebooks
-            if value < minimum:
-                raise ValueError(
-                    f"{key} is {value}; at least {minimum} frames are needed for any "
-                    f"audio, because the decoder holds back the last {minimum - 1}."
-                )
+            if value <= 0:
+                raise ValueError(f"{key} must be at least 1, got {value}.")
 
     def _check_prompt_fits(self, text: str, num_frames: int) -> None:
         """Reject a prompt that leaves no room in the trained context for audio.
 
-        The DAC drops the last ``n_codebooks - 1`` frames, so fewer than
-        ``n_codebooks + 1`` generated frames give empty audio.
+        Two spare positions, so the context stop lands in the decode loop, not prefill.
         """
         limit = self.config.max_position_embeddings
-        budget = limit - (self.config.n_codebooks + 1)
+        budget = limit - 2
         if num_frames > budget:
             n_bytes = len(text.encode("utf-8"))
             raise ValueError(
@@ -710,6 +700,7 @@ class Zonos2Model(Model):
             model_type=self.config.dac_model_type,
             overlap_frames=self.config.dac_overlap_frames,
             hop_length=self.config.dac_hop_length,
+            eoa_id=self.config.eoa_id,
         )
         return Zonos2DACSubmodule(decoder, self.config.n_codebooks).to(device)
 
