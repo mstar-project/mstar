@@ -250,6 +250,42 @@ def test_process_prompt_turbo_rejects_short_reference():
         )
 
 
+def _tone(seconds: float, sr: int = 24000) -> torch.Tensor:
+    t = torch.arange(int(seconds * sr)) / sr
+    return 0.3 * torch.sin(2 * torch.pi * 220 * t)
+
+
+# Each of these crashed the voice encoder (500) or cloned noise with a 200
+@pytest.mark.parametrize("wav,message", [
+    (torch.full((2 * 24000,), float("nan")), "NaN or infinite"),
+    (torch.full((2 * 24000,), float("inf")), "NaN or infinite"),
+    (torch.cat([_tone(1.0), torch.tensor([float("nan")])]), "NaN or infinite"),
+    (torch.tensor([0.1]), "s of sound once silence is trimmed"),
+    (_tone(0.016), "s of sound once silence is trimmed"),
+    (_tone(0.3), "s of sound once silence is trimmed"),
+    # 6.2 s long, but the encoder's trim keeps only the burst (frame-rounded)
+    (torch.cat([torch.zeros(3 * 24000), _tone(0.2), torch.zeros(3 * 24000)]), r"has 0\.\d+ s of sound"),
+])
+def test_process_prompt_rejects_unusable_reference(wav, message):
+    with pytest.raises(ValueError, match=message):
+        _make_model().process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [wav]})
+
+
+def test_process_prompt_accepts_short_but_usable_reference():
+    out = _make_model().process_prompt(
+        "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [_tone(0.6)]},
+    )
+    assert out[REF_AUDIO][0].numel() == int(0.6 * 24000)
+
+
+def test_undecodable_reference_is_a_client_error(tmp_path):
+    pytest.importorskip("torchcodec")
+    bad = tmp_path / "ref.wav"
+    bad.write_bytes(b"hello world" * 100)
+    with pytest.raises(ValueError, match="Could not decode the reference audio"):
+        ChatterboxModel._decode_audio(str(bad))
+
+
 @pytest.mark.parametrize("prompt,inputs,outputs,kwargs,message", [
     ("", ["text"], ["audio"], {}, "non-empty"),
     ("   ", ["text"], ["audio"], {}, "non-empty"),
@@ -296,7 +332,7 @@ def test_generation_kwargs_defaults_and_turbo_guards():
     assert knobs["max_new_tokens"] == 1000 and knobs["n_cfm_timesteps"] == 10
     assert model.resolve_generation_kwargs({"do_sample": False})["temperature"] == 0.0
     assert model.get_max_output_tokens(max_new_tokens=42) == 42
-    with pytest.raises(ValueError, match="exceeds"):
+    with pytest.raises(ValueError, match=r"max_new_tokens=5000 is outside \[1, 4096\]"):
         model.resolve_generation_kwargs({"max_new_tokens": 5000})
 
     configs = model.get_request_resource_configs({}, {"cfg_weight": 0.3, "temperature": 0.5, "seed": 1})
@@ -311,6 +347,64 @@ def test_generation_kwargs_defaults_and_turbo_guards():
     assert knobs["cfg_weight"] == 0.0 and knobs["exaggeration"] == 0.0 and knobs["min_p"] == 0.0
     assert knobs["top_k"] == 1000 and knobs["top_p"] == 0.95
     assert turbo.get_request_resource_configs({}, {})[T3_KV].needed_labels == [COND_LABEL]
+
+
+# Each of these hung a request for 600 s, failed its whole batch, or was
+# served as a 200 with the wrong audio before the knobs were checked
+@pytest.mark.parametrize("knobs,message", [
+    ({"max_new_tokens": 0}, r"max_new_tokens=0 is outside"),
+    ({"max_new_tokens": -5}, r"max_new_tokens=-5 is outside"),
+    ({"max_new_tokens": 4097}, r"max_new_tokens=4097 is outside"),
+    ({"max_new_tokens": "abc"}, "max_new_tokens must be an integer"),
+    ({"max_new_tokens": 12.7}, "max_new_tokens must be an integer"),
+    ({"max_output_tokens": 0}, r"max_new_tokens=0 is outside"),
+    ({"temperature": -1}, r"temperature=-1.0 is outside"),
+    ({"temperature": float("nan")}, "temperature must be a finite number"),
+    ({"top_p": 1.5}, r"top_p=1.5 is outside"),
+    ({"top_k": -3}, r"top_k=-3 is outside"),
+    ({"min_p": 2.0}, r"min_p=2.0 is outside"),
+    ({"min_p": -0.5}, r"min_p=-0.5 is outside"),
+    ({"repetition_penalty": 0}, r"repetition_penalty=0.0 is outside \(0.0"),
+    ({"repetition_penalty": -1}, "repetition_penalty=-1.0 is outside"),
+    ({"cfg_weight": "x"}, "cfg_weight must be a finite number"),
+    ({"cfg_weight": -1}, "cfg_weight=-1.0 is outside"),
+    ({"cfg_weight": float("nan")}, "cfg_weight must be a finite number"),
+    ({"exaggeration": float("nan")}, "exaggeration must be a finite number"),
+    ({"exaggeration": float("inf")}, "exaggeration must be a finite number"),
+    ({"n_cfm_timesteps": 0}, r"n_cfm_timesteps=0 is outside"),
+    ({"n_cfm_timesteps": -2}, r"n_cfm_timesteps=-2 is outside"),
+    ({"n_cfm_timesteps": 101}, r"n_cfm_timesteps=101 is outside \[1, 100\]"),
+    ({"watermark": "false"}, "watermark must be true or false"),
+    ({"do_sample": "false"}, "do_sample must be true or false"),
+    ({"ignore_eos": 1}, "ignore_eos must be true or false"),
+    ({"seed": 2**63}, "seed=.* is outside"),
+    ({"seed": -1}, "seed=-1 is outside"),
+    ({"seed": True}, "seed must be an integer"),
+    ({"temperature": True}, "temperature must be a finite number"),
+])
+def test_generation_kwargs_reject_bad_values(knobs, message):
+    for variant in ("chatterbox", "turbo"):
+        with pytest.raises(ValueError, match=message):
+            _make_model(variant).resolve_generation_kwargs(knobs)
+    # preprocessing checks them too, so the client gets a 400 before the conductor sees them
+    with pytest.raises(ValueError, match=message):
+        _make_model().process_prompt("hello", ["text"], ["audio"], **knobs)
+
+
+def test_generation_kwargs_accept_boundary_values():
+    model = _make_model()
+    knobs = model.resolve_generation_kwargs({
+        "max_new_tokens": 1.0, "temperature": 0, "top_p": 1, "top_k": 0, "min_p": 1,
+        "cfg_weight": 0, "exaggeration": 0, "n_cfm_timesteps": 100, "seed": 0,
+        "watermark": False, "do_sample": True, "ignore_eos": True,
+    })
+    assert knobs["max_new_tokens"] == 1 and isinstance(knobs["max_new_tokens"], int)
+    assert knobs["temperature"] == 0.0 and knobs["n_cfm_timesteps"] == 100
+    assert knobs["watermark"] is False and knobs["ignore_eos"] is True
+    assert model.resolve_generation_kwargs({"max_new_tokens": 4096})["max_new_tokens"] == 4096
+    # other request fields ride along in the same kwargs and are left alone
+    out = model.process_prompt("hello", ["text"], ["audio"], voice="default", language_id=None, seed=7)
+    assert set(out) == {TEXT_INPUTS}
 
 
 # ---------------------------------------------------------------------------

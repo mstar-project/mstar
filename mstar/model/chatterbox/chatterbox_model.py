@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -58,9 +59,10 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
-from mstar.model.chatterbox.components.audio_frontend import resample
+from mstar.model.chatterbox.components.audio_frontend import resample, trim_silence
 from mstar.model.chatterbox.config import (
     COND_LABEL,
+    S3_SR,
     S3GEN_NODE,
     S3GEN_SR,
     T3_ATTN,
@@ -100,6 +102,13 @@ _T3_KNOBS = ("cfg_weight", "exaggeration", "min_p", "max_new_tokens")
 _S3GEN_KNOBS = ("n_cfm_timesteps", "watermark")
 
 MAX_REFERENCE_SECONDS = 30.0
+# Sound left after the voice encoder's silence trim; shorter clips crash its
+# STFT (under 12.5 ms) or clone noise (40 ms gave WER 1.0)
+MIN_REFERENCE_SECONDS = 0.5
+# Bounds S3Gen time per chunk; the reference uses 10 (Turbo 2)
+MAX_CFM_TIMESTEPS = 100
+# Sentence chunking adds the chunk index to the seed, so leave int64 headroom
+MAX_SEED = 2**62
 
 
 class ChatterboxModel(Model):
@@ -293,25 +302,40 @@ class ChatterboxModel(Model):
 
         Turbo has no guidance, no exaggeration and no min-p; a request that
         asks for them gets the reference behaviour (ignored) with a warning.
+
+        Every value is checked here, so ``process_prompt`` answers a bad one
+        with a 400 before the conductor or a worker sees it.
         """
         mk = dict(model_kwargs or {})
         g = self.config.generation
-        do_sample = bool(mk.get("do_sample", True))
+        do_sample = _flag("do_sample", mk.get("do_sample", True))
+        temperature = _number("temperature", mk.get("temperature", g.temperature), low=0.0)
         knobs = {
-            "temperature": float(mk.get("temperature", g.temperature)) if do_sample else 0.0,
-            "top_p": float(mk.get("top_p", g.top_p)),
-            "top_k": int(mk.get("top_k", g.top_k)),
-            "min_p": float(mk.get("min_p", g.min_p)),
-            "repetition_penalty": float(mk.get("repetition_penalty", g.repetition_penalty)),
-            "cfg_weight": float(mk.get("cfg_weight", g.cfg_weight)),
-            "exaggeration": float(mk.get("exaggeration", g.exaggeration)),
-            "max_new_tokens": int(
-                mk.get("max_new_tokens", mk.get("max_output_tokens", g.max_new_tokens))
+            "temperature": temperature if do_sample else 0.0,
+            "top_p": _number("top_p", mk.get("top_p", g.top_p), low=0.0, high=1.0),
+            "top_k": _integer("top_k", mk.get("top_k", g.top_k), low=0),
+            "min_p": _number("min_p", mk.get("min_p", g.min_p), low=0.0, high=1.0),
+            "repetition_penalty": _number(
+                "repetition_penalty", mk.get("repetition_penalty", g.repetition_penalty),
+                low=0.0, low_open=True,
             ),
-            "n_cfm_timesteps": int(mk.get("n_cfm_timesteps", g.n_cfm_timesteps)),
-            "watermark": bool(mk.get("watermark", g.watermark)),
-            "ignore_eos": bool(mk.get("ignore_eos", False)),
+            "cfg_weight": _number("cfg_weight", mk.get("cfg_weight", g.cfg_weight), low=0.0),
+            "exaggeration": _number("exaggeration", mk.get("exaggeration", g.exaggeration), low=0.0),
+            "max_new_tokens": _integer(
+                "max_new_tokens",
+                mk.get("max_new_tokens", mk.get("max_output_tokens", g.max_new_tokens)),
+                low=1, high=self.config.t3.max_speech_tokens,
+            ),
+            "n_cfm_timesteps": _integer(
+                "n_cfm_timesteps", mk.get("n_cfm_timesteps", g.n_cfm_timesteps),
+                low=1, high=MAX_CFM_TIMESTEPS,
+            ),
+            "watermark": _flag("watermark", mk.get("watermark", g.watermark)),
+            "ignore_eos": _flag("ignore_eos", mk.get("ignore_eos", False)),
         }
+        # the conductor seeds the request with it; checked here, not returned
+        if mk.get("seed") is not None:
+            _integer("seed", mk["seed"], low=0, high=MAX_SEED)
         if self.config.is_turbo and (
             knobs["cfg_weight"] > 0 or knobs["exaggeration"] > 0 or knobs["min_p"] > 0
         ):
@@ -319,11 +343,6 @@ class ChatterboxModel(Model):
                 "Chatterbox-Turbo ignores cfg_weight, exaggeration and min_p"
             )
             knobs.update(cfg_weight=0.0, exaggeration=0.0, min_p=0.0)
-        if knobs["max_new_tokens"] > self.config.t3.max_speech_tokens:
-            raise ValueError(
-                f"max_new_tokens {knobs['max_new_tokens']} exceeds the T3 limit "
-                f"{self.config.t3.max_speech_tokens}"
-            )
         return knobs
 
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
@@ -464,8 +483,13 @@ class ChatterboxModel(Model):
             logger.debug("soundfile could not decode %s (%s); trying torchcodec", filepath, exc)
             from torchcodec.decoders import AudioDecoder
 
-            decoder = AudioDecoder(filepath, sample_rate=S3GEN_SR, num_channels=1)
-            return decoder.get_all_samples().data[0].float()
+            # an undecodable upload is the client's error (400); a missing
+            # decoder library above still surfaces as a server error
+            try:
+                decoder = AudioDecoder(filepath, sample_rate=S3GEN_SR, num_channels=1)
+                return decoder.get_all_samples().data[0].float()
+            except RuntimeError as decode_exc:
+                raise ValueError(f"Could not decode the reference audio: {decode_exc}") from decode_exc
         if sr != S3GEN_SR:
             wav = resample(wav, sr, S3GEN_SR)
         return wav
@@ -488,9 +512,18 @@ class ChatterboxModel(Model):
         wav = wav.detach().to("cpu", torch.float32).reshape(-1)
         if wav.numel() == 0:
             raise ValueError("Reference audio is empty")
+        if not torch.isfinite(wav).all():
+            raise ValueError("Reference audio has NaN or infinite samples")
         max_len = int(MAX_REFERENCE_SECONDS * S3GEN_SR)
         if wav.numel() > max_len:
             wav = wav[:max_len]
+        # the same trim the voice encoder applies before its STFT
+        sound = trim_silence(resample(wav, S3GEN_SR, S3_SR), top_db=20.0).numel() / S3_SR
+        if sound < MIN_REFERENCE_SECONDS:
+            raise ValueError(
+                f"Reference audio has {sound:.2f} s of sound once silence is trimmed; "
+                f"at least {MIN_REFERENCE_SECONDS} s is needed"
+            )
         if self.config.is_turbo:
             if wav.numel() < 5 * S3GEN_SR:
                 raise ValueError("Chatterbox-Turbo needs a reference clip longer than 5 s")
@@ -512,6 +545,8 @@ class ChatterboxModel(Model):
             raise ValueError("Chatterbox takes text plus an optional reference audio clip")
         if set(output_modalities) != {"audio"}:
             raise ValueError("Chatterbox produces audio output only")
+        # a bad knob fails here as a 400; past this point it would hang the request
+        self.resolve_generation_kwargs(kwargs)
 
         text_ids = self._tokenize(prompt, kwargs.get("language_id"))
         if text_ids.numel() > self.config.max_text_tokens:
@@ -878,6 +913,40 @@ class ChatterboxModel(Model):
         from mstar.model.chatterbox.components.watermark import PerthWatermarker
 
         return PerthWatermarker.build(device) if self.config.generation.watermark else None
+
+
+def _flag(name: str, value: Any) -> bool:
+    """A JSON boolean; a string such as "false" is refused, not read as true."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be true or false, got {value!r}")
+    return value
+
+
+def _number(
+    name: str, value: Any, *, low: float | None = None, high: float | None = None,
+    low_open: bool = False,
+) -> float:
+    """A finite number in [low, high], or (low, high] when ``low_open``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    value = float(value)
+    too_low = low is not None and (value <= low if low_open else value < low)
+    if too_low or (high is not None and value > high):
+        lo = "-inf" if low is None else low
+        hi = "inf" if high is None else high
+        raise ValueError(f"{name}={value} is outside {'(' if low_open else '['}{lo}, {hi}]")
+    return value
+
+
+def _integer(name: str, value: Any, *, low: int, high: int | None = None) -> int:
+    """An integer in [low, high]; a float is taken only when it is whole (2.0, not 2.5)."""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    if value < low or (high is not None and value > high):
+        raise ValueError(f"{name}={value} is outside [{low}, {'inf' if high is None else high}]")
+    return value
 
 
 def _graph_rows(max_rows: int) -> tuple[int, ...]:
