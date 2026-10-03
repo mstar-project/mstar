@@ -288,6 +288,25 @@ def test_conductor_drain_for_a_never_admitted_rid_acks_at_once():
     assert len(_reads_done(w)) == 1
 
 
+def test_follower_drops_the_conductors_remove_instead_of_parking_it():
+    """A follower acts only on its leader's REMOVE. When that one lands first,
+    the conductor's copy arrives for a rid already gone; parked, it stayed
+    forever. The leader's still waits for a NEW that hasn't arrived."""
+    w = _worker(known_rids=(), is_follower=True)
+    w._unprocessed_messages = {}
+    Worker._process_message_list(w, [
+        WorkerMessage(
+            message_type=WorkerMessageType.REMOVE_REQUEST,
+            body=RemoveRequest(request_id="X"),
+        ),
+        WorkerMessage(
+            message_type=WorkerMessageType.REMOVE_REQUEST,
+            body=RemoveRequest(request_id="Y", source=MessageSource.TP_RANK_0),
+        ),
+    ])
+    assert list(w._unprocessed_messages) == ["Y"]
+
+
 def test_draining_rid_still_takes_inputs_for_a_queued_tp_follow():
     """READS_DONE waits for a committed follow batch, so dropping the inputs
     that batch needs would stall the drain and hold the REMOVE forever."""

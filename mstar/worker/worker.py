@@ -883,6 +883,14 @@ class Worker:
         # signals onto this same list, and mutating it while iterating it would
         # never terminate.
         for message in list(messages):
+            if (
+                message.message_type == WorkerMessageType.REMOVE_REQUEST
+                and message.body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF)
+                and self.is_tp_follower
+            ):
+                # a follower acts only on its leader's REMOVE; parked, the
+                # conductor's copy of one that already ran would stay forever
+                continue
             # per_request_info is handle-keyed, so resolve the wire string
             # first; an unknown one has no handle and is parked the same way.
             needs_active = message.message_type in msg_types_needing_active_request or (
