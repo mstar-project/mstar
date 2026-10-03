@@ -188,6 +188,25 @@ def test_cli_adapter_and_benchmark_entries_are_registered():
         sys.path.remove(repo_root)
 
 
+def test_speech_adapter_fetches_a_reference_url_only_when_the_server_allows(tmp_path, monkeypatch):
+    from mstar.api_server import media_io
+    from mstar.api_server.openai.adapters import ChatterboxAdapter
+
+    req = SimpleNamespace(
+        input="Hi", voice=None, temperature=None, top_p=None, seed=None,
+        model_extra={"ref_audio": "http://example.invalid/ref.wav"},
+    )
+    fetched = []
+    monkeypatch.setattr(media_io, "save_remote_url", lambda url, d: fetched.append(url) or ("audio", "/x.wav"))
+    monkeypatch.delenv("MSTAR_ALLOW_REMOTE", raising=False)
+    with pytest.raises(ValueError, match="Remote media fetch is disabled"):
+        ChatterboxAdapter().speech_to_request(req, tmp_path)
+    assert fetched == []
+    monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
+    args = ChatterboxAdapter().speech_to_request(req, tmp_path)
+    assert fetched == ["http://example.invalid/ref.wav"] and args.file_paths == {"audio": ["/x.wav"]}
+
+
 def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
     from mstar.api_server.openai.adapters import ChatterboxAdapter
 
@@ -802,7 +821,7 @@ def _run(sub, tokens, is_final=None, rid="r"):
 def test_s3gen_offline_chunk_filters_control_tokens_and_uses_builtin_voice():
     sub, fake = _s3_submodule()
     tokens = torch.tensor([[6561], [10], [20], [6562]])  # BOS, speech, speech, EOS
-    prepared, pcm = _run(sub, tokens)  # no engine flag: EOS marks the end
+    prepared, pcm = _run(sub, tokens, is_final=True)
     assert prepared.tensor_inputs[SPEECH_TOKENS].tolist() == [10, 20]
     assert prepared.kwargs["ref"] is sub.builtin_voice and prepared.kwargs["seed"] == 7
     assert prepared.kwargs["n_timesteps"] == 4 and prepared.kwargs["watermark"] is False
@@ -811,18 +830,33 @@ def test_s3gen_offline_chunk_filters_control_tokens_and_uses_builtin_voice():
     assert fake.calls[0][1:4] == ((1, 2), 2, 4) and fake.calls[0][5] is True
 
 
+def test_s3gen_stop_token_does_not_end_the_stream():
+    # ignore_eos decodes past the stop token; only the engine's flag ends the stream
+    sub, _ = _s3_submodule()
+    prepared, a = _run(sub, torch.tensor([[10], [6562]]), is_final=False)
+    assert prepared.kwargs["is_final"] is False
+    prepared, b = _run(sub, torch.tensor([[6562]]))  # no flag at all
+    assert prepared.kwargs["is_final"] is False
+    prepared, c = _run(sub, torch.tensor([[30], [40]]), is_final=True)
+    assert prepared.kwargs["is_final"] is True
+    # the speech after the stop tokens is vocoded: as much audio as 10, 30, 40 in one chunk
+    whole, _ = _s3_submodule()
+    _, ref = _run(whole, torch.tensor([[10], [30], [40]]), is_final=True)
+    assert a.numel() + b.numel() + c.numel() == ref.numel() > 0
+
+
 def test_s3gen_turbo_appends_silence_and_empty_input_yields_no_audio():
     sub, fake = _s3_submodule("turbo")
-    prepared, pcm = _run(sub, torch.tensor([[5], [6562]]))
+    prepared, pcm = _run(sub, torch.tensor([[5], [6562]]), is_final=True)
     assert prepared.tensor_inputs[SPEECH_TOKENS].tolist() == [5]
     assert fake.calls[0][1] == (1, 4)  # 5 + three silence tokens
     assert pcm.numel() == 4 * 2 * 480
 
     sub, fake = _s3_submodule("turbo")
-    _, pcm = _run(sub, torch.tensor([[6562]]))
+    _, pcm = _run(sub, torch.tensor([[6562]]), is_final=True)
     assert pcm.numel() == 0 and fake.calls == []
     sub, fake = _s3_submodule("turbo")
-    _, pcm = _run(sub, None)  # empty final flush
+    _, pcm = _run(sub, None, is_final=True)  # empty final flush
     assert pcm.numel() == 0
 
 

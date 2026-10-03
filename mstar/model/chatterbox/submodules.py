@@ -640,10 +640,9 @@ class S3GenSubmodule(NodeSubmodule):
             if chunk is None or chunk.numel() == 0
             else chunk.to(device, torch.long).reshape(-1)
         )
-        # The engine names the final chunk; without that (older engines) the
-        # stream ends with T3's stop token or an empty flush.
-        is_final = bool(kwargs.get("is_final_stream_chunk", False)) or chunk is None \
-            or bool((raw == self.config.t3.stop_speech_token).any())
+        # Only the engine's final-chunk flag ends the stream: a stop token does
+        # not, or ``ignore_eos`` decoding past it would never be vocoded
+        is_final = bool(kwargs.get("is_final_stream_chunk", False))
         # BOS/EOS and any other control id are not speech (reference
         # ``drop_invalid_tokens`` + ``< 6561`` filter)
         tokens = raw[raw < self.config.s3gen.vocab_size]

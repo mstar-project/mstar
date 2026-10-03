@@ -449,7 +449,8 @@ class ChatterboxAdapter(OpenAIAdapter):
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
-            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir, allow_remote=True)
+            # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
+            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir, allow_remote=False)
             file_paths = {"audio": [path]}
             input_modalities = ["text", "audio"]
         return SubmitArgs(

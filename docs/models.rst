@@ -223,12 +223,17 @@ Chatterbox notes
 - Requests: ``/v1/audio/speech`` with ``input``, ``voice`` (``default`` = the
   voice shipped in the checkpoint, or a preset name resolved under the
   deployment's ``model_kwargs: voices_dir``), and in ``extra_body``
-  ``ref_audio`` (data URL / base64 / path / URL of a reference clip, 5-30 s,
-  cloning), ``exaggeration`` (0-1, emotion intensity, default 0.5),
+  ``ref_audio`` (data URL / base64 / path of a reference clip, 5-30 s,
+  cloning; an http(s) URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``), ``exaggeration`` (0-1, emotion intensity, default 0.5),
   ``cfg_weight`` (default 0.5; 0 disables guidance and halves the T3 work),
   ``temperature``/``top_p``/``top_k``/``min_p``/``repetition_penalty``,
   ``seed``, ``n_cfm_timesteps`` (S3Gen Euler steps, 10; Turbo 2),
-  ``max_new_tokens`` and ``watermark`` (default on). Turbo ignores
+  ``max_new_tokens``, ``ignore_eos`` (T3 decodes all ``max_new_tokens``
+  past the stop token, for fixed-length benchmarks; the speech tokens among
+  them are vocoded, but T3 keeps emitting stop and control tokens after the
+  end of speech and those are dropped, so the audio is shorter than
+  ``max_new_tokens`` / 25 s: 4096 tokens gave 117 s on base and 141 s on
+  Turbo, not 164 s) and ``watermark`` (default on). Turbo ignores
   ``cfg_weight``, ``exaggeration`` and ``min_p`` like the reference package.
   The native ``/generate`` route and ``client.tts(...)`` take the same knobs;
   a clip uploaded as ``audio`` input is the reference voice.
@@ -288,8 +293,15 @@ Chatterbox notes
 - Reference clips are decoded with ``soundfile`` (WAV/FLAC/OGG/MP3 through
   the bundled libsndfile); other codecs fall back to ``torchcodec``, which
   needs FFmpeg's shared libraries on the node.
-- Text longer than 512 tokens is rejected: the reference model has no chunking
-  either; split long inputs into sentences client-side.
+- Keep each request short, a sentence or two. Text longer than 512 tokens is
+  rejected, but quality drops well before that, as it does in the reference
+  package: on three-sentence inputs (600-720 characters) Turbo often drops or
+  babbles the last sentence (median WER 0.10, reference 0.12; base 0.02), and
+  1,500-2,000 characters come back from Turbo as a second or so of unrelated
+  speech, with a 200. For long text send ``sentence_chunking: true`` in
+  ``extra_body``: the server splits it into sentence groups of up to 400
+  characters (at most 32) and synthesises them in order, or split it
+  client-side.
 - Benchmarks and parity scripts live in ``benchmark/chatterbox/``
   (``bench_all.sh`` drives M*, Chatterbox-TTS-Server and chatterbox-vllm on
   one GPU; ``reference_greedy.py`` + ``serve_parity.py`` compare a served
