@@ -22,7 +22,13 @@ from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
 from mstar.conductor.conductor import Conductor
 from mstar.engine.resources import SamplingReqConfig
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVSpec,
+    PagedKVConfig,
+    RingKVConfig,
+    RingKVLayerConfig,
+)
 from mstar.engine.resources.kv.keys import chain
 from mstar.model.base import PrefixStream, ProcessPromptOutput
 from mstar.model.orpheus.config import OrpheusModelConfig
@@ -391,6 +397,38 @@ def test_orpheus_is_handed_a_config_for_the_stream_it_declares():
 
 # ── max_tokens on every kv cache ─────────────────────────────────────────
 
+
+class _RingModel(_SamplerOnlyModel):
+    """Beside its paged cache, a ring cache, as Waypoint's frames keep one."""
+
+    def get_node_resources(self):
+        ring = RingKVConfig(
+            num_layers=1, num_kv_heads=1, head_dim=8, tokens_per_frame=4,
+            layers=(RingKVLayerConfig(ring_frames=2, ring_buckets=1, pinned_dilation=1),),
+        )
+        return [*super().get_node_resources(), KVSpec(resource_key="ring", nodes={"DiT"}, config=ring)]
+
+
+def test_a_ring_cache_is_handed_no_reservation_to_admit_by():
+    configs = _conductor_configs(_RingModel(), {}, max_tokens=16)
+
+    assert configs["kv"].max_tokens == 16 and "ring" not in configs, (
+        "a ring cache, which keeps a window, was handed a paged cache's reservation"
+    )
+
+
+def test_opening_a_request_builds_none_of_the_models_resources():
+    model = _RingModel()
+    conductor = SimpleNamespace(model=model, _kv_cache_keys=Conductor._paged_kv_keys(model))
+
+    def rebuilt():
+        raise AssertionError("a request rebuilt the model's resource specs")
+
+    model.get_node_resources = rebuilt
+
+    configs = Conductor._get_resource_configs(conductor, {}, {})
+
+    assert "kv" in configs, "the paged cache got no config to admit by"
 
 def test_whisper_is_handed_max_tokens_on_both_of_its_caches():
     whisper = WhisperModel.__new__(WhisperModel)
