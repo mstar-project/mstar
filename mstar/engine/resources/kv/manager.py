@@ -405,7 +405,6 @@ class KVManager(AttentionResource):
         # spec, or the spec leader's. A guidance pool under CFG parallel only
         # reserves what the leader admitted, so no room is checked on it
         self._leads = leads
-        # and whether it admits by that count itself, as rank 0 of its group
         self._decides = self._rank == 0 and leads
         self._reserved: dict[str, Reservation] = {}
         # requests that asked and have not reserved, in the order they first asked
@@ -992,8 +991,7 @@ class KVManager(AttentionResource):
             num_pages = -(-length // page_size)
             page_idxs = stream.page_indices[:num_pages]
             if self._is_padding(s.request_id) or self._unheld(s.request_id, s.label):
-                # a replay's padding row, or a label its request holds nothing
-                # in, took no page of its own: its tokens land in the sink
+                # took no page of its own (see `_in_sink`): its tokens land in the sink
                 page_idxs += [SINK_PAGE] * (num_pages - len(page_idxs))
             views.append(SequenceView(
                 request_id=s.request_id,
@@ -1205,8 +1203,7 @@ class KVManager(AttentionResource):
                 # tokens (image_gen, action_gen) still read these pages, and
                 # leaving the mark set would make the request unevictable
                 stream.step_in_flight = False
-                # what a label the request holds nothing in wrote went to the
-                # sink, so it keeps no length a reload would size pages for
+                # went to the sink: a length kept here would stretch every later view of it over sink pages
                 if (
                     step.commit and segment.span > 0
                     and not self._unheld(segment.request_id, segment.label)
@@ -1740,7 +1737,6 @@ class KVManager(AttentionResource):
                     for rid, res in self._reserved.items() if held[rid] > res.pages
                 }
                 assert not over, f"requests took more pages than they reserved: {over}"
-                # only a pool whose count stands for the request checks the room it promised
                 if self._leads:
                     outstanding, supply = self._outstanding(), self._supply()
                     assert outstanding <= supply, (
@@ -1800,7 +1796,7 @@ class KVManager(AttentionResource):
         A batched replay gives its padding rows their capture span, so each
         would otherwise take a page per label on its first replay and keep it,
         in every bucket, config and slot, which no request could be admitted
-        against. A capture still gives them pages, and hands them back after.
+        against.
         """
         return (not ctx.capture and self._is_padding(rid)) or self._unheld(rid, label)
 
@@ -1944,8 +1940,7 @@ class KVManager(AttentionResource):
         return None
 
     def _reserve_new(self, ctx: StepContext) -> AdmissionDeferred | None:
-        """Reserve for a request that reached admit without passing readiness,
-        as one continuing a speculative step onto another node does.
+        """Reserve for a request that reached admit without passing this pool's readiness.
 
         Where this pool decides, at world size 1, it waits its turn as at
         readiness. Under TP, rank 0 has already sent the step to the other
