@@ -933,6 +933,9 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "wan22": Wan22Adapter(),
     "whisper_large": WhisperAdapter(),
     "higgs_audio": HiggsAudioAdapter(),
+    "flux2_klein": DiffusionImageAdapter(),
+    "flux2_klein_9b": DiffusionImageAdapter(),
+    "z_image_turbo": DiffusionImageAdapter(),
 }
 
 

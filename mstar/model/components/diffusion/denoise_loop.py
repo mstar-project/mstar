@@ -237,7 +237,9 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def prepare_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs,
     ) -> NodeInputs | None:
-        state = self.request_state(fwd_info.request_id)
+        # Keyed by the integer rid_handle, NOT by request_id. The handle is what
+        # the engine keys batches by and what it hands check_stop
+        state = self.request_state(fwd_info.rid_handle)
         k = self.step_index(fwd_info)
         device = self.get_device()
         if "schedule" not in state:
@@ -359,21 +361,36 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             for i, rid in enumerate(engine_inputs.request_ids)
         }
 
-    def check_stop(self, request_id: str, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
+    def check_stop(self, request_id: int, request_info: CurrentForwardPassInfo, outputs) -> set[str]:
+        # ``request_id`` is the engine's integer rid handle, the same key
+        # prepare_inputs stored under.
         state = self.request_states.get(request_id)
         if state is None or "num_steps" not in state:
+            logger.warning(
+                "%s: check_stop found no schedule for request %r (state=%s); the loop "
+                "will not be stopped by this pass",
+                type(self).__name__, request_id, "absent" if state is None else "no num_steps",
+            )
             return set()
         # iteration k is being postprocessed while the counter reads k, so N steps stop at k == N - 1
-        if self.step_index(request_info) + 1 >= int(state["num_steps"]):
-            return {self.loop_name}
-        return set()
+        k, num_steps = self.step_index(request_info), int(state["num_steps"])
+        stop = k + 1 >= num_steps
+        logger.info("%s: check_stop request %s k=%d/%d -> %s", type(self).__name__,
+                    request_id, k, num_steps, "STOP" if stop else "continue")
+        return {self.loop_name} if stop else set()
 
     # ------------------------------------------------------------ resources
     def _uniform_key(self, keys) -> Hashable | None:
         keys = set(keys)
         return keys.pop() if len(keys) == 1 else None
 
-    def cg_key_info(self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo]):
+    def cg_key_info(
+        self, graph_walk: str,
+        per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata=None,
+        **kwargs,
+    ):
+        del per_request_input_metadata, kwargs
         # Padding rows (a captured bucket's dummy requests) carry no step metadata; the
         # real rows decide the bucket.
         keys = [self.bucket_key_for(info) for info in per_request_info.values() if info.step_metadata]
