@@ -24,7 +24,12 @@ from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
-from mstar.engine.resources.kv.manager import AdmissionDeferred, KVManager
+from mstar.engine.resources.kv.manager import (
+    AdmissionDeferred,
+    KVManager,
+    KVSequenceInfo,
+    PublishedKVInfo,
+)
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.step import AdmitRuntimeError, AllocationFailed, Segment, StepContext
 
@@ -407,6 +412,37 @@ def test_a_label_the_row_holds_nothing_in_keeps_no_length(monkeypatch):
 
     assert kv._streams["text"]["cfg_img"].stored_len == 0, (
         "the unguided row's cfg_img kept a length its later views would stretch over the sink"
+    )
+
+
+# ── a stream read from another worker ───────────────────────────────────
+
+
+def _published(generation: int) -> PublishedKVInfo:
+    """Another worker's 100-token ``main``, at its reset ``generation``."""
+    return PublishedKVInfo.build_for_rank(rank=0, world_size=1, seq_info={
+        "main": KVSequenceInfo(
+            seq_len=100, latest_kv_transfer_info="remote",
+            page_indices=list(range(7)), reset_generation=generation,
+        ),
+    })
+
+
+def test_a_producer_rewind_gives_back_what_the_index_lent():
+    kv = _manager(max_num_pages=32)
+    tokens = list(range(100))
+    kv.ingest_request("a", _request(tokens, max_tokens=8))
+    assert _prefill(kv, "a", 100).ok
+    kv.remove_request("a")
+    kv.ingest_request("b", _request(tokens, max_tokens=8))
+    assert kv.admit_retrieve("b", NODE, DECODE, _published(1)).ok
+    assert kv._streams["b"]["main"].hits, "the read took nothing from the index"
+
+    # the producer replaced the stream, so the pages the index lent are dropped
+    kv.admit_retrieve("b", NODE, DECODE, _published(2))
+
+    assert kv._held_fresh("b") <= kv._reserved["b"].pages, (
+        "a rewind dropped the index's pages and left the request to take them past its reservation"
     )
 
 
