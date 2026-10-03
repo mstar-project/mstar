@@ -86,6 +86,7 @@ def _worker():
     w.scheduler = SimpleNamespace(
         clear_rid=lambda rid, rid_str: None,
         clear_wire_rid=lambda rid_str: None,
+        pending_tp_follow_count={},
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.communicator = SimpleNamespace(send=lambda *a, **k: None)

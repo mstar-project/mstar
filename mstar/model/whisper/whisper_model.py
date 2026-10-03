@@ -82,6 +82,11 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 class WhisperModel(Model):
     """Whisper ASR: HF audio encoder + mstar-native AR decoder."""
 
+    # ASR: one audio input. A text prompt is accepted but ignored -- the
+    # decoder prompt is built from the language/task kwargs. Emits a transcript.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "audio"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text"})
+
     def __init__(
         self,
         model_path_hf: str,

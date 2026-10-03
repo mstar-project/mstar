@@ -32,9 +32,10 @@ NDJSON stream.
        the ordering and the count of same-modality attachments; an explicit list
        replaces it.
    * - ``output_modalities``
-     - ``text``
+     - model default
      - Comma-separated desired outputs (e.g. ``text``, ``image``, ``audio``, ``video``,
        ``video_frame``, ``action``). ``video_frame`` is streaming-only raw RGB24.
+       Omitted, the model's default output is used (audio for a TTS model).
    * - ``streaming``
      - ``true``
      - ``true`` → NDJSON stream of chunks; ``false`` → one JSON document.
@@ -132,7 +133,7 @@ run anywhere:
 
 The core method is ``generate``:
 
-``generate(*, text=None, images=None, audio=None, video=None, output_modalities=("text",), input_modalities=None, stream=False, request_id=None, **model_kwargs)``
+``generate(*, text=None, images=None, audio=None, video=None, output_modalities=None, input_modalities=None, stream=False, request_id=None, **model_kwargs)``
    Submit a request. ``images`` / ``audio`` / ``video`` accept a path, raw ``bytes``, a
    ``(filename, bytes)`` tuple, or a list of those. Extra keyword args are forwarded as the
    model's ``model_kwargs`` (e.g. ``voice="tara"``, ``temperature=0.7``,

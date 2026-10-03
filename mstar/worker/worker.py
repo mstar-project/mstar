@@ -674,7 +674,8 @@ class Worker:
         # tensor state now would race the GPU thread reading those tensors
         # / KV pages. Queue the remove and apply it once no in-flight step
         # references the rid (see _apply_pending_removes_safe_to_drop in
-        # the run loop).
+        # the run loop). So does a queued committed TP-follow: removing now
+        # strands its ScheduleTPNode in the FIFO and hangs the TP group.
         request_id = self._rid(body.request_id)
         if request_id is None:
             # Never admitted here, or already removed: no handle-keyed state to
@@ -683,7 +684,8 @@ class Worker:
             # later message would ever pop it.
             self.scheduler.clear_wire_rid(body.request_id)
             return
-        if request_id in self._in_flight_rids:
+        if request_id in self._in_flight_rids or \
+                self.scheduler.pending_tp_follow_count.get(body.request_id, 0) > 0:
             self._pending_removes.add(request_id)
             return
 
@@ -844,7 +846,10 @@ class Worker:
     def _process_new_inputs(self, body: InputSignals) -> None:
         # Draining for teardown: don't start new reads for this rid. The
         # producer's segment may be unlinked once every reader ACKs READS_DONE.
-        if body.request_id in self._draining_rids:
+        # A queued committed TP-follow still needs its inputs, and READS_DONE
+        # waits for it, so those still land.
+        if body.request_id in self._draining_rids and \
+                self.scheduler.pending_tp_follow_count.get(body.request_id, 0) == 0:
             return
         logger.debug(
             "Received new signals %s at worker %s for request %s",
@@ -952,10 +957,24 @@ class Worker:
         # signals onto this same list, and mutating it while iterating it would
         # never terminate.
         for message in list(messages):
+            if (
+                message.message_type == WorkerMessageType.REMOVE_REQUEST
+                and message.body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF)
+                and self.is_tp_follower
+            ):
+                # a follower acts only on its leader's REMOVE; parked, the
+                # conductor's copy of one that already ran would stay forever
+                continue
             # per_request_info is handle-keyed, so resolve the wire string
             # first; an unknown one has no handle and is parked the same way.
+            needs_active = message.message_type in msg_types_needing_active_request or (
+                # a leader-forwarded DRAIN can beat the conductor's NEW; applied
+                # early, the NEW gate drops the NEW and strands the REMOVE
+                message.message_type == WorkerMessageType.DRAIN_REQUEST
+                and message.body.source == MessageSource.TP_RANK_0
+            )
             if (
-                message.message_type in msg_types_needing_active_request and \
+                needs_active and \
                 self._rid(message.body.request_id)
                 not in self.request_state.per_request_info
             ):
@@ -2645,7 +2664,7 @@ class Worker:
             # Fail it here and take it out of the batch before the routing
             # loops below touch it. Only ever the ones `check_stop_for_batch`
             # just added: the caller already reported (and cleared) the rids
-            # that failed in prepare_inputs / postprocess.
+            # that failed in prepare_inputs / their forward / postprocess.
             failed = dict(batch_N.node_batch.failed_requests)
             self._drop_failed_rids(batch_N, outputs, failed)
             self._fail_requests(failed)
@@ -2939,9 +2958,14 @@ class Worker:
         self, in_flight_rids: set[int]
     ) -> None:
         """Apply ``REMOVE_REQUEST`` for any rid that is not currently held by
-        an in-flight GPU step. Removes for in-flight rids stay deferred and
-        are reattempted next iter."""
-        to_apply = [r for r in self._pending_removes if r not in in_flight_rids]
+        an in-flight GPU step or a still-queued committed TP-follow batch.
+        Removes for those stay deferred and are reattempted next iter."""
+        # the follow count is keyed by the wire string, the removes by handle
+        to_apply = [
+            r for r in self._pending_removes
+            if r not in in_flight_rids
+            and self.scheduler.pending_tp_follow_count.get(self._rid_str(r), 0) == 0
+        ]
         for rid in to_apply:
             self._pending_removes.discard(rid)
             self._remove_request(RemoveRequest(
@@ -2955,14 +2979,15 @@ class Worker:
     ) -> None:
         """Excise ``failed_requests`` from a finished batch.
 
-        A rid that raised in ``postprocess`` is still carried in the batch (the
-        engine only recorded the error), and one that raised in
-        ``prepare_inputs`` is already out of ``node_batch.request_ids`` but not
-        out of the worker-side ``ScheduledBatch``. Either way we must not route
-        its outputs or mark its node complete — that's how a request that blew
-        up mid-walk ends up reported to the client as a successful empty
-        response. ``_postprocess_batch`` reconciles the remaining structures
-        from ``node_batch.request_ids``.
+        A rid that raised in its per-request forward or in ``postprocess`` is
+        still carried in the batch (the engine only recorded the error), and one
+        that raised in ``prepare_inputs`` is already out of
+        ``node_batch.request_ids`` but not out of the worker-side
+        ``ScheduledBatch``. Either way we must not route its outputs or mark its
+        node complete — that's how a request that blew up mid-walk ends up
+        reported to the client as a successful empty response.
+        ``_postprocess_batch`` reconciles the remaining structures from
+        ``node_batch.request_ids``.
         """
         for rid in failed_requests:
             outputs.pop(rid, None)
@@ -3475,7 +3500,7 @@ class Worker:
                         _maybe_clear_spec()
 
                     if pending.node_batch.failed_requests:
-                        # A per-rid stage (prepare_inputs / postprocess) blamed
+                        # A per-rid stage (prepare_inputs / forward / postprocess) blamed
                         # specific requests. Drop the speculation: it was built
                         # from pending's rids and may thread outputs that the
                         # failed rids never produced. The rest of the batch

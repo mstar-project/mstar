@@ -97,7 +97,7 @@ class MStarClient:
         images=None,
         audio=None,
         video=None,
-        output_modalities=("text",),
+        output_modalities=None,
         input_modalities=None,
         stream: bool = False,
         request_id: str | None = None,
@@ -110,22 +110,26 @@ class MStarClient:
         tuple. Extra keyword args are forwarded verbatim as the model's
         ``model_kwargs`` (e.g. ``voice="tara"``, ``think_mode=True``,
         ``temperature=0.7``, ``max_output_tokens=256``); ``None`` values are
-        dropped so server-side defaults apply.
+        dropped so server-side defaults apply. Without ``output_modalities``
+        the server picks the model's default (text, or e.g. audio for TTS).
 
         Returns a :class:`GenerateResult` when ``stream=False``, or an iterator
         of :class:`StreamEvent` when ``stream=True``. Raw ``video_frame`` output
         is streaming-only and yields :class:`VideoFrameChunk` objects.
         """
-        if "video_frame" in output_modalities and not stream:
+        # None names no output: the server answers with the model's default
+        if isinstance(output_modalities, str):
+            output_modalities = [m.strip() for m in output_modalities.split(",") if m.strip()]
+        wanted = tuple(output_modalities or ())
+        if "video_frame" in wanted and not stream:
             raise ValueError(
                 "output modality 'video_frame' requires stream=True; raw frame "
                 "chunks cannot be returned as an aggregated response"
             )
         files = self._build_files(images, audio, video)
-        data: dict[str, str] = {
-            "output_modalities": ",".join(output_modalities),
-            "streaming": "true" if stream else "false",
-        }
+        data: dict[str, str] = {"streaming": "true" if stream else "false"}
+        if output_modalities is not None:
+            data["output_modalities"] = ",".join(wanted)
         if text is not None:
             data["text"] = text
         if input_modalities is not None:
@@ -138,7 +142,7 @@ class MStarClient:
 
         url = f"{self.base_url}/generate"
         if stream:
-            return self._stream(url, data, files, output_modalities=output_modalities)
+            return self._stream(url, data, files, output_modalities=wanted)
         resp = self._session.post(url, data=data, files=files or None, timeout=self.timeout)
         resp.raise_for_status()
         return self._parse_result(resp.json())

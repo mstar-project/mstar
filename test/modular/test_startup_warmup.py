@@ -72,7 +72,8 @@ def test_warmup_files_of_any_modality_keep_prompt_order() -> None:
     assert [(p.modality, p.index) for p in req["prompt_parts"]] == [
         ("image", 0), ("audio", 0), ("image", 1), ("video", 0), ("text", 0),
     ]
-    assert req["output_modalities"] == ["text"]
+    # none named: submit_request gives it the model's default
+    assert req["output_modalities"] == []
 
 
 def test_malformed_warmups_are_skipped(caplog) -> None:

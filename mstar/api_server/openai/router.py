@@ -20,7 +20,7 @@ from mstar.api_server.openai import (
     serving_transcriptions,
     serving_videos,
 )
-from mstar.api_server.openai._util import now
+from mstar.api_server.openai._util import error_type, now
 from mstar.api_server.openai.adapters import get_adapter
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
@@ -58,6 +58,13 @@ def _error(status: int, message: str, type_: str = "invalid_request_error") -> J
     )
 
 
+def _exception_error(e: Exception) -> JSONResponse:
+    # ValueError/TypeError are bad requests (e.g. an unsupported modality at
+    # intake); anything else is ours
+    status = getattr(e, "status_code", 400 if isinstance(e, (ValueError, TypeError)) else 500)
+    return _error(status, str(getattr(e, "detail", e)), error_type(status))
+
+
 def _resolve(require: str):
     """Return (api, model_name, adapter, error_response). ``error`` is non-None
     when the loaded model can't serve ``require`` (e.g. 'supports_chat')."""
@@ -91,8 +98,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     try:
         result = await serving_chat.create_chat_completion(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
+        return _exception_error(e)
     if request.stream:
         return StreamingResponse(
             result, media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
@@ -108,7 +114,7 @@ async def audio_speech(request: SpeechRequest, raw_request: Request):
     try:
         return await serving_speech.create_speech(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
-        return _error(getattr(e, "status_code", 500), str(getattr(e, "detail", e)), "server_error")
+        return _exception_error(e)
 
 
 @router.post("/v1/audio/transcriptions")
@@ -150,8 +156,7 @@ async def audio_transcriptions(request: Request):
             getattr(upload, "filename", None), raw_request=request,
         )
     except Exception as e:  # noqa: BLE001
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
+        return _exception_error(e)
 
 
 @router.websocket("/v1/realtime")
@@ -191,9 +196,7 @@ async def images_generations(request: ImageGenerationRequest, raw_request: Reque
     try:
         result = await serving_images.create_images(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
-        # a malformed request (adapter / model validation) is the client's error, not the server's
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
+        return _exception_error(e)
     return JSONResponse(result)
 
 
@@ -205,8 +208,7 @@ async def videos_generations(request: VideoGenerationRequest, raw_request: Reque
     try:
         result = await serving_videos.create_videos(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
+        return _exception_error(e)
     if (request.model_extra or {}).get("stream_video"):
         # A windowed request delivering each window as it lands: NDJSON lines
         # (see serving_videos._stream_ndjson) instead of one JSON body.
@@ -252,6 +254,5 @@ async def images_edits(request: Request):
             raw_request=request,
         )
     except Exception as e:  # noqa: BLE001
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
+        return _exception_error(e)
     return JSONResponse(result)

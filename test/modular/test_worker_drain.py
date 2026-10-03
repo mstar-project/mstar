@@ -2,7 +2,8 @@
 
 DRAIN_REQUEST stops scheduling/reading a request and ACKs READS_DONE once its
 in-flight reads finish; the hard cleanup (force_cleanup_request) waits for the
-conductor's REMOVE_REQUEST. No read may start for a draining request.
+conductor's REMOVE_REQUEST. No read may start for a draining request, except
+the inputs a committed TP-follow batch still queued for it needs.
 """
 
 from types import SimpleNamespace
@@ -13,6 +14,8 @@ from mstar.utils.ipc_format import (
     InputSignals,
     MessageSource,
     RemoveRequest,
+    WorkerMessage,
+    WorkerMessageType,
 )
 from mstar.worker.rid_table import RidTable
 from mstar.worker.worker import Worker
@@ -22,6 +25,7 @@ from mstar.worker.worker import Worker
 def _worker(
     known_rids=("X",), in_flight=(), draining=(), reads_done=(),
     pending_drains=(), inflight_reads=False, is_follower=False, tp_follow=(),
+    int_handles=False,
 ):
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
@@ -31,21 +35,24 @@ def _worker(
     w.failed = set()
     w.forced = []
     w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
-    w._in_flight_rids = set(in_flight)
+    # the rid string is its own handle by default; int_handles mints real ones,
+    # for state keyed by the wire string (the TP-follow count)
+    rids = RidTable()
+    rids.intern("other")  # so no handle is 0
+    handle = {r: rids.intern(r) if int_handles else r for r in known_rids}
+    w._in_flight_rids = {handle.get(r, r) for r in in_flight}
     w._pending_drains = set(pending_drains)
     w._draining_rids = set(draining)
     w._reads_done_sent = set(reads_done)
     w._pending_removes = set()
-    # Identity interning: these tests use the rid string as its own handle, so
-    # the string/handle split is exercised without a real runtime.
     w._graph_runtime = SimpleNamespace(
-        get_rid_handle=lambda r: r if r in known_rids else None,
-        get_rid_string=lambda h: h,
+        get_rid_handle=handle.get,
+        get_rid_string=rids.name if int_handles else (lambda h: h),
         remove_request=lambda h: None,
         # The TP fan-out reads the sharding config off the runtime now; no
         # groups means no followers, which is what these tests assume.
-        get_sharding_config=lambda r: (
-            SimpleNamespace(groups=[]) if r in known_rids else None
+        get_sharding_config=lambda h: (
+            SimpleNamespace(groups=[]) if h in handle.values() else None
         ),
     )
     w._last_active = {}
@@ -59,7 +66,7 @@ def _worker(
     )
     w.request_state = SimpleNamespace(
         per_request_info={
-            rid: SimpleNamespace(sharding_config=SimpleNamespace(groups=[]))
+            handle[rid]: SimpleNamespace(sharding_config=SimpleNamespace(groups=[]))
             for rid in known_rids
         },
         remove_request=lambda rid: None,
@@ -222,6 +229,98 @@ def test_remove_force_cleans_and_clears_drain_state():
     assert w.forced == ["X"]
     assert "X" not in w._draining_rids
     assert "X" not in w._reads_done_sent
+
+
+def test_remove_deferred_while_committed_tp_follow_pending():
+    """Removing while a committed TP-follow is queued strands its ScheduleTPNode
+    in the FIFO, blocking later follows — so defer, like an in-flight rid."""
+    w = _worker(tp_follow=("X",), int_handles=True)
+    handle = w._graph_runtime.get_rid_handle("X")
+    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    assert w._pending_removes == {handle}
+    assert w.forced == []   # tensors not torn down
+    assert w.cleared == []  # scheduler state kept until the follow runs
+
+
+def test_pending_remove_waits_for_the_tp_follow_then_applies():
+    # the removes are handles and the follow count is keyed by wire string
+    w = _worker(tp_follow=("X",), int_handles=True)
+    handle = w._graph_runtime.get_rid_handle("X")
+    w._pending_removes = {handle}
+    Worker._apply_pending_removes_safe_to_drop(w, in_flight_rids=set())
+    assert w._pending_removes == {handle}
+    assert w.forced == []
+
+    w.scheduler.pending_tp_follow_count["X"] = 0  # the follow ran
+    Worker._apply_pending_removes_safe_to_drop(w, in_flight_rids=set())
+    assert w._pending_removes == set()
+    assert w.forced == [handle]
+
+
+def test_drain_before_new_is_buffered_not_applied():
+    """A DRAIN that beats the NEW must buffer until the NEW lands. Applied early
+    it sets _draining_rids, the NEW gate drops the NEW, and REMOVE strands."""
+    w = _worker(known_rids=(), is_follower=True)
+    w._unprocessed_messages = {}
+    Worker._process_message_list(w, [
+        WorkerMessage(
+            message_type=WorkerMessageType.DRAIN_REQUEST,
+            body=DrainRequest(request_id="X", source=MessageSource.TP_RANK_0),
+        )
+    ])
+    # buffered (rid unknown): no drain state, no premature READS_DONE
+    assert [m.message_type for m in w._unprocessed_messages["X"]] == [
+        WorkerMessageType.DRAIN_REQUEST
+    ]
+    assert "X" not in w._draining_rids
+    assert _reads_done(w) == []
+
+
+def test_conductor_drain_for_a_never_admitted_rid_acks_at_once():
+    """Ingest can fail after the conductor registered the rid, so no NEW ever
+    comes; parking its DRAIN would hold the teardown barrier for the TTL."""
+    w = _worker(known_rids=())
+    w._unprocessed_messages = {}
+    Worker._process_message_list(w, [WorkerMessage(
+        message_type=WorkerMessageType.DRAIN_REQUEST, body=DrainRequest(request_id="X"),
+    )])
+    assert w._unprocessed_messages == {}
+    assert len(_reads_done(w)) == 1
+
+
+def test_follower_drops_the_conductors_remove_instead_of_parking_it():
+    """A follower acts only on its leader's REMOVE. When that one lands first,
+    the conductor's copy arrives for a rid already gone; parked, it stayed
+    forever. The leader's still waits for a NEW that hasn't arrived."""
+    w = _worker(known_rids=(), is_follower=True)
+    w._unprocessed_messages = {}
+    Worker._process_message_list(w, [
+        WorkerMessage(
+            message_type=WorkerMessageType.REMOVE_REQUEST,
+            body=RemoveRequest(request_id="X"),
+        ),
+        WorkerMessage(
+            message_type=WorkerMessageType.REMOVE_REQUEST,
+            body=RemoveRequest(request_id="Y", source=MessageSource.TP_RANK_0),
+        ),
+    ])
+    assert list(w._unprocessed_messages) == ["Y"]
+
+
+def test_draining_rid_still_takes_inputs_for_a_queued_tp_follow():
+    """READS_DONE waits for a committed follow batch, so dropping the inputs
+    that batch needs would stall the drain and hold the REMOVE forever."""
+    w = _worker(draining=("X",), tp_follow=("X",), int_handles=True)
+    w.enable_nvtx = False
+    reads = []
+    w.tensor_manager.start_read_tensors = (
+        lambda rid, edges, graph_walk=None: reads.append(rid) or []
+    )
+    w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
+    Worker._process_new_inputs(w, InputSignals(
+        request_id="X", inputs=[], request_info=SimpleNamespace(graph_walk="g"),
+    ))
+    assert reads == [w._graph_runtime.get_rid_handle("X")]
 
 
 def test_process_new_inputs_skips_reads_for_draining_rid():

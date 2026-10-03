@@ -256,6 +256,11 @@ class BagelModel(Model):
     through interleaved text and image inputs.
     """
 
+    # Text + image only (ViT/VAE encoders in, decode/image_gen out); no
+    # audio/video/action encoder or decoder, so reject those at intake.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text", "image"})
+
     def __init__(
         self,
         model_path_hf: str,
@@ -593,6 +598,9 @@ class BagelModel(Model):
         """
         result: NameToTensorList = {}
 
+        if prompt is None and "image" not in input_modalities:
+            # nothing to prefill: the walk opens on a decode with no token, and hangs
+            raise ValueError("BAGEL requires a text prompt or an image")
         if prompt is not None:
             target_output = output_modalities[0] if output_modalities else "text"
             is_understanding = target_output == "text"

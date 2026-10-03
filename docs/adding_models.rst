@@ -163,6 +163,22 @@ You must implement these abstract methods:
 
    See `Step 4 — Implement the submodules`_.
 
+You must also declare which modalities the model takes and emits, as the class
+attributes ``SUPPORTED_INPUT_MODALITIES`` and ``SUPPORTED_OUTPUT_MODALITIES``
+(``frozenset`` subsets of :data:`mstar.model.base.MODALITIES`). The API server
+rejects any other modality with a 400 before the request reaches the data worker, and
+it counts uploaded files as well as the declared ``input_modalities``. Declare what
+the model tolerates, not only what it reads: if a front end sends a text prompt that
+the model ignores, ``text`` still belongs in the input set. Inputs that arrive in
+``model_kwargs`` (actions, robot state) are not modalities. A class that serves
+several checkpoints declares their union and narrows the instance in ``__init__``
+(Qwen3-TTS takes ``audio`` only on Base, Cosmos3 emits ``text`` only where the
+reasoner is served). A model that does not declare inherits the full set, and
+``test/modular/test_modality_validation.py`` fails for it (CI skips a model whose
+third-party deps it lacks, so run it locally). A request that names no
+output gets ``DEFAULT_OUTPUT_MODALITIES``; left unset, that is the model's only
+output, or ``text``. A model with several outputs and no text output must set it.
+
 .. note::
 
    ``model_kwargs`` reaches your model from clients through the OpenAI routes'
@@ -1751,6 +1767,7 @@ Checklist
          [ ] get_partition_forward_pass_args
          [ ] postprocess
          [ ] get_submodule
+         [ ] SUPPORTED_INPUT_MODALITIES / SUPPORTED_OUTPUT_MODALITIES
          [ ] (optional) get_request_resource_configs
          [ ] (optional) prefix_key_streams + checkpoint_path   — cross-request prefix reuse
    [ ] mstar/model/registry.py                    — add to MODEL_REGISTRY (+ HF_MODELS)

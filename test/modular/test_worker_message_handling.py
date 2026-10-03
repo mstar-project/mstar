@@ -34,6 +34,7 @@ def _stub_worker(active_rids):
         per_request_info={h: object() for h in handles.values()}
     )
     stub._unprocessed_messages = {}
+    stub.is_tp_follower = False
     stub._rid = handles.get
     stub.delivered = []
 

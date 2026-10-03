@@ -85,6 +85,9 @@ class _Stub(Resource):
     def commit(self, step, ctx):
         self.calls.append("commit")
 
+    def abort_step(self, step, ctx):
+        self.calls.append("abort")
+
     def publish(self, request_id):
         self.calls.append(f"publish:{request_id}")
         return self._published
@@ -229,6 +232,25 @@ def test_admit_short_circuits_and_preserves_the_failure_reason():
     assert attn.calls == [], "nothing downstream of the failure admits"
 
 
+def test_admit_that_raises_unwinds_the_resources_before_it():
+    """A raise fails the step outright, so the marks the resources before it
+    took are dropped, as on a refusal."""
+    class _Raising(_Stub):
+        def admit(self, step, ctx):
+            self.calls.append("admit")
+            raise RuntimeError("admit blew up")
+
+    kv, attn = _Stub("kv"), _Raising("attn", deps=("kv",))
+    sampler = _Stub("sampler", deps=("attn",))
+    runner = StepRunner({"attn": attn, "kv": kv, "sampler": sampler})
+
+    with pytest.raises(RuntimeError, match="admit blew up"):
+        runner.admit(_step(["kv", "attn", "sampler"]))
+
+    assert kv.calls == ["admit", "abort"]
+    assert attn.calls == ["admit"] and sampler.calls == []
+
+
 def test_admit_reports_not_ready_when_any_resource_is_pending():
     kv = _Stub("kv", admit_outcome=AdmitOutcome(ok=True, ready=False))
     runner = StepRunner({"kv": kv, "sampler": _Stub("sampler")})
@@ -255,6 +277,20 @@ def test_commit_sweeps_declared_resources_in_plan_order():
     runner.commit(_step(["kv", "attn"]))
 
     assert kv.calls == ["commit"] and attn.calls == ["commit"]
+
+
+def test_abort_step_reaches_every_declared_resource_past_a_raise():
+    class _Raising(_Stub):
+        def abort_step(self, step, ctx):
+            raise RuntimeError("abort failed")
+
+    kv, attn = _Stub("kv"), _Raising("attn", deps=("kv",))
+    sampler = _Stub("sampler", deps=("attn",))
+    runner = StepRunner({"attn": attn, "kv": kv, "sampler": sampler})
+
+    runner.abort_step(_step(["kv", "attn", "sampler"]))
+
+    assert kv.calls == ["abort"] and sampler.calls == ["abort"]
 
 
 def test_publish_collects_per_request_per_key_and_omits_the_silent():

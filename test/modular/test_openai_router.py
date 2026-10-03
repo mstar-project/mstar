@@ -126,7 +126,7 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
         },
     )
     assert r.status_code == 400
-    assert r.json()["error"]["type"] == "server_error"
+    assert r.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_chat_audio_output(client_and_stub):
@@ -155,6 +155,21 @@ def test_audio_speech(client_and_stub):
     assert r.status_code == 200
     assert r.headers["content-type"] == "audio/wav" and r.content[:4] == b"RIFF"
     assert stub.last_submit["model_kwargs"]["voice"] == "tara"
+
+
+def test_audio_speech_clone_uploads_the_reference_clip(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "omnivoice"
+    stub.next_chunks = [_Chunk("audio", _pcm([100, -100]), {"sample_rate": 24000})]
+    ref = "data:audio/wav;base64," + base64.b64encode(b"RIFF....WAVE").decode()
+    r = client.post("/v1/audio/speech", json={
+        "model": "omnivoice", "input": "hi", "ref_audio": ref, "ref_text": "hello",
+    })
+    assert r.status_code == 200
+    sub = stub.last_submit
+    assert sub["input_modalities"] == ["text", "audio"]
+    (path,) = sub["file_paths"]["audio"]
+    assert Path(path).is_file() and Path(path).read_bytes() == b"RIFF....WAVE"
 
 
 def test_images(client_and_stub):
@@ -223,6 +238,43 @@ def test_videos_generations_wan22_rejects_video_conditioning(client_and_stub):
     )
     assert r.status_code == 400
     assert "video" in r.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("model,path,kwargs", [
+    ("orpheus", "/v1/audio/speech", {"json": {"model": "orpheus", "input": "hi"}}),
+    ("bagel", "/v1/images/generations", {"json": {"model": "bagel", "prompt": "x"}}),
+    ("bagel", "/v1/images/edits", {
+        "files": {"image": ("in.png", b"\x89PNG", "image/png")}, "data": {"prompt": "x"},
+    }),
+])
+def test_intake_rejection_is_a_bad_request_on_every_route(
+    client_and_stub, monkeypatch, model, path, kwargs,
+):
+    # submit_request raises UnsupportedModalityError (a ValueError) at intake;
+    # every route must surface it as a 400 like chat and videos, not a 500
+    client, stub = client_and_stub
+    stub.model_name = model
+
+    def reject(**kw):
+        raise ValueError("model does not support: 'image' (output)")
+
+    monkeypatch.setattr(stub, "submit_request", reject)
+    r = client.post(path, **kwargs)
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+    assert "does not support" in r.json()["error"]["message"]
+
+
+def test_image_edit_on_a_model_without_edits_is_a_bad_request(client_and_stub):
+    # cosmos3 serves /images/generations, which also opens /edits
+    client, stub = client_and_stub
+    stub.model_name = "cosmos3"
+    r = client.post(
+        "/v1/images/edits",
+        files={"image": ("in.png", b"\x89PNG", "image/png")}, data={"prompt": "x"},
+    )
+    assert r.status_code == 400
+    assert "not supported" in r.json()["error"]["message"]
 
 
 def test_chat_stream(client_and_stub):
@@ -429,3 +481,18 @@ def test_speech_stream_pcm_has_no_wav_header(client_and_stub):
     r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True})
     assert r.headers["content-type"].startswith("audio/wav") and r.content[:4] == b"RIFF"
     assert r.content[44:] == _pcm([1, 2, 3])
+
+
+def test_a_transcription_4xx_is_typed_invalid_request(client_and_stub, monkeypatch):
+    from mstar.api_server.openai import serving_transcriptions
+
+    client, stub = client_and_stub
+    stub.model_name = "whisper_large"
+
+    async def bad_request(*a, **k):
+        raise ValueError("unsupported language")
+
+    monkeypatch.setattr(serving_transcriptions, "create_transcription", bad_request)
+    r = client.post("/v1/audio/transcriptions", files={"file": ("a.wav", b"RIFF")})
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"

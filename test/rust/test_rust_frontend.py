@@ -4,6 +4,7 @@ stubbed — proves the HTTP surface, the msgpack bridge protocol, and the
 error path end to end without GPUs. Skipped unless the ``mstar_rust``
 extension is installed and the server binary is built
 (``cargo build --release`` in ``rust/server/``)."""
+import asyncio
 import contextlib
 import json
 import socket
@@ -39,6 +40,12 @@ class _Chunk:
         self.metadata = metadata or {}
 
 
+class _RejectedError(ValueError):
+    """Stands in for UnsupportedModalityError: a status-carrying intake error."""
+
+    status_code = 400
+
+
 class _StubAPIServer:
     """Scripted data plane: echoes the prompt back in two text chunks."""
 
@@ -51,6 +58,8 @@ class _StubAPIServer:
                        model_kwargs=None, streaming=True, request_id=None):
         if text and "boom" in text:
             raise ValueError("scripted ingest failure")
+        if text and "hologram" in text:
+            raise _RejectedError("model does not support: 'hologram' (input)")
         self.submitted.append({
             "rid": request_id, "text": text,
             "in": input_modalities, "out": output_modalities,
@@ -127,6 +136,20 @@ def test_chat_roundtrip(stack):
     assert sub["out"] == ["text"]
 
 
+def test_generate_leaves_an_unnamed_output_to_the_backend(stack):
+    # the backend fills in the model's default, not a hard-coded "text"
+    import urllib.parse
+
+    port, stub, _bridge, _proc = stack
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate",
+        data=urllib.parse.urlencode({"text": "hi", "streaming": "false"}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        assert r.status == 200
+    assert stub.submitted[-1]["out"] == []
+
+
 def _post_raw(port, path, raw_bytes, timeout=15):
     """POST a raw body (possibly malformed) as application/json; return
     (status, parsed_json_or_None)."""
@@ -169,6 +192,45 @@ def test_ingest_failure_is_a_500_not_a_hang(stack):
     # and the server keeps serving afterwards
     assert _chat(port, "again")["choices"][0]["message"]["content"] == \
         "Hello world"
+
+
+def test_intake_rejection_keeps_its_status(stack):
+    port, _stub, _bridge, _proc = stack
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _chat(port, "hologram", timeout=15)
+    assert e.value.code == 400
+    err = json.loads(e.value.read())["error"]
+    assert "does not support" in err["message"]
+    assert err["type"] == "invalid_request_error"
+
+
+def test_streaming_intake_rejection_keeps_its_status(stack):
+    """A streaming response is a 200 once its headers are out, so the frontend
+    waits for the backend's intake ack first; a rejection keeps its 400."""
+    import urllib.parse
+
+    port, _stub, _bridge, _proc = stack
+    chat = {"model": "qwen3_omni", "stream": True,
+            "messages": [{"role": "user", "content": "hologram"}]}
+    code, body = _post_raw(port, "/v1/chat/completions", json.dumps(chat).encode())
+    assert code == 400 and "does not support" in body["error"]["message"]
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate",
+        data=urllib.parse.urlencode({"text": "hologram", "streaming": "true"}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=15)
+    assert e.value.code == 400
+    assert "does not support" in json.loads(e.value.read())["detail"]
+
+    # an accepted request still streams
+    chat["messages"][0]["content"] = "hi"
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions",
+        data=json.dumps(chat).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        assert r.status == 200 and b"[DONE]" in r.read()
 
 
 def test_health_goes_red_when_the_bridge_dies(stack):
@@ -469,6 +531,96 @@ def test_nonstreaming_backend_error_maps_to_real_status():
             json.dumps({"model": "qwen3_omni",
                         "messages": [{"role": "user", "content": "hi"}]}).encode())
         assert code == 400, (code, body)
+
+
+class _SlowFirstChunkStub(_StubAPIServer):
+    """The first output lands well after intake, like a long prefill."""
+
+    async def iter_result_chunks(self, request_id):
+        await asyncio.sleep(2.0)
+        async for c in super().iter_result_chunks(request_id):
+            yield c
+
+
+def _sse_events(port, body, timeout=15):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions",
+        data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    t0 = time.monotonic()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        headers_s = time.monotonic() - t0
+        lines = r.read().decode().splitlines()
+    return headers_s, [json.loads(ln[6:]) for ln in lines if ln.startswith("data: {")]
+
+
+def test_streaming_headers_go_out_at_intake_not_first_output():
+    # the intake ack commits the 200; without it the headers wait for output
+    body = {"model": "qwen3_omni", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}
+    with _model_stack("qwen3_omni", _SlowFirstChunkStub()) as (port, _up):
+        headers_s, events = _sse_events(port, body)
+    assert headers_s < 1.0, headers_s
+    assert "".join(e["choices"][0]["delta"].get("content") or "" for e in events) == "Hello world"
+
+
+def test_a_mid_stream_error_is_typed_by_its_status():
+    body = {"model": "qwen3_omni", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}
+    for status, type_ in ((400, "invalid_request_error"), (500, "server_error")):
+        with _model_stack("qwen3_omni", _ErrorChunkStub(status)) as (port, _up):
+            _, events = _sse_events(port, body)
+        (err,) = [e["error"] for e in events if "error" in e]
+        assert (err["type"], err["code"]) == (type_, status)
+
+
+def test_a_mid_stream_generate_error_is_an_error_chunk():
+    # the Python /generate's shape, status included; the bare {"error": ...}
+    # line dropped it, and readers of `modality` missed the failure
+    import base64
+    import urllib.parse
+
+    form = {"text": "hi", "output_modalities": "text", "streaming": "true"}
+    with _model_stack("qwen3_omni", _ErrorChunkStub(400)) as (port, _up):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/generate",
+            data=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            (line,) = r.read().decode().splitlines()
+    chunk = json.loads(line)
+    assert (chunk["modality"], chunk["metadata"]) == ("error", {"status": 400})
+    assert base64.b64decode(chunk["data"]) == b"Error in worker: boom"
+
+
+def test_streaming_speech_intake_rejection_is_a_400():
+    # the WAV header is a 200 once sent, so the rejection has to land first
+    with _model_stack("orpheus", _StubAPIServer()) as (port, _up):
+        code, body = _post_raw(port, "/v1/audio/speech", json.dumps(
+            {"model": "orpheus", "input": "hologram", "stream": True}).encode())
+    assert code == 400 and "does not support" in body["error"]["message"]
+
+
+def test_mock_generate_without_a_named_output_answers_in_text():
+    # no bridge, so no model to pick a default: the mock falls back to text
+    import base64
+    import subprocess
+    import urllib.parse
+
+    port = _free_port()
+    proc = subprocess.Popen([BINARY, "qwen3_omni", str(port)])
+    try:
+        assert _wait_healthy(port)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/generate",
+            data=urllib.parse.urlencode({"text": "hi", "streaming": "false"}).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = json.loads(r.read())
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+    (chunk,) = body["outputs"]["text"]
+    assert base64.b64decode(chunk["data"]) == b"[mock] hi"
 
 
 def test_images_generations_on_cosmos3():

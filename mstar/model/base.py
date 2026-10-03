@@ -288,7 +288,44 @@ class ForwardPassArgs:
     stream_lead_items: dict[str, int] = field(default_factory=dict)
 
 
+# Every modality a request can name; each model narrows it per direction.
+# video_frame (raw RGB24 frames) is output-only and streaming-only
+MODALITIES: frozenset[str] = frozenset(
+    {"text", "image", "audio", "video", "video_frame", "action", "scalar", "tensor"}
+)
+
+
 class Model(ABC):
+    # Input/output modalities the model handles at intake. The base is the full
+    # universe, so a model that doesn't narrow it behaves as before
+    SUPPORTED_INPUT_MODALITIES: frozenset[str] = MODALITIES
+    SUPPORTED_OUTPUT_MODALITIES: frozenset[str] = MODALITIES
+    # What a request that names no output gets. None: the model's only output,
+    # else text; a model with several outputs and no text must set it
+    DEFAULT_OUTPUT_MODALITIES: tuple[str, ...] | None = None
+
+    def default_output_modalities(self) -> tuple[str, ...]:
+        if self.DEFAULT_OUTPUT_MODALITIES is not None:
+            return self.DEFAULT_OUTPUT_MODALITIES
+        if len(self.SUPPORTED_OUTPUT_MODALITIES) == 1:
+            return tuple(self.SUPPORTED_OUTPUT_MODALITIES)
+        return ("text",)
+
+    def unsupported_modalities(
+        self, input_modalities: list[str], output_modalities: list[str],
+    ) -> list[tuple[str, str]]:
+        """Return the ``(modality, direction)`` pairs this model can't handle,
+        for intake to reject. Empty means every requested modality is supported."""
+        bad = [
+            (m, "input") for m in input_modalities
+            if m not in self.SUPPORTED_INPUT_MODALITIES
+        ]
+        bad += [
+            (m, "output") for m in output_modalities
+            if m not in self.SUPPORTED_OUTPUT_MODALITIES
+        ]
+        return bad
+
     def _get_worker_graphs_for_graph_walk(
         self,
         graph_walk: str,

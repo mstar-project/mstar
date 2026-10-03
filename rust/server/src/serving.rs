@@ -81,7 +81,57 @@ pub fn result_stream(
     request_id: &str,
     streaming: bool,
 ) -> OutStream {
-    let base = raw_result_stream(state, args, request_id, streaming);
+    detokenize(
+        state,
+        args,
+        raw_result_stream(state, args, request_id, streaming),
+    )
+}
+
+/// `result_stream`, but first waits for the backend's intake ack: the headers commit a 200.
+/// A rejection (an unsupported modality is a 400) comes back as `(status, message)`.
+pub async fn admitted_result_stream(
+    state: &AppState,
+    args: &SubmitArgs,
+    request_id: &str,
+) -> Result<OutStream, (u16, String)> {
+    use futures::StreamExt;
+    let Some(b) = &state.bridge else {
+        return Ok(result_stream(state, args, request_id, true));
+    };
+    let mut rx = b.submit(args, request_id, true);
+    let mut guard = AbortGuard {
+        bridge: b.clone(),
+        rid: request_id.to_string(),
+        done: false,
+    };
+    let deadline = Instant::now() + state.request_timeout;
+    let left = deadline.saturating_duration_since(Instant::now());
+    let head = match tokio::time::timeout(left, rx.recv()).await {
+        Ok(Some(StreamItem::Accepted)) => None,
+        Ok(Some(StreamItem::Error { status, message })) => {
+            guard.done = true; // refused at intake: nothing to abort
+            return Err((status, message));
+        }
+        Ok(Some(StreamItem::Done)) => {
+            guard.done = true;
+            return Ok(Box::pin(futures::stream::empty()));
+        }
+        // output with no ack ahead of it: keep it at the head
+        Ok(Some(StreamItem::Chunk(c))) => Some(Out::Chunk(c)),
+        Ok(None) => return Err((500, "backend closed the request".to_string())),
+        Err(_elapsed) => return Err((500, "Request timed out".to_string())),
+    };
+    let base = bridge_stream(rx, guard, deadline);
+    let base: OutStream = match head {
+        Some(first) => Box::pin(futures::stream::iter([first]).chain(base)),
+        None => base,
+    };
+    Ok(detokenize(state, args, base))
+}
+
+/// On the frontend-tokenizes path, turn raw token-id chunks into text chunks.
+fn detokenize(state: &AppState, args: &SubmitArgs, base: OutStream) -> OutStream {
     match (&args.tokens, &state.tok) {
         (Some(_), Some(tok)) => {
             use futures::StreamExt;
@@ -133,53 +183,65 @@ fn raw_result_stream(
                 rid: request_id.to_string(),
                 done: false,
             };
-            let deadline = Instant::now() + state.request_timeout;
-            // finished: a terminal item was yielded — end on the next poll.
-            let st = (rx, guard, deadline, false);
-            Box::pin(futures::stream::unfold(
-                st,
-                |(mut rx, mut guard, deadline, finished)| async move {
-                    if finished {
-                        return None;
-                    }
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    match tokio::time::timeout(left, rx.recv()).await {
-                        Ok(Some(StreamItem::Chunk(c))) => {
-                            Some((Out::Chunk(c), (rx, guard, deadline, false)))
-                        }
-                        Ok(Some(StreamItem::Error { status, message })) => {
-                            guard.done = true; // conductor already cleaned up
-                            Some((
-                                Out::Error { status, message },
-                                (rx, guard, deadline, true),
-                            ))
-                        }
-                        Ok(Some(StreamItem::Done)) => {
-                            guard.done = true;
-                            drop(guard); // completed: Drop sees done and skips the abort
-                            None
-                        }
-                        Ok(None) => None, // sender dropped; guard aborts
-                        Err(_elapsed) => {
-                            // Total budget exceeded — mstar raises 500
-                            // "Request timed out" and aborts. The guard (still
-                            // not done) sends the abort when the state drops.
-                            Some((
-                                Out::Error {
-                                    status: 500,
-                                    message: "Request timed out".to_string(),
-                                },
-                                (rx, guard, deadline, true),
-                            ))
-                        }
-                    }
-                },
-            ))
+            bridge_stream(rx, guard, Instant::now() + state.request_timeout)
         }
         None => Box::pin(futures::stream::iter(
             mock_chunks(args, state.sample_rate).into_iter().map(Out::Chunk),
         )),
     }
+}
+
+/// A request's bridge items as a result stream, cut off at `deadline`.
+fn bridge_stream(
+    rx: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
+    guard: AbortGuard,
+    deadline: Instant,
+) -> OutStream {
+    // finished: a terminal item was yielded — end on the next poll.
+    let st = (rx, guard, deadline, false);
+    Box::pin(futures::stream::unfold(
+        st,
+        |(mut rx, mut guard, deadline, finished)| async move {
+            if finished {
+                return None;
+            }
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                return match tokio::time::timeout(left, rx.recv()).await {
+                    // intake passed; only admitted_result_stream waits on it
+                    Ok(Some(StreamItem::Accepted)) => continue,
+                    Ok(Some(StreamItem::Chunk(c))) => {
+                        Some((Out::Chunk(c), (rx, guard, deadline, false)))
+                    }
+                    Ok(Some(StreamItem::Error { status, message })) => {
+                        guard.done = true; // conductor already cleaned up
+                        Some((
+                            Out::Error { status, message },
+                            (rx, guard, deadline, true),
+                        ))
+                    }
+                    Ok(Some(StreamItem::Done)) => {
+                        guard.done = true;
+                        drop(guard); // completed: Drop sees done and skips the abort
+                        None
+                    }
+                    Ok(None) => None, // sender dropped; guard aborts
+                    Err(_elapsed) => {
+                        // Total budget exceeded — mstar raises 500
+                        // "Request timed out" and aborts. The guard (still
+                        // not done) sends the abort when the state drops.
+                        Some((
+                            Out::Error {
+                                status: 500,
+                                message: "Request timed out".to_string(),
+                            },
+                            (rx, guard, deadline, true),
+                        ))
+                    }
+                };
+            }
+        },
+    ))
 }
 
 /// Gather a non-streaming request's chunks; the first error wins (mstar's
@@ -202,7 +264,14 @@ pub async fn collect(stream: OutStream) -> Result<Vec<ResultChunk>, (u16, String
 fn mock_chunks(args: &SubmitArgs, sample_rate: u32) -> Vec<ResultChunk> {
     let mut out = Vec::new();
     let prompt = args.text.clone().unwrap_or_default();
-    for modality in &args.output_modalities {
+    // none named: a real backend picks the model's default; the mock has no model
+    let text = ["text".to_string()];
+    let mods = if args.output_modalities.is_empty() {
+        &text[..]
+    } else {
+        &args.output_modalities[..]
+    };
+    for modality in mods {
         match modality.as_str() {
             "text" => out.push(ResultChunk {
                 modality: "text".to_string(),

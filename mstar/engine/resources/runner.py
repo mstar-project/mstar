@@ -8,7 +8,7 @@ and handing to next. (in fact, maybe `plan` should do this and runner only moves
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from typing import Any
 
 from mstar.engine.resources.base import CGSlotSpec, PublishedInfo, Resource
@@ -321,11 +321,16 @@ class StepRunner:
         """reserve capacity for step"""
         self._drop_stale_preplan(step)
         ready = True
+        admitted: list[str] = []
         for key in self._keys_for(step):
             if self._nvtx:
                 range_push(f"res.admit.{key}")
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
+            except Exception:
+                # a raise fails the step, so the marks taken above go too
+                self._abort(step, admitted)
+                raise
             finally:
                 if self._nvtx:
                     range_pop()
@@ -334,7 +339,12 @@ class StepRunner:
                     "Admit for resource %s failed with error: %s",
                     key, outcome.reason.message
                 )
+                # a refused step never commits, so the in-flight marks taken above
+                # would block offload; a staged pre-plan keeps its marks for the retry
+                if self._staged is None:
+                    self._abort(step, admitted)
                 return FullAdmitOutcome(outcome, key)
+            admitted.append(key)
             ready = ready and outcome.ready
         return FULL_ADMIT_OK if ready else FULL_ADMIT_NOT_READY
 
@@ -411,6 +421,18 @@ class StepRunner:
             finally:
                 if self._nvtx:
                     range_pop()
+
+    def abort_step(self, step: SubmoduleStep) -> None:
+        """the failure-path counterpart of `commit`; one resource raising
+        doesn't stop the rest"""
+        self._abort(step, self._keys_for(step))
+
+    def _abort(self, step: SubmoduleStep, keys: Iterable[str]) -> None:
+        for key in keys:
+            try:
+                self._resources[key].abort_step(step.get(key), step.ctx)
+            except Exception:
+                logger.exception("abort_step failed for resource %s", key)
 
     def publish(
         self,

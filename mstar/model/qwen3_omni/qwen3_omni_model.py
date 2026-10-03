@@ -112,6 +112,11 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
 class Qwen3OmniModel(Model):
     """Qwen3-Omni: Thinker + Talker + Code2Wav 3-partition streaming model."""
 
+    # Omni: any of text/image/audio/video in. Thinker emits text; the Talker
+    # and Code2Wav partitions add audio when it is requested.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image", "audio", "video"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"text", "audio"})
+
     def __init__(
         self,
         model_path_hf: str,

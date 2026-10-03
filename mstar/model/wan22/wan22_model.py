@@ -67,6 +67,10 @@ logger = logging.getLogger(__name__)
 class Wan22Model(Model):
     """Wan2.2-TI2V-5B video generation model (TI2V-5B variant only)."""
 
+    # T2V and I2V: text prompt with an optional conditioning image, emits video.
+    SUPPORTED_INPUT_MODALITIES = frozenset({"text", "image"})
+    SUPPORTED_OUTPUT_MODALITIES = frozenset({"video"})
+
     ENCODE_TEXT_WALK = "encode_text"
     ENCODE_IMAGE_WALK = "encode_image"
     VIDEO_GEN_WALK = "video_gen"

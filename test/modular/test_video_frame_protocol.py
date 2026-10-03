@@ -96,6 +96,7 @@ def test_sdk_rejects_nonstreaming_raw_frames_before_http():
 
 def test_api_core_rejects_nonstreaming_raw_frames_before_preprocessing():
     server = APIServer.__new__(APIServer)
+    server.model = None  # no model loaded: only the universe-wide checks apply
     assert "video_frame" in SUPPORTED_MODALITIES
 
     with pytest.raises(ValueError, match="requires streaming=True"):
