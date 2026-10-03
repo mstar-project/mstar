@@ -36,3 +36,6 @@ test/modular/test_kv_abort_step.py
 test/modular/test_modality_validation.py
 test/modular/test_openai_router.py
 test/modular/test_generate_route.py
+test/modular/test_generate_ws.py
+test/modular/test_startup_warmup.py
+test/modular/test_worker_message_handling.py
