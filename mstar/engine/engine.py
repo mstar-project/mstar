@@ -1579,25 +1579,30 @@ class Engine:
             # eviction freed, so it is just as much rank 0's call. Not ready here
             # until the delta says so.
             return False
-        reloaded = all(
-            resource.reload(request_id)
-            for resource in self._submodules[node_name].resources.values()
-            if resource.supports_eviction and resource.is_offloaded(request_id)
+        # ponytail: a failed retry reloads and re-offloads whatever fit; check every resource fits before reloading any
+        reloaded: list[Resource] = []
+        for resource in self._submodules[node_name].resources.values():
+            if not (resource.supports_eviction and resource.is_offloaded(request_id)):
+                continue
+            if not resource.reload(request_id):
+                # undone, not kept: every page move rank 0 makes is journalled or undone, and a partial one can't be
+                for done in reloaded:
+                    done.offload(request_id)
+                return False
+            reloaded.append(resource)
+        # Logged at the same level as the eviction in
+        # ``Worker._try_offload_cold_request`` and as a follower's replay, so
+        # the two ranks' resident-set moves can be lined up side by side.
+        # A reload only happens after an eviction, so this is not chatty.
+        logger.info(
+            "Reloaded request %s on %s",
+            self._graph_runtime.get_rid_string(request_id), node_name,
         )
-        if reloaded:
-            # Logged at the same level as the eviction in
-            # ``Worker._try_offload_cold_request`` and as a follower's replay, so
-            # the two ranks' resident-set moves can be lined up side by side.
-            # A reload only happens after an eviction, so this is not chatty.
-            logger.info(
-                "Reloaded request %s on %s",
-                self._graph_runtime.get_rid_string(request_id), node_name,
+        if node_name in self._resident_delta:
+            self._resident_delta[node_name].add_reloaded(
+                self._graph_runtime.get_rid_string(request_id)
             )
-            if node_name in self._resident_delta:
-                self._resident_delta[node_name].add_reloaded(
-                    self._graph_runtime.get_rid_string(request_id)
-                )
-        return reloaded
+        return True
 
     def _classify_tp_roles(
         self, node_names: set[str], parallel_groups: WorkerParallelGroups,
