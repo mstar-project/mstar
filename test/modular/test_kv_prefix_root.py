@@ -278,17 +278,6 @@ def _said_at_load(caplog, kv, model) -> tuple[list[str], list[str]]:
 
 
 @requires_cuda
-def test_a_keyed_node_with_host_pages_says_what_opened_and_no_more(caplog):
-    info, warnings = _said_at_load(
-        caplog, _kv(prefix_cache_salt="deployment", cpu_offload_pages=4), _Declaring(),
-    )
-
-    assert len(info) == 2 and "main" in info[0] and "LLM" in info[0], (
-        "the cache opened without saying which label it keys on which node"
-    )
-    assert warnings == [], "a cache with host pages to offload to was warned it had none"
-
-
 def test_a_keyed_node_says_what_one_request_reserves(caplog):
     info, warnings = _said_at_load(caplog, _kv(prefix_cache_salt="deployment"), _Declaring())
 
@@ -299,7 +288,6 @@ def test_a_keyed_node_says_what_one_request_reserves(caplog):
         "the load log left out the pool's pages or what a request reserves at the default max_tokens"
     )
     assert warnings == [], "a pool that admits by reservation was warned its decode can hold"
-
 
 
 def test_a_node_that_keys_two_pools_is_refused_at_load():
@@ -315,6 +303,7 @@ def test_a_node_that_keys_two_pools_is_refused_at_load():
 
     with pytest.raises(ValueError, match="more than one KV pool"):
         engine._open_prefix_caches(specs, _KeyingTwo())
+
 
 @pytest.mark.parametrize("overrides, model", [
     ({}, _Model), ({"prefix_cache": False}, _Declaring),

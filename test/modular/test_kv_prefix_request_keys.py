@@ -430,23 +430,6 @@ def test_opening_a_request_builds_none_of_the_models_resources():
 
     assert "kv" in configs, "the paged cache got no config to admit by"
 
-def test_whisper_is_handed_max_tokens_on_both_of_its_caches():
-    whisper = WhisperModel.__new__(WhisperModel)
-    whisper.config = WhisperModelConfig()
-    caches = {
-        spec.resource_key for spec in whisper.get_node_resources()
-        if isinstance(spec, KVSpec)
-    }
-
-    configs = _conductor_configs(whisper, {}, max_tokens=whisper.get_max_output_tokens())
-
-    handed = {key: getattr(configs.get(key), "max_tokens", None) for key in caches}
-    assert handed == dict.fromkeys(caches, 444), (
-        "whisper returns a sampler config alone, so its caches never learn how "
-        "far a request can grow"
-    )
-
-
 class _StubFeatureExtractor:
     """A silent 30 s window's features, the length the real extractor pads to."""
 

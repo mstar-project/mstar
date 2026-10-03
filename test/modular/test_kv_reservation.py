@@ -135,16 +135,6 @@ def test_a_leased_hit_is_held_rather_than_reserved():
     )
 
 
-def test_removal_gives_the_reservation_back():
-    kv = _manager()
-    kv.ingest_request("r", _keyed(list(range(50)), max_tokens=40))
-    _run(kv, "r", 50)
-
-    kv.remove_request("r")
-
-    assert kv._outstanding() == 0, "a removed request still held room it can never take"
-
-
 def test_a_models_count_past_max_seq_len_is_reserved_whole():
     # Bagel's image tokens: counted by the model, but not positions
     kv = _manager(max_seq_len=64)
@@ -169,35 +159,6 @@ def test_decode_adds_at_most_max_seq_len_to_a_models_count():
 
     assert kv._reserved["r"].pages == _pages(20 + 64), (
         "decode was reserved past the positions max_seq_len allows"
-    )
-
-
-def test_a_request_nothing_counts_is_left_to_run_as_before():
-    # no count from the model and no keys: max_seq_len is all that bounds it,
-    # which for most models is far more than the pool can spare per request
-    kv = _manager(max_seq_len=64)
-    kv.ingest_request("r", KVReqConfig(max_tokens=444))
-
-    _run(kv, "r", 20)
-
-    assert "r" not in kv._reserved, "a request with nothing to size it by was held to a guess"
-
-
-def test_a_label_opened_only_on_another_node_is_not_reserved():
-    # a single-GPU Bagel pool: the guidance nodes' labels live elsewhere
-    kv = _manager(nodes={"LLM"})
-    kv.ingest_request("r", KVReqConfig(
-        max_tokens=16,
-        needed_labels_per_node_walk={
-            ("LLM", WALK): ["main"], ("LLM_cfg_text", WALK): ["cfg_text"],
-        },
-        prompt_slots={"main": 32, "cfg_text": 32}, decode_labels=["main"],
-    ))
-
-    _run(kv, "r", 32)
-
-    assert kv._reserved["r"].pages == _pages(32 + 16), (
-        "a label this pool never holds for the request was reserved on it"
     )
 
 

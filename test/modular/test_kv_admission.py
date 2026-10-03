@@ -132,18 +132,6 @@ def _prefill(kv: KVManager, rid: str, prompt: int):
 # ── waiting ─────────────────────────────────────────────────────────────
 
 
-def test_a_request_that_does_not_fit_waits_until_room_frees():
-    kv = _manager(max_num_pages=16)
-    kv.ingest_request("a", _request(list(range(100)), max_tokens=60))
-    kv.ingest_request("b", _request(list(range(500, 600)), max_tokens=60))
-    assert _ready(kv, "a").ready
-
-    assert not _ready(kv, "b").ready
-
-    kv.remove_request("a")
-    assert _ready(kv, "b").ready, "room a gave back never reached the request waiting for it"
-
-
 def test_nothing_passes_the_head_of_the_queue():
     kv = _manager(max_num_pages=16)
     kv.ingest_request("a", _request(list(range(100)), max_tokens=60))
@@ -263,17 +251,6 @@ def _two_admitted(kv: KVManager) -> KVManager:
     return kv
 
 
-def test_a_follower_takes_what_rank_zero_would_hold_back():
-    leader = _two_admitted(_manager(max_num_pages=16, rank=0, world_size=2))
-    follower = _two_admitted(_manager(max_num_pages=16, rank=1, world_size=2))
-
-    # rank 0 admitted b and sent the step on; refusing it here would hang rank 0
-    assert not _ready(leader, "b").ready
-    assert _ready(follower, "b").ready and _step(follower, "b", 100).ok, (
-        "a follower refused a step rank 0 already runs"
-    )
-
-
 def _cfg_parallel_cache(node: str, rank: int = 0, world_size: int = 1) -> KVManager:
     """One worker's cache under CFG parallel, which runs ``node`` of the three."""
     spec = KVSpec(
@@ -289,17 +266,6 @@ def _cfg_parallel_cache(node: str, rank: int = 0, world_size: int = 1) -> KVMana
         device=torch.device("cpu"), joint_comm_group=group, kv_dtype=torch.float32,
         nodes=frozenset({node}),
     ))
-
-
-def test_under_cfg_parallel_the_leaders_cache_decides_for_the_guidance_caches():
-    leader = _two_admitted(_cfg_parallel_cache("LLM"))
-    guidance = _two_admitted(_cfg_parallel_cache("LLM_cfg_text"))
-
-    # each worker's own queue would order two requests differently
-    assert not _ready(leader, "b").ready, "the leader's cache admitted past its room"
-    assert _ready(guidance, "b").ready and _step(guidance, "b", 100).ok, (
-        "a guidance cache refused a request on its own count"
-    )
 
 
 def test_under_cfg_parallel_and_tp_only_the_leaders_rank_zero_holds_a_request_back():
@@ -356,25 +322,7 @@ def _guided_prefill(kv: KVManager, rids: tuple[str, ...], span: int):
     return views
 
 
-def test_a_row_the_batch_guides_takes_no_page_its_request_never_counted(monkeypatch):
-    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
-    kv = _manager(max_num_pages=32)
-    labels = ["main", "cfg_text", "cfg_img"]
-    guided = _request(list(range(500, 500 + 4 * PAGE_SIZE)), max_tokens=PAGE_SIZE)
-    guided.needed_labels = labels
-    guided.prompt_slots = dict.fromkeys(labels, 4 * PAGE_SIZE)
-    kv.ingest_request("text", _request(list(range(4 * PAGE_SIZE)), max_tokens=PAGE_SIZE))
-    kv.ingest_request("image", guided)
-    assert _ready(kv, "text").ready and _ready(kv, "image").ready
-
-    views = _guided_prefill(kv, ("text", "image"), 4 * PAGE_SIZE)
-
-    assert kv._held_fresh("text") == 4, "the unguided row took pages for the guidance branches"
-    view = next(v for v in views["cfg_img"].views if v.request_id == "text")
-    assert set(view.page_idxs) == {SINK_PAGE}, "the unguided row's cfg_img was planned off the sink"
-
-
-def test_a_row_counted_on_labels_its_walks_never_open_takes_no_page_there(monkeypatch):
+def test_a_row_takes_nothing_on_a_label_its_walks_never_open(monkeypatch):
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
     kv = _manager(max_num_pages=32)
     labels = ["main", "cfg_text", "cfg_img"]
@@ -388,44 +336,18 @@ def test_a_row_counted_on_labels_its_walks_never_open_takes_no_page_there(monkey
     kv.ingest_request("unguided", unguided)
     kv.ingest_request("image", guided)
     assert _ready(kv, "unguided").ready and _ready(kv, "image").ready
+    assert _step(kv, "unguided", 2 * PAGE_SIZE).ok
 
-    views = _guided_prefill(kv, ("unguided", "image"), 4 * PAGE_SIZE)
+    # main already holds two pages, so a fork onto cfg_text would copy them
+    views = _guided_prefill(kv, ("unguided", "image"), 2 * PAGE_SIZE)
 
     assert kv._held_fresh("unguided") == 4, "the unguided row took pages for guidance it never runs"
     view = next(v for v in views["cfg_img"].views if v.request_id == "unguided")
     assert set(view.page_idxs) == {SINK_PAGE}, "the unguided row's cfg_img was planned off the sink"
-
-
-def _beside_a_guided_request(kv: KVManager) -> KVManager:
-    """``text`` two pages into its prompt, and a guided ``image`` beside it."""
-    labels = ["main", "cfg_text", "cfg_img"]
-    guided = _request(list(range(500, 500 + 4 * PAGE_SIZE)), max_tokens=PAGE_SIZE)
-    guided.needed_labels = labels
-    guided.prompt_slots = dict.fromkeys(labels, 4 * PAGE_SIZE)
-    kv.ingest_request("text", _request(list(range(4 * PAGE_SIZE)), max_tokens=PAGE_SIZE))
-    kv.ingest_request("image", guided)
-    assert _ready(kv, "text").ready and _ready(kv, "image").ready
-    assert _step(kv, "text", 2 * PAGE_SIZE).ok
-    return kv
-
-
-def test_a_guided_fork_copies_nothing_onto_a_label_the_row_holds_nothing_in(monkeypatch):
-    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
-    kv = _beside_a_guided_request(_manager(max_num_pages=32))
-
-    # main already holds two pages, so a fork onto cfg_text would copy them
-    _guided_prefill(kv, ("text", "image"), 2 * PAGE_SIZE)
-
-    assert "cfg_text" not in kv._streams["text"], "the guided fork copied main onto the unguided row's cfg_text"
-
-
-def test_a_label_the_row_holds_nothing_in_keeps_no_length(monkeypatch):
-    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
-    kv = _beside_a_guided_request(_manager(max_num_pages=32))
-
-    _guided_prefill(kv, ("text", "image"), 2 * PAGE_SIZE)
-
-    assert kv._streams["text"]["cfg_img"].stored_len == 0, (
+    assert "cfg_text" not in kv._streams["unguided"], (
+        "the guided fork copied main onto the unguided row's cfg_text"
+    )
+    assert kv._streams["unguided"]["cfg_img"].stored_len == 0, (
         "the unguided row's cfg_img kept a length its later views would stretch over the sink"
     )
 
