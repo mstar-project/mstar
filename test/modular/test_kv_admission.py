@@ -572,7 +572,8 @@ def test_nothing_is_admitted_into_the_room_a_reload_will_take():
 def _drive(kv: KVManager, rng: random.Random, ops: int) -> list[str]:
     """Requests sharing a few prompts, admitted by readiness, prefilled after
     a probe as prepare does, decoded to their ``max_tokens`` and removed, with
-    aborts along the way. Every step an admitted request runs must fit."""
+    aborts along the way. Every step an admitted request runs must fit, and
+    the supply the pool keeps between asks is what it would count afresh."""
     prompts = [list(range(base, base + rng.randrange(20, 90))) for base in (0, 1000, 2000)]
     waiting: dict[str, tuple[int, int]] = {}
     running: dict[str, list[int]] = {}
@@ -610,6 +611,9 @@ def _drive(kv: KVManager, rng: random.Random, ops: int) -> list[str]:
             kv.remove_request(rid)
             log.append(f"abort {rid}")
         kv.assert_pages_conserved()
+        assert kv._supply() == kv._arena.num_free + len(kv._index._find_evictable()), (
+            f"the supply kept since the last ask is not what counting afresh gives: {log}"
+        )
     return log
 
 
