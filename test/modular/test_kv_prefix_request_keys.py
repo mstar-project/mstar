@@ -359,7 +359,7 @@ def _conductor_configs(
     the model's own, a default for anything it declared a stream for or any
     cache, and then each stamped with its own chain and counts."""
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model), model_kwargs, {},
+        SimpleNamespace(model=model, _kv_cache_keys=Conductor._paged_kv_keys(model)), model_kwargs, {},
     )
     Conductor._stamp_resource_configs(configs, model_kwargs, seed=1, max_tokens=max_tokens)
     return configs

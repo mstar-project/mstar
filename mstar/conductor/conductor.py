@@ -26,7 +26,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
-from mstar.engine.resources import KVReqConfig, KVSpec, ResourceReqConfig
+from mstar.engine.resources import KVReqConfig, KVSpec, PagedKVConfig, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
@@ -301,6 +301,8 @@ class Conductor:
         self._early_abort_deadlines: deque[tuple[float, str]] = deque()
 
         self.model = model
+        # read once: `get_node_resources` builds the specs anew on every call
+        self._kv_cache_keys = self._paged_kv_keys(model)
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
@@ -466,18 +468,24 @@ class Conductor:
         is a deployment-wide property the model declares in its resource specs.
 
         A declared stream gets a config even when the model returned none, or its
-        keys would have nowhere to go. So does every KV cache, which admits a
-        request by how far its ``max_tokens`` lets it grow.
+        keys would have nowhere to go. So does every paged KV cache, which admits
+        a request by how far its ``max_tokens`` lets it grow.
         """
         configs = self.model.get_request_resource_configs(
             partition_fwd_args=partition_fwd_args, model_kwargs=model_kwargs
         )
         for key, streams in self.model.prefix_key_streams().items():
             configs.setdefault(key, KVReqConfig(needed_labels=list(streams)))
-        for spec in self.model.get_node_resources():
-            if isinstance(spec, KVSpec):
-                configs.setdefault(spec.resource_key, KVReqConfig())
+        for key in self._kv_cache_keys:
+            configs.setdefault(key, KVReqConfig())
         return configs
+
+    @staticmethod
+    def _paged_kv_keys(model) -> frozenset[str]:
+        return frozenset(
+            spec.resource_key for spec in model.get_node_resources()
+            if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
+        )
 
     def _derive_worker_info(self):
         """Derive per-rank worker info from the worker graphs."""
