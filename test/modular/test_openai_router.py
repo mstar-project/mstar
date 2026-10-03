@@ -448,3 +448,18 @@ def test_speech_stream_pcm_has_no_wav_header(client_and_stub):
     r = client.post("/v1/audio/speech", json={"input": "hi", "stream": True})
     assert r.headers["content-type"].startswith("audio/wav") and r.content[:4] == b"RIFF"
     assert r.content[44:] == _pcm([1, 2, 3])
+
+
+def test_a_transcription_4xx_is_typed_invalid_request(client_and_stub, monkeypatch):
+    from mstar.api_server.openai import serving_transcriptions
+
+    client, stub = client_and_stub
+    stub.model_name = "whisper_large"
+
+    async def bad_request(*a, **k):
+        raise ValueError("unsupported language")
+
+    monkeypatch.setattr(serving_transcriptions, "create_transcription", bad_request)
+    r = client.post("/v1/audio/transcriptions", files={"file": ("a.wav", b"RIFF")})
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"

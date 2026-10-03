@@ -156,8 +156,7 @@ async def audio_transcriptions(request: Request):
             getattr(upload, "filename", None), raw_request=request,
         )
     except Exception as e:  # noqa: BLE001
-        default_status = 400 if isinstance(e, (ValueError, TypeError)) else 500
-        return _error(getattr(e, "status_code", default_status), str(getattr(e, "detail", e)), "server_error")
+        return _exception_error(e)
 
 
 @router.websocket("/v1/realtime")
