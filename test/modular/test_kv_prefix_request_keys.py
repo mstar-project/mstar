@@ -112,11 +112,9 @@ def _deployment(page_size: int = PAGE_SIZE) -> dict:
     return {"model": "stub", "resources": {"kv": {"page_size": page_size}}}
 
 
-def _apply_chain(
-    cfg, key: str, model_kwargs: dict | None, max_tokens: int | None = None,
-) -> None:
+def _apply_chain(cfg, key: str, model_kwargs: dict | None) -> None:
     """One config's share of the conductor's stamp over a request's configs."""
-    Conductor._stamp_resource_configs({key: cfg}, model_kwargs, seed=1, max_tokens=max_tokens)
+    Conductor._stamp_resource_configs({key: cfg}, model_kwargs, seed=1, max_tokens=None)
 
 
 def _handed_over(model_kwargs: dict, key: str = "kv") -> KVReqConfig:
@@ -402,11 +400,7 @@ def test_whisper_is_handed_max_tokens_on_both_of_its_caches():
         if isinstance(spec, KVSpec)
     }
 
-    configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=whisper), {}, {},
-    )
-    for cfg in configs.values():
-        cfg.apply_conductor_config(seed=1, max_tokens=whisper.get_max_output_tokens())
+    configs = _conductor_configs(whisper, {}, max_tokens=whisper.get_max_output_tokens())
 
     handed = {key: getattr(configs.get(key), "max_tokens", None) for key in caches}
     assert handed == dict.fromkeys(caches, 444), (

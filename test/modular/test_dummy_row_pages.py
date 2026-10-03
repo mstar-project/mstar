@@ -149,7 +149,7 @@ def test_a_zero_span_padding_row_needs_no_pages_at_replay():
 
 def test_a_batched_padding_row_still_declares_its_token():
     """The other half: a decode-shaped config ignores the token argument, so
-    its padding rows re-take one page each on first replay rather than none."""
+    its padding rows still declare one token each at replay, which lands in the sink."""
     device = torch.device("cpu")
     batched = BatchedCudaGraphConfig(
         capture_graph_walk="decode",

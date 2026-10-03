@@ -235,7 +235,7 @@ def test_a_step_that_skipped_readiness_waits_its_turn_at_admit():
     kv.ingest_request("b", _request(list(range(500, 600)), max_tokens=60))
     free = kv._arena.num_free
 
-    # a step continuing a speculation onto this node never asked readiness
+    # a step that never asked readiness
     outcome = _step(kv, "b", 100)
 
     assert isinstance(outcome.reason, AdmissionDeferred)

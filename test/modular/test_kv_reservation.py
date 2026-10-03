@@ -76,8 +76,8 @@ def _keyed(tokens: list[int], max_tokens: int) -> KVReqConfig:
     )
 
 
-def _ctx(*rids: str, capture: bool = False) -> StepContext:
-    return StepContext(request_ids=rids, graph_walk=WALK, slot=0, capture=capture)
+def _ctx(*rids: str) -> StepContext:
+    return StepContext(request_ids=rids, graph_walk=WALK, slot=0, capture=False)
 
 
 def _run(kv: KVManager, rid: str, span: int, label: str = "main") -> None:
