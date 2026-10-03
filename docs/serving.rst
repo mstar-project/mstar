@@ -224,15 +224,17 @@ no longer read. It raises an error with a message describing the migration.
 cached pages. A single request opts out by sending ``prefix_cache=False``, which
 travels with its other ``model_kwargs``.
 
-A cached prompt no longer reserves its pages, so the pool no longer limits how many
-requests are admitted. It has to hold the decode of every request allowed to run at once,
-and a decode step that finds no free page holds its requests until they time out.
-``max_concurrent_requests`` prevents that. It caps how many requests run at once, and the
-pool's pages divided by the pages one request needs, prompt and output together, is a
-safe value. ``cpu_offload_pages`` lets a full pool move a request to the host. An offload
-frees only the device pages no other running request reads, though, so a request that
-shares most of its prompt frees little. Offload helps a pool that runs short now and then.
-It doesn't replace the cap.
+The pool admits a request only once the pages it can take fit beside what the running
+requests may still take. A request can take its prompt, less the pages it finds cached, and
+up to ``max_tokens`` of decode, so a running request never runs out of pages. A request that
+doesn't fit waits, and none passes one that asked earlier, so short requests never starve a
+long one. A request that could not fit even alone fails at once. The pool sizes a request
+this way when its model counts what each request holds (Bagel and Whisper do) or keys its
+prompt; for any other model it admits as before. When a cache opens for prefix reuse, the
+engine logs its pages and what a request reserves at the default ``max_tokens``.
+``max_concurrent_requests`` is still an optional cap on top. ``cpu_offload_pages`` lets a
+full pool move a request to the host. An offload frees only the device pages no other
+running request reads, so a request that shares most of its prompt frees little.
 
 **Single GPU.** Everything on rank 0:
 
