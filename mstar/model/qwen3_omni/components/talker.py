@@ -15,7 +15,6 @@ Weight prefix: ``talker.``
 
 from __future__ import annotations
 
-import flashinfer
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -431,7 +430,10 @@ class Qwen3OmniCodePredictor(nn.Module):
 
     @torch.compiler.disable
     def _apply_rope(self, q_rot, k_rot, flat_pos, rope_theta):
-        # moved to its own function for torch.compile purposes
+        # moved to its own function for torch.compile purposes. Imported here,
+        # as in rope.py, so the model imports (and its checks run) without it
+        import flashinfer
+
         return flashinfer.rope.apply_rope_pos_ids(
             q_rot, k_rot,
             pos_ids=flat_pos,
