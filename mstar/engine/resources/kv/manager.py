@@ -894,7 +894,7 @@ class KVManager(AttentionResource):
                 ).get(segment.label)
                 if stream is None:
                     continue
-                if stream.gate_lease and not ctx.is_preplan and segment.span:
+                if stream.gate_lease and segment.span:
                     # prepare never cut this step's inputs to the lease the gate
                     # took, so the step writes the stream from 0
                     self._lent(segment.request_id, -len(stream.lease))
