@@ -986,6 +986,7 @@ class Conductor:
                         request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
                         step_metadata=fwd_args.step_metadata,
+                        stream_lead_items=fwd_args.stream_lead_items,
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
@@ -1381,6 +1382,19 @@ class Conductor:
         )
         pstate.metadata = fwd_args.full_metadata
         pstate.metadata.kwargs.update(fwd_args.step_metadata)
+
+        # The worker's signal is authoritative for a stream-terminated
+        # partition: the pass that consumed the stream's final chunk has run.
+        # Treat it as the partition's own `request_done` so its downstream
+        # connections get `producer_done` and the chain closes. A model that
+        # inferred the end from the connection counters instead
+        # (`consumed_count >= token_count`) could race: `consumed_count` counts
+        # chunks popped for execution, and every worker-graphs-done report from
+        # a worker carries every buffer's count, so a colocated consumer's report
+        # could finish this partition while its last step was still running,
+        # and that step's output arrived for a request already gone.
+        if incoming_connections and partition_done_from_worker:
+            fwd_args.request_done = True
 
         # Check max output tokens for partitions that produce tokens
         if pstate.num_output_tokens >= request_data.max_output_tokens:

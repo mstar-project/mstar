@@ -283,6 +283,10 @@ class ForwardPassArgs:
     # is passed into the fwd pass
     step_metadata: dict = field(default_factory=dict)
 
+    # initial args only: CurrentForwardPassInfo.stream_lead_items for the
+    # partition's consumer streams
+    stream_lead_items: dict[str, int] = field(default_factory=dict)
+
 
 # Every modality a request can name; each model narrows it per direction.
 # video_frame (raw RGB24 frames) is output-only and streaming-only

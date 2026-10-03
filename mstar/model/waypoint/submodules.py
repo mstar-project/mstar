@@ -727,11 +727,13 @@ class WaypointVaeEncoderSubmodule(_SingleRequestMixin, _FunctionalAeMixin, NodeS
 
     def cg_key_info(
         self, graph_walk: str, per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata=None, **kwargs,
     ) -> tuple[int, int] | None:
         """The captured (H, W) bucket for this batch's seed, or None for eager.
 
         The seed shape isn't on ``model_inputs`` at lease time, so it is read
         off ``step_metadata["seed_hw"]``, set by ``get_initial_forward_pass_args``."""
+        del per_request_input_metadata, kwargs
         if graph_walk != PRIME_WALK:
             return None
         sizes = set()

@@ -80,6 +80,13 @@ class StreamBuffer:
     _num_tensors_registered = 0
     _num_buffer_writes = 0
 
+    def prime_context(self, context_items: int) -> None:
+        """The first ``context_items`` items the producer sends are context only
+        (e.g. a voice clone's reference frames): the first chunk carries them
+        ahead of its new items, reported as ``context_items``."""
+        self.policy.prime(context_items)
+        self._delivered_end = context_items
+
     def pre_read_register(self, tensor_id: str):
         self._num_tensors_registered += 1
         self._tensor_ids_in_order.append(tensor_id)

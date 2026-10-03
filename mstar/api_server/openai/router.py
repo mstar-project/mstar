@@ -241,6 +241,8 @@ async def images_edits(request: Request):
                 extra[key] = json.loads(value)
             except (json.JSONDecodeError, TypeError):
                 extra[key] = value
+        if form.get("size"):
+            extra["size"] = form.get("size")  # the adapter maps "WxH" to the model's width / height
         result = await serving_images.create_image_edit(
             api,
             model_name,

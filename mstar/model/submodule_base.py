@@ -5,7 +5,8 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -18,6 +19,21 @@ if TYPE_CHECKING:
     from mstar.engine.cuda_graph_runner import PiecewiseCudaGraphRunner
     from mstar.engine.engine import ExecutingBatch
     from mstar.streaming.stream_buffer import StreamChunkInfo
+
+
+class InputMetadata(NamedTuple):
+    """What the worker knows about one request's inputs to this step.
+
+    Per step, unlike the per-request ``CurrentForwardPassInfo``. Build it with
+    keywords: fields get added here rather than as new hook arguments.
+    """
+    # input_name -> where that streamed input's chunk sits in its stream
+    stream_chunks: Mapping[str, StreamChunkInfo] = MappingProxyType({})
+    # TODO: fold in prepare_inputs' is_final_stream_chunk kwarg once the Chatterbox work settles.
+    # TODO: move step_metadata and dynamic_loop_iter_counts here off CurrentForwardPassInfo (move, don't copy).
+
+
+EMPTY_INPUT_METADATA = InputMetadata()
 
 
 @dataclass
@@ -279,10 +295,8 @@ class ModelInputsFromEngine:
     # ``capture_forward_method``, so most submodules never need this.
     captured: bool = False
 
-    # rid -> {input_name: StreamChunkInfo}; only rids consuming a streamed input
-    per_request_stream_chunks: "Mapping[str, Mapping[str, StreamChunkInfo]]" = field(
-        default_factory=dict
-    )
+    # rid -> this step's InputMetadata; rids without any are absent
+    per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
     @property
     @torch.compiler.disable
@@ -351,6 +365,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def cg_key_info(
         self, graph_walk: str,
         per_request_info: dict[str, CurrentForwardPassInfo],
+        per_request_input_metadata: Mapping[str, InputMetadata] | None = None,
+        **kwargs: Any,
     ) -> Any:
         """Which of this walk's capture buckets a batch belongs to.
 
@@ -365,9 +381,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
         its step. Disagreeing is not an error anywhere — it just misses the
         capture and runs eager — so derive both from one place.
 
+        ``per_request_input_metadata`` is the batch's per-step input facts (as
+        on ``ModelInputsFromEngine``), e.g. for a bucket that follows a stream chunk.
+
         None (the default) means the walk has a single capture.
         """
-        del graph_walk, per_request_info
+        del graph_walk, per_request_info, per_request_input_metadata, kwargs
         return None
 
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:
