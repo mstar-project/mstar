@@ -332,6 +332,28 @@ def test_a_row_the_batch_guides_takes_no_page_its_request_never_counted(monkeypa
     assert set(view.page_idxs) == {SINK_PAGE}, "the unguided row's cfg_img was planned off the sink"
 
 
+def test_a_row_counted_on_labels_its_walks_never_open_takes_no_page_there(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _manager(max_num_pages=32)
+    labels = ["main", "cfg_text", "cfg_img"]
+    guided = _request(list(range(500, 500 + 4 * PAGE_SIZE)), max_tokens=PAGE_SIZE)
+    guided.needed_labels = labels
+    guided.prompt_slots = dict.fromkeys(labels, 4 * PAGE_SIZE)
+    # Bagel counts a generating request on all three labels, but with guidance
+    # off its walks open main alone, and its reservation counts only that
+    unguided = _request(list(range(4 * PAGE_SIZE)), max_tokens=PAGE_SIZE)
+    unguided.prompt_slots = dict.fromkeys(labels, 4 * PAGE_SIZE)
+    kv.ingest_request("unguided", unguided)
+    kv.ingest_request("image", guided)
+    assert _ready(kv, "unguided").ready and _ready(kv, "image").ready
+
+    views = _guided_prefill(kv, ("unguided", "image"), 4 * PAGE_SIZE)
+
+    assert kv._held_fresh("unguided") == 4, "the unguided row took pages for guidance it never runs"
+    view = next(v for v in views["cfg_img"].views if v.request_id == "unguided")
+    assert set(view.page_idxs) == {SINK_PAGE}, "the unguided row's cfg_img was planned off the sink"
+
+
 # ── a request moved to the host ─────────────────────────────────────────
 
 
