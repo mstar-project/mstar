@@ -585,6 +585,7 @@ class Engine:
                 self._keyed_walks.setdefault(node, set()).update(
                     stream.walk for stream in by_label.values()
                 )
+        keyed: list[str] = []
         for key, resource in self._resources.items():
             if checkpoint is None and declared.get(key):
                 config = specs_by_key[key].config
@@ -611,6 +612,7 @@ class Engine:
             })
             if not opened or not declared.get(key):
                 continue
+            keyed.append(key)
             nodes = ", ".join(sorted(specs_by_key[key].nodes))
             for label in declared[key]:
                 logger.info("KV %s: prefix cache open for %s on %s", key, label, nodes)
@@ -625,6 +627,15 @@ class Engine:
                 key, config.max_num_pages,
                 -(-min(max_tokens, config.max_seq_len) // config.page_size), max_tokens,
             )
+        for node in set().union(*(specs_by_key[key].nodes for key in keyed)):
+            pools = sorted(key for key in keyed if node in specs_by_key[key].nodes)
+            if len(pools) > 1:
+                raise ValueError(
+                    f"{node} keys prompts in more than one KV pool ({', '.join(pools)}): its "
+                    "steps cut every pool's prefix to the shortest hit, so a pool that admitted "
+                    "a request on a longer one would take the difference fresh, past the room "
+                    "it checked"
+                )
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:
         """Per-rid ``submodule.prepare_inputs``, onto ``batch.inputs``.
