@@ -862,6 +862,8 @@ class KVManager(AttentionResource):
                     # The producer rewound/replaced this logical stream. Its
                     # seq_len may be unchanged, so length alone cannot prove
                     # the receiver still holds the published contents.
+                    # what the index lent goes, so the request takes those pages itself
+                    self._lent(rid, -(len(stream.lease or ()) + stream.hits))
                     self._release_lease(stream)
                     drop = self._arena.any_sealed(stream.page_indices)
                     if drop:
