@@ -285,7 +285,8 @@ class OrpheusModel(Model):
     ) -> NameToTensorList:
         # Orpheus is text-only; raw multimodal tensors are unused.
         if prompt is None:
-            return {}
+            # the prefill walk waits on text_inputs, so this would hang
+            raise ValueError("Orpheus requires a text prompt")
 
         # An explicit empty/None voice keeps the unprefixed prompt.
         voice = kwargs.get("voice", self.config.default_voice)

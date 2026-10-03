@@ -259,6 +259,23 @@ def test_vjepa2_fails_a_request_with_no_video():
         cls.__new__(cls).process_prompt("describe", ["text"], ["video"], tensors={})
 
 
+@pytest.mark.parametrize("name, inp, out", [
+    ("bagel", [], ["text"]), ("bagel", [], ["image"]), ("orpheus", [], ["audio"]),
+])
+def test_a_request_with_no_prompt_fails_instead_of_hanging(name, inp, out):
+    # /generate without `text` or an image: the first walk waits on an input
+    # that never comes
+    cls = _model_cls(name)
+    with pytest.raises(ValueError, match="text prompt"):
+        cls.__new__(cls).process_prompt(None, inp, out, tensors={})
+
+
+def test_bagel_still_takes_an_image_with_no_prompt():
+    # the image prefills, so the walk runs; only nothing at all is refused
+    cls = _model_cls("bagel")
+    cls.__new__(cls).process_prompt(None, ["image"], ["text"], tensors={})
+
+
 def test_cosmos3_audio_out_means_the_sound_walk():
     # audio is the sound band of a video, so asking for it turns sound on, and
     # asking for it without a video fails instead of returning an image
