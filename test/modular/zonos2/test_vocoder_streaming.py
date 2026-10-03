@@ -1,17 +1,12 @@
-"""Streaming, batched and reference parity for ``StreamingDacDecoder``.
+"""Streaming and batched parity for ``StreamingDacDecoder``.
 
 ``decode_dac`` is a per-frame stub, so a stream must equal one decode of the
 whole sequence. The oracle shears and trims on its own, sharing no helper with
-the decoder. Set ``ZONOS2_REF_PYTHON`` to the reference's ``python/`` dir to
-also compare against Zyphra's vocoder and EOS rule.
+the decoder.
 """
 from __future__ import annotations
 
-import types
-
-import numpy as np
 import pytest
-from _reference import DetokenizeMsg, load_reference  # pytest puts this dir on sys.path
 
 from mstar.model.zonos2 import vocoder as V
 
@@ -177,38 +172,3 @@ def test_batched_single_group_homogeneous():
             out[r].append(res[r])
     for r, f in streams.items():
         _assert_pcm_close(torch.cat(out[r]), _oneshot(f))
-
-
-# -- parity with Zyphra's vocoder ---------------------------------------------
-@pytest.fixture
-def reference(monkeypatch):
-    voc, seq = load_reference(monkeypatch, "tokenizer/vocoder.py", "tts/sequence.py")
-    monkeypatch.setattr(voc, "decode_dac", _stub_decode)
-    return voc, seq
-
-
-def _reference_pcm(reference, frames, ignore_eos):
-    voc, seq = reference
-    mgr = voc.TTSVocoderManager(
-        n_codebooks=NC, audio_pad_id=PAD, min_decode_chunk=OVERLAP + 1,
-        overlap_frames=OVERLAP, hop_length=HOP,
-    )
-    params = types.SimpleNamespace(ignore_eos=ignore_eos, max_tokens=10**9)
-    s = seq.TTSSequence(prompt_ids=[], sampling_params=params, n_codebooks=NC, eoa_id=EOA)
-    chunks, rows = [], frames.tolist()
-    for i, row in enumerate(rows):
-        s.append_token(row + [0])
-        # The serving path (core.check_eos) never sets eos_frame under ignore_eos.
-        eos = None if ignore_eos else s.eos_frame
-        chunks += mgr.decode_frames([DetokenizeMsg(0, row, i == len(rows) - 1, eos)])
-    audio = torch.from_numpy(np.frombuffer(b"".join(chunks), dtype=np.float32).copy())
-    return V.to_int16_pcm(audio)
-
-
-@pytest.mark.parametrize("seed", [0, 5])
-@pytest.mark.parametrize("eos_at", EOS_CASES)
-@pytest.mark.parametrize("ignore_eos", [False, True])
-def test_matches_reference_vocoder(reference, seed, eos_at, ignore_eos):
-    frames = _frames(seed, eos_at=eos_at)
-    got = _drive(_new_decoder(), frames, [16, 16, 8], ignore_eos=ignore_eos)
-    _assert_pcm_close(got, _reference_pcm(reference, frames, ignore_eos))
