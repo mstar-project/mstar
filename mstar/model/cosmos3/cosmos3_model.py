@@ -198,6 +198,9 @@ class Cosmos3Model(Model):
         # against whichever tokenizer is bound; see ``postprocess``).
         self._detokenizer = None
         self.config: Cosmos3Config = self._load_config()
+        if not self._reasoner_enabled():
+            # text comes only from the reasoner
+            self.SUPPORTED_OUTPUT_MODALITIES = self.SUPPORTED_OUTPUT_MODALITIES - {"text"}
         self.tokenizer = self._load_tokenizer()
 
         self._submodule_cache: dict[str, torch.nn.Module | None] = {}

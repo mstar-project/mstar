@@ -7,6 +7,7 @@ supported input/output modalities, and ``submit_request`` rejects the rest with
 ``UnsupportedModalityError`` (mapped to a 400 by the HTTP layer).
 """
 
+import json
 import threading
 from importlib import import_module
 from types import SimpleNamespace
@@ -154,6 +155,8 @@ ACCEPTED = [
     ("qwen3_omni", ["image", "text"], ["audio"]),
     ("orpheus", ["text"], ["audio"]),
     ("qwen3_tts", ["text"], ["audio"]),
+    # client.tts(reference_audio=...) on the Base checkpoint
+    ("qwen3_tts_base", ["audio", "text"], ["audio"]),
     ("omnivoice", ["text"], ["audio"]),
     # speech route with ref_audio: the clip to clone
     ("omnivoice", ["text", "audio"], ["audio"]),
@@ -315,3 +318,25 @@ def test_every_default_output_is_one_the_model_supports(name):
     cls = _model_cls(name)
     model = cls.__new__(cls)
     assert set(model.default_output_modalities()) <= cls.SUPPORTED_OUTPUT_MODALITIES
+
+
+def test_cosmos3_without_a_reasoner_refuses_text_at_intake():
+    cls = _model_cls("cosmos3")
+    model = cls(model_path_hf="unused", skip_weight_loading=True)
+    assert model.unsupported_modalities(["text"], ["text"]) == [("text", "output")]
+    assert "text" in cls.SUPPORTED_OUTPUT_MODALITIES  # kept for the Edge checkpoints
+
+
+@pytest.mark.parametrize("tts_model_type, takes_audio", [("custom_voice", False), ("base", True)])
+def test_qwen3_tts_takes_a_clip_only_on_base(tmp_path, monkeypatch, tts_model_type, takes_audio):
+    cls = _model_cls("qwen3_tts")
+    (tmp_path / "speech_tokenizer").mkdir()
+    (tmp_path / "config.json").write_text(json.dumps({"tts_model_type": tts_model_type}))
+    (tmp_path / "generation_config.json").write_text("{}")
+    (tmp_path / "speech_tokenizer" / "config.json").write_text("{}")
+    monkeypatch.setattr(
+        "mstar.model.qwen3_tts.qwen3_tts_model.AutoTokenizer.from_pretrained",
+        lambda *a, **k: None,
+    )
+    model = cls(model_path_hf=str(tmp_path))
+    assert (model.unsupported_modalities(["text", "audio"], ["audio"]) == []) is takes_audio
