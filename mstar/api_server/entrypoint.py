@@ -978,7 +978,8 @@ class WarmupRequest:
 
     text: str | None = None
     files: list[WarmupMedia] = field(default_factory=list)
-    output_modalities: list[str] = field(default_factory=lambda: ["text"])
+    # empty: the model's default, as on /generate
+    output_modalities: list[str] = field(default_factory=list)
     model_kwargs: dict | None = None
 
     @classmethod
@@ -988,7 +989,7 @@ class WarmupRequest:
         unknown = set(spec) - {"text", "files", "output_modalities", "model_kwargs"}
         if unknown:
             raise ValueError(f"unknown key(s) {sorted(unknown)}")
-        out_mods = spec.get("output_modalities") or ["text"]
+        out_mods = spec.get("output_modalities") or []
         if isinstance(out_mods, str):
             out_mods = [m.strip() for m in out_mods.split(",") if m.strip()]
         files = spec.get("files") or []
@@ -1060,7 +1061,7 @@ def _run_warmup_requests(server: APIServer, specs: list) -> None:
             continue
         logger.info(
             "warmup request %d/%d (%s) done in %.1f s",
-            index + 1, len(specs), ",".join(request.output_modalities),
+            index + 1, len(specs), ",".join(request.output_modalities) or "default",
             time.perf_counter() - t0,
         )
 
@@ -1223,7 +1224,8 @@ async def generate_ws(websocket: WebSocket):
         try:
             if request_id is not None and not isinstance(request_id, str):
                 raise ValueError("request_id must be a string")
-            out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or ["text"]
+            # none named: the model's default, as on /generate
+            out_mods = _ws_modalities(message.get("output_modalities"), "output_modalities") or []
             text = message.get("text")
             if text is not None and not isinstance(text, str):
                 raise ValueError("text must be a string")
