@@ -338,19 +338,35 @@ def compile_transformer_forward(
     (``exclude_from_compile``) and compiles the rest — ``True`` for all of them, or a list of the
     op classes to keep eager (``["norms"]``, ``["activations"]``), since each excluded module is a
     graph break that costs fusion (klein-4B pays 8% at B=1 for all of them, Z-Image 48%)."""
-    import torch._inductor.config as inductor_config
-
     types = exact_op_types(exact_ops)
     if types:
         excluded = exclude_from_compile(transformer, types)
         logger.info("compiled transformer keeps %d modules (%s) on the eager kernels", excluded,
                     "all classes" if exact_ops is True else ", ".join(exact_ops))
-    inductor_config.emulate_precision_casts = bool(eager_rounding)
-    transformer.forward = torch.compile(transformer.forward, fullgraph=False, dynamic=False)
+    transformer.forward = _with_inductor_rounding(
+        torch.compile(transformer.forward, fullgraph=False, dynamic=False),
+        eager_rounding=bool(eager_rounding),
+    )
+
+
+def _with_inductor_rounding(compiled, *, eager_rounding: bool):
+    """Wrap a compiled callable so ``emulate_precision_casts`` is in effect for the
+    traces it builds, and only for those. This works with torch.compile's lazy
+    compilation, and post-torch 2.12 per-thread config behavior, without introducing
+    a global config change.
+    """
+    import torch._inductor.config as inductor_config
+
+    def forward(*args, **kwargs):
+        with inductor_config.patch(emulate_precision_casts=eager_rounding):
+            return compiled(*args, **kwargs)
+
+    return forward
 
 
 def compile_vae_decode(vae: nn.Module):
-    """``vae.decode`` compiled per static shape with inductor autotuning (no cudagraphs: the
+    """
+    ``vae.decode`` compiled per static shape with inductor autotuning (no cudagraphs: the
     engine's runner owns capture). Static, not symbolic: a symbolic batch dimension decoded
     batch 8 in 346 ms against 223 ms for the per-size graph. A fresh max-autotune compile costs
     tens of seconds, so the decoder warms every batch size it will ever call at load and splits
@@ -360,8 +376,12 @@ def compile_vae_decode(vae: nn.Module):
     one (inductor's GroupNorm / SiLU decompositions), and because the autotuner benchmarks
     candidate conv kernels, two server processes can pick different ones (64 dB apart on the same
     seeds). An "exact" compile that keeps GroupNorm and SiLU on the eager kernels is bit-exact but
-    slower than eager (111 vs 89 ms), so the exactness knob for the VAE is ``vae_compile: false``."""
-    return torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=VAE_COMPILE_MODE)
+    slower than eager (111 vs 89 ms), so the exactness knob for the VAE is ``vae_compile: false``.
+    """
+    return _with_inductor_rounding(
+        torch.compile(vae.decode, fullgraph=False, dynamic=False, mode=VAE_COMPILE_MODE),
+        eager_rounding=True,
+    )
 
 
 def decode_in_chunks(decode, latents: torch.Tensor, chunk_sizes: Sequence[int]) -> torch.Tensor:

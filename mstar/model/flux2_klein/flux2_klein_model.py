@@ -325,8 +325,12 @@ class Flux2KleinModel(Model):
         ref_dims = [(int(img.shape[-2]), int(img.shape[-1])) for img in images]
         self._resolve_size(kwargs, ref_dims)
         self._resolve_steps(kwargs)
-        if float(kwargs.get("guidance_scale", 1.0)) != 1.0 and self.config.is_distilled:
-            logger.info("guidance_scale is ignored: FLUX.2 klein is step-distilled and runs without CFG")
+        # Ungated on is_distilled: a non-distilled checkpoint is the case that most
+        # needed telling, and it was the one case that stayed silent. Only distilled
+        # checkpoints load at all now (Flux2KleinConfig.from_snapshot), so this fires
+        # whenever a caller's guidance_scale is about to be dropped.
+        if float(kwargs.get("guidance_scale", 1.0)) != 1.0:
+            logger.warning("guidance_scale is ignored: FLUX.2 klein is step-distilled and runs without CFG")
         ids, mask = self.tokenize(prompt)
         return {TEXT_INPUTS: [ids], TEXT_MASK: [mask]}
 

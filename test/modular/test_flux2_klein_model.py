@@ -500,21 +500,55 @@ def test_vae_decode_sizes_are_the_four_compiled_sizes_clamped_to_the_max_batch()
     assert [s for s in VAE_DECODE_BATCH_SIZES if s <= small.max_batch_size] == [1, 2, 4]
 
 
-def test_compile_eager_rounding_knob_sets_inductor_precision_emulation(monkeypatch):
+def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch):
+    """``torch.compile`` traces lazily, so ``emulate_precision_casts`` has to be in
+    effect when the compiled callable is CALLED, not when it is built -- the build runs
+    on the worker's main thread and the traces on the GPU executor thread, and since
+    torch 2.12 the config is per-thread. It must also not stay set, or the next region
+    to compile silently inherits it (the VAE decode did, by node build order)."""
     import torch._inductor.config as inductor_config
 
     from mstar.model.flux2_klein.submodules import compile_transformer_forward
 
-    calls = []
+    calls, seen = [], []
     monkeypatch.setattr(torch, "compile", lambda fn, **kw: calls.append(kw) or fn)
+    monkeypatch.setattr(inductor_config, "emulate_precision_casts", False)
+
     module = torch.nn.Linear(2, 2)
+    module.forward = lambda *a, **k: seen.append(inductor_config.emulate_precision_casts)
     compile_transformer_forward(module, eager_rounding=True)
-    assert inductor_config.emulate_precision_casts is True and calls[-1]["dynamic"] is False
-    compile_transformer_forward(module, eager_rounding=False)
+    assert calls[-1]["dynamic"] is False
+    # building it does not touch the global, so nothing downstream inherits a value
     assert inductor_config.emulate_precision_casts is False
-    inductor_config.emulate_precision_casts = False  # leave the process default behind
+    module.forward()
+    assert seen == [True], "the flag was not live where inductor actually traces"
+    assert inductor_config.emulate_precision_casts is False, "the flag leaked"
+
+    module.forward = lambda *a, **k: seen.append(inductor_config.emulate_precision_casts)
+    compile_transformer_forward(module, eager_rounding=False)
+    module.forward()
+    assert seen[-1] is False
+
     assert _make_model().compile_eager_rounding is True
     assert _make_model(compile_eager_rounding=False).compile_eager_rounding is False
+
+
+def test_the_vae_decode_asks_for_its_own_rounding_instead_of_inheriting(monkeypatch):
+    """It used to read whatever the transformer's compile left in the global config, so
+    the decoder's kernels depended on which node was built first."""
+    import torch._inductor.config as inductor_config
+
+    from mstar.model.flux2_klein.submodules import compile_vae_decode
+
+    seen = []
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: fn)
+    monkeypatch.setattr(inductor_config, "emulate_precision_casts", False)
+
+    vae = torch.nn.Module()
+    vae.decode = lambda *a, **k: seen.append(inductor_config.emulate_precision_casts)
+    compile_vae_decode(vae)()
+    assert seen == [True]
+    assert inductor_config.emulate_precision_casts is False
 
 
 def test_requests_above_max_image_area_are_rejected():
@@ -589,3 +623,72 @@ def test_blank_prompts_are_rejected():
     for bad in (None, "", "   "):
         with pytest.raises(ValueError, match="text prompt"):
             model.process_prompt(bad, ["text"], ["image"])
+
+
+def _index_only_snapshot(tmp_path: Path, **index) -> Path:
+    """Just ``model_index.json``. Enough for the guards that run before the sub-configs
+    are parsed; a snapshot that gets past them needs real weights."""
+    import json
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "model_index.json").write_text(
+        json.dumps({"_class_name": "Flux2KleinPipeline", **index})
+    )
+    return tmp_path
+
+
+def test_a_non_distilled_snapshot_is_refused_rather_than_served_unguided(tmp_path):
+    """Nothing downstream runs CFG, so a -base / FLUX.2-dev checkpoint used to load and
+    serve silently unguided images at 50 steps."""
+    from mstar.model.flux2_klein.config import Flux2KleinConfig
+
+    with pytest.raises(NotImplementedError, match="non-distilled"):
+        Flux2KleinConfig.from_snapshot(
+            _index_only_snapshot(tmp_path / "base", is_distilled=False)
+        )
+
+
+def test_a_snapshot_without_is_distilled_is_not_treated_as_non_distilled(tmp_path):
+    """The key is absent from some snapshots. Defaulting it to False made the unguided
+    path the common one; it must default to distilled and get past this guard."""
+    from mstar.model.flux2_klein.config import Flux2KleinConfig
+
+    # Gets past the guard and fails later, on the sub-config this stub has no file for.
+    with pytest.raises(FileNotFoundError):
+        Flux2KleinConfig.from_snapshot(_index_only_snapshot(tmp_path / "nokey"))
+
+
+def test_a_guidance_embeds_snapshot_is_refused(tmp_path, monkeypatch):
+    """The transformer would build a guidance embedder the forward never feeds."""
+    import dataclasses
+
+    from mstar.model.flux2_klein import config as config_mod
+    from mstar.model.flux2_klein.config import Flux2KleinConfig
+
+    guided = dataclasses.replace(Flux2KleinConfig().transformer, guidance_embeds=True)
+    monkeypatch.setattr(
+        config_mod.Flux2TransformerConfig, "from_dict", classmethod(lambda cls, cfg: guided),
+    )
+    snapshot = _index_only_snapshot(tmp_path, is_distilled=True)
+    (snapshot / "transformer").mkdir()
+    (snapshot / "transformer" / "config.json").write_text("{}")
+
+    with pytest.raises(NotImplementedError, match="guidance_embeds"):
+        Flux2KleinConfig.from_snapshot(snapshot)
+
+
+def test_a_dropped_guidance_scale_is_always_reported(caplog):
+    """The warning used to be gated on ``is_distilled``, so it fired only where being
+    unguided was correct and stayed silent on the checkpoints that needed it."""
+    import logging
+
+    model = _make_model()
+
+    with caplog.at_level(logging.WARNING):
+        model.process_prompt("a cat", ["text"], ["image"], guidance_scale=4.0)
+    assert any("guidance_scale is ignored" in r.message for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        model.process_prompt("a cat", ["text"], ["image"])
+    assert not [r for r in caplog.records if "guidance_scale" in r.message]

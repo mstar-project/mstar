@@ -185,8 +185,11 @@ class Flux2KleinConfig:
     default_height: int = 1024
     default_width: int = 1024
     default_num_inference_steps: int = 4
-    # Distilled: no classifier-free guidance (the pipeline ignores guidance_scale
-    # when is_distilled). Kept as a knob so a -base checkpoint can turn it on.
+    # Distilled: no classifier-free guidance (the pipeline ignores guidance_scale).
+    # Kept as a knob for a -base checkpoint, but CFG is NOT implemented yet --
+    # ``denoise`` runs a single conditional pass and ``guidance_scale`` is only
+    # logged -- so ``from_snapshot`` refuses a non-distilled snapshot rather than
+    # serving it silently unguided. Flip this back to a real knob when CFG lands.
     is_distilled: bool = True
     default_guidance_scale: float = 1.0
     # Ceiling on the denoise Loop; a request's step count is clamped to it.
@@ -213,8 +216,27 @@ class Flux2KleinConfig:
             index = json.load(f)
         if index.get("_class_name") not in ("Flux2KleinPipeline", "Flux2Pipeline"):
             raise ValueError(f"{snapshot} is not a FLUX.2 pipeline snapshot ({index.get('_class_name')!r})")
+        # Before parsing the rest: nothing downstream runs CFG. `denoise` does one
+        # conditional pass and `guidance_scale` is only logged, so a non-distilled
+        # checkpoint would load and serve silently unguided images at 50 steps.
+        # `is_distilled` is absent from some snapshots, so the DEFAULT decides --
+        # hence True; defaulting to False made the unguided path the common one.
+        if not bool(index.get("is_distilled", True)):
+            raise NotImplementedError(
+                f"{snapshot} is a non-distilled FLUX.2 checkpoint, which needs "
+                "classifier-free guidance; mstar runs a single conditional pass, so it "
+                "would serve unguided images. Only the step-distilled klein checkpoints "
+                "are supported."
+            )
         with open(snapshot / "transformer" / "config.json") as f:
             transformer = Flux2TransformerConfig.from_dict(json.load(f))
+        # Same reason as the is_distilled guard, but it needs the transformer config:
+        # a guidance embedder the forward never feeds.
+        if transformer.guidance_embeds:
+            raise NotImplementedError(
+                f"{snapshot} sets guidance_embeds; mstar does not feed a guidance "
+                "embedding to the transformer, so the served images would ignore it."
+            )
         with open(snapshot / "vae" / "config.json") as f:
             vae = Flux2VaeConfig.from_dict(json.load(f))
         with open(snapshot / "text_encoder" / "config.json") as f:
@@ -231,12 +253,11 @@ class Flux2KleinConfig:
                 f"transformer in_channels {transformer.in_channels} != VAE patched latent channels "
                 f"{vae.patched_latent_channels}"
             )
-        is_distilled = bool(index.get("is_distilled", False))
+        # Past the guard every loadable snapshot is distilled, so the defaults are
+        # the distilled ones; the non-distilled branch comes back with CFG.
         return cls(
             transformer=transformer, vae=vae, text_encoder=text_encoder, scheduler=scheduler,
-            is_distilled=is_distilled,
-            default_num_inference_steps=4 if is_distilled else 50,
-            default_guidance_scale=1.0 if is_distilled else 4.0,
+            is_distilled=True, default_num_inference_steps=4, default_guidance_scale=1.0,
         )
 
 

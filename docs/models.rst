@@ -554,50 +554,80 @@ The OpenAI routes are ``POST /v1/images/generations`` (``size`` as ``WxH``, ``se
 conditioning tokens, in order).
 
 Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
-``attention_backend`` (``sdpa``, the default: the reference kernel, cuDNN on an H100,
-measured as fast as FlashInfer in the served path; ``flashinfer``: the DiT's joint
-attention runs on the engine's ragged FlashInfer resource, also CUDA-graph replayable),
-``compile`` (``torch.compile`` of the transformer, one trace per shape) with
-``compile_eager_rounding`` (inductor rounds intermediates where eager PyTorch does and fuses
-no FMAs) and ``compile_exact_ops`` (``true``, or a list of op classes among ``norms`` and
-``activations``: those modules stay on the eager kernels inside the compiled forward, so inductor
-only fuses the chains around the GEMMs and attention; each excluded module is a graph break: the
-norms alone make the transformer exact (the shipped ``[norms]`` costs klein-4B 4% of its B=1
-latency, 0.371 vs 0.356 s; excluding the activations too adds cost and nothing else) while Z-Image's
-180 norms per step cost 45%, so it ships ``false``; the
-compiled transformer is then bit-exact with the eager one — measured on klein-4B and 9B — where
-the plain compile, even with eager rounding, lands at a median 35 to 38 dB PSNR from the eager
-path over the 100 protocol prompts, because a 4- or 8-step distilled sampler amplifies the last
-bit of inductor's own reductions and activation decompositions), ``cuda_graph`` with
-``capture_sizes`` / ``capture_batch_sizes`` (the denoise step, Euler update included, is captured
-per listed ``[height, width]`` and batch size; other shapes run the eager batched path) and
-``capture_edit_sizes`` (klein: edit buckets with one reference image of the output size, the shape
-of an edit that keeps its reference's size; defaults to ``capture_sizes``, ``[]`` captures none; the
-eight edit buckets of the 1024² default cost about 8 GiB of peak VRAM on klein-4B and 6 GiB on 9B,
-and every extra capture size adds roughly 7 minutes of startup), ``async_scheduling`` (the engine's speculative scheduling of the image
-nodes: the worker assembles a batch's next denoise step while the current one runs and merges requests
-that became ready meanwhile, so requests at different steps share a forward; on by default. Measured on
-one H100 against lockstep, same GPU back to back: klein-4B 0.365 to 0.372 s vs 0.377 to 0.390 s at B=1
-and about 3 percent more images per second at 4 and 16 concurrent requests, klein-9B 2 percent, Z-Image
-neutral, with the served images unchanged; the denoise phase is compute-bound either way. The step a
-request speculates past its schedule is vetoed before any forward. ``false`` restores lockstep),
-``max_batch_size``, and ``vae_compile`` (``torch.compile`` of the VAE decode with inductor
-autotuning: 89 to 29 ms at 1024² on an H100; its fused reductions move the image by about 55 dB
-PSNR from the eager decode on every prompt, and the autotuner may pick other conv kernels in
-another server process, so set it to ``false`` for bit-exact, repeatable output (the eager decode of
-an 8-image batch at 1024² allocates about 40 GiB of activations: served peaks of 75 GiB on klein-4B and
-77 GiB on Z-Image at 16 concurrent requests against 36 to 44 GiB compiled); the parity
-suite runs with it off; the compiled decode is warmed at load for the ``capture_sizes`` grids
-and the decode batch sizes, and any other latent shape decodes eagerly rather than paying a
-40 to 100 s autotune inside a request). With the klein defaults every served image is within 53 dB of the eager
-path on all 100 protocol prompts, and with ``vae_compile: false`` it is bit-exact. Z-Image ships
-the plain compile (``compile_exact_ops: false``: 0.86 s at B=1, a median 34 dB from the eager path)
-because keeping its 180 norms per step eager costs 45% (1.25 s); ``compile_exact_ops: [norms]``
-turns it into the reference-faithful mode (at least 55.9 dB on every prompt). For scale, the served
-images of the other engines are 10 to 16 dB from the diffusers reference for the same seeds.
-``max_image_area`` (pixels, default 2048²) bounds the output size a request may ask for:
-larger requests are rejected with a 400 before scheduling instead of occupying the worker
-for minutes (an 8192² request means 262k tokens of quadratic attention).
+
+``attention_backend``
+   ``sdpa`` (default) is the reference kernel, cuDNN on an H100 and measured as fast as
+   FlashInfer in the served path. ``flashinfer`` runs the DiT's joint attention on the
+   engine's ragged FlashInfer resource; both are CUDA-graph replayable.
+
+``compile``
+   ``torch.compile`` of the transformer, one trace per shape.
+
+``compile_eager_rounding``
+   Inductor rounds intermediates where eager PyTorch does, and fuses no FMAs.
+
+``compile_exact_ops``
+   ``true``, or a list of op classes among ``norms`` and ``activations``: those modules
+   stay on the eager kernels inside the compiled forward, so inductor only fuses the
+   chains around the GEMMs and attention. Each excluded module is a graph break, so this
+   is a latency-for-exactness trade:
+
+   * The norms alone make the transformer bit-exact with eager (measured on klein-4B and
+     9B). The shipped ``[norms]`` costs klein-4B 4% of its B=1 latency (0.371 vs
+     0.356 s); excluding the activations too adds cost and nothing else.
+   * Z-Image's 180 norms per step cost 45% (1.25 vs 0.86 s at B=1), so it ships ``false``
+     and lands at a median 34 dB. ``[norms]`` turns it reference-faithful (at least
+     55.9 dB on every prompt).
+   * Without it, the plain compile — even with eager rounding — lands at a median 35 to
+     38 dB PSNR from eager over the 100 protocol prompts, because a 4- or 8-step
+     distilled sampler amplifies the last bit of inductor's own reductions and activation
+     decompositions.
+
+``cuda_graph``, ``capture_sizes``, ``capture_batch_sizes``
+   The denoise step, Euler update included, is captured per listed ``[height, width]``
+   and batch size. Other shapes run the eager batched path.
+
+``capture_edit_sizes``
+   klein only: edit buckets with one reference image of the output size, the shape of an
+   edit that keeps its reference's size. Defaults to ``capture_sizes``; ``[]`` captures
+   none. The eight edit buckets of the 1024² default cost about 8 GiB of peak VRAM on
+   klein-4B and 6 GiB on 9B, and every extra capture size adds roughly 7 minutes of
+   startup.
+
+``async_scheduling``
+   The engine's speculative scheduling of the image nodes: the worker assembles a batch's
+   next denoise step while the current one runs and merges requests that became ready
+   meanwhile, so requests at different steps share a forward. On by default; a step a
+   request speculates past its schedule is vetoed before any forward, and ``false``
+   restores lockstep. Measured on one H100 back to back against lockstep: klein-4B 0.365
+   to 0.372 s vs 0.377 to 0.390 s at B=1 and about 3% more images per second at 4 and 16
+   concurrent requests, klein-9B 2%, Z-Image neutral, served images unchanged — the
+   denoise phase is compute-bound either way.
+
+``max_batch_size``
+   Rows batched per denoise step.
+
+``vae_compile``
+   ``torch.compile`` of the VAE decode with inductor autotuning: 89 to 29 ms at 1024² on
+   an H100. Its fused reductions move the image by about 55 dB PSNR from the eager decode
+   on every prompt, and the autotuner may pick different conv kernels in another server
+   process, so set it to ``false`` for bit-exact, repeatable output — which is how the
+   parity suite runs. The compiled decode is warmed at load for the ``capture_sizes``
+   grids and the decode batch sizes; any other latent shape decodes eagerly rather than
+   paying a 40 to 100 s autotune inside a request. Memory cuts the other way: the eager
+   decode of an 8-image batch at 1024² allocates about 40 GiB of activations, for served
+   peaks of 75 GiB on klein-4B and 77 GiB on Z-Image at 16 concurrent requests against
+   36 to 44 GiB compiled.
+
+``max_image_area``
+   Pixels, default 2048². Bounds the output size a request may ask for; larger requests
+   are rejected with a 400 before scheduling instead of occupying the worker for minutes
+   (an 8192² request means 262k tokens of quadratic attention).
+
+With the klein defaults every served image is within 53 dB of the eager path on all 100
+protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
+images of the other engines are 10 to 16 dB from the diffusers reference for the same
+seeds.
 Requests at the same output size batch across users in every node, including the
 text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the
 transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or
