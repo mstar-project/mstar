@@ -111,6 +111,16 @@ def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> Non
     )
 
 
+def worker_device(device_type: str, rank: int, rank_devices: dict[int, int] | None = None) -> str:
+    """The device string a worker rank runs on: its own number unless the
+    deployment's ``rank_devices`` maps it elsewhere (several ranks may share a
+    GPU); CPU deployments ignore the mapping."""
+    if device_type == "cpu":
+        return "cpu"
+    index = (rank_devices or {}).get(rank, rank)
+    return f"{device_type}:{index}"
+
+
 def _worker_process_target(
     worker_id: str,
     worker_ids: list[str],
@@ -317,6 +327,15 @@ class Conductor:
         )
         assert "max_seq_len" in self.model_config
         assert "node_groups" in self.model_config
+        # Optional ``rank_devices: {rank: device_index}`` places a worker rank
+        # on a device other than the one its number implies, e.g. two workers
+        # sharing one GPU so a light node's steps stop interleaving with a
+        # heavy node's on the same worker loop.
+        self.rank_devices = {
+            int(rank): int(index)
+            for rank, index in (self.model_config.get("rank_devices") or {}).items()
+        }
+        model.validate_config_yaml(self.model_config, model_config_file)
 
         self.default_sharding_config = model.get_sharding_config(model_config_file)
         # The conductor is the only process that sees every worker graph, so it
@@ -533,10 +552,7 @@ class Conductor:
                     "model": self.model,
                     "enable_nvtx": self.enable_nvtx,
                     "enable_prof": self.enable_prof,
-                    "device": (
-                        f"{self.device_type}:{rank}"
-                        if self.device_type != "cpu" else "cpu"
-                    ),
+                    "device": worker_device(self.device_type, rank, self.rank_devices),
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device
@@ -745,6 +761,35 @@ class Conductor:
                 )
                 for dest_worker, sliced_edge in fanout.items():
                     inputs_per_worker[dest_worker].append(sliced_edge)
+        # The split above yields one edge per (rank, node, walk), so a name
+        # produced across walks arrives as several. The consumer would take the
+        # second as the next iteration's input and drop the third, so rejoin
+        # them in persist order. Keyed by source rank: a TP fan-in edge stays
+        # one per rank, which is what the consumer consolidates on.
+        for dest_worker, edges in inputs_per_worker.items():
+            merged: list[GraphEdge] = []
+            first_by_key: dict[tuple[str, str, int], GraphEdge] = {}
+            for edge in edges:
+                if not edge.tensor_info:
+                    merged.append(edge)  # signal-only, nothing to join
+                    continue
+                key = (
+                    edge.name, edge.next_node,
+                    edge.tensor_info[0].source_tp_rank,
+                )
+                first = first_by_key.get(key)
+                if first is not None:
+                    # Rank numbering only lines up if the contributors share a
+                    # source TP size, which is what fan-in counts.
+                    assert first._total_fanin == edge._total_fanin, (
+                        f"{edge.name}: contributors to one name disagree on "
+                        f"fan-in ({first._total_fanin} vs {edge._total_fanin})"
+                    )
+                    first.tensor_info = first.tensor_info + edge.tensor_info
+                    continue
+                first_by_key[key] = edge
+                merged.append(edge)
+            inputs_per_worker[dest_worker] = merged
         return inputs_per_worker
 
     def _update_persist_ref_counts(
@@ -961,6 +1006,7 @@ class Conductor:
                         request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
                         step_metadata=fwd_args.step_metadata,
+                        stream_lead_items=fwd_args.stream_lead_items,
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
@@ -1282,13 +1328,16 @@ class Conductor:
             for name, infos in body.persist_signals.items():
                 request_data.persist_signals.setdefault(name, []).extend(infos)
 
+        # Resource publish info is rank-sharded. Every TP rank contributes its
+        # own KV pages and transfer descriptor, and PublishedKVInfo.update()
+        # folds those entries by rank.
+        merge_publish_info(
+            pstate.resource_publish_info, body.resource_publish_info
+        )
+
         # Absorb-only fields are replicated across TP ranks; only the rank-0
         # message contributes.
         if body.is_first_tp_rank:
-            merge_publish_info(
-                pstate.resource_publish_info, body.resource_publish_info
-            )
-
             if body.new_token_counts:
                 for name, count in body.new_token_counts.items():
                     pstate.num_output_tokens += count
@@ -1353,6 +1402,19 @@ class Conductor:
         )
         pstate.metadata = fwd_args.full_metadata
         pstate.metadata.kwargs.update(fwd_args.step_metadata)
+
+        # The worker's signal is authoritative for a stream-terminated
+        # partition: the pass that consumed the stream's final chunk has run.
+        # Treat it as the partition's own `request_done` so its downstream
+        # connections get `producer_done` and the chain closes. A model that
+        # inferred the end from the connection counters instead
+        # (`consumed_count >= token_count`) could race: `consumed_count` counts
+        # chunks popped for execution, and every worker-graphs-done report from
+        # a worker carries every buffer's count, so a colocated consumer's report
+        # could finish this partition while its last step was still running,
+        # and that step's output arrived for a request already gone.
+        if incoming_connections and partition_done_from_worker:
+            fwd_args.request_done = True
 
         # Check max output tokens for partitions that produce tokens
         if pstate.num_output_tokens >= request_data.max_output_tokens:

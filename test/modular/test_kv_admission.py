@@ -22,7 +22,7 @@ import torch
 
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVStep
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import AdmissionDeferred, KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
@@ -43,11 +43,18 @@ SEED = 20260930
 class _StubTransfer:
     """No engine, no bytes moved."""
 
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
-    def get_kv_transfer_info(self):
-        return None
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del kwargs
+        return transfer_info == self.get_kv_transfer_info()
+
+    def remove_request(self, request_id):
+        del request_id
 
     def start_async_retrieve(self, **kwargs):
         del kwargs
@@ -69,7 +76,7 @@ def _manager(
     if world_size > 1:
         group = SimpleNamespace(rank=rank, world_size=world_size)
     kv = KVManager(
-        cfg=KVConfig(
+        cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096,
             max_num_pages=max_num_pages, page_size=PAGE_SIZE,
             cpu_offload_pages=cpu_offload_pages,
@@ -265,7 +272,7 @@ def _cfg_parallel_cache(node: str) -> KVManager:
     """One worker's cache under CFG parallel, which runs ``node`` of the three."""
     spec = KVSpec(
         resource_key="kv", nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"},
-        config=KVConfig(
+        config=PagedKVConfig(
             num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096,
             max_num_pages=16, page_size=PAGE_SIZE,
         ),

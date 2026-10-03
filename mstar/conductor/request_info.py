@@ -56,6 +56,11 @@ class CurrentForwardPassInfo:
     # rather than riding on this object across the wire.
     dynamic_loop_iter_counts: dict[str, int] = field(default_factory=dict)
 
+    # stream edge -> items it starts with that are context only (a voice
+    # clone's reference frames); primes the consumer's StreamBuffer. Make this
+    # a per-stream dataclass if more per-request stream settings appear.
+    stream_lead_items: dict[str, int] = field(default_factory=dict)
+
     def update_publish_info(self, other: dict[str, PublishedInfo]):
         merge_publish_info(self.resource_publish_info, other)
 
@@ -118,6 +123,6 @@ class PartitionState:
     wg_rank_completions: dict[int, int] = field(default_factory=dict)
     num_output_tokens: int = 0
     curr_forward_outputs: list[str] = field(default_factory=list)
-    # resource label -> PublishedInfo, accumulated from the rank-0 worker's
-    # reports and handed back out on the next forward
+    # resource label -> PublishedInfo, accumulated across all TP ranks and
+    # handed back out on the next forward
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)

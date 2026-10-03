@@ -1,7 +1,9 @@
+import errno
 import hashlib
 import logging
 import os
 import platform
+import shutil
 import stat
 import time
 from abc import ABC, abstractmethod
@@ -133,30 +135,30 @@ class AsyncMooncakeReader:
         self.max_batch_size = max_batch_size
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._pending: list[Future] = []
-        if device != "cpu":
-            self._copy_stream = torch.cuda.Stream(device=device)
-        else:
-            self._copy_stream = torch.cuda.Stream()
+        # none on the host: host buffers have no GPU work to wait for, and a stream or event would
+        # create a CUDA context on a GPU that other processes may have filled
+        self._copy_stream = torch.cuda.Stream(device=device) if torch.device(device).type == "cuda" else None
 
     def submit(self, read_info: list[TransferReadInfo]) -> Future:
         """Non-blocking: enqueue a batch of READs.
 
-        Records a CUDA event on the current stream to ensure GPU data
+        On a device, records a CUDA event on the current stream to ensure GPU data
         is ready before the background thread reads it.
         """
         if not read_info:
             return
-        event = torch.cuda.current_stream().record_event()
+        event = torch.cuda.current_stream().record_event() if self._copy_stream is not None else None
         future = self._executor.submit(self._do_read, read_info, event)
         self._pending.append(future)
         # Prune completed futures to avoid unbounded growth
         self._pending = [f for f in self._pending if not f.done()]
         return future
 
-    def _do_read(self, read_info: list["TransferReadInfo"], event: torch.cuda.Event):
+    def _do_read(self, read_info: list["TransferReadInfo"], event: torch.cuda.Event | None):
         """Worker thread: wait for GPU data via CUDA event, then PUT."""
-        self._copy_stream.wait_event(event)
-        self._copy_stream.synchronize()
+        if event is not None:
+            self._copy_stream.wait_event(event)
+            self._copy_stream.synchronize()
 
         start_time = time.perf_counter()
 
@@ -327,6 +329,9 @@ class TensorCommunicationManager(ABC):
         self.my_session_id = my_session_id
         self.enable_prof = enable_prof
         self.device = device
+        # by the manager's device, not torch.cuda.is_available() alone: a host manager holds only host tensors,
+        # and its first sync would create a CUDA context on a GPU that other processes may have filled
+        self._on_cuda = torch.cuda.is_available() and torch.device(device).type == "cuda"
         self.communicator = communicator
         self.transfer_engine = transfer_engine
         self.tensor_store = TensorStore()
@@ -464,7 +469,7 @@ class TensorCommunicationManager(ABC):
         # step), so the unconditional default-stream sync here would
         # uselessly drain GPU(N+1). Pass ``skip_cuda_sync=True`` from
         # those call sites.
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         request_ids: list[Rid] = []
         uuids: list[int] = []
@@ -502,7 +507,7 @@ class TensorCommunicationManager(ABC):
         will ever read them, and a stored tensor nothing references is only
         freed when its request is torn down.
         """
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
 
         flat_uuids: list[int] = []
@@ -824,8 +829,13 @@ class TensorCommunicationManager(ABC):
         ready: dict[Rid, list[GraphEdge]] = {}
         still_pending = []
         uuid_to_time = {}
+        # the async reader finishes a request's reads in any order, so a read
+        # that is done waits for the ones started before it: a streamed token
+        # must not reach the client ahead of the one before it
+        waiting: set[Rid] = set()
         for ep in self.pending:
-            if ep.future is None or ep.future.done():
+            done = ep.future is None or ep.future.done()
+            if done and ep.request_id not in waiting:
                 if ep.future is not None:
                     ep.future.result()
                 for edge in ep.graph_edges:
@@ -838,6 +848,7 @@ class TensorCommunicationManager(ABC):
                         for info in edge.tensor_info:
                             uuid_to_time[info.uuid] = ep.rx_time
             else:
+                waiting.add(ep.request_id)
                 still_pending.append(ep)
         self.pending = still_pending
 
@@ -1127,7 +1138,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         )
 
     def register_for_send(self, request_id, tensor_infos, skip_cuda_sync=False):
-        if not skip_cuda_sync:
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         for info in tensor_infos:
             self._register_one(request_id, info.uuid)
@@ -1140,7 +1151,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         """Uuid-driven form. Registration here reads nothing off a descriptor
         but the uuid -- the tensor itself comes from the store -- so taking
         uuids avoids rebuilding one per tensor."""
-        if not skip_cuda_sync:
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         for request_id, uuids in per_request:
             for uuid in uuids:
@@ -1288,6 +1299,10 @@ def _deserialize_tensor(
     return t
 
 
+# Docker gives a container 64 MB of /dev/shm, and one video or audio tensor can outgrow that
+_SHM_DIR_WARN_BYTES = 1 << 30
+
+
 def _default_shm_dir() -> str:
     """Return the default shared-memory directory for the current platform."""
     if platform.system() == "Linux" and os.path.isdir("/dev/shm"):
@@ -1346,6 +1361,17 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
 
         self.shm_dir = shm_dir or _default_shm_dir()
         os.makedirs(self.shm_dir, exist_ok=True)
+        # at boot, not at the first large send: that failure would be the only other sign of a small dir
+        try:
+            st = os.statvfs(self.shm_dir)
+            shm_total = st.f_frsize * st.f_blocks
+        except OSError:
+            shm_total = None
+        if shm_total is not None and shm_total < _SHM_DIR_WARN_BYTES:
+            logger.warning(
+                "SHM: %s holds only %d MiB and every tensor in flight is written there, so a large one will "
+                "fail its send with ENOSPC. Give it more room (docker --shm-size), or pass "
+                "--tensor-comm-protocol TCP, which is slower", self.shm_dir, shm_total >> 20)
 
         # uuid → file path for sender-side cleanup
         self._shm_files: dict[int, str] = {}
@@ -1404,11 +1430,40 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     "deployment's namespace"
                 ) from None
 
+    def _write_shm_file(self, path: str, data: bytes) -> None:
+        """Write one tensor's bytes to ``path``.
+
+        A full shm dir fails the write part way, and no cleanup knows the partial file: left behind, it
+        would keep the space it took, and the next request would find the dir fuller still.
+        """
+        try:
+            with self._create_shm_file(path) as f:
+                f.write(data)
+        except OSError as exc:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            if exc.errno != errno.ENOSPC:
+                raise
+            free = shutil.disk_usage(self.shm_dir).free
+            if free < len(data):
+                reason = f"{self.shm_dir} has {free} bytes free, too few for a {len(data)}-byte tensor"
+            else:
+                reason = (
+                    f"{self.shm_dir} reported no space for a {len(data)}-byte tensor, with {free} bytes free after "
+                    "the failed write: it may be out of inodes, or other writers held the space meanwhile"
+                )
+            raise OSError(
+                errno.ENOSPC,
+                f"{reason}. Give it more room (docker --shm-size), or pass --tensor-comm-protocol TCP, which is slower",
+            ) from exc
+
     def register_for_send(
         self, request_id: Rid, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         # Producer's completion event is already waited on upstream, so the
         # source tensors are device-visible on entry. Running the D2H on a
@@ -1430,7 +1485,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
     ):
         """Uuid-driven form. This path reads nothing off a descriptor but the
         uuid, so taking uuids avoids rebuilding one per tensor."""
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         ctx = (
             torch.cuda.stream(self._d2h_stream)
@@ -1451,8 +1506,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         t0 = time.perf_counter()
         data = _serialize_tensor(tensor)
         path = self._shm_path(self.my_entity_id, uuid)
-        with self._create_shm_file(path) as f:
-            f.write(data)
+        self._write_shm_file(path, data)
         self._shm_files[uuid] = path
         self.tensor_store.set_metadata(uuid, mem_registered=True)
         if self.enable_prof:

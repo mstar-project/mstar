@@ -45,8 +45,14 @@ def _worker(target: str, not_ready: set[int]) -> tuple[Worker, _Runtime]:
     worker = Worker.__new__(Worker)
     worker._graph_runtime = runtime = _Runtime(target)
     worker._pending_removes = set()
+    worker._pending_drains = set()
+    worker._draining_rids = set()
+    worker._rid_str = str
     worker._poll_stream_buffers_for_speculation = lambda rid, node_name: []
-    worker.scheduler = SimpleNamespace(room_for_continuing=lambda target: None)
+    worker.scheduler = SimpleNamespace(
+        room_for_continuing=lambda target: None, failed_rids=set(),
+        backlog_splits_from=lambda request_state, target, rid: False,
+    )
     worker.tensor_manager = SimpleNamespace(get_tensor=None)
     worker.request_state = SimpleNamespace(
         get_partition_for_node=lambda node_name: 0,

@@ -60,6 +60,8 @@ class EngineResourceInfo:
     joint_comm_group: JointGroups | None = None
     transfer_engine_info: "TransferEngineInfo | None" = None
     kv_dtype: torch.dtype = torch.bfloat16
+    # Whether this logical resource has consumers in another worker instance.
+    needs_remote_transfer: bool = True
     # the spec's nodes this worker runs; under CFG parallel other workers run the rest
     nodes: "frozenset[str] | None" = None
     # the specs this one named in `depends_on`, by resource key
@@ -177,6 +179,30 @@ class Resource(ABC):
         return
 
     def publish(self, request_id: str) -> "PublishedInfo | None":
+        return None
+
+    def publish_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> "PublishedInfo | None":
+        """Publish after one node step, with context for selective exporters.
+
+        Existing resources remain compatible through ``publish``; resources
+        that need node/walk context can override this method.
+        """
+        del node_name, graph_walk
+        return self.publish(request_id)
+
+    def publish_after_stop(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> "PublishedInfo | None":
+        """Publish state that is useful only when a dynamic loop stops."""
+        del request_id, node_name, graph_walk
         return None
 
     def reset_request(self, rid: str, free: bool=False):
@@ -316,6 +342,11 @@ class AttentionResource(Resource):
 class PublishedInfo(ABC):
     @abstractmethod
     def update(self, other: "PublishedInfo") -> None:
+        ...
+
+    @abstractmethod
+    def clone(self) -> "PublishedInfo":
+        """Return independent publication metadata for deferred sending."""
         ...
 
 

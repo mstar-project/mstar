@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from mstar.communication.tensors import LocalTransferEngine
-from mstar.engine.resources.kv.config import KVConfig, KVStep, RetentionPolicy
+from mstar.engine.resources.kv.config import KVStep, PagedKVConfig, RetentionPolicy
 from mstar.engine.resources.kv.cpu_page_pool import OffloadedStream
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
@@ -28,7 +28,7 @@ PS = 8  # page size used throughout
 
 
 def _make_manager(max_num_pages: int = 64) -> KVManager:
-    cfg = KVConfig(
+    cfg = PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=4, max_seq_len=max_num_pages * PS,
         max_num_pages=max_num_pages, page_size=PS,
     )

@@ -16,10 +16,10 @@ from mstar.engine.resources.base import (
 )
 from mstar.engine.resources.kv.cache import KVCache, PageAllocator
 from mstar.engine.resources.kv.config import (
-    KVConfig,
     KVReqConfig,
     KVSpec,
     KVStep,
+    PagedKVConfig,
     RetentionPolicy,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
@@ -191,20 +191,30 @@ class CacheStream:
     # the inputs to it (`apply_cached_prefix`); `admit` never converts one still set
     gate_lease: bool = False
     offloaded: bool = False
+    # General mutation epoch used by plans and offload claims. Appends move it.
     generation: int = 0
+    # Logical-content epoch exported to remote readers. Unlike generation, an
+    # append does not move it; rewinds and whole-stream replacements do.
+    reset_generation: int = 0
+    # Last remote logical-content epoch this cache observed. None keeps
+    # transfer descriptors from before reset_generation compatible.
+    remote_reset_generation: int | None = None
 
     # set from a successful admit until commit: an admitted step already holds
     # addressing into these pages, so an offload in that window must not claim
     # them. read by `_claim_for_offload`
     step_in_flight: bool = False
 
-    def reset(self, freed: bool=False):
+    def reset(self, freed: bool=False, *, content_reset: bool=True):
         self.stored_len = 0
         self.position = 0
         self.released = 0
         self.protected_prefix = 0
         self.retention = None
         self.generation += 1
+        if content_reset:
+            self.reset_generation += 1
+            self.remote_reset_generation = None
         self.step_in_flight = False
 
         if freed:
@@ -259,6 +269,7 @@ class KVSequenceInfo:
     # for tracking KV cache
     latest_kv_transfer_info: Any
     page_indices: list[int] = field(default_factory=list)
+    reset_generation: int | None = None
 
 
 @dataclass
@@ -286,6 +297,23 @@ class PublishedKVInfo(PublishedInfo):
                 **self.info[key],
                 **val
             }
+
+    def clone(self) -> "PublishedKVInfo":
+        return PublishedKVInfo(
+            info={
+                rank: {
+                    label: KVSequenceInfo(
+                        seq_len=seq.seq_len,
+                        latest_kv_transfer_info=seq.latest_kv_transfer_info,
+                        page_indices=list(seq.page_indices),
+                        reset_generation=seq.reset_generation,
+                    )
+                    for label, seq in labels.items()
+                }
+                for rank, labels in self.info.items()
+            },
+            world_size=self.world_size,
+        )
 
     def get(self, rank: int) -> dict[str, KVSequenceInfo]:
         return self.info.get(rank, {})
@@ -325,12 +353,13 @@ class KVManager(AttentionResource):
 
     def __init__(
         self,
-        cfg: KVConfig,
+        cfg: PagedKVConfig,
         name: str,
         joint_comm_group: JointGroups | None,
         transfer_engine_info: TransferEngineInfo,
         device: torch.device,
         dtype=torch.bfloat16,
+        needs_remote_transfer: bool = False,
         nodes: set[str] | None = None,
         leads: bool = True,
     ):
@@ -351,7 +380,10 @@ class KVManager(AttentionResource):
         sink = self._arena.acquire(1)
         assert sink == [SINK_PAGE], f"expected page {SINK_PAGE} first, got {sink}"
         self._transfer = KVTransferManager(
-            transfer_engine_info, self.kv_cache
+            transfer_engine_info,
+            self.kv_cache,
+            resource_key=name,
+            needs_remote_transfer=needs_remote_transfer,
         )
         self._cpu_pool: CPUPagePool | None = None
         if cfg.cpu_offload_pages > 0:
@@ -389,9 +421,9 @@ class KVManager(AttentionResource):
         self._preplan_key = None
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
 
-        # (rid, to_label, stored_len, generation) for pre-forks appliedb by
-        # a staged step; facilitates clear_preplan function
-        self._preplan_fork_undo: list[tuple[str, str, int, int]] = []
+        # Prior length and epochs for pre-forks applied by a staged step;
+        # facilitates clear_preplan.
+        self._preplan_fork_undo: list[tuple[str, str, int, int, int]] = []
         # (rid, to_label) for intialized reservations by staged step; cleared_preplan removes
         # recorded in admit not plan, so separate from above.
         self._preplan_new_labels: list[tuple[str, str]] = []
@@ -425,6 +457,7 @@ class KVManager(AttentionResource):
             joint_comm_group=info.joint_comm_group,
             transfer_engine_info=info.transfer_engine_info,
             dtype=info.kv_dtype,
+            needs_remote_transfer=info.needs_remote_transfer,
             nodes=spec.nodes if info.nodes is None else info.nodes,
             leads=(
                 info.nodes is None or info.nodes >= spec.nodes
@@ -813,7 +846,30 @@ class KVManager(AttentionResource):
                     return AdmitOutcome(ok=True, ready=False)
 
                 stream = self._ensure_label(rid, label)
-                own = seq_info.latest_kv_transfer_info == self._own_transfer_info()
+                own = self._transfer.owns_transfer_info(
+                    transfer_info=seq_info.latest_kv_transfer_info,
+                    request_id=rid,
+                    label=label,
+                )
+                remote_reset_generation = seq_info.reset_generation
+                if (
+                    not own
+                    and remote_reset_generation is not None
+                    and stream.remote_reset_generation is not None
+                    and remote_reset_generation
+                    != stream.remote_reset_generation
+                ):
+                    # The producer rewound/replaced this logical stream. Its
+                    # seq_len may be unchanged, so length alone cannot prove
+                    # the receiver still holds the published contents.
+                    self._release_lease(stream)
+                    drop = self._arena.any_sealed(stream.page_indices)
+                    if drop:
+                        self._arena.release(stream.page_indices)
+                    stream.reset(freed=drop)
+                    stream.forget_chain()
+                if not own and remote_reset_generation is not None:
+                    stream.remote_reset_generation = remote_reset_generation
                 if not own and stream.chain is not None:
                     # another rank sampled the token after this record, so the pending tail is one behind
                     stream.chain.unkeyed = None
@@ -1167,13 +1223,20 @@ class KVManager(AttentionResource):
         # state: dropping the cached plan is not enough, the pre-forks already
         # copied pages and moved lengths
         with self._lock:
-            for rid, label, stored_len, generation in reversed(
+            for (
+                rid,
+                label,
+                stored_len,
+                generation,
+                reset_generation,
+            ) in reversed(
                 self._preplan_fork_undo
             ):
                 stream = self._streams.get(rid, {}).get(label)
                 if stream is not None:
                     stream.stored_len = stored_len
                     stream.generation = generation
+                    stream.reset_generation = reset_generation
             self._preplan_fork_undo = []
             # labels the staged step invented are removed, not rewound to 0:
             # a stream at 0 that nothing asked for is still a stream, and it
@@ -1500,7 +1563,8 @@ class KVManager(AttentionResource):
                 self._arena.release(claim.pages)
                 stream.page_indices = []
                 stream.hits = 0
-                stream.reset()
+                # Offload changes residency, not logical stream contents.
+                stream.reset(content_reset=False)
             return freed, {claim.label for claim in moved}
 
     def _abandon_claims(self, rid: str, labels: list[str]) -> None:
@@ -1583,28 +1647,81 @@ class KVManager(AttentionResource):
         """Device pages the request is holding — the most reclaimable first."""
         return float(self.reclaimable(rid))
 
-    def _own_transfer_info(self):
+    def _own_transfer_info(
+        self,
+        request_id: str,
+        label: str,
+        stream: CacheStream,
+    ):
         """This cache's transfer descriptor, as `publish` stamps it."""
-        return self._transfer.get_kv_transfer_info()
+        return self._transfer.get_kv_transfer_info(
+            request_id=request_id,
+            label=label,
+            page_indices=stream.page_indices,
+            seq_len=stream.stored_len,
+            reset_generation=stream.reset_generation,
+        )
 
-    def publish(self, request_id: str):
-        # `remove_request` can pop the streams from another thread between the
-        # forward and finalize; nothing to publish then
-        streams = self._streams.get(request_id)
-        if streams is None:
-            return None
-
-        transfer_info = self._own_transfer_info()
+    def publish(
+        self,
+        request_id: str,
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+        *,
+        final: bool = False,
+    ):
         with self._lock:
+            # remove_request can race finalize on another thread. Resolve the
+            # request and build its descriptor in this one critical section.
+            streams = self._streams.get(request_id)
+            overrides = self._overrides.get(request_id)
+            if streams is None or overrides is None:
+                return None
+            labels = overrides.get_publish_labels(
+                node_name, graph_walk, list(streams), final=final,
+            )
+            if not labels:
+                return None
             seq_info = {
                 label: KVSequenceInfo(
                     seq_len=stream.stored_len,
-                    latest_kv_transfer_info=transfer_info,
+                    latest_kv_transfer_info=self._own_transfer_info(
+                        request_id=request_id,
+                        label=label,
+                        stream=stream,
+                    ),
                     page_indices=list(stream.page_indices),
-                ) for label, stream in streams.items()
+                    reset_generation=stream.reset_generation,
+                ) for label in labels
+                if (stream := streams.get(label)) is not None
             }
+            if not seq_info:
+                return None
         return PublishedKVInfo.build_for_rank(
             rank=self._rank, world_size=self._world_size, seq_info=seq_info,
+        )
+
+    def publish_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        return self.publish(
+            request_id, node_name=node_name, graph_walk=graph_walk,
+        )
+
+    def publish_after_stop(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        return self.publish(
+            request_id,
+            node_name=node_name,
+            graph_walk=graph_walk,
+            final=True,
         )
 
     def reset_request(self, rid: str, free: bool=False):
@@ -1652,6 +1769,7 @@ class KVManager(AttentionResource):
                 self._cpu_pool.remove_request(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
+            self._transfer.remove_request(rid)
             self._reserved.pop(rid, None)
             self._waiting.pop(rid, None)
             self._rooted.pop(rid, None)
@@ -2094,8 +2212,8 @@ class KVManager(AttentionResource):
         Locked (reentrant): called from plan (pre-forks, else unguarded) and
         from the already-locked commit (post-forks).
 
-        ``undo`` collects each target's prior ``(stored_len, generation)`` so a
-        preplan that is abandoned can be reversed; see `clear_preplan`.
+        ``undo`` collects each target's prior length and epochs so a preplan
+        that is abandoned can be reversed; see `clear_preplan`.
         """
         with self._lock:
             if from_label not in self._streams[rid]:
@@ -2104,7 +2222,13 @@ class KVManager(AttentionResource):
             to_stream = self._ensure_label(rid, to_label)
             if undo is not None:
                 undo.append(
-                    (rid, to_label, to_stream.stored_len, to_stream.generation)
+                    (
+                        rid,
+                        to_label,
+                        to_stream.stored_len,
+                        to_stream.generation,
+                        to_stream.reset_generation,
+                    )
                 )
             # sized off the source's length, not either side's page count:
             # both can hold more pages than the fork needs, and a target left
@@ -2129,6 +2253,7 @@ class KVManager(AttentionResource):
             )
             to_stream.stored_len = from_stream.stored_len
             to_stream.generation += 1
+            to_stream.reset_generation += 1
 
     def _alloc(
         self, request_id: str, label: str, seq_len: int

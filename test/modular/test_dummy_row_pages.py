@@ -23,7 +23,7 @@ from mstar.engine.cuda_graph_config import (
 )
 from mstar.engine.cuda_graph_runner import DummyRowPool
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVConfig, KVStep
+from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
 from mstar.engine.resources.step import Segment, StepContext
@@ -33,14 +33,21 @@ from mstar.model.submodule_base import ARNodeInputs
 class _StubTransferManager:
     """No engine, no bytes moved."""
 
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
-    def get_kv_transfer_info(self):
-        return None
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del transfer_info, kwargs
+        return False
 
     def cleanup(self):
         pass
+
+    def remove_request(self, request_id):
+        del request_id
 
 
 @pytest.fixture(autouse=True)
@@ -90,7 +97,7 @@ def test_release_all_is_a_no_op_on_a_pool_that_opened_nothing():
 
 
 def _kv_manager(max_num_pages=64, page_size=16) -> KVManager:
-    cfg = KVConfig(
+    cfg = PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=1024,
         max_num_pages=max_num_pages, page_size=page_size,
     )
