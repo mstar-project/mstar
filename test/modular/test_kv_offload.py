@@ -524,6 +524,7 @@ def _ctx_pre(*rids: str) -> StepContext:
     return ctx
 
 
+@requires_cuda
 def test_a_rolled_back_admit_returns_its_pages():
     mgr = _make_manager(max_num_pages=8)
     mgr.ingest_request("r0")
@@ -542,6 +543,7 @@ def test_a_rolled_back_admit_returns_its_pages():
     )
 
 
+@requires_cuda
 def test_rolling_back_twice_releases_once():
     """The runner unwinds the refusing resource as well as the ones ahead of it,
     so a double call has to be harmless rather than double-free the arena."""
@@ -558,6 +560,7 @@ def test_rolling_back_twice_releases_once():
     assert mgr._arena.num_free == before
 
 
+@requires_cuda
 def test_a_committed_admit_is_not_rolled_back():
     """Once the step has run its reservation is real, and unwinding it would pull
     pages out from under a stream that is addressing them."""
@@ -578,6 +581,7 @@ def test_a_committed_admit_is_not_rolled_back():
     assert mgr._arena.num_free == free_after_commit
 
 
+@requires_cuda
 def test_a_preplanned_step_unwinds_what_the_preplan_reserved():
     """The case the log keeps hitting. A pre-planned step is reserved on the
     pre-plan pass; its later ``admit`` no-ops. So when a resource further down the
@@ -609,6 +613,7 @@ def test_a_preplanned_step_unwinds_what_the_preplan_reserved():
     assert _stream(mgr, "r0").page_indices == []
 
 
+@requires_cuda
 def test_unwinding_one_step_leaves_another_streams_pages_alone():
     mgr = _make_manager(max_num_pages=16)
     mgr.ingest_request("r0")
@@ -632,6 +637,7 @@ def test_unwinding_one_step_leaves_another_streams_pages_alone():
     )
 
 
+@requires_cuda
 def test_removing_a_request_forgets_its_unwind_record():
     """Handles are RECYCLED (see ``mstar.worker.rid_table``), so a reservation
     record outliving its request attaches to whichever request gets that handle
@@ -659,6 +665,7 @@ def test_removing_a_request_forgets_its_unwind_record():
     )
 
 
+@requires_cuda
 def test_resetting_a_request_forgets_its_unwind_record():
     """A reset releases the stream's pages, so a surviving record names pages the
     arena has already handed to someone else."""
@@ -674,6 +681,7 @@ def test_resetting_a_request_forgets_its_unwind_record():
     assert mgr._admit_reserved_pages == {}
 
 
+@requires_cuda
 def test_an_alloc_that_needs_no_new_pages_reports_none():
     """The common decode case: the stream already holds enough pages, so nothing
     is acquired and there is nothing to unwind. ``_alloc`` still has to answer —
