@@ -327,6 +327,10 @@ class StepRunner:
                 range_push(f"res.admit.{key}")
             try:
                 outcome = self._resources[key].admit(step.get(key), step.ctx)
+            except Exception:
+                # a raise fails the step, so the marks taken above go too
+                self._abort(step, admitted)
+                raise
             finally:
                 if self._nvtx:
                     range_pop()

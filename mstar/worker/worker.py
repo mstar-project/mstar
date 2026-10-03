@@ -2458,7 +2458,7 @@ class Worker:
             # Fail it here and take it out of the batch before the routing
             # loops below touch it. Only ever the ones `check_stop_for_batch`
             # just added: the caller already reported (and cleared) the rids
-            # that failed in prepare_inputs / postprocess.
+            # that failed in prepare_inputs / their forward / postprocess.
             failed = dict(batch_N.node_batch.failed_requests)
             self._drop_failed_rids(batch_N, outputs, failed)
             self._fail_requests(failed)
@@ -2769,14 +2769,15 @@ class Worker:
     ) -> None:
         """Excise ``failed_requests`` from a finished batch.
 
-        A rid that raised in ``postprocess`` is still carried in the batch (the
-        engine only recorded the error), and one that raised in
-        ``prepare_inputs`` is already out of ``node_batch.request_ids`` but not
-        out of the worker-side ``ScheduledBatch``. Either way we must not route
-        its outputs or mark its node complete — that's how a request that blew
-        up mid-walk ends up reported to the client as a successful empty
-        response. ``_postprocess_batch`` reconciles the remaining structures
-        from ``node_batch.request_ids``.
+        A rid that raised in its per-request forward or in ``postprocess`` is
+        still carried in the batch (the engine only recorded the error), and one
+        that raised in ``prepare_inputs`` is already out of
+        ``node_batch.request_ids`` but not out of the worker-side
+        ``ScheduledBatch``. Either way we must not route its outputs or mark its
+        node complete — that's how a request that blew up mid-walk ends up
+        reported to the client as a successful empty response.
+        ``_postprocess_batch`` reconciles the remaining structures from
+        ``node_batch.request_ids``.
         """
         for rid in failed_requests:
             outputs.pop(rid, None)
@@ -3284,7 +3285,7 @@ class Worker:
                         _maybe_clear_spec()
 
                     if pending.node_batch.failed_requests:
-                        # A per-rid stage (prepare_inputs / postprocess) blamed
+                        # A per-rid stage (prepare_inputs / forward / postprocess) blamed
                         # specific requests. Drop the speculation: it was built
                         # from pending's rids and may thread outputs that the
                         # failed rids never produced. The rest of the batch
