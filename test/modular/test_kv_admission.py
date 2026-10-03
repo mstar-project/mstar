@@ -26,7 +26,7 @@ from mstar.engine.resources.kv.config import KVConfig, KVReqConfig, KVSpec, KVSt
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import AdmissionDeferred, KVManager
 from mstar.engine.resources.kv.plan import SINK_PAGE
-from mstar.engine.resources.step import AdmitRuntimeError, Segment, StepContext
+from mstar.engine.resources.step import AdmitRuntimeError, AllocationFailed, Segment, StepContext
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the host pool pins its memory"
@@ -293,6 +293,21 @@ def test_a_guidance_cache_checks_no_room_of_its_own(monkeypatch):
 
     # admitted by the leader, so past what this cache alone would have let in
     assert _step(guidance, "b", 100).ok, "a guidance cache failed the leader's decision"
+
+
+def test_a_guidance_cache_short_of_pages_reports_it_rather_than_asserting(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    guidance = _cfg_parallel_cache("LLM_cfg_text")
+    guidance.ingest_request("a", _request(list(range(100)), max_tokens=60))
+    assert _step(guidance, "a", 100).ok
+    guidance.ingest_request("b", _request(list(range(500, 700)), max_tokens=10))
+
+    # b's 13 pages are more than the 8 a left: room only the leader's cache promises
+    outcome = _step(guidance, "b", 200)
+
+    assert isinstance(outcome.reason, AllocationFailed), (
+        "a guidance cache treated room the leader promised as its own broken promise"
+    )
 
 
 # ── a batch that runs guidance for every row ────────────────────────────
