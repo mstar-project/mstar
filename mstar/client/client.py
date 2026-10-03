@@ -117,6 +117,8 @@ class MStarClient:
         is streaming-only and yields :class:`VideoFrameChunk` objects.
         """
         # None names no output: the server answers with the model's default
+        if isinstance(output_modalities, str):
+            output_modalities = [m.strip() for m in output_modalities.split(",") if m.strip()]
         wanted = tuple(output_modalities or ())
         if "video_frame" in wanted and not stream:
             raise ValueError(
@@ -126,7 +128,7 @@ class MStarClient:
         files = self._build_files(images, audio, video)
         data: dict[str, str] = {"streaming": "true" if stream else "false"}
         if output_modalities is not None:
-            data["output_modalities"] = ",".join(output_modalities)
+            data["output_modalities"] = ",".join(wanted)
         if text is not None:
             data["text"] = text
         if input_modalities is not None:
