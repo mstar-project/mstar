@@ -423,14 +423,26 @@ class KokoroAdapter(OpenAIAdapter):
         )
 
 
+def _refuse_server_path(ref: str, upload_dir: Path) -> None:
+    """A plain path must name a file the server stored itself, under
+    ``upload_dir``; checked before anything is opened, so it cannot probe the disk."""
+    if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
+        return
+    if not Path(ref).resolve().is_relative_to(Path(upload_dir).resolve()):
+        raise ValueError(
+            "ref_audio must be a data URL or an http(s) URL; paths on the server are refused"
+        )
+
+
 class ChatterboxAdapter(OpenAIAdapter):
     """Chatterbox / Chatterbox-Turbo: zero-shot TTS with voice cloning.
 
     ``voice`` is either ``"default"`` (the voice shipped with the checkpoint)
     or the name of a preset clip in the deployment's ``voices_dir``. A
     reference clip for cloning comes through ``ref_audio`` in ``extra_body``
-    (a data URL, base64, local path or, when allowed, a URL) and is loaded by
-    the worker exactly like an uploaded file. The model's own knobs --
+    (a data URL or, when the server allows it, an http(s) URL; paths on the
+    server are refused) and is loaded by the worker like an uploaded file.
+    The model's own knobs --
     ``exaggeration``, ``cfg_weight``, ``min_p``, ``repetition_penalty``,
     ``top_k``, ``n_cfm_timesteps``, ``watermark``, ``max_new_tokens`` and, for
     the multilingual checkpoint, ``language_id`` -- pass through ``extra_body``
@@ -449,6 +461,7 @@ class ChatterboxAdapter(OpenAIAdapter):
         input_modalities = ["text"]
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
+            _refuse_server_path(ref_audio, upload_dir)
             # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
             _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir, allow_remote=False)
             file_paths = {"audio": [path]}

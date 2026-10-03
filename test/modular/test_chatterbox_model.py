@@ -207,6 +207,28 @@ def test_speech_adapter_fetches_a_reference_url_only_when_the_server_allows(tmp_
     assert fetched == ["http://example.invalid/ref.wav"] and args.file_paths == {"audio": ["/x.wav"]}
 
 
+def test_speech_adapter_refuses_paths_outside_the_upload_dir(tmp_path):
+    from mstar.api_server.openai.adapters import ChatterboxAdapter
+
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    elsewhere = tmp_path / "elsewhere.wav"
+    elsewhere.write_bytes(b"RIFF")
+    (uploads / "escape.wav").symlink_to(elsewhere)
+    (uploads / "mine.wav").write_bytes(b"RIFF")
+
+    def request(ref):
+        req = SimpleNamespace(
+            input="Hi", voice=None, temperature=None, top_p=None, seed=None, model_extra={"ref_audio": ref},
+        )
+        return ChatterboxAdapter().speech_to_request(req, uploads)
+
+    for ref in ("/etc/hostname", str(elsewhere), str(uploads / ".." / "elsewhere.wav"), str(uploads / "escape.wav")):
+        with pytest.raises(ValueError, match="paths on the server are refused"):
+            request(ref)
+    assert request(str(uploads / "mine.wav")).file_paths == {"audio": [str(uploads / "mine.wav")]}
+
+
 def test_speech_adapter_maps_voice_and_reference_audio(tmp_path):
     from mstar.api_server.openai.adapters import ChatterboxAdapter
 
@@ -1404,6 +1426,7 @@ def test_multilingual_text_preprocessing_steps(tmp_path):
     table = tmp_path / "cj.json"
     table.write_text(json.dumps(["你\tonf", "好\tvnd", "妳\tvnf", "奶\tvnd"]), encoding="utf-8")
     cj = CangjieConverter(table)
+    cj.segmenter = None  # spacy_pkuseg, when installed, splits words first; check the spelling alone
     assert cj.encode_glyph("你") == "onf" and cj.encode_glyph("奶") == "vnd1" and cj.encode_glyph("a") is None
     assert cj("你好!") == "[cj_o][cj_n][cj_f][cj_.][cj_v][cj_n][cj_d][cj_.]!"
     # the multilingual punctuation table accepts CJK sentence enders
