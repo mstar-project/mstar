@@ -23,6 +23,7 @@ import torch
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.cpu_page_pool import OffloadedStream
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import (
     AdmissionDeferred,
@@ -474,6 +475,64 @@ def _offloaded_with_a_hit(kv: KVManager) -> str:
     assert kv.offload("b") > 0, "the request did not move to the host"
     return "b"
 
+
+
+class _StubHostPool:
+    """The host pool `offload` and `reload` use, minus the copies."""
+
+    def __init__(self):
+        self.states: dict = {}
+
+    def offload_stream(self, rid, label, gpu_kv_cache, gpu_page_indices, stored_len, position, **kwargs):
+        self.states.setdefault(rid, {})[label] = OffloadedStream(
+            cpu_page_indices=list(gpu_page_indices), stored_len=stored_len, position=position, **kwargs,
+        )
+        return True
+
+    def sync(self):
+        pass
+
+    def is_offloaded(self, rid):
+        return bool(self.states.get(rid))
+
+    def labels(self, rid):
+        return list(self.states.get(rid, {}))
+
+    def remove_request(self, rid):
+        self.states.pop(rid, None)
+
+
+def _on_the_host(kv: KVManager):
+    """``b`` running on pages lent by the index, then offloaded: its stream,
+    and its hits, reservation and reset generation from before."""
+    kv._cpu_pool = _StubHostPool()
+    prompt = list(range(4 * PAGE_SIZE))
+    kv.ingest_request("a", _request(prompt, max_tokens=2 * PAGE_SIZE))
+    assert _ready(kv, "a").ready and _prefill(kv, "a", len(prompt)).ok
+    kv.ingest_request("b", _request(prompt, max_tokens=2 * PAGE_SIZE))
+    assert _ready(kv, "b").ready and _prefill(kv, "b", len(prompt)).ok
+    kv.remove_request("a")
+    stream = kv._streams["b"]["main"]
+    before = (stream.hits, kv._reserved["b"].pages, stream.reset_generation)
+    assert before[0], "b took nothing from the index"
+    assert kv.offload("b") > 0, "the request did not move to the host"
+    return stream, before
+
+
+def test_an_offload_gives_back_what_the_index_lent():
+    kv = _manager(max_num_pages=32)
+    stream, (hits, owed, _) = _on_the_host(kv)
+
+    assert (stream.hits, kv._reserved["b"].pages) == (0, owed + hits), (
+        "the offloaded stream still counts the index's pages as lent to it"
+    )
+
+
+def test_an_offload_does_not_tell_readers_the_stream_was_rewritten():
+    kv = _manager(max_num_pages=32)
+    stream, (_, _, epoch) = _on_the_host(kv)
+
+    assert stream.reset_generation == epoch, "an offload moved the stream's contents epoch"
 
 @requires_cuda
 def test_a_reload_takes_back_only_what_the_reservation_kept():
