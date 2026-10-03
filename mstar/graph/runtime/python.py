@@ -867,10 +867,10 @@ class PythonGraphRuntime(GraphRuntime):
         if staged is None:
             return
         dropped = set(dropped_rids)
-        for rid, node, into_signals, into_next_iter in staged:
+        for rid, staged_node, into_signals, into_next_iter in staged:
             if success and rid not in dropped:
                 continue
-            self._undo_spec_ingest(node, into_signals, into_next_iter)
+            self._undo_spec_ingest(staged_node, into_signals, into_next_iter)
 
     def _can_continue_loop(
         self, rid: int, wgio, spec_info, graph_walk: str,
