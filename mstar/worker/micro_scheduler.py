@@ -202,13 +202,15 @@ class MicroScheduler:
         # pending resident deltas for TP follow nodes
         self._pending_resident_deltas: dict[str, OffloadDelta] = {}
         self._last_resident_delta: int = -1
+        # popped, not settled: a settled head can still fail to build, and its removals wait for its admit
+        self._last_popped_tp_seq: int = -1
 
     @property
     def last_consumed_tp_seq(self) -> int:
         """Highest leader step this rank has taken off the FIFO. What orders a
         forwarded removal against the step stream — see
         ``Worker._removal_step_reached``."""
-        return self._last_resident_delta
+        return self._last_popped_tp_seq
 
     def _select_node_rr(
         self, node_name_to_requests: dict[str, list[ReadyNodeEntry]]
@@ -300,6 +302,7 @@ class MicroScheduler:
         # drain refcount is discharged in one place.
         message = self.tp_batches_pending_schedule.popleft()
         self._apply_delta_from_message(message)
+        self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
         for rid in message.request_ids:
             if rid not in self.pending_tp_follow_count:
                 continue
