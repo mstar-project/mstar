@@ -177,6 +177,11 @@ class Speculation:
     is_same_node: bool
     # rid -> edges
     consumed_streaming_edges: dict[int, list[StreamingEdge]] = field(default_factory=dict)
+    # Handle for the runtime's staged streaming ingests. Settled exactly once,
+    # via ``_settle_speculation``: on submit (keeping them), or on abandon /
+    # per-rid drop (undoing those rids', so the chunk leaves the node's slot
+    # before it is handed back to its StreamBuffer).
+    spec_id: int = 0
     is_yield_away: bool = False
     loop_name: str | None = None
     dropped: set[int] = field(default_factory=set)
@@ -1897,6 +1902,7 @@ class Worker:
         continuing: list[int],
         *,
         is_same_node: bool,
+        spec_id: int = 0,
         tp_seq: int = -1,
     ) -> Speculation:
         """Package prepared rids (batch order) into the ``Speculation`` the main
@@ -1947,8 +1953,54 @@ class Worker:
             is_same_node=is_same_node,
             loop_name=spec_target.loop_name,
             consumed_streaming_edges=consumed_streaming_edges,
+            spec_id=spec_id,
             tp_seq=tp_seq,
         )
+
+    def _settle_speculation(
+        self, speculation: Speculation, success: bool,
+        dropped_rids: set[int] = frozenset(),
+    ) -> None:
+        """Settle the runtime's staged streaming ingests, then give back the
+        chunks of every rid that will not run.
+
+        The order matters: the undo takes the chunk out of the node's input
+        slot, and only then is it handed back to its StreamBuffer. Returning it
+        while it is still in the slot is what tracked one chunk twice (a freed
+        tensor behind a stale buffered edge) and, because a same-node prep
+        ingests into the next-iter slot, let the FOLLOWING chunk take the
+        current slot and be consumed first.
+
+        Settles once per speculation: ``spec_id`` is dropped from the runtime
+        here, so a second call is a no-op.
+
+        On ``success`` the same call marks the batch speculatively scheduled, so
+        "this speculation is now real" is ONE crossing into the runtime rather
+        than two. The two halves address DIFFERENT rids: the flag goes on
+        ``scheduled_batch``, already pruned of the dropped rids, while the undo
+        targets exactly those dropped rids. The flag is cleared elsewhere
+        (``_clear_speculative_flag``), on paths with no stage to settle.
+        """
+        batch = speculation.scheduled_batch
+        rids = list(batch.request_to_worker_graph) if success else []
+        self._graph_runtime.commit_speculation(
+            speculation.spec_id, success, list(dropped_rids),
+            # Keeps these nodes off the ready queue while the step is in flight.
+            node=batch.node_name if rids else None,
+            wg_id=batch.request_to_worker_graph[rids[0]] if rids else None,
+            scheduled_rids=rids,
+        )
+        give_back = (
+            speculation.consumed_streaming_edges.items() if not success
+            else [
+                (rid, speculation.consumed_streaming_edges.get(rid, []))
+                for rid in dropped_rids
+            ]
+        )
+        for rid, edges in list(give_back):
+            for se in edges:
+                self._return_streaming_edge(rid, se)
+            speculation.consumed_streaming_edges.pop(rid, None)
 
     def _is_tearing_down(self, rid: int) -> bool:
         """Removed, aborted or failed: no further speculative work for ``rid``.
@@ -2118,7 +2170,7 @@ class Worker:
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, continuing,
-            is_same_node=speculating_same_node,
+            is_same_node=speculating_same_node, spec_id=prep.spec_id,
         )
 
     def _thread_outputs_to_speculative(
@@ -2166,9 +2218,6 @@ class Worker:
                 # Its final chunks go back below; it must not flush or report done.
                 speculation.node_batch.final_stream_rids.discard(r)
                 speculation.node_batch.stream_partition_done_rids.discard(r)
-                for se in speculation.consumed_streaming_edges.get(r, []):
-                    self._return_streaming_edge(r, se)
-                speculation.consumed_streaming_edges.pop(r, None)
         speculation.continuing_rids = threaded_continuing
         speculation.dropped = dropped
 
@@ -2309,7 +2358,7 @@ class Worker:
             pending, spec_target_info,
             new_request_to_worker_graph, per_request_inputs,
             consumed_streaming_edges, continuing,
-            is_same_node=True, tp_seq=head.spec_seq,
+            is_same_node=True, spec_id=prep.spec_id, tp_seq=head.spec_seq,
         )
 
     # How many "no speculative head from step s" seqs a follower remembers.
@@ -2948,6 +2997,11 @@ class Worker:
             speculation.plan_future = None
             self._reset_skip_plan_flags(speculation.node_batch)
             sb = speculation.scheduled_batch
+            # This step never ran, so its staged chunks go back to their
+            # buffers -- in particular for the fresh rids pushed back below,
+            # which survive this error and would otherwise hold a chunk in a
+            # slot the next ingest can overtake.
+            self._settle_speculation(speculation, success=False)
             self._clear_speculative_flag(sb)
             fresh = {
                 rid: wg_id
@@ -3346,9 +3400,9 @@ class Worker:
                                 )
                                 speculation.plan_future = None
                             if not speculation.is_yield_away:
-                                for rid, edges in speculation.consumed_streaming_edges.items():
-                                    for se in edges:
-                                        self._return_streaming_edge(rid, se)
+                                # The step will not run at all: un-ingest every
+                                # staged chunk and hand them all back.
+                                self._settle_speculation(speculation, success=False)
                                 # Fresh rids are not re-readied by N's routing
                                 # the way continuing rids are: give them back.
                                 sb = speculation.scheduled_batch
@@ -3391,10 +3445,18 @@ class Worker:
                         spec_node_batch = speculation.node_batch
                         if not speculation.is_yield_away:
                             self._thread_outputs_to_speculative(speculation, outputs)
-                        # set node._speculatively_scheduled to true, so that it doesn't
-                        # accidentally get put on the ready queue while already executing
-                        # this does not include the dropped rids
-                        self._set_speculative_flag(spec_batch, True)
+                        # The one settle for a step that runs: marks the batch
+                        # speculatively scheduled (so its nodes are not put back
+                        # on the ready queue while it executes -- not the dropped
+                        # rids, which the threading already pruned), and keeps
+                        # the staged ingests except for those dropped rids,
+                        # whose chunks are un-ingested and go back to their
+                        # buffers. Outside the submit guard below, so an
+                        # all-dropped batch is still settled.
+                        self._settle_speculation(
+                            speculation, success=True,
+                            dropped_rids=speculation.dropped,
+                        )
 
                         if spec_batch.request_to_worker_graph:
                             if self.enable_nvtx:

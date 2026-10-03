@@ -166,6 +166,12 @@ pub struct GraphRuntime {
     /// Routing parked between complete_and_route_batch and send_outputs.
     completions: FxHashMap<u64, Completion>,
     completion_counter: u64,
+    /// Streaming ingests a prep staged, parked until commit_speculation
+    /// settles them: spec_id -> (wg, [(rid, spec node, [(slot, from_next)])]).
+    /// The wg rides along because the undo needs the same (wg, rid) pair the
+    /// prep used to reach the walk state.
+    staged_specs: FxHashMap<u32, (WgIndex, Vec<(u32, NodeId, Vec<(u8, bool)>)>)>,
+    spec_counter: u32,
 
     /// A share of the SAME bookkeeper Python handed TensorStore, taken at
     /// construction. Routing reads descriptors and adjusts refcounts through
@@ -594,7 +600,7 @@ pub struct GraphRuntime {
 
         let mut out = SpecPrepOut::default();
         let mut cols = EdgeColumns::default();
-        let mut undo: Vec<(u32, Vec<(u8, bool)>)> = Vec::new();
+        let mut undo: Vec<(u32, NodeId, Vec<(u8, bool)>)> = Vec::new();
         let mut cursor = 0usize;
 
         for (i, &rid) in input.rids.iter().enumerate() {
@@ -623,7 +629,7 @@ pub struct GraphRuntime {
                 &all_refs[slice.clone()], slice.start,
             ) {
                 Some((kept, edges, ingested)) => {
-                    undo.push((rid, ingested));
+                    undo.push((rid, spec_node, ingested));
                     out.consumed_streaming_edge_idxs.extend(kept);
                     out.ready_rids.push(rid);
                     out.wg_ids.push(wg_id);
@@ -637,8 +643,8 @@ pub struct GraphRuntime {
                 None if follower => {
                     // Undo every rid prepped so far, or this rank joins the
                     // collective with a batch the leader never sent.
-                    for (done_rid, slots) in undo {
-                        self.undo_spec_ingest(wg, done_rid, spec_node, &slots);
+                    for (done_rid, node, slots) in undo {
+                        self.undo_spec_ingest(wg, done_rid, node, &slots);
                     }
                     return Ok(SpecPrepOut {
                         all_or_nothing_failed: true,
@@ -648,8 +654,24 @@ pub struct GraphRuntime {
                 None => {}
             }
         }
+        out.spec_id = self.stage_spec(wg, undo);
         out.set_edges(cols);
         Ok(out)
+    }
+
+    /// Park what a prep ingested, for `commit_speculation` to settle. 0 when
+    /// nothing was ingested: no stage to undo, so nothing to settle.
+    fn stage_spec(
+        &mut self, wg: WgIndex, undo: Vec<(u32, NodeId, Vec<(u8, bool)>)>,
+    ) -> u32 {
+        let staged: Vec<_> =
+            undo.into_iter().filter(|(_, _, s)| !s.is_empty()).collect();
+        if staged.is_empty() {
+            return 0;
+        }
+        self.spec_counter += 1;
+        self.staged_specs.insert(self.spec_counter, (wg, staged));
+        self.spec_counter
     }
 
     /// False once this rid's loop has ended: a stop is already pending, or the
@@ -1173,6 +1195,8 @@ pub struct SpecPrepOut {
     #[pyo3(get)] pub tensors_per_edge: Vec<u32>,
     #[pyo3(get)] pub is_final_streaming_chunk: Vec<bool>,
     #[pyo3(get)] pub uuids: Vec<u64>,
+    /// Handle for `commit_speculation`; 0 when nothing was staged.
+    #[pyo3(get)] pub spec_id: u32,
     /// Follower path only: the batch could not be built and was rolled back.
     all_or_nothing_failed: bool,
 }
@@ -1382,6 +1406,8 @@ impl GraphRuntime {
             pending_loop_stops: FxHashSet::default(),
             completions: FxHashMap::default(),
             completion_counter: 0,
+            staged_specs: FxHashMap::default(),
+            spec_counter: 0,
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
         })
@@ -1541,6 +1567,14 @@ impl GraphRuntime {
             c.speculative.remove(&rid);
             c.nested.remove(&rid);
             !c.routing.is_empty()
+        });
+
+        // Same recycling hazard for a staged speculation nobody settled: its
+        // undo would otherwise run against whichever request takes this handle
+        // next. The walk state it names is dropped just below anyway.
+        self.staged_specs.retain(|_, (_, staged)| {
+            staged.retain(|&(r, _, _)| r != rid);
+            !staged.is_empty()
         });
 
         if let Some(info) = self.requests[rid as usize].take() {
@@ -2041,6 +2075,46 @@ impl GraphRuntime {
     /// being past the last) lives here.
     fn prep_spec_rids(&mut self, input: SpecPrepArg) -> PyResult<SpecPrepOut> {
         self.prep_spec(input, false)
+    }
+
+    /// Settle the streaming ingests a prep staged under `spec_id`.
+    ///
+    /// Every rid that will NOT run its speculative step -- all of them when
+    /// `!success`, otherwise those in `dropped_rids` -- has its staged ingest
+    /// undone, so the chunk leaves the slot without being dereferenced and the
+    /// caller can hand it back to its StreamBuffer. The rest are forgotten.
+    /// See `GraphRuntime.commit_speculation` for why both halves matter.
+    /// ``scheduled_rids`` are marked speculatively scheduled on ``node`` in the
+    /// SAME call, so committing a speculation is one crossing rather than two.
+    /// They are passed rather than taken from the stage because a spec batch
+    /// also carries rids that staged no chunk -- fresh ones off the ready queue,
+    /// and continuing ones with nothing buffered -- which still must not be
+    /// re-queued while the step runs. One node for the batch, so one name.
+    #[pyo3(signature = (
+        spec_id, success, dropped_rids = Vec::new(),
+        node = None, wg_id = None, scheduled_rids = Vec::new(),
+    ))]
+    fn commit_speculation(
+        &mut self, spec_id: u32, success: bool, dropped_rids: Vec<u32>,
+        node: Option<String>, wg_id: Option<u32>, scheduled_rids: Vec<u32>,
+    ) -> PyResult<()> {
+        if success {
+            if let (Some(node), Some(wg_id)) = (node, wg_id) {
+                self.set_speculatively_scheduled(
+                    node, wg_id, scheduled_rids, true,
+                )?;
+            }
+        }
+        let Some((wg, staged)) = self.staged_specs.remove(&spec_id) else {
+            return Ok(()); // unknown or 0: nothing was staged
+        };
+        for (rid, node, slots) in staged {
+            if success && !dropped_rids.contains(&rid) {
+                continue;
+            }
+            self.undo_spec_ingest(wg, rid, node, &slots);
+        }
+        Ok(())
     }
 
     /// The TP-follower counterpart: ALL or nothing, no room cap, no loop

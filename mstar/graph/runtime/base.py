@@ -386,6 +386,10 @@ class SpeculationPrepOutput(NamedTuple):
     # edges simply has none here, so callers that want an entry for it pass
     # ready_rids to ``to_input_tensors``.
     input_edges: ColumnarEdgeSpecs
+    # Handle for ``commit_speculation``, which every prep that returns one must
+    # eventually be settled with. 0 when the prep staged no streaming ingest,
+    # and so has nothing to settle.
+    spec_id: int = 0
 
 
 class ReadyNodeSpec(NamedTuple):
@@ -783,6 +787,26 @@ class GraphRuntime(ABC):
         ALL-OR-NOTHING (None rolls the whole set back) and applies neither the
         loop-completion filter nor ``room_for_continuing`` -- both are local
         decisions the leader already made for everyone.
+        """
+        pass
+
+    @abstractmethod
+    def commit_speculation(
+        self, spec_id: int, success: bool, dropped_rids: list[int] = (),
+        node: str | None = None, wg_id: int | None = None,
+        scheduled_rids: list[int] = (),
+    ):
+        """Settle the streaming ingests a prep staged under ``spec_id``.
+        On ``success``, ``scheduled_rids`` are also marked speculatively
+        scheduled on ``node``.
+
+        The scheduled rids are passed rather than read off the stage in order
+        to also include the fresh rids rolled in from the ready queue. For
+        dropped rids, stream chunks are returned to the stream buffers and
+        un-ingested from the graph.
+
+        Idempotent, and a no-op for an unknown or 0 id, so a caller settling a
+        prep that staged nothing (or settling twice on an error path) is safe.
         """
         pass
 
