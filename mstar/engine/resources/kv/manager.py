@@ -412,6 +412,8 @@ class KVManager(AttentionResource):
         self._waiting: dict[str, None] = {}
         # the head's rooted prompt keys, hashed once however often it asks
         self._rooted: dict[str, list[bytes]] = {}
+        # the labels each request's walks open here, read per segment per step
+        self._opened: dict[str, set[str]] = {}
         # label -> the walk prepare probes it on
         self._prefill_walks: dict[str, str] = {}
 
@@ -1656,6 +1658,7 @@ class KVManager(AttentionResource):
             self._reserved.pop(rid, None)
             self._waiting.pop(rid, None)
             self._rooted.pop(rid, None)
+            self._opened.pop(rid, None)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -1802,16 +1805,21 @@ class KVManager(AttentionResource):
         return (not ctx.capture and self._is_padding(rid)) or self._unheld(rid, label)
 
     def _unheld(self, rid, label: str) -> bool:
-        """Whether the model counted ``rid`` out of ``label``.
+        """Whether ``rid``, counted by its model, holds nothing in ``label``,
+        as no walk of its own opens it.
 
         A model can run a label for a whole batch (Bagel's guidance branches run
         for every row once one row needs them), and a row whose request holds
         nothing there never reads back what it wrote. Pages for it would be
-        pages the request never reserved.
+        pages the request never reserved, which counts only the labels it opens.
         """
         overrides = self._overrides.get(rid)
-        slots = overrides.prompt_slots if overrides is not None else None
-        return bool(slots) and label not in slots
+        if overrides is None or not overrides.prompt_slots:
+            return False
+        opened = self._opened.get(rid)
+        if opened is None:
+            opened = self._opened[rid] = self._labels_opened(overrides)
+        return label not in opened
 
     def _labels_opened(self, overrides: KVReqConfig) -> set[str]:
         """The labels ``overrides`` can open on this pool's nodes, on any walk."""
