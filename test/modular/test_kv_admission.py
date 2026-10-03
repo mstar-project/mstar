@@ -369,6 +369,40 @@ def test_a_row_counted_on_labels_its_walks_never_open_takes_no_page_there(monkey
     assert set(view.page_idxs) == {SINK_PAGE}, "the unguided row's cfg_img was planned off the sink"
 
 
+def _beside_a_guided_request(kv: KVManager) -> KVManager:
+    """``text`` two pages into its prompt, and a guided ``image`` beside it."""
+    labels = ["main", "cfg_text", "cfg_img"]
+    guided = _request(list(range(500, 500 + 4 * PAGE_SIZE)), max_tokens=PAGE_SIZE)
+    guided.needed_labels = labels
+    guided.prompt_slots = dict.fromkeys(labels, 4 * PAGE_SIZE)
+    kv.ingest_request("text", _request(list(range(4 * PAGE_SIZE)), max_tokens=PAGE_SIZE))
+    kv.ingest_request("image", guided)
+    assert _ready(kv, "text").ready and _ready(kv, "image").ready
+    assert _step(kv, "text", 2 * PAGE_SIZE).ok
+    return kv
+
+
+def test_a_guided_fork_copies_nothing_onto_a_label_the_row_holds_nothing_in(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _beside_a_guided_request(_manager(max_num_pages=32))
+
+    # main already holds two pages, so a fork onto cfg_text would copy them
+    _guided_prefill(kv, ("text", "image"), 2 * PAGE_SIZE)
+
+    assert "cfg_text" not in kv._streams["text"], "the guided fork copied main onto the unguided row's cfg_text"
+
+
+def test_a_label_the_row_holds_nothing_in_keeps_no_length(monkeypatch):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", True)
+    kv = _beside_a_guided_request(_manager(max_num_pages=32))
+
+    _guided_prefill(kv, ("text", "image"), 2 * PAGE_SIZE)
+
+    assert kv._streams["text"]["cfg_img"].stored_len == 0, (
+        "the unguided row's cfg_img kept a length its later views would stretch over the sink"
+    )
+
+
 # ── a request moved to the host ─────────────────────────────────────────
 
 
