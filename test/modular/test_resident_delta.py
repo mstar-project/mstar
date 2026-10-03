@@ -271,6 +271,49 @@ def test_reload_request_reports_whether_it_worked():
     assert engine.reload_request("node", "b") is False
 
 
+class _Pages(_Resource):
+    def __init__(self, free: int, need: int):
+        super().__init__()
+        self.free = free
+        self.need = need
+
+    def offload(self, rid):
+        if rid in self.offloaded:
+            return 0
+        self.offloaded.add(rid)
+        self.free += self.need
+        return self.need
+
+    def reload(self, rid):
+        if self.need > self.free:
+            return False
+        self.free -= self.need
+        self.offloaded.discard(rid)
+        return True
+
+
+def test_a_partial_reload_gives_back_what_it_reloaded():
+    """Resources reload in turn, so the first can fit while the second can't, as
+    whisper's ``kv_cache`` does ahead of the tighter ``cross_kv_cache``. The delta
+    carries only a full reload and a follower never reloads by itself, so pages
+    the first kept would be pages no follower holds, and the next admit short of
+    them refuses on rank 0 alone."""
+    engine = _Engine()
+    first, second = _Pages(free=8, need=4), _Pages(free=0, need=12)
+    first.offloaded = {"a"}
+    second.offloaded = {"a"}
+    engine._submodules = {
+        "node": SimpleNamespace(resources={"first": first, "second": second})
+    }
+
+    assert engine.reload_request("node", "a") is False
+    assert len(engine.take_resident_delta("node")) == 0
+    assert second.is_offloaded("a")
+    assert first.is_offloaded("a") and first.free == 8, (
+        "the first resource kept pages the delta never mentions"
+    )
+
+
 def test_a_reloaded_request_is_ready_again():
     """The same bug one level up, where it actually bites."""
     engine = _Engine()
