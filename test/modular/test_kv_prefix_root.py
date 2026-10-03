@@ -10,10 +10,9 @@ walk their indexes independently and would match different lengths; and for a
 model that names no checkpoint, until the deployment sets a salt, because two
 builds that differ only in their weights would share every key.
 
-Where it opens, the engine says so, and warns a cache with no host pages: a
-cached prompt reserves none of its pages, so nothing bounds how many requests
-decode at once, and with nothing to offload a full pool holds them until they
-time out.
+Where it opens, the engine says so, and what a request reserves there. It
+refuses a node that keys prompts in two pools: the node's steps cut both to the
+shorter hit, so the other pool would take pages it admitted the request without.
 """
 
 from __future__ import annotations
@@ -98,6 +97,14 @@ class _Declaring(_Model):
         return {KV: {"main": PrefixStream("text_inputs", "ids", "prefill_text", "decode")}}
 
 
+
+class _KeyingTwo(_Model):
+    """Keys ``main`` on two KV resources from the same node's text walk."""
+
+    def prefix_key_streams(self):
+        stream = PrefixStream("text_inputs", "ids", "prefill_text", "decode")
+        return {KV: {"main": stream}, "kv2": {"main": stream}}
+
 def _checkpoint(root, config: bytes) -> str:
     root.mkdir()
     (root / "config.json").write_bytes(config)
@@ -105,14 +112,14 @@ def _checkpoint(root, config: bytes) -> str:
     return str(root)
 
 
-def _kv(dtype=torch.float32, **overrides) -> KVManager:
+def _kv(dtype=torch.float32, name=KV, **overrides) -> KVManager:
     cfg = dict(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
         max_num_pages=16, page_size=16,
     )
     cfg.update(overrides)
     return KVManager(
-        cfg=PagedKVConfig(**cfg), name=KV, joint_comm_group=None,
+        cfg=PagedKVConfig(**cfg), name=name, joint_comm_group=None,
         transfer_engine_info=None, device=torch.device("cpu"), dtype=dtype,
     )
 
@@ -293,6 +300,21 @@ def test_a_keyed_node_says_what_one_request_reserves(caplog):
     )
     assert warnings == [], "a pool that admits by reservation was warned its decode can hold"
 
+
+
+def test_a_node_that_keys_two_pools_is_refused_at_load():
+    engine = Engine.__new__(Engine)
+    engine._resources = {
+        KV: _kv(prefix_cache_salt="deployment"),
+        "kv2": _kv(name="kv2", prefix_cache_salt="deployment"),
+    }
+    specs = {
+        key: KVSpec(resource_key=key, nodes={"LLM"}, config=kv.config)
+        for key, kv in engine._resources.items()
+    }
+
+    with pytest.raises(ValueError, match="more than one KV pool"):
+        engine._open_prefix_caches(specs, _KeyingTwo())
 
 @pytest.mark.parametrize("overrides, model", [
     ({}, _Model), ({"prefix_cache": False}, _Declaring),
