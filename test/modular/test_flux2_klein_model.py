@@ -238,20 +238,20 @@ def test_shape_key_from_step_metadata_and_capture_buckets():
     shape = shape_from_metadata(model.config, {"height": 512, "width": 768, "ref_grids": [[32, 48]]})
     assert shape == KleinShape(grid=(32, 48), text_len=512, ref_grids=((32, 48),))
     assert shape.total_tokens == 512 + 32 * 48 + 32 * 48
-    captured = model.capture_shapes()
+    captured = model.capture_buckets()
     assert [(w, s.grid, s.ref_grids) for w, s in captured] == [
         (IMAGE_GEN_WALK, (64, 64), ()), (IMAGE_GEN_WALK, (48, 64), ()),
         # edits default to one reference of the output size, for the same sizes
         (IMAGE_EDIT_WALK, (64, 64), ((64, 64),)), (IMAGE_EDIT_WALK, (48, 64), ((48, 64),)),
     ]
     assert model.warmup_sizes() == [(1024, 1024), (768, 1024)]
-    assert _make_model(cuda_graph=False).capture_shapes() == []
+    assert _make_model(cuda_graph=False).capture_buckets() == []
     only_small_edits = _make_model(capture_edit_sizes=[[512, 512]])
-    assert [(w, s.grid, s.ref_grids) for w, s in only_small_edits.capture_shapes()] == [
+    assert [(w, s.grid, s.ref_grids) for w, s in only_small_edits.capture_buckets()] == [
         (IMAGE_GEN_WALK, (64, 64), ()), (IMAGE_EDIT_WALK, (32, 32), ((32, 32),)),
     ]
     assert only_small_edits.warmup_sizes() == [(1024, 1024), (512, 512)]
-    assert all(w == IMAGE_GEN_WALK for w, _ in _make_model(capture_edit_sizes=[]).capture_shapes())
+    assert all(w == IMAGE_GEN_WALK for w, _ in _make_model(capture_edit_sizes=[]).capture_buckets())
 
 
 def test_postprocess_encodes_png():

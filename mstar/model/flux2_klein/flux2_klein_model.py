@@ -424,7 +424,7 @@ class Flux2KleinModel(Model):
         # checkpoint dtypes, which is what the parity tests pin.
         return None
 
-    def capture_shapes(self) -> list[tuple[str, Hashable]]:
+    def capture_buckets(self) -> list[tuple[str, Hashable]]:
         if not self.cuda_graph:
             return []
         text_len = self.config.text_encoder.max_sequence_length
@@ -488,7 +488,7 @@ class Flux2KleinModel(Model):
                 compile_transformer=self.compile_transformer,
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
                 max_batch_size=self.max_batch_size,
-                capture_shapes=self.capture_shapes(), capture_batch_sizes=self.capture_batch_sizes,
+                capture_buckets=self.capture_buckets(), capture_batch_sizes=self.capture_batch_sizes,
             )
         logger.warning("FLUX.2 klein has no submodule for node %r; running it dummy", node_name)
         return None

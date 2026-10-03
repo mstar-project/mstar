@@ -80,7 +80,7 @@ uv pip install \
   "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 ```
 
-Other models: `mstar serve flux2_klein` · `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
+Other models: `mstar serve flux2_klein` · `mstar serve cosmos3` · `mstar serve cosmos3_droid` · `mstar serve qwen3_omni` · `mstar serve kokoro` · `mstar serve orpheus` · `mstar serve pi05` · `mstar serve vjepa2`
 
 **Python SDK** — works for every model (text, image, audio, video):
 
@@ -97,7 +97,7 @@ for event in client.chat("Tell me a story", stream=True):   # streaming
     print(getattr(event, "text", ""), end="", flush=True)
 ```
 
-**OpenAI-compatible API** — drop-in for `bagel`, `cosmos3`, `qwen3_omni`, and `orpheus`:
+**OpenAI-compatible API** — drop-in for `bagel`, `cosmos3`, `qwen3_omni`, `orpheus`, and `kokoro`:
 
 ```python
 from openai import OpenAI
@@ -122,6 +122,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [Orpheus](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | Speech LM | text → speech | `/v1/audio/speech` |
 | [Cosmos3 Nano / Super](https://huggingface.co/nvidia/Cosmos3-Nano) | World model | text, image, video → image, video (+ sound), robot actions | `/v1/images/generations`, `/v1/videos/generations` |
 | [Cosmos3 Policy DROID](https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID) | Robot policy | text, image, video → robot actions, video | `/generate`, `/v1/images/generations`, `/v1/videos/generations` |
+| [Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge) | 480p world model + VLM | text, image, video → image, video (streamed windows), robot actions, text | `/v1/chat/completions`, `/v1/images/generations`, `/v1/videos/generations`, `/generate`, `/generate/ws` |
 | [Pi0.5](https://huggingface.co/lerobot/pi05_base) | Vision-language-action | text, image, state → robot actions | `/generate` |
 | [V-JEPA 2 / 2-AC](https://huggingface.co/facebook/vjepa2-vitl-fpc64-256) | World model | video (+ actions) → latents, rollouts | `/generate` |
 | [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) | Video diffusion | text, image → video | `/v1/videos/generations`, `/generate` |

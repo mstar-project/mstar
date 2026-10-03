@@ -1,6 +1,7 @@
 import torch
 
 from mstar.engine.resources.attn.base import AttentionManager
+from mstar.engine.resources.attn.ragged.base import RaggedAttnManager
 from mstar.engine.resources.kv.manager import KVManager
 
 
@@ -18,6 +19,8 @@ class AttentionCallable:
     That sharing is why the label is one cursor for the whole stack. No model
     varies its label per layer today; one that needs to should thread the label
     explicitly rather than use this.
+
+    For a cacheless attention, see :class:`RaggedAttentionCallable`.
     """
 
     def __init__(self, kv: KVManager, attn: AttentionManager | None=None):
@@ -56,3 +59,32 @@ class AttentionCallable:
         if self.attn.requires_kv_write:
             self.kv.write_kv(k, v)
         return self.attn.run(q, kv_cache_layer=self.kv.layer_view(), k=k, v=v)
+
+
+class RaggedAttentionCallable:
+    """`AttentionCallable` for a cacheless attention: ``(q, k, v) -> out`` over
+    one declared span of a `RaggedAttnManager`.
+
+    No ``kv`` and no layer cursor, because there is neither to carry: a ragged
+    plan is keyed by the segment label, and the wrapper behind it is per
+    (bucket, slot, label) rather than per layer. The label is therefore bound
+    here at construction instead of being a cursor on the resource -- which is
+    what lets one stack attend over several spans at once (a refiner over the
+    image tokens next to a pass over all of them), the case `AttentionCallable`
+    says to thread explicitly.
+
+    One instance per label, held for the life of the resource binding: a
+    compiled transformer region guards on the identity of the callables it is
+    handed, so handing it a fresh one per step retraces that frame every step
+    until Dynamo gives up.
+    """
+
+    def __init__(self, attn: RaggedAttnManager, label: str):
+        self.attn = attn
+        self.label = label
+
+    @torch.compiler.disable
+    def __call__(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.attn.run(q, k, v, label=self.label)

@@ -30,6 +30,10 @@ from mstar.engine.resources.kv.config import (
     KVReqConfig,
     KVSpec,
     KVStep,
+    PagedKVConfig,
+    RingKVConfig,
+    RingKVLayerConfig,
+    RingKVStep,
 )
 from mstar.engine.resources.position.config import (
     PosBackend,
@@ -86,6 +90,7 @@ __all__ = [
     "KVSpec",
     "KVStep",
     "NodeResourceSpec",
+    "PagedKVConfig",
     "PosBackend",
     "PosScheme",
     "PositionConfig",
@@ -97,6 +102,9 @@ __all__ = [
     "Resource",
     "ResourceReqConfig",
     "ResourceStep",
+    "RingKVConfig",
+    "RingKVLayerConfig",
+    "RingKVStep",
     "SamplerSpec",
     "SamplerStep",
     "SamplingReqConfig",

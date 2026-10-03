@@ -158,11 +158,11 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
         self, transformer: nn.Module, config: ZImageConfig, *, loop_name: str, attn_resource_key: str | None,
         compile_transformer: bool = True, compile_eager_rounding: bool = True,
         compile_exact_ops: bool | Sequence[str] = False, max_batch_size: int = 8,
-        capture_shapes=(), capture_batch_sizes=(1, 2, 4, 8),
+        capture_buckets=(), capture_batch_sizes=(1, 2, 4, 8),
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
-            capture_shapes=capture_shapes, capture_batch_sizes=capture_batch_sizes,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
         )
         self.transformer = transformer
         self.config = config
@@ -174,37 +174,37 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
                 transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
             )
 
-    def shape_key_for(self, fwd_info: CurrentForwardPassInfo) -> ZShape:
+    def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> ZShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
-    def schedule_for(self, fwd_info, shape_key: ZShape) -> FlowMatchSchedule:
+    def schedule_for(self, fwd_info, bucket_key: ZShape) -> FlowMatchSchedule:
         return FlowMatchSchedule.build(
-            self.config.scheduler, int(fwd_info.step_metadata["num_inference_steps"]), shape_key.image_tokens,
+            self.config.scheduler, int(fwd_info.step_metadata["num_inference_steps"]), bucket_key.image_tokens,
         )
 
-    def seed_latents(self, fwd_info, shape_key: ZShape, generator: torch.Generator) -> torch.Tensor:
-        h, w = shape_key.grid
+    def seed_latents(self, fwd_info, bucket_key: ZShape, generator: torch.Generator) -> torch.Tensor:
+        h, w = bucket_key.grid
         patch = self.config.transformer.patch_size
         # randn_tensor parity: fp32 on the CPU generator, in the unpacked [C, H/8, W/8] layout
         return torch.randn(
             (self.config.transformer.in_channels, h * patch, w * patch), generator=generator, dtype=torch.float32,
         )
 
-    def request_inputs(self, fwd_info, inputs: NameToTensorList, shape_key: ZShape) -> dict[str, torch.Tensor]:
+    def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: ZShape) -> dict[str, torch.Tensor]:
         embeds = inputs[TEXT_EMBEDS][0][0]
         text_len = int(fwd_info.step_metadata["text_len"])
-        pad_mask = torch.arange(shape_key.cap_len, device=embeds.device) >= text_len
+        pad_mask = torch.arange(bucket_key.cap_len, device=embeds.device) >= text_len
         return {TEXT_EMBEDS: embeds, CAP_PAD_MASK: pad_mask}
 
-    def num_tokens(self, shape_key: ZShape) -> int:
-        return shape_key.total_tokens
+    def num_tokens(self, bucket_key: ZShape) -> int:
+        return bucket_key.total_tokens
 
-    def attention_segments(self, shape_key: ZShape):
+    def attention_segments(self, bucket_key: ZShape):
         # the refiners attend over the padded image tokens / the caption alone, the main layers over both
         return (
-            (IMAGE_SPAN, shape_key.image_tokens_padded),
-            (CAPTION_SPAN, shape_key.cap_len),
-            (MAIN_SPAN, shape_key.total_tokens),
+            (IMAGE_SPAN, bucket_key.image_tokens_padded),
+            (CAPTION_SPAN, bucket_key.cap_len),
+            (MAIN_SPAN, bucket_key.total_tokens),
         )
 
     def _ragged_spans(self):
@@ -212,35 +212,35 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
             return None
         return {span: self.ragged_for(span) for span in ATTENTION_SPANS}
 
-    def capture_request_inputs(self, shape_key: ZShape, device) -> dict[str, torch.Tensor]:
+    def capture_request_inputs(self, bucket_key: ZShape, device) -> dict[str, torch.Tensor]:
         tcfg = self.config.transformer
-        h, w = shape_key.grid
+        h, w = bucket_key.grid
         return {
             LATENTS: torch.zeros(tcfg.in_channels, h * tcfg.patch_size, w * tcfg.patch_size, device=device),
-            TEXT_EMBEDS: torch.zeros(shape_key.cap_len, tcfg.cap_feat_dim, dtype=self.transformer.dtype, device=device),
-            CAP_PAD_MASK: torch.zeros(shape_key.cap_len, dtype=torch.bool, device=device),
+            TEXT_EMBEDS: torch.zeros(bucket_key.cap_len, tcfg.cap_feat_dim, dtype=self.transformer.dtype, device=device),
+            CAP_PAD_MASK: torch.zeros(bucket_key.cap_len, dtype=torch.bool, device=device),
         }
 
-    def build_layout(self, shape_key: ZShape, device):
-        h, w = shape_key.grid
-        n_img, n_pad = shape_key.image_tokens, shape_key.image_tokens_padded - shape_key.image_tokens
-        cap_ids = torch.zeros(shape_key.cap_len, 3, dtype=torch.long)
-        cap_ids[:, 0] = torch.arange(1, shape_key.cap_len + 1)
+    def build_layout(self, bucket_key: ZShape, device):
+        h, w = bucket_key.grid
+        n_img, n_pad = bucket_key.image_tokens, bucket_key.image_tokens_padded - bucket_key.image_tokens
+        cap_ids = torch.zeros(bucket_key.cap_len, 3, dtype=torch.long)
+        cap_ids[:, 0] = torch.arange(1, bucket_key.cap_len + 1)
         hh, ww = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
-        img_ids = torch.stack([torch.full((n_img,), shape_key.cap_len + 1), hh.flatten(), ww.flatten()], dim=-1)
+        img_ids = torch.stack([torch.full((n_img,), bucket_key.cap_len + 1), hh.flatten(), ww.flatten()], dim=-1)
         img_ids = torch.cat([img_ids, torch.zeros(n_pad, 3, dtype=torch.long)])
-        image_pad_mask = torch.zeros(shape_key.image_tokens_padded, dtype=torch.bool)
+        image_pad_mask = torch.zeros(bucket_key.image_tokens_padded, dtype=torch.bool)
         image_pad_mask[n_img:] = True
         return {
             "image_freqs": self.rope(img_ids).to(device), "caption_freqs": self.rope(cap_ids).to(device),
             "image_pad_mask": image_pad_mask.to(device),
         }
 
-    def denoise(self, engine_inputs, shape_key: ZShape, latents, timestep, sigma, sigma_next, **cond):
-        layout = self.layout(shape_key, latents.device)
+    def denoise(self, engine_inputs, bucket_key: ZShape, latents, timestep, sigma, sigma_next, **cond):
+        layout = self.layout(bucket_key, latents.device)
         patch = self.config.transformer.patch_size
         tokens = torch.stack([patchify_image(row, patch) for row in latents.to(self.transformer.dtype)])
-        n_pad = shape_key.image_tokens_padded - shape_key.image_tokens
+        n_pad = bucket_key.image_tokens_padded - bucket_key.image_tokens
         if n_pad:
             tokens = torch.cat([tokens, tokens[:, -1:].expand(-1, n_pad, -1)], dim=1)
         # the reference conditions on (1000 - t) / 1000 with the scheduler's fp32 timestep
@@ -250,7 +250,7 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
             t_cond, layout["image_freqs"], layout["caption_freqs"], ragged=self._ragged_spans(),
         )
         channels = self.config.transformer.in_channels
-        velocity = -torch.stack([unpatchify_image(row, shape_key.grid, patch, channels) for row in out.float()])
+        velocity = -torch.stack([unpatchify_image(row, bucket_key.grid, patch, channels) for row in out.float()])
         return euler_step(latents, velocity, sigma, sigma_next)
 
 

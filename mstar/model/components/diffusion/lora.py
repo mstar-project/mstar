@@ -27,6 +27,7 @@ import logging
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -53,11 +54,19 @@ class LoraSpec:
         return cls(path=str(raw["path"]), scale=float(raw.get("scale", 1.0)))
 
 
+class LoraLayer(NamedTuple):
+    """One module's adapter: ``W += scale * alpha / r * b @ a``."""
+
+    a: torch.Tensor  # [r, in]
+    b: torch.Tensor  # [out, r]
+    alpha: float
+
+
 @dataclass
 class LoraAdapter:
-    """``module path -> (A [r, in], B [out, r], alpha)`` in diffusers naming."""
+    """``module path -> LoraLayer`` in diffusers naming."""
 
-    layers: dict[str, tuple[torch.Tensor, torch.Tensor, float]] = field(default_factory=dict)
+    layers: dict[str, LoraLayer] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.layers)
@@ -142,7 +151,7 @@ def normalize_lora_state_dict(
         if b.shape[1] != rank:
             raise ValueError(f"LoRA module {module!r}: A is rank {rank} but B has {b.shape[1]} columns")
         fallback = default_alpha(rank) if default_alpha is not None else float(rank)
-        adapter.layers[module] = (a, b, alphas.get(module, fallback))
+        adapter.layers[module] = LoraLayer(a=a, b=b, alpha=alphas.get(module, fallback))
     return adapter
 
 
@@ -175,13 +184,13 @@ def merge_lora(
     params = dict(module.named_parameters())
     rules = list(stacked_params)
     touched = []
-    for module_path, (a, b, alpha) in adapter.layers.items():
+    for module_path, layer in adapter.layers.items():
         native = remap(module_path + ".weight")
         target, shard_id = _apply_stacked(native, rules)
         if target not in params:
             raise KeyError(f"LoRA layer {module_path!r} maps to {target!r}, which is not a parameter of the module")
-        factor = scale * alpha / a.shape[0]
-        delta = (b.float() @ a.float()) * factor
+        factor = scale * layer.alpha / layer.a.shape[0]
+        delta = (layer.b.float() @ layer.a.float()) * factor
         owner_path = target.rsplit(".", 1)[0]
         _merge_delta(params[target], delta, module.get_submodule(owner_path), shard_id)
         touched.append(target)

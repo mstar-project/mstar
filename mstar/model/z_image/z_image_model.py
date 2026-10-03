@@ -277,7 +277,7 @@ class ZImageModel(Model):
     def get_autocast_dtype(self):
         return None
 
-    def capture_shapes(self) -> list[tuple[str, Hashable]]:
+    def capture_buckets(self) -> list[tuple[str, Hashable]]:
         if not self.cuda_graph:
             return []
         return [
@@ -315,7 +315,7 @@ class ZImageModel(Model):
                 compile_transformer=self.compile_transformer,
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
                 max_batch_size=self.max_batch_size,
-                capture_shapes=self.capture_shapes(), capture_batch_sizes=self.capture_batch_sizes,
+                capture_buckets=self.capture_buckets(), capture_batch_sizes=self.capture_batch_sizes,
             )
         logger.warning("Z-Image has no submodule for node %r; running it dummy", node_name)
         return None

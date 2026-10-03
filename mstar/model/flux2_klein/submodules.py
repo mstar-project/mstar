@@ -180,7 +180,7 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
     Per-shape derived state is the joint rotary table ``(cos, sin)`` over the text ids
     ``(0,0,0,l)``, the image grid ``(0,h,w,0)`` and each reference grid ``(10(i+1),h,w,0)``.
     The transformer is compiled per shape when ``compile`` is on; captured graphs
-    (``capture_shapes``) record those kernels together with the Euler update.
+    (``capture_buckets``) record those kernels together with the Euler update.
     """
 
     def __init__(
@@ -192,12 +192,12 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         attn_resource_key: str | None,
         compile_transformer: bool = True, compile_eager_rounding: bool = True, compile_exact_ops: ExactOps = False,
         max_batch_size: int = 8,
-        capture_shapes=(),
+        capture_buckets=(),
         capture_batch_sizes=(1, 2, 4, 8),
     ):
         super().__init__(
             loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
-            capture_shapes=capture_shapes, capture_batch_sizes=capture_batch_sizes,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
         )
         self.transformer = transformer
         self.config = config
@@ -212,56 +212,56 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
             )
 
     # hooks -----------------------------------------------------------------
-    def shape_key_for(self, fwd_info: CurrentForwardPassInfo) -> KleinShape:
+    def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> KleinShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
-    def schedule_for(self, fwd_info, shape_key: KleinShape) -> FlowMatchSchedule:
+    def schedule_for(self, fwd_info, bucket_key: KleinShape) -> FlowMatchSchedule:
         return FlowMatchSchedule.build(
-            self.config.scheduler, int(fwd_info.step_metadata["num_inference_steps"]), shape_key.image_tokens,
+            self.config.scheduler, int(fwd_info.step_metadata["num_inference_steps"]), bucket_key.image_tokens,
         )
 
-    def seed_latents(self, fwd_info, shape_key: KleinShape, generator: torch.Generator) -> torch.Tensor:
+    def seed_latents(self, fwd_info, bucket_key: KleinShape, generator: torch.Generator) -> torch.Tensor:
         # randn_tensor parity: drawn in the packed [C, h, w] layout in bf16 on the CPU
         # generator, then packed row-major to tokens.
-        h, w = shape_key.grid
+        h, w = bucket_key.grid
         noise = torch.randn(
             (1, self.config.transformer.in_channels, h, w), generator=generator, dtype=self.transformer.dtype,
         )
         return pack_latents(noise)[0]
 
-    def request_inputs(self, fwd_info, inputs: NameToTensorList, shape_key: KleinShape) -> dict[str, torch.Tensor]:
+    def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: KleinShape) -> dict[str, torch.Tensor]:
         tensors = {TEXT_EMBEDS: inputs[TEXT_EMBEDS][0][0]}
-        if shape_key.ref_grids:
+        if bucket_key.ref_grids:
             tensors[REF_LATENTS] = inputs[REF_LATENTS][0][0]
         return tensors
 
-    def num_tokens(self, shape_key: KleinShape) -> int:
-        return shape_key.total_tokens
+    def num_tokens(self, bucket_key: KleinShape) -> int:
+        return bucket_key.total_tokens
 
-    def capture_request_inputs(self, shape_key: KleinShape, device) -> dict[str, torch.Tensor]:
+    def capture_request_inputs(self, bucket_key: KleinShape, device) -> dict[str, torch.Tensor]:
         dtype = self.transformer.dtype
         tcfg = self.config.transformer
         tensors = {
-            LATENTS: torch.zeros(shape_key.image_tokens, tcfg.in_channels, dtype=dtype, device=device),
-            TEXT_EMBEDS: torch.zeros(shape_key.text_len, tcfg.joint_attention_dim, dtype=dtype, device=device),
+            LATENTS: torch.zeros(bucket_key.image_tokens, tcfg.in_channels, dtype=dtype, device=device),
+            TEXT_EMBEDS: torch.zeros(bucket_key.text_len, tcfg.joint_attention_dim, dtype=dtype, device=device),
         }
-        if shape_key.ref_grids:
+        if bucket_key.ref_grids:
             tensors[REF_LATENTS] = torch.zeros(
-                shape_key.ref_tokens, self.config.transformer.in_channels, dtype=dtype, device=device,
+                bucket_key.ref_tokens, self.config.transformer.in_channels, dtype=dtype, device=device,
             )
         return tensors
 
-    def build_layout(self, shape_key: KleinShape, device) -> tuple[torch.Tensor, torch.Tensor]:
-        ids = [text_ids(shape_key.text_len), image_grid_ids(*shape_key.grid)]
+    def build_layout(self, bucket_key: KleinShape, device) -> tuple[torch.Tensor, torch.Tensor]:
+        ids = [text_ids(bucket_key.text_len), image_grid_ids(*bucket_key.grid)]
         scale = self.config.ref_image_time_scale
-        ids += [image_grid_ids(h, w, t=scale * (i + 1)) for i, (h, w) in enumerate(shape_key.ref_grids)]
+        ids += [image_grid_ids(h, w, t=scale * (i + 1)) for i, (h, w) in enumerate(bucket_key.ref_grids)]
         cos, sin = self.rope(torch.cat(ids))
         return cos.to(device), sin.to(device)
 
-    def denoise(self, engine_inputs, shape_key: KleinShape, latents, timestep, sigma, sigma_next, **cond):
+    def denoise(self, engine_inputs, bucket_key: KleinShape, latents, timestep, sigma, sigma_next, **cond):
         text_embeds = cond[TEXT_EMBEDS]
         ref_latents = cond.get(REF_LATENTS)
-        rope = self.layout(shape_key, latents.device)
+        rope = self.layout(bucket_key, latents.device)
         model_input = latents if ref_latents is None else torch.cat([latents, ref_latents], dim=1)
         # The reference hands the transformer ``t.to(latents.dtype) / 1000``; the double
         # rounding through bf16 is part of what the checkpoint saw.

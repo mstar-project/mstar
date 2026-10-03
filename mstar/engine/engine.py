@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
 from mstar.engine.cuda_graph_runner import (
     CudaGraphRunner,
@@ -23,6 +23,7 @@ from mstar.engine.resources import (
     AdmitFailedReason,
     FullAdmitOutcome,
     NodeResourceSpec,
+    PublishedInfo,
     Resource,
     ResourceReqConfig,
     SlotLease,
@@ -40,7 +41,9 @@ from mstar.engine.resources.step import (
     AdmitOutcome,
 )
 from mstar.model.submodule_base import (
+    EMPTY_INPUT_METADATA,
     ARNodeInputs,
+    InputMetadata,
     LazyRequestStates,
     ModelInputsFromEngine,
     NodeInputs,
@@ -176,7 +179,11 @@ class SubmoduleManagement:
 class ExecutingBatch:
     node_name: str
 
-    per_request_info: Mapping[str, CurrentForwardPassInfo]
+    # Keyed by the worker's integer rid handle. CUDA-graph capture pads with
+    # its own rows, which carry negative handles from the same space (see
+    # cuda_graph_runner.dummy_rid_handle), so a padded batch is still int-keyed
+    # throughout.
+    per_request_info: Mapping[int, CurrentForwardPassInfo]
     step_context: StepContext
 
     running_batched: bool = False
@@ -192,7 +199,7 @@ class ExecutingBatch:
     # The rids the staged plan was built over. The plan is theirs exactly —
     # order included — so it is stale the moment this stops matching
     # ``request_ids`` (a request dropped while threading outputs or preparing).
-    preplanned_rids: tuple[str, ...] | None = None
+    preplanned_rids: tuple[int, ...] | None = None
 
     # Declared once for the batch (pre-plan declares it first when it runs)
     # and driven from here on
@@ -202,9 +209,15 @@ class ExecutingBatch:
     per_request_input_tensors: Mapping[str, NameToTensorList] = field(
         default_factory=dict
     )
-    # rids whose consumed streaming input was the final chunk — this step
-    # reports the partition done
+    # rids for which this step ends every finite stream into the node; the
+    # consumer flushes what it held back
     final_stream_rids: set[str] = field(default_factory=set)
+    # rid -> this step's InputMetadata; rids without any are absent
+    per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
+
+    # rids for which this step ends every finite stream into the partition;
+    # this step reports the partition done
+    stream_partition_done_rids: set[str] = field(default_factory=set)
 
     # Populated on batch preparation
     inputs: list[NodeInputs] | None = None
@@ -222,6 +235,12 @@ class ExecutingBatch:
     # This step's per-rid outputs, published as soon as the forward has been
     # submitted — the tensors exist then, even though their values land later.
     outputs: dict[str, NameToTensorList] = field(default_factory=dict)
+
+    # Durable resource state produced by this worker in this batch. This is
+    # deliberately narrower than per_request_info's inherited aggregate.
+    resource_publish_info: dict[str, dict[str, PublishedInfo]] = field(
+        default_factory=dict
+    )
 
     # The next step reads N's outputs, and plans against N's committed state.
     # Two separate dependencies, so two events: whoever prepares N+1 can start
@@ -339,9 +358,22 @@ class Engine:
             if len(relevant_nodes) == 0:
                 continue # resource not needed
 
-            if not parallel_groups.all_in_same_group(spec.nodes):
+            if not parallel_groups.all_have_compatible_parallel_shape(
+                spec.nodes
+            ):
                 raise ValueError(
                     f"Resource spec {spec.resource_key} nodes {spec.nodes} "
+                    "must use the same TP x SP shape across replicas"
+                )
+
+            # A spec is a logical resource identity and may span replicas on
+            # different workers (for example BAGEL's three CFG branches).
+            # This Engine constructs only the local instance, so require only
+            # the locally hosted consumers to share one parallel group.
+            if not parallel_groups.all_in_same_group(relevant_nodes):
+                raise ValueError(
+                    f"Resource spec {spec.resource_key} local nodes "
+                    f"{relevant_nodes} "
                     f"must all be in the same parallel (tp x sp) group"
                 )
             joint_comm_group = parallel_groups.get_joint_group_for_node(
@@ -354,6 +386,11 @@ class Engine:
                     joint_comm_group=joint_comm_group,
                     transfer_engine_info=transfer_engine_info,
                     kv_dtype=kv_cache_type,
+                    needs_remote_transfer=(
+                        parallel_groups.resource_needs_remote_transfer(
+                            spec.nodes, relevant_nodes
+                        )
+                    ),
                     dependencies={
                         key: specs_by_key[key] for key in spec.depends_on()
                     },
@@ -505,6 +542,14 @@ class Engine:
             submodule_mgmt.joint_comm_group.world_size,
         )
         runners: dict[str, PiecewiseCudaGraphRunner] = {}
+        # One graph memory pool for all of the node's regions (see
+        # ``PiecewiseCudaGraphRunner``): its captured-memory footprint becomes
+        # the largest region's rather than the sum over regions.
+        memory_pool = (
+            torch.cuda.graphs.graph_pool_handle()
+            if configs and getattr(self._device, "type", None) == "cuda" and torch.cuda.is_available()
+            else None
+        )
         for label, config in configs.items():
             runner = PiecewiseCudaGraphRunner(
                 label=f"{node_name}_{label}",
@@ -516,6 +561,7 @@ class Engine:
                 joint_comm_group=submodule_mgmt.joint_comm_group,
                 num_slots=submodule_mgmt.num_slots,
                 node_name=node_name,
+                memory_pool=memory_pool,
             )
             runners[label] = runner
         return runners
@@ -573,8 +619,10 @@ class Engine:
                 logger.warning(
                     "KV %s: prefix cache on with cpu_offload_pages 0: a decode "
                     "step that finds nothing to evict holds its requests until "
-                    "they time out. max_concurrent_requests caps how many run "
-                    "at once, and cpu_offload_pages gives the worker a victim",
+                    "they time out. Set max_concurrent_requests to the pool's "
+                    "pages over the pages one request needs. cpu_offload_pages "
+                    "gives the worker a victim, but one that shares most of its "
+                    "prompt frees little",
                     key,
                 )
 
@@ -603,6 +651,11 @@ class Engine:
                     fwd_info=batch.per_request_info[rid],
                     inputs=batch.per_request_input_tensors.get(rid, {}),
                     resources=self._submodules[batch.node_name].resources,
+                    # the step that ends the last of the node's streams: it must
+                    # flush whatever it held back (a vocoder's crossfade tail, the
+                    # look-ahead frames a token encoder withholds)
+                    is_final_stream_chunk=rid in batch.final_stream_rids,
+                    input_metadata=batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA),
                 )
                 if req_inputs is not None:
                     req_inputs = self._skip_cached_prefix(batch, rid, req_inputs)
@@ -707,6 +760,14 @@ class Engine:
                     batch.outputs = self._exec_single(batch)
             batch.outputs_ready.set()
             return batch.outputs
+        except Exception:
+            # A raise before the plan was promoted (declare, admit) would leave
+            # the stage for the next step's admit to find. Drop it here. The
+            # lease is released by _exec_single's own finally.
+            if batch.preplanned_rids is not None and self._runner.staged:
+                self._runner.clear_preplan()
+                batch.preplanned_rids = None
+            raise
         finally:
             batch.preplan_event = None
             batch.release_waiters()
@@ -1027,6 +1088,7 @@ class Engine:
             per_request_states=LazyRequestStates(submodule, rids),
             captured=lease is not None,
             step=step,
+            per_request_input_metadata=batch.per_request_input_metadata,
         )
         if nvtx:
             range_push("engine.preprocess")
@@ -1189,22 +1251,46 @@ class Engine:
         return stops
 
     def finalize_batch(
-        self, batch: ExecutingBatch
-    ):
+        self, batch: ExecutingBatch,
+        publish_request_ids: list[int] | None = None,
+    ) -> dict[str, dict[str, PublishedInfo]]:
         if self._enable_nvtx:
             range_push("engine.finalize_batch")
         try:
             # Returns rid -> {resource label -> published info}
             published = self._runner.publish(
-                batch.request_ids, node_name=batch.node_name,
+                batch.request_ids if publish_request_ids is None
+                else publish_request_ids,
+                node_name=batch.node_name,
+                graph_walk=batch.step_context.graph_walk,
             )
             for rid, info in batch.per_request_info.items():
                 if rid not in published:
                     continue
                 info.update_publish_info(published[rid])
+            return published
         finally:
             if self._enable_nvtx:
                 range_pop()
+
+    def finalize_stopped_requests(
+        self,
+        batch: ExecutingBatch,
+        request_ids: list[int],
+    ) -> None:
+        """Publish state that must include the last iteration of a stopped loop."""
+        published = self._runner.publish_after_stop(
+            request_ids,
+            node_name=batch.node_name,
+            graph_walk=batch.step_context.graph_walk,
+        )
+        for rid in request_ids:
+            rid_published = published.get(rid, {})
+            batch.per_request_info[rid].update_publish_info(rid_published)
+            merge_publish_info(
+                batch.resource_publish_info.setdefault(rid, {}),
+                rid_published,
+            )
 
     def _collect_outputs(
         self,
@@ -1290,6 +1376,28 @@ class Engine:
             outputs.setdefault(rid, {}).update(rid_out)
 
 
+    def capture_group(
+        self, node_name: str, graph_walk: str, request_id: int,
+        request_info: CurrentForwardPassInfo,
+    ) -> Any | None:
+        """The capture bucket this one request would replay, by
+        ``cg_key_info``; None when the walk has no capture or the submodule
+        does not split by it.
+
+        A batch spanning two groups matches no capture and runs eager, so the
+        scheduler batches each group on its own when the submodule opts in
+        (``split_batches_by_capture_key``).
+        """
+        submodule_mgmt = self._submodules[node_name]
+        if not submodule_mgmt.submodule.split_batches_by_capture_key(graph_walk):
+            return None
+        cg_runner = submodule_mgmt.cuda_graph_runner
+        if cg_runner is None or not cg_runner.captures_walk(graph_walk):
+            return None
+        return submodule_mgmt.submodule.cg_key_info(
+            graph_walk, {request_id: request_info},
+        )
+
     def get_max_batch_size(self, node_name: str, graph_walk: str) -> int | None:
         """Most requests this node will take in one step, or None for no cap.
 
@@ -1360,6 +1468,7 @@ class Engine:
         # the same per-request facts its `declare_step` stamps on the step.
         batch.cg_key_info = submodule_mgmt.submodule.cg_key_info(
             batch.step_context.graph_walk, batch.per_request_info,
+            per_request_input_metadata=batch.per_request_input_metadata,
         )
         lease = cg_runner.lease_slot(
             graph_walk=batch.step_context.graph_walk,
@@ -1495,8 +1604,8 @@ class Engine:
             cg_runner = self._submodules[batch.node_name].cuda_graph_runner
             if lease is not None and cg_runner is not None:
                 cg_runner.release(lease, len(batch.request_ids))
-        for resource in self._resources.values():
-            resource.clear_preplan()
+        # through the runner, so its record of the staged step goes too
+        self._runner.clear_preplan()
 
     # ── Eviction ────────────────────────────────────────────────────────
     #
