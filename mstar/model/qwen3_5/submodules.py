@@ -529,13 +529,13 @@ class VisionEncoderSubmodule(NodeSubmodule):
     `prepare_inputs` and attention boundaries are declared as step segments,
     so the compiled tower's only symbolic shape is its token count.
 
-    The block loop is captured one image per replay, which beats batching:
+    The block loop is captured one prompt per replay, which beats batching:
     eager, the tower is launch-bound (~500 kernels, ~4 ms of GPU work in a
     ~20 ms forward on 9B). So the encoder takes one request a step.
     """
 
-    # Patch-count buckets, one image per replay. 16384 patches merge to the
-    # LLM's 4096 `prefill_vision` bucket; a larger image runs eagerly.
+    # Patch-count buckets, one prompt per replay. 16384 patches merge to the
+    # LLM's 4096 `prefill_vision` bucket; a larger prompt runs eagerly.
     BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
 
     def __init__(
@@ -615,11 +615,11 @@ class VisionEncoderSubmodule(NodeSubmodule):
         self, device: torch.device, autocast_dtype: torch.dtype,
         tp_world_size: int = 1, **kwargs,
     ) -> dict[str, PiecewiseCudaGraphConfig]:
-        """The block loop, one image per replay, by patch-count bucket.
+        """The block loop, one prompt per replay, by patch-count bucket.
 
         Patch embed, position resample and rope run eagerly before it, the
         merger after (it quarters the row count, which a region's output view
-        cannot express). Batch size 1: one replay is one image's segment.
+        cannot express). Batch size 1: one replay is one prompt's segments.
         """
         hidden, head_dim = self.config.hidden_size, self.config.head_dim
 
@@ -632,11 +632,9 @@ class VisionEncoderSubmodule(NodeSubmodule):
             }
 
         def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
+            (rid,) = request_ids
             return SubmoduleStep(
-                segments=[
-                    Segment(request_id=rid, label="main", span=n)
-                    for rid, n in zip(request_ids, seq_lens, strict=True)
-                ],
+                segments=[Segment(request_id=rid, label="main", span=n) for n in seq_lens],
                 steps={VISION_ATTN: AttentionStep(causal=False)},
             )
 
@@ -665,31 +663,22 @@ class VisionEncoderSubmodule(NodeSubmodule):
         sin: torch.Tensor,
         seq_lengths: tuple[int, ...],
     ) -> torch.Tensor | None:
-        """The block loop replayed once per image, or None if not leased.
+        """The block loop replayed once per prompt, or None if not leased.
 
-        Decided as the engine leased, on batch size and total patch count;
-        each image then fits a bucket, being at most the total.
+        Decided as the engine leased, on batch size and total patch count.
         """
         runner = engine_inputs.piecewise_runners.get(VISION_BLOCK_LOOP)
         if runner is None or not runner.can_run(
             len(engine_inputs.request_ids), int(hidden.shape[0]),
         ):
             return None
-        rid = engine_inputs.request_ids[0]
-        outs, start = [], 0
-        for n in seq_lengths:
-            end = start + n
-            out = runner.run(
-                static_inputs={
-                    "hidden": hidden[start:end], "cos": cos[start:end], "sin": sin[start:end],
-                },
-                request_ids=[rid],
-                seq_lens=[n],
-            ).get_view("hidden")
-            # the next replay overwrites the buffer behind this view
-            outs.append(out if len(seq_lengths) == 1 else out.clone())
-            start = end
-        return outs[0] if len(outs) == 1 else torch.cat(outs)
+        # one replay for every image, not one each: a second plan overwrites the schedule a queued replay still reads
+        return runner.run(
+            static_inputs={"hidden": hidden, "cos": cos, "sin": sin},
+            request_ids=[engine_inputs.request_ids[0]],
+            seq_lens=list(seq_lengths),
+            real_bs=1,
+        ).get_view("hidden")
 
     def preprocess(
         self,

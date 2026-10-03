@@ -239,7 +239,11 @@ class Qwen3_5DenseModel(Model):
         """The ViT tower's attention, its only resource; none when text-only."""
         if self.vision_config is None:
             return []
+        from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
+
         vision = self.vision_config
+        processor = self.image_processor
+        min_patches = processor.size["shortest_edge"] // processor.patch_size ** 2
         return [
             RaggedAttentionSpec(
                 resource_key=VISION_ATTN, nodes={"vision_encoder"},
@@ -247,8 +251,10 @@ class Qwen3_5DenseModel(Model):
                     num_qo_heads=vision.num_heads,
                     num_kv_heads=vision.num_heads,
                     head_dim=vision.head_dim,
-                    # one segment per captured replay: the block loop takes one
-                    # image at a time, so the default of one per request fits
+                    # a segment per image, not per request: the resize floors each image at `shortest_edge` pixels
+                    max_segments_per_request=(
+                        VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
+                    ),
                 ),
             ),
         ]
