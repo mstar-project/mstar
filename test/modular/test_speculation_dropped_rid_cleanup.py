@@ -101,4 +101,24 @@ def test_dropped_rid_gets_its_own_edges_back():
     # the speculative-scheduled flag goes on the one that still runs.
     assert committed == [(spec.spec_id, True, ["drop"], ["keep"])]
     assert returned == [("drop", "audio_drop")]
-    assert set(spec.consumed_streaming_edges) == {"keep"}
+    # keep's chunk now belongs to the step, so the settle forgets it.
+    assert spec.consumed_streaming_edges == {} and spec.spec_id == 0
+
+
+def test_failed_settle_after_success_returns_nothing():
+    """An error between the success settle and submit settles again with
+    ``success=False``. The runtime stage is gone by then, so the kept chunk
+    stays in its slot; returning it to its buffer would track it twice.
+    """
+    returned: list[tuple[str, str]] = []
+    worker = SimpleNamespace(
+        _return_streaming_edge=lambda rid, se: returned.append((rid, se.edge.name)),
+        _graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None),
+    )
+    spec = _speculation(["keep"])
+    spec.spec_id = 5
+
+    Worker._settle_speculation(worker, spec, True)
+    Worker._settle_speculation(worker, spec, False)
+
+    assert returned == []

@@ -2011,8 +2011,10 @@ class Worker:
         ingests into the next-iter slot, let the FOLLOWING chunk take the
         current slot and be consumed first.
 
-        Settles once per speculation: ``spec_id`` is dropped from the runtime
-        here, so a second call is a no-op.
+        Settles once per speculation: ``spec_id`` and the consumed edges are
+        cleared here, so a second call is a no-op on both sides. Without that,
+        a failed settle after a successful one would return the kept chunks to
+        their buffers while they are still in the node's slot.
 
         On ``success`` the same call marks the batch speculatively scheduled, so
         "this speculation is now real" is ONE crossing into the runtime rather
@@ -2041,6 +2043,9 @@ class Worker:
             for se in edges:
                 self._return_streaming_edge(rid, se)
             speculation.consumed_streaming_edges.pop(rid, None)
+        # The kept rids' chunks now belong to the step; nothing is left to undo.
+        speculation.spec_id = 0
+        speculation.consumed_streaming_edges.clear()
 
     def _is_tearing_down(self, rid: int) -> bool:
         """Removed, aborted or failed: no further speculative work for ``rid``.
