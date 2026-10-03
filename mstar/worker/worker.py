@@ -1765,10 +1765,8 @@ class Worker:
         max_continuing = self.scheduler.room_for_continuing(spec_target)
 
         # Removes are filtered here; prep_spec_rids assumes that. So is a rid the
-        # target node won't admit yet (a KV pool's reservation, a reload): its
-        # admit would refuse the whole batch, so it takes the queue, where
-        # readiness holds it like any other. A loop-back onto the same node
-        # needs no ask, as every rid in batch N passed that node's readiness.
+        # target would not run yet, as its admit would refuse the whole batch; a
+        # loop-back asks nothing, since batch N's rids passed this node's readiness.
         candidates = [
             r for r in batch_N.request_to_worker_graph
             if r not in self._pending_removes
@@ -1870,9 +1868,7 @@ class Worker:
         )
 
     def _ready_on(self, node_name: str, rid: int) -> bool:
-        """Whether ``node_name``'s resources would run ``rid`` now, as the
-        scheduler asks before it batches a request (a terminal failure reads
-        as not ready here, and the scheduler's own check fails the rid)."""
+        """Whether ``node_name`` would run ``rid`` now; a terminal failure is left for the scheduler to fail."""
         partition = self.request_state.get_partition_for_node(node_name)
         outcome = self.engine_manager.get_engine(node_name).check_ready(
             node_name, rid, self.request_state.get_fwd_info(rid, partition),
