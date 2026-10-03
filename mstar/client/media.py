@@ -36,8 +36,8 @@ def parse_ndjson_line(line: str) -> dict | None:
     """Parse one NDJSON line from ``/generate`` streaming into a decoded dict.
 
     Returns ``{"modality", "bytes", "metadata"}`` or ``None`` for blank /
-    unparseable lines. A top-level ``error`` is the Rust frontend's in-band
-    failure envelope and raises rather than being mistaken for an empty chunk.
+    unparseable lines. A top-level ``error`` (an older Rust frontend's in-band
+    failure envelope) raises rather than being mistaken for an empty chunk.
     """
     line = line.strip()
     if not line:

@@ -1024,11 +1024,13 @@ async fn generate_finish(
         let body = base.map(|item| {
             Ok::<Bytes, Infallible>(Bytes::from(match item {
                 Out::Chunk(c) => ndjson_line(&c),
-                Out::Error { message, .. } => {
-                    let mut s = json!({"error": message}).to_string();
-                    s.push('\n');
-                    s.into_bytes()
-                }
+                // The Python server's in-band error, which the SDK raises on:
+                // an `error` chunk carrying the message and its status
+                Out::Error { status, message } => ndjson_line(&ResultChunk {
+                    modality: "error".to_string(),
+                    data: message.into_bytes(),
+                    metadata: json!({"status": status}),
+                }),
             }))
         });
         return Response::builder()

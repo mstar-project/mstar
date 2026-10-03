@@ -573,6 +573,25 @@ def test_a_mid_stream_error_is_typed_by_its_status():
         assert (err["type"], err["code"]) == (type_, status)
 
 
+def test_a_mid_stream_generate_error_is_an_error_chunk():
+    # the Python /generate's shape, status included; the bare {"error": ...}
+    # line dropped it, and readers of `modality` missed the failure
+    import base64
+    import urllib.parse
+
+    form = {"text": "hi", "output_modalities": "text", "streaming": "true"}
+    with _model_stack("qwen3_omni", _ErrorChunkStub(400)) as (port, _up):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/generate",
+            data=urllib.parse.urlencode(form).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            (line,) = r.read().decode().splitlines()
+    chunk = json.loads(line)
+    assert (chunk["modality"], chunk["metadata"]) == ("error", {"status": 400})
+    assert base64.b64decode(chunk["data"]) == b"Error in worker: boom"
+
+
 def test_streaming_speech_intake_rejection_is_a_400():
     # the WAV header is a 200 once sent, so the rejection has to land first
     with _model_stack("orpheus", _StubAPIServer()) as (port, _up):
