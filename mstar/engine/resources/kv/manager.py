@@ -900,7 +900,8 @@ class KVManager(AttentionResource):
                 # discards its output.
                 views.append(SequenceView(
                     request_id=s.request_id, label=s.label,
-                    page_idxs=[SINK_PAGE] if s.span > 0 else [],
+                    # a sink page per page of span, not one: fewer and its writes spill into the previous row's pages
+                    page_idxs=[SINK_PAGE] * -(-s.span // page_size),
                     length=s.span, to_compute=s.span,
                 ))
                 continue
