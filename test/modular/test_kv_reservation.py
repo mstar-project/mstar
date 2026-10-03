@@ -152,6 +152,19 @@ def test_a_models_count_past_max_seq_len_is_reserved_whole():
     )
 
 
+def test_decode_adds_at_most_max_seq_len_to_a_models_count():
+    kv = _manager(max_seq_len=64)
+    kv.ingest_request("r", KVReqConfig(
+        max_tokens=444, prompt_slots={"main": 20}, decode_labels=["main"],
+    ))
+
+    _run(kv, "r", 20)
+
+    assert kv._reserved["r"].pages == _pages(20 + 64), (
+        "decode was reserved past the positions max_seq_len allows"
+    )
+
+
 def test_a_request_nothing_counts_is_left_to_run_as_before():
     # no count from the model and no keys: max_seq_len is all that bounds it,
     # which for most models is far more than the pool can spare per request
