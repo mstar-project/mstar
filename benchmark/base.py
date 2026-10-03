@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Optional
@@ -183,6 +184,26 @@ class Kokoro(Model):
     def get_served_model_name(self) -> str:
         # M* ignores the field; Kokoro-FastAPI accepts only "kokoro" (or OpenAI voice-model aliases).
         return "kokoro"
+
+
+class Chatterbox(Model):
+    """Chatterbox (Resemble AI) zero-shot TTS; the Turbo checkpoint shares the
+    request shape and is served under the ``chatterbox_turbo`` registry key."""
+
+    def get_hf_url(self):
+        return "ResembleAI/chatterbox"
+
+    def get_supported_modalities(self):
+        return {RequestType.T2S}
+
+    def get_model_kwargs(self, request_type: RequestType):
+        # The reference package's defaults (temperature 0.8, exaggeration 0.5,
+        # cfg 0.5), so every system synthesises the same request and stops on
+        # the model's own EOS. The voice defaults to the checkpoint's built-in
+        # one; set CHATTERBOX_BENCH_VOICE to a preset file name (e.g.
+        # "Abigail.wav") that both M* (voices_dir) and Chatterbox-TTS-Server
+        # (predefined voices) resolve, for a same-voice comparison.
+        return {"voice": os.environ.get("CHATTERBOX_BENCH_VOICE", "default"), "temperature": 0.8}
 
 
 class Qwen3Omni(Model):
@@ -378,6 +399,7 @@ class ModelType(Enum):
     BAGEL = "bagel"
     ORPHEUS = "orpheus"
     KOKORO = "kokoro"
+    CHATTERBOX = "chatterbox"
     QWEN3OMNI = "qwen3omni"
     QWEN3TTS = "qwen3_tts"
     QWEN3TTS_1P7B = "qwen3_tts_1p7b"
@@ -394,6 +416,8 @@ class ModelType(Enum):
             return Orpheus(**kwargs)
         if self == ModelType.KOKORO:
             return Kokoro(**kwargs)
+        if self == ModelType.CHATTERBOX:
+            return Chatterbox(**kwargs)
         if self == ModelType.QWEN3OMNI:
             return Qwen3Omni(**kwargs)
         if self == ModelType.QWEN3TTS:
